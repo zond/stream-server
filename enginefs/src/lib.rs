@@ -14106,7 +14106,15 @@ mod tests {
             .expect("a stream at byte 150");
         let mut byte = [0u8; 1];
         at_start.read_exact(&mut byte).await.expect("a byte at 0");
-        seek.read_exact(&mut byte).await.expect("a byte at 150");
+        // Most of a piece, not a byte: the consumer's position is a
+        // smoothed average of where its reads end, weighted by their size
+        // (`retention::streams::Stream`), and one byte is the crawler's
+        // read, which it rightly all but ignores. Twenty-four bytes of a
+        // twenty-five-byte piece put the position in piece 6.
+        let mut most_of_a_piece = [0u8; 24];
+        seek.read_exact(&mut most_of_a_piece)
+            .await
+            .expect("most of the piece at 150");
         (enginefs, engine, bucket, store, at_start, seek)
     }
 

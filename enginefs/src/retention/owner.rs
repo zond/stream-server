@@ -3359,7 +3359,7 @@ mod tests {
         let (backing, owner, _budget) = proxy();
         let reader = owner.reader(0, domain(0, 0..8));
         let claim = reader.note((0, 0)).expect("the first byte is due");
-        backing.read_from(0, 1);
+        backing.read_from(0, PIECE);
         let (entered, _release) = backing.park_held();
         let pass = spawn_pass(&owner, 0, claim);
         entered.await.expect("the pass to reach its listing");
@@ -3400,10 +3400,10 @@ mod tests {
         // The second player's first byte is due too; its claim is dropped
         // unused, which is a pass that never ran.
         drop(second.note((0, 6 * PIECE)));
-        backing.read_from(6 * PIECE, 1);
+        backing.seek_to(6 * PIECE);
         let reader = owner.reader(0, domain(0, 0..8));
         let claim = reader.note((0, 3 * PIECE)).expect("due");
-        backing.read_from(3 * PIECE, 1);
+        backing.seek_to(3 * PIECE);
         let first = owner
             .pass(&0, &(), claim, Mode::Live)
             .await
@@ -3703,7 +3703,7 @@ mod tests {
         // its window is in the pass's own windows and nowhere else by then.
         let second = owner.reader(0, domain(0, 0..8));
         drop(second.note((0, 7 * PIECE)));
-        backing.read_from(7 * PIECE, 1);
+        backing.seek_to(7 * PIECE);
         let second = parking_lot::Mutex::new(Some(second));
         // A body framed over piece 4 that ends while the unlinks run: the
         // pass snapshotted its promise at the re-read and honours it to the
@@ -3714,7 +3714,7 @@ mod tests {
         // A third player arriving during the unlinks.
         let third = owner.reader(0, domain(0, 0..8));
         let claim = reader.note((0, 0)).expect("due");
-        backing.read_from(0, 1);
+        backing.seek_to(0);
         let answers = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let hook: Hook<ProxySide> = Box::new({
             let answers = answers.clone();
@@ -3734,7 +3734,7 @@ mod tests {
                 // A note during a pass starts nothing, but its window is
                 // live at the door.
                 assert!(third.note((0, 3 * PIECE)).is_none());
-                backing.read_from(3 * PIECE, 1);
+                backing.seek_to(3 * PIECE);
                 answers.push(("a head that moved since", door.refuses(3)));
                 assert!(!door.shut(), "nothing has closed the door");
                 backing.keeps_everything.store(true, Ordering::SeqCst);
@@ -4688,7 +4688,7 @@ mod tests {
         let reader = owner.reader(0, domain(0, 0..8));
         backing.fail_held.store(true, Ordering::SeqCst);
         let claim = reader.note((0, 0)).expect("due");
-        backing.read_from(0, 1);
+        backing.seek_to(0);
         let (probe, waiter) = watch_release(&owner.lookup(&0).unwrap());
         let outcome = owner.pass(&0, &(), claim, Mode::Live).await;
         assert!(outcome.concluded.is_none());
@@ -4704,12 +4704,12 @@ mod tests {
         let claim = reader
             .note((0, 0))
             .expect("a pass that measured nothing left the reader due where it stood");
-        backing.read_from(0, 1);
+        backing.seek_to(0);
         let (entered, release) = backing.park_held();
         let pass = spawn_pass(&owner, 0, claim);
         entered.await.expect("parked at the listing");
         assert!(reader.note((0, 3 * PIECE)).is_none());
-        backing.read_from(3 * PIECE, 1);
+        backing.seek_to(3 * PIECE);
         release.send(()).expect("the parked pass");
         let outcome = pass.await.expect("joined");
         assert!(outcome.concluded.is_none());
@@ -5448,13 +5448,13 @@ mod tests {
             .reader_on(&0, (0, 0), Buffering::default())
             .expect("the entity the install made");
         assert!(playing.note((0, 0)).is_none());
-        backing.read_from(0, 1);
+        backing.seek_to(0);
         // mpv's read of the Cues, still open while the tick runs.
         let probe = owner
             .reader_on(&0, (0, 7 * PIECE), Buffering::default())
             .expect("the same entity");
         assert!(probe.note((0, 7 * PIECE)).is_none());
-        backing.read_from(7 * PIECE, 1);
+        backing.seek_to(7 * PIECE);
 
         let claim = owner.turn(&0).await.expect("the turn");
         let outcome = owner
@@ -5598,7 +5598,7 @@ mod tests {
                 .reader_on(&0, (0, 0), Buffering::default())
                 .expect("the entity the install made");
             assert!(playing.note((0, 5 * PIECE)).is_none());
-            backing.read_from(5 * PIECE, 1);
+            backing.seek_to(5 * PIECE);
         }
         assert_eq!(owner.readers_of(&0), 0, "the response closed");
         // And a probe runs beside the paused film, as a player's next
@@ -5608,7 +5608,7 @@ mod tests {
                 .reader_on(&0, (0, 0), Buffering::default())
                 .expect("the same entity");
             assert!(probe.note((0, 0)).is_none());
-            backing.read_from(0, 1);
+            backing.seek_to(0);
         }
 
         let claim = owner.turn(&0).await.expect("the turn");
@@ -5857,12 +5857,12 @@ mod tests {
                     reader.note((0, 2 * PIECE)).is_none(),
                     "a note inside the hook found the turn free"
                 );
-                inside.read_from(2 * PIECE, 1);
+                inside.seek_to(2 * PIECE);
                 assert!(owner.holding(&0).is_some());
             }
         });
         let claim = reader.note((0, 0)).expect("due");
-        backing.read_from(0, 1);
+        backing.seek_to(0);
         let outcome = owner.pass(&0, &(), claim, Mode::Live).await;
         assert_eq!(fired.load(Ordering::SeqCst), 2);
         // The hook's byte landed before the re-read, so this pass measured

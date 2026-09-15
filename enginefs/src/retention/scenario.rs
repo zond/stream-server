@@ -362,6 +362,18 @@ impl<S: Side> FakeBacking<S> {
     /// from under. Both real read paths report every read they serve
     /// (`Engine::note_read`, `proxy_retention::Reader::note_read`); a test
     /// that wants a live consumer says so here.
+    /// A viewer seeking to `at` and playing on from there: three
+    /// quarter-piece reads, which is what it takes for the smoothed
+    /// position ([`crate::retention::streams::Stream`]) to land inside the
+    /// piece the seek went to. One read of a byte is a marker the position
+    /// rightly ignores -- that is the crawler's read.
+    pub(crate) fn seek_to(&self, at: u64) {
+        let quarter = (PIECE / 4).max(1);
+        for i in 0..3 {
+            self.read_from(at + i * quarter, quarter);
+        }
+    }
+
     pub(crate) fn read_from(&self, at: u64, bytes: u64) {
         self.note_read(1, at, at.saturating_add(bytes), std::time::Instant::now());
     }
@@ -472,7 +484,7 @@ impl<S: Side> Backing for FakeBacking<S> {
         if let Some(hook) = self.on_reading.lock().as_ref() {
             hook();
         }
-        let want = streams.want(domain.file, asking.seconds, available, domain.piece);
+        let want = streams.want(domain.file, asking.seconds, available, domain.piece, now);
         let exempt = streams.exempt(domain.file, extent.end);
         // **What may not be unlinked is published here**, where the want
         // set is decided: the pass's own holdings -- every promise and
@@ -489,7 +501,7 @@ impl<S: Side> Backing for FakeBacking<S> {
             .saturating_sub(available);
         let how_many = usize::try_from(over.div_ceil(domain.piece.max(1))).unwrap_or(0);
         let (_, reclaim) = streams.coldest_of(domain.file, now, &kept, how_many);
-        let at = streams.busiest(domain.file, domain.piece);
+        let at = streams.busiest(domain.file, domain.piece, now);
         crate::retention::owner::Consumers {
             want,
             exempt,

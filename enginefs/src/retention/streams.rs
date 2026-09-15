@@ -64,9 +64,17 @@ impl Read {
 struct Stream {
     /// Which response is feeding it now. A change is a reopen.
     reader: u64,
-    /// Where this consumer is: the end of its last read. A scrub back
-    /// moves it back, because that is where the viewer now is and where a
-    /// window would belong.
+    /// Where this consumer is, in bytes of the file.
+    ///
+    /// **A byte-weighted average of where its reads end**, not the last
+    /// read's end ([`Self::place`]): a read moves it by a share that grows
+    /// with the read's size, so a viewer's 256 KiB reads carry it and a
+    /// crawler's 91-byte read at the tail of the same held run does not.
+    /// A seek inside held bytes moves it over a handful of reads, which
+    /// costs nothing -- the bytes under the new position are held, which
+    /// is why the read joined this stream at all. A read about to run out
+    /// of held bytes places it outright, so the window lands where the
+    /// fetching is needed.
     end: u64,
     /// The read before this one, which is what the next sample is measured
     /// against.
@@ -107,6 +115,38 @@ struct Stream {
 }
 
 impl Stream {
+    /// Whether nothing has read from this stream for [`STREAM_DORMANT`] as
+    /// of `now`. A dormant stream is kept -- a resumed read rejoins it --
+    /// but it holds no window, takes no share and is nobody's head.
+    fn dormant(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.seen) >= STREAM_DORMANT
+    }
+
+    /// Move [`Self::end`] for `read`, which has just joined this stream.
+    ///
+    /// `missing_within` is how many bytes lie between the read's end and
+    /// the first piece ahead of it the disk does not hold, or `u64::MAX`
+    /// when the held run reaches the file's end. **A read within its
+    /// window -- a piece at least -- of missing data places the position
+    /// outright**: the fetch
+    /// is needed there now and a position that lagged behind would draw
+    /// the window short of the reads. Every other read moves the position
+    /// by its share of the way, `size / (size + piece / 8)`, so
+    /// the crawler's tail read inside a fully held film is a rounding
+    /// error and a viewer's seek converges in a handful of reads.
+    fn place(&mut self, read: &Read, missing_within: u64, piece: u64) {
+        let size = read.size();
+        if missing_within <= self.window.max(piece) {
+            self.end = read.end;
+            return;
+        }
+        let smoothing = (piece / PLAYHEAD_SMOOTHING_PIECE_SHARE).max(1);
+        let from = i128::from(self.end);
+        let delta = i128::from(read.end) - from;
+        let moved = delta * i128::from(size) / (i128::from(size) + i128::from(smoothing));
+        self.end = u64::try_from(from + moved).unwrap_or(0);
+    }
+
     /// Fold what this consumer ate since the last read into its rate, if
     /// what it did says anything at all.
     ///
@@ -450,34 +490,39 @@ impl FileStreams {
         held: &BTreeSet<u32>,
         piece: u64,
     ) -> Option<Rejected> {
-        // Before the join, so an expired stream cannot be resumed and a new
-        // one starting where it left off is reported honestly as new.
-        self.expire(read.returned);
-
         let at = |offset: u64| self.geometry.at(piece, offset);
         let run = run_containing(held, at(read.begin), &self.geometry.bound);
-        let nearest = run.and_then(|run| {
+        let nearest = run.as_ref().and_then(|run| {
             self.streams
                 .iter()
                 .position(|stream| run.contains(&at(stream.end.saturating_sub(1))))
         });
 
-        if let Some(index) = nearest {
+        if let (Some(index), Some(run)) = (nearest, run) {
+            // How far the read is from running out of held bytes: the
+            // first missing piece of its run, or nothing when the run
+            // reaches the file's end -- the film's own end is not a hole.
+            let missing_within = if run.end >= self.geometry.bound.end {
+                u64::MAX
+            } else {
+                let into_piece = self.geometry.offset.saturating_add(read.end) % piece.max(1);
+                u64::from(run.end.saturating_sub(at(read.end.saturating_sub(1))))
+                    .saturating_mul(piece)
+                    .saturating_sub(into_piece)
+            };
             let stream = &mut self.streams[index];
             stream.sample(&read, self.ceiling);
             if stream.reader != reader {
                 stream.reader = reader;
             }
-            // Wherever the last read ended, backwards included. A scrub
-            // back is not ground already played -- it is ground about to be
-            // played again, and a window belongs where the viewer is. The
-            // cost is a transient demuxer re-read dragging the position a
-            // few hundred kilobytes back until the next read jumps forward.
-            // What bounds how far the two readings can differ is the held
-            // run: a read joins this stream only while the stream's last
-            // byte and the read's first are in one run of held pieces, and
-            // a read past a hole is a stream of its own.
-            stream.end = read.end;
+            // Backwards included: a scrub back is not ground already
+            // played, it is ground about to be played again, and a window
+            // belongs where the viewer is. What bounds how far a read and
+            // the position can differ is the held run: a read joins this
+            // stream only while the stream's position and the read's first
+            // byte are in one run of held pieces, and a read past a hole
+            // is a stream of its own. See [`Stream::place`].
+            stream.place(&read, missing_within, piece);
             stream.eaten = stream
                 .eaten
                 .saturating_add(read.end.saturating_sub(read.begin));
@@ -506,9 +551,10 @@ impl FileStreams {
 impl FileStreams {
     /// The piece this file is being consumed at; see
     /// [`Streams::busiest`].
-    fn busiest(&self, piece: u64) -> Option<u32> {
+    fn busiest(&self, piece: u64, now: Instant) -> Option<u32> {
         self.streams
             .iter()
+            .filter(|stream| !stream.dormant(now))
             .max_by_key(|stream| stream.eaten)
             .map(|stream| self.geometry.at(piece, stream.end))
     }
@@ -532,17 +578,27 @@ const REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 /// consumer's reads at the rate the field measured.
 const WAITING_READS: usize = 256;
 
-/// How long a stream nothing has read from stays a stream.
+/// How long a stream nothing has read from stays live.
 ///
-/// A placeholder the field log is meant to inform, like every constant in
-/// `docs/read-pattern-retention.md`. Too short and a slow second track --
-/// one measured at roughly 20 kB/s, reading forty kilobytes at a time --
-/// expires between its own reads and is counted again and again, which
-/// looks exactly like a join rule that is too tight. Too long and a
-/// response that ended minutes ago is still reported as something being
-/// read. Thirty seconds is longer than any gap that track left and shorter
-/// than a viewer's pause.
-const STREAM_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+/// A stream is never expired on a timer: it lives with its entity, like
+/// the torrent does, and a resumed read rejoins it. What idleness changes
+/// is what it holds. A dormant stream's window is no longer exempt from
+/// reclaim, so its pieces are the LRU's like everything else -- a paused
+/// viewer's pieces stay for as long as nothing colder needs the room, and
+/// a seek's abandoned stream pins nothing -- and it takes no share of the
+/// allowance and is nobody's head. Thirty seconds is longer than any gap
+/// the field's slow second track left between its own reads.
+const STREAM_DORMANT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How many bytes of reading move a stream's position halfway to a read's
+/// end ([`Stream::place`]), as a share of the piece: an eighth. On the
+/// field's 4 MiB pieces that is half a mebibyte -- a viewer's 256 KiB
+/// read moves the position a third of the way, so a seek inside held
+/// bytes converges in a couple of dozen reads, under two seconds of
+/// playback, while the crawler's 91-byte read at the tail moves it by a
+/// fiftieth of a percent. In pieces rather than bytes because a piece is
+/// the unit everything else here is measured in, the fakes' included.
+const PLAYHEAD_SMOOTHING_PIECE_SHARE: u64 = 8;
 
 impl FileStreams {
     /// The pieces these streams want fetched ahead of them.
@@ -566,20 +622,15 @@ impl FileStreams {
     /// streams is sixteen megabytes, and a device with less free space than
     /// that is not playing video, so it is not a case the allocation has to
     /// be shaped around.
-    /// Forget every stream not read for [`STREAM_IDLE`] as of `now`.
-    fn expire(&mut self, now: Instant) {
-        self.streams
-            .retain(|stream| now.saturating_duration_since(stream.seen) < STREAM_IDLE);
-    }
-
     /// What these streams would ask for over `seconds`, before anything is
     /// shared out -- the demand this file puts on the entity's allowance.
-    fn asked(&self, seconds: u64) -> u64 {
+    fn asked(&self, seconds: u64, now: Instant) -> u64 {
         // Saturating against a `seconds` nobody should hand in: the
         // `Maximum` profile is a finite day, precisely so this does not
         // saturate and hand every stream the whole allowance.
         self.streams
             .iter()
+            .filter(|stream| !stream.dormant(now))
             .map(|stream| stream.demand(self.ceiling).saturating_mul(seconds))
             .fold(0u64, u64::saturating_add)
     }
@@ -593,14 +644,24 @@ impl FileStreams {
     /// its own demand against the whole allowance would be promised it
     /// alone, and two files being read would together promise twice the
     /// disk there is.
-    fn grant(&mut self, seconds: u64, piece: u64, share: impl Fn(u64) -> u64) -> Vec<Range<u32>> {
+    fn grant(
+        &mut self,
+        seconds: u64,
+        piece: u64,
+        share: impl Fn(u64) -> u64,
+        now: Instant,
+    ) -> Vec<Range<u32>> {
         let floor = FLOOR_PIECES.saturating_mul(piece);
         let ceiling = self.ceiling;
-        for stream in &mut self.streams {
+        for stream in self
+            .streams
+            .iter_mut()
+            .filter(|stream| !stream.dormant(now))
+        {
             let target = share(stream.demand(ceiling).saturating_mul(seconds));
             stream.grant(target, floor);
         }
-        let windows = self.windows(piece);
+        let windows = self.windows(piece, now);
         // What a window covers is what may not be unlinked, so the answer
         // is published here, where it is known, rather than recomputed at a
         // door that would have to take this lock to do it. **Here and not
@@ -621,9 +682,10 @@ impl FileStreams {
     /// window doubled on every pass of every other file would reach a full
     /// lookahead at a rate set by how many files are being read rather than
     /// by its own.
-    fn windows(&self, piece: u64) -> Vec<Range<u32>> {
+    fn windows(&self, piece: u64, now: Instant) -> Vec<Range<u32>> {
         self.streams
             .iter()
+            .filter(|stream| !stream.dormant(now))
             .filter_map(|stream| {
                 let from = self.geometry.at(piece, stream.end);
                 let to = self
@@ -745,15 +807,6 @@ impl Streams {
         let overflow = waiting.len().saturating_sub(WAITING_READS);
         waiting.drain(..overflow);
         self.pending = waiting;
-        // **Every file's idle streams, not only this one's.** A stream
-        // expires by not being read, and a file nobody reads any more has
-        // no pass of its own to notice: its streams sat in the map with
-        // their windows published as exempt for as long as another file of
-        // the entity kept being played. After the reads above, so a stream
-        // a stale read just started is judged as of `now` like the rest.
-        for streams in self.by_file.values_mut() {
-            streams.expire(now);
-        }
         last
     }
 
@@ -841,13 +894,21 @@ impl Streams {
 
     /// What every stream on every file of this entity wants fetched ahead
     /// of it. See [`FileStreams::want`].
-    pub fn want(&mut self, file: usize, seconds: u64, budget: u64, piece: u64) -> Vec<Range<u32>> {
+    pub fn want(
+        &mut self,
+        file: usize,
+        seconds: u64,
+        budget: u64,
+        piece: u64,
+        now: Instant,
+    ) -> Vec<Range<u32>> {
         // The demand of everything being read, so the sharing is over the
-        // entity and not over one file of it.
+        // entity and not over one file of it. Live streams only: a dormant
+        // one holds no window and takes no share ([`STREAM_DORMANT`]).
         let asked: u64 = self
             .by_file
             .values()
-            .map(|streams| streams.asked(seconds))
+            .map(|streams| streams.asked(seconds, now))
             .fold(0u64, u64::saturating_add);
         // One factor for every stream of every file, which is what makes
         // the shares equal in seconds. Nothing to scale when it all fits.
@@ -865,9 +926,9 @@ impl Streams {
             // a window that doubled on every pass of every file would grow
             // at a rate set by how many files are being read.
             windows.extend(if *idx == file {
-                streams.grant(seconds, piece, share)
+                streams.grant(seconds, piece, share, now)
             } else {
-                streams.windows(piece)
+                streams.windows(piece, now)
             });
         }
         windows
@@ -889,8 +950,8 @@ impl Streams {
     /// crawler has two streams, both of them a player's, and which one is
     /// the viewer is exactly what a rate says and a range header does not.
     /// See [`crate::retention::owner::Consumers::at`].
-    pub fn busiest(&self, file: usize, piece: u64) -> Option<u32> {
-        self.by_file.get(&file)?.busiest(piece)
+    pub fn busiest(&self, file: usize, piece: u64, now: Instant) -> Option<u32> {
+        self.by_file.get(&file)?.busiest(piece, now)
     }
 
     /// What each stream on `file` has measured its consumer to be eating,
@@ -1039,9 +1100,10 @@ mod tests {
         streams.observe(2, read(tail, tail + 39_316, t0, 2), &held, PIECE);
         assert_eq!(streams.streams.len(), 2, "a hole apart, so two consumers");
 
-        assert_eq!(
-            streams.busiest(PIECE),
-            Some(3),
+        assert!(
+            streams
+                .busiest(PIECE, t0 + Duration::from_secs(2))
+                .is_some_and(|piece| piece < 8),
             "the newest reader is at the tail; the one eating the file is not"
         );
 
@@ -1052,7 +1114,9 @@ mod tests {
             streams.observe(2, read(from, from + 262_144, t0, 3 + step), &held, PIECE);
         }
         assert_eq!(
-            streams.busiest(PIECE).map(|piece| piece >= PIECES - 4),
+            streams
+                .busiest(PIECE, t0 + Duration::from_secs(203))
+                .map(|piece| piece >= PIECES - 4),
             Some(true),
             "whoever is eating the file is where the file is being consumed"
         );
@@ -1347,7 +1411,7 @@ mod tests {
         // a window grows for a consumer that is consuming.
         for step in 0..5u64 {
             streams.streams[0].seen = at(t0, step + 1);
-            want(&mut streams, 90, u64::MAX, PIECE);
+            want(&mut streams, 90, u64::MAX, PIECE, t0);
         }
         assert!(
             streams.streams[0].window > FLOOR_PIECES * PIECE,
@@ -1368,7 +1432,7 @@ mod tests {
         // floor, so what it is granted is its own rate and not the floor.
         stream_at(&mut streams, 100, 200_000, t0);
 
-        want(&mut streams, 90, u64::MAX, PIECE);
+        want(&mut streams, 90, u64::MAX, PIECE, t0);
         let window = streams.streams[0].window;
         assert_eq!(window, 200_000 * 90, "ninety seconds of what it measured");
         assert!(
@@ -1411,7 +1475,7 @@ mod tests {
         streams.ceiling = Some(ceiling);
         streams.streams[0].window = u64::MAX;
 
-        want(&mut streams, 90, u64::MAX, PIECE);
+        want(&mut streams, 90, u64::MAX, PIECE, t0);
         assert_eq!(
             streams.streams[0].window,
             ceiling * 90,
@@ -1496,15 +1560,26 @@ mod tests {
     /// One file's share of its own demand: what [`Streams::want`] does when
     /// the entity is one file, which is every test below that builds a
     /// [`FileStreams`] directly.
-    fn want(streams: &mut FileStreams, seconds: u64, budget: u64, piece: u64) -> Vec<Range<u32>> {
-        let asked = streams.asked(seconds);
-        streams.grant(seconds, piece, |want| {
-            if asked <= budget || asked == 0 {
-                want
-            } else {
-                ((want as u128 * budget as u128) / asked as u128) as u64
-            }
-        })
+    fn want(
+        streams: &mut FileStreams,
+        seconds: u64,
+        budget: u64,
+        piece: u64,
+        now: Instant,
+    ) -> Vec<Range<u32>> {
+        let asked = streams.asked(seconds, now);
+        streams.grant(
+            seconds,
+            piece,
+            |want| {
+                if asked <= budget || asked == 0 {
+                    want
+                } else {
+                    ((want as u128 * budget as u128) / asked as u128) as u64
+                }
+            },
+            now,
+        )
     }
 
     /// Put a stream on `streams` at `piece` with a measured rate, without
@@ -1540,7 +1615,7 @@ mod tests {
         let mut streams = file_at(start * PIECE);
         stream_at(&mut streams, 100, 3_500_000, t0);
 
-        let windows = want(&mut streams, 90, u64::MAX, PIECE);
+        let windows = want(&mut streams, 90, u64::MAX, PIECE, t0);
         assert_eq!(
             windows[0].start,
             u32::try_from(start).unwrap() + 100,
@@ -1566,7 +1641,7 @@ mod tests {
         // Sixty seconds asked for, and half of that on the disk. Rates far
         // enough above the floor that the share is what decides, not it.
         let asked = (3_500_000 + 1_000_000) * 60;
-        let windows = want(&mut streams, 60, asked / 2, PIECE);
+        let windows = want(&mut streams, 60, asked / 2, PIECE, t0);
 
         let film = u64::from(windows[0].end - windows[0].start);
         let track = u64::from(windows[1].end - windows[1].start);
@@ -1612,8 +1687,8 @@ mod tests {
 
         // Sixty seconds asked for between them, and half of it on the disk.
         let asked = (3_500_000 + 1_000_000) * 60;
-        streams.want(0, 60, asked / 2, PIECE);
-        let windows = streams.want(1, 60, asked / 2, PIECE);
+        streams.want(0, 60, asked / 2, PIECE, t0);
+        let windows = streams.want(1, 60, asked / 2, PIECE, t0);
 
         let width = |of: &Range<u32>| u64::from(of.end - of.start);
         let film: u64 = windows.iter().filter(|w| w.start < 2_783).map(width).sum();
@@ -1643,8 +1718,8 @@ mod tests {
         let budget = 60 * PIECE;
         let mut windows = Vec::new();
         for _ in 0..10 {
-            streams.want(0, seconds, budget, PIECE);
-            windows = streams.want(1, seconds, budget, PIECE);
+            streams.want(0, seconds, budget, PIECE, t0);
+            windows = streams.want(1, seconds, budget, PIECE, t0);
         }
 
         let width = |of: &Range<u32>| u64::from(of.end - of.start);
@@ -1660,27 +1735,44 @@ mod tests {
         );
     }
 
-    /// **A pass of one file expires the idle streams of another.**
+    /// **A dormant stream of another file holds no window on this file's
+    /// pass.**
     ///
-    /// A stream expires by not being read, and `FileStreams::observe` runs
-    /// only on a read of its own file -- so a file nobody reads any more
-    /// had no pass to notice, and its streams sat in the map with their
-    /// windows published as exempt for as long as another file of the
-    /// entity kept being played: a season pack's finished episode holding
-    /// its window against the reclaim through the whole of the next.
+    /// Dormancy is judged as of the pass's clock, whichever file the pass
+    /// is for, so a season pack's finished episode does not hold its
+    /// window exempt against the reclaim through the whole of the next.
+    /// The stream itself stays, for the viewer who comes back to it.
     #[test]
-    fn a_pass_of_one_file_expires_the_idle_streams_of_another() {
+    fn a_dormant_stream_of_another_file_holds_no_window() {
         let t0 = Instant::now();
         let mut streams = Streams::default();
         stream_on(&mut streams, 0, 0, 100, 3_500_000, t0);
         stream_on(&mut streams, 1, 2_783, 100, 3_500_000, t0);
         let held = run(0..PIECES);
 
-        // A minute on, a pass for file 1 alone.
-        streams.observe(1, &held, PIECE, t0 + std::time::Duration::from_secs(60));
+        // A minute on, a pass for file 1: nothing has read either file.
+        let later = t0 + Duration::from_secs(60);
+        streams.observe(1, &held, PIECE, later);
+        let windows = streams.want(1, 90, u64::MAX, PIECE, later);
         assert!(
-            streams.by_file[&0].streams.is_empty(),
-            "file 0's stream, unread for a minute, survived file 1's pass"
+            windows.is_empty(),
+            "a stream unread for a minute still held a window: {windows:?}"
+        );
+        assert_eq!(
+            streams.by_file[&0].streams.len(),
+            1,
+            "and it is kept, for the read that comes back to it"
+        );
+
+        // File 1 is read again: its stream is live, file 0's is dormant,
+        // and the dormant one takes no share of an allowance that fits
+        // exactly one stream's sixty seconds.
+        streams.by_file.get_mut(&1).unwrap().streams[0].seen = later;
+        let windows = streams.want(1, 60, 3_500_000 * 60, PIECE, later);
+        let width: u64 = windows.iter().map(|w| u64::from(w.end - w.start)).sum();
+        assert!(
+            width > 40,
+            "the live stream was granted {width} pieces: the dormant one took a share"
         );
     }
 
@@ -1704,7 +1796,7 @@ mod tests {
         // A read of file 1 parks on a piece far from its stream.
         streams.by_file[&1].exempt.hold(4_000..4_001);
 
-        streams.want(0, 90, u64::MAX, PIECE);
+        streams.want(0, 90, u64::MAX, PIECE, t0);
         assert!(
             streams.by_file[&1].exempt.holds(4_000),
             "file 0's pass overwrote file 1's promise"
@@ -1729,13 +1821,13 @@ mod tests {
         }
 
         for _ in 0..4 {
-            streams.want(0, 90, u64::MAX, PIECE);
+            streams.want(0, 90, u64::MAX, PIECE, t0);
         }
         assert_eq!(
             streams.by_file[&1].streams[0].window, 0,
             "four passes of the other file granted this one nothing"
         );
-        streams.want(1, 90, u64::MAX, PIECE);
+        streams.want(1, 90, u64::MAX, PIECE, t0);
         assert!(
             streams.by_file[&1].streams[0].window > 0,
             "and its own pass is what grants it"
@@ -1759,7 +1851,7 @@ mod tests {
         streams.streams[0].window = 0;
 
         let floor = FLOOR_PIECES * PIECE;
-        let first = want(&mut streams, 90, u64::MAX, PIECE);
+        let first = want(&mut streams, 90, u64::MAX, PIECE, t0);
         assert_eq!(
             u64::from(first[0].end - first[0].start) * PIECE,
             floor + PIECE,
@@ -1768,7 +1860,7 @@ mod tests {
 
         let mut granted = streams.streams[0].window;
         for _ in 0..4 {
-            want(&mut streams, 90, u64::MAX, PIECE);
+            want(&mut streams, 90, u64::MAX, PIECE, t0);
             let now = streams.streams[0].window;
             assert!(
                 now <= granted * 2,
@@ -1782,14 +1874,16 @@ mod tests {
         );
     }
 
-    /// **A stream nothing has read from stops being one.**
+    /// **A stream nothing has read from goes dormant, and stays.**
     ///
-    /// Without it a two-hour film accumulates a stream per seek for the
-    /// whole session, and the count the field log is read for stops meaning
-    /// anything. Pruned before the join, so an expired stream cannot be
-    /// resumed by a read that happens to land in its old run.
+    /// It is not expired: a stream lives with its entity, like the torrent
+    /// does, and a resumed read rejoins it. What idleness takes is its
+    /// standing -- no window, no share, not the head -- so its pieces are
+    /// the LRU's like everything else. A paused viewer's pieces stay for
+    /// as long as nothing colder needs the room, and a seek's abandoned
+    /// stream pins nothing.
     #[test]
-    fn a_stream_nothing_has_read_from_stops_being_one() {
+    fn a_stream_nothing_has_read_from_goes_dormant_and_stays() {
         let t0 = Instant::now();
         let held = disk(&[0..4, 2_000..2_004]);
         let mut streams = file_at(0);
@@ -1801,16 +1895,140 @@ mod tests {
             streams.observe(1, read(262_144, 524_288, t0, 20), &held, PIECE),
             None
         );
-        assert_eq!(streams.streams.len(), 2, "twenty seconds is not idle yet");
+        let at_20 = t0 + Duration::from_secs(20);
+        assert!(
+            streams.streams.iter().all(|stream| !stream.dormant(at_20)),
+            "twenty seconds is not idle yet"
+        );
 
         assert_eq!(
             streams.observe(1, read(524_288, 786_432, t0, 40), &held, PIECE),
             None
         );
+        let at_40 = t0 + Duration::from_secs(40);
         assert_eq!(
             streams.streams.len(),
+            2,
+            "the one that stopped reading is kept"
+        );
+        assert!(
+            streams.streams[1].dormant(at_40) && !streams.streams[0].dormant(at_40),
+            "the one that stopped reading is dormant; the one that did not is not"
+        );
+        assert_eq!(
+            want(&mut streams, 90, u64::MAX, PIECE, at_40).len(),
             1,
-            "the one that stopped reading is gone; the one that did not is not"
+            "a dormant stream holds no window"
+        );
+        assert_eq!(
+            streams.busiest(PIECE, at_40),
+            Some(0),
+            "and is not where the file is being consumed"
+        );
+
+        // Reading from it again wakes it: the same stream, not a new one.
+        assert_eq!(
+            streams.observe(2, read(8_388_870_144, 8_389_132_288, t0, 60), &held, PIECE),
+            None,
+            "a resumed read rejoined its stream"
+        );
+        assert_eq!(streams.streams.len(), 2);
+    }
+
+    /// **A crawler's read at the tail does not move the viewer's
+    /// position.**
+    ///
+    /// On a fully held film every piece is one run, so mpv's index crawl
+    /// at the tail joins the viewer's stream -- rightly, membership is the
+    /// held run. The position is a byte-weighted average of where reads
+    /// end ([`Stream::place`]): the viewer's 256 KiB reads carry it and
+    /// the crawler's 91 bytes do not, so the window and the head stay
+    /// with the viewer.
+    #[test]
+    fn a_crawlers_read_at_the_tail_does_not_move_the_viewers_position() {
+        let t0 = Instant::now();
+        let held = run(0..PIECES);
+        let mut streams = file_at(0);
+        for i in 0..3u64 {
+            streams.observe(1, read(i * 262_144, (i + 1) * 262_144, t0, i), &held, PIECE);
+        }
+        let before = streams.streams[0].end;
+        let tail = u64::from(PIECES - 1) * PIECE + 100;
+        streams.observe(2, read(tail, tail + 91, t0, 3), &held, PIECE);
+        assert_eq!(streams.streams.len(), 1, "one run, one stream");
+        let moved = streams.streams[0].end - before;
+        assert!(
+            moved * 1_000 < tail - before,
+            "the crawler's 91 bytes at the tail moved the position {moved} bytes of the \
+             {} to the tail",
+            tail - before
+        );
+        // And the viewer's next read pulls it straight back.
+        streams.observe(1, read(3 * 262_144, 4 * 262_144, t0, 4), &held, PIECE);
+        assert!(
+            streams.streams[0].end < 2 * PIECE,
+            "the position did not come back to the viewer: {}",
+            streams.streams[0].end
+        );
+        assert!(matches!(
+            streams.busiest(PIECE, t0 + Duration::from_secs(4)),
+            Some(0 | 1)
+        ));
+    }
+
+    /// **A seek inside held bytes converges over a handful of reads.**
+    ///
+    /// Gradual, because the bytes under the new position are held -- that
+    /// is why the read joined this stream -- so nothing is waiting on the
+    /// window getting there. Two dozen 256 KiB reads, under two seconds of
+    /// playback, bring a four-hundred-megabyte seek within a couple of
+    /// mebibytes.
+    #[test]
+    fn a_seek_inside_held_bytes_converges_over_a_few_reads() {
+        let t0 = Instant::now();
+        let held = run(0..PIECES);
+        let mut streams = file_at(0);
+        streams.observe(1, read(0, 262_144, t0, 0), &held, PIECE);
+        let target = 100 * PIECE;
+        streams.observe(1, read(target, target + 262_144, t0, 1), &held, PIECE);
+        let after_one = streams.streams[0].end;
+        assert!(
+            after_one > 262_144 && after_one < target,
+            "one read moved the position part of the way, not all: {after_one}"
+        );
+        for i in 1..24u64 {
+            let from = target + i * 262_144;
+            streams.observe(1, read(from, from + 262_144, t0, 1 + i), &held, PIECE);
+        }
+        let end = streams.streams[0].end;
+        let reads_end = target + 24 * 262_144;
+        assert!(
+            reads_end - end < 2 * 1024 * 1024,
+            "two dozen reads in, the position is still {} bytes behind the reads",
+            reads_end - end
+        );
+    }
+
+    /// **A read about to run out of held bytes places the position at
+    /// once.**
+    ///
+    /// The window is drawn from the position, and where the next pieces
+    /// are missing the window is what fetches them: a position lagging a
+    /// seek would draw it short of the reads and the viewer would wait on
+    /// pieces nothing was asking for.
+    #[test]
+    fn a_read_about_to_run_out_of_held_bytes_places_the_position_at_once() {
+        let t0 = Instant::now();
+        let held = run(0..8);
+        let mut streams = file_at(0);
+        streams.observe(1, read(0, 262_144, t0, 0), &held, PIECE);
+        // Into the last held piece, with piece 8 missing beyond it.
+        let from = 7 * PIECE + 1_000;
+        streams.observe(1, read(from, from + 262_144, t0, 1), &held, PIECE);
+        assert_eq!(
+            streams.streams[0].end,
+            from + 262_144,
+            "a read a piece short of missing data was smoothed instead of placed"
         );
     }
 
@@ -1911,10 +2129,14 @@ mod tests {
 
         streams.domain(3, 0, whole(), None);
         streams.observe(3, &run(0..PIECES), PIECE, at(t0, 1));
-        assert_eq!(
-            streams.heads(3),
-            vec![(reads as u64 * 262_144, WAITING_READS as u32)],
-            "the newest are kept, and they reach where the consumer really is"
+        let heads = streams.heads(3);
+        assert_eq!(heads.len(), 1);
+        assert_eq!(heads[0].1, WAITING_READS as u32, "the newest are kept");
+        assert!(
+            reads as u64 * 262_144 - heads[0].0 < 1024 * 1024,
+            "and they reach where the consumer really is, a read or two of smoothing \
+             behind: {}",
+            heads[0].0
         );
     }
 
@@ -1932,7 +2154,7 @@ mod tests {
         let held = run(1_800..1_860);
         streams.record(0, 1, read(1_850 * PIECE, 1_850 * PIECE + 262_144, t0, 0));
         streams.observe(0, &held, PIECE, t0);
-        let windows = streams.want(0, 90, u64::MAX, PIECE);
+        let windows = streams.want(0, 90, u64::MAX, PIECE, t0);
 
         let exempt = streams.exempt(0, PIECES);
         let window = windows[0].clone();
@@ -1968,7 +2190,7 @@ mod tests {
         let held = run(1_800..1_860);
         streams.record(7, 1, read(1_850 * PIECE, 1_850 * PIECE + 262_144, t0, 0));
         streams.observe(7, &held, PIECE, t0);
-        let windows = streams.want(7, 90, u64::MAX, PIECE);
+        let windows = streams.want(7, 90, u64::MAX, PIECE, t0);
 
         assert!(
             windows[0].clone().all(|piece| exempt.holds(piece)),

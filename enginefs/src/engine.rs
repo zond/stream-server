@@ -582,6 +582,7 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
             asking.seconds,
             available,
             domain.piece_length,
+            now,
         );
         let exempt = streams.exempt(domain.file_idx, extent.end);
         // **What may not be unlinked is published here**, where the want
@@ -607,7 +608,7 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         let (tracked, reclaim) = streams.coldest_of(domain.file_idx, now, &kept, how_many);
         // Who, among this file's readers, the viewer is; see
         // [`crate::retention::owner::Consumers::at`].
-        let at = streams.busiest(domain.file_idx, domain.piece_length);
+        let at = streams.busiest(domain.file_idx, domain.piece_length, now);
         if !streams.report_due(now) {
             return crate::retention::owner::Consumers {
                 want,
@@ -1561,17 +1562,27 @@ impl<H: TorrentHandle> Engine<H> {
         // detector answers everything from: a position says where
         // something got to, a read says somebody is moving through the
         // file. `poll_read` reports both on the real path.
+        //
+        // Three quarter-piece reads rather than one byte: the position is
+        // a smoothed average of where reads end
+        // (`crate::retention::streams::Stream`), and a byte is the
+        // crawler's read, which it rightly ignores. Three is what lands
+        // the position inside the piece the seek went to.
+        let quarter = (self.handle.piece_length().unwrap_or(4) / 4).max(1);
         let now = std::time::Instant::now();
-        self.note_read(
-            file_idx,
-            1,
-            crate::retention::streams::Read {
-                begin: offset,
-                end: offset.saturating_add(1),
-                arrived: now,
-                returned: now,
-            },
-        );
+        for i in 0..3u64 {
+            let begin = offset.saturating_add(i * quarter);
+            self.note_read(
+                file_idx,
+                1,
+                crate::retention::streams::Read {
+                    begin,
+                    end: begin.saturating_add(quarter),
+                    arrived: now,
+                    returned: now,
+                },
+            );
+        }
     }
 
     /// How long the film is, with no position; see

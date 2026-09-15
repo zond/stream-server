@@ -70,7 +70,13 @@ A read `R` joins a stream `S` when it is the same file and
 - `R.end > S.end` -- it extends past it.
 
 Ties go to the stream whose `end` is nearest `R.begin`. No match makes a new
-stream, and a stream unseen for `STREAM_IDLE` expires.
+stream. A stream unseen for `STREAM_DORMANT` is not expired -- it lives with
+its entity and a resumed read rejoins it -- but it goes dormant: no window,
+no share of the allowance, not the head. Its pieces are the LRU's like any
+others. And `S.end` is not the last read's end but a byte-weighted average
+of where the stream's reads end, so the crawler's tail read inside a fully
+held film does not move the viewer's position; a read about to run out of
+held bytes places it outright (`Stream::place`).
 
 ### Why the span, and not a tolerance
 

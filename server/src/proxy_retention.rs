@@ -419,7 +419,7 @@ impl Backing for ProxyBacking {
         // whose duration the app *has* stated is the same arithmetic.
         streams.domain(0, 0, extent.clone(), ceiling);
         let rejected = streams.observe(0, held, CHUNK_BYTES, now);
-        let want = streams.want(0, asking.seconds, available, CHUNK_BYTES);
+        let want = streams.want(0, asking.seconds, available, CHUNK_BYTES, now);
         let exempt = streams.exempt(0, extent.end);
         // **What may not be unlinked is published here**, where the want
         // set is decided: the pass's own holdings -- every promise and
@@ -442,7 +442,7 @@ impl Backing for ProxyBacking {
         // One body is one reader here, but a proxied entity can still be
         // read by two of them; see
         // [`enginefs::retention::owner::Consumers::at`].
-        let at = streams.busiest(0, CHUNK_BYTES);
+        let at = streams.busiest(0, CHUNK_BYTES, now);
         if !streams.report_due(now) {
             return enginefs::retention::owner::Consumers {
                 want,
@@ -2468,10 +2468,16 @@ mod tests {
             !retention.heads_of(dir.path()).is_empty()
         })
         .await;
-        assert_eq!(
-            retention.heads_of(dir.path()),
-            vec![(2 * CHUNK_BYTES, 3)],
-            "one consumer, and every read of it joined"
+        let heads = retention.heads_of(dir.path());
+        assert_eq!(heads.len(), 1, "one consumer: {heads:?}");
+        assert_eq!(heads[0].1, 3, "and every read of it joined");
+        // The position is a smoothed average of where the reads end
+        // (`enginefs::retention::streams::Stream`): a read behind the
+        // second chunk's end, not exactly at it.
+        assert!(
+            2 * CHUNK_BYTES - heads[0].0 < CHUNK_BYTES,
+            "the consumer is where its reads have got to: {}",
+            heads[0].0
         );
     }
 
@@ -2991,12 +2997,14 @@ mod tests {
                 _ => return,
             };
             into_hook.note(at * CHUNK_BYTES);
-            into_hook.note_read(
-                at * CHUNK_BYTES,
-                at * CHUNK_BYTES + 1,
-                Instant::now(),
-                Instant::now(),
-            );
+            // A seek and a few reads on from it, not a byte: the position
+            // is a smoothed average of where reads end, and one byte is
+            // the crawler's read, which it rightly all but ignores.
+            let quarter = CHUNK_BYTES / 4;
+            for i in 0..3 {
+                let begin = at * CHUNK_BYTES + i * quarter;
+                into_hook.note_read(begin, begin + quarter, Instant::now(), Instant::now());
+            }
         }));
 
         // The pass this starts measures the head of the film -- and playback
