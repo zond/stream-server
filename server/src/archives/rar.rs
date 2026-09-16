@@ -4,7 +4,7 @@ use super::{
 };
 use anyhow::{Result, anyhow};
 use std::path::{Path, PathBuf};
-use unrar_rs::{ExtractOptions, RarArchive, StaticVolumeProvider};
+use unrar_rs::{RarArchive, StaticVolumeProvider};
 
 /// RAR archive handler backed by the pure-Rust `unrar-rs` crate.
 ///
@@ -75,22 +75,23 @@ fn resolve_entry(archive: &RarArchive, target: &str) -> Result<(usize, u64)> {
 
 /// Decompress a single member into the progressive cache's sync writer.
 ///
-/// Runs on the blocking pool. `extract_member_streaming` decodes directly into
-/// the writer without buffering the whole member in memory, and handles solid
-/// and non-solid archives alike (for a solid member it replays the preceding
-/// members internally). `verify: true` turns a CRC32/BLAKE2sp mismatch into an
+/// Runs on the blocking pool. `copy_to` decodes directly into the writer
+/// without buffering the whole member in memory, and handles solid and
+/// non-solid archives alike (for a solid member it replays the preceding
+/// members internally). Verification turns a CRC32/BLAKE2sp mismatch into an
 /// error instead of silently serving corrupt bytes.
 fn extract_entry(archive_path: &Path, index: usize, out: &mut SyncCacheWriter) -> Result<()> {
     let mut archive = open_archive(archive_path)?;
+    // The crate opens an archive verifying, so this restates its default
+    // rather than changing it -- said out loud because serving a member whose
+    // checksum did not match is the failure this guards, and a default is a
+    // thing that can change under us.
+    archive.set_verify(true);
     let provider = StaticVolumeProvider::from_ordered(vec![archive_path.to_path_buf()]);
-    let options = ExtractOptions {
-        verify: true,
-        password: None,
-        restore_owners: false,
-    };
 
     archive
-        .extract_member_streaming(index, &options, &provider, out)
+        .by_index_via(index, &provider)
+        .and_then(|entry| entry.copy_to(out))
         .map_err(|e| anyhow!("RAR extraction failed: {}", e))?;
 
     use std::io::Write;
