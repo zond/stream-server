@@ -2445,10 +2445,7 @@ fn a_seek_back_inside_the_window_is_served_from_disk_and_one_outside_it_is_not()
     // really happened. Which chunk that is comes out of the cache too --
     // what a full disk gives up is the coldest of what nothing is reading,
     // and where that lands is the LRU's answer.
-    let held = cached_chunk_indices(&fixture);
-    let gone = (0..PLAYED_CHUNKS)
-        .find(|chunk| !held.contains(chunk))
-        .expect("the reclaim took something");
+    let gone = reclaimed_chunk_below(&fixture, PLAYED_CHUNKS);
     let at = gone * CHUNK;
     let response = client
         .get(&url)
@@ -6545,6 +6542,32 @@ fn cached_chunk_indices(fixture: &Fixture) -> Vec<u64> {
         .collect();
     indices.sort_unstable();
     indices
+}
+
+/// A chunk below `played` that the cache has given up, waited for.
+///
+/// The bound asserted before a caller reaches here is an *upper* one -- the
+/// cache holds no more than a window -- and an upper bound is satisfied by
+/// a cache that has given nothing up yet. Read once and trusted, that left
+/// the caller with no reclaimed chunk to ask about and a panic saying the
+/// reclaim took nothing, on a Windows runner, on a commit that could not
+/// have changed it: the same commit passed when it was run again. The
+/// reclaim is what such a test is about, so this waits for it rather than
+/// asking whether it has already happened. Bounded, so one that never
+/// happens fails instead of hanging.
+fn reclaimed_chunk_below(fixture: &Fixture, played: u64) -> u64 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let held = cached_chunk_indices(fixture);
+        if let Some(gone) = (0..played).find(|chunk| !held.contains(chunk)) {
+            return gone;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the reclaim took nothing below chunk {played}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// The longest contiguous run of chunks on the disk, as a half-open range of
