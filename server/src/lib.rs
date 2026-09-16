@@ -90,6 +90,14 @@ mod cache_budget;
 mod cache_cleaner;
 mod devices;
 mod diagnostics;
+// What an embedder needs to apply this switch itself. xtremio starts this
+// server with `init_logging: false` and owns the process's one subscriber,
+// so [`diagnostics::logging::set_diagnostics_trace`] has no filter to
+// reload there: the setting is persisted and nothing in the log changes.
+// Exporting the builder and the two targets is what lets that embedder
+// build the same filter this crate would have built, from the same
+// strings, rather than keeping a second copy of them that drifts.
+pub use diagnostics::logging::{PROXY_TRACE_TARGET, RETENTION_TRACE_TARGET, log_filter};
 mod lan_media;
 mod proxy_cache;
 mod proxy_retention;
