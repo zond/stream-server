@@ -525,11 +525,12 @@ mod tests {
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         let ca_key = rcgen::KeyPair::generate().unwrap();
         let ca = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
 
         let leaf_params =
             rcgen::CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
         let leaf_key = rcgen::KeyPair::generate().unwrap();
-        let leaf = leaf_params.signed_by(&leaf_key, &ca, &ca_key).unwrap();
+        let leaf = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
 
         let config = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::aws_lc_rs::default_provider(),

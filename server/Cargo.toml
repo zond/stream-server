@@ -142,7 +142,7 @@ enginefs = { path = "../enginefs", features = [
 # Generates that fixture's CA and leaf at run time. The old fixture shipped a
 # self-signed CA certificate used as an end entity, which rustls refuses
 # whatever it is trusted as, so it could only ever be the unverifiable case.
-rcgen = "0.13"
+rcgen = "0.14"
 # The integration tests' HTTP client. Only they block; the server never does.
 reqwest = { version = "0.13", features = ["blocking"] }
 

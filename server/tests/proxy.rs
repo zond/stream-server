@@ -3919,8 +3919,10 @@ fn a_custom_response_header_cannot_reframe_the_response() -> anyhow::Result<()> 
 /// downgraded to accepting anything. That downgrade is gone, so the fixture
 /// issues a real chain instead.
 struct TestCa {
-    certificate: rcgen::Certificate,
-    key: rcgen::KeyPair,
+    /// What signs the leaves: rcgen 0.14 takes the issuer's parameters and
+    /// key as one value rather than a certificate and a key side by side,
+    /// so the pair is kept in that shape instead of being rebuilt per leaf.
+    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
     pem: Vec<u8>,
 }
 
@@ -3934,11 +3936,14 @@ static TEST_CA: std::sync::LazyLock<TestCa> = std::sync::LazyLock::new(|| {
         name
     };
     let key = rcgen::KeyPair::generate().expect("a key for the test CA");
-    let certificate = params.self_signed(&key).expect("a self-signed test CA");
-    let pem = certificate.pem().into_bytes();
+    // Self-signed first: it borrows the parameters the issuer then takes.
+    let pem = params
+        .self_signed(&key)
+        .expect("a self-signed test CA")
+        .pem()
+        .into_bytes();
     TestCa {
-        certificate,
-        key,
+        issuer: rcgen::Issuer::new(params, key),
         pem,
     }
 });
@@ -3963,7 +3968,7 @@ impl TlsOrigin {
         let leaf_params =
             rcgen::CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])?;
         let leaf_key = rcgen::KeyPair::generate()?;
-        let leaf = leaf_params.signed_by(&leaf_key, &TEST_CA.certificate, &TEST_CA.key)?;
+        let leaf = leaf_params.signed_by(&leaf_key, &TEST_CA.issuer)?;
         std::fs::write(&cert, leaf.pem())?;
         std::fs::write(&key, leaf_key.serialize_pem())?;
 
@@ -4004,12 +4009,15 @@ impl TlsOrigin {
         let mut ca_params = rcgen::CertificateParams::new(Vec::new())?;
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         let ca_key = rcgen::KeyPair::generate()?;
-        let ca = ca_params.self_signed(&ca_key)?;
+        // No self-signed certificate for this one: nothing here has to trust
+        // it, and rcgen 0.14 signs from the parameters and the key rather
+        // than from an issued certificate.
+        let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
 
         let leaf_params =
             rcgen::CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])?;
         let leaf_key = rcgen::KeyPair::generate()?;
-        let leaf = leaf_params.signed_by(&leaf_key, &ca, &ca_key)?;
+        let leaf = leaf_params.signed_by(&leaf_key, &issuer)?;
         std::fs::write(&cert, leaf.pem())?;
         std::fs::write(&key, leaf_key.serialize_pem())?;
 
