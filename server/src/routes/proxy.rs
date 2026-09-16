@@ -1695,6 +1695,38 @@ async fn proxy(
     let status = response.status();
     let res_headers = response.headers().clone();
 
+    // What the origin answered, for the switch that asks (see
+    // [`PROXY_TRACE_TARGET`]). Origins and never URLs: `d=` carries the
+    // caller's credentials in its query, and a log is the one place they
+    // must not turn up. The caller's `Range` is safe -- it is a byte
+    // count -- and is half of what tells a player that opened mid-file
+    // from one that could not read the container at all.
+    tracing::info!(
+        target: crate::diagnostics::logging::PROXY_TRACE_TARGET,
+        method = %method,
+        target_origin = %url.origin().ascii_serialization(),
+        answered_by = %fetched_url.origin().ascii_serialization(),
+        hops,
+        range = headers
+            .get(header::RANGE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("none"),
+        status = status.as_u16(),
+        content_type = res_headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or(""),
+        content_length = res_headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or(""),
+        content_range = res_headers
+            .get(header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or(""),
+        "what the origin answered",
+    );
+
     // The origin's own type, beside the caller's forced one from above:
     // asked separately, see [`forced_content_type`] for why merging them was
     // the bug.

@@ -775,6 +775,11 @@ fn the_diagnostics_trace_setting_changes_the_installed_log_filter() -> anyhow::R
         ..offline_config()
     })?;
     let trace_on = || tracing::enabled!(target: "enginefs::retention::trace", tracing::Level::INFO);
+    // The proxy's own half of the switch: what an origin answered, which is
+    // the only thing that tells a debrid link that served an error page
+    // from one that served a film.
+    let proxy_on =
+        || tracing::enabled!(target: "stream_server::routes::proxy::trace", tracing::Level::INFO);
     let rest_on = || tracing::enabled!(target: "enginefs::engine", tracing::Level::INFO);
 
     assert!(
@@ -785,11 +790,16 @@ fn the_diagnostics_trace_setting_changes_the_installed_log_filter() -> anyhow::R
         !trace_on(),
         "the retention trace was in the log before anyone asked"
     );
+    assert!(
+        !proxy_on(),
+        "the proxy trace was in the log before anyone asked"
+    );
     assert!(rest_on(), "the rest of enginefs is missing from the log");
 
     let updated = handle.update_settings(serde_json::json!({ "diagnosticsTrace": true }))?;
     assert!(updated.diagnostics_trace);
     assert!(trace_on(), "the setting did not reach the installed filter");
+    assert!(proxy_on(), "the setting did not reach the proxy's trace");
     assert!(rest_on());
     let persisted: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
         config_dir.path().join("config").join("settings.json"),
@@ -798,6 +808,7 @@ fn the_diagnostics_trace_setting_changes_the_installed_log_filter() -> anyhow::R
 
     handle.update_settings(serde_json::json!({ "diagnosticsTrace": false }))?;
     assert!(!trace_on(), "the setting did not turn the trace off again");
+    assert!(!proxy_on(), "the proxy trace outlived the switch");
     assert!(rest_on());
 
     // A start over settings that already say `true` applies it: the second

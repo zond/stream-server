@@ -21,6 +21,18 @@ static LOG_FILTER: OnceLock<LogFilter> = OnceLock::new();
 /// line. Off unless the `diagnosticsTrace` setting turns it on.
 pub const RETENTION_TRACE_TARGET: &str = "enginefs::retention::trace";
 
+/// What `/proxy` reports about each answer it relays, under the same
+/// switch as the retention trace.
+///
+/// A stream that plays from a torrent and fails from a debrid link leaves
+/// nothing behind to tell them apart: the player says only that it could
+/// not recognise the format, and the URL is redacted on its way to the log
+/// because it carries the viewer's credentials. This target is the other
+/// half of that sentence -- what the origin actually answered -- and it is
+/// written with origins rather than URLs for the same reason the player's
+/// line is redacted.
+pub const PROXY_TRACE_TARGET: &str = "stream_server::routes::proxy::trace";
+
 /// The process's log filter, kept so a setting can change it while the
 /// process runs. `tracing` allows one global subscriber per process and
 /// its filter is set when it is installed; `reload` is the one way to
@@ -40,7 +52,9 @@ struct LogFilter {
 /// other `enginefs` line while this one decides the trace alone.
 pub fn log_filter(base: &str, diagnostics_trace: bool) -> EnvFilter {
     let level = if diagnostics_trace { "info" } else { "off" };
-    EnvFilter::new(format!("{base},{RETENTION_TRACE_TARGET}={level}"))
+    EnvFilter::new(format!(
+        "{base},{RETENTION_TRACE_TARGET}={level},{PROXY_TRACE_TARGET}={level}"
+    ))
 }
 
 /// Remember the installed subscriber's filter handle, once per process.
