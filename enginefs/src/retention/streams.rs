@@ -25,7 +25,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// One read that was served, as the detector sees it.
 ///
@@ -45,6 +45,26 @@ pub struct Read {
     pub arrived: Instant,
     /// When we finished serving it.
     pub returned: Instant,
+}
+
+/// One consumer of a file, read off its stream for the cache window.
+///
+/// Three facts and a position, and the window wants exactly these to say
+/// whether this reader is the one about to stop the film: how much it
+/// eats a second when it is eating ([`Self::rate`], the sustained figure,
+/// `None` before a read has come back late enough to measure one), how
+/// long since it last asked for anything ([`Self::idle`]), and what one of
+/// its reads is worth ([`Self::last_read`]) -- the tolerance below which
+/// "bytes in front of it" means "waiting for more" and not "has some".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reader {
+    /// The last byte it read. [`Stream::end`] is exclusive, and at a
+    /// boundary would name the unit this reader is waiting for rather than
+    /// the one it is reading out of.
+    pub at: u64,
+    pub rate: Option<u64>,
+    pub idle: Duration,
+    pub last_read: u64,
 }
 
 impl Read {
@@ -965,23 +985,22 @@ impl Streams {
     /// So nothing is ever sized from this alone: a window is sized from the
     /// film's own arithmetic, which a measured rate may only lower
     /// ([`Stream::demand`]).
-    /// Where each stream on `file` has reached and how fast it is
-    /// consuming: the two halves of "how long has this one got", paired
-    /// here rather than by zipping [`Self::heads`] with [`Self::rates`],
-    /// which are two walks of one list and agree only by convention.
-    ///
-    /// `None` for a stream with no rate yet: it has read once, or it is
-    /// not reading at all. A head that consumes nothing cannot run out,
-    /// which is what makes it a different question from how many bytes sit
-    /// in front of it.
-    pub fn heads_with_rates(&self, file: usize) -> Vec<(u64, Option<u64>)> {
+    /// Every consumer of `file`, as the cache window needs to know it:
+    /// where it is, what it has been eating, and whether it is still at
+    /// it. See [`Reader`].
+    pub fn readers(&self, file: usize, now: Instant) -> Vec<Reader> {
         self.by_file
             .get(&file)
             .map(|streams| {
                 streams
                     .streams
                     .iter()
-                    .map(|stream| (stream.end, stream.rate))
+                    .map(|stream| Reader {
+                        at: stream.end.saturating_sub(1),
+                        rate: stream.rate,
+                        idle: now.saturating_duration_since(stream.seen),
+                        last_read: stream.last.size(),
+                    })
                     .collect()
             })
             .unwrap_or_default()

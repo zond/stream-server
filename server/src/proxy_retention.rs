@@ -1137,17 +1137,20 @@ impl ProxyRetention {
         }
     }
 
-    /// Where each consumer of `dir` has reached and what it is drawing:
-    /// the two halves of how long that one has got. See
-    /// [`enginefs::retention::streams::Streams::heads_with_rates`].
-    pub(crate) fn heads_with_rates_of(&self, dir: &Path) -> Vec<(u64, Option<u64>)> {
+    /// Every consumer of `dir`, as the cache window needs to know it. See
+    /// [`enginefs::retention::streams::Streams::readers`].
+    pub(crate) fn window_readers_of(
+        &self,
+        dir: &Path,
+        now: std::time::Instant,
+    ) -> Vec<enginefs::retention::streams::Reader> {
         self.detectors
             .lock()
             .ok()
             .and_then(|detectors| {
                 detectors
                     .get(&dir.to_path_buf())
-                    .map(|streams| streams.heads_with_rates(0))
+                    .map(|streams| streams.readers(0, now))
             })
             .unwrap_or_default()
     }
@@ -1242,9 +1245,13 @@ impl ProxyRetention {
     /// entity: the answer is [`Self::held`], which is the owner's held set
     /// and lists the entity's bucket directories only to seed it. Call it
     /// off the reactor -- a panel cannot know whether it is the first.
-    pub fn window(&self, target: &str) -> Option<enginefs::retention::CacheWindow> {
+    pub fn window(
+        &self,
+        target: &str,
+        now: std::time::Instant,
+    ) -> Option<enginefs::retention::CacheWindow> {
         let live = self.live.reading();
-        let (_, holding) = self.owner.holdings().into_iter().find(|(key, holding)| {
+        let (key, holding) = self.owner.holdings().into_iter().find(|(key, holding)| {
             &*holding.domain.target == target && holding.installed.is_some() && live.is_proxy(key)
         })?;
         let dir = holding.domain.dir;
@@ -1252,60 +1259,50 @@ impl ProxyRetention {
         // shown a measurement nobody made. Only the seed can fail, and a
         // seed that failed installed nothing, so the next panel asks again.
         let held = self.held(&dir).ok()?;
-        // Every consumer of this entity, with what it is drawing, and the
-        // entity's own last position as the fallback for one nothing is
-        // registered against. The worst of them is the window, for the
-        // reason the torrent side gives at
-        // [`enginefs::retention::PolicyReading::window`]: a player waits on
-        // whichever of its streams runs out first, and what it holds is the
-        // unbroken run it is inside rather than every chunk on that side.
-        let heads = self.heads_with_rates_of(dir.path());
-        let heads = if heads.is_empty() {
-            vec![(holding.last_position?, None)]
-        } else {
-            heads
-        };
-        let mut worst: Option<enginefs::retention::CacheWindow> = None;
-        for (position, rate) in heads {
-            let head = enginefs::retention::window_of_run(
-                // The last byte read and not the next one wanted: a head
-                // is the end of its last read, which at a boundary is the
-                // first byte of a chunk nothing has fetched yet. Anchored
-                // there, every stream that had just finished a chunk read
-                // as holding nothing.
-                Self::run_around(&held, position.saturating_sub(1) / CHUNK_BYTES),
-                rate,
-            );
-            worst = Some(match worst {
-                Some(worst) => worst.worse_of(head),
-                None => head,
+        // Every consumer of this entity, its run measured in chunks to the
+        // byte; which of them the window is about is
+        // [`enginefs::retention::CacheWindow::worst_of`]'s to decide.
+        let heads = self
+            .window_readers_of(dir.path(), now)
+            .into_iter()
+            .map(|reader| {
+                let (behind_bytes, ahead_bytes) = Self::run_around(&held, reader.at);
+                enginefs::retention::HeadRun {
+                    behind_bytes,
+                    ahead_bytes,
+                    rate: reader.rate,
+                    idle: reader.idle,
+                    last_read: reader.last_read,
+                }
             });
-        }
-        Some(worst.unwrap_or_default())
+        Some(enginefs::retention::CacheWindow::worst_of(
+            heads,
+            self.owner.bitrate(&key),
+            Self::run_around(&held, holding.last_position?),
+        ))
     }
 
-    /// The unbroken run of held chunks `at` stands in, as bytes behind and
-    /// bytes ahead, or `None` when the chunk under it is not held -- that
-    /// consumer is waiting right now.
-    ///
-    /// The chunk the head is in counts as ahead: it is the one a player is
-    /// reading out of, not one it has passed.
-    fn run_around(held: &BTreeSet<u64>, at: u64) -> Option<(u64, u64)> {
-        if !held.contains(&at) {
-            return None;
+    /// The unbroken run of held chunks the byte `at` stands in, as bytes
+    /// behind and bytes ahead of it -- to the byte, so a reader waiting at
+    /// the end of what is held has next to nothing ahead of it rather than
+    /// the rest of its chunk. Nothing held under it is a run of nothing.
+    fn run_around(held: &BTreeSet<u64>, at: u64) -> (u64, u64) {
+        let chunk = at / CHUNK_BYTES;
+        if !held.contains(&chunk) {
+            return (0, 0);
         }
-        let mut start = at;
+        let mut start = chunk;
         while start > 0 && held.contains(&(start - 1)) {
             start -= 1;
         }
-        let mut end = at.saturating_add(1);
+        let mut end = chunk.saturating_add(1);
         while held.contains(&end) {
             end = end.saturating_add(1);
         }
-        Some((
-            (at - start).saturating_mul(CHUNK_BYTES),
-            (end - at).saturating_mul(CHUNK_BYTES),
-        ))
+        (
+            at - start.saturating_mul(CHUNK_BYTES),
+            end.saturating_mul(CHUNK_BYTES) - at,
+        )
     }
 
     /// How many open bodies this cache is answering: reads that have
@@ -1952,7 +1949,7 @@ mod tests {
         .await;
 
         let shown = retention
-            .window(TARGET)
+            .window(TARGET, std::time::Instant::now())
             .expect("a bounded stream a player is inside");
         let protected = retention.protected().await;
 
@@ -1961,7 +1958,7 @@ mod tests {
         seeking.promises(14..16);
 
         assert_eq!(
-            retention.window(TARGET),
+            retention.window(TARGET, std::time::Instant::now()),
             Some(shown),
             "the panel shows what the owner has watched arrive, and two \
              chunks it never heard about are not that"
@@ -2368,7 +2365,7 @@ mod tests {
     /// read-ahead that has *arrived*, and a proxied entity only ever has
     /// what the origin has relayed so far.
     #[tokio::test]
-    async fn the_window_a_panel_shows_is_the_disk_split_at_the_playhead() {
+    async fn the_window_a_panel_shows_is_the_run_round_the_reader_to_the_byte() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = ChunkDir::new(tmp.path().join("entity"));
         // Chunks three to nine: everything a player has fetched of a
@@ -2389,17 +2386,24 @@ mod tests {
         );
 
         assert_eq!(
-            retention.window(TARGET),
+            retention.window(TARGET, std::time::Instant::now()),
             Some(enginefs::retention::CacheWindow {
-                behind_bytes: CHUNK_BYTES,
-                ahead_bytes: 6 * CHUNK_BYTES,
-                ..Default::default()
+                behind_bytes: CHUNK_BYTES + 5,
+                ahead_bytes: 6 * CHUNK_BYTES - 5,
+                behind_seconds: None,
+                ahead_seconds: None,
             }),
-            "chunk three is behind the head; the chunk under it and the five \
-             after it are what playback has in hand"
+            "chunk three and five bytes of chunk four are behind the reader's \
+             byte; the rest of the run through chunk nine is ahead of it. No \
+             seconds: one read has no rate and the test prices the film at \
+             nothing, so this is the fallback -- bytes round the position, \
+             and no time"
         );
         assert_eq!(
-            retention.window("https://origin.example/other-film.mkv"),
+            retention.window(
+                "https://origin.example/other-film.mkv",
+                std::time::Instant::now()
+            ),
             None,
             "and it is the stream that was asked about, not whatever is open"
         );
@@ -2424,7 +2428,7 @@ mod tests {
         let opened = bounded.reader(&dir, TOTAL, TARGET.into());
         opened.promises(0..16);
         assert_eq!(
-            bounded.window(TARGET),
+            bounded.window(TARGET, std::time::Instant::now()),
             None,
             "a body has been framed, but no byte of it has reached a player"
         );
@@ -2443,7 +2447,7 @@ mod tests {
             Instant::now(),
             Instant::now(),
         );
-        assert_eq!(unbounded.window(TARGET), None);
+        assert_eq!(unbounded.window(TARGET, std::time::Instant::now()), None);
         drop(reader);
     }
 
@@ -3552,16 +3556,17 @@ mod tests {
             );
 
             assert_eq!(
-                retention.window(TARGET),
+                retention.window(TARGET, std::time::Instant::now()),
                 Some(enginefs::retention::CacheWindow {
-                    behind_bytes: CHUNK_BYTES,
-                    ahead_bytes: 6 * CHUNK_BYTES,
-                    ..Default::default()
+                    behind_bytes: CHUNK_BYTES + 5,
+                    ahead_bytes: 6 * CHUNK_BYTES - 5,
+                    behind_seconds: None,
+                    ahead_seconds: None,
                 }),
                 "the seven chunks of the entity being played, split at its \
-                 playhead -- and not the four the finished session left \
+                 reader's byte -- and not the four the finished session left \
                  round the end of the film, which would be three behind and \
-                 one ahead of a playhead nobody is at"
+                 one ahead of a position nobody is at"
             );
             drop(reader);
         }

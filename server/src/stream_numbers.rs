@@ -266,9 +266,11 @@ impl StreamStore for ProxyCache {
         // Off the reactor: the window is counted from a listing of the
         // entity's chunk directories.
         let retention = self.retention().clone();
-        let window = tokio::task::spawn_blocking(move || retention.window(target.as_str()))
-            .await
-            .ok()??;
+        let window = tokio::task::spawn_blocking(move || {
+            retention.window(target.as_str(), std::time::Instant::now())
+        })
+        .await
+        .ok()??;
         Some(StreamNumbers {
             window: Some(window),
             sharing: None,

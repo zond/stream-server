@@ -2952,7 +2952,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let engine = self.peek_engine(info_hash).await?;
         let transfer = engine.handle.transfer_totals();
         let refused_reclaims = engine.refused_reclaims();
-        let Some(reading) = engine.policy_reading(file_idx) else {
+        let Some(reading) = engine.policy_reading(file_idx, std::time::Instant::now()) else {
             return Some(crate::retention::TorrentStreamNumbers {
                 window: None,
                 committed_bytes: None,
@@ -11405,16 +11405,22 @@ mod tests {
     }
 
     /// **The panel's window is a reading of the disk, not of the policy's
-    /// intentions.**
+    /// intentions -- and of the run the reader is in, to the byte.**
     ///
     /// What a viewer is being told is "you can scrub back this far, and you
     /// have this much in hand". Both halves are therefore what is *on the
-    /// disk* on each side of the playhead: the ahead half is read-ahead
-    /// that has arrived, and a stream whose read-ahead has not arrived yet
-    /// must not report the extent the policy intends to fill as though the
-    /// bytes were there.
+    /// disk* around the reader: the ahead half is read-ahead that has
+    /// arrived, and a stream whose read-ahead has not arrived yet must not
+    /// report the extent the policy intends to fill as though the bytes
+    /// were there. Measured from the reader's byte, not its piece: sixty
+    /// bytes into a file of twenty-five-byte pieces is ten bytes into piece
+    /// two, so ten of that piece are behind and fifteen ahead.
+    ///
+    /// No seconds: this reader has read once, so it has no rate, and the
+    /// test states no duration for the film to be priced by. That is the
+    /// fallback window -- bytes round where playback is, and no time.
     #[tokio::test]
-    async fn the_window_is_what_the_store_holds_of_the_file_split_at_the_playhead() {
+    async fn the_window_is_the_run_the_reader_is_in_to_the_byte() {
         let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
         // Four pieces of twenty-five bytes, so a playhead can have pieces on
         // both sides of it.
@@ -11444,13 +11450,14 @@ mod tests {
         assert_eq!(
             numbers.window,
             Some(crate::retention::CacheWindow {
-                behind_bytes: 50,
-                ahead_bytes: 25,
-                ..Default::default()
+                behind_bytes: 60,
+                ahead_bytes: 15,
+                behind_seconds: None,
+                ahead_seconds: None,
             }),
-            "pieces zero and one are behind the playhead; piece two is the one \
-             under it and counts as ahead; piece three is not on the disk and \
-             is not in hand"
+            "pieces zero and one and ten bytes of piece two are behind the \
+             reader; the other fifteen of piece two are ahead; piece three is \
+             not on the disk and is not in hand"
         );
     }
 
@@ -12900,7 +12907,9 @@ mod tests {
         engine.begin_retention(0).await;
         engine.test_read_at(0, 25);
         assert!(
-            engine.policy_reading(0).is_some(),
+            engine
+                .policy_reading(0, std::time::Instant::now())
+                .is_some(),
             "a policy stands and the reader is inside the file"
         );
         assert!(

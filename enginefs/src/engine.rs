@@ -1664,50 +1664,52 @@ impl<H: TorrentHandle> Engine<H> {
     /// any lock. A pass in flight has the policy in its cell like any other
     /// moment, so the committed count is the live one -- a pass parked in
     /// its advertise has already committed the piece it is announcing.
+    ///
+    /// Every reader of the file goes in, placed to the byte, with the
+    /// film's own rate beside them; which of them the window is about is
+    /// [`crate::retention::CacheWindow::worst_of`]'s to decide, not this
+    /// method's. It used to pick "the" playhead here -- the detector's
+    /// head -- and a comment recorded the day mpv's read of the tail had
+    /// left that head at the end of the file with the player at 0:00.
     pub(crate) fn policy_reading(
         &self,
         file_idx: usize,
+        now: Instant,
     ) -> Option<crate::retention::PolicyReading> {
-        let domain_file_idx = file_idx;
+        use crate::retention::{PiecePosition, PieceReader};
         let holding = self.retention.holding(&file_idx)?;
         let installed = holding.installed?;
-        // Every head reading this file, not the one the detector calls the
-        // entity's: each stream mpv opens reads this file, and the film
-        // stops for whichever of them runs out -- a subtitle track with
-        // nothing in hand stalls the demuxer exactly as the video does.
-        // [`crate::retention::PolicyReading::window`] reports the worst of
-        // them, so which head is "the" playhead stops being a guess this
-        // has to make. The detector's own head is kept as the fallback for
-        // a file no stream is registered against.
-        let heads: Vec<(u32, Option<u64>)> = {
+        let piece_length = holding.domain.piece_length;
+        let span_offset = holding.domain.span.offset;
+        let place = |at: u64| -> Option<PiecePosition> {
+            let piece = TorrentBacking::<H>::index_of(&holding.domain, (file_idx, at))?;
+            Some(PiecePosition {
+                piece,
+                offset: span_offset.saturating_add(at) % piece_length,
+            })
+        };
+        let fallback = place(holding.head?.1)?;
+        let readers = {
             let streams = self.streams.lock();
             streams
-                .heads_with_rates(domain_file_idx)
+                .readers(file_idx, now)
                 .into_iter()
-                .filter_map(|(end, rate)| {
-                    // The byte last read, not the one wanted next: `end` is
-                    // exclusive, and at a piece boundary it names the piece
-                    // the stream is waiting for rather than the one it is
-                    // reading out of.
-                    let at = end.saturating_sub(1);
-                    let piece =
-                        TorrentBacking::<H>::index_of(&holding.domain, (domain_file_idx, at))?;
-                    Some((piece, rate))
+                .filter_map(|reader| {
+                    Some(PieceReader {
+                        at: place(reader.at)?,
+                        rate: reader.rate,
+                        idle: reader.idle,
+                        last_read: reader.last_read,
+                    })
                 })
                 .collect()
         };
-        let heads = if heads.is_empty() {
-            vec![(
-                TorrentBacking::<H>::index_of(&holding.domain, holding.head?)?,
-                None,
-            )]
-        } else {
-            heads
-        };
         Some(crate::retention::PolicyReading::new(
             installed.pieces,
-            holding.domain.piece_length,
-            heads,
+            piece_length,
+            self.retention.bitrate(&file_idx),
+            readers,
+            fallback,
             installed.committed.len(),
         ))
     }

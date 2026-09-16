@@ -2321,20 +2321,25 @@ fn a_panel_asking_about_a_proxied_stream_is_told_the_run_its_reader_is_in() -> a
     // fetch again to carry on.
     let held = cached_chunk_indices(&fixture);
     let head = (64 * CHUNK - 1) / CHUNK;
-    let expected = if held.contains(&head) {
+    // The two halves meet at the reader's byte, wherever in the chunk that
+    // is, so their sum is the run's whole length and says nothing about
+    // where the byte fell -- which is what makes it checkable here.
+    let run_bytes = if held.contains(&head) {
         let start = (0..=head).rev().take_while(|c| held.contains(c)).last();
         let end = (head..).take_while(|c| held.contains(c)).last();
-        (
-            (head - start.unwrap_or(head)) * CHUNK,
-            (end.unwrap_or(head) + 1 - head) * CHUNK,
-        )
+        (end.unwrap_or(head) + 1 - start.unwrap_or(head)) * CHUNK
     } else {
-        (0, 0)
+        0
     };
     assert_eq!(
-        (window.behind_bytes, window.ahead_bytes),
-        expected,
+        window.behind_bytes + window.ahead_bytes,
+        run_bytes,
         "the halves are the run the reader is standing in, out of {held:?}"
+    );
+    assert!(
+        window.ahead_bytes <= CHUNK,
+        "a reader that has read to the end of what is held has less than a \
+         chunk in front of it: {window:?}"
     );
     assert!(
         window.behind_bytes + window.ahead_bytes <= cached_chunks(&fixture).len() as u64 * CHUNK,
