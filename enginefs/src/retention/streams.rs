@@ -965,6 +965,28 @@ impl Streams {
     /// So nothing is ever sized from this alone: a window is sized from the
     /// film's own arithmetic, which a measured rate may only lower
     /// ([`Stream::demand`]).
+    /// Where each stream on `file` has reached and how fast it is
+    /// consuming: the two halves of "how long has this one got", paired
+    /// here rather than by zipping [`Self::heads`] with [`Self::rates`],
+    /// which are two walks of one list and agree only by convention.
+    ///
+    /// `None` for a stream with no rate yet: it has read once, or it is
+    /// not reading at all. A head that consumes nothing cannot run out,
+    /// which is what makes it a different question from how many bytes sit
+    /// in front of it.
+    pub fn heads_with_rates(&self, file: usize) -> Vec<(u64, Option<u64>)> {
+        self.by_file
+            .get(&file)
+            .map(|streams| {
+                streams
+                    .streams
+                    .iter()
+                    .map(|stream| (stream.end, stream.rate))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn rates(&self, file: usize) -> Vec<Option<u64>> {
         self.by_file
             .get(&file)

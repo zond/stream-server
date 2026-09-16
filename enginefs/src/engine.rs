@@ -1668,19 +1668,46 @@ impl<H: TorrentHandle> Engine<H> {
         &self,
         file_idx: usize,
     ) -> Option<crate::retention::PolicyReading> {
+        let domain_file_idx = file_idx;
         let holding = self.retention.holding(&file_idx)?;
         let installed = holding.installed?;
-        // The entity's head as the detector last placed it, and not its
-        // last delivered byte or its newest reader's: this is the reading
-        // a client draws the behind/ahead split from. On the television
-        // the split read 50.3 MB behind and 4.2 ahead with the player at
-        // 0:00, because mpv's read of the tail had left the file's head at
-        // the end of the file; see `Holding::head`.
-        let playhead = TorrentBacking::<H>::index_of(&holding.domain, holding.head?)?;
+        // Every head reading this file, not the one the detector calls the
+        // entity's: each stream mpv opens reads this file, and the film
+        // stops for whichever of them runs out -- a subtitle track with
+        // nothing in hand stalls the demuxer exactly as the video does.
+        // [`crate::retention::PolicyReading::window`] reports the worst of
+        // them, so which head is "the" playhead stops being a guess this
+        // has to make. The detector's own head is kept as the fallback for
+        // a file no stream is registered against.
+        let heads: Vec<(u32, Option<u64>)> = {
+            let streams = self.streams.lock();
+            streams
+                .heads_with_rates(domain_file_idx)
+                .into_iter()
+                .filter_map(|(end, rate)| {
+                    // The byte last read, not the one wanted next: `end` is
+                    // exclusive, and at a piece boundary it names the piece
+                    // the stream is waiting for rather than the one it is
+                    // reading out of.
+                    let at = end.saturating_sub(1);
+                    let piece =
+                        TorrentBacking::<H>::index_of(&holding.domain, (domain_file_idx, at))?;
+                    Some((piece, rate))
+                })
+                .collect()
+        };
+        let heads = if heads.is_empty() {
+            vec![(
+                TorrentBacking::<H>::index_of(&holding.domain, holding.head?)?,
+                None,
+            )]
+        } else {
+            heads
+        };
         Some(crate::retention::PolicyReading::new(
             installed.pieces,
             holding.domain.piece_length,
-            playhead,
+            heads,
             installed.committed.len(),
         ))
     }

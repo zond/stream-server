@@ -518,6 +518,11 @@ mod tests {
             window: Some(CacheWindow {
                 behind_bytes: 1_288_490_188,
                 ahead_bytes: 356_515_840,
+                // One of each: a half measured against a head that is
+                // consuming, and a half whose head is not, which is an
+                // absence and is spelled `null` like every other here.
+                behind_seconds: Some(412.5),
+                ahead_seconds: None,
             }),
             sharing: Sharing::of(
                 Some(859_832_320),
@@ -532,7 +537,12 @@ mod tests {
         assert_eq!(
             serde_json::to_value(numbers).expect("it serializes"),
             serde_json::json!({
-                "window": { "behindBytes": 1_288_490_188u64, "aheadBytes": 356_515_840u64 },
+                "window": {
+                    "behindBytes": 1_288_490_188u64,
+                    "aheadBytes": 356_515_840u64,
+                    "behindSeconds": 412.5,
+                    "aheadSeconds": null,
+                },
                 "sharing": {
                     "committedBytes": 859_832_320u64,
                     "transfer": {

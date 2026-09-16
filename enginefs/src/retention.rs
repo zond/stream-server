@@ -213,7 +213,10 @@ pub(crate) fn playhead_piece(span: &FilePieceSpan, piece_length: u64, offset_in_
 pub struct PolicyReading {
     pieces: Range<u32>,
     piece_length: u64,
-    playhead: u32,
+    /// Every head reading this file, with what it is consuming: the piece
+    /// it stands on and its rate in bytes per second, `None` for a head
+    /// that is not consuming.
+    heads: Vec<(u32, Option<u64>)>,
     committed: usize,
 }
 
@@ -224,13 +227,13 @@ impl PolicyReading {
     pub(crate) fn new(
         pieces: Range<u32>,
         piece_length: u64,
-        playhead: u32,
+        heads: Vec<(u32, Option<u64>)>,
         committed: usize,
     ) -> Self {
         Self {
             pieces,
             piece_length,
-            playhead,
+            heads,
             committed,
         }
     }
@@ -245,29 +248,83 @@ impl PolicyReading {
         (self.committed as u64).saturating_mul(self.piece_length)
     }
 
-    /// What the store holds of this file, split at the playhead.
+    /// What the store holds around every head reading this file, as the
+    /// worst of them.
+    ///
+    /// **The run each head is standing in, not everything on its side of
+    /// the file.** Summing held pieces by which side of the playhead they
+    /// fall on counts a piece twenty gigabytes away as read-ahead: with
+    /// mpv reading the tail of a Matroska file for its cues while the film
+    /// plays, the panel read twenty seconds in hand with the very next
+    /// piece missing, and mpv's own cache at zero beside it. A player
+    /// reads in order, so what it has in hand is the unbroken run it is
+    /// inside and nothing else.
+    ///
+    /// **The lowest of the heads, because any of them stalls the film.**
+    /// Each stream mpv opens -- the video, a subtitle track, the read of
+    /// the cues -- is a reader of this one file, and a demuxer waiting on
+    /// any of them is a demuxer that is not delivering frames. Reporting
+    /// the video's window alone says the film is fed while the subtitles
+    /// it also needs are not.
+    ///
+    /// A head whose own piece is missing has no run at all, and reads
+    /// zero on both sides: that stream is waiting right now, which is the
+    /// honest answer and the one worth showing.
     ///
     /// `held` is the pieces on the disk now -- the store's own held set,
-    /// read by the caller. **Neither half is a promise**: `ahead` is
-    /// read-ahead that has arrived, not read-ahead that is planned, and a
-    /// stream that has fetched nothing yet has a window of zero rather than
-    /// the extent the policy intends to fill. The piece under the playhead
-    /// counts as ahead: it is the one a player is about to read, not one it
-    /// has passed.
-    ///
-    /// Pieces outside this file are not this policy's and are skipped --
-    /// `held` is the whole torrent's.
+    /// read by the caller -- and pieces outside this file are not this
+    /// policy's, which [`HeldSnapshot::run_containing`] bounds for us.
     pub fn window(&self, held: &HeldSnapshot) -> CacheWindow {
-        let mut window = CacheWindow::default();
-        for piece in held.in_range(self.pieces.clone()) {
-            let half = if piece < self.playhead {
-                &mut window.behind_bytes
-            } else {
-                &mut window.ahead_bytes
-            };
-            *half = half.saturating_add(self.piece_length);
+        let mut worst: Option<CacheWindow> = None;
+        for &(head, rate) in &self.heads {
+            let head = window_of_run(self.run_around(head, held), rate);
+            worst = Some(match worst {
+                Some(worst) => worst.worse_of(head),
+                None => head,
+            });
         }
-        window
+        worst.unwrap_or_default()
+    }
+
+    /// The unbroken run of held pieces `head` is standing in, split at it.
+    /// The piece under the head counts as ahead: it is the one a player is
+    /// about to read, not one it has passed.
+    fn run_around(&self, head: u32, held: &HeldSnapshot) -> Option<(u64, u64)> {
+        let run = held.run_containing(head, self.pieces.clone())?;
+        Some((
+            u64::from(head - run.start).saturating_mul(self.piece_length),
+            u64::from(run.end - head).saturating_mul(self.piece_length),
+        ))
+    }
+}
+
+/// How long `bytes` last a head consuming `rate` bytes a second.
+///
+/// `None` when the head is not consuming, which is not "no runway" but
+/// the opposite: a head that reads nothing cannot run out. mpv's read of
+/// a Matroska file's cues sits still at the tail for the whole film, and
+/// the few bytes in front of it would otherwise make it the worst-off
+/// stream on the panel forever.
+pub fn seconds_of(bytes: u64, rate: Option<u64>) -> Option<f64> {
+    match rate {
+        Some(rate) if rate > 0 => Some(bytes as f64 / rate as f64),
+        _ => None,
+    }
+}
+
+/// The run of held units `at` stands in, as a window with its seconds.
+///
+/// `unit_bytes` is a piece on the torrent side and a chunk on the proxy's,
+/// and `held` is that store's own set. `None` from `run` -- nothing held
+/// where the head stands -- is a window of zero on both sides, which is
+/// that stream waiting right now.
+pub fn window_of_run(run: Option<(u64, u64)>, rate: Option<u64>) -> CacheWindow {
+    let (behind_bytes, ahead_bytes) = run.unwrap_or((0, 0));
+    CacheWindow {
+        behind_bytes,
+        ahead_bytes,
+        behind_seconds: seconds_of(behind_bytes, rate),
+        ahead_seconds: seconds_of(ahead_bytes, rate),
     }
 }
 
@@ -283,7 +340,7 @@ impl PolicyReading {
 /// playhead in either store (`enginefs::engine::Engine`'s is `None`, the
 /// proxy's map is empty), so there is nothing to read one of these off,
 /// which is the honest answer for a process that has watched nothing yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheWindow {
     /// Bytes of the stream we hold behind the playhead: what a scan back
@@ -291,6 +348,57 @@ pub struct CacheWindow {
     pub behind_bytes: u64,
     /// Bytes we hold from the playhead on: what playback has in hand.
     pub ahead_bytes: u64,
+    /// How long the run behind lasts the head that owns it, in seconds;
+    /// `None` when that head is not consuming and so has no runway to
+    /// measure. See [`seconds_of`].
+    pub behind_seconds: Option<f64>,
+    /// The same for the run ahead: the seconds until the stream that is
+    /// worst off runs out, which is when the film next stops.
+    pub ahead_seconds: Option<f64>,
+}
+
+impl CacheWindow {
+    /// This reading and `head`'s, each half taken from whichever of the two
+    /// runs out of it first.
+    ///
+    /// The halves are chosen separately and may come from different heads:
+    /// "what stops the film next" and "how far back can this scrub" are
+    /// different questions, and the stream that answers one need not be the
+    /// stream that answers the other.
+    ///
+    /// Sooner is decided on time and not on bytes, which is the whole point
+    /// of carrying the seconds: a head that consumes nothing -- mpv's read
+    /// of a Matroska file's cues, parked at the tail for the whole film --
+    /// has a handful of bytes in front of it and all the time in the world,
+    /// and it is not the stream about to stall. Between two heads that are
+    /// both idle there is nothing to rank by but the bytes.
+    pub fn worse_of(self, head: CacheWindow) -> CacheWindow {
+        let behind = sooner(
+            (self.behind_seconds, self.behind_bytes),
+            (head.behind_seconds, head.behind_bytes),
+        );
+        let ahead = sooner(
+            (self.ahead_seconds, self.ahead_bytes),
+            (head.ahead_seconds, head.ahead_bytes),
+        );
+        CacheWindow {
+            behind_bytes: behind.1,
+            behind_seconds: behind.0,
+            ahead_bytes: ahead.1,
+            ahead_seconds: ahead.0,
+        }
+    }
+}
+
+/// Whichever of two halves runs out first. See [`CacheWindow::worse_of`].
+fn sooner(worst: (Option<f64>, u64), head: (Option<f64>, u64)) -> (Option<f64>, u64) {
+    let takes_it = match (head.0, worst.0) {
+        (Some(head), Some(worst)) => head < worst,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => head.1 < worst.1,
+    };
+    if takes_it { head } else { worst }
 }
 
 /// What one torrent stream's stores say about it right now: the cache
@@ -304,7 +412,7 @@ pub struct CacheWindow {
 /// ratio for this run and must be labelled as one; the conventional
 /// per-torrent, across-restarts ratio would need counters stored on disk,
 /// and a stored counter is a claim about a past this process never saw.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TorrentStreamNumbers {
     /// What the piece store holds of the file, split at the playhead, or
     /// `None` where there is no policy or no playhead to split at.
@@ -691,5 +799,111 @@ mod tests {
         assert!(!registry.is_registered(HASH));
         assert_eq!(unlink(&registry, HASH, vec![1], None).await, 0);
         assert!(piece.is_file());
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::{CacheWindow, seconds_of, window_of_run};
+
+    /// A head that reads nothing cannot run out, so it never becomes the
+    /// worst -- however few bytes sit in front of it.
+    ///
+    /// This is mpv's read of a Matroska file's cues: it lands at the tail,
+    /// takes what it needs and stops, and its handful of bytes would
+    /// otherwise be the number on the panel for the rest of the film.
+    #[test]
+    fn a_head_that_consumes_nothing_never_becomes_the_worst() {
+        let playing = window_of_run(Some((40_000_000, 30_000_000)), Some(3_000_000));
+        let parked = window_of_run(Some((0, 65_536)), None);
+
+        let worst = playing.worse_of(parked);
+
+        assert_eq!(
+            (worst.behind_bytes, worst.ahead_bytes),
+            (40_000_000, 30_000_000),
+            "the parked head has fewer bytes but all the time in the world"
+        );
+        assert_eq!(worst.ahead_seconds, Some(10.0));
+    }
+
+    /// Between heads that are both consuming it is time that decides, not
+    /// bytes: a fast stream with a big run can be closer to stalling than a
+    /// slow one with a small run.
+    #[test]
+    fn the_head_that_runs_out_first_is_the_one_reported() {
+        let fast = window_of_run(Some((0, 30_000_000)), Some(15_000_000));
+        let slow = window_of_run(Some((0, 4_000_000)), Some(1_000_000));
+
+        let worst = fast.worse_of(slow);
+
+        assert_eq!(
+            worst.ahead_seconds,
+            Some(2.0),
+            "the fast one, two seconds out"
+        );
+        assert_eq!(
+            worst.ahead_bytes, 30_000_000,
+            "and its bytes, not the other's"
+        );
+    }
+
+    /// The halves are answered by whichever head is worst at each, which
+    /// need not be the same head: "what stops the film next" and "how far
+    /// back can this scrub" are different questions.
+    #[test]
+    fn each_half_comes_from_whichever_head_is_worst_at_it() {
+        let video = window_of_run(Some((60_000_000, 3_000_000)), Some(3_000_000));
+        let subtitles = window_of_run(Some((1_000_000, 20_000_000)), Some(1_000_000));
+
+        let worst = video.worse_of(subtitles);
+
+        assert_eq!(
+            worst.ahead_seconds,
+            Some(1.0),
+            "the video, a second from stalling"
+        );
+        assert_eq!(worst.behind_seconds, Some(1.0), "and the subtitles behind");
+        assert_eq!(
+            (worst.behind_bytes, worst.ahead_bytes),
+            (1_000_000, 3_000_000)
+        );
+    }
+
+    /// A head standing where nothing is held has no run at all, which is
+    /// that stream waiting right now.
+    #[test]
+    fn a_head_on_a_piece_nobody_holds_reads_zero() {
+        let waiting = window_of_run(None, Some(3_000_000));
+        assert_eq!((waiting.behind_bytes, waiting.ahead_bytes), (0, 0));
+        assert_eq!(
+            waiting.ahead_seconds,
+            Some(0.0),
+            "zero seconds, not no answer"
+        );
+    }
+
+    /// Two idle heads have no time to rank by, so the smaller run is taken:
+    /// there is nothing else to go on, and it is the likelier of the two to
+    /// be the one waiting.
+    #[test]
+    fn between_two_idle_heads_the_smaller_run_is_taken() {
+        let worst =
+            window_of_run(Some((0, 9_000)), None).worse_of(window_of_run(Some((0, 4_000)), None));
+        assert_eq!(worst.ahead_bytes, 4_000);
+        assert_eq!(worst.ahead_seconds, None);
+    }
+
+    #[test]
+    fn a_rate_of_zero_is_not_a_division() {
+        assert_eq!(seconds_of(1_000, Some(0)), None);
+        assert_eq!(seconds_of(1_000, None), None);
+        assert_eq!(seconds_of(3_000, Some(1_500)), Some(2.0));
+    }
+
+    #[test]
+    fn a_window_with_no_heads_at_all_is_zero() {
+        assert_eq!(CacheWindow::default().behind_bytes, 0);
+        assert_eq!(CacheWindow::default().ahead_seconds, None);
     }
 }

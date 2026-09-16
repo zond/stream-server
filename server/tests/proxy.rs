@@ -2275,13 +2275,17 @@ fn a_stream_relayed_before_anything_has_walked_the_cache_is_still_bounded() -> a
 /// **What a playback panel is told about a proxied stream, end to end.**
 ///
 /// A client holding the URL it handed its player asks one question and gets
-/// the window round the playhead -- and it is the disk it gets, not the
-/// policy's intentions: the two halves add up to the chunk files really in
-/// the cache, counted here by walking the root. The sharing row is absent,
-/// because a proxied response is not seeded and a row of zeroes would say
-/// the opposite.
+/// the run its reader is standing in -- the disk, not the policy's
+/// intentions, and the *unbroken* part of it rather than every chunk on
+/// that side of the head. A cache reclaiming round a head leaves holes, and
+/// a player reads in order: chunks beyond a hole are not in hand, however
+/// many of them there are. The expectation here is derived from the chunk
+/// files themselves, so it says that and not a number somebody typed.
+///
+/// The sharing row is absent, because a proxied response is not seeded and
+/// a row of zeroes would say the opposite.
 #[test]
-fn a_panel_asking_about_a_proxied_stream_is_told_what_is_on_the_disk() -> anyhow::Result<()> {
+fn a_panel_asking_about_a_proxied_stream_is_told_the_run_its_reader_is_in() -> anyhow::Result<()> {
     use std::io::Read;
 
     let fixture = fixture_with(Origin::start_sized(RETENTION_ORIGIN)?)?;
@@ -2311,15 +2315,30 @@ fn a_panel_asking_about_a_proxied_stream_is_told_what_is_on_the_disk() -> anyhow
         .stream_numbers(&url)?
         .expect("this server is holding that stream");
     let window = numbers.window.expect("a bounded stream has a window");
+    // The chunk the last byte read came out of, and the unbroken run of
+    // chunk files around it -- or nothing at all, if the reclaim has since
+    // taken the head's own chunk, which is a reader that would have to
+    // fetch again to carry on.
+    let held = cached_chunk_indices(&fixture);
+    let head = (64 * CHUNK - 1) / CHUNK;
+    let expected = if held.contains(&head) {
+        let start = (0..=head).rev().take_while(|c| held.contains(c)).last();
+        let end = (head..).take_while(|c| held.contains(c)).last();
+        (
+            (head - start.unwrap_or(head)) * CHUNK,
+            (end.unwrap_or(head) + 1 - head) * CHUNK,
+        )
+    } else {
+        (0, 0)
+    };
     assert_eq!(
-        window.behind_bytes + window.ahead_bytes,
-        cached_chunks(&fixture).len() as u64 * CHUNK,
-        "the two halves are the chunk files really on the disk"
+        (window.behind_bytes, window.ahead_bytes),
+        expected,
+        "the halves are the run the reader is standing in, out of {held:?}"
     );
     assert!(
-        window.behind_bytes > 0,
-        "and a player two thirds through a film can scrub back into what it \
-         has already played: {window:?}"
+        window.behind_bytes + window.ahead_bytes <= cached_chunks(&fixture).len() as u64 * CHUNK,
+        "and never more than the cache is holding: {window:?}"
     );
     assert_eq!(
         numbers.sharing, None,

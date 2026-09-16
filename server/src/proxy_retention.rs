@@ -1137,6 +1137,21 @@ impl ProxyRetention {
         }
     }
 
+    /// Where each consumer of `dir` has reached and what it is drawing:
+    /// the two halves of how long that one has got. See
+    /// [`enginefs::retention::streams::Streams::heads_with_rates`].
+    pub(crate) fn heads_with_rates_of(&self, dir: &Path) -> Vec<(u64, Option<u64>)> {
+        self.detectors
+            .lock()
+            .ok()
+            .and_then(|detectors| {
+                detectors
+                    .get(&dir.to_path_buf())
+                    .map(|streams| streams.heads_with_rates(0))
+            })
+            .unwrap_or_default()
+    }
+
     /// Where each consumer of `dir` has reached, and how many
     /// reads took it there. What the detector has made of this entity, for
     /// a test to read; the shipped build says it in a trace line.
@@ -1232,23 +1247,65 @@ impl ProxyRetention {
         let (_, holding) = self.owner.holdings().into_iter().find(|(key, holding)| {
             &*holding.domain.target == target && holding.installed.is_some() && live.is_proxy(key)
         })?;
-        let at = holding.last_position? / CHUNK_BYTES;
         let dir = holding.domain.dir;
-        let mut window = enginefs::retention::CacheWindow::default();
         // No held set, no window: a panel shown an empty window would be
         // shown a measurement nobody made. Only the seed can fail, and a
         // seed that failed installed nothing, so the next panel asks again.
-        for index in self.held(&dir).ok()? {
-            // The chunk the playhead is in counts as ahead: it is the one a
-            // player is reading out of, not one it has passed.
-            let half = if index < at {
-                &mut window.behind_bytes
-            } else {
-                &mut window.ahead_bytes
-            };
-            *half = half.saturating_add(CHUNK_BYTES);
+        let held = self.held(&dir).ok()?;
+        // Every consumer of this entity, with what it is drawing, and the
+        // entity's own last position as the fallback for one nothing is
+        // registered against. The worst of them is the window, for the
+        // reason the torrent side gives at
+        // [`enginefs::retention::PolicyReading::window`]: a player waits on
+        // whichever of its streams runs out first, and what it holds is the
+        // unbroken run it is inside rather than every chunk on that side.
+        let heads = self.heads_with_rates_of(dir.path());
+        let heads = if heads.is_empty() {
+            vec![(holding.last_position?, None)]
+        } else {
+            heads
+        };
+        let mut worst: Option<enginefs::retention::CacheWindow> = None;
+        for (position, rate) in heads {
+            let head = enginefs::retention::window_of_run(
+                // The last byte read and not the next one wanted: a head
+                // is the end of its last read, which at a boundary is the
+                // first byte of a chunk nothing has fetched yet. Anchored
+                // there, every stream that had just finished a chunk read
+                // as holding nothing.
+                Self::run_around(&held, position.saturating_sub(1) / CHUNK_BYTES),
+                rate,
+            );
+            worst = Some(match worst {
+                Some(worst) => worst.worse_of(head),
+                None => head,
+            });
         }
-        Some(window)
+        Some(worst.unwrap_or_default())
+    }
+
+    /// The unbroken run of held chunks `at` stands in, as bytes behind and
+    /// bytes ahead, or `None` when the chunk under it is not held -- that
+    /// consumer is waiting right now.
+    ///
+    /// The chunk the head is in counts as ahead: it is the one a player is
+    /// reading out of, not one it has passed.
+    fn run_around(held: &BTreeSet<u64>, at: u64) -> Option<(u64, u64)> {
+        if !held.contains(&at) {
+            return None;
+        }
+        let mut start = at;
+        while start > 0 && held.contains(&(start - 1)) {
+            start -= 1;
+        }
+        let mut end = at.saturating_add(1);
+        while held.contains(&end) {
+            end = end.saturating_add(1);
+        }
+        Some((
+            (at - start).saturating_mul(CHUNK_BYTES),
+            (end - at).saturating_mul(CHUNK_BYTES),
+        ))
     }
 
     /// How many open bodies this cache is answering: reads that have
@@ -2336,6 +2393,7 @@ mod tests {
             Some(enginefs::retention::CacheWindow {
                 behind_bytes: CHUNK_BYTES,
                 ahead_bytes: 6 * CHUNK_BYTES,
+                ..Default::default()
             }),
             "chunk three is behind the head; the chunk under it and the five \
              after it are what playback has in hand"
@@ -3498,6 +3556,7 @@ mod tests {
                 Some(enginefs::retention::CacheWindow {
                     behind_bytes: CHUNK_BYTES,
                     ahead_bytes: 6 * CHUNK_BYTES,
+                    ..Default::default()
                 }),
                 "the seven chunks of the entity being played, split at its \
                  playhead -- and not the four the finished session left \

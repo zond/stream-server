@@ -11446,6 +11446,7 @@ mod tests {
             Some(crate::retention::CacheWindow {
                 behind_bytes: 50,
                 ahead_bytes: 25,
+                ..Default::default()
             }),
             "pieces zero and one are behind the playhead; piece two is the one \
              under it and counts as ahead; piece three is not on the disk and \
@@ -11498,6 +11499,7 @@ mod tests {
         let split = crate::retention::CacheWindow {
             behind_bytes: 0,
             ahead_bytes: 75,
+            ..Default::default()
         };
         assert_eq!(
             enginefs
@@ -11624,6 +11626,7 @@ mod tests {
             Some(crate::retention::CacheWindow {
                 behind_bytes: 25,
                 ahead_bytes: 25,
+                ..Default::default()
             }),
             "piece four is behind the playhead and piece five is under it;              the four pieces of the other episode are not this stream's to              scrub back into"
         );
@@ -13869,6 +13872,7 @@ mod tests {
                 Some(crate::retention::CacheWindow {
                     behind_bytes: 25,
                     ahead_bytes: 75,
+                    ..Default::default()
                 }),
                 Some(0)
             ),
