@@ -1,11 +1,19 @@
 # Known issues, redundancy and stale docs
 
-Verified against the tree at `5c7923c`, last checked 2026-09-14. Every
-entry here was checked against the code on that date, not carried over
-from notes: two
-items on the previous list (a standalone binary binding `0.0.0.0`, and a
-JNI embed that never reclaims) turned out to describe crates this workspace
-no longer has, which is why this file exists and the notes did not.
+Last checked 2026-09-16, against the tree at `bd48aac`. What was checked
+on that date: the **open list**, which is empty; the **standing hazards**,
+each re-run rather than re-read (`librqbit` resolves to one source in this
+repo's, rqbit's and xtremio's lock files; CI is green on every pushed
+head); and the **dependency pins**, which is how the three that were a
+major behind were found and bumped. The **Redundant** and **Stale docs**
+sections below still carry their 2026-09-14 reading and say so where it
+matters; the **Closed** entries carry the date each was closed.
+
+Every entry here was checked against the code rather than carried over
+from notes: two items on the previous list (a standalone binary binding
+`0.0.0.0`, and a JNI embed that never reclaims) turned out to describe
+crates this workspace no longer has, which is why this file exists and the
+notes did not.
 
 The workspace is two library crates, `enginefs` and `server`. There is no
 binary and no JNI crate; the only embedder is xtremio, which links `server`
@@ -89,6 +97,18 @@ order to do them in.
   it, and the fmt gate runs before clippy and the tests, so the whole Rust
   job never ran. Check `gh run list -R zond/<repo>` after pushing -- and
   note that in the forks `gh` targets upstream unless `-R` names the fork.
+* **`cargo update` cannot tell you a dependency is out of date.** It only
+  ever moves within the requirement it is given, so a workspace pinned a
+  whole major behind reports as fully up to date -- `--dry-run` printing
+  nothing means "nothing to do under these requirements", not "these are
+  the newest crates". On 2026-09-16 that hid `dirs` at 6 (7.0 out),
+  `unrar-rs` at 0.7 (0.10.5 out) and `rcgen` at 0.13 (0.14.10 out), two of
+  them runtime dependencies. The check is to read each declared
+  requirement against what crates.io lists as newest, which is a loop over
+  `https://crates.io/api/v1/crates/<name>` and the `max_stable_version`
+  field, and to do it for every workspace -- this one, xtremio's `rust/`,
+  and rqbit's.
+
 * **Never `git checkout <file>` to undo an experiment.** It restores from
   HEAD, not from the working tree, so it discards everything uncommitted in
   that file. Copy the file to the scratchpad and copy it back instead.
