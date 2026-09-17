@@ -336,7 +336,9 @@ Shipped from it, in three layers:
 - **rqbit `3cc8eef7`** -- the split depth is a runtime setting
   (`ManagedTorrent::set_deadline_pieces`) and the tracker reports the
   median completion of its pieces, first claim to last chunk, over the
-  last sixteen completed -- whole and split alike, because a piece is one
+  last sixty-four completed (sixteen until 2026-09-17 12:22, when one
+  seek's burst of fast split pieces was seen swinging it) -- whole and
+  split alike, because a piece is one
   peer's whole reservation until the split reaches it, and a median of
   split pieces alone (`8de7eacc`, superseded the same day) measured the
   mode it was sizing. The crate holds no opinion about the depth;
@@ -384,3 +386,16 @@ does not count a report while it is `Some(true)`. Traced as
 `stage=player_stalled counted=<bool>`. A seek is a new stream from the
 floor, so the same rule covers seeks server-side as well; the player's
 reset is belt and braces.
+
+## Eighth field log: the depth flapped on the arithmetic alone (2026-09-17 12:22, xtremio b0e7659)
+
+Stall counting was right end to end: `stalls=0` throughout, the open and
+two seeks reported nothing, no popup during steady playback. The depth
+ran 2-8 on the median alone -- and flapped 7-3-4-5-6-8-5-4-3 within forty
+seconds after a seek, because a sixteen-sample ring is one seek's burst of
+fast split pieces, then the slow whole pieces from deep in the window.
+Two changes: rqbit's ring is sixty-four completions, and
+`DeadlineDepth::settle` lets the depth rise at once but fall one piece a
+pass (`deadline_depth` now logs `asked` beside `depth`). Splitting is
+one-way per piece, so the flap never hurt playback; it was noise and a
+moving target for the swarm.

@@ -14,7 +14,7 @@
 //! arrived, on pieces that needed six.
 //!
 //! The backend knows how long its pieces take (the median of the last
-//! sixteen completed, whole and split alike) but not how fast the reader
+//! sixty-four completed, whole and split alike) but not how fast the reader
 //! eats them or that the player has stopped; this crate knows both, so the
 //! depth is decided here, on every pass, and applied when it changes:
 //!
@@ -40,6 +40,14 @@
 //! * **Reset per video.** The stalls are this video's: a new player on the
 //!   torrent starts the count again, since the next episode's swarm is the
 //!   same but its bitrate is not necessarily.
+//! * **Up freely, down a piece a pass.** A rising median is the signal --
+//!   pieces are taking longer and the split has to start earlier now. A
+//!   falling one can wait: the depth the backend holds shrinks by one per
+//!   pass towards what the arithmetic asks, so a median that dips for a
+//!   few passes (the fast split pieces of a seek's burst filling the ring)
+//!   does not pull the split zone out from under pieces already cut. The
+//!   field of 2026-09-17 12:22 had the depth flap 7-3-4-5-6-8-5-4-3 in
+//!   forty seconds on the arithmetic alone.
 //!
 //! Where no length has been stated there is no bitrate, so no median-derived
 //! depth and no ceiling: the floor plus the stalls stands, as the constant
@@ -88,7 +96,7 @@ pub fn depth(
 
 /// **This video's stalls, and the depth last handed down** -- what the
 /// pass keeps between two readings so it applies a depth only when it
-/// changes.
+/// changes, and lets it fall no faster than a piece a pass.
 ///
 /// One per torrent, not per file: the split depth is the torrent's (it is
 /// the piece tracker's), and a torrent plays one video at a time. Kept on
@@ -117,14 +125,20 @@ impl DeadlineDepth {
         self.stalls
     }
 
-    /// Record `depth` as what the backend now holds; `true` when it differs
-    /// from what was last recorded, which is when the caller applies it.
-    /// The first reading always applies: the backend's own default is not
-    /// this crate's to assume.
-    pub fn settle(&mut self, depth: usize) -> bool {
+    /// The depth to hand the backend given that the arithmetic asks for
+    /// `asked`: `asked` itself when it is no lower than what the backend
+    /// holds, one less than the backend holds when it is -- and `None` when
+    /// that is what the backend holds already, so the caller applies only a
+    /// change. The first reading always applies as asked: the backend's own
+    /// default is not this crate's to assume.
+    pub fn settle(&mut self, asked: usize) -> Option<usize> {
+        let depth = match self.applied {
+            Some(held) if asked < held => held - 1,
+            _ => asked,
+        };
         let changed = self.applied != Some(depth);
         self.applied = Some(depth);
-        changed
+        changed.then_some(depth)
     }
 }
 
@@ -233,8 +247,23 @@ mod tests {
         state.opened();
         assert_eq!(state.stalls(), 0);
 
-        assert!(state.settle(2), "the first reading is applied");
-        assert!(!state.settle(2), "the same depth again is not");
-        assert!(state.settle(3), "a change is");
+        assert_eq!(state.settle(2), Some(2), "the first reading is applied");
+        assert_eq!(state.settle(2), None, "the same depth again is not");
+        assert_eq!(state.settle(3), Some(3), "a change is");
+    }
+
+    /// The depth rises to whatever is asked at once and falls one piece a
+    /// pass: eight asked after three is eight; three asked after eight is
+    /// seven, then six, and a reading that asks for more on the way down
+    /// takes it.
+    #[test]
+    fn the_depth_rises_at_once_and_falls_a_piece_a_pass() {
+        let mut state = DeadlineDepth::default();
+        assert_eq!(state.settle(3), Some(3));
+        assert_eq!(state.settle(8), Some(8), "up, freely");
+        assert_eq!(state.settle(3), Some(7), "down, one");
+        assert_eq!(state.settle(3), Some(6));
+        assert_eq!(state.settle(6), None, "what it holds is what is asked");
+        assert_eq!(state.settle(9), Some(9), "and up again at once");
     }
 }

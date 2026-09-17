@@ -659,18 +659,19 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         // its pieces take; see [`crate::retention::deadline`]. Every
         // pass, applied when it changes: the median moves as pieces finish
         // and the stalls as the player reports them.
-        let depth = crate::retention::deadline::depth(
+        let asked = crate::retention::deadline::depth(
             self.handle.piece_completion_median(),
             domain.piece_length,
             asking.ceiling,
             asking.seconds,
             streams.deadline.stalls(),
         );
-        if streams.deadline.settle(depth) {
+        if let Some(depth) = streams.deadline.settle(asked) {
             self.handle.set_deadline_pieces(depth);
             crate::retention::trace::deadline_depth(
                 &self.info_hash,
                 depth,
+                asked,
                 self.handle.piece_completion_median(),
                 streams.deadline.stalls(),
             );
