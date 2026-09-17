@@ -314,3 +314,48 @@ Stalls: 3.8 s at open (piece 0 plus the tail read), then 3.0, 3.8, 1.5 and
 earlier. The 3.0 s seek had no piece wait over a second at all: what is
 left of a seek's cost is the new stream's window ramp, which zond has
 chosen to leave as it is. Nothing to fix from this log.
+
+## Sixth field log: the same film on a phone (2026-09-17, xtremio e861525)
+
+The 20 GB film that juddered on the television ran on a phone on the same
+wifi, verbose logging on: **same stalls, same shape.** The film wants
+3.57 MB/s; the swarm delivered 4.4-7.1 MB/s fetched and 2.4-6.6 MB/s
+verified, so the margin was thin and every straggler showed. The stalls
+were last-range stragglers: piece 652 took 11.8 s for one 256 KiB range
+while its other fifteen claims were long done; joins arrived, in the order
+the outpacing rule admits them, each at its joiner's own latency -- and
+splitting had begun about a second before the reader reached the piece,
+on pieces that needed six. The two split pieces at the head were the right
+mechanism at the wrong depth. Not a display or decode problem: mpv's own
+cache sat at 0.0 s while the OSD showed 20 s ahead, because the OSD's
+"ahead" was the bytes on disk in front of the video head and mpv reads
+several streams of the container (the subtitle track was the one behind).
+
+Shipped from it, in three layers:
+
+- **rqbit `8de7eacc`** -- the split depth is a runtime setting
+  (`ManagedTorrent::set_deadline_pieces`) and the tracker reports the
+  median completion of its split pieces, first claim to last chunk, over
+  the last sixteen. The crate holds no opinion about the depth; `CLAIMS.md`
+  says why ("How deep the splitting goes is the embedder's").
+- **enginefs `retention::deadline`** -- every pass sizes the depth: start at
+  `ceil(median / seconds-a-piece-plays-for)`, never under two, plus one per
+  stall the player has reported for this video, never past the stream's
+  lookahead in pieces; applied to the backend when it changes, traced as
+  `stage=deadline_depth`. `EngineFS::on_player_opened` resets the stalls,
+  `on_player_stalled` counts one; `ServerHandle::note_player_opened` and
+  `note_player_stalled` are the embedder's calls.
+- **xtremio** reports both: opened when a torrent source starts playing,
+  stalled when the buffering popup shows after the first frame.
+
+Untested in the field as of this entry. What to look for in the next log:
+`deadline_depth` lines with a `median_ms` and the depth they set; whether
+the reader still walks into pieces in flight (`piece_claims_at` probes on
+pieces inside the split depth); and whether the stall count climbs past
+one or two on a film the swarm can carry at all. The ceiling is a guard,
+not a target: a depth at the lookahead is every piece of the window split,
+which is the thing the head-only split was introduced to stop.
+
+The `hevc_mediacodec: Both surface and native_window are NULL` line in
+mpv's log is *not* the copy-path marker an earlier note took it for: it
+appears with `hwdec=mediacodec` too. The OSD's hwdec row is the check.

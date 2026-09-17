@@ -2777,6 +2777,14 @@ impl TorrentHandle for LibrqbitHandle {
             .map(|m| m.lengths().default_piece_length() as u64)
     }
 
+    fn set_deadline_pieces(&self, pieces: usize) {
+        self.handle.set_deadline_pieces(pieces);
+    }
+
+    fn deadline_completion_median(&self) -> Option<std::time::Duration> {
+        self.handle.deadline_completion_median()
+    }
+
     fn piece_claims_at(&self, file_idx: usize, offset: u64) -> Vec<crate::backend::ClaimLine> {
         let Some(metadata) = self.handle.metadata.load_full() else {
             return Vec::new();

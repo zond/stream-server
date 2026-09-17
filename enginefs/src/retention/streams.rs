@@ -723,6 +723,10 @@ impl FileStreams {
 #[derive(Debug, Default)]
 pub struct Streams {
     by_file: HashMap<usize, FileStreams>,
+    /// **How deep the backend is splitting the head of the lookahead**, and
+    /// this video's stalls that size it; see [`super::deadline`]. The
+    /// engine counts what the player reports here, the pass reads it.
+    pub deadline: super::deadline::DeadlineDepth,
     /// Reads served since the last pass, awaiting the listing of their own
     /// file to be answered against. A read carries its own timestamps, so
     /// waiting costs the answer nothing.

@@ -53,6 +53,7 @@ use std::time::Duration;
 use crate::backend::{AfterRelease, FilePieceSpan, TorrentHandle};
 use crate::piece_store::{DeleteOutcome, HeldSnapshot, StoreRegistry};
 
+pub mod deadline;
 pub mod exempt;
 pub(crate) mod ledger;
 pub mod live;

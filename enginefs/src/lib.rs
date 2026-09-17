@@ -3124,6 +3124,25 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
     }
 
+    /// **A player opened on the torrent**: what it goes on to report about
+    /// buffering is this video's, not the last one's. See
+    /// [`crate::retention::deadline`] for what the reports size.
+    pub async fn on_player_opened(&self, info_hash: &str) {
+        if let Some(engine) = self.peek_engine(info_hash).await {
+            engine.player_opened();
+        }
+    }
+
+    /// **The player showed its buffering popup after having played** --
+    /// the one signal that the pieces ahead of it were not arriving in
+    /// time, whatever the reason. Each one has the backend split one more
+    /// piece of the lookahead for the rest of this video.
+    pub async fn on_player_stalled(&self, info_hash: &str) {
+        if let Some(engine) = self.peek_engine(info_hash).await {
+            engine.player_stalled();
+        }
+    }
+
     /// [`Self::on_stream_start`] without its `PlaybackStart` reconcile, for
     /// a caller that asks the reconciler itself once its disk gate has run
     /// (`routes::stream`, through [`Self::focus_torrent`]). The gate may
@@ -4946,6 +4965,10 @@ mod tests {
 
     #[derive(Default)]
     struct FakeCounters {
+        /// Every split depth the pass has handed down, in order.
+        deadline_set: Mutex<Vec<usize>>,
+        /// What the fake reports as its median split-piece completion.
+        deadline_median: Mutex<Option<std::time::Duration>>,
         /// Every `piece_claims_at` the blocked-read probe asked, as
         /// `(file_idx, offset)`.
         claims_asked: Mutex<Vec<(usize, u64)>>,
@@ -5581,6 +5604,14 @@ mod tests {
         /// can be sized without a layout.
         fn piece_length(&self) -> Option<u64> {
             Some(self.files.first()?.length / self.pieces_per_file())
+        }
+
+        fn set_deadline_pieces(&self, pieces: usize) {
+            self.counters.deadline_set.lock().unwrap().push(pieces);
+        }
+
+        fn deadline_completion_median(&self) -> Option<std::time::Duration> {
+            *self.counters.deadline_median.lock().unwrap()
         }
 
         fn piece_claims_at(&self, file_idx: usize, offset: u64) -> Vec<crate::backend::ClaimLine> {
@@ -12417,6 +12448,68 @@ mod tests {
             Some(&(2..5)),
             "the pieces the consumer moved onto are wanted again"
         );
+    }
+
+    /// **A pass sizes how deep the backend splits the lookahead, from the
+    /// backend's median and the player's stalls, and hands it down when it
+    /// changes.** See [`crate::retention::deadline`] for the arithmetic;
+    /// this is the loop round it: the first pass applies the floor, a
+    /// stated length and a measured median move it, a stall adds one, a new
+    /// player takes the stalls back, and a pass that changes nothing says
+    /// nothing to the backend.
+    #[tokio::test]
+    async fn a_pass_hands_the_backend_the_split_depth_when_it_changes() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 200)]);
+        // Eight pieces of twenty-five bytes, and a budget that bounds the
+        // file -- a torrent nothing bounds has no policy and no pass.
+        counters.pieces_per_file.store(8, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(100));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        let _store = seeded_store(&enginefs, &engine);
+        engine.begin_retention(0).await;
+        engine.test_read_at(0, 0);
+        let handed = || counters.deadline_set.lock().unwrap().clone();
+        let pass = || async {
+            engine
+                .retain(enginefs.store_registry(), &playing(0))
+                .await
+                .expect("a pass");
+        };
+
+        pass().await;
+        assert_eq!(
+            handed(),
+            vec![crate::retention::deadline::FLOOR],
+            "nothing measured and no length stated: the floor, applied once"
+        );
+        pass().await;
+        assert_eq!(handed().len(), 1, "the same depth is not handed down again");
+
+        // Two hundred bytes over twenty seconds is ten a second: a piece
+        // plays for 2.5 s, and a six-second median needs three of them.
+        engine.told_duration(0, std::time::Duration::from_secs(20));
+        *counters.deadline_median.lock().unwrap() = Some(std::time::Duration::from_secs(6));
+        pass().await;
+        assert_eq!(handed().last(), Some(&3), "ceil(6 / 2.5)");
+
+        enginefs.on_player_stalled(TEST_HASH).await;
+        pass().await;
+        assert_eq!(handed().last(), Some(&4), "one more for the stall");
+
+        enginefs.on_player_opened(TEST_HASH).await;
+        pass().await;
+        assert_eq!(
+            handed().last(),
+            Some(&3),
+            "a new player starts its stalls from none"
+        );
+        assert_eq!(handed().len(), 4);
     }
 
     /// **A piece that arrives under the pass, outside the window, does not

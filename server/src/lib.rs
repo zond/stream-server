@@ -338,6 +338,23 @@ impl ServerHandle {
             .await;
     }
 
+    /// **Tell the server a player opened on this torrent**, so what it goes
+    /// on to say about buffering is counted for this video and not the
+    /// last; see [`enginefs::EngineFS::on_player_opened`]. Any player, any
+    /// file of the torrent: the count is the torrent's.
+    pub async fn note_player_opened(&self, info_hash: &str) {
+        self.state.engine.on_player_opened(info_hash).await;
+    }
+
+    /// **Tell the server the player is buffering after having played** --
+    /// its popup is up and the frames have stopped. The one thing a player
+    /// knows that this server cannot see; each report has the backend
+    /// split one more piece ahead of the reader for the rest of this video.
+    /// See [`enginefs::EngineFS::on_player_stalled`].
+    pub async fn note_player_stalled(&self, info_hash: &str) {
+        self.state.engine.on_player_stalled(info_hash).await;
+    }
+
     /// Whether this server is using the connection while nothing is playing
     /// -- what a client's "working in the background" indicator shows, in
     /// each direction, exactly what `routes::system::background_traffic`

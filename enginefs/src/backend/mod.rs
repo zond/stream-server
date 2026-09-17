@@ -678,6 +678,20 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     fn piece_claims_at(&self, _file_idx: usize, _offset: u64) -> Vec<ClaimLine> {
         Vec::new()
     }
+    /// **How many pieces at the head of a stream's lookahead the backend
+    /// splits** into claims a faster peer may join, and asks for before
+    /// anything deeper -- the depth [`crate::retention::deadline`] sizes
+    /// from the median below and the player's stalls. A backend without
+    /// claims has nothing to set. Applied at once to a live torrent and
+    /// kept for one that is not yet.
+    fn set_deadline_pieces(&self, _pieces: usize) {}
+    /// **How long a split piece has been taking**: the backend's median,
+    /// over the last pieces a reader waited on, from the first claim to the
+    /// last chunk. `None` for a backend without claims, a torrent not live,
+    /// or one that has finished no split piece yet.
+    fn deadline_completion_median(&self) -> Option<std::time::Duration> {
+        None
+    }
     /// Open a reader on `file_idx` at `start_offset` that asks the backend
     /// to fetch `lookahead_bytes` ahead of wherever it reads, and no more.
     ///

@@ -653,6 +653,28 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
             domain.piece_length,
             now,
         );
+        // **How deep the backend splits the head of that window**, sized
+        // from what only this side knows -- the film's rate and the
+        // player's stalls -- against what only the backend knows, how long
+        // its split pieces take; see [`crate::retention::deadline`]. Every
+        // pass, applied when it changes: the median moves as pieces finish
+        // and the stalls as the player reports them.
+        let depth = crate::retention::deadline::depth(
+            self.handle.deadline_completion_median(),
+            domain.piece_length,
+            asking.ceiling,
+            asking.seconds,
+            streams.deadline.stalls(),
+        );
+        if streams.deadline.settle(depth) {
+            self.handle.set_deadline_pieces(depth);
+            crate::retention::trace::deadline_depth(
+                &self.info_hash,
+                depth,
+                self.handle.deadline_completion_median(),
+                streams.deadline.stalls(),
+            );
+        }
         let exempt = streams.exempt(domain.file_idx, extent.end);
         // **What may not be unlinked is published here**, where the want
         // set is decided: the pass's own holdings -- every promise and
@@ -1643,6 +1665,21 @@ impl<H: TorrentHandle> Engine<H> {
     /// [`Retention::note_duration`]. What a cast can state.
     pub fn told_duration(&self, file_idx: usize, duration: std::time::Duration) {
         self.retention.note_duration(&file_idx, duration);
+    }
+
+    /// A player opened on this torrent: its stalls start from none. What
+    /// sizes how deep the backend splits the lookahead, with the film's
+    /// rate and the backend's own timing; see
+    /// [`crate::retention::deadline`]. Takes effect at the next pass.
+    pub fn player_opened(&self) {
+        self.streams.lock().deadline.opened();
+    }
+
+    /// The player showed its buffering popup after having played: one more
+    /// piece of the lookahead is split for the rest of this video. Takes
+    /// effect at the next pass.
+    pub fn player_stalled(&self) {
+        self.streams.lock().deadline.stalled();
     }
 
     /// What the retention policy says about `file_idx` right now, or `None`

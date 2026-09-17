@@ -287,6 +287,21 @@ pub fn streams_seen(seen: StreamsSeen<'_>) {
     );
 }
 
+/// The pass handed the backend a new split depth; see
+/// [`super::deadline`]. Logged on change only, so a stream that has settled
+/// says nothing.
+pub fn deadline_depth(info_hash: &str, depth: usize, median: Option<Duration>, stalls: usize) {
+    tracing::info!(
+        target: "enginefs::retention::trace",
+        info_hash = %info_hash,
+        depth,
+        median_ms = median.map(|median| median.as_millis() as u64),
+        stalls,
+        stage = "deadline_depth",
+        "how many pieces at the head of the lookahead are split"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
