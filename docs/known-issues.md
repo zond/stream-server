@@ -362,3 +362,25 @@ which is the thing the head-only split was introduced to stop.
 The `hevc_mediacodec: Both surface and native_window are NULL` line in
 mpv's log is *not* the copy-path marker an earlier note took it for: it
 appears with `hwdec=mediacodec` too. The OSD's hwdec row is the check.
+
+## Seventh field log: the stall reports in the field (2026-09-17 06:41, xtremio 3695218)
+
+The first two logs of the adaptive depth. In the first (06:26, xtremio
+3a6ac82) the open's own wait was counted as stall one -- the player's rule
+was "the position has changed", and mpv reports zero and then the resume
+point on load. Fixed in xtremio 5aa7ee2 (a tick, forward and under two
+seconds) and 3695218 (a seek resets it too; zond does not want a seek to
+deepen the split). In the second (06:41) the open reported `stalls=0`, the
+two seeks changed nothing, and the depth sat at 3 on a 1.3 s median from a
+faster swarm. One miss: a popup 1.4 s after the first frame, at the open's
+position, counted. It was the tail of the open's wait -- the viewer's
+window was 8 MB at that moment and 321 MB ten seconds later -- and the
+player cannot tell that from a stall.
+
+This side can: `Stream::filling` records whether the last grant was cut
+short by the doubling, `Streams::viewer_filling` answers it for the live
+stream that has asked for the most bytes, and `Engine::player_stalled`
+does not count a report while it is `Some(true)`. Traced as
+`stage=player_stalled counted=<bool>`. A seek is a new stream from the
+floor, so the same rule covers seeks server-side as well; the player's
+reset is belt and braces.

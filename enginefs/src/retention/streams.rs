@@ -127,6 +127,12 @@ struct Stream {
     /// never been granted. A window grows for a consumer that is
     /// consuming; see [`Stream::grant`].
     granted_for: Option<Instant>,
+    /// Whether the last grant was cut short by the doubling -- the window
+    /// is still on its way to what the rate asks for. What says a stall
+    /// reported now is the window filling and not the swarm falling short;
+    /// see [`Streams::viewer_filling`]. True until the first grant: a
+    /// stream nothing has granted has no window at all.
+    filling: bool,
     /// The last sample [`Self::sample`] admitted: what the consumer ate and
     /// the gap it took, from the previous read's return to this one's
     /// arrival. Kept raw for the trace ([`Streams::last_sample`]), so a
@@ -323,6 +329,9 @@ impl Stream {
         } else {
             self.window.saturating_mul(2)
         };
+        // Cut short by the doubling: the window has not reached what was
+        // asked, and the next pass will grow it again.
+        self.filling = ceiling < target;
         self.window = target.min(ceiling).max(floor);
         self.window
     }
@@ -562,6 +571,7 @@ impl FileStreams {
             rate: None,
             window: 0,
             granted_for: None,
+            filling: true,
             sampled: None,
         });
         Some(Rejected::Outside)
@@ -572,11 +582,18 @@ impl FileStreams {
     /// The piece this file is being consumed at; see
     /// [`Streams::busiest`].
     fn busiest(&self, piece: u64, now: Instant) -> Option<u32> {
+        self.viewer(now)
+            .map(|stream| self.geometry.at(piece, stream.end))
+    }
+
+    /// The live stream that has asked for the most bytes -- the viewer
+    /// among a file's readers, by the argument at [`Stream::eaten`]; `None`
+    /// for a file nothing live is reading.
+    fn viewer(&self, now: Instant) -> Option<&Stream> {
         self.streams
             .iter()
             .filter(|stream| !stream.dormant(now))
             .max_by_key(|stream| stream.eaten)
-            .map(|stream| self.geometry.at(piece, stream.end))
     }
 }
 
@@ -976,6 +993,27 @@ impl Streams {
     /// See [`crate::retention::owner::Consumers::at`].
     pub fn busiest(&self, file: usize, piece: u64, now: Instant) -> Option<u32> {
         self.by_file.get(&file)?.busiest(piece, now)
+    }
+
+    /// **Whether the viewer's window is still filling** -- the live stream
+    /// that has asked for the most bytes, over every file of the entity,
+    /// had its last grant cut short by the doubling ([`Stream::grant`]).
+    /// `None` for an entity nothing live is reading.
+    ///
+    /// What a stall reported by the player is read against: a window
+    /// reaches what its rate asks for in a handful of passes after an open
+    /// or a seek, and a stall inside that ramp is the window filling, not
+    /// the swarm falling short of a full one. The player cannot tell the
+    /// two apart -- both are its buffering popup after a frame -- and this
+    /// side can, so the count that deepens the split
+    /// ([`super::deadline`]) skips the ramp here rather than by a guessed
+    /// grace period there.
+    pub fn viewer_filling(&self, now: Instant) -> Option<bool> {
+        self.by_file
+            .values()
+            .filter_map(|streams| streams.viewer(now))
+            .max_by_key(|stream| stream.eaten)
+            .map(|stream| stream.filling)
     }
 
     /// What each stream on `file` has measured its consumer to be eating,
@@ -1641,6 +1679,7 @@ mod tests {
             rate: Some(rate),
             window: u64::MAX,
             granted_for: None,
+            filling: false,
             sampled: None,
         });
     }
@@ -1877,6 +1916,60 @@ mod tests {
             streams.by_file[&1].streams[0].window > 0,
             "and its own pass is what grants it"
         );
+    }
+
+    /// **A stream is filling until a grant reaches what it asked for, and
+    /// the viewer is the one whose filling the entity reports.** Nothing
+    /// granted is filling; a grant the doubling cut short is filling; a
+    /// grant that reached the target is not. Between two files the one
+    /// whose live stream has asked for the most bytes answers, and an
+    /// entity with no live stream answers nothing.
+    #[test]
+    fn the_viewers_window_is_filling_until_a_grant_reaches_its_target() {
+        let t0 = Instant::now();
+        let mut streams = Streams::default();
+        stream_on(&mut streams, 0, 0, 100, 3_500_000, t0);
+        stream_on(&mut streams, 1, 2_783, 100, 3_500_000, t0);
+        for file in [0, 1] {
+            let stream = &mut streams.by_file.get_mut(&file).unwrap().streams[0];
+            stream.window = 0;
+            stream.filling = true;
+        }
+        streams.by_file.get_mut(&0).unwrap().streams[0].eaten = 10 * PIECE;
+        assert_eq!(
+            streams.viewer_filling(t0),
+            Some(true),
+            "nothing granted yet: no window at all"
+        );
+
+        // A grant a pass, each for a fresh read: 8 MB, 16, 32 ... towards
+        // 315 MB, which the seventh reaches.
+        for pass in 1..=6u64 {
+            streams.by_file.get_mut(&0).unwrap().streams[0].seen = t0 + Duration::from_secs(pass);
+            streams.want(0, 90, u64::MAX, PIECE, t0 + Duration::from_secs(pass));
+            assert_eq!(
+                streams.viewer_filling(t0 + Duration::from_secs(pass)),
+                Some(true),
+                "pass {pass}: the doubling cut the grant short"
+            );
+        }
+        streams.by_file.get_mut(&0).unwrap().streams[0].seen = t0 + Duration::from_secs(7);
+        streams.want(0, 90, u64::MAX, PIECE, t0 + Duration::from_secs(7));
+        assert_eq!(
+            streams.viewer_filling(t0 + Duration::from_secs(7)),
+            Some(false),
+            "the grant reached what the rate asked for"
+        );
+
+        // The other file's stream, ungranted, becomes the viewer by bytes.
+        streams.by_file.get_mut(&1).unwrap().streams[0].eaten = 100 * PIECE;
+        assert_eq!(
+            streams.viewer_filling(t0 + Duration::from_secs(7)),
+            Some(true)
+        );
+
+        // Everything dormant: nothing to say.
+        assert_eq!(streams.viewer_filling(t0 + Duration::from_secs(600)), None);
     }
 
     /// **A window grows towards what the rate asks for; it never jumps to

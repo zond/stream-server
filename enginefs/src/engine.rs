@@ -1675,11 +1675,26 @@ impl<H: TorrentHandle> Engine<H> {
         self.streams.lock().deadline.opened();
     }
 
-    /// The player showed its buffering popup after having played: one more
-    /// piece of the lookahead is split for the rest of this video. Takes
-    /// effect at the next pass.
-    pub fn player_stalled(&self) {
-        self.streams.lock().deadline.stalled();
+    /// The player showed its buffering popup while playing: one more piece
+    /// of the lookahead is split for the rest of this video, at the next
+    /// pass -- unless the viewer's window is still filling
+    /// ([`crate::retention::streams::Streams::viewer_filling`]). In the
+    /// seconds after an open or a seek the window is on its way to what
+    /// the rate asks for, a doubling a pass, and a popup then is that ramp
+    /// and not the swarm falling short of a full window: the field log of
+    /// 2026-09-17 06:41 had one 1.4 s after the first frame, counted, on a
+    /// window of 8 MB that was 321 MB ten seconds later.
+    pub fn player_stalled(&self, now: Instant) {
+        let mut streams = self.streams.lock();
+        let filling = streams.viewer_filling(now) == Some(true);
+        if !filling {
+            streams.deadline.stalled();
+        }
+        crate::retention::trace::player_stalled(
+            &self.info_hash,
+            !filling,
+            streams.deadline.stalls(),
+        );
     }
 
     /// What the retention policy says about `file_idx` right now, or `None`

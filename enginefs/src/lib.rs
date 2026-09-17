@@ -3139,7 +3139,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// piece of the lookahead for the rest of this video.
     pub async fn on_player_stalled(&self, info_hash: &str) {
         if let Some(engine) = self.peek_engine(info_hash).await {
-            engine.player_stalled();
+            engine.player_stalled(std::time::Instant::now());
         }
     }
 
@@ -12454,9 +12454,10 @@ mod tests {
     /// backend's median and the player's stalls, and hands it down when it
     /// changes.** See [`crate::retention::deadline`] for the arithmetic;
     /// this is the loop round it: the first pass applies the floor, a
-    /// stated length and a measured median move it, a stall adds one, a new
-    /// player takes the stalls back, and a pass that changes nothing says
-    /// nothing to the backend.
+    /// measured median moves it, a stall adds one -- but not a stall while
+    /// the viewer's window is still filling, which is the ramp after an
+    /// open and not the swarm -- a new player takes the stalls back, and a
+    /// pass that changes nothing says nothing to the backend.
     #[tokio::test]
     async fn a_pass_hands_the_backend_the_split_depth_when_it_changes() {
         let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 200)]);
@@ -12471,8 +12472,12 @@ mod tests {
         let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
-        let _store = seeded_store(&enginefs, &engine);
+        let store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
+        // Two hundred bytes over twenty seconds is ten a second: a piece
+        // plays for 2.5 s. The window a viewer asks for is the budget's
+        // hundred bytes, from a floor of fifty: two grants to fill.
+        engine.told_duration(0, std::time::Duration::from_secs(20));
         engine.test_read_at(0, 0);
         let handed = || counters.deadline_set.lock().unwrap().clone();
         let pass = || async {
@@ -12486,21 +12491,33 @@ mod tests {
         assert_eq!(
             handed(),
             vec![crate::retention::deadline::FLOOR],
-            "nothing measured and no length stated: the floor, applied once"
+            "nothing measured yet: the floor, applied once"
         );
-        pass().await;
-        assert_eq!(handed().len(), 1, "the same depth is not handed down again");
 
-        // Two hundred bytes over twenty seconds is ten a second: a piece
-        // plays for 2.5 s, and a six-second median needs three of them.
-        engine.told_duration(0, std::time::Duration::from_secs(20));
+        // A stall while the window is still filling is the ramp after the
+        // open, and is not counted. The viewer reads on into pieces that
+        // have arrived -- a read into a piece not held starts a stream of
+        // its own -- so the next pass grants it again.
+        enginefs.on_player_stalled(TEST_HASH).await;
+        for piece in [1u32, 2] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        store.init_for_tests().unwrap();
+        engine.test_read_at(0, 25);
+        pass().await;
+        assert_eq!(
+            handed().len(),
+            1,
+            "the ramp's stall changed nothing, and an unchanged depth is not handed down again"
+        );
+
+        // The window reached what was asked in that pass; the next stall
+        // is the swarm's and counts. A six-second median needs three
+        // pieces, plus the one for the stall.
+        enginefs.on_player_stalled(TEST_HASH).await;
         *counters.deadline_median.lock().unwrap() = Some(std::time::Duration::from_secs(6));
         pass().await;
-        assert_eq!(handed().last(), Some(&3), "ceil(6 / 2.5)");
-
-        enginefs.on_player_stalled(TEST_HASH).await;
-        pass().await;
-        assert_eq!(handed().last(), Some(&4), "one more for the stall");
+        assert_eq!(handed().last(), Some(&4), "ceil(6 / 2.5) + 1 stall");
 
         enginefs.on_player_opened(TEST_HASH).await;
         pass().await;
@@ -12509,7 +12526,7 @@ mod tests {
             Some(&3),
             "a new player starts its stalls from none"
         );
-        assert_eq!(handed().len(), 4);
+        assert_eq!(handed().len(), 3);
     }
 
     /// **A piece that arrives under the pass, outside the window, does not

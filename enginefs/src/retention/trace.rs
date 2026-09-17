@@ -302,6 +302,21 @@ pub fn deadline_depth(info_hash: &str, depth: usize, median: Option<Duration>, s
     );
 }
 
+/// The player reported buffering while playing; `counted` says whether it
+/// went into the stalls that deepen the split, or was read as the viewer's
+/// window still filling after an open or a seek. See
+/// [`crate::engine::Engine::player_stalled`].
+pub fn player_stalled(info_hash: &str, counted: bool, stalls: usize) {
+    tracing::info!(
+        target: "enginefs::retention::trace",
+        info_hash = %info_hash,
+        counted,
+        stalls,
+        stage = "player_stalled",
+        "the player said it was buffering"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
