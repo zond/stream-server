@@ -399,3 +399,21 @@ Two changes: rqbit's ring is sixty-four completions, and
 pass (`deadline_depth` now logs `asked` beside `depth`). Splitting is
 one-way per piece, so the flap never hurt playback; it was noise and a
 moving target for the swarm.
+
+## Ninth field log: a refused peer slept through its moment (2026-09-17 14:55, xtremio 42dcb0f)
+
+Smoothing held: one `deadline_depth` line after the open (`depth=3
+asked=3`), none after; `stalls=0`, the open and the seek reported nothing.
+The open cost 22.9 s: 12.5 s on piece 0 with no peers connected for ten of
+them (cold start; discovery, not scheduling), then 6.5 s on tail piece
+5565 whose last claim sat with a holder of 6.9 s round trip while a 489 ms
+peer, nine claims of that piece already delivered, was refused at ~400 ms
+of the claim's age, had nothing in flight, and slept the request loop's
+flat five seconds. rqbit `d1376b40` replaces the five seconds: every
+time-based refusal names the instant it would be lifted (`retry_at`), the
+loop also wakes on `new_pieces_notify`, on the peer's own Have, and on
+shares put in a pool (a split reservation or a cut at the head, which
+pulsed nothing before), and a thirty-second backstop logs at info when it
+fires -- a line that in a field log means a wake-up is missing. CLAIMS.md,
+"When a refused peer asks again". The ten seconds of zero peers at open
+remain: peer discovery latency at cold start, a different problem.
