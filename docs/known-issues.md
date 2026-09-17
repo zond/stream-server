@@ -409,7 +409,7 @@ them (cold start; discovery, not scheduling), then 6.5 s on tail piece
 5565 whose last claim sat with a holder of 6.9 s round trip while a 489 ms
 peer, nine claims of that piece already delivered, was refused at ~400 ms
 of the claim's age, had nothing in flight, and slept the request loop's
-flat five seconds. rqbit `d1376b40` replaces the five seconds: every
+flat five seconds. rqbit `4110d894` replaces the five seconds: every
 time-based refusal names the instant it would be lifted (`retry_at`), the
 loop also wakes on `new_pieces_notify`, on the peer's own Have, and on
 shares put in a pool (a split reservation or a cut at the head, which
