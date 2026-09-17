@@ -656,11 +656,11 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         // **How deep the backend splits the head of that window**, sized
         // from what only this side knows -- the film's rate and the
         // player's stalls -- against what only the backend knows, how long
-        // its split pieces take; see [`crate::retention::deadline`]. Every
+        // its pieces take; see [`crate::retention::deadline`]. Every
         // pass, applied when it changes: the median moves as pieces finish
         // and the stalls as the player reports them.
         let depth = crate::retention::deadline::depth(
-            self.handle.deadline_completion_median(),
+            self.handle.piece_completion_median(),
             domain.piece_length,
             asking.ceiling,
             asking.seconds,
@@ -671,7 +671,7 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
             crate::retention::trace::deadline_depth(
                 &self.info_hash,
                 depth,
-                self.handle.deadline_completion_median(),
+                self.handle.piece_completion_median(),
                 streams.deadline.stalls(),
             );
         }

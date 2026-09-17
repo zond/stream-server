@@ -685,11 +685,14 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     /// claims has nothing to set. Applied at once to a live torrent and
     /// kept for one that is not yet.
     fn set_deadline_pieces(&self, _pieces: usize) {}
-    /// **How long a split piece has been taking**: the backend's median,
-    /// over the last pieces a reader waited on, from the first claim to the
-    /// last chunk. `None` for a backend without claims, a torrent not live,
-    /// or one that has finished no split piece yet.
-    fn deadline_completion_median(&self) -> Option<std::time::Duration> {
+    /// **How long a piece has been taking**: the backend's median over the
+    /// last pieces completed, whole and split alike, from the first claim
+    /// to the last chunk. Whole pieces are most of the sample and the
+    /// point of it -- a piece is one peer's whole reservation until the
+    /// split reaches it, so theirs is the time the split has to start
+    /// ahead of. `None` for a backend without claims, a torrent not live,
+    /// or one that has finished no piece yet.
+    fn piece_completion_median(&self) -> Option<std::time::Duration> {
         None
     }
     /// Open a reader on `file_idx` at `start_offset` that asks the backend

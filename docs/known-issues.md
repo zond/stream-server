@@ -333,11 +333,14 @@ several streams of the container (the subtitle track was the one behind).
 
 Shipped from it, in three layers:
 
-- **rqbit `8de7eacc`** -- the split depth is a runtime setting
+- **rqbit `3cc8eef7`** -- the split depth is a runtime setting
   (`ManagedTorrent::set_deadline_pieces`) and the tracker reports the
-  median completion of its split pieces, first claim to last chunk, over
-  the last sixteen. The crate holds no opinion about the depth; `CLAIMS.md`
-  says why ("How deep the splitting goes is the embedder's").
+  median completion of its pieces, first claim to last chunk, over the
+  last sixteen completed -- whole and split alike, because a piece is one
+  peer's whole reservation until the split reaches it, and a median of
+  split pieces alone (`8de7eacc`, superseded the same day) measured the
+  mode it was sizing. The crate holds no opinion about the depth;
+  `CLAIMS.md` says why ("How deep the splitting goes is the embedder's").
 - **enginefs `retention::deadline`** -- every pass sizes the depth: start at
   `ceil(median / seconds-a-piece-plays-for)`, never under two, plus one per
   stall the player has reported for this video, never past the stream's

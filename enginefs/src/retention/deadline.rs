@@ -13,16 +13,21 @@
 //! slowest claim. Splitting had begun about a second before the reader
 //! arrived, on pieces that needed six.
 //!
-//! The backend knows how long its split pieces take (the median of the last
-//! sixteen) but not how fast the reader eats them or that the player has
-//! stopped; this crate knows both, so the depth is decided here, on every
-//! pass, and applied when it changes:
+//! The backend knows how long its pieces take (the median of the last
+//! sixteen completed, whole and split alike) but not how fast the reader
+//! eats them or that the player has stopped; this crate knows both, so the
+//! depth is decided here, on every pass, and applied when it changes:
 //!
-//! * **Start at the median.** A split piece takes the median to arrive; the
+//! * **Start at the median.** A piece takes the median to arrive; the
 //!   reader plays a piece in `piece_length / bitrate` seconds; so the split
 //!   has to begin `ceil(median / seconds_per_piece)` pieces ahead for the
 //!   piece to be whole when the reader gets there. Never fewer than
-//!   [`FLOOR`], which is what the constant was.
+//!   [`FLOOR`], which is what the constant was. The median is of every
+//!   piece on purpose: until the split reaches it a piece is one peer's
+//!   whole reservation, so what whole pieces take is the time to cover,
+//!   and a median of split pieces alone -- several peers filling each at
+//!   once -- measured the mode it was sizing and shrank the depth back to
+//!   a second before the reader.
 //! * **One more per stall.** The player says when it has shown its
 //!   buffering popup after having played -- the one signal that the
 //!   arithmetic above was not enough, whatever the reason. Each such stall
@@ -49,8 +54,8 @@ pub const FLOOR: usize = 2;
 /// **How many pieces at the head of the lookahead to split**, from what a
 /// pass knows.
 ///
-/// `median` is the backend's median completion of a split piece, `None`
-/// before it has finished any; `bitrate` the film's own, `None` before a
+/// `median` is the backend's median completion of a piece, `None` before
+/// it has finished any; `bitrate` the film's own, `None` before a
 /// player has stated a length; `lookahead_seconds` the seconds of film the
 /// viewer's buffer profile buys; `stalls` how many times this video's
 /// player has reported buffering after having played. Never zero.

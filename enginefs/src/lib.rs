@@ -4967,7 +4967,7 @@ mod tests {
     struct FakeCounters {
         /// Every split depth the pass has handed down, in order.
         deadline_set: Mutex<Vec<usize>>,
-        /// What the fake reports as its median split-piece completion.
+        /// What the fake reports as its median piece completion.
         deadline_median: Mutex<Option<std::time::Duration>>,
         /// Every `piece_claims_at` the blocked-read probe asked, as
         /// `(file_idx, offset)`.
@@ -5610,7 +5610,7 @@ mod tests {
             self.counters.deadline_set.lock().unwrap().push(pieces);
         }
 
-        fn deadline_completion_median(&self) -> Option<std::time::Duration> {
+        fn piece_completion_median(&self) -> Option<std::time::Duration> {
             *self.counters.deadline_median.lock().unwrap()
         }
 
