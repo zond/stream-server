@@ -164,6 +164,9 @@ pub(super) struct Inner {
     /// still holds -- see [`Self::open_for_write`]. Never reset; a field log
     /// reads the number, not the rate.
     staged_over_held: AtomicU64,
+    /// The pieces a short staged copy has already been reported passed over
+    /// for, so the log says it once per piece rather than once per read.
+    shadows_reported: Mutex<BTreeSet<u32>>,
     /// Which pieces are complete on disk -- see the type doc. Not advisory:
     /// a bit is set only after the rename that made the piece ours and
     /// cleared only by an unlink that removed it, so a reader of this set
@@ -481,6 +484,7 @@ impl PieceStore {
                 removed_files: Mutex::new(BTreeSet::new()),
                 staged: Mutex::new(BTreeSet::new()),
                 staged_over_held: AtomicU64::new(0),
+                shadows_reported: Mutex::new(BTreeSet::new()),
                 held,
                 seeded: AtomicBool::new(false),
                 checking: AtomicBool::new(false),
@@ -908,6 +912,17 @@ impl Inner {
 
     /// Drop every cached handle of a piece: its files are about to be
     /// renamed, deleted or shadowed.
+    /// The staged copy's length when it is a shadow -- shorter than its
+    /// piece while the store holds the piece -- and `None` when it is the
+    /// copy to read. See [`Self::open_for_read`].
+    fn shadowing(&self, piece: u32, staged: &File) -> Option<u64> {
+        if !self.held.holds(piece) {
+            return None;
+        }
+        let len = staged.metadata().ok()?.len();
+        (len < self.layout.piece_length_of(piece)).then_some(len)
+    }
+
     fn forget_handles(&self, piece: u32) {
         self.handles.forget(u64::from(piece));
     }
@@ -1065,25 +1080,72 @@ impl Inner {
     /// its "yes" is still checked against the filesystem and falls through;
     /// only its "no" is trusted, and a wrong "no" would need a staged file
     /// this process neither wrote nor saw at `init`, which nothing makes.
+    ///
+    /// **Except a staged copy that is shorter than its piece while the
+    /// store holds the piece.** That is not a re-download, it is a shadow:
+    /// a backend wrote a few chunks into a piece that was already finished
+    /// (see `open_for_write` and `staged_over_held`), and served from it
+    /// every read hits EOF past those chunks or zeros between them. Field
+    /// log 2026-09-19, piece 4342: minutes of `reading 262144 bytes at N of
+    /// piece 4342` after the piece had been read whole. A legitimate
+    /// re-download of a held piece -- one the initial check rejected, whose
+    /// held bit was seeded from the disk before the check ran -- is only
+    /// read by its own hash check, which runs once every chunk is written
+    /// and so finds it full length. So a short staged copy of a held piece
+    /// is passed over for the complete one, which is opened without being
+    /// cached: if the staged copy does go on to complete, its rename must
+    /// not be answered by a handle to the file it replaced.
     fn open_for_read(&self, piece: u32) -> anyhow::Result<Arc<File>> {
         let index = u64::from(piece);
         if self.staged.lock().contains(&piece) {
-            if let Some(file) = self.handles.get(index, true) {
-                return Ok(file);
-            }
-            match self.chunks.open_staged(index) {
-                Ok(Some(f)) => {
-                    self.count_open();
-                    let file = Arc::new(f);
-                    self.handles.remember(index, true, &file);
-                    return Ok(file);
-                }
-                Ok(None) => self.count_staging_probe(),
-                Err(e) => {
-                    return Err(anyhow::Error::new(e).context(format!(
-                        "could not open staged piece {}",
-                        self.staging_path(piece).display()
-                    )));
+            let staged = match self.handles.get(index, true) {
+                Some(file) => Some(file),
+                None => match self.chunks.open_staged(index) {
+                    Ok(Some(f)) => {
+                        self.count_open();
+                        let file = Arc::new(f);
+                        self.handles.remember(index, true, &file);
+                        Some(file)
+                    }
+                    Ok(None) => {
+                        self.count_staging_probe();
+                        None
+                    }
+                    Err(e) => {
+                        return Err(anyhow::Error::new(e).context(format!(
+                            "could not open staged piece {}",
+                            self.staging_path(piece).display()
+                        )));
+                    }
+                },
+            };
+            if let Some(file) = staged {
+                match self.shadowing(piece, &file) {
+                    None => return Ok(file),
+                    Some(staged_len) => match self.chunks.open_complete(index) {
+                        Ok(f) => {
+                            self.count_open();
+                            if self.shadows_reported.lock().insert(piece) {
+                                tracing::warn!(
+                                    piece,
+                                    staged_len,
+                                    piece_len = self.layout.piece_length_of(piece),
+                                    stage = "staged_shadow_bypassed",
+                                    "a short staged copy over a held piece; reading the complete copy"
+                                );
+                            }
+                            return Ok(Arc::new(f));
+                        }
+                        // No complete copy after all: the staged one is
+                        // all there is, whatever its length.
+                        Err(ChunkError::Missing { .. }) => return Ok(file),
+                        Err(e) => {
+                            return Err(anyhow::Error::new(e).context(format!(
+                                "could not open piece file {}",
+                                self.piece_path(piece).display()
+                            )));
+                        }
+                    },
                 }
             }
         }
@@ -3513,6 +3575,57 @@ mod tests {
             store.staged_over_held(),
             1,
             "a staged copy opened over a piece the store holds"
+        );
+    }
+
+    /// **A short staged copy over a held piece is passed over for reads.**
+    ///
+    /// A backend that writes a chunk into a finished piece opens a staged
+    /// copy over it, and before this every read of that piece was served
+    /// the staged copy: EOF past its bytes, zeros between them. Field log
+    /// 2026-09-19, piece 4342. The complete copy is the one to read.
+    #[test]
+    fn a_short_staged_copy_over_a_held_piece_is_not_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        let global = global_bytes(store.layout().total_length());
+        fill(&store, &global, 8);
+        assert!(store.has_piece(0));
+
+        // One byte lands in piece 0 after it was finished.
+        store.pwrite_all(0, 0, &[7u8]).unwrap();
+        assert_eq!(store.staged_over_held(), 1);
+
+        let mut read = vec![0u8; PIECE_LENGTH as usize];
+        store
+            .pread_exact(0, 0, &mut read)
+            .expect("the whole piece reads, from the complete copy");
+        assert_eq!(
+            read,
+            global[..PIECE_LENGTH as usize],
+            "the complete copy's bytes"
+        );
+    }
+
+    /// **A full-length staged copy of a held piece is the one read.** The
+    /// legitimate case: a held piece the initial check rejected, fetched
+    /// again whole -- its own hash check has to read the new bytes, not
+    /// the rejected ones.
+    #[test]
+    fn a_full_staged_copy_of_a_held_piece_is_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        let global = global_bytes(store.layout().total_length());
+        fill(&store, &global, 8);
+
+        let fresh = vec![9u8; PIECE_LENGTH as usize];
+        store.pwrite_all(0, 0, &fresh).unwrap();
+
+        let mut read = vec![0u8; PIECE_LENGTH as usize];
+        store.pread_exact(0, 0, &mut read).unwrap();
+        assert_eq!(
+            read, fresh,
+            "the re-downloaded bytes, which the check must see"
         );
     }
 
