@@ -744,14 +744,22 @@ pub struct HotFilePriorityPlan {
     pub bitrate_bytes_per_sec: Option<u64>,
 }
 
+/// What a backend can say about the memory it is using.
+///
+/// **Every field of it is zero today**: the librqbit backend answers
+/// `default()`, and nothing in this workspace calls
+/// `BackendEngineFS::diagnostics_snapshot`, which is the only thing that
+/// asks for one. Two fields named the deleted Rust piece cache
+/// (`rust_piece_cache_entries`, `rust_piece_cache_bytes`) and went with it;
+/// the rest are kept for the backend that fills them, and
+/// `docs/known-issues.md` says so rather than leaving a reader to find out
+/// from a field that is always zero.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct BackendMemoryDiagnostics {
     pub native_storage_bytes: u64,
     pub native_storage_pieces: u64,
     pub native_total_read_bytes: u64,
     pub native_total_write_bytes: u64,
-    pub rust_piece_cache_entries: u64,
-    pub rust_piece_cache_bytes: u64,
     pub waiter_keys: u64,
     pub waiter_wakers: u64,
     pub torrents: Vec<TorrentMemoryDiagnostics>,

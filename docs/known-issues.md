@@ -37,9 +37,20 @@ Sync` on a future it wrapped), `piece_cache.rs` (`PieceCacheManager`) and
 field no constructor filled), together about 650 lines. They went with
 `Engine::data_cache` -- a 64 MB moka cache built per engine that nothing
 ever read or wrote -- and the `moka` dependency that existed for them.
-`BackendMemoryDiagnostics::rust_piece_cache_{entries,bytes}` outlives them
-as two fields that are always zero; they are part of a serialized
-diagnostics shape, so they wait for whoever next changes it.
+`BackendMemoryDiagnostics::rust_piece_cache_{entries,bytes}` named that
+cache and went with it: nothing in this workspace and nothing in xtremio
+reads the shape (`grep` over `xtremio/lib` and `xtremio/rust/src` on
+2026-09-19 found neither the fields nor the struct), so no app change was
+needed for it.
+
+What is left of that struct is still worth knowing: **every remaining
+field of it is also always zero**, because `LibrqbitBackend::memory_diagnostics`
+answers `BackendMemoryDiagnostics::default()` and the only
+caller of `BackendEngineFS::diagnostics_snapshot` is nobody -- no route,
+no `ServerHandle` method, no test. It is either a backend's job that was
+never finished or a shape to delete with `diagnostics_snapshot`; it is
+named here rather than quietly kept, and deleting a public API is the
+owner's call.
 
 ### Smaller
 
