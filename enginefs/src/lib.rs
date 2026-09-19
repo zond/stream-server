@@ -11,13 +11,10 @@ use tokio::task::AbortHandle;
 use tracing::debug;
 
 pub mod backend;
-pub mod cache;
 pub mod chunk_store;
-pub mod disk_cache;
 pub mod engine;
 pub mod files;
 pub mod http_client;
-pub mod piece_cache;
 pub mod piece_store;
 pub mod reconcile;
 pub mod retention;
@@ -637,11 +634,6 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     /// wanted at a time. Single-file torrents bypass this selector.
     active_multifile_files: Arc<RwLock<HashMap<String, MultiFileActiveSelection>>>,
     priority_generation: Arc<AtomicU64>,
-    /// Optional disk cache for persisting completed files. No constructor
-    /// populates it in the librqbit-only build, and nothing reads it either,
-    /// so it is dead code today; kept for a future backend that wants it.
-    #[allow(dead_code)]
-    disk_cache: Option<Arc<disk_cache::DiskCacheManager>>,
     /// The user's sharing setting: with it on this server uploads all the
     /// time, and with it off only while a player is reading from it. See
     /// [`Self::apply_upload_switch`].
@@ -1124,7 +1116,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             live: live.clone(),
             active_multifile_files: Arc::new(RwLock::new(HashMap::new())),
             priority_generation: Arc::new(AtomicU64::new(0)),
-            disk_cache: None,
             seeding_enabled: Arc::new(AtomicBool::new(true)),
             upload_switch: Arc::new(tokio::sync::Mutex::new(())),
             magnet_adds: Arc::new(RwLock::new(HashMap::new())),
@@ -4045,9 +4036,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// **That precondition is checked here rather than assumed.** The
     /// caller reached this path because the *registry* had no engine, and
     /// the registry is not the session: [`Self::remove_engine`] drops an
-    /// entry and leaves the torrent running (the TUI's delete key does
-    /// exactly that, and so does the idle sweep for the moment between
-    /// dropping the entry and telling the backend), and a magnet add
+    /// entry and leaves the torrent running ([`Self::remove_engine`] is
+    /// what a caller that wants the engine forgotten and the torrent kept
+    /// uses; the idle sweep does both halves, but under the
+    /// [`RemovalGate`], so no add of that hash runs between them), and a
+    /// magnet add
     /// parks the hash outside both for as long as metadata takes. Unlinking
     /// the directory in either case is the corruption this layer exists to
     /// avoid: the torrent goes on believing it holds those pieces,
@@ -17019,10 +17012,10 @@ mod tests {
     }
 
     /// The registry is not the session. `remove_engine` drops the registry
-    /// entry and leaves the torrent running in the backend -- it is what
-    /// the TUI's delete key does, and the idle sweep's own first step --
-    /// so an unpin arriving afterwards finds no engine while the torrent is
-    /// very much alive. Nothing was pinned and nothing may be deleted: the
+    /// entry and leaves the torrent running in the backend -- the idle
+    /// sweep's own first step, and whatever else wants the engine forgotten
+    /// and the torrent kept -- so an unpin arriving afterwards finds no
+    /// engine while the torrent is very much alive. Nothing was pinned and nothing may be deleted: the
     /// bytes in the store belong to a torrent this call has no engine to
     /// reach, and unlinking them by hand is exactly the have-set desync
     /// `delete_download_data` holds a claim across the unlink to avoid.

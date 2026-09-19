@@ -2,7 +2,6 @@ use crate::backend::{
     EngineStats, FilePieceSpan, TorrentHandle,
     priorities::{self, BufferProfile, Fetching},
 };
-use crate::cache::DataCache;
 use crate::piece_store::{HeldSnapshot, RetentionPolicy, Share, StoreRegistry};
 use crate::retention::live::{Live, Reading};
 use crate::retention::owner::{Backing, Door, Install, Mode, Retention, Trigger};
@@ -1199,7 +1198,6 @@ pub struct Engine<H: TorrentHandle> {
     /// half of why nothing else reads it.
     pub last_accessed: AtomicU64,
     pub active_streams: Arc<AtomicUsize>,
-    pub data_cache: DataCache,
     /// Whether this process has re-applied its want-set to this torrent
     /// ([`crate::reconcile::Conditions::settled`]).
     ///
@@ -1381,10 +1379,6 @@ impl<H: TorrentHandle> Engine<H> {
             clock,
             last_accessed: AtomicU64::new(clock.now_secs()),
             active_streams: Arc::new(AtomicUsize::new(0)),
-            data_cache: moka::future::Cache::builder()
-                .weigher(|_key, value: &Arc<Vec<u8>>| value.len() as u32)
-                .max_capacity(64 * 1024 * 1024) // 64MB cache per engine
-                .build(),
             settled: AtomicBool::new(true),
             last_transition_at: AtomicU64::new(NEVER_MOVED),
             pinned_files,
