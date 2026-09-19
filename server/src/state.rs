@@ -27,6 +27,11 @@ pub struct AppState {
     /// Archive sessions, swept when idle (see `crate::archives::sessions`);
     /// a swept session's downloaded archive goes with it.
     pub archive_cache: crate::archives::sessions::Sessions<crate::archives::ArchiveSession>,
+    /// The archives being read out of torrents right now, swept when idle
+    /// (see `crate::archives::torrent`). The `torrent:` form of the stream
+    /// route has no `/create` and so no session of its own; this is what
+    /// owns one member's extraction across the requests that read it.
+    pub torrent_archives: crate::archives::torrent::TorrentArchives,
     /// What `GET /casting` answers with. Always empty: the SSDP discovery
     /// loop that filled it went with the daemon, and nothing could be cast
     /// to an entry anyway (see `crate::devices`).
@@ -107,6 +112,9 @@ impl AppState {
             http_addr: SocketAddr::from(([127, 0, 0, 1], 11470)),
             auth_token: None,
             archive_cache: crate::archives::sessions::Sessions::new(
+                crate::archives::SESSION_IDLE_TIMEOUT,
+            ),
+            torrent_archives: crate::archives::torrent::TorrentArchives::new(
                 crate::archives::SESSION_IDLE_TIMEOUT,
             ),
             devices: Arc::new(RwLock::new(Vec::new())),

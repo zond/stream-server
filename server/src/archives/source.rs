@@ -21,10 +21,90 @@ use super::cache::ProgressiveCache;
 use super::{ArchiveReader, AsyncSeekableReader, CacheConfig, OpenedMember};
 use anyhow::Result;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
+
+/// The extractions an archive's owner keeps: one per member, for as long as
+/// the owner lives.
+///
+/// Every HTTP request used to be its own extraction: the handler decoded the
+/// whole member into a fresh scratch file per `open_file`, so a player's
+/// ordinary opening -- the head, then the tail for its index, then one
+/// request per seek -- ran that many decodings at once and put that many
+/// copies of the member on disk, for minutes of a slow SoC and several times
+/// the member in flash. Here the first request's extraction is kept and
+/// every later request takes a reader from it, whether it is still being
+/// written or finished.
+///
+/// The one implementation for both owners: [`ArchiveSource`], which owns an
+/// archive on disk, and `super::torrent::TorrentArchive`, which owns one
+/// inside a torrent. What differs between them is only where the archive is
+/// read from, which is the `open_archive` argument.
+#[derive(Default)]
+pub struct MemberCaches {
+    /// Held for the life of the owner, so the extraction files are too: each
+    /// cache is the one owner of its file's name, so dropping the last owner
+    /// unlinks every extraction at once, whether or not an extraction task
+    /// is still running -- one that is writes on into a file with no name
+    /// until it sees nobody is reading (`cache::ABANDONED_AFTER`) and gives
+    /// up, and those bytes are reclaimed when it does. The mutex is held
+    /// across an open so two requests racing for a member that is not there
+    /// yet start one extraction, not two.
+    members: Mutex<HashMap<String, ProgressiveCache>>,
+}
+
+impl MemberCaches {
+    /// A reader over `member`, from the one extraction of it kept here --
+    /// opening the archive through `open_archive` only when there is none to
+    /// read from. A member the format serves without decoding comes straight
+    /// back and nothing is kept: there is no extraction to repeat.
+    ///
+    /// Two things replace an entry. A cache that has failed -- decoding
+    /// failed, or nothing read it for long enough that the writer gave up
+    /// (`cache::ABANDONED_AFTER`) -- would only tell a new reader so, and is
+    /// extracted again. And a cache whose file is gone: the file is a
+    /// scratch file under the cache root that a reader opens by path, so
+    /// anything that unlinks it -- a session sweep racing a request, an
+    /// operator clearing the root -- leaves a name with nothing behind it.
+    pub async fn open<F, Fut>(
+        &self,
+        member: &str,
+        archive: &str,
+        open_archive: F,
+    ) -> Result<Box<dyn AsyncSeekableReader>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Box<dyn ArchiveReader>>>,
+    {
+        let mut members = self.members.lock().await;
+        members.retain(|_, cache| !cache.is_failed());
+        if let Some(cache) = members.get(member) {
+            match cache.reader().await {
+                Ok(reader) => return Ok(Box::new(reader)),
+                Err(error) => {
+                    tracing::debug!(
+                        archive,
+                        member,
+                        %error,
+                        "extracted member is gone from disk; extracting again"
+                    );
+                    members.remove(member);
+                }
+            }
+        }
+        match open_archive().await?.open_file(member).await? {
+            OpenedMember::Extracted(cache) => {
+                let reader = cache.reader().await?;
+                members.insert(member.to_string(), cache);
+                Ok(Box::new(reader))
+            }
+            OpenedMember::Direct(reader) => Ok(reader),
+        }
+    }
+}
 
 /// An archive on disk: where it is, what it was created from, and -- when
 /// this server fetched it -- the file itself, deleted with the last owner.
@@ -36,16 +116,9 @@ pub struct ArchiveSource {
     /// `Some` for a download: owning it is what deletes the file on drop.
     _download: Option<NamedTempFile>,
     cache_config: CacheConfig,
-    /// The members extracted so far, by name -- see [`Self::open_member`].
-    /// Held for the life of the source, so their files are too: each cache
-    /// is the one owner of its file's name, so dropping the last
-    /// `Arc<ArchiveSource>` unlinks every extraction at once, whether or not
-    /// an extraction task is still running -- one that is writes on into a
-    /// file with no name until it sees nobody is reading
-    /// (`cache::ABANDONED_AFTER`) and gives up, and those bytes are reclaimed
-    /// when it does. The mutex is held across an open so two requests racing
-    /// for a member that is not there yet start one extraction, not two.
-    members: Mutex<HashMap<String, ProgressiveCache>>,
+    /// The members extracted so far -- see [`MemberCaches`]. Held for the
+    /// life of the source, so their files are too.
+    members: MemberCaches,
 }
 
 impl ArchiveSource {
@@ -56,7 +129,7 @@ impl ArchiveSource {
             origin,
             _download: None,
             cache_config,
-            members: Mutex::new(HashMap::new()),
+            members: MemberCaches::default(),
         }
     }
 
@@ -69,54 +142,16 @@ impl ArchiveSource {
             origin,
             _download: Some(file),
             cache_config,
-            members: Mutex::new(HashMap::new()),
+            members: MemberCaches::default(),
         }
     }
 
     /// A reader over `member`, from the one extraction of it this source
-    /// keeps.
-    ///
-    /// Every HTTP request used to be its own extraction: the handler decoded
-    /// the whole member into a fresh scratch file per `open_file`, so a
-    /// player's ordinary opening -- the head, then the tail for its index,
-    /// then one request per seek -- ran that many decodings at once and put
-    /// that many copies of the member on disk, for minutes of a slow SoC and
-    /// several times the member in flash. Here the first request's
-    /// extraction is kept in `members` and every later request takes a
-    /// reader from it, whether it is still being written or finished.
-    ///
-    /// Two things replace an entry. A cache that has failed -- decoding
-    /// failed, or nothing read it for long enough that the writer gave up
-    /// (`cache::ABANDONED_AFTER`) -- would only tell a new reader so, and is
-    /// extracted again. And a cache whose file is gone: the file is a
-    /// scratch file under the cache root that a reader opens by path, so
-    /// anything that unlinks it -- a session sweep racing a request, an
-    /// operator clearing the root -- leaves a name with nothing behind it.
+    /// keeps -- see [`MemberCaches::open`].
     pub async fn open_member(&self, member: &str) -> Result<Box<dyn AsyncSeekableReader>> {
-        let mut members = self.members.lock().await;
-        members.retain(|_, cache| !cache.is_failed());
-        if let Some(cache) = members.get(member) {
-            match cache.reader().await {
-                Ok(reader) => return Ok(Box::new(reader)),
-                Err(error) => {
-                    tracing::debug!(
-                        archive = %self.path.display(),
-                        member,
-                        %error,
-                        "extracted member is gone from disk; extracting again"
-                    );
-                    members.remove(member);
-                }
-            }
-        }
-        match self.reader().await?.open_file(member).await? {
-            OpenedMember::Extracted(cache) => {
-                let reader = cache.reader().await?;
-                members.insert(member.to_string(), cache);
-                Ok(Box::new(reader))
-            }
-            OpenedMember::Direct(reader) => Ok(reader),
-        }
+        self.members
+            .open(member, &self.path.to_string_lossy(), || self.reader())
+            .await
     }
 
     pub fn path(&self) -> &Path {

@@ -155,6 +155,31 @@ impl<T: Send + Sync + 'static> Sessions<T> {
         self.inner.map.get(key).map(|entry| Lease::new(&entry))
     }
 
+    /// The session under `key`, leased, created by `make` when there is
+    /// none.
+    ///
+    /// One session per key even when requests race for it, which is the
+    /// point: a player's opening is several requests at once on the same
+    /// member, and two sessions for it would each do the work the session
+    /// exists to do once. `make` runs under the map's own lock, so it is a
+    /// constructor and nothing else -- no I/O, no await.
+    pub fn get_or_insert_with(&self, key: &str, make: impl FnOnce() -> T) -> Lease<T> {
+        self.inner.sweep(Instant::now());
+        self.ensure_janitor();
+        let entry = self
+            .inner
+            .map
+            .entry(key.to_string())
+            .or_insert_with(|| Entry {
+                value: Arc::new(make()),
+                usage: Arc::new(Usage {
+                    leases: AtomicUsize::new(0),
+                    last_used: Mutex::new(Instant::now()),
+                }),
+            });
+        Lease::new(&entry)
+    }
+
     /// The first session `matches` accepts, leased. For finding a session
     /// that already holds what a new one would otherwise fetch again.
     pub fn find(&self, mut matches: impl FnMut(&T) -> bool) -> Option<Lease<T>> {
@@ -300,6 +325,80 @@ mod tests {
         }
         assert!(sessions.is_empty(), "the janitor never swept");
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    /// `get_or_insert_with` makes one session per key however many callers
+    /// ask at once -- a player's opening is several requests on the same
+    /// member -- and leases what it hands back, so a session created for
+    /// one request is in use by it.
+    #[tokio::test(start_paused = true)]
+    async fn racing_callers_get_one_session() {
+        let sessions: Sessions<u32> = Sessions::new(TIMEOUT);
+        let made = Arc::new(AtomicUsize::new(0));
+        let make = || {
+            let made = made.clone();
+            move || {
+                made.fetch_add(1, Ordering::SeqCst);
+                7u32
+            }
+        };
+
+        let first = sessions.get_or_insert_with("k", make());
+        let second = sessions.get_or_insert_with("k", make());
+        assert_eq!(*first, 7);
+        assert_eq!(*second, 7);
+        assert_eq!(made.load(Ordering::SeqCst), 1, "one session, not two");
+        assert_eq!(sessions.len(), 1);
+
+        // Both leases are uses: the session stays while either is out.
+        drop(first);
+        tokio::time::advance(TIMEOUT * 2).await;
+        sessions.sweep(Instant::now());
+        assert_eq!(sessions.len(), 1, "a lease is a use");
+        drop(second);
+        tokio::time::advance(TIMEOUT * 2).await;
+        sessions.sweep(Instant::now());
+        assert!(sessions.is_empty());
+
+        // And a key that has been swept is made again rather than missing.
+        let again = sessions.get_or_insert_with("k", make());
+        assert_eq!(*again, 7);
+        assert_eq!(made.load(Ordering::SeqCst), 2);
+    }
+
+    /// And the same under a real race: four callers arriving at once on a
+    /// key that is not there yet make **one** session between them, because
+    /// the map decides who creates it while it holds the key.
+    ///
+    /// This is the case the API exists for -- a player's opening is several
+    /// requests on one member at the same instant -- and the one a
+    /// lookup-then-insert pair gets wrong while reading exactly right in a
+    /// sequential test. The maker sleeps so that a pair that lets more than
+    /// one caller in has them all inside it; the assertion is the count, not
+    /// the time.
+    #[test]
+    fn one_maker_runs_when_callers_race() {
+        let sessions: Sessions<u32> = Sessions::new(TIMEOUT);
+        let made = Arc::new(AtomicUsize::new(0));
+        let start = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let sessions = sessions.clone();
+                let made = made.clone();
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    let lease = sessions.get_or_insert_with("k", || {
+                        std::thread::sleep(Duration::from_millis(100));
+                        made.fetch_add(1, Ordering::SeqCst);
+                        7u32
+                    });
+                    assert_eq!(*lease, 7);
+                });
+            }
+        });
+        assert_eq!(made.load(Ordering::SeqCst), 1, "one session, not four");
+        assert_eq!(sessions.len(), 1);
     }
 
     /// `find` leases what it finds, so a session found for reuse is a

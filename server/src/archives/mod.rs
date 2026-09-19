@@ -11,6 +11,7 @@ pub mod sevenz;
 pub mod source;
 pub mod tar;
 pub mod tgz;
+pub mod torrent;
 pub mod window;
 pub mod zip;
 

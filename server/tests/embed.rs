@@ -4338,6 +4338,79 @@ fn archive_extractions(cache_root: &std::path::Path) -> Vec<std::path::PathBuf> 
         .collect()
 }
 
+/// **Two ranged reads of one member inside a torrent are one extraction**
+/// (review #18's leftover).
+///
+/// The `torrent:` form has no `/create`, so until it had a session of its
+/// own (`archives::torrent::TorrentArchives`) every request built its own
+/// reader on the torrent and decoded the member again: a player seeking in
+/// a film inside an archive wrote a second copy of the film per range
+/// request, each one held to the volume's free-space floor and each one
+/// paid for again.
+///
+/// The oracle is the disk, not a counter the route keeps: the files under
+/// `<cacheRoot>/.archives` are one per extraction (`ProgressiveCache`
+/// creates its scratch file before it returns, so a second extraction is
+/// already on disk by the time the second response's headers are sent),
+/// and what is asserted is that the file the second read is served from is
+/// **the same file** the first one made -- a count alone would read a
+/// second extraction that replaced the first as one extraction. The member
+/// is deflated, because a stored one is not extracted at all.
+#[test]
+fn two_ranged_reads_of_a_member_in_a_torrent_are_one_extraction() -> anyhow::Result<()> {
+    const MEMBER: &str = "member.bin";
+    const MEMBER_LEN: usize = 512 * 1024;
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+
+    let (handle, base, info_hash) = archive_member_server_with(
+        config_dir.path(),
+        cache_dir.path(),
+        src.path(),
+        MEMBER,
+        MEMBER_LEN,
+        None,
+        async_zip::Compression::Deflate,
+    )?;
+    let cache_root = resolved(&cache_dir.path().join("cache"));
+    let payload = member_payload(MEMBER_LEN);
+    let anonymous = reqwest::blocking::Client::new();
+
+    // The head of the member, as a player asks for it first.
+    let head = anonymous
+        .get(archive_member_url(&base, &info_hash, MEMBER))
+        .header(reqwest::header::RANGE, "bytes=0-4095")
+        .send()?;
+    assert_eq!(head.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(head.bytes()?.as_ref(), &payload[..4096]);
+    let extraction = archive_extractions(&cache_root);
+    assert_eq!(extraction.len(), 1);
+
+    // And then a seek into the middle of it.
+    let middle = anonymous
+        .get(archive_member_url(&base, &info_hash, MEMBER))
+        .header(
+            reqwest::header::RANGE,
+            format!("bytes={}-{}", 256 * 1024, 256 * 1024 + 4095),
+        )
+        .send()?;
+    assert_eq!(middle.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        middle.bytes()?.as_ref(),
+        &payload[256 * 1024..256 * 1024 + 4096]
+    );
+    assert_eq!(
+        archive_extractions(&cache_root),
+        extraction,
+        "the seek extracted the member a second time"
+    );
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
 /// **A stored member inside a torrent is served from the torrent**, with no
 /// extraction at all: it is a byte range of the archive, so a range request
 /// on it is a range read of the torrent and nothing is written under the

@@ -748,7 +748,37 @@ impl Drop for TorrentMemberStream {
     }
 }
 
-// New implementation of stream_file
+/// A torrent's file reader as an archive source: the bridge from
+/// `enginefs::backend::FileStreamTrait` (AsyncRead + AsyncSeek + Unpin +
+/// Send) to this module's [`crate::archives::AsyncSeekableReader`].
+struct BackendStream(Box<dyn enginefs::backend::FileStreamTrait>);
+
+impl tokio::io::AsyncRead for BackendStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncSeek for BackendStream {
+    fn start_seek(
+        mut self: std::pin::Pin<&mut Self>,
+        position: std::io::SeekFrom,
+    ) -> std::io::Result<()> {
+        std::pin::Pin::new(&mut self.0).start_seek(position)
+    }
+
+    fn poll_complete(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<u64>> {
+        std::pin::Pin::new(&mut self.0).poll_complete(cx)
+    }
+}
+
 /// Whether `error` is the volume's free-space floor refusing an
 /// extraction ([`crate::archives::cache::VolumeRoom`]).
 fn is_storage_full(error: &anyhow::Error) -> bool {
@@ -775,6 +805,12 @@ async fn stream_file(
     // that keeps the reconciler from pausing the torrent this body reads
     // from. `None` for the session form, which reads from a file.
     let mut torrent_stream_in_use = None;
+    // And the torrent form's session, which owns the one extraction of the
+    // member this body reads (see `archives::torrent`). Leased the same way
+    // and for the same reason as `session_in_use`: the extraction is in use
+    // while the player reads, and its idle clock starts when the body is
+    // dropped.
+    let mut torrent_session_in_use = None;
 
     // 1. Determine Input Source, and open the member in it
     let mut reader: Box<dyn crate::archives::AsyncSeekableReader> = if key.starts_with("torrent:") {
@@ -830,83 +866,63 @@ async fn stream_file(
                     TorrentMemberStream::start(state.engine.clone(), hash_part.to_lowercase(), idx)
                         .await,
                 );
-                // get_file_reader(idx, offset, priority). The intent's cap
-                // alone: this path installs no retention policy, so there is
-                // no window to cut the lookahead to.
-                let reader = handle
-                    .get_file_reader(
-                        idx,
-                        0,
-                        7,
-                        None,
-                        // Archive members are read whole and sequentially,
-                        // and no player ever states a duration for one.
-                        enginefs::backend::priorities::librqbit_stream_lookahead_bytes(
-                            enginefs::backend::priorities::Fetching::Download,
-                        ),
+                // The session this archive's extractions live in, leased for
+                // as long as the response body reads from it: the first
+                // request here extracts the member and every later one --
+                // the tail read, the seek backwards -- reads that one
+                // extraction rather than starting another (see
+                // `archives::torrent`). A stored member is served straight
+                // out of the torrent and nothing is extracted at all.
+                let (member, session) = state
+                    .torrent_archives
+                    .open_member(
+                        hash_part,
+                        &archive_internal_path,
+                        file_path_in_archive,
+                        extension,
+                        cache_config,
+                        || async move {
+                            // get_file_reader(idx, offset, priority). The
+                            // intent's cap alone: this path installs no
+                            // retention policy, so there is no window to cut
+                            // the lookahead to. 7 = high priority.
+                            let reader = handle
+                                .get_file_reader(
+                                    idx,
+                                    0,
+                                    7,
+                                    None,
+                                    // Archive members are read whole and
+                                    // sequentially, and no player ever
+                                    // states a duration for one.
+                                    enginefs::backend::priorities::librqbit_stream_lookahead_bytes(
+                                        enginefs::backend::priorities::Fetching::Download,
+                                    ),
+                                )
+                                .await?;
+                            Ok(Box::new(BackendStream(reader))
+                                as Box<dyn crate::archives::AsyncSeekableReader>)
+                        },
                     )
-                    .await // 7 = high priority
+                    .await
                     .map_err(|e| {
-                        tracing::error!("Failed to get file stream: {}", e);
-                        StatusCode::INTERNAL_SERVER_ERROR
+                        tracing::warn!(
+                            info_hash = %hash_part,
+                            member = file_path_in_archive,
+                            error = %e,
+                            "archive member in a torrent could not be opened"
+                        );
+                        // As the session form answers it: a member that will
+                        // not fit above the volume's free-space floor is not
+                        // a missing one, and everything else is.
+                        if is_storage_full(&e) {
+                            StatusCode::INSUFFICIENT_STORAGE
+                        } else {
+                            StatusCode::NOT_FOUND
+                        }
                     })?;
-
-                // Wrapper bridging enginefs::backend::FileStreamTrait (AsyncRead +
-                // AsyncSeek + Unpin + Send) to this module's AsyncSeekableReader.
-                struct BackendStreamWrapper(Box<dyn enginefs::backend::FileStreamTrait>);
-
-                // Wrapper impls
-                impl tokio::io::AsyncRead for BackendStreamWrapper {
-                    fn poll_read(
-                        mut self: std::pin::Pin<&mut Self>,
-                        cx: &mut std::task::Context<'_>,
-                        buf: &mut tokio::io::ReadBuf<'_>,
-                    ) -> std::task::Poll<std::io::Result<()>> {
-                        std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
-                    }
-                }
-                impl tokio::io::AsyncSeek for BackendStreamWrapper {
-                    fn start_seek(
-                        mut self: std::pin::Pin<&mut Self>,
-                        position: std::io::SeekFrom,
-                    ) -> std::io::Result<()> {
-                        std::pin::Pin::new(&mut self.0).start_seek(position)
-                    }
-                    fn poll_complete(
-                        mut self: std::pin::Pin<&mut Self>,
-                        cx: &mut std::task::Context<'_>,
-                    ) -> std::task::Poll<std::io::Result<u64>> {
-                        std::pin::Pin::new(&mut self.0).poll_complete(cx)
-                    }
-                }
-                // If we need Sync and trait doesn't provide it, we are stuck unless we relax requirement or wrap in Mutex.
-                // Mutex provides Sync. Use tokio::sync::Mutex? No, AsyncRead needs &mut.
-                // std::sync::Mutex? Blocks.
-                // Let's modify `AsyncSeekableReader` to NOT require Sync.
-
-                let wrapped_reader = Box::new(BackendStreamWrapper(reader));
-
-                // We need to ensure wrapped_reader is `AsyncSeekableReader`.
-                // Ideally `ArchiveReader` accepts `Box<dyn AsyncSeekableReader>`.
-
-                let archive_reader = crate::archives::get_archive_reader_from_stream(
-                    wrapped_reader,
-                    extension,
-                    cache_config,
-                )
-                .map_err(|e| {
-                    tracing::error!("Failed to create stream reader: {}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
-                // No session to keep the extraction in: this form pays for
-                // one per request.
-                archive_reader
-                    .open_file(file_path_in_archive)
-                    .await
-                    .map_err(|_| StatusCode::NOT_FOUND)?
-                    .into_reader()
-                    .await
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                torrent_session_in_use = Some(session);
+                member
             } else {
                 return Err(StatusCode::NOT_FOUND);
             }
@@ -1005,6 +1021,7 @@ async fn stream_file(
         // registered until the body is dropped, so nothing pauses the
         // torrent underneath a player that is still reading.
         let _streaming = &torrent_stream_in_use;
+        let _extraction = &torrent_session_in_use;
         chunk
     }));
 
