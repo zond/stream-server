@@ -816,7 +816,7 @@ mod tests {
         let store = PieceStore::under(Arc::clone(&registry), HASH, Arc::clone(&layout));
         std::fs::create_dir_all(store.dir()).unwrap();
         store.pwrite_all(0, 8, &[7u8; 8]).expect("write");
-        store.complete_piece(1).expect("complete");
+        store.complete_piece_and_wait(1).expect("complete");
         store.init_for_tests().expect("seed and register");
         let piece = store.piece_path(1);
         assert!(piece.is_file() && registry.is_registered(HASH));

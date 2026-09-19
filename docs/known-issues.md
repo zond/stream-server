@@ -474,3 +474,71 @@ PCM sound, teasers of other films). Comet sends a plain URL for it; the
 official client does no content sniffing either, and Torrentio answers
 such links with a "failed RAR" video. See the xtremio notes for what
 archive playback would take.
+
+## Readable before durable (2026-09-19)
+
+A field log had head pieces waiting 20 ms to over a second between their
+last chunk and the reader's wake-up. librqbit wakes a reader when it sets
+the have-bit, and it sets it only after `on_piece_completed` returns --
+which is where the piece store flushed the 4 MiB staged copy
+(`fdatasync`) and renamed it into place. On the Chromecast's eMMC under
+concurrent writes the flush is the slow part.
+
+**What changed.** `PieceStore::complete_piece` now accepts the piece --
+sets its held bit, leaves it readable from the staged copy, which is the
+copy the hash check just read whole -- and queues the flush and the
+rename for the store's committer thread (`piece_store::commit`,
+`Inner::run_commit`). The queue holds eight pieces; a completion that
+finds it full waits for room, which is the old synchronous cost and no
+worse. The durable record is unchanged in meaning: the final name only
+ever stands over flushed bytes, `PieceStore::has_piece` answers from it,
+librqbit's `has_piece` and `init`'s walk wait for a queued rename rather
+than call the piece absent (the walk waits for any store's commits under
+its directory, which covers a restart out of error building a fresh store
+while the errored one is still committing), and a crash before the rename
+leaves a staged-only piece the next `init` does not claim. A delete of a
+piece whose rename is queued cancels it; one that meets the rename in
+progress waits for it and deletes the result.
+
+**What is logged.** `stage="piece_commit_slow"` (info) when a flush plus
+rename takes 100 ms or more, with `sync_ms`, `rename_ms` and `queued_ms`;
+`stage="piece_commit_backpressure"` (info) when a completion waited 100 ms
+or more for room in the queue -- that one is a reader waiting again, and
+a device that cannot keep up with the download. `stage=
+"piece_commit_failed"` (error) is the case below. Not measured on the
+device yet; the next field log should show whether head pieces still
+wait, and how long the flushes really are. On a desktop NVMe, 4 MiB
+pieces completed every 400 ms beside a writer dirtying pages flat out, a
+completion held its caller p50 11-17 ms, p90 143-323 ms, max 426-768 ms
+before, and under 0.12 ms after. Completed back to back, faster than the
+flushes, the queue fills and the two are the same: the backpressure is
+the old cost, as intended.
+
+**The case that is not clean: a commit that fails after the completion
+returned.** librqbit has set its have-bit by then, and may have announced
+the piece -- directly, or through retention's committed set, which counts
+held pieces -- and there is no un-have. What the store does
+(`Inner::fail_commit`):
+
+- clears the held bit, so retention withdraws the piece from what new
+  peers are told and never reclaims or commits it again;
+- after a failed **flush**, removes the staged copy: Linux marks the pages
+  clean after a failed `fsync`, so a read after eviction would be served
+  whatever the device holds, and a `MissingPiece` is better than zeros
+  that pass for media. After a failed **rename** the flushed bytes stay
+  and keep being read;
+- keeps the error and fails every later `pwrite_all` and
+  `on_piece_completed` with it, kind intact. librqbit treats either as
+  fatal ("FATAL: error writing chunk to disk"), so the torrent goes to
+  Error exactly as it did when the commit was synchronous -- one write
+  later -- and `ENOSPC` recovery still recognises a full disk. The
+  restart's fresh store does not hold the piece and it is downloaded
+  again.
+
+Left open, both needing a device that refuses a flush: a torrent that
+writes nothing more after the failure -- every piece it wants is here --
+does not fail until something restarts it, and until then a read of a
+piece whose flush failed fails, and a peer that was told about it and
+asks is hung up on. Peers told about a piece the process then crashed
+before committing are not a case: their connections end with the
+process.

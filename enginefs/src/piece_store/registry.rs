@@ -346,7 +346,7 @@ mod tests {
         store
             .pwrite_all(0, offset, &vec![piece as u8 + 1; len])
             .expect("write");
-        store.complete_piece(piece).expect("complete");
+        store.complete_piece_and_wait(piece).expect("complete");
     }
 
     fn held_of(registry: &StoreRegistry) -> Option<BTreeSet<u32>> {
@@ -707,7 +707,7 @@ mod tests {
         for piece in 0..2 {
             let offset = u64::from(piece) * PIECE_LENGTH;
             other.pwrite_all(0, offset, &[9u8; 8]).unwrap();
-            other.complete_piece(piece).unwrap();
+            other.complete_piece_and_wait(piece).unwrap();
         }
         other.init_for_tests().unwrap();
         assert_eq!(registry.occupancy(), 14 + 16);

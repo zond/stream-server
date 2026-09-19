@@ -8264,6 +8264,9 @@ mod tests {
         root: &crate::piece_store::StoreRoot,
         hash: &str,
     ) -> std::collections::BTreeSet<u32> {
+        // A piece the store has accepted is under its staged name until its
+        // queued rename lands; the listing is of final names.
+        root.wait_for_commits(hash);
         crate::chunk_store::ChunkDir::new(root.torrent_dir(hash))
             .held()
             .expect("the torrent's directory lists")
@@ -9504,8 +9507,14 @@ mod tests {
             done += n;
         }
         drop(reader);
-        let before = on_disk(&store, &hash);
-        assert!(!before.is_empty());
+        // Not waiting for the queued renames to list what landed: the
+        // bucket has to be made unwritable while the download is still
+        // writing into it, and a piece accepted a moment ago may still be
+        // under its staged name.
+        assert!(
+            store.torrent_dir(&hash).join("0").is_dir(),
+            "the bucket exists"
+        );
 
         // The bucket will take no new file. A process that ignores the mode
         // (root, and some CI containers) cannot be shown this.

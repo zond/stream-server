@@ -185,6 +185,7 @@
 //! peer ends up holding is what we announced, and every one of those pieces
 //! is still on our disk when the stream is over.
 
+mod commit;
 pub mod layout;
 pub mod pin_record;
 pub mod policy;

@@ -10,6 +10,8 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::SyncSender;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use librqbit::storage::{StorageFactory, TorrentStorage};
@@ -17,6 +19,7 @@ use parking_lot::Mutex;
 
 use crate::chunk_store::{ChunkDir, ChunkError, Entry, OpenChunks, StoredChunk, collect_strays};
 
+use super::commit::PENDING;
 use super::layout::{FileSpec, PieceLayout};
 use super::registry::StoreRegistry;
 
@@ -80,7 +83,13 @@ pub struct MissingPiece {
 ///
 /// Which pieces are complete on disk, one bit each, kept in memory and kept
 /// exact: seeded once by `init` from the walk it already performs, set the
-/// moment a piece's rename lands, cleared by the unlink that removes it.
+/// moment a hash-checked piece is accepted ([`PieceStore::complete_piece`]),
+/// cleared by the unlink that removes it. A piece accepted and not yet
+/// renamed into place is held: its bytes are on the volume under the
+/// staged name, it is what a read of the piece is served, and its rename is
+/// queued -- the rename changes which name the bytes stand under and not
+/// whether the store has them. What does wait for the rename is the durable
+/// record, the final name, which is what the next process seeds from.
 /// Every one of those passes through this store, so the set can be exact
 /// without asking the disk, which is what lets whoever decides retention
 /// stop listing directories every couple of seconds. The disk is still the
@@ -168,9 +177,10 @@ pub(super) struct Inner {
     /// for, so the log says it once per piece rather than once per read.
     shadows_reported: Mutex<BTreeSet<u32>>,
     /// Which pieces are complete on disk -- see the type doc. Not advisory:
-    /// a bit is set only after the rename that made the piece ours and
-    /// cleared only by an unlink that removed it, so a reader of this set
-    /// need not ask the disk.
+    /// a bit is set only for a piece whose hash check passed and whose
+    /// rename is landed or queued, and cleared only by an unlink that
+    /// removed it or a commit that failed, so a reader of this set need not
+    /// ask the disk.
     held: HeldBits,
     /// True once `init`'s walk has landed in `held`. Before that the set is
     /// not empty, it is *unknown*, and [`PieceStore::held`] says so with
@@ -202,6 +212,17 @@ pub(super) struct Inner {
     /// The handles most recently opened -- see the type doc. Empty on a
     /// store that has just been created or taken.
     handles: OpenChunks,
+    /// Where [`PieceStore::complete_piece`] queues a piece to be flushed and
+    /// renamed into place, or `None` until the first completion starts the
+    /// committer thread. Bounded ([`COMMIT_QUEUE`]): a device that cannot
+    /// keep up makes a completion wait for room, which is the synchronous
+    /// commit this replaced and no worse.
+    committer: Mutex<Option<SyncSender<Commit>>>,
+    /// The first commit this store could not make durable -- see
+    /// [`Inner::fail_commit`]. Sticky: from then on every write and every
+    /// completion librqbit asks of the store fails with it, which is how the
+    /// failure reaches the torrent.
+    failed_commit: Mutex<Option<FailedCommit>>,
     /// Files opened, and staging names probed and found absent, for the
     /// tests that pin the open count -- the whole reason the cache exists.
     #[cfg(test)]
@@ -213,6 +234,52 @@ pub(super) struct Inner {
     /// can cut the power to check.
     #[cfg(test)]
     syncs: AtomicUsize,
+    /// Run by the committer before it flushes a piece: how a test holds a
+    /// flush the way a busy eMMC does, or fails it the way a full one does.
+    #[cfg(test)]
+    before_sync: Mutex<Option<SyncHook>>,
+}
+
+#[cfg(test)]
+type SyncHook = Arc<dyn Fn(u32) -> io::Result<()> + Send + Sync>;
+
+/// How many completed pieces may wait for the committer before a completion
+/// waits for room. Eight 4 MiB pieces is 32 MiB of staged bytes not yet
+/// durable -- a few seconds of download -- which is what a stalled flush may
+/// run ahead of before the download feels it.
+const COMMIT_QUEUE: usize = 8;
+
+/// A flush or a wait for the queue that takes longer than this is logged:
+/// it is the time a reader would have been parked before the commit left
+/// the completion path.
+const SLOW_COMMIT: Duration = Duration::from_millis(100);
+
+/// One completed piece on its way to the device.
+struct Commit {
+    inner: Arc<Inner>,
+    piece: u32,
+    /// The ticket [`super::commit::Pending`] knows this commit by.
+    id: u64,
+    /// The cached staged handle at completion, if any -- the write handle
+    /// when the piece was written through this store a moment ago.
+    handle: Option<Arc<File>>,
+    queued: Instant,
+}
+
+impl Commit {
+    fn run(self) {
+        self.inner
+            .run_commit(self.piece, self.id, self.handle, self.queued);
+    }
+}
+
+/// What a commit that failed left behind, kept so that it can be raised
+/// again at every later write: the error itself is not `Clone`, so its kind
+/// -- which is what `ENOSPC` recovery reads -- and its text are kept.
+struct FailedCommit {
+    piece: u32,
+    kind: io::ErrorKind,
+    message: String,
 }
 
 /// The registry a store reports to and the key it reports under.
@@ -233,8 +300,8 @@ impl Drop for Inner {
     }
 }
 
-/// One bit per piece: set when the piece's rename lands, cleared when its
-/// file is unlinked.
+/// One bit per piece: set when the piece is accepted as complete, cleared
+/// when its file is unlinked or its commit fails.
 ///
 /// Atomic words and nothing else, because the set is written from every
 /// peer's task at once: librqbit runs `on_piece_completed` inside the peer
@@ -490,6 +557,10 @@ impl PieceStore {
                 checking: AtomicBool::new(false),
                 epoch: AtomicU64::new(0),
                 handles: OpenChunks::new(),
+                committer: Mutex::new(None),
+                failed_commit: Mutex::new(None),
+                #[cfg(test)]
+                before_sync: Mutex::new(None),
                 #[cfg(test)]
                 opens: AtomicUsize::new(0),
                 #[cfg(test)]
@@ -574,15 +645,54 @@ impl PieceStore {
         self.inner.epoch()
     }
 
-    /// Promote a written piece to a complete one. Nothing may read it as ours
-    /// before this returns and everything may afterwards, so this is the
-    /// single instant at which the have-record for a piece comes into being.
+    /// Accept a written, hash-checked piece as complete: readable from the
+    /// moment this returns, **durable a little later**.
+    ///
+    /// librqbit calls this (as `on_piece_completed`) between its hash check
+    /// and its have-bit, with the stream reader that is waiting on the piece
+    /// parked until it returns. What makes a piece ours on disk -- the
+    /// flush of its staged bytes and the rename to its final name -- can
+    /// take a second on a phone's eMMC under concurrent writes, so it is not
+    /// done here: the piece is queued for this store's committer thread and
+    /// this returns. Until the rename lands the piece is read from its
+    /// staged copy, which is the newest copy and the one the hash check has
+    /// just read whole; see [`Inner::run_commit`] for what the committer
+    /// does and [`Inner::fail_commit`] for what happens when it cannot.
+    ///
+    /// The held set counts the piece from here -- it is on the volume, and
+    /// it is what a read gets -- but the durable record does not move until
+    /// the rename: the final name, [`Self::has_piece`] and a fresh store's
+    /// seed still say no for a queued piece, and
+    /// [`TorrentStorage::has_piece`] waits for the rename, so a crash before
+    /// it costs a re-download and never a have-bit over unflushed bytes. What
+    /// librqbit's own have-bit may say in the meantime is the subject of
+    /// `docs/known-issues.md`'s "readable before durable".
+    ///
+    /// Fails only when an earlier commit of this store already failed, or
+    /// when there is no committer to queue on and the commit made in place
+    /// failed: either way the torrent has to restart on a fresh store.
     ///
     /// Idempotent in the direction that matters: called for a piece already in
-    /// place with nothing staged, it says so rather than failing, because
-    /// librqbit logs a failure here at debug and marks the piece have anyway.
+    /// place with nothing staged, it commits nothing and says so rather than
+    /// failing.
     pub fn complete_piece(&self, piece: u32) -> anyhow::Result<()> {
-        self.inner.complete_piece(piece)
+        Inner::complete_piece(&self.inner, piece)
+    }
+
+    /// [`Self::complete_piece`] and then the commit it queued: the durable
+    /// result, for a test about what ends up on disk.
+    #[cfg(any(test, feature = "test-seed"))]
+    pub fn complete_piece_and_wait(&self, piece: u32) -> anyhow::Result<()> {
+        self.complete_piece(piece)?;
+        PENDING.wait_for(&self.staging_path(piece));
+        self.inner.ensure_no_failed_commit()
+    }
+
+    /// Return once every commit queued for this store's directory has
+    /// landed or failed.
+    #[cfg(any(test, feature = "test-seed"))]
+    pub fn wait_for_commits(&self) {
+        PENDING.wait_under(self.dir());
     }
 
     /// Reclaim one piece. This is the entry point the policy layer drives;
@@ -738,12 +848,15 @@ impl Inner {
     /// no count at all. The set is copied out before the `stat`s, which are
     /// filesystem work the write path must not wait behind; an entry the
     /// set still names after its copy was completed or deleted finds
-    /// nothing and counts nothing.
+    /// nothing and counts nothing. A staged copy whose rename is queued is
+    /// a held piece, priced by the held bits, and is not counted twice.
     pub(super) fn staged_bytes(&self) -> u64 {
         let staged: Vec<u32> = self.staged.lock().iter().copied().collect();
         staged
             .into_iter()
-            .filter_map(|piece| std::fs::metadata(self.staging_path(piece)).ok())
+            .map(|piece| self.staging_path(piece))
+            .filter(|path| !PENDING.is_pending(path))
+            .filter_map(|path| std::fs::metadata(path).ok())
             .map(|metadata| crate::chunk_store::occupied_bytes(&metadata))
             .sum()
     }
@@ -766,72 +879,265 @@ impl Inner {
         self.chunks.staging_path(u64::from(piece))
     }
 
-    fn complete_piece(&self, piece: u32) -> anyhow::Result<()> {
-        // Before anything else, the staged bytes go to the device. The
-        // rename below is metadata, and the journal makes it durable at its
-        // next commit; the piece's data are dirty pages with no such
-        // promise, and a power cut between the two leaves the final name
-        // standing over blocks that were never written. Nothing in the
-        // filesystem closes that window for us: ext4's `auto_da_alloc`
-        // flushes data for a rename *over an existing* name, and this
-        // rename is to a new one; f2fs has nothing like it. The final name
-        // is the have-record -- `seed_from_disk` reads it back as a bit at
-        // the next launch and `has_piece` is `is_file()` -- so the zeros
-        // would go to the player and to peers as a verified piece, and the
-        // resume bitfield librqbit `sync_all`s would vouch for them.
-        //
-        // What it costs: one fdatasync per piece, of 256 KiB to 4 MiB, at
-        // the rate a playback downloads -- a few pieces a second at the
-        // most, which is well inside what even an SD card commits in that
-        // time, and it is the data alone; the metadata rides the journal.
-        // The cached staged handle is the write handle when the piece was
-        // written through this store a moment ago; a piece whose handle
-        // has left the cache, or whose cached handle was a read's -- which
-        // Windows will not flush through -- is reopened by name.
+    fn complete_piece(self: &Arc<Self>, piece: u32) -> anyhow::Result<()> {
+        // Held from here, before librqbit's have-bit and the reader it
+        // wakes: the retention pass reads a reader's lookahead as the run of
+        // held pieces in front of it, and a piece the reader is already
+        // reading that the set left out would be a hole in that run for as
+        // long as the flush takes. Set with the commit queued, under one
+        // lock, so a delete that cancels the commit and clears the bit sees
+        // both or neither.
+        let id = PENDING.begin(&self.staging_path(piece), || self.held.set(piece));
+        let commit = Commit {
+            inner: Arc::clone(self),
+            piece,
+            id,
+            handle: self.handles.get(u64::from(piece), true),
+            queued: Instant::now(),
+        };
+        match self.committer() {
+            Some(sender) => {
+                let sending = Instant::now();
+                match sender.send(commit) {
+                    Ok(()) => {
+                        let waited = sending.elapsed();
+                        if waited >= SLOW_COMMIT {
+                            tracing::info!(
+                                piece,
+                                waited_ms = waited.as_millis() as u64,
+                                stage = "piece_commit_backpressure",
+                                "a completed piece waited for room in the commit queue"
+                            );
+                        }
+                    }
+                    // The thread is gone: the commit is made here.
+                    Err(unsent) => unsent.0.run(),
+                }
+            }
+            // No thread to hand it to: the commit is made here, as it
+            // always was before there was one.
+            None => commit.run(),
+        }
+        // An earlier commit that failed, a commit made in place that did,
+        // or one that failed while this waited for room: librqbit's to hear
+        // about now, where it is fatal to the torrent.
+        self.ensure_no_failed_commit()
+    }
+
+    /// This store's committer, started on first use. `None` only when the
+    /// thread could not be spawned, and then the caller commits in place.
+    fn committer(&self) -> Option<SyncSender<Commit>> {
+        let mut committer = self.committer.lock();
+        if let Some(sender) = committer.as_ref() {
+            return Some(sender.clone());
+        }
+        let (sender, queue) = std::sync::mpsc::sync_channel::<Commit>(COMMIT_QUEUE);
+        // The thread holds no reference to the store: every queued commit
+        // does, so the store lives until its last commit has landed, and
+        // then its drop drops the sender and the thread's `recv` ends.
+        let spawned = std::thread::Builder::new()
+            .name("piece-commit".into())
+            .spawn(move || {
+                while let Ok(commit) = queue.recv() {
+                    commit.run();
+                }
+            });
+        match spawned {
+            Ok(_) => {
+                *committer = Some(sender.clone());
+                Some(sender)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "could not start the piece committer; committing in place"
+                );
+                None
+            }
+        }
+    }
+
+    /// Flush a queued piece to the device and rename it into place, unless a
+    /// delete took it off the queue first.
+    ///
+    /// **The flush comes first, and the rename only over flushed bytes.**
+    /// The rename is metadata, and the journal makes it durable at its next
+    /// commit; the piece's data are dirty pages with no such promise, and a
+    /// power cut between the two would leave the final name standing over
+    /// blocks that were never written. Nothing in the filesystem closes
+    /// that window for us: ext4's `auto_da_alloc` flushes data for a rename
+    /// *over an existing* name, and this rename is to a new one; f2fs has
+    /// nothing like it. The final name is the have-record --
+    /// `seed_from_disk` reads it back as a bit at the next launch and
+    /// `has_piece` is `is_file()` -- so the zeros would go to the player and
+    /// to peers as a verified piece, and the resume bitfield librqbit
+    /// `sync_all`s would vouch for them.
+    ///
+    /// What it costs: one fdatasync per piece, of 256 KiB to 4 MiB, at the
+    /// rate a playback downloads. That used to be paid on librqbit's
+    /// completion path with the waiting reader parked behind it -- 20 ms to
+    /// over a second on the Chromecast's eMMC under concurrent writes -- and
+    /// is paid here now, where nothing waits on it. The cached staged handle
+    /// is the write handle when the piece was written through this store a
+    /// moment ago; a piece whose handle had left the cache, or whose cached
+    /// handle was a read's -- which Windows will not flush through -- is
+    /// reopened by name.
+    ///
+    /// **The final name only ever stands over flushed bytes.** The held bit
+    /// was set when the piece was accepted; what waits for the flush is the
+    /// rename, and a delete that meets the rename in progress waits for it
+    /// ([`super::commit::Pending::cancel`]), so what the delete unlinks is
+    /// whatever the rename left.
+    fn run_commit(&self, piece: u32, id: u64, handle: Option<Arc<File>>, queued: Instant) {
+        let path = self.staging_path(piece);
+        #[cfg(test)]
+        let injected = match self.before_sync.lock().clone() {
+            Some(hook) => hook(piece),
+            None => Ok(()),
+        };
+        #[cfg(not(test))]
+        let injected = Ok(());
+        let flushing = Instant::now();
         let index = u64::from(piece);
-        let synced = match self.handles.get(index, true) {
+        let synced = injected.and_then(|()| match handle {
             Some(file) if file.sync_data().is_ok() => Ok(()),
             _ => self.chunks.sync_staged(index),
-        };
-        self.count_sync();
-        synced.with_context(|| {
-            format!(
-                "could not flush the completed piece {} to the device before moving it into place",
-                self.staging_path(piece).display()
-            )
-        })?;
-        // Before the rename: the staged handle names a file about to become
-        // the complete one, and a cached complete handle -- the old copy a
-        // re-download is replacing -- names bytes about to be unlinked.
-        self.forget_handles(piece);
-        // `None`, and it has to be. librqbit never writes BEP-47 padding, so
-        // a piece whose tail is padding is committed *short* -- there is no
-        // length a legal padded piece would satisfy, and the completeness
-        // criterion for a torrent piece is the swarm's SHA-1, which has
-        // already passed by the time this runs. The URL adapter, which has no
-        // hash, passes its expected byte count here instead.
-        let completed = self.chunks.commit(u64::from(piece), None).map_err(|e| {
-            anyhow::Error::new(e).context(format!(
-                "could not move the completed piece {} into place at {}",
-                self.staging_path(piece).display(),
-                self.piece_path(piece).display()
-            ))
         });
-        if completed.is_ok() {
-            self.staged.lock().remove(&piece);
-            // After the rename and before returning: librqbit sets its
-            // have-bit only once this has returned `Ok`, so this is the one
-            // instant at which the held set can agree with both the disk
-            // and the have-set. Set before the rename, a failed rename
-            // would leave a bit over staged bytes; set by the caller
-            // afterwards, a pass between the two would see a piece on disk
-            // the store denied.
-            self.held.set(piece);
+        self.count_sync();
+        let sync_ms = flushing.elapsed().as_millis() as u64;
+        // A delete took the piece while it was queued or being flushed: the
+        // staged copy is gone or going, and whatever the flush said about it
+        // is about a file nobody wants.
+        if !PENDING.start_rename(&path, id) {
+            return;
         }
-        completed
+        let renaming = Instant::now();
+        let committed = synced.map_err(|e| (e, "flush")).and_then(|()| {
+            // Before the rename: the staged handle names a file about to
+            // become the complete one, and a cached complete handle --
+            // the old copy a re-download is replacing -- names bytes
+            // about to be unlinked.
+            self.forget_handles(piece);
+            // `None`, and it has to be. librqbit never writes BEP-47
+            // padding, so a piece whose tail is padding is committed
+            // *short* -- there is no length a legal padded piece would
+            // satisfy, and the completeness criterion for a torrent
+            // piece is the swarm's SHA-1, which has already passed by
+            // the time this runs.
+            self.chunks.commit(index, None).map_err(|e| (e, "rename"))
+        });
+        match committed {
+            Ok(()) => {
+                // A read that found the staged copy between the forget and
+                // the rename may have cached a handle to it under the staged
+                // key -- the file that is now the complete one. It is
+                // harmless there: a read asks for a staged handle only while
+                // the set names the piece, and a write that puts the piece
+                // back in the set forgets it first (`open_for_write`).
+                self.staged.lock().remove(&piece);
+            }
+            Err((error, step)) => self.fail_commit(piece, step, error),
+        }
+        PENDING.finish(&path, id);
+        let rename_ms = renaming.elapsed().as_millis() as u64;
+        let queued_ms = flushing.duration_since(queued).as_millis() as u64;
+        if u128::from(sync_ms + rename_ms) >= SLOW_COMMIT.as_millis() {
+            tracing::info!(
+                piece,
+                sync_ms,
+                rename_ms,
+                queued_ms,
+                dir = %self.chunks.path().display(),
+                stage = "piece_commit_slow",
+                "a completed piece was slow to reach the device; its reader was not waiting on it"
+            );
+        }
+    }
+
+    /// A queued commit that could not be made durable.
+    ///
+    /// librqbit has set its have-bit by now -- the completion returned `Ok`
+    /// when the piece was queued -- and may have announced the piece, and
+    /// there is no un-have to send. What this can still do is make the
+    /// failure what it was when the commit was synchronous: **fatal to the
+    /// torrent.** The error is kept and every later write and completion
+    /// librqbit asks of this store fails with it
+    /// ([`Self::ensure_no_failed_commit`]), which librqbit treats exactly as
+    /// it treated a failed commit ("FATAL: error writing chunk to disk"): the
+    /// torrent goes to Error, and a restart builds a fresh store whose
+    /// `init` finds the piece staged and not complete, so the initial check
+    /// does not claim it and it is downloaded again. `ENOSPC` recovery
+    /// recognises the error by its kind, which is kept for that.
+    ///
+    /// The held bit goes at once: retention stops announcing the piece to
+    /// peers that have not yet been told, and will not commit it.
+    ///
+    /// What the bytes do until then depends on which step failed. A failed
+    /// **flush** means the bytes may never reach the device, and after a
+    /// failed `fsync` Linux marks the pages clean -- a read after eviction
+    /// is served whatever the device holds -- so the staged copy is removed
+    /// and a read of the piece fails [`MissingPiece`] rather than risk
+    /// zeros that pass for media. A failed **rename** leaves flushed bytes
+    /// under the staged name, which are the verified piece; they stay, and
+    /// keep being read, and the next `init` finds them staged.
+    ///
+    /// Left open: a torrent that writes nothing more -- every piece it
+    /// wants is here -- never hears of the failure until it is restarted,
+    /// and until then reads of a piece whose flush failed fail. Both need a
+    /// device that refuses a flush, which is a failing or full disk.
+    fn fail_commit(&self, piece: u32, step: &str, error: io::Error) {
+        tracing::error!(
+            piece,
+            step,
+            path = %self.staging_path(piece).display(),
+            error = %error,
+            stage = "piece_commit_failed",
+            "a completed piece could not be made durable; the torrent will fail at its next write"
+        );
+        if step == "flush" {
+            let mut staged = self.staged.lock();
+            self.forget_handles(piece);
+            if let Err(e) = std::fs::remove_file(self.staging_path(piece))
+                && e.kind() != io::ErrorKind::NotFound
+            {
+                tracing::warn!(piece, error = %e, "could not remove a piece whose flush failed");
+            }
+            staged.remove(&piece);
+        }
+        self.held.clear(piece);
+        let mut failed = self.failed_commit.lock();
+        if failed.is_none() {
+            *failed = Some(FailedCommit {
+                piece,
+                kind: error.kind(),
+                message: format!("could not {step} the completed piece {piece}: {error}"),
+            });
+        }
+    }
+
+    /// Fail with the commit that failed, if one did -- see
+    /// [`Self::fail_commit`].
+    fn ensure_no_failed_commit(&self) -> anyhow::Result<()> {
+        match &*self.failed_commit.lock() {
+            None => Ok(()),
+            Some(failed) => Err(anyhow::Error::new(io::Error::new(
+                failed.kind,
+                failed.message.clone(),
+            ))
+            .context(format!(
+                "piece {} was accepted as complete and could not be made durable; \
+                 this store takes no more writes",
+                failed.piece
+            ))),
+        }
     }
 
     pub(super) fn delete_piece(&self, piece: u32) -> anyhow::Result<bool> {
+        // A commit still queued for the piece never lands now, and one
+        // renaming it is waited out, so that what is unlinked below is
+        // whatever it left and the bit cleared below is never set again
+        // behind this.
+        PENDING.cancel(&self.staging_path(piece));
         // Before the unlink, or a later read of the same piece would be
         // served the deleted bytes through the handle that outlived them.
         self.forget_handles(piece);
@@ -859,6 +1165,11 @@ impl Inner {
     }
 
     fn seed_from_disk(&self) -> anyhow::Result<()> {
+        // Whatever is queued to be renamed into this directory lands first --
+        // by this store, or by the one a restart out of error is replacing
+        // -- or the walk would find it staged, and the rename would then put
+        // a complete piece on the disk that the held set never names.
+        PENDING.wait_under(self.chunks.path());
         // What a staged file is *called*, and what a complete one is, are
         // the chunk store's decisions, and this walk asks it rather than
         // spelling either a second time: a second copy of the suffix here
@@ -1009,9 +1320,12 @@ impl Inner {
     /// that have gone empty, so a bucket really can disappear between one
     /// write and the next.
     fn open_for_write(&self, piece: u32) -> anyhow::Result<Arc<File>> {
-        if let Some(file) = self.handles.get(u64::from(piece), true) {
-            return Ok(file);
-        }
+        // The set before the cache, and a piece new to the set loses every
+        // cached handle before one is looked up. A handle cached under the
+        // staged key outlives the rename that made its file the complete
+        // one whenever a read cached it while the committer was renaming
+        // (`Inner::run_commit`), and a write that took it from the cache
+        // would write a re-download into the complete copy.
         if self.staged.lock().insert(piece) {
             // A new staged copy over a complete one: from here a read has
             // to see the staged bytes, so a cached complete handle -- the
@@ -1044,6 +1358,8 @@ impl Inner {
                     "a staged copy was opened over a piece this store holds"
                 );
             }
+        } else if let Some(file) = self.handles.get(u64::from(piece), true) {
+            return Ok(file);
         }
         let file = self
             .chunks
@@ -1357,6 +1673,14 @@ impl StoreRoot {
                 .sum::<u64>()
     }
 
+    /// Return once every commit queued for `info_hash`'s pieces, by any
+    /// store, has landed or failed: a listing taken after this sees every
+    /// piece a store has accepted under its final name.
+    #[cfg(any(test, feature = "test-seed"))]
+    pub fn wait_for_commits(&self, info_hash: &str) {
+        PENDING.wait_under(&self.torrent_dir(info_hash));
+    }
+
     /// One torrent's directory as a directory of chunks -- the one place the
     /// piece store's `(info hash, piece)` addressing meets the chunk store.
     fn chunks(&self, info_hash: &str) -> ChunkDir {
@@ -1486,6 +1810,10 @@ impl TorrentStorage for PieceStore {
 
     fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
         self.ensure_live()?;
+        // A commit that failed after librqbit was told the piece was ours
+        // is raised here, where librqbit treats a failure as fatal to the
+        // torrent -- see `Inner::fail_commit`.
+        self.inner.ensure_no_failed_commit()?;
         // A file being written is a file that is back, whatever
         // `remove_file` was told about it before: see `removed_files`.
         {
@@ -1585,18 +1913,22 @@ impl TorrentStorage for PieceStore {
     }
 
     /// Make a downloaded piece ours. Called after the hash check, so this is
-    /// where the staged bytes become the have-record -- see
-    /// [`Self::complete_piece`] and [`crate::chunk_store::STAGING_SUFFIX`].
+    /// where the staged bytes are accepted, and queued to become the
+    /// have-record -- see [`Self::complete_piece`] and
+    /// [`crate::chunk_store::STAGING_SUFFIX`].
     ///
     /// At the pinned rev librqbit runs this *before* it sets the piece's
     /// have-bit, and treats an `Err` here as fatal to the torrent rather
-    /// than advertise a piece it could not commit -- so "presence means
-    /// complete" is now exactly the contract librqbit relies on: nothing is
-    /// counted, advertised, served or readable through a stream until the
-    /// rename here has returned `Ok`, and a rename that fails stops the
-    /// torrent instead of leaving a have-bit over a half-committed piece.
-    /// The staging-then-rename this store already did is what makes that
-    /// safe, unchanged.
+    /// than advertise a piece it could not commit. What this promises by
+    /// returning `Ok` is that the piece is readable, whole and checked,
+    /// from here on -- from its staged copy until the queued rename lands
+    /// -- and not yet that it is durable: the flush and the rename run on
+    /// the store's committer, off the path the waiting reader is parked
+    /// on. A commit that fails after this returned is raised at the next
+    /// write or completion librqbit asks of the store, which is fatal to
+    /// the torrent there ([`Inner::fail_commit`]); a crash before the rename
+    /// leaves a staged copy the next `init` does not claim, so the resume
+    /// bitfield's bit for it is cleared by [`TorrentStorage::has_piece`].
     fn on_piece_completed(
         &self,
         piece_index: librqbit_core::lengths::ValidPieceIndex,
@@ -1625,6 +1957,11 @@ impl TorrentStorage for PieceStore {
         piece_index: librqbit_core::lengths::ValidPieceIndex,
     ) -> anyhow::Result<bool> {
         let piece = piece_index.get();
+        // A piece queued for its rename is answered once the rename has
+        // landed or failed: a "no" now would be the check writing off a
+        // piece it is about to hold, and a "yes" before the rename would
+        // be a claim about bytes not yet on the device.
+        PENDING.wait_for(&self.staging_path(piece));
         Ok(self.has_piece(piece) || !self.inner.piece_has_an_owner(piece))
     }
 
@@ -1922,7 +2259,7 @@ mod tests {
         write_only(store, global, chunk);
         for piece in 0..store.layout().piece_count() {
             if store.piece_has_an_owner(piece) {
-                store.complete_piece(piece).expect("complete");
+                store.complete_piece_and_wait(piece).expect("complete");
             }
         }
     }
@@ -2309,7 +2646,7 @@ mod tests {
             store.pwrite_all(0, 0, &global[0..10]).unwrap();
             store.pwrite_all(1, 0, &global[10..23]).unwrap();
             for piece in 0..3 {
-                store.complete_piece(piece).unwrap();
+                store.complete_piece_and_wait(piece).unwrap();
             }
         };
 
@@ -2335,7 +2672,7 @@ mod tests {
         fill_both(&store);
         store.remove_file(0, Path::new("a")).unwrap();
         store.pwrite_all(0, 0, &global[0..8]).unwrap();
-        store.complete_piece(0).unwrap();
+        store.complete_piece_and_wait(0).unwrap();
         store.remove_file(1, Path::new("b")).unwrap();
         assert!(store.has_piece(0));
         assert!(
@@ -2365,7 +2702,7 @@ mod tests {
         let payload = global_bytes(store.layout().total_length());
         store.pwrite_all(0, 0, &payload).unwrap();
         for piece in 0..4 {
-            store.complete_piece(piece).unwrap();
+            store.complete_piece_and_wait(piece).unwrap();
         }
         // Somebody else's directory, in the bucket, wearing piece 1's name.
         let usurper = store.piece_path(1);
@@ -2412,7 +2749,7 @@ mod tests {
         let payload = global_bytes(store.layout().total_length());
         store.pwrite_all(0, 0, &payload).unwrap();
         for piece in 0..4 {
-            store.complete_piece(piece).unwrap();
+            store.complete_piece_and_wait(piece).unwrap();
         }
         // Somebody else's directory, beside piece 1, wearing the name its
         // staged copy would have.
@@ -2536,7 +2873,7 @@ mod tests {
         let payload = vec![0xa5u8; piece_length as usize * 4];
         store.pwrite_all(0, 0, &payload).unwrap();
         for piece in 0..4 {
-            store.complete_piece(piece).unwrap();
+            store.complete_piece_and_wait(piece).unwrap();
         }
 
         let before = allocated(tmp.path());
@@ -2600,7 +2937,7 @@ mod tests {
 
         write_only(&store, &global, 4);
         assert!(!store.has_piece(0), "still not, with every byte written");
-        store.complete_piece(0).unwrap();
+        store.complete_piece_and_wait(0).unwrap();
         assert!(store.has_piece(0) && storage_has_piece(&store, 0));
         assert!(
             !store.staging_path(0).exists(),
@@ -2610,7 +2947,7 @@ mod tests {
         assert!(!store.has_piece(2), "the others are untouched by it");
 
         store
-            .complete_piece(0)
+            .complete_piece_and_wait(0)
             .expect("completing a piece already in place is not a failure");
     }
 
@@ -2669,7 +3006,7 @@ mod tests {
         store.pread_exact(2, 0, &mut buf).unwrap();
         assert_eq!(buf.to_vec(), again, "a read gets what was written last");
 
-        store.complete_piece(2).unwrap();
+        store.complete_piece_and_wait(2).unwrap();
         assert_eq!(std::fs::read(store.piece_path(2)).unwrap(), again);
         store.pread_exact(2, 0, &mut buf).unwrap();
         assert_eq!(buf.to_vec(), again);
@@ -2701,7 +3038,7 @@ mod tests {
             "one open per piece written, not per chunk"
         );
         for piece in 0..pieces as u32 {
-            store.complete_piece(piece).unwrap();
+            store.complete_piece_and_wait(piece).unwrap();
         }
 
         store.inner.opens.store(0, Ordering::Relaxed);
@@ -2751,13 +3088,13 @@ mod tests {
         );
         assert!(store.inner.handles.get(u64::from(last), true).is_some());
 
-        store.complete_piece(0).unwrap();
+        store.complete_piece_and_wait(0).unwrap();
         assert_eq!(
             store.inner.syncs.load(Ordering::Relaxed),
             1,
             "a piece whose handle is gone is reopened and flushed once"
         );
-        store.complete_piece(last).unwrap();
+        store.complete_piece_and_wait(last).unwrap();
         assert_eq!(
             store.inner.syncs.load(Ordering::Relaxed),
             2,
@@ -2766,8 +3103,229 @@ mod tests {
         assert_eq!(std::fs::read(store.piece_path(0)).unwrap(), &payload[..16]);
 
         // Nothing staged any more: the idempotent completion is still one.
-        store.complete_piece(0).unwrap();
+        store.complete_piece_and_wait(0).unwrap();
         assert!(store.has_piece(0));
+    }
+
+    /// A flush the test holds, the way a busy eMMC holds one: the committer
+    /// says which piece it is flushing on `entered` and then waits until
+    /// this is dropped -- which a failing test does as it unwinds, so
+    /// nothing is left hanging.
+    struct HeldFlush {
+        entered: std::sync::mpsc::Receiver<u32>,
+        _release: std::sync::mpsc::Sender<()>,
+    }
+
+    fn hold_flushes(store: &PieceStore) -> HeldFlush {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (entered_tx, released) = (Mutex::new(entered_tx), Mutex::new(released));
+        *store.inner.before_sync.lock() = Some(Arc::new(move |piece| {
+            let _ = entered_tx.lock().send(piece);
+            let _ = released.lock().recv();
+            Ok(())
+        }));
+        HeldFlush {
+            entered,
+            _release: release,
+        }
+    }
+
+    const PATIENCE: Duration = Duration::from_secs(10);
+
+    /// **The reader waiting on a piece is not parked behind its flush.**
+    ///
+    /// The field log this is for had head pieces waiting 20 ms to over a
+    /// second between their last chunk and the reader's wake-up: the flush
+    /// of the staged copy ran inside `on_piece_completed`, and librqbit
+    /// sets the have-bit -- which is what wakes the reader -- only after
+    /// that returns. So the completion must return with the flush still on
+    /// the device, and the piece must read back whole from its staged copy
+    /// meanwhile.
+    ///
+    /// It is held from the completion on -- the retention pass reads a
+    /// reader's lookahead off the held set. But the durable record must not
+    /// run ahead of the flush: the final name and `has_piece` say no until
+    /// the rename, and the two things that read the durable record --
+    /// librqbit's `has_piece`, and a fresh store's walk over the same
+    /// directory, which is what a restart out of error runs -- wait for it
+    /// rather than calling the piece absent.
+    #[test]
+    fn a_completed_piece_is_readable_while_its_flush_is_still_on_the_device() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(open_store(tmp.path(), PIECE_LENGTH, &SPECS));
+        store.seed_from_disk().unwrap();
+        let global = global_bytes(store.layout().total_length());
+        // Piece 2 is file 2's first eight bytes: staged whole.
+        store.pwrite_all(2, 0, &global[16..24]).unwrap();
+        let flush = hold_flushes(&store);
+
+        let (done_tx, done) = std::sync::mpsc::channel();
+        {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                let _ = done_tx.send(store.complete_piece(2).is_ok());
+            });
+        }
+        assert_eq!(flush.entered.recv_timeout(PATIENCE).unwrap(), 2);
+        assert!(
+            done.recv_timeout(PATIENCE)
+                .expect("the completion waited for the flush"),
+            "and it succeeded"
+        );
+
+        let mut read = [0u8; 8];
+        store.pread_exact(2, 0, &mut read).unwrap();
+        assert_eq!(read, global[16..24], "readable from the staged copy");
+        assert!(!store.has_piece(2), "not on disk as complete yet");
+        assert!(!store.piece_path(2).exists());
+        assert!(
+            store.held().unwrap().contains(2),
+            "held: a retention pass reads the reader's lookahead off the held set"
+        );
+        assert_eq!(
+            store.inner.staged_bytes(),
+            0,
+            "and priced once, by the held bits, not again as a staged copy"
+        );
+
+        let asked = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || storage_has_piece(&store, 2))
+        };
+        let walked = {
+            let dir = tmp.path().to_path_buf();
+            std::thread::spawn(move || {
+                let fresh = open_store(&dir, PIECE_LENGTH, &SPECS);
+                fresh.seed_from_disk().unwrap();
+                fresh.held().unwrap().contains(2)
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !asked.is_finished(),
+            "librqbit's has_piece answered with the rename still to come"
+        );
+        assert!(
+            !walked.is_finished(),
+            "a fresh store walked the directory with the rename still to come"
+        );
+
+        drop(flush);
+        assert!(asked.join().unwrap(), "answered once the rename landed");
+        assert!(walked.join().unwrap(), "and the walk found it complete");
+        store.wait_for_commits();
+        assert!(store.has_piece(2) && store.held().unwrap().contains(2));
+        assert_eq!(std::fs::read(store.piece_path(2)).unwrap(), global[16..24]);
+    }
+
+    /// A reclaim that meets a piece still queued for its rename takes it off
+    /// the queue: the rename must not land after the delete -- a complete
+    /// piece on disk the held set was just told had gone -- and must not
+    /// fail for want of the staged copy the delete removed, which would be
+    /// a commit failure and the end of the torrent.
+    #[test]
+    fn a_piece_deleted_while_its_commit_is_queued_never_lands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        store.seed_from_disk().unwrap();
+        let global = global_bytes(store.layout().total_length());
+        store.pwrite_all(2, 0, &global[16..24]).unwrap();
+        let flush = hold_flushes(&store);
+        store.complete_piece(2).unwrap();
+        assert_eq!(flush.entered.recv_timeout(PATIENCE).unwrap(), 2);
+
+        assert!(store.delete_piece(2).unwrap(), "the staged copy went");
+        drop(flush);
+        // The cancelled commit is off the books already, so waiting for the
+        // queue to drain is waiting for a later commit behind it: one
+        // committer, in order.
+        store.pwrite_all(0, 0, &global[0..8]).unwrap();
+        store
+            .complete_piece_and_wait(0)
+            .expect("a cancelled commit is not a failed one");
+        assert!(!store.piece_path(2).exists() && !store.staging_path(2).exists());
+        assert!(!store.held().unwrap().contains(2));
+        assert!(store.has_piece(0));
+    }
+
+    /// **A flush that fails after the completion returned is fatal, one
+    /// write later.** librqbit has the have-bit by then and there is no
+    /// un-have; what is left is to fail the torrent the way the synchronous
+    /// commit did, at the next thing librqbit asks of the store, and with
+    /// the error's kind intact -- `ENOSPC` recovery recognises a full disk
+    /// by it. The staged bytes go: after a failed flush the page cache no
+    /// longer vouches for them, and a read must fail rather than risk
+    /// zeros.
+    #[test]
+    fn a_flush_that_fails_after_the_completion_is_raised_at_the_next_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        store.seed_from_disk().unwrap();
+        let global = global_bytes(store.layout().total_length());
+        store.pwrite_all(2, 0, &global[16..24]).unwrap();
+        *store.inner.before_sync.lock() = Some(Arc::new(|_| {
+            Err(io::Error::from(io::ErrorKind::StorageFull))
+        }));
+        store
+            .complete_piece(2)
+            .expect("accepted before the flush ran");
+        store.wait_for_commits();
+
+        assert!(!store.held().unwrap().contains(2));
+        assert!(!store.piece_path(2).exists());
+        assert!(
+            !store.staging_path(2).exists(),
+            "bytes whose flush failed are not left to be read"
+        );
+        let read = store.pread_exact(2, 0, &mut [0u8; 8]).unwrap_err();
+        assert!(
+            read.chain()
+                .any(|c| c.downcast_ref::<MissingPiece>().is_some()),
+            "{read:#}"
+        );
+
+        let refused = store.pwrite_all(0, 0, &global[0..2]).unwrap_err();
+        assert!(
+            refused.chain().any(|cause| cause
+                .downcast_ref::<io::Error>()
+                .is_some_and(|io| io.kind() == io::ErrorKind::StorageFull)),
+            "the kind reaches librqbit's error: {refused:#}"
+        );
+        assert!(store.complete_piece(3).is_err());
+    }
+
+    /// A read that finds the staged copy while the committer renames it can
+    /// cache a handle under the staged key that names the complete file by
+    /// the time the rename lands. Reads never ask for it -- the piece is
+    /// out of the staged set -- but a write staging the piece again must not
+    /// be handed it, or the write lands in the verified copy. Nothing
+    /// writes a held piece without a delete first, except the backend bug
+    /// `staged_over_held` counts; this is that bug, over that handle.
+    #[test]
+    fn a_write_staging_a_piece_again_never_writes_through_a_handle_cached_before() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        store.seed_from_disk().unwrap();
+        let global = global_bytes(store.layout().total_length());
+        store.pwrite_all(2, 0, &global[16..24]).unwrap();
+        store.complete_piece_and_wait(2).unwrap();
+        let stale = Arc::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(store.piece_path(2))
+                .unwrap(),
+        );
+        store.inner.handles.remember(2, true, &stale);
+
+        store.pwrite_all(2, 0, &[0xee; 2]).unwrap();
+        assert_eq!(
+            std::fs::read(store.piece_path(2)).unwrap(),
+            global[16..24],
+            "the complete copy was written through the stale handle"
+        );
+        assert_eq!(std::fs::read(store.staging_path(2)).unwrap(), [0xee; 2]);
     }
 
     /// **A handle that no longer names its file costs the read, and the
@@ -2903,7 +3461,7 @@ mod tests {
                 .pwrite_all(file_id, from - base, &global[from as usize..to as usize])
                 .expect("write");
         }
-        store.complete_piece(piece).expect("complete");
+        store.complete_piece_and_wait(piece).expect("complete");
     }
 
     /// The pair above is explained by bookkeeping that does not survive the
@@ -2995,7 +3553,7 @@ mod tests {
         assert_eq!(held.in_range(0..0), BTreeSet::new());
         assert!(held.contains(2) && !held.contains(0));
 
-        fresh.complete_piece(0).unwrap();
+        fresh.complete_piece_and_wait(0).unwrap();
         assert_eq!(
             fresh.held().unwrap().in_range(0..4),
             BTreeSet::from([0, 2, 3]),
@@ -3083,7 +3641,7 @@ mod tests {
         // The same index by the completion path: the file is in place, so
         // the rename reports the piece complete, and the bit still does not
         // land.
-        fresh.complete_piece(5).unwrap();
+        fresh.complete_piece_and_wait(5).unwrap();
         assert_eq!(
             fresh.held().unwrap().count(),
             2,
@@ -3177,13 +3735,13 @@ mod tests {
         assert_eq!(*store.inner.staged.lock(), BTreeSet::from([1]));
     }
 
-    /// The bit is a claim about a file, and it is made after the rename and
-    /// not before: librqbit sets its have-bit only once this returns `Ok`,
-    /// so a bit set over a rename that then failed would be a piece the
-    /// store held and the torrent did not -- and a pass reading the set
-    /// would offer peers bytes the hash check never promoted.
+    /// A rename that fails takes the bit back: the bit was set when the
+    /// piece was accepted, and a bit standing over a rename that will never
+    /// land is a piece a pass would go on committing and announcing. The
+    /// failure itself is fatal to the store, one call later, as it was to
+    /// the torrent when the commit was synchronous.
     #[test]
-    fn complete_piece_sets_the_bit_only_after_the_rename_succeeded() {
+    fn a_rename_that_fails_takes_the_bit_back_and_fails_the_store() {
         let tmp = tempfile::tempdir().unwrap();
         let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
         store.seed_from_disk().unwrap();
@@ -3196,25 +3754,41 @@ mod tests {
         std::fs::create_dir(&usurper).unwrap();
         std::fs::write(usurper.join("inside"), b"not ours").unwrap();
 
-        assert!(store.complete_piece(2).is_err());
+        assert!(store.complete_piece_and_wait(2).is_err());
         assert!(
             !store.held().unwrap().contains(2),
             "no bit over bytes that are still staged"
         );
         assert!(
             store.staging_path(2).is_file(),
-            "and the staged copy is where it was"
+            "and the staged copy is where it was: its flush went through"
         );
         assert!(store.inner.staged.lock().contains(&2));
 
-        std::fs::remove_dir_all(&usurper).unwrap();
-        store.complete_piece(2).unwrap();
+        // The failure landed after librqbit was told the piece was ours, so
+        // it is raised at the next thing librqbit asks of the store, where
+        // an error is fatal to the torrent -- see `Inner::fail_commit`.
+        let refused = store.pwrite_all(3, 0, &global[29..30]).unwrap_err();
         assert!(
-            store.held().unwrap().contains(2),
+            format!("{refused:#}").contains("could not rename the completed piece 2"),
+            "{refused:#}"
+        );
+        assert!(store.complete_piece(3).is_err());
+
+        // And the torrent's restart is a fresh store over the same
+        // directory, which finds the piece staged and not held.
+        std::fs::remove_dir_all(&usurper).unwrap();
+        let fresh = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        fresh.seed_from_disk().unwrap();
+        assert!(!fresh.held().unwrap().contains(2));
+        assert!(fresh.inner.staged.lock().contains(&2));
+        fresh.complete_piece_and_wait(2).unwrap();
+        assert!(
+            fresh.held().unwrap().contains(2),
             "the rename landed, so the bit is set"
         );
-        assert!(!store.inner.staged.lock().contains(&2));
-        assert!(store.has_piece(2));
+        assert!(!fresh.inner.staged.lock().contains(&2));
+        assert!(fresh.has_piece(2));
     }
 
     /// The other direction of the same rule: a bit goes when the file goes.
@@ -3440,6 +4014,7 @@ mod tests {
         successor
             .on_piece_completed(piece_index(&store, 2))
             .unwrap();
+        successor.wait_for_commits();
         assert_eq!(
             store.held().unwrap().in_range(0..4),
             BTreeSet::from([0, 1, 2]),
@@ -3450,7 +4025,7 @@ mod tests {
         // no liveness check, because a peer's completion can be in flight
         // across the swap.
         successor.pwrite_all(3, 0, &global[29..30]).unwrap();
-        store.complete_piece(3).unwrap();
+        store.complete_piece_and_wait(3).unwrap();
         assert_eq!(
             successor.held().unwrap().in_range(0..4),
             BTreeSet::from([0, 1, 2, 3]),
@@ -3658,7 +4233,7 @@ mod tests {
         let store = open_store(tmp.path(), piece_length, &specs);
         for piece in 0..pieces {
             store.pwrite_all(0, piece * piece_length, &[7u8]).unwrap();
-            store.complete_piece(piece as u32).unwrap();
+            store.complete_piece_and_wait(piece as u32).unwrap();
         }
 
         let mut buckets = 0usize;
@@ -3824,7 +4399,7 @@ mod librqbit_tests {
         let store = PieceStore::new(root.join(&info_hash), layout.clone());
         store.pwrite_all(0, 0, &payload).expect("write");
         for piece in 0..layout.piece_count() {
-            store.complete_piece(piece).expect("complete");
+            store.complete_piece_and_wait(piece).expect("complete");
         }
         let shadow = store.staging_path(0);
         std::fs::write(&shadow, vec![0u8; 16384]).unwrap();
@@ -3911,7 +4486,7 @@ mod librqbit_tests {
         // complete.
         for piece in 0..layout.piece_count() {
             assert!(!store.has_piece(piece), "staged, not ours");
-            store.complete_piece(piece).expect("complete");
+            store.complete_piece_and_wait(piece).expect("complete");
             assert!(store.has_piece(piece));
         }
         empty
