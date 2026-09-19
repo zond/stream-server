@@ -10,6 +10,10 @@ const DEFAULT_TRACKERS_URL: &str =
     "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt";
 const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 const REFRESH_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60); // Check every hour
+/// The whole tracker-list request, connect to last byte.
+const TRACKER_LIST_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+/// What a tracker list may weigh. The default list is about 10 KB.
+const TRACKER_LIST_MAX_BODY: usize = 1024 * 1024;
 
 /// Trait for tracker persistence (implemented by AppState or similar)
 /// This allows enginefs to persist trackers without depending on server crate
@@ -230,11 +234,17 @@ impl TrackerManager {
             "Fetched raw trackers, ranking by RTT"
         );
 
-        // Rank trackers by RTT
+        // The reachable ones, fastest first; a tracker whose probe failed
+        // is not in the answer at all. Only then the top 20: ranked with
+        // the failures at the end, a refresh on a network where most probes
+        // failed filled the persisted list with trackers nobody could reach.
         let ranked = TrackerProber::rank_trackers(raw_trackers).await;
-
-        // Filter out unreachable trackers (those with max duration from failed probes)
-        // Keep top 20 fastest trackers
+        if ranked.is_empty() {
+            // Nothing answered -- this network, not the list. The trackers
+            // cached from a refresh that could reach some stay.
+            warn!("No fetched tracker answered its probe; keeping the cached list");
+            return Ok(());
+        }
         let top_trackers: Vec<String> = ranked.into_iter().take(20).collect();
 
         info!(count = top_trackers.len(), "Ranked and cached top trackers");
@@ -265,13 +275,21 @@ impl TrackerManager {
     ///
     /// Through [`crate::http_client_builder`], like every other HTTPS client
     /// here: the list is fetched from GitHub over TLS on every refresh.
+    ///
+    /// Bounded twice, because the refresh task awaits it and nothing else
+    /// would end it: by [`TRACKER_LIST_FETCH_TIMEOUT`] for the whole request,
+    /// so a GET that stalls does not park the refresh for the life of the
+    /// process, and by [`TRACKER_LIST_MAX_BODY`] for what is buffered.
     async fn fetch_trackers(&self, url: &str) -> anyhow::Result<Vec<String>> {
         let response = crate::http_client_builder()
+            .timeout(TRACKER_LIST_FETCH_TIMEOUT)
             .build()?
             .get(url)
             .send()
-            .await?;
-        let text = response.text().await?;
+            .await?
+            .error_for_status()?;
+        let body = crate::http_client::read_capped(response, TRACKER_LIST_MAX_BODY).await?;
+        let text = String::from_utf8_lossy(&body);
 
         let mut trackers = Vec::new();
         for line in text.lines() {
@@ -489,6 +507,158 @@ mod tests {
         assert!(
             manager.take_refresh_task().is_none(),
             "the task has one owner; a second taker must not get it too"
+        );
+    }
+
+    /// An HTTP origin on loopback that answers every connection with
+    /// `respond`, after reading the request head.
+    async fn origin<F, Fut>(respond: F) -> String
+    where
+        F: Fn(tokio::net::TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut head = [0u8; 4096];
+                let _ = socket.read(&mut head).await;
+                tokio::spawn(respond(socket));
+            }
+        });
+        format!("http://{addr}/trackers.txt")
+    }
+
+    /// A tracker-list GET that never answers ends at the fetch's timeout
+    /// (review #46): the refresh task awaits it, and nothing else would.
+    #[tokio::test(start_paused = true)]
+    async fn a_tracker_list_fetch_that_stalls_ends() {
+        let url = origin(|socket| async move {
+            tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
+            drop(socket);
+        })
+        .await;
+        let fetched = tokio::time::timeout(
+            TRACKER_LIST_FETCH_TIMEOUT * 2,
+            TrackerManager::offline().fetch_trackers(&url),
+        )
+        .await
+        .expect("the fetch has its own timeout");
+        assert!(fetched.is_err());
+    }
+
+    /// And one that never stops sending is cut off at the cap, rather than
+    /// buffered whole.
+    #[tokio::test]
+    async fn a_tracker_list_that_never_ends_is_cut_off_at_the_cap() {
+        use tokio::io::AsyncWriteExt;
+        let url = origin(|mut socket| async move {
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                .await;
+            let line = b"udp://tracker.invalid:6969/announce\n".repeat(1024);
+            while socket.write_all(&line).await.is_ok() {}
+        })
+        .await;
+        let error = TrackerManager::offline()
+            .fetch_trackers(&url)
+            .await
+            .expect_err("refused");
+        assert!(format!("{error:#}").contains("too large"), "{error:#}");
+    }
+
+    /// An error page is not a tracker list: its lines used to become
+    /// "trackers".
+    #[tokio::test]
+    async fn an_error_answer_is_not_a_tracker_list() {
+        use tokio::io::AsyncWriteExt;
+        let url = origin(|mut socket| async move {
+            let body = b"udp://tracker.invalid:6969/announce\n";
+            let _ = socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+            let _ = socket.write_all(body).await;
+        })
+        .await;
+        assert!(
+            TrackerManager::offline()
+                .fetch_trackers(&url)
+                .await
+                .is_err()
+        );
+    }
+
+    /// Storage whose list is a day stale and whose source is `url`; records
+    /// every save.
+    struct StaleCache {
+        url: String,
+        saved: parking_lot::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl TrackerStorage for StaleCache {
+        fn get_cached_trackers(&self) -> Vec<String> {
+            vec!["udp://cached.invalid:6969/announce".to_string()]
+        }
+        fn get_last_updated(&self) -> i64 {
+            0
+        }
+        fn get_source_url(&self) -> String {
+            self.url.clone()
+        }
+        fn save_trackers(&self, trackers: Vec<String>, _timestamp: i64) {
+            self.saved.lock().push(trackers);
+        }
+    }
+
+    /// **A refresh on which no tracker answers keeps the cached list**
+    /// (review #47). Failed probes used to be ranked last rather than left
+    /// out, so the persisted top 20 filled with trackers nobody could reach
+    /// whenever fewer than 20 answered -- and with nothing but those when
+    /// none did.
+    #[tokio::test]
+    async fn a_refresh_where_no_tracker_answers_keeps_the_cached_list() {
+        use tokio::io::AsyncWriteExt;
+        let url = origin(|mut socket| async move {
+            let body = b"not a tracker url\nwss://tracker.invalid/announce\n";
+            let _ = socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+            let _ = socket.write_all(body).await;
+        })
+        .await;
+        let storage = Arc::new(StaleCache {
+            url,
+            saved: parking_lot::Mutex::new(Vec::new()),
+        });
+        let manager = TrackerManager {
+            trackers: Arc::new(RwLock::new(vec![
+                "udp://cached.invalid:6969/announce".to_string(),
+            ])),
+            storage: Some(storage.clone()),
+            refresh_task: Arc::new(parking_lot::Mutex::new(None)),
+        };
+        manager.refresh_if_needed().await.unwrap();
+        assert!(
+            storage.saved.lock().is_empty(),
+            "{:?}",
+            storage.saved.lock()
+        );
+        assert_eq!(
+            manager.get_trackers().await,
+            vec!["udp://cached.invalid:6969/announce".to_string()]
         );
     }
 }

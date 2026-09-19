@@ -2067,8 +2067,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     /// The tracker list a torrent is added with: the built-in defaults, the
-    /// tracker manager's cached list (ranked by RTT), and any request-supplied
-    /// extras, sorted and de-duplicated.
+    /// tracker manager's cached list, and any request-supplied extras,
+    /// sorted and de-duplicated. The RTT ranking chose *which* trackers the
+    /// cached list holds (the fastest that answered); it says nothing about
+    /// their order here, which is alphabetical -- the backend announces to
+    /// all of them.
     async fn merged_trackers(&self, extra_trackers: Option<Vec<String>>) -> Vec<String> {
         let mut trackers: Vec<String> = Vec::new();
         if self.public_trackers == crate::backend::PublicTrackers::Use {
