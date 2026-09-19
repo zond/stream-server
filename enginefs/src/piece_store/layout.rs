@@ -155,6 +155,23 @@ impl PieceLayout {
         }
     }
 
+    /// How long a piece's file is once every byte of it that anybody
+    /// writes has landed: the end, within the piece, of the last byte a
+    /// payload file owns. [`Self::piece_length_of`] less a BEP-47 padding
+    /// tail, since librqbit never writes padding and a piece file is only
+    /// as long as the highest byte written to it. Zero for a piece that is
+    /// padding or zero-length files throughout.
+    pub fn written_length_of(&self, piece: u32) -> u64 {
+        let start = self.piece_offset(piece);
+        let end = start + self.piece_length_of(piece);
+        self.files[self.files_overlapping_piece(piece)]
+            .iter()
+            .filter(|f| f.owns_bytes)
+            .map(|f| (f.offset + f.len).min(end) - start)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The byte offset of a piece in the torrent's global space.
     pub fn piece_offset(&self, piece: u32) -> u64 {
         piece as u64 * self.piece_length
@@ -374,6 +391,30 @@ mod tests {
             16,
             "an even division leaves a full-length last piece, not a zero-length one"
         );
+    }
+
+    /// A padded piece's file is written only up to its payload, so that is
+    /// the length a whole copy of it has -- not the piece's length.
+    #[test]
+    fn a_piece_is_written_up_to_its_last_payload_byte() {
+        let l = layout(
+            8,
+            &[
+                FileSpec::payload(10),
+                FileSpec::padding(6),
+                FileSpec::payload(13),
+                FileSpec::payload(1),
+            ],
+        );
+        assert_eq!(l.written_length_of(0), 8);
+        assert_eq!(
+            l.written_length_of(1),
+            2,
+            "the padding tail is never written"
+        );
+        assert_eq!(l.written_length_of(3), 6, "the short last piece, whole");
+        let padding_only = layout(4, &[FileSpec::payload(4), FileSpec::padding(4)]);
+        assert_eq!(padding_only.written_length_of(1), 0);
     }
 
     #[test]
