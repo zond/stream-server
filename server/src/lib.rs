@@ -1776,6 +1776,10 @@ fn lan_media_routes() -> Router<AppState> {
         .merge(archive_stream_routes())
 }
 
+/// What `POST /create` may weigh: a hex-encoded `.torrent` in a JSON
+/// envelope, so about half of this is the file.
+const MAX_CREATE_BODY: usize = 32 * 1024 * 1024;
+
 /// Everything that is not media bytes: what stremio-core's StreamingServer
 /// model calls through `Env::fetch`, plus the app/test status routes. Every
 /// route here requires `Authorization: Bearer <token>` (see `auth`); a new
@@ -1790,7 +1794,20 @@ fn control_router() -> Router<AppState> {
             "/settings",
             get(routes::system::get_settings).post(routes::system::set_settings),
         )
-        .route("/create", post(routes::engine::create_engine))
+        .route(
+            "/create",
+            post(routes::engine::create_engine)
+                // A `.torrent` arrives here hex-encoded inside a JSON
+                // object, so the body is twice the file plus the envelope,
+                // and axum's default limit of 2 MB refused every torrent
+                // over about a megabyte with a `413` the client could only
+                // read as "the server would not take this file". A torrent
+                // that large is a very large one -- 1 MB of piece hashes is
+                // a 20,000-piece torrent -- and this is a token-protected
+                // route, so the limit is the one that stops a runaway body
+                // rather than one that judges the file.
+                .layer(axum::extract::DefaultBodyLimit::max(MAX_CREATE_BODY)),
+        )
         .route("/{infoHash}/create", post(routes::engine::create_magnet))
         .route(
             "/{infoHash}/stats.json",
