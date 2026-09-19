@@ -1,11 +1,10 @@
 use crate::backend::dht_bootstrap::{self, BootstrapResolvers};
 use crate::backend::{
-    BackendFileInfo, BackendMemoryDiagnostics, BtSettingEffect, BtSettingSupport, BtSettingsReport,
-    DhtStatus, DroppedFilePieces, EngineStats, FileStreamTrait, Footprint, Growler,
-    LEAN_PEER_LIMIT, PeerDiscovery, PeerSearch, RunState, Source, StartupPhase, StatsFile,
-    StatsOptions, SwarmCap, TorrentBackend, TorrentFilePriorityPlan, TorrentHandle,
-    TorrentListenPort, TorrentPlacement, TorrentPrivacyConfig, TorrentProxyType, TorrentSource,
-    TorrentSpeedProfile, TransferTotals,
+    BackendFileInfo, BtSettingEffect, BtSettingSupport, BtSettingsReport, DhtStatus,
+    DroppedFilePieces, EngineStats, FileStreamTrait, Footprint, Growler, LEAN_PEER_LIMIT,
+    PeerDiscovery, PeerSearch, RunState, Source, StartupPhase, StatsFile, StatsOptions, SwarmCap,
+    TorrentBackend, TorrentFilePriorityPlan, TorrentHandle, TorrentListenPort, TorrentPlacement,
+    TorrentPrivacyConfig, TorrentProxyType, TorrentSource, TorrentSpeedProfile, TransferTotals,
 };
 use crate::scrape::SwarmScraper;
 use anyhow::{Context, Result};
@@ -2121,10 +2120,6 @@ impl TorrentBackend for LibrqbitBackend {
             iter.map(|(_id, handle)| handle.info_hash().as_string())
                 .collect()
         })
-    }
-
-    async fn memory_diagnostics(&self) -> BackendMemoryDiagnostics {
-        BackendMemoryDiagnostics::default()
     }
 
     /// The per-torrent lever is librqbit's `ManagedTorrent::set_peer_limit`

@@ -555,10 +555,22 @@ impl FileStreams {
     ) -> Option<Rejected> {
         let at = |offset: u64| self.geometry.at(piece, offset);
         let run = held.containing(at(read.begin), &self.geometry.bound);
+        // **The reader's own stream first, then the one most recently
+        // read.** Several streams can sit in one run -- a hole between two
+        // of them fills, and what were two consumers are now two positions
+        // in one run -- and the first in vector order is whichever was
+        // created first, which after a scrub back is the stream the viewer
+        // left. Joining that one moves the history, the rate and the window
+        // onto a dormant stream while the live one keeps none. By the run
+        // rule they are the same consumer either way, so this only decides
+        // where the history is kept; it keeps it where the reading is.
         let nearest = run.as_ref().and_then(|run| {
             self.streams
                 .iter()
-                .position(|stream| run.contains(&at(stream.end.saturating_sub(1))))
+                .enumerate()
+                .filter(|(_, stream)| run.contains(&at(stream.end.saturating_sub(1))))
+                .max_by_key(|(_, stream)| (stream.reader == reader, stream.seen))
+                .map(|(index, _)| index)
         });
 
         if let (Some(index), Some(run)) = (nearest, run) {
@@ -2564,6 +2576,53 @@ mod tests {
             (0..8).collect::<Vec<_>>(),
             "and still at the age the pass that found them gave them"
         );
+    }
+
+    /// **A read in a run of several streams joins the one being read.**
+    ///
+    /// Two streams with a hole between them are two consumers. When the
+    /// hole fills they are two positions in one run, and a read that could
+    /// belong to either used to join whichever was created first -- the one
+    /// the viewer left. The history then piled up on a dormant stream.
+    #[test]
+    fn a_read_joins_the_stream_it_is_being_read_on() {
+        let t0 = Instant::now();
+        let mut streams = Streams::default();
+        streams.domain(0, 0, whole(), None);
+
+        // Two runs, so two consumers: one at the file's head, one deep.
+        let split: BTreeSet<u32> = run(0..4).union(&run(64..68)).copied().collect();
+        streams.record(0, 1, read(0, PIECE, t0, 0));
+        streams.observe(0, &split, PIECE, t0);
+        streams.record(0, 2, read(64 * PIECE, 64 * PIECE + PIECE, at(t0, 1), 1));
+        streams.observe(0, &split, PIECE, at(t0, 1));
+        assert_eq!(streams.counts(), vec![(0, 2)], "two consumers");
+
+        // The hole fills, and the viewer on the deep stream scrubs back
+        // into ground the head stream also sits in.
+        let whole_run = run(0..68);
+        streams.record(0, 2, read(60 * PIECE, 60 * PIECE + PIECE, at(t0, 2), 2));
+        streams.observe(0, &whole_run, PIECE, at(t0, 2));
+
+        // Told apart by when each was created, because a stream takes the
+        // reader of whatever last read it.
+        let file = &streams.by_file[&0];
+        assert_eq!(file.streams.len(), 2, "and still two");
+        let deep = file
+            .streams
+            .iter()
+            .max_by_key(|stream| stream.began)
+            .expect("the stream the viewer is on");
+        let head = file
+            .streams
+            .iter()
+            .min_by_key(|stream| stream.began)
+            .expect("the stream the viewer left");
+        assert_eq!(
+            deep.reads, 2,
+            "the scrub back joined the stream it was read on"
+        );
+        assert_eq!(head.reads, 1, "and left the other one where it was");
     }
 
     /// Files do not share streams: the same offsets in two files are two

@@ -31,8 +31,8 @@ use crate::backend::librqbit::LibrqbitBackend;
 use crate::backend::priorities::EngineCacheConfig;
 
 use crate::backend::{
-    BackendMemoryDiagnostics, Footprint, HotFilePriorityPlan, RunState, TorrentBackend,
-    TorrentFilePriorityPlan, TorrentHandle, TorrentListenPort, TorrentPlacement, TorrentSource,
+    Footprint, HotFilePriorityPlan, RunState, TorrentBackend, TorrentFilePriorityPlan,
+    TorrentHandle, TorrentListenPort, TorrentPlacement, TorrentSource,
 };
 
 const INACTIVE_TORRENT_REMOVE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
@@ -851,13 +851,6 @@ impl StreamActivitySnapshot {
     pub fn playback_is_live(&self) -> bool {
         self.engine_active_streams > 0 || self.active_streams.values().any(|count| *count > 0)
     }
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct EngineDiagnosticsSnapshot {
-    pub uptime_secs: u64,
-    pub streams: StreamActivitySnapshot,
-    pub memory: BackendMemoryDiagnostics,
 }
 
 /// What the torrent cache holds and what nothing may take from it, as the
@@ -3262,17 +3255,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             .any(|count| *count > 0)
     }
 
-    pub async fn diagnostics_snapshot(&self) -> EngineDiagnosticsSnapshot {
-        let streams = self.stream_activity_snapshot().await;
-        let memory = self.backend.memory_diagnostics().await;
-
-        EngineDiagnosticsSnapshot {
-            uptime_secs: self.clock.now_secs(),
-            streams,
-            memory,
-        }
-    }
-
     /// Called when a stream starts for a torrent file.
     /// Several torrent files may be active at once; cleanup is per file stream.
     ///
@@ -5581,10 +5563,6 @@ mod tests {
 
         async fn list_torrents(&self) -> Vec<String> {
             self.handles.iter().map(|h| h.info_hash.clone()).collect()
-        }
-
-        async fn memory_diagnostics(&self) -> BackendMemoryDiagnostics {
-            BackendMemoryDiagnostics::default()
         }
     }
 
@@ -10262,10 +10240,6 @@ mod tests {
 
         async fn list_torrents(&self) -> Vec<String> {
             self.inner.list_torrents().await
-        }
-
-        async fn memory_diagnostics(&self) -> BackendMemoryDiagnostics {
-            self.inner.memory_diagnostics().await
         }
     }
 
@@ -17950,10 +17924,6 @@ mod tests {
 
         async fn list_torrents(&self) -> Vec<String> {
             Vec::new()
-        }
-
-        async fn memory_diagnostics(&self) -> BackendMemoryDiagnostics {
-            BackendMemoryDiagnostics::default()
         }
     }
 

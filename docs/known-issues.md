@@ -43,14 +43,15 @@ reads the shape (`grep` over `xtremio/lib` and `xtremio/rust/src` on
 2026-09-19 found neither the fields nor the struct), so no app change was
 needed for it.
 
-What is left of that struct is still worth knowing: **every remaining
-field of it is also always zero**, because `LibrqbitBackend::memory_diagnostics`
-answers `BackendMemoryDiagnostics::default()` and the only
-caller of `BackendEngineFS::diagnostics_snapshot` is nobody -- no route,
-no `ServerHandle` method, no test. It is either a backend's job that was
-never finished or a shape to delete with `diagnostics_snapshot`; it is
-named here rather than quietly kept, and deleting a public API is the
-owner's call.
+The rest of that struct went the same way on 2026-09-20 (zond's call):
+every field of it answered zero -- `LibrqbitBackend::memory_diagnostics`
+returned `default()` -- and the only caller of
+`BackendEngineFS::diagnostics_snapshot` was nobody: no route, no
+`ServerHandle` method, no test. `BackendMemoryDiagnostics`,
+`TorrentMemoryDiagnostics`, `EngineDiagnosticsSnapshot`, the trait method
+and the snapshot are deleted. A backend that has something true to say
+about its memory can state it then, in the shape that suits what it
+measures.
 
 ### Smaller
 
