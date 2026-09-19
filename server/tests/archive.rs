@@ -249,6 +249,48 @@ impl Fixture {
     }
 }
 
+/// **A create under a key that is in use does not swap the archive out from
+/// under a player** (review #67). `/{fmt}/create/{key}` takes the key from
+/// the caller, and every `/{fmt}/stream/{key}/...` after it reads whatever
+/// that key now names -- so a second caller (on Android, any app on the
+/// device) could point a live session at an archive of its own. A repeat of
+/// the same create still lands: a re-play sends it again.
+#[test]
+fn a_create_cannot_take_over_another_archives_session_key() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let url = fixture.origin.url("/fixture.7z");
+    let other = fixture.origin.url("/download?id=7");
+    let client = reqwest::blocking::Client::new();
+    let create_with_key = |key: &str, url: &str| -> anyhow::Result<reqwest::blocking::Response> {
+        Ok(client
+            .post(format!("{}/7zip/create/{key}", fixture.base))
+            .json(&serde_json::json!({ "urls": [url] }))
+            .send()?)
+    };
+
+    assert_eq!(
+        create_with_key("mine", &url)?.status(),
+        reqwest::StatusCode::OK
+    );
+    // The same archive again is a re-play, not a takeover.
+    assert_eq!(
+        create_with_key("mine", &url)?.status(),
+        reqwest::StatusCode::OK
+    );
+    // A different one is refused, and the session still names the first.
+    assert_eq!(
+        create_with_key("mine", &other)?.status(),
+        reqwest::StatusCode::CONFLICT
+    );
+    let response = client
+        .get(format!("{}/7zip/stream/mine/first.txt", fixture.base))
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.bytes()?.as_ref(), FIRST_CONTENT);
+
+    fixture.finish()
+}
+
 /// An archive fetched by URL is stored under the cache root with the suffix
 /// the reader is chosen by -- so it can be opened at all, which a download
 /// without one never could -- a member of it is served with ranges, and a
