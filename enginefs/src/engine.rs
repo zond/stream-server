@@ -666,7 +666,7 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
             asking.seconds,
             streams.deadline.stalls(),
         );
-        if let Some(depth) = streams.deadline.settle(asked) {
+        if let Some(depth) = streams.settle_deadline(domain.file_idx, asked, now) {
             self.handle.set_deadline_pieces(depth);
             crate::retention::trace::deadline_depth(
                 &self.info_hash,

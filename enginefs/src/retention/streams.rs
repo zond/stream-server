@@ -871,6 +871,18 @@ impl Streams {
         last
     }
 
+    /// Settle the torrent's split depth for `file`'s pass, beside what
+    /// every other file still being read last asked; see
+    /// [`super::deadline::DeadlineDepth::settle_for`].
+    pub fn settle_deadline(&mut self, file: usize, asked: usize, now: Instant) -> Option<usize> {
+        let by_file = &self.by_file;
+        self.deadline.settle_for(file, asked, |other| {
+            by_file
+                .get(&other)
+                .is_some_and(|streams| streams.streams.iter().any(|s| !s.dormant(now)))
+        })
+    }
+
     /// What the LRU would give up first, and how many pieces it is watching
     /// -- exempting everything in `kept`, which is what no unlink may
     /// touch: the tiers above it.
@@ -1994,6 +2006,30 @@ mod tests {
 
         // Everything dormant: nothing to say.
         assert_eq!(streams.viewer_filling(t0 + Duration::from_secs(600)), None);
+    }
+
+    /// **One split depth serves every file being read, and it is the most
+    /// any of them asks.** Settled after each file's pass from that file's
+    /// own bitrate, a film asking six and its audio track asking two
+    /// flapped the torrent's depth 6/5/6/5. A file nothing reads any more
+    /// stops asking, and the depth falls a piece a pass from there.
+    #[test]
+    fn the_split_depth_is_the_most_any_file_being_read_asks() {
+        let t0 = Instant::now();
+        let mut streams = Streams::default();
+        stream_on(&mut streams, 0, 0, 100, 3_500_000, t0);
+        stream_on(&mut streams, 1, 2_783, 2_800, 20_000, t0);
+
+        assert_eq!(streams.settle_deadline(0, 6, t0), Some(6));
+        for _ in 0..3 {
+            assert_eq!(streams.settle_deadline(1, 2, t0), None, "the audio's pass");
+            assert_eq!(streams.settle_deadline(0, 6, t0), None, "the film's pass");
+        }
+
+        // The film stops being read; the audio goes on.
+        let later = t0 + STREAM_DORMANT + Duration::from_secs(1);
+        streams.by_file.get_mut(&1).unwrap().streams[0].seen = later;
+        assert_eq!(streams.settle_deadline(1, 2, later), Some(5));
     }
 
     /// **Granting publishes nothing.** The backing publishes what may not
