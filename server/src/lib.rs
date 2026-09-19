@@ -1534,11 +1534,25 @@ pub fn build_router(state: AppState) -> Router {
                 )
             }),
         )
-        .layer(cors_layer())
+        // **No CORS layer on loopback.** Nothing that reads this listener is
+        // a browser: the embedder's player (mpv), its HTTP client and
+        // stremio-core all ignore CORS, and the Cast receiver -- the one
+        // browser media element in the picture -- is on another device and
+        // reads the LAN listener, which keeps its layer. What a wildcard
+        // `Access-Control-Allow-Origin` did buy here was for everybody
+        // else on the device: loopback is not "only this app" -- any page
+        // a browser on the device has open, and on Android any app, reaches
+        // it -- and the open routes fetch what the caller names. Under `*`
+        // a web page could read LAN and intranet URLs through `/proxy`
+        // (`?d=http://192.168.1.1/admin`, with headers of its choosing in
+        // `h=`), `/ftp`, an archive create and a torrent-creating stream
+        // `GET`. Without it the browser still sends the request -- this is
+        // not a request barrier -- but the page cannot read what comes
+        // back.
         .with_state(state)
 }
 
-/// CORS for every route the server serves.
+/// CORS for the LAN media listener, the one a Cast receiver reads.
 ///
 /// `CorsLayer::permissive()` answers `*` to all four lists. That is not quite
 /// enough here:
@@ -1549,28 +1563,24 @@ pub fn build_router(state: AppState) -> Router {
 ///   `Content-Type`, `Accept-Encoding` and `Range` as the request headers the
 ///   server has to allow. Naming them is the guarantee; a wildcard only works
 ///   for as long as the receiver's fetch implementation expands it.
-/// * The `*` wildcard never covers `Authorization` (the Fetch standard
-///   excludes it by name), so a browser-hosted client could not send the
-///   control API's bearer header at all under `permissive()`.
 /// * A player that seeks needs `Content-Range`, `Content-Length` and
 ///   `Accept-Ranges` readable from script, so they are exposed by name too.
-/// * `Location` goes with them. `/proxy` relays the `Location` of a `3xx` it
-///   declines to follow (`routes::proxy`), and that header exists to be read
-///   -- it is the only thing saying where the origin sent us. Unexposed, the
-///   one client shape that reads response headers by name, a browser-hosted
-///   one, could not see it, which is the shape the relay was for.
+///
+/// Nothing on that listener takes a bearer header or relays a `Location`,
+/// so neither is named: those were for a browser-hosted client of the
+/// loopback listener, which no longer answers CORS at all (see
+/// [`build_router`]).
 ///
 /// Methods stay a wildcard: every method this server answers is one of the
 /// safelisted ones or is preflighted, and `*` is honoured for methods
 /// everywhere.
-fn cors_layer() -> CorsLayer {
+fn lan_cors_layer() -> CorsLayer {
     CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers([
             header::ACCEPT,
             header::ACCEPT_ENCODING,
-            header::AUTHORIZATION,
             header::CONTENT_TYPE,
             header::RANGE,
         ])
@@ -1581,14 +1591,14 @@ fn cors_layer() -> CorsLayer {
             header::CONTENT_LENGTH,
             header::CONTENT_RANGE,
             header::CONTENT_TYPE,
-            header::LOCATION,
         ])
         .max_age(Duration::from_secs(24 * 60 * 60))
 }
 
 /// The router the LAN media listener serves (see [`crate::lan_media`]):
 /// [`lan_media_routes`] and the two unhandled-request fallbacks, with the
-/// same tracing and CORS layers the loopback router carries.
+/// tracing layer the loopback router carries and the CORS layer it does not
+/// ([`lan_cors_layer`]: a Cast receiver is a browser media element).
 ///
 /// [`control_router`] is deliberately absent -- not merged and left behind the
 /// bearer middleware, but *not mounted at all*. A control path on this
@@ -1641,7 +1651,7 @@ fn build_lan_media_router(state: AppState) -> Router {
                     );
                 }),
         )
-        .layer(cors_layer())
+        .layer(lan_cors_layer())
         .with_state(state)
 }
 
