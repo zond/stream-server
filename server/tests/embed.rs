@@ -3251,6 +3251,15 @@ fn content_range_total(response: &reqwest::blocking::Response) -> u64 {
 /// which runs the arithmetic again for the client: a publisher that stopped
 /// reading the owners would still be answering that route correctly while
 /// sizing every window on free space alone.
+///
+/// **What is asserted is the cap net of the volume's own movement.** The
+/// disk arm is `occupied + available - floor`, and `available` is a reading
+/// of a real volume that the rest of this test binary is writing to while
+/// this runs: a plain `after > before` is a bet that the suite freed more
+/// than it wrote in between, and it lost that bet once. So the volume is
+/// read beside each cap -- the same `statvfs` the publisher takes -- and
+/// the growth is measured in `cap - available`, which is the occupancy the
+/// publisher put in and nothing else.
 #[test]
 fn the_minute_publishers_cap_follows_the_owners_occupancy() -> anyhow::Result<()> {
     /// Enough that the difference is nothing like the noise of a session
@@ -3283,10 +3292,16 @@ fn the_minute_publishers_cap_follows_the_owners_occupancy() -> anyhow::Result<()
     // seed goes after the launch sweep, which removes every store directory
     // the session does not claim.)
     seed_piece_store(&cache_root, &torrent, &content);
+    // The publisher's own view of the volume, read here as it reads it. It
+    // moves under both of us -- every other test in this binary writes to
+    // this volume -- which is why each cap below is paired with a reading
+    // of it.
+    let available = || fs4::available_space(&cache_root).expect("the volume answers");
     handle.update_settings(serde_json::json!({ "cacheSize": UNCAPPED }))?;
     let before = handle
         .published_cache_budget()
         .expect("a cap from the volume");
+    let free_before = available();
 
     // The session picks the seeded pieces up: `init` seeds the store's held
     // set from what is on the disk and registers it, and from that instant
@@ -3309,24 +3324,38 @@ fn the_minute_publishers_cap_follows_the_owners_occupancy() -> anyhow::Result<()
     let after = handle
         .published_cache_budget()
         .expect("a cap from the volume");
+    let free_after = available();
     let usage = handle.cache_usage()?;
+    let free_at_usage = available();
     assert!(
         usage.total_bytes >= SEEDED as u64,
         "the store counts what it registered: {usage:?}"
     );
+    // `cap - available` is the occupancy the publisher put into it, and
+    // that is what the registration moved: the seeded bytes were on the
+    // volume before either reading, so no `statvfs` can account for them.
+    // Half the film as the bound, for the session's own records and for
+    // the moment between the publisher's reading of the volume and ours --
+    // the claim is the whole film, and what is allowed for is noise.
+    let occupancy_in = |cap: u64, free: u64| cap as i128 - free as i128;
+    let gained = occupancy_in(after, free_after) - occupancy_in(before, free_before);
     assert!(
-        after > before,
-        "the cap grew by what the store now says it holds: {before} -> {after}"
+        gained >= (SEEDED / 2) as i128,
+        "the cap grew by what the store now says it holds: {before} (volume {free_before}) \
+         -> {after} (volume {free_after}), occupancy in the cap grew by {gained}"
     );
     // And the two readings of the same cache agree. `GET /cache.json` runs
     // the same arithmetic over the same owners a moment later, so the only
     // difference between them is whatever the volume did in between -- a
     // publisher reading no occupancy at all would be short by the whole of
-    // the seeded film.
+    // the seeded film. "Whatever the volume did" is measured rather than
+    // assumed small, because on a busy volume it is not.
     let reported = usage.limit_bytes.expect("a cap from the volume");
+    let volume_moved = free_after.abs_diff(free_at_usage);
     assert!(
-        after.abs_diff(reported) < SEEDED as u64 / 2,
-        "the cap in force and the cap reported are one number: {after} against {reported}"
+        after.abs_diff(reported) <= volume_moved + (SEEDED / 2) as u64,
+        "the cap in force and the cap reported are one number: {after} against {reported}, \
+         with the volume moving {volume_moved} between the two"
     );
 
     handle.shutdown()?;
