@@ -8,6 +8,10 @@ const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct TrackerProber;
 
 impl TrackerProber {
+    /// The trackers that answered their probe, fastest first. One that did
+    /// not answer is left out rather than ranked last: the caller keeps the
+    /// top of this list, and failures at its end filled that top whenever
+    /// fewer trackers answered than it keeps.
     pub async fn rank_trackers(trackers: Vec<String>) -> Vec<String> {
         let mut results = Vec::new();
 
@@ -20,13 +24,8 @@ impl TrackerProber {
         }
 
         for handle in handles {
-            if let Ok((tracker, rtt)) = handle.await {
-                if let Some(duration) = rtt {
-                    results.push((tracker, duration));
-                } else {
-                    // If probe failed, push to end with max duration
-                    results.push((tracker, Duration::from_secs(3600)));
-                }
+            if let Ok((tracker, Some(duration))) = handle.await {
+                results.push((tracker, duration));
             }
         }
 
@@ -121,5 +120,34 @@ impl TrackerProber {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tracker whose probe fails is left out, not ranked last (review
+    /// #47): the caller keeps the top of this list.
+    #[tokio::test]
+    async fn a_tracker_that_does_not_answer_is_not_ranked() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let _ = socket
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+        let alive = format!("http://{addr}/announce");
+        let ranked = TrackerProber::rank_trackers(vec![
+            "not a tracker url".to_string(),
+            "wss://tracker.invalid/announce".to_string(),
+            alive.clone(),
+        ])
+        .await;
+        assert_eq!(ranked, vec![alive]);
     }
 }
