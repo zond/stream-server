@@ -1407,6 +1407,66 @@ fn stats_json_reports_resolving_metadata_with_the_requests_trackers() -> anyhow:
     Ok(())
 }
 
+/// **A torrent file with no bytes is a `200` with no body** (review #64).
+/// `HEAD` promised `Content-Length: 1` -- the inclusive end of an empty
+/// range saturated to 0 and was read as one byte -- and the `GET` the
+/// player made next answered `416`, which is what a client sees as a file
+/// it cannot read rather than an empty one. (The archive routes were fixed
+/// for the same case; the torrent routes were not.)
+#[test]
+fn a_zero_length_torrent_file_is_an_empty_body_not_a_416() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+
+    let content = src.path().join("Feature");
+    std::fs::create_dir_all(&content)?;
+    write_payload(&content.join("movie.bin"), 32 * 1024);
+    std::fs::write(content.join("notes.nfo"), b"")?;
+    let (torrent, info_hash) = real_torrent(&content);
+
+    let cache_root = resolved(&cache_dir.path().join("cache"));
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_root.clone()),
+        ..offline_config()
+    })?;
+    seed_piece_store(&cache_root, &torrent, &content);
+    let base = format!("http://{}", handle.http_addr());
+    let client = bearer_client(&handle)?;
+    client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
+        .send()?
+        .error_for_status()?;
+    let stats = stats_after_check(&client, &base, &info_hash)?;
+    let idx = file_index(&stats, "notes.nfo");
+
+    let anonymous = reqwest::blocking::Client::new();
+    let url = format!("{base}/{info_hash}/{idx}");
+    let head = anonymous.head(&url).send()?;
+    assert_eq!(head.status(), reqwest::StatusCode::OK);
+    assert_eq!(header_value(&head, "content-length"), "0");
+
+    let get = anonymous.get(&url).send()?;
+    assert_eq!(get.status(), reqwest::StatusCode::OK, "{}", get.status());
+    assert_eq!(header_value(&get, "content-length"), "0");
+    assert!(get.bytes()?.is_empty());
+
+    // A `Range` on an empty file is the one thing that is a 416: there is
+    // no byte for it to name.
+    let ranged = anonymous
+        .get(&url)
+        .header(reqwest::header::RANGE, "bytes=0-0")
+        .send()?;
+    assert_eq!(ranged.status(), reqwest::StatusCode::RANGE_NOT_SATISFIABLE);
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
 /// A real multi-file torrent (correct piece hashes, 16 KiB pieces) built
 /// from the files under `dir`, whose name becomes the torrent name --
 /// librqbit's `<root>/<name>` folder in the cache root. Returns the
