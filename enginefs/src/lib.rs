@@ -2326,6 +2326,24 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         if let Some(engine) = self.get_engine(&info_hash).await {
             return Lookup::found(EngineLookup::Ready(engine));
         }
+        // Only the 40-hex spelling. librqbit also takes a 32-character
+        // base32 `btih`, and would add the torrent -- whose engine it then
+        // publishes under the hex hash, while the magnet registry, the
+        // stream counts and every later lookup go on using the base32
+        // string: every request found no engine and added the torrent
+        // again, and the idle sweep never saw the streams. Refused before
+        // anything is registered, as a failure record nobody keeps.
+        if !(info_hash.len() == 40 && info_hash.bytes().all(|b| b.is_ascii_hexdigit())) {
+            return Lookup::found(EngineLookup::Failed(FailedMagnetAdd {
+                error: MagnetAddError::Backend {
+                    info_hash: info_hash.clone(),
+                    error: Arc::new(anyhow::anyhow!(
+                        "{info_hash:?} is not a 40-character hex info hash"
+                    )),
+                },
+                trackers: Arc::from(Vec::new()),
+            }));
+        }
         // Merge before taking the registry lock: the tracker manager may
         // refresh its list over the network.
         let trackers = self.merged_trackers(extra_trackers).await;
@@ -17410,6 +17428,24 @@ mod tests {
             2,
             "the torrent the removal took is added again"
         );
+    }
+
+    /// **Only the hex spelling of an info hash starts an add** (review #44).
+    /// A base32 `btih` was handed to librqbit, which added the torrent and
+    /// published it under the hex hash, while every lookup went on asking
+    /// under the base32 string -- each request added the torrent again.
+    #[tokio::test]
+    async fn a_base32_info_hash_starts_no_add() {
+        let (enginefs, _counters) = test_enginefs_with_file_count(1);
+        let base32 = "MFRGGZDFMZTWQ2LKNNWG23TPOBYXE43U";
+        let result = enginefs.get_or_add_magnet(base32, None).await;
+        assert!(
+            matches!(result, Err(MagnetAddError::Backend { .. })),
+            "refused"
+        );
+        assert_eq!(enginefs.backend.adds.load(Ordering::SeqCst), 0);
+        assert!(enginefs.pending_magnet_add(base32).await.is_none());
+        assert!(enginefs.failed_magnet_add(base32).await.is_none());
     }
 
     /// **A magnet add's timeout does not remove a torrent another add
