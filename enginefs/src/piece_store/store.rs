@@ -3455,7 +3455,14 @@ mod tests {
             store.inner.handles.get(2, true).is_some(),
             "flushed through"
         );
-        *store.inner.handle_sync.lock() = Some(Arc::new(|_| Err(io::Error::from_raw_os_error(5))));
+        // The device, not the handle. Spelled as a kind rather than as
+        // errno 5, which is `EIO` here and `ERROR_ACCESS_DENIED` on
+        // Windows -- where it would name the one failure that *is* the
+        // handle's ([`handle_cannot_flush`]) and this test would then
+        // watch the retry it exists to forbid.
+        *store.inner.handle_sync.lock() = Some(Arc::new(|_| {
+            Err(io::Error::other("the device refused the flush"))
+        }));
         store
             .complete_piece(2)
             .expect("accepted before the flush ran");
@@ -3668,7 +3675,9 @@ mod tests {
                 opens.set(opens.get() + 1);
                 Ok(Box::new(()))
             },
-            |()| Err(io::Error::from_raw_os_error(5)),
+            // A device error, on every platform: see the note in
+            // `a_handle_flush_the_device_refused_is_not_retried_by_name`.
+            |()| Err(io::Error::other("the device is failing")),
             || forgotten.set(forgotten.get() + 1),
         );
         assert!(outcome.is_err());
