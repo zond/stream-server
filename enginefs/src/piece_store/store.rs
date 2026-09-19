@@ -243,10 +243,17 @@ pub(super) struct Inner {
     /// device error or a read-only handle on Windows does.
     #[cfg(test)]
     handle_sync: Mutex<Option<SyncHook>>,
+    /// Run by a completion just before the held bit is set: how a test
+    /// puts a delete between the commit being queued and the bit.
+    #[cfg(test)]
+    before_held_set: Mutex<Option<PieceHook>>,
 }
 
 #[cfg(test)]
 type SyncHook = Arc<dyn Fn(u32) -> io::Result<()> + Send + Sync>;
+
+#[cfg(test)]
+type PieceHook = Arc<dyn Fn(u32) + Send + Sync>;
 
 /// How many completed pieces may wait for the committer before a completion
 /// waits for room. Eight 4 MiB pieces is 32 MiB of staged bytes not yet
@@ -269,12 +276,28 @@ struct Commit {
     /// when the piece was written through this store a moment ago.
     handle: Option<Arc<File>>,
     queued: Instant,
+    /// Whether [`Inner::run_commit`] came back. A commit dropped without
+    /// that -- its committer panicked, taking it and the queue behind it
+    /// with the thread -- is abandoned in [`Drop`], or the path stays
+    /// pending for ever and the next `init`'s walk, which waits for it
+    /// under librqbit's torrent lock, never returns.
+    ran: bool,
 }
 
 impl Commit {
-    fn run(self) {
+    fn run(mut self) {
+        let handle = self.handle.take();
         self.inner
-            .run_commit(self.piece, self.id, self.handle, self.queued);
+            .run_commit(self.piece, self.id, handle, self.queued);
+        self.ran = true;
+    }
+}
+
+impl Drop for Commit {
+    fn drop(&mut self) {
+        if !self.ran {
+            self.inner.abandon_commit(self.piece, self.id);
+        }
     }
 }
 
@@ -569,6 +592,8 @@ impl PieceStore {
                 #[cfg(test)]
                 handle_sync: Mutex::new(None),
                 #[cfg(test)]
+                before_held_set: Mutex::new(None),
+                #[cfg(test)]
                 opens: AtomicUsize::new(0),
                 #[cfg(test)]
                 staging_probes: AtomicUsize::new(0),
@@ -599,6 +624,13 @@ impl PieceStore {
         self.inner.chunks.staging_path(u64::from(piece))
     }
 
+    /// How many times a staged copy has been opened over a piece this store
+    /// holds, or written while its rename was queued -- see
+    /// `Inner::open_for_write`. Zero is the only good answer.
+    pub fn staged_over_held(&self) -> u64 {
+        self.inner.staged_over_held()
+    }
+
     /// Whether this piece is on disk, **complete**. A piece halfway through
     /// being downloaded is not: its bytes are under [`Self::staging_path`]
     /// until the hash check passes.
@@ -609,13 +641,6 @@ impl PieceStore {
     /// say why it is left open rather than papered over with an empty file.
     /// [`TorrentStorage::has_piece`] answers a different question and does not
     /// have that hole -- see there.
-    /// How many times a staged copy has been opened over a piece this store
-    /// holds -- see [`PieceStoreInner::open_for_write`]. Zero is the only
-    /// good answer.
-    pub fn staged_over_held(&self) -> u64 {
-        self.inner.staged_over_held()
-    }
-
     pub fn has_piece(&self, piece: u32) -> bool {
         self.inner.chunks.has_chunk(u64::from(piece))
     }
@@ -894,13 +919,17 @@ impl Inner {
         // long as the flush takes. Set with the commit queued, under one
         // lock, so a delete that cancels the commit and clears the bit sees
         // both or neither.
-        let id = PENDING.begin(&self.staging_path(piece), || self.held.set(piece));
+        let id = PENDING.begin(&self.staging_path(piece), || {
+            self.before_held_set(piece);
+            self.held.set(piece)
+        });
         let commit = Commit {
             inner: Arc::clone(self),
             piece,
             id,
             handle: self.handles.get(u64::from(piece), true),
             queued: Instant::now(),
+            ran: false,
         };
         match self.committer() {
             Some(sender) => {
@@ -1132,6 +1161,33 @@ impl Inner {
         }
     }
 
+    /// A queued commit that will never run: its committer died with it.
+    ///
+    /// Nothing is known about the flush, so nothing is touched on the disk
+    /// -- the bytes are what the hash check read, and a read of them is no
+    /// worse than it was a moment ago -- but the piece may never be made
+    /// durable, which is a failed commit: this store takes no more writes,
+    /// and the restart that follows seeds from what did land. What must not
+    /// be left is the path pending: whatever waits on it would wait for
+    /// ever.
+    fn abandon_commit(&self, piece: u32, id: u64) {
+        PENDING.finish(&self.staging_path(piece), id);
+        tracing::error!(
+            piece,
+            path = %self.staging_path(piece).display(),
+            stage = "piece_commit_abandoned",
+            "a completed piece's commit never ran; the torrent will fail at its next write"
+        );
+        let mut failed = self.failed_commit.lock();
+        if failed.is_none() {
+            *failed = Some(FailedCommit {
+                piece,
+                kind: io::ErrorKind::Other,
+                message: format!("the commit of the completed piece {piece} never ran"),
+            });
+        }
+    }
+
     /// Fail with the commit that failed, if one did -- see
     /// [`Self::fail_commit`].
     fn ensure_no_failed_commit(&self) -> anyhow::Result<()> {
@@ -1329,6 +1385,18 @@ impl Inner {
     #[cfg(not(test))]
     fn count_staging_probe(&self) {}
 
+    /// Where a test puts a delete racing a completion.
+    #[cfg(test)]
+    fn before_held_set(&self, piece: u32) {
+        let hook = self.before_held_set.lock().clone();
+        if let Some(hook) = hook {
+            hook(piece);
+        }
+    }
+
+    #[cfg(not(test))]
+    fn before_held_set(&self, _piece: u32) {}
+
     /// Flush the piece's staged bytes through a handle to them.
     #[cfg(test)]
     fn sync_handle(&self, piece: u32, file: &File) -> io::Result<()> {
@@ -1396,8 +1464,27 @@ impl Inner {
                     "a staged copy was opened over a piece this store holds"
                 );
             }
-        } else if let Some(file) = self.handles.get(u64::from(piece), true) {
-            return Ok(file);
+        } else {
+            // **Or a write lands in a copy already accepted.** The set
+            // still names a completed piece until its queued rename lands,
+            // and a write in that window reuses the handle and writes into
+            // the verified bytes the committer is about to flush and name
+            // complete. The same backend bug as above, with no new staged
+            // copy to count it by -- so it is counted here, where it lands.
+            // The held bit first: it is one atomic load, and the rest is
+            // only paid by a write into a held piece, which is the bug.
+            if self.held.holds(piece) && PENDING.is_pending(&self.staging_path(piece)) {
+                self.staged_over_held.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    piece,
+                    path = %self.staging_path(piece).display(),
+                    stage = "staged_over_held",
+                    "a write landed in a completed piece whose rename is queued"
+                );
+            }
+            if let Some(file) = self.handles.get(u64::from(piece), true) {
+                return Ok(file);
+            }
         }
         let file = self
             .chunks
@@ -1809,8 +1896,13 @@ impl TorrentStorage for PieceStore {
     /// Once per torrent start, and that is every place the seed happens: on
     /// an add and on the session's restore inside librqbit's `block_in_place`,
     /// and on a restart out of error on the reactor under the torrent's own
-    /// lock -- where the walk already ran before the seed rode on it, so it
-    /// costs that path nothing it was not paying.
+    /// lock. The walk already ran there before the seed rode on it; what it
+    /// adds is the wait for commits still queued under the directory
+    /// (`Inner::seed_from_disk`) -- the errored store's, up to a full
+    /// queue and the one in hand, each an fdatasync. On a busy eMMC that is
+    /// seconds of one runtime worker and of that torrent's lock. It is paid
+    /// because the alternative is a walk that finds a piece staged whose
+    /// rename then lands, a complete piece the held set never names.
     fn init(
         &mut self,
         _shared: &librqbit::ManagedTorrentShared,
@@ -3394,6 +3486,106 @@ mod tests {
         store.complete_piece_and_wait(2).unwrap();
         assert!(store.has_piece(2));
         assert_eq!(std::fs::read(store.piece_path(2)).unwrap(), global[16..24]);
+    }
+
+    /// **A write into a completed piece whose rename is still queued is
+    /// counted.** The staged set names the piece until the rename lands,
+    /// so the write reuses the handle and lands in the verified bytes the
+    /// committer is about to flush -- the backend bug `staged_over_held`
+    /// exists to show, with no new staged copy to count it by.
+    #[test]
+    fn a_write_into_a_piece_whose_rename_is_queued_is_counted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        store.seed_from_disk().unwrap();
+        let global = global_bytes(store.layout().total_length());
+        store.pwrite_all(2, 0, &global[16..24]).unwrap();
+        let flush = hold_flushes(&store);
+        store.complete_piece(2).unwrap();
+        assert_eq!(flush.entered.recv_timeout(PATIENCE).unwrap(), 2);
+
+        store.pwrite_all(2, 0, &[0xee; 2]).unwrap();
+        assert_eq!(store.staged_over_held(), 1);
+        drop(flush);
+        store.wait_for_commits();
+    }
+
+    /// **The held bit is set under the same lock the commit is queued
+    /// under.** A delete that cancels the commit and clears the bit must
+    /// see both or neither; one that ran between the two left the bit set
+    /// over a piece whose files it had just unlinked -- a piece the store
+    /// claims and nothing can read.
+    #[test]
+    fn a_delete_racing_a_completion_never_leaves_a_bit_over_no_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(open_store(tmp.path(), PIECE_LENGTH, &SPECS));
+        store.seed_from_disk().unwrap();
+        let global = global_bytes(store.layout().total_length());
+        store.pwrite_all(2, 0, &global[16..24]).unwrap();
+        let flush = hold_flushes(&store);
+
+        // The delete, run from inside the completion at the moment before
+        // the bit is set, and given a while to get through.
+        let (go, went) = std::sync::mpsc::channel::<()>();
+        let (done, deleted) = std::sync::mpsc::channel::<()>();
+        let deleter = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                went.recv().unwrap();
+                store.delete_piece(2).unwrap();
+                let _ = done.send(());
+            })
+        };
+        let (go, deleted) = (Mutex::new(go), Mutex::new(deleted));
+        *store.inner.before_held_set.lock() = Some(Arc::new(move |_| {
+            let _ = go.lock().send(());
+            let _ = deleted.lock().recv_timeout(Duration::from_millis(300));
+        }));
+        store.complete_piece(2).unwrap();
+        *store.inner.before_held_set.lock() = None;
+        deleter.join().unwrap();
+        drop(flush);
+        store.wait_for_commits();
+
+        assert!(!store.piece_path(2).exists() && !store.staging_path(2).exists());
+        assert!(
+            !store.held().unwrap().contains(2),
+            "the bit stands over a piece the delete took"
+        );
+    }
+
+    /// **A committer that dies does not leave its commits pending for
+    /// ever.** The next `init`'s walk waits for every commit queued under
+    /// its directory, under librqbit's torrent lock, so a commit that
+    /// never finished would hang the restart that follows. It is a failed
+    /// commit instead: the store takes no more writes.
+    #[test]
+    fn a_committer_that_dies_leaves_nothing_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(open_store(tmp.path(), PIECE_LENGTH, &SPECS));
+        store.seed_from_disk().unwrap();
+        let global = global_bytes(store.layout().total_length());
+        store.pwrite_all(2, 0, &global[16..24]).unwrap();
+        *store.inner.before_sync.lock() = Some(Arc::new(|_| panic!("the committer dies")));
+        store
+            .complete_piece(2)
+            .expect("accepted before the flush ran");
+
+        let (waited, returned) = std::sync::mpsc::channel();
+        {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                store.wait_for_commits();
+                let _ = waited.send(());
+            });
+        }
+        returned
+            .recv_timeout(PATIENCE)
+            .expect("a commit its committer took down with it is still pending");
+        assert!(
+            store.pwrite_all(0, 0, &global[0..2]).is_err(),
+            "a commit that never ran is a failed one"
+        );
     }
 
     /// A read that finds the staged copy while the committer renames it can
