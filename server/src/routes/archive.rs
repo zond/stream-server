@@ -749,6 +749,16 @@ impl Drop for TorrentMemberStream {
 }
 
 // New implementation of stream_file
+/// Whether `error` is the volume's free-space floor refusing an
+/// extraction ([`crate::archives::cache::VolumeRoom`]).
+fn is_storage_full(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::StorageFull)
+    })
+}
+
 async fn stream_file(
     state: &AppState,
     key: &str,
@@ -925,7 +935,16 @@ async fn stream_file(
                     error = %e,
                     "archive member could not be opened"
                 );
-                StatusCode::NOT_FOUND
+                // A member that will not fit above the volume's free-space
+                // floor is not a missing one: the extraction is refused,
+                // and `507` says which of the two it was (the download half
+                // of this route answers the same status for the same
+                // reason).
+                if is_storage_full(&e) {
+                    StatusCode::INSUFFICIENT_STORAGE
+                } else {
+                    StatusCode::NOT_FOUND
+                }
             })?;
         session_in_use = Some(session);
         reader
@@ -1084,6 +1103,23 @@ mod tests {
     /// Room above the free-space floor for `bytes`, whatever the volume.
     fn room_for(bytes: u64) -> impl Fn(&std::path::Path) -> Option<u64> + Clone + Send + 'static {
         move |_: &std::path::Path| Some(crate::cache_budget::CACHE_FREE_SPACE_FLOOR + bytes)
+    }
+
+    /// The `507` an extraction refused for want of room answers with is
+    /// decided by this (review #18): a member that will not fit is not a
+    /// missing one.
+    #[test]
+    fn a_storage_full_extraction_is_told_apart_from_a_missing_member() {
+        let full: anyhow::Error = std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "the extraction needs more than the volume has above its floor",
+        )
+        .into();
+        assert!(is_storage_full(&full.context("opening the member")));
+        let missing: anyhow::Error =
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no such member").into();
+        assert!(!is_storage_full(&missing));
+        assert!(!is_storage_full(&anyhow::anyhow!("not an io error at all")));
     }
 
     fn config(root: &std::path::Path) -> CacheConfig {

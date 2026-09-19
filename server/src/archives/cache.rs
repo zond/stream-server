@@ -79,6 +79,92 @@ impl Abandonment {
     }
 }
 
+/// Bytes an extraction writes between readings of the volume's free space.
+///
+/// The same idea as the download's `DOWNLOAD_RECHECK_BYTES`, and the same
+/// size: often enough that a member decoding at 100 MB/s cannot run more
+/// than a fraction of a second past the floor, rare enough that the
+/// `statvfs` is nothing beside the decode.
+const EXTRACT_RECHECK_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Free bytes on the volume a path is on. `crate::cache_budget`'s in
+/// production; a test hands its own in.
+pub type FreeSpaceProbe = Arc<dyn Fn(&std::path::Path) -> Option<u64> + Send + Sync>;
+
+/// What an extraction may take of the volume it writes to: whatever is
+/// above the volume's own free-space floor
+/// ([`enginefs::free_space_floor`]), which is the line a download is
+/// already held to (`routes::archive`'s `DownloadRoom`).
+///
+/// An extracted member is a whole second copy of a file this server was
+/// asked to play -- a 20 GB member decoded out of a 20 GB archive -- and
+/// it was written with nothing asking whether the volume had room for it,
+/// inside no cap: not the cache budget (the scratch directory is beside
+/// the torrent-data root, and nothing counts it) and not the download's
+/// floor (the download had ended). What filled the disk was the device's,
+/// so the torrents stopped, the proxy's cache went, and the extraction ran
+/// on to `ENOSPC`.
+///
+/// A probe that cannot answer is "unknown", never "full": the extraction
+/// goes ahead, exactly as a download does.
+pub struct VolumeRoom {
+    dir: PathBuf,
+    floor: u64,
+    probe: FreeSpaceProbe,
+    written_since_check: u64,
+}
+
+impl VolumeRoom {
+    /// The floor is read once, from the volume's size: it does not move
+    /// while a member extracts.
+    fn new(dir: PathBuf, probe: FreeSpaceProbe) -> Self {
+        let floor = enginefs::free_space_floor(enginefs::volume_total(&dir));
+        Self {
+            dir,
+            floor,
+            probe,
+            written_since_check: 0,
+        }
+    }
+
+    fn room(&self) -> Option<u64> {
+        (self.probe)(&self.dir).map(|available| available.saturating_sub(self.floor))
+    }
+
+    /// Refuse a member whose own stated length will not fit: every archive
+    /// format states one, so the usual case is answered before a byte is
+    /// decoded.
+    fn refuse_if_it_cannot_fit(&self, len: u64) -> io::Result<()> {
+        match self.room() {
+            Some(room) if room < len => Err(Self::full(format!(
+                "the extraction needs {len} bytes and the volume has {room} above its floor"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// Called with what has just been written: asks the volume again every
+    /// [`EXTRACT_RECHECK_BYTES`], for the member that states no length and
+    /// for the volume something else is filling meanwhile.
+    fn wrote(&mut self, n: u64) -> io::Result<()> {
+        self.written_since_check = self.written_since_check.saturating_add(n);
+        if self.written_since_check < EXTRACT_RECHECK_BYTES {
+            return Ok(());
+        }
+        self.written_since_check = 0;
+        match self.room() {
+            Some(0) => Err(Self::full(
+                "the extraction reached the volume's free-space floor".to_string(),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    fn full(message: String) -> io::Error {
+        io::Error::new(io::ErrorKind::StorageFull, message)
+    }
+}
+
 /// The core cache controller
 ///
 /// The backing file is a [`NamedTempFile`] owned by the cache alone (shared
@@ -114,24 +200,49 @@ impl ProgressiveCache {
         dir: &std::path::Path,
         total_size: Option<u64>,
     ) -> io::Result<(Self, CacheWriter)> {
-        // On the blocking pool: a `stat`, a `mkdir` and an `open` on the
-        // cache volume, which on the flash of a slow device or a mount that
-        // has stopped answering park whatever reactor worker runs them.
+        Self::new_in_dir_with_probe(
+            dir,
+            total_size,
+            Arc::new(crate::cache_budget::available_space),
+        )
+        .await
+    }
+
+    /// [`Self::new_in_dir`] with the volume's free space answered by
+    /// `probe` -- production passes `cache_budget::available_space`; a test
+    /// passes a volume of its own choosing.
+    pub async fn new_in_dir_with_probe(
+        dir: &std::path::Path,
+        total_size: Option<u64>,
+        probe: FreeSpaceProbe,
+    ) -> io::Result<(Self, CacheWriter)> {
+        // On the blocking pool: a `stat`, a `mkdir`, the free-space reading
+        // and an `open` on the cache volume, which on the flash of a slow
+        // device or a mount that has stopped answering park whatever
+        // reactor worker runs them.
         let dir = dir.to_path_buf();
-        let temp_file = tokio::task::spawn_blocking(move || {
+        let (temp_file, room) = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&dir)?;
-            tempfile::Builder::new()
+            let room = VolumeRoom::new(dir.clone(), probe);
+            // Before the file exists: a member that cannot fit is refused
+            // rather than half-written and then unwound.
+            if let Some(size) = total_size {
+                room.refuse_if_it_cannot_fit(size)?;
+            }
+            let file = tempfile::Builder::new()
                 .prefix("archive_extract_")
-                .tempfile_in(&dir)
+                .tempfile_in(&dir)?;
+            io::Result::Ok((file, room))
         })
         .await
         .map_err(io::Error::other)??;
-        Self::from_temp_file(temp_file, total_size).await
+        Self::from_temp_file(temp_file, total_size, room).await
     }
 
     async fn from_temp_file(
         temp_file: NamedTempFile,
         total_size: Option<u64>,
+        room: VolumeRoom,
     ) -> io::Result<(Self, CacheWriter)> {
         let temp_path = temp_file.path().to_path_buf();
         let writer_handle = temp_file.as_file().try_clone()?;
@@ -160,6 +271,7 @@ impl ProgressiveCache {
             notify: notify.clone(),
             handle: writer_handle,
             abandonment: Abandonment::new(readers.clone(), ABANDONED_AFTER),
+            room,
         };
 
         Ok((
@@ -221,6 +333,9 @@ pub struct CacheWriter {
     /// reclaimed when it drops the handle.
     handle: std::fs::File,
     abandonment: Abandonment,
+    /// What is left on the volume above its floor, asked again every
+    /// [`EXTRACT_RECHECK_BYTES`]. See [`VolumeRoom`].
+    room: VolumeRoom,
 }
 
 impl AsyncWrite for CacheWriter {
@@ -237,6 +352,14 @@ impl AsyncWrite for CacheWriter {
         if let Poll::Ready(Ok(n)) = poll
             && n > 0
         {
+            // The volume, every `EXTRACT_RECHECK_BYTES` (see
+            // [`VolumeRoom`]). A `statvfs` on a reactor thread is what this
+            // spends: a few microseconds on any volume that answers, once
+            // per 8 MB decoded.
+            if let Err(full) = self.room.wrote(n as u64) {
+                self.set_error(full.to_string());
+                return Poll::Ready(Err(full));
+            }
             self.state_tx.send_modify(|state| {
                 state.written_bytes += n as u64;
             });
@@ -316,6 +439,7 @@ impl CacheWriter {
             file,
             notify: self.notify.clone(),
             abandonment: Abandonment::new(self.abandonment.readers.clone(), self.abandonment.after),
+            room: VolumeRoom::new(self.room.dir.clone(), self.room.probe.clone()),
         })
     }
 
@@ -334,6 +458,9 @@ pub struct SyncCacheWriter {
     file: std::fs::File,
     notify: Arc<Notify>,
     abandonment: Abandonment,
+    /// See [`CacheWriter::room`]. Every sync clone reads the volume on its
+    /// own account, which is right: they are separate extractions.
+    room: VolumeRoom,
 }
 
 impl SyncCacheWriter {
@@ -370,6 +497,10 @@ impl std::io::Write for SyncCacheWriter {
         self.check_abandoned()?;
         let n = self.file.write(buf)?;
         if n > 0 {
+            if let Err(full) = self.room.wrote(n as u64) {
+                self.set_error(full.to_string());
+                return Err(full);
+            }
             self.state_tx.send_modify(|state| {
                 state.written_bytes += n as u64;
             });
@@ -577,6 +708,112 @@ mod tests {
     use super::ProgressiveCache;
     use std::io::SeekFrom;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+    /// **An extraction is held to the same free-space floor as a
+    /// download** (review #18). A member states its own length, so the
+    /// usual case is refused before a byte is decoded: the extraction is a
+    /// whole second copy of the file, under no cap at all -- the cache
+    /// budget does not count the scratch directory, and the download's
+    /// floor was for the download.
+    #[tokio::test]
+    async fn a_member_that_will_not_fit_is_refused_before_it_is_written() {
+        use super::FreeSpaceProbe;
+        let dir = tempfile::tempdir().unwrap();
+        let floor = enginefs::free_space_floor(enginefs::volume_total(dir.path()));
+        let probe = |available: u64| -> FreeSpaceProbe {
+            std::sync::Arc::new(move |_: &std::path::Path| Some(available))
+        };
+
+        let refused = match ProgressiveCache::new_in_dir_with_probe(
+            dir.path(),
+            Some(64 * 1024 * 1024),
+            probe(floor + 32 * 1024 * 1024),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a member that takes the volume under its floor is refused"),
+        };
+        assert_eq!(refused.kind(), std::io::ErrorKind::StorageFull);
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "and nothing was written for it"
+        );
+
+        // Room for it: the extraction goes ahead.
+        ProgressiveCache::new_in_dir_with_probe(
+            dir.path(),
+            Some(64 * 1024 * 1024),
+            probe(floor + 128 * 1024 * 1024),
+        )
+        .await
+        .expect("a member that fits");
+
+        // A volume that will not say is unknown, never full -- as it is
+        // for a download.
+        ProgressiveCache::new_in_dir_with_probe(
+            dir.path(),
+            Some(u64::MAX),
+            std::sync::Arc::new(|_: &std::path::Path| None),
+        )
+        .await
+        .expect("an unreadable volume refuses nothing");
+    }
+
+    /// And the volume is asked again while the member is decoded, for the
+    /// one that states no length and for the volume something else is
+    /// filling meanwhile.
+    #[tokio::test]
+    async fn an_extraction_stops_when_the_volume_reaches_its_floor() {
+        use super::{EXTRACT_RECHECK_BYTES, FreeSpaceProbe};
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let floor = enginefs::free_space_floor(enginefs::volume_total(dir.path()));
+        let available =
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(floor + 128 * 1024 * 1024));
+        let probe: FreeSpaceProbe = {
+            let available = available.clone();
+            std::sync::Arc::new(move |_: &std::path::Path| {
+                Some(available.load(std::sync::atomic::Ordering::SeqCst))
+            })
+        };
+        let (cache, writer) = ProgressiveCache::new_in_dir_with_probe(dir.path(), None, probe)
+            .await
+            .expect("a member of unknown length");
+        let _reader = cache
+            .reader()
+            .await
+            .expect("a reader, so nothing is abandoned");
+        let mut out = writer.try_clone_sync().expect("a sync writer");
+
+        let block = vec![0u8; EXTRACT_RECHECK_BYTES as usize];
+        out.write_all(&block).expect("the first block fits");
+
+        // The volume fills under the extraction.
+        available.store(floor, std::sync::atomic::Ordering::SeqCst);
+        let refused = out
+            .write_all(&block)
+            .expect_err("the volume is at its floor");
+        assert_eq!(refused.kind(), std::io::ErrorKind::StorageFull);
+        assert!(cache.is_failed(), "and the readers are told");
+
+        // The async writer, which the small members go through, asks the
+        // same question.
+        let probe: FreeSpaceProbe = std::sync::Arc::new(move |_: &std::path::Path| Some(floor));
+        let (cache, mut writer) = ProgressiveCache::new_in_dir_with_probe(dir.path(), None, probe)
+            .await
+            .expect("a member of unknown length");
+        let _reader = cache
+            .reader()
+            .await
+            .expect("a reader, so nothing is abandoned");
+        let refused = writer
+            .write_all(&block)
+            .await
+            .expect_err("the volume is at its floor");
+        assert_eq!(refused.kind(), std::io::ErrorKind::StorageFull);
+        assert!(cache.is_failed());
+    }
 
     #[tokio::test]
     async fn reads_all_written_bytes_in_order() {
