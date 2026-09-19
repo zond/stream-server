@@ -99,7 +99,10 @@ pub fn depth(
 /// changes, and lets it fall no faster than a piece a pass.
 ///
 /// One per torrent, not per file: the split depth is the torrent's (it is
-/// the piece tracker's), and a torrent plays one video at a time. Kept on
+/// the piece tracker's), and a torrent plays one video at a time -- which
+/// may be read from more than one of its files, a film and an external
+/// audio track, each pass sizing the depth from its own file's bitrate, so
+/// what each asked is kept and the most of them settles. Kept on
 /// the read-pattern detector because that is the one thing the engine, which
 /// hears from the player, and its backing, which runs the pass, already
 /// share.
@@ -107,6 +110,12 @@ pub fn depth(
 pub struct DeadlineDepth {
     stalls: usize,
     applied: Option<usize>,
+    /// What each file's last pass asked for, by file index. One depth
+    /// serves every file of the torrent, and each file's pass sizes it from
+    /// its own bitrate: a film asking six and its external audio track
+    /// asking two, settled one pass after the other, flapped the depth
+    /// 6/5/6/5. The depth is the most any file still being read asks.
+    asked_by: std::collections::HashMap<usize, usize>,
 }
 
 impl DeadlineDepth {
@@ -131,7 +140,26 @@ impl DeadlineDepth {
     /// that is what the backend holds already, so the caller applies only a
     /// change. The first reading always applies as asked: the backend's own
     /// default is not this crate's to assume.
-    pub fn settle(&mut self, asked: usize) -> Option<usize> {
+    ///
+    /// `file` is whose pass this is, and `reading` says which files are
+    /// still being read: what those asked stands beside this, and the most
+    /// of them is what settles. A file nothing reads any more asks nothing.
+    pub fn settle_for(
+        &mut self,
+        file: usize,
+        asked: usize,
+        reading: impl Fn(usize) -> bool,
+    ) -> Option<usize> {
+        self.asked_by.insert(file, asked);
+        self.asked_by
+            .retain(|other, _| *other == file || reading(*other));
+        let asked = self.asked_by.values().copied().max().unwrap_or(asked);
+        self.settle(asked)
+    }
+
+    /// [`Self::settle_for`] once the files have been folded into one ask.
+    /// Private, so a pass cannot settle its own file's ask alone.
+    fn settle(&mut self, asked: usize) -> Option<usize> {
         let depth = match self.applied {
             Some(held) if asked < held => held - 1,
             _ => asked,
