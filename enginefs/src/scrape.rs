@@ -327,10 +327,9 @@ async fn scrape_http_inner(url: &Url, info_hash: &[u8; 20]) -> Result<ScrapeOutc
     if !status.is_success() {
         bail!("tracker answered {status}");
     }
-    let body = response.bytes().await.context("reading scrape response")?;
-    if body.len() > HTTP_SCRAPE_MAX_BODY {
-        bail!("scrape response too large ({} bytes)", body.len());
-    }
+    let body = crate::http_client::read_capped(response, HTTP_SCRAPE_MAX_BODY)
+        .await
+        .context("reading scrape response")?;
     parse_http_scrape_response(&body, info_hash)
 }
 
@@ -1336,5 +1335,38 @@ mod tests {
             }
             other => panic!("expected counts from the Debian tracker, got {other:?}"),
         }
+    }
+
+    /// A scrape body over the cap is refused as it arrives, not after it
+    /// has been buffered whole (review #45): one that never ends used to be
+    /// read until the request's timeout.
+    #[tokio::test]
+    async fn a_scrape_body_over_the_cap_is_refused_as_it_arrives() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut head = [0u8; 4096];
+                    let _ = socket.read(&mut head).await;
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                        .await;
+                    let block = [b'd'; 16 * 1024];
+                    while socket.write_all(&block).await.is_ok() {}
+                });
+            }
+        });
+        let url = Url::parse(&format!("http://{addr}/scrape")).unwrap();
+        let started = std::time::Instant::now();
+        let error = scrape_http_inner(&url, &[0u8; 20])
+            .await
+            .expect_err("refused");
+        assert!(format!("{error:#}").contains("too large"), "{error:#}");
+        assert!(
+            started.elapsed() < HTTP_SCRAPE_TIMEOUT,
+            "refused at the cap, not at the timeout"
+        );
     }
 }
