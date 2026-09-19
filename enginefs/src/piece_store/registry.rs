@@ -23,9 +23,12 @@
 //! registry reaches *after* the state does: the `Inner` lives as long as
 //! its last handle, and the errored live state's handle goes when the peer
 //! tasks it cancelled have exited -- milliseconds after `run_state` says
-//! Error. In that gap the hash still answers a set and a delete through it
-//! still goes; nothing here reads the run state, and nothing that reads it
-//! may trust one reading across an unlink.
+//! Error -- and every commit still queued on its committer holds one too,
+//! so the `Inner` stays until the last of those has been flushed: up to a
+//! full queue of fdatasyncs, which on a busy eMMC is seconds. In that gap
+//! the hash still answers a set and a delete through it still goes;
+//! nothing here reads the run state, and nothing that reads it may trust
+//! one reading across an unlink.
 //!
 //! [`PieceStore`]: super::PieceStore
 //! [`PieceStore::held`]: super::PieceStore::held
@@ -107,7 +110,7 @@ impl StoreRegistry {
     /// for `info_hash` holds, or 0 for a hash with no registered store.
     ///
     /// A backend writing into a piece it was told was finished. Zero is the
-    /// only good answer; see `PieceStoreInner::open_for_write`.
+    /// only good answer; see `Inner::open_for_write` in the store.
     pub fn staged_over_held(&self, info_hash: &str) -> u64 {
         self.live(info_hash)
             .map(|inner| inner.staged_over_held())
