@@ -692,10 +692,12 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         // **What must go, and no more.** The disk that nothing else needs
         // is scrub-back: giving it up before something asks for the room
         // buys nothing and costs a re-fetch. So the reclaim is the overhang
-        // over the allowance and nothing else, taken coldest first.
-        let over = (held.len() as u64)
-            .saturating_mul(domain.piece_length)
-            .saturating_sub(available);
+        // over what the disk may hold and nothing else, taken coldest
+        // first -- over the disk's line, not the windows' allowance, which
+        // has the committed set taken off already ([`Asking::overhang`]).
+        //
+        // [`Asking::overhang`]: crate::retention::owner::Asking::overhang
+        let over = asking.overhang(domain.piece_length, held.len());
         let how_many = usize::try_from(over.div_ceil(domain.piece_length.max(1))).unwrap_or(0);
         let (tracked, reclaim) = streams.coldest_of(domain.file_idx, now, &kept, how_many);
         // Who, among this file's readers, the viewer is; see
@@ -2616,6 +2618,65 @@ mod pin_tests {
             "a committed piece was offered for reclaim: {:?}",
             consumers.reclaim
         );
+    }
+
+    /// **The disk settles at the cap, committed set and all.**
+    ///
+    /// The committed set is on the disk whatever is asked, so the windows'
+    /// allowance takes it off -- and the reclaim used to measure its
+    /// overhang against that same allowance, taking it off again: the disk
+    /// settled at the cap less the committed set, and scrub-back a viewer
+    /// could have gone back to was reclaimed early for room nothing
+    /// needed. Passes run here until one reclaims nothing, which is where
+    /// the disk settles.
+    #[test]
+    fn the_disk_settles_at_the_cap_with_the_committed_set_counted_once() {
+        let backing = TorrentBacking {
+            handle: PinnedHandle {
+                reselected: Arc::default(),
+            },
+            info_hash: "pinned".to_string(),
+            live: Arc::new(Live::new()),
+            pinned: Arc::default(),
+            pins_unknown: Arc::default(),
+            refused: Arc::new(AtomicUsize::new(0)),
+            streams: Arc::default(),
+        };
+        let domain = FileDomain {
+            file_idx: 0,
+            span: FilePieceSpan {
+                pieces: 0..20,
+                offset: 0,
+                bytes: 20 * PIECE,
+            },
+            piece_length: PIECE,
+        };
+        let mut held: BTreeSet<u32> = (0..20).collect();
+        let now = std::time::Instant::now();
+        for _ in 0..8 {
+            let consumers = backing.reading(
+                &domain,
+                &held,
+                crate::retention::owner::Asking {
+                    budget: crate::retention::CacheBudget::Bytes(12 * PIECE),
+                    headroom: None,
+                    ceiling: None,
+                    seconds: 90,
+                    holding: Vec::new(),
+                    committed: std::iter::once(0..4).collect(),
+                    margin: 0,
+                    now,
+                },
+            );
+            if consumers.reclaim.is_empty() {
+                break;
+            }
+            for piece in consumers.reclaim {
+                held.remove(&piece);
+            }
+        }
+        assert_eq!(held.len(), 12, "where the disk settled: {held:?}");
+        assert!((0..4).all(|piece| held.contains(&piece)));
     }
 
     #[test]

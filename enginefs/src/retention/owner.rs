@@ -355,10 +355,17 @@ impl Asking {
     ///
     /// **Less the committed set.** Those pieces are on the disk and stay
     /// there whatever the consumers ask for -- a piece offered to a peer is
-    /// out of reach of every reclaim -- so an allowance that did not count
-    /// them let the disk settle at the cap *plus* the committed set, by up
-    /// to `COMMITTED_SECONDS` of film. Masked under the Normal profile,
-    /// whose margin happened to be as large; exposed under Maximum.
+    /// out of reach of every reclaim -- so windows sized to an allowance
+    /// that did not count them let the disk settle at the cap *plus* the
+    /// committed set, by up to `COMMITTED_SECONDS` of film. Masked under
+    /// the Normal profile, whose margin happened to be as large; exposed
+    /// under Maximum.
+    ///
+    /// **This is what the windows may spend, not where the reclaim
+    /// starts.** The committed pieces are in `held` already, so measuring
+    /// the overhang against this took them off twice and the disk settled
+    /// at the cap less the committed set -- scrub-back given up early, for
+    /// nothing. The reclaim reads [`Self::overhang`].
     ///
     /// One computation for every backing, so the scenarios test the same
     /// arithmetic the torrent and the proxy run. `piece` is the piece
@@ -369,6 +376,23 @@ impl Asking {
     /// The other arms are the shapes the type admits, answered the safe way
     /// round -- nothing stated over nothing read is not a licence.
     pub fn allowance(&self, piece: u64, held: usize) -> u64 {
+        self.disk(piece, held)
+            .saturating_sub(self.committed_pieces().saturating_mul(piece))
+    }
+
+    /// **How many bytes of the `held` pieces must go**: what the disk
+    /// holds over what it may hold before the margin. Where the disk
+    /// settles is therefore the cap less the margin, committed pieces
+    /// included -- they are part of what is held, and part of what may be.
+    pub fn overhang(&self, piece: u64, held: usize) -> u64 {
+        (held as u64)
+            .saturating_mul(piece)
+            .saturating_sub(self.disk(piece, held))
+    }
+
+    /// What the whole entity may hold on the disk, committed set and all:
+    /// the cap or the volume, less the margin the fill needs.
+    fn disk(&self, piece: u64, held: usize) -> u64 {
         let held = (held as u64).saturating_mul(piece);
         let available = match (self.budget, self.headroom) {
             (CacheBudget::Unbounded, _) => u64::MAX,
@@ -379,9 +403,7 @@ impl Asking {
         };
         // An allowance that spent the whole budget would sit a stride over
         // it for as long as anything is downloading.
-        available
-            .saturating_sub(self.margin)
-            .saturating_sub(self.committed_pieces().saturating_mul(piece))
+        available.saturating_sub(self.margin)
     }
 
     /// How many pieces the committed set holds.
@@ -2022,18 +2044,38 @@ impl<B: Backing> Retention<B> {
                 .map(|reader| reader.promised.clone())
                 .filter(|range| !range.is_empty())
                 .collect();
-            holding.extend(state.readers.values().filter_map(|reader| {
-                let head = B::index_of(&state.domain, reader.head()?)?;
-                let ahead = u32::try_from(
-                    reader
-                        .buffering
-                        .lookahead_bytes
-                        .div_ceil(B::piece_length(&state.domain)?.max(1)),
-                )
-                .unwrap_or(u32::MAX);
-                Some(head..head.saturating_add(ahead).saturating_add(1))
-            }));
+            let lookaheads: Vec<Range<u32>> = state
+                .readers
+                .values()
+                .filter_map(|reader| {
+                    let head = B::index_of(&state.domain, reader.head()?)?;
+                    let ahead = u32::try_from(
+                        reader
+                            .buffering
+                            .lookahead_bytes
+                            .div_ceil(B::piece_length(&state.domain)?.max(1)),
+                    )
+                    .unwrap_or(u32::MAX);
+                    Some(head..head.saturating_add(ahead).saturating_add(1))
+                })
+                .collect();
+            holding.extend(lookaheads.iter().cloned());
             drop(state);
+            // What the open streams will still fetch: their lookaheads, in
+            // this entity's extent, less what the listing already found.
+            // Only that is still to arrive -- a lookahead piece on the disk
+            // is in `held` and priced there -- and counting the whole
+            // lookahead counted every fetched piece of it twice. Under
+            // `Maximum` a first open's lookahead is the whole cap, so it
+            // was an allowance of nothing for the life of the stream.
+            let extent = B::extent(&domain);
+            let unfetched = lookaheads
+                .iter()
+                .flat_map(|run| run.start.max(extent.start)..run.end.min(extent.end))
+                .filter(|piece| !held.contains(piece))
+                .collect::<BTreeSet<u32>>()
+                .len() as u64;
+            let piece_length = B::piece_length(&domain).unwrap_or(0);
             Asking {
                 budget: begin.budget,
                 headroom: self.budget.headroom(),
@@ -2049,20 +2091,21 @@ impl<B: Backing> Retention<B> {
                 // **What arrives between this pass and the next one.**
                 //
                 // Two readings of the same thing and the larger wins. What
-                // an open reader was granted is what its own stream is
-                // pulling, and it is exact -- when there is one: a reader
-                // that has neither promised nor delivered is not in the
-                // entity's map, and a torrent fills for a file nobody has
-                // read a byte of yet. The stride is what is left then: it
-                // is defined as how far the head may move before another
-                // pass, which is the same interval measured in pieces.
+                // the open readers' streams are still pulling -- their
+                // lookaheads less what is already held, above -- is exact
+                // when there is a reader: one that has neither promised nor
+                // delivered is not in the entity's map, and a torrent fills
+                // for a file nobody has read a byte of yet. The stride is
+                // what is left then: it is defined as how far the head may
+                // move before another pass, which is the same interval
+                // measured in pieces.
                 //
                 // Without it the allowance spends the whole budget, and the
                 // disk sits a stride *over* the line the budget exists to
                 // keep it under.
-                margin: buffering
-                    .lookahead_bytes
-                    .max(u64::from(stride).saturating_mul(B::piece_length(&domain).unwrap_or(0))),
+                margin: unfetched
+                    .max(u64::from(stride))
+                    .saturating_mul(piece_length),
             }
         };
         let consumers = self.backing.reading(&begin.domain, &held, asking);
@@ -5432,6 +5475,73 @@ mod tests {
         );
     }
 
+    /// **A lookahead the stream has already fetched is on the disk once.**
+    ///
+    /// The margin is the room the fill needs before the next pass, and an
+    /// open stream's part of that is what its lookahead has still to bring.
+    /// Counted as the whole lookahead, every piece of it already fetched
+    /// was priced twice -- in what is held, and again as room still owed --
+    /// and the disk settled a lookahead short of the cap. Under `Maximum`
+    /// a first open's lookahead is the cap itself, so that was an
+    /// allowance of nothing: every stream at its floor and all of the
+    /// scrub-back reclaimed on every pass.
+    #[tokio::test]
+    async fn a_fetched_lookahead_is_not_counted_again_as_room_the_fill_needs() {
+        // The proxy's shape, so no committed set stands in the way of
+        // what the allowance alone decides.
+        let backing = Proxy::new([domain(0, 0..16)]);
+        backing.holds(0..16);
+        let budget = Arc::new(RetentionBudget::default());
+        budget.set(Some(10 * PIECE), None);
+        let owner = Retention::new(backing.clone(), budget.clone());
+        let installing = owner.reader(0, domain(0, 0..16));
+        let claim = installing
+            .note((0, 8 * PIECE))
+            .expect("the first byte is due");
+        drop(installing);
+        backing.seek_to(8 * PIECE);
+        // Eight pieces in, reading four ahead, and all of it on the disk.
+        let _reader = owner
+            .reader_on(
+                &0,
+                (0, 8 * PIECE),
+                Buffering {
+                    lookahead_bytes: 4 * PIECE,
+                    ..Buffering::default()
+                },
+            )
+            .expect("the entity the first byte installed");
+        let now = std::time::Instant::now();
+        owner.pass_at(&0, &(), claim, Mode::Live, now).await;
+        for _ in 0..3 {
+            let claim = owner.turn(&0).await.expect("the turn");
+            owner.pass_at(&0, &(), claim, Mode::Live, now).await;
+        }
+        // The cap less a stride of room: the lookahead the fill still owes
+        // is none, so the stride is all the margin there is.
+        let left = backing.on_disk();
+        assert_eq!(left.len(), 9, "where the disk settled: {left:?}");
+
+        // And what it does still owe is room kept for it: the file back on
+        // the disk but for two pieces of the lookahead, so the rest of it
+        // makes room for those.
+        backing.holds(0..16);
+        backing
+            .held
+            .lock()
+            .retain(|piece| *piece != 11 && *piece != 12);
+        for _ in 0..3 {
+            let claim = owner.turn(&0).await.expect("the turn");
+            owner.pass_at(&0, &(), claim, Mode::Live, now).await;
+        }
+        let left = backing.on_disk();
+        assert_eq!(
+            left.len(),
+            8,
+            "the two pieces still to come fit under the cap: {left:?}"
+        );
+    }
+
     /// **A probe's window is kept and not fetched.**
     ///
     /// The other half of the same field bug. A live probe never claimed the
@@ -6030,6 +6140,12 @@ mod tests {
             committed.allowance(1_000, 10),
             3_000,
             "the committed set is on the disk whatever the consumers ask for"
+        );
+        assert_eq!(
+            committed.overhang(1_000, 10),
+            4_000,
+            "and it is part of what is held: the disk gives back what it \
+             holds over the cap, not over the windows' share of it"
         );
     }
 

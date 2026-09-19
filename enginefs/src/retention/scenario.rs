@@ -496,9 +496,7 @@ impl<S: Side> Backing for FakeBacking<S> {
         kept.extend(asking.holding.iter().cloned());
         kept.extend(asking.committed.iter().cloned());
         exempt.publish(&kept);
-        let over = (held.len() as u64)
-            .saturating_mul(domain.piece)
-            .saturating_sub(available);
+        let over = asking.overhang(domain.piece, held.len());
         let how_many = usize::try_from(over.div_ceil(domain.piece.max(1))).unwrap_or(0);
         let (_, reclaim) = streams.coldest_of(domain.file, now, &kept, how_many);
         let at = streams.busiest(domain.file, domain.piece, now);
