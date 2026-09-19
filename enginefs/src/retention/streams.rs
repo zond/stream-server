@@ -853,7 +853,7 @@ impl Streams {
                     let pieces = streams.geometry.at(piece, read.begin)
                         ..=streams.geometry.at(piece, read.end.saturating_sub(1));
                     last = streams.observe(reader, read, held, piece);
-                    streams.ledger.read(pieces, read.returned);
+                    streams.ledger.read(pieces, reader, read.returned);
                 }
             }
             // A pass for a file nothing has described can answer nothing:

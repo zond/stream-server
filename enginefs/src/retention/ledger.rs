@@ -41,9 +41,20 @@ struct Use {
     /// piece nothing has read yet -- lookahead that arrived and has not
     /// been reached.
     read: Option<Instant>,
-    /// How many reads have touched it. One read is no discount; the
-    /// discount is for coming *back*.
+    /// How many visits have read it. One is no discount; the discount is
+    /// for coming *back*.
+    ///
+    /// Visits and not reads: a response reads a 4 MiB piece in sixteen
+    /// 256 KiB reads on one pass through it, and counted per read every
+    /// piece a viewer played once was at the ten-halving ceiling, the
+    /// same as an index read at every seek -- so the discount told
+    /// nothing apart. A visit is a read by a different response from the
+    /// last one that read the piece; one response reads forward, so it
+    /// cannot come back to a piece it has left.
     reads: u32,
+    /// Which response last read it, for telling a visit from the next
+    /// chunk of the same one.
+    reader: u64,
 }
 
 impl Use {
@@ -88,6 +99,7 @@ impl Ledger {
                 fetched: now,
                 read: None,
                 reads: 0,
+                reader: 0,
             });
         }
     }
@@ -98,11 +110,18 @@ impl Ledger {
     /// this is the half of `last_useful` that decides almost everything --
     /// a piece behind the playhead is one that was read, a piece ahead of
     /// it is one that arrived.
-    pub(crate) fn read(&mut self, pieces: std::ops::RangeInclusive<u32>, at: Instant) {
+    ///
+    /// `reader` is the response that served it: a read by the response
+    /// that read the piece last is more of the same visit, and moves only
+    /// the time ([`Use::reads`]).
+    pub(crate) fn read(&mut self, pieces: std::ops::RangeInclusive<u32>, reader: u64, at: Instant) {
         for piece in pieces {
             if let Some(used) = self.by_piece.get_mut(&piece) {
+                if used.read.is_none() || used.reader != reader {
+                    used.reads = used.reads.saturating_add(1);
+                }
                 used.read = Some(at);
-                used.reads = used.reads.saturating_add(1);
+                used.reader = reader;
             }
         }
     }
@@ -167,7 +186,7 @@ mod tests {
         let t0 = Instant::now();
         let mut ledger = Ledger::default();
         ledger.settle(&disk(0..4), t0);
-        ledger.read(1..=1, at(t0, 30));
+        ledger.read(1..=1, 1, at(t0, 30));
 
         let coldest = ledger.coldest(at(t0, 60), |_| false, 4);
         assert_eq!(
@@ -194,9 +213,9 @@ mod tests {
 
         // Piece 1 was last read forty seconds before piece 0 -- older by
         // the plain reading -- but it was read four times and piece 0 once.
-        ledger.read(0..=0, at(t0, 50));
-        for second in [10, 20, 30, 40] {
-            ledger.read(1..=1, at(t0, second));
+        ledger.read(0..=0, 1, at(t0, 50));
+        for (reader, second) in [(2, 10), (3, 20), (4, 30), (5, 40)] {
+            ledger.read(1..=1, reader, at(t0, second));
         }
 
         let coldest = ledger.coldest(at(t0, 100), |_| false, 2);
@@ -206,6 +225,34 @@ mod tests {
             "the piece that keeps being wanted outlives the more recently \
              read one: ninety seconds halved four times is under six, \
              against fifty"
+        );
+    }
+
+    /// **One pass through a piece is one visit, however many reads it
+    /// took.** A response reads a 4 MiB piece in sixteen reads; counted per
+    /// read, a piece played once had the ten-halving ceiling already and
+    /// an index read at every seek could not outlive it.
+    #[test]
+    fn one_pass_through_a_piece_is_one_visit() {
+        let t0 = Instant::now();
+        let mut ledger = Ledger::default();
+        ledger.settle(&disk(0..2), t0);
+
+        // Piece 0 played through once by one response, sixteen reads.
+        for _ in 0..16 {
+            ledger.read(0..=0, 1, at(t0, 50));
+        }
+        // Piece 1, the index, read by three seeks' responses.
+        for (reader, second) in [(2, 10), (3, 20), (4, 30)] {
+            ledger.read(1..=1, reader, at(t0, second));
+        }
+
+        let coldest = ledger.coldest(at(t0, 100), |_| false, 2);
+        assert_eq!(
+            coldest,
+            vec![0, 1],
+            "the index read at every seek outlives the piece played once: \
+             seventy seconds halved twice, against fifty"
         );
     }
 
@@ -231,7 +278,7 @@ mod tests {
         let t0 = Instant::now();
         let mut ledger = Ledger::default();
         ledger.settle(&disk(0..2), t0);
-        ledger.read(0..=0, t0);
+        ledger.read(0..=0, 1, t0);
 
         // Piece 0 goes, and comes back at a later pass.
         ledger.settle(&disk(1..2), at(t0, 10));
