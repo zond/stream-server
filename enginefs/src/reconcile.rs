@@ -2,7 +2,9 @@
 //!
 //! There is one persisted pause bit in the backend and there are two
 //! reasons to pause: nothing is playing it and nobody pinned it, and the
-//! volume the torrent writes to is under [`CACHE_FREE_SPACE_FLOOR`]. A
+//! volume the torrent writes to is under its floor ([`Volumes::floor`],
+//! which is [`crate::free_space_floor`] of the volume's own size, and
+//! [`CACHE_FREE_SPACE_FLOOR`] only on a volume large enough for it). A
 //! starting playback must lift the first and must not lift the second, so
 //! every earlier round of this code kept an in-memory record of *why* a
 //! torrent was paused -- `Engine::idle_paused`,
@@ -355,9 +357,9 @@ pub fn verdict(conditions: &Conditions, trigger: Trigger) -> Verdict {
 /// one.** The ladder asks "should I start this torrent?" and takes its line
 /// from `line`, which is the hysteresis; everything that asks "is this
 /// device short?" -- the statistics a client reads, the stream route's
-/// gate -- asks at [`CACHE_FREE_SPACE_FLOOR`], the same number
-/// `ensure_download_disk_ready` answers `507` under and the published cap
-/// keeps free. Handing the hysteresis to those callers reports a volume the
+/// gate -- asks at the volume's own floor ([`Volumes::floor`]), the same
+/// number `ensure_download_disk_ready` answers `507` under and the
+/// published cap keeps free. Handing the hysteresis to those callers reports a volume the
 /// rest of the server is happy with as out of disk.
 pub fn volume_is_short(
     line: u64,
@@ -452,7 +454,7 @@ struct Reading {
     /// the first probe, and for a volume that will not say its size.
     floor: u64,
     /// The clock reading when this volume was first seen with less than
-    /// [`CACHE_FREE_SPACE_FLOOR`] + [`FREE_SPACE_RESUME_MARGIN`] free.
+    /// its `floor` + [`FREE_SPACE_RESUME_MARGIN`] free.
     ///
     /// That line, and not the floor, because this is the number the stall
     /// bound is judged on: a stopped torrent is not started again until the

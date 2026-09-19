@@ -30,6 +30,17 @@ Two of them were the last of the design dropped in `fbb8d79`: inspect the
 container, guess where its index is, treat those pieces specially. The
 read-pattern detector answers that from behaviour instead.
 
+Three more were still here when the 2026-09-19 review looked (row #50), and
+this entry said otherwise: `cache.rs` (`CachedStream`, with an `unsafe impl
+Sync` on a future it wrapped), `piece_cache.rs` (`PieceCacheManager`) and
+`disk_cache.rs` (`DiskCacheManager`, reached only by a `BackendEngineFS`
+field no constructor filled), together about 650 lines. They went with
+`Engine::data_cache` -- a 64 MB moka cache built per engine that nothing
+ever read or wrote -- and the `moka` dependency that existed for them.
+`BackendMemoryDiagnostics::rust_piece_cache_{entries,bytes}` outlives them
+as two fields that are always zero; they are part of a serialized
+diagnostics shape, so they wait for whoever next changes it.
+
 ### Smaller
 
 * `Consumers::at`, `Streams::busiest`, `Stream::eaten` live only for
