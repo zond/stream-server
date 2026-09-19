@@ -341,6 +341,13 @@ pub(crate) struct FileDomain {
     piece_length: u64,
 }
 
+impl FileDomain {
+    /// The file's first byte within the torrent.
+    pub(crate) fn file_offset(&self) -> u64 {
+        self.span.offset
+    }
+}
+
 /// The torrent side of the retention owner: what one torrent's handle, store
 /// and pin set are to a [`Retention`]. One per engine, keyed by file index.
 ///

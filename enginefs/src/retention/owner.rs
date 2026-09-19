@@ -3160,6 +3160,12 @@ pub struct Reader<B: Backing> {
 }
 
 impl<B: Backing> Reader<B> {
+    /// What the entity this read is on covers: for a torrent's file, where
+    /// the file lies in the torrent. A copy, taken under L2.
+    pub fn domain(&self) -> B::Domain {
+        self.entity.state.lock().domain.clone()
+    }
+
     /// This read will deliver `pieces` off the disk, and until it has,
     /// nothing may unlink them. The range shrinks from the front as
     /// [`Self::note`] reports bytes going out, and is released whole when
