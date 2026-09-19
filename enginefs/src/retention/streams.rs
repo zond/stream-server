@@ -723,18 +723,13 @@ impl FileStreams {
             let target = share(stream.demand(ceiling).saturating_mul(seconds));
             stream.grant(target, floor);
         }
-        let windows = self.windows(piece, now);
-        // What a window covers is what may not be unlinked, so the answer
-        // is published here, where it is known, rather than recomputed at a
-        // door that would have to take this lock to do it. **Here and not
-        // in [`Self::windows`]**: that is also what a pass of *another*
-        // file reads for this one, and a publication from there rewrote
-        // this file's set with its windows alone -- without the promises
-        // its own pass had published beside them. The set is this file's
-        // pass's to write, and the backing overwrites it a call later with
-        // the windows and the promises together.
-        self.exempt.publish(&windows);
-        windows
+        // **Nothing is published here.** What may not be unlinked is the
+        // windows *and* the promises, the lookaheads and the committed set,
+        // and only the backing has all of those: it publishes them together
+        // a call later. A publication of the windows alone, here, cleared
+        // every promise bit for the moment between the two -- a door asked
+        // in that moment let a parked read's piece go.
+        self.windows(piece, now)
     }
 
     /// Where the windows already granted reach, granting nothing.
@@ -2001,6 +1996,27 @@ mod tests {
         assert_eq!(streams.viewer_filling(t0 + Duration::from_secs(600)), None);
     }
 
+    /// **Granting publishes nothing.** The backing publishes what may not
+    /// be unlinked -- windows, promises, lookaheads and the committed set
+    /// together -- once it has all of them. A grant that published its
+    /// windows alone first cleared the rest for the moment between, and a
+    /// door asked then let a parked read's piece go.
+    #[test]
+    fn a_grant_leaves_what_the_backing_published_standing() {
+        let t0 = Instant::now();
+        let mut streams = Streams::default();
+        stream_on(&mut streams, 0, 0, 100, 3_500_000, t0);
+        let exempt = streams.exempt(0, PIECES);
+        // The last pass's publication: a window and a parked read's
+        // promise far from it.
+        exempt.publish(&[100..110, 3_000..3_001]);
+        streams.want(0, 90, u64::MAX, PIECE, t0);
+        assert!(
+            exempt.holds(3_000),
+            "the grant cleared a promise the backing had published"
+        );
+    }
+
     /// **After a seek within one file, the window filling is the new
     /// stream's.** The stream the viewer left stays live for
     /// [`STREAM_DORMANT`] and has eaten far more, so by bytes alone it was
@@ -2366,8 +2382,10 @@ mod tests {
         streams.record(0, 1, read(1_850 * PIECE, 1_850 * PIECE + 262_144, t0, 0));
         streams.observe(0, &held, PIECE, t0);
         let windows = streams.want(0, 90, u64::MAX, PIECE, t0);
-
+        // What the backing does with the answer, beside its promises.
         let exempt = streams.exempt(0, PIECES);
+        exempt.publish(&windows);
+
         let window = windows[0].clone();
         assert!(
             window.clone().all(|piece| exempt.holds(piece)),
@@ -2402,6 +2420,8 @@ mod tests {
         streams.record(7, 1, read(1_850 * PIECE, 1_850 * PIECE + 262_144, t0, 0));
         streams.observe(7, &held, PIECE, t0);
         let windows = streams.want(7, 90, u64::MAX, PIECE, t0);
+        // The backing publishes through the handle it asks for now.
+        streams.exempt(7, PIECES).publish(&windows);
 
         assert!(
             windows[0].clone().all(|piece| exempt.holds(piece)),
