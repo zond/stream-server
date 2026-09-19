@@ -2763,6 +2763,14 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             info_hash = %engine.info_hash,
             "removing an errored torrent nobody is playing and nobody pinned, with its files"
         );
+        // Both halves under the [`RemovalGate`], like the idle sweep's: the
+        // session's torrent and the registry's engine go as one step, so an
+        // add that runs between them is not handed the torrent that is
+        // going (see `Self::publish_added`). The pin lock above stops a pin
+        // or unpin of this hash; it says nothing about a `.torrent`
+        // `/create` or a stream's magnet add, which take no pin lock.
+        let gate = self.removal_gate.clone();
+        let held = gate.lock().await;
         if let Err(error) = self
             .backend
             .remove_torrent_and_files(&engine.info_hash)
@@ -2776,6 +2784,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             return;
         }
         self.remove_engine_if_current(engine).await;
+        drop(held);
     }
 
     /// Every entity nobody is playing and nobody is reading, taken off the
@@ -3799,10 +3808,17 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 && !engine.is_pinned()
                 && !self.torrent_activity_registers(info_hash, &engine).await;
             if added_by_this_pin {
+                // Under the [`RemovalGate`], for the same reason the idle
+                // sweep's removal is: the registry entry and the session's
+                // torrent are two instants, and an add between them is
+                // handed the torrent this refusal is dropping.
+                let gate = self.removal_gate.clone();
+                let held = gate.lock().await;
                 self.remove_engine_if_current(&engine).await;
                 if let Err(e) = self.backend.remove_torrent(info_hash).await {
                     debug!(info_hash, error = %e, "could not drop the torrent added for a refused pin");
                 }
+                drop(held);
             }
             return Err(error);
         }
@@ -4089,13 +4105,18 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             );
             return false;
         }
+        // Asked and answered under the [`RemovalGate`]: "does the session
+        // still hold it?" and the removal that follows are one step, and an
+        // add in between is handed the torrent that is going.
+        let gate = self.removal_gate.clone();
+        let held = gate.lock().await;
         if self.backend.get_torrent(info_hash).await.is_some() {
             // Not dormant at all: the registry lost the engine but the
             // session still holds the torrent. It goes through the backend,
             // whose delete removes the torrent first and releases the
             // pieces through its storage -- never by hand, behind a
             // have-set that would go on advertising them.
-            return match self.backend.remove_torrent_and_files(info_hash).await {
+            let removed = match self.backend.remove_torrent_and_files(info_hash).await {
                 Ok(()) => {
                     tracing::info!(info_hash, file_idx, "download_deleted_through_the_session");
                     true
@@ -4110,7 +4131,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     false
                 }
             };
+            drop(held);
+            return removed;
         }
+        drop(held);
         // Asked at the door, because every question above it was an
         // `await` ago: a torrent added, restored or restarted since is one
         // whose store registered at `init`, and deleting its directory
@@ -4355,6 +4379,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             }
             return deleted;
         }
+        // The registry entry and the session's torrent go as one step,
+        // under the [`RemovalGate`]: an add in between is handed the
+        // torrent this delete is taking (see `Self::publish_added`). The
+        // hash's pin lock, which the caller holds, stops another pin or
+        // unpin and nothing else.
+        let gate = self.removal_gate.clone();
+        let _held = gate.lock().await;
         self.remove_engine_if_current(engine).await;
         match self
             .backend
@@ -5439,10 +5470,10 @@ mod tests {
         /// `add_hold`, standing in for metadata still resolving.
         hold_add: Arc<AtomicBool>,
         add_hold: Arc<tokio::sync::Semaphore>,
-        /// Test knob: park the next `remove_torrent_and_files` call, the
-        /// way `FakeCounters::advertise_gate` parks a pass. The fake sends
-        /// on the first channel as it enters the call and waits on the
-        /// second before returning, so a test can ask what a pin does
+        /// Test knob: park the next removal -- of either kind -- the way
+        /// `FakeCounters::advertise_gate` parks a pass. The fake sends on
+        /// the first channel as it enters the call and waits on the second
+        /// before returning, so a test can ask what a pin or an add does
         /// while a removal is inside the backend. Runs once and is gone.
         remove_gate: Arc<Mutex<Option<Gate>>>,
         /// The last thing `set_upload_enabled` was told; `None` before the
@@ -5458,6 +5489,16 @@ mod tests {
     );
 
     impl FakeBackend {
+        /// Parked inside a removal, if a test asked for it: see
+        /// [`FakeBackend::remove_gate`].
+        async fn park_at_the_remove_gate(&self) {
+            let gate = self.remove_gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
+        }
+
         fn new(handles: Vec<FakeHandle>) -> Self {
             Self {
                 handles,
@@ -5520,6 +5561,7 @@ mod tests {
         }
 
         async fn remove_torrent(&self, info_hash: &str) -> Result<()> {
+            self.park_at_the_remove_gate().await;
             self.removed.lock().unwrap().push(info_hash.to_string());
             Ok(())
         }
@@ -5529,13 +5571,7 @@ mod tests {
         }
 
         async fn remove_torrent_and_files(&self, info_hash: &str) -> Result<()> {
-            // Parked inside the call, if a test asked for it: see
-            // `FakeBackend::remove_gate`.
-            let gate = self.remove_gate.lock().unwrap().take();
-            if let Some((entered, release)) = gate {
-                let _ = entered.send(());
-                let _ = release.await;
-            }
+            self.park_at_the_remove_gate().await;
             self.removed_with_files
                 .lock()
                 .unwrap()
@@ -17497,6 +17533,191 @@ mod tests {
         assert_eq!(enginefs.backend.adds.load(Ordering::SeqCst), 0);
         assert!(enginefs.pending_magnet_add(base32).await.is_none());
         assert!(enginefs.failed_magnet_add(base32).await.is_none());
+    }
+
+    /// Park the backend inside its next removal, and answer the channel
+    /// that lets it finish.
+    fn park_the_next_removal(
+        enginefs: &BackendEngineFS<FakeBackend>,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *enginefs.backend.remove_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    /// A `.torrent` add running while `removal` is parked inside the
+    /// backend: it must wait for the removal rather than publish the
+    /// torrent that is going, and then add the torrent again.
+    async fn an_add_waits_for_the_removal(
+        enginefs: &Arc<BackendEngineFS<FakeBackend>>,
+        entered: tokio::sync::oneshot::Receiver<()>,
+        release: tokio::sync::oneshot::Sender<()>,
+        removal: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let removal = tokio::spawn(removal);
+        tokio::time::timeout(TEST_WAIT_BOUND, entered)
+            .await
+            .expect("the removal reached the backend")
+            .expect("the fake said so");
+        let adds_before = enginefs.backend.adds.load(Ordering::SeqCst);
+
+        let add = tokio::spawn({
+            let enginefs = enginefs.clone();
+            async move {
+                enginefs
+                    .add_torrent(TorrentSource::Bytes(Vec::new()), None)
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !add.is_finished(),
+            "the add waits for the removal instead of publishing the torrent it is taking"
+        );
+
+        // The removal takes the torrent out of the session and finishes.
+        enginefs.backend.hide_torrents.store(true, Ordering::SeqCst);
+        release.send(()).expect("the removal is waiting on this");
+        removal.await.expect("the removal task");
+        add.await.expect("the add task").expect("the add");
+        assert_eq!(
+            enginefs.backend.adds.load(Ordering::SeqCst),
+            adds_before + 2,
+            "the torrent the removal took is added again"
+        );
+    }
+
+    /// **The errored torrent's removal is one step to an add too** (review
+    /// #95). It holds the hash's pin lock, which stops a pin and an unpin
+    /// and nothing else: a `.torrent` `/create` or a stream's magnet add in
+    /// the gap between the session's removal and the registry's was handed
+    /// the torrent that was going.
+    #[tokio::test(start_paused = true)]
+    async fn an_add_under_an_errored_torrents_removal_waits_and_adds_again() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        nothing_torrent_is_playing(&enginefs);
+        counters.in_error_state.store(true, Ordering::SeqCst);
+        let enginefs = Arc::new(enginefs);
+        let (entered, release) = park_the_next_removal(&enginefs);
+        let removal = {
+            let enginefs = enginefs.clone();
+            async move {
+                enginefs.reconcile_tick().await;
+            }
+        };
+        an_add_waits_for_the_removal(&enginefs, entered, release, removal).await;
+    }
+
+    /// **And the torrent a refused pin drops.** `pin_download` holds the
+    /// pin lock while it drops the torrent its own add created, so no pin
+    /// races it -- but the drop is the same two instants, and a stream or a
+    /// `/create` fits between them.
+    #[tokio::test(start_paused = true)]
+    async fn an_add_under_a_refused_pins_drop_waits_and_adds_again() {
+        let root = tempfile::tempdir().unwrap();
+        let counters = Arc::new(FakeCounters::default());
+        let handle = FakeHandle {
+            info_hash: TEST_HASH.to_string(),
+            counters,
+            files: vec![BackendFileInfo {
+                name: "video-0.mkv".to_string(),
+                length: 100,
+            }],
+            init: FakeInit::new(true, Duration::from_secs(60)),
+        };
+        let mut enginefs = BackendEngineFS::new_with_backend(
+            FakeBackend::new(vec![handle]),
+            HashMap::new(),
+            root.path().join("cache"),
+            root.path().join("downloads"),
+        );
+        // No room, so the pin is refused and drops the torrent it added.
+        enginefs.set_free_space_probe(|_| Ok(0));
+        let enginefs = Arc::new(enginefs);
+        let (entered, release) = park_the_next_removal(&enginefs);
+        let removal = {
+            let enginefs = enginefs.clone();
+            async move {
+                let refused = enginefs.pin_download(TEST_HASH, 0, None).await;
+                assert!(
+                    matches!(refused, Err(PinDownloadError::InsufficientSpace { .. })),
+                    "the pin is refused for want of space"
+                );
+            }
+        };
+        an_add_waits_for_the_removal(&enginefs, entered, release, removal).await;
+    }
+
+    /// **And the whole-torrent delete an unpin makes.** It runs under the
+    /// pin lock as well, and the same two instants are the same gap.
+    #[tokio::test(start_paused = true)]
+    async fn an_add_under_a_download_delete_waits_and_adds_again() {
+        let (enginefs, _counters) = test_enginefs_with_file_count(1);
+        nothing_torrent_is_playing(&enginefs);
+        let enginefs = Arc::new(enginefs);
+        let (entered, release) = park_the_next_removal(&enginefs);
+        let removal = {
+            let enginefs = enginefs.clone();
+            async move {
+                let outcome = enginefs
+                    .unpin_download(TEST_HASH, 0, true)
+                    .await
+                    .expect("the delete");
+                assert!(outcome.deleted_files, "the torrent went with its files");
+            }
+        };
+        an_add_waits_for_the_removal(&enginefs, entered, release, removal).await;
+    }
+
+    /// **And the delete of a pin the session turns out to hold.** The
+    /// registry has no engine, so the add path cannot see the torrent at
+    /// all; it is handed the one the session is about to drop.
+    #[tokio::test(start_paused = true)]
+    async fn an_add_under_a_dormant_pins_delete_waits_and_adds_again() {
+        let root = tempfile::tempdir().unwrap();
+        let counters = Arc::new(FakeCounters::default());
+        let handle = FakeHandle {
+            info_hash: TEST_HASH.to_string(),
+            counters,
+            files: vec![BackendFileInfo {
+                name: "video-0.mkv".to_string(),
+                length: 100,
+            }],
+            init: FakeInit::new(true, Duration::from_secs(60)),
+        };
+        // The backend holds the torrent, the registry knows nothing of it,
+        // and the embedder named a pin for it: a "dormant" pin the session
+        // turns out to have.
+        let enginefs = Arc::new(BackendEngineFS::new_with_backend(
+            FakeBackend::new(vec![handle]),
+            HashMap::new(),
+            root.path().join("cache"),
+            root.path().join("downloads"),
+        ));
+        enginefs
+            .apply_pins(Some(BTreeMap::from([(
+                TEST_HASH.to_string(),
+                vec![0usize],
+            )])))
+            .await;
+        let (entered, release) = park_the_next_removal(&enginefs);
+        let removal = {
+            let enginefs = enginefs.clone();
+            async move {
+                let outcome = enginefs
+                    .unpin_download(TEST_HASH, 0, true)
+                    .await
+                    .expect("the delete");
+                assert!(outcome.unpinned && outcome.deleted_files, "{outcome:?}");
+            }
+        };
+        an_add_waits_for_the_removal(&enginefs, entered, release, removal).await;
     }
 
     /// **A magnet add's timeout does not remove a torrent another add
