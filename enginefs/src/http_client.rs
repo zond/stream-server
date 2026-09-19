@@ -95,6 +95,33 @@ pub fn http_client_builder() -> reqwest::ClientBuilder {
     )
 }
 
+/// A response body read whole, but never more than `max` bytes of it.
+///
+/// `Response::bytes` and `text` buffer whatever the far end sends before
+/// anybody can look at the length, so a cap checked afterwards bounds
+/// nothing: the whole body is already in memory, and a body that never ends
+/// is read until the client's timeout. Refused at once on a declared
+/// `Content-Length` over the cap, and otherwise at the first chunk that
+/// crosses it.
+pub(crate) async fn read_capped(
+    mut response: reqwest::Response,
+    max: usize,
+) -> anyhow::Result<Vec<u8>> {
+    if let Some(declared) = response.content_length()
+        && declared > max as u64
+    {
+        anyhow::bail!("response too large ({declared} bytes declared, {max} allowed)");
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > max {
+            anyhow::bail!("response too large (over {max} bytes)");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// Extra trust anchors for tests that need an HTTPS origin that *verifies*.
 ///
 /// `server`'s proxy tests stand up a real TLS listener, and several of them
