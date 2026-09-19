@@ -657,6 +657,10 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     /// torrent must not be raced by an unpin that deletes its data; entries
     /// live only while a call holds or waits for them.
     pin_locks: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Held across a removal of a torrent from the registry *and* the
+    /// session, and across every add's "is the torrent I was handed still
+    /// in the session?" and its publication. See [`RemovalGate`].
+    removal_gate: RemovalGate,
     /// Pins the embedder named for torrents the backend did not have at
     /// startup (see [`Self::apply_pins`]): held here for the life of the
     /// process and applied by whatever next puts an engine for the torrent
@@ -723,7 +727,27 @@ struct EngineParts {
     live: Arc<crate::retention::live::Live>,
     pins_unknown: Arc<crate::piece_store::PinsUnknown>,
     dormant_pins: DormantPins,
+    removal_gate: RemovalGate,
 }
+
+/// Held by whatever takes a torrent out of the registry and then out of
+/// the session, for the whole of both, and by every add for the moment it
+/// checks that the torrent it was handed is still in the session and
+/// publishes it.
+///
+/// The two halves of a removal are two instants with an await between
+/// them, and an add that runs in that gap is handed the torrent that is
+/// about to go: the backend's add of a torrent it already manages answers
+/// with that torrent (librqbit's `AlreadyManaged`), the registry no longer
+/// has an engine for the hash, and the add publishes a new engine around a
+/// torrent the removal then deletes with its files. A stream on it fails
+/// its reads; a pin on it is told `Ok` about a download that is gone. With
+/// the gate the add waits for the removal to finish, finds the torrent
+/// gone from the session, and adds it again. One gate rather than one per
+/// hash: an add holds it for a lookup and a registration, and a removal
+/// for one torrent's deletion, so the wait it can impose on an unrelated
+/// add is one torrent's removal, and removals are rare.
+type RemovalGate = Arc<tokio::sync::Mutex<()>>;
 
 /// The pins waiting for their torrent to come back: see
 /// `BackendEngineFS::dormant_pins`.
@@ -1075,6 +1099,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             upload_switch: Arc::new(tokio::sync::Mutex::new(())),
             magnet_adds: Arc::new(RwLock::new(HashMap::new())),
             pin_locks: parking_lot::Mutex::new(HashMap::new()),
+            removal_gate: RemovalGate::default(),
             dormant_pins: Arc::new(parking_lot::Mutex::new(BTreeMap::new())),
             free_space_probe: Arc::new(|path| match declared_volume_space(path) {
                 Some(bytes) => Ok(bytes),
@@ -1097,6 +1122,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let live_clone = efs.live.clone();
         let active_multifile_files_clone = efs.active_multifile_files.clone();
         let magnet_adds_clone = efs.magnet_adds.clone();
+        let gate_clone = efs.removal_gate.clone();
         let clock = efs.clock;
         let sweep = tokio::spawn(async move {
             loop {
@@ -1264,12 +1290,24 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     // up first, so a touch is the earliest trace any of them
                     // leaves, and a stamp at or after this sweep's `now`
                     // reads as an age of zero.
-                    let mut write = engines_clone.write().await;
-                    let mut removed = Vec::with_capacity(to_remove.len());
+                    //
+                    // **And the two halves of a removal are one step under
+                    // the [`RemovalGate`].** The registry entry going and
+                    // the session's torrent going are two instants with an
+                    // await between them, and an add in that gap -- a
+                    // `.torrent` `/create`, a pin, a stream coming back to
+                    // the torrent -- was handed the torrent about to go
+                    // (`AlreadyManaged`), found no engine, and published
+                    // one around it: the torrent and its files then went,
+                    // under a stream, or under a pin answered `Ok`. Every
+                    // add publishes under the gate and checks the session
+                    // first, so it waits here and then adds again.
                     for engine in to_remove {
-                        let hash = &engine.info_hash;
+                        let held = gate_clone.lock().await;
+                        let mut write = engines_clone.write().await;
+                        let hash = engine.info_hash.clone();
                         let current = write
-                            .get(hash)
+                            .get(&hash)
                             .is_some_and(|current| Arc::ptr_eq(current, &engine));
                         let age_secs = now.saturating_sub(
                             engine
@@ -1283,7 +1321,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                                 .load(std::sync::atomic::Ordering::SeqCst)
                                 == 0
                             && age_secs > INACTIVE_TORRENT_REMOVE_TIMEOUT.as_secs()
-                            && !live_clone.is_torrent(hash);
+                            && !live_clone.is_torrent(&hash);
                         if !still_idle {
                             tracing::debug!(
                                 info_hash = %hash,
@@ -1295,18 +1333,15 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                             continue;
                         }
                         debug!(info_hash = %hash, "Auto-removing inactive engine");
-                        write.remove(hash);
-                        removed.push(engine.info_hash.clone());
-                    }
-                    drop(write);
+                        write.remove(&hash);
+                        drop(write);
 
-                    // Actually stop the torrents in the backend session,
-                    // and take their bytes with them: an engine nothing has
-                    // asked about for five minutes is one whose entities
-                    // the slack passes have already emptied, and what it
-                    // leaves behind is a directory nothing in this process
-                    // has a deleter for once its store is gone.
-                    for hash in removed {
+                        // Actually stop the torrent in the backend session,
+                        // and take its bytes with it: an engine nothing has
+                        // asked about for five minutes is one whose entities
+                        // the slack passes have already emptied, and what it
+                        // leaves behind is a directory nothing in this process
+                        // has a deleter for once its store is gone.
                         if let Err(e) = backend_clone.remove_torrent_and_files(&hash).await {
                             tracing::warn!(
                                 info_hash = %hash,
@@ -1321,6 +1356,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                                 "Removed inactive torrent from backend"
                             );
                         }
+                        drop(held);
                     }
                 }
             }
@@ -2056,6 +2092,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             live: self.live.clone(),
             pins_unknown: self.pins_unknown.clone(),
             dormant_pins: self.dormant_pins.clone(),
+            removal_gate: self.removal_gate.clone(),
         }
     }
 
@@ -2137,8 +2174,58 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     ) -> Result<Arc<Engine<B::Handle>>> {
         let trackers = self.merged_trackers(extra_trackers).await;
         debug!(count = trackers.len(), "Adding torrent with trackers");
-        let handle = self.backend.add_torrent(source, trackers).await?;
-        Ok(Self::register_engine(&self.engines, handle, self.engine_parts()).await)
+        let handle = self
+            .backend
+            .add_torrent(source.clone(), trackers.clone())
+            .await?;
+        Self::publish_added(
+            &*self.backend,
+            &self.engines,
+            handle,
+            self.engine_parts(),
+            || self.backend.add_torrent(source.clone(), trackers.clone()),
+        )
+        .await
+    }
+
+    /// Publish the engine for a torrent the backend has just added, under
+    /// the [`RemovalGate`]: if a removal took the torrent out of the
+    /// session after the backend handed it over -- the add ran in the gap
+    /// between a removal's registry half and its session half, and was
+    /// given the torrent that was going -- it is added again with
+    /// `add_again` rather than published dead. Once: a torrent that is
+    /// gone again straight after its re-add is published as it stands,
+    /// which is what every add did before the gate.
+    async fn publish_added<E, F, Fut>(
+        backend: &B,
+        engines: &EngineRegistry<B::Handle>,
+        mut handle: B::Handle,
+        parts: EngineParts,
+        mut add_again: F,
+    ) -> Result<Arc<Engine<B::Handle>>, E>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<B::Handle, E>>,
+    {
+        let gate = parts.removal_gate.clone();
+        let mut readded = false;
+        loop {
+            let held = gate.lock().await;
+            if readded || backend.get_torrent(&handle.info_hash()).await.is_some() {
+                let engine = Self::register_engine(engines, handle, parts).await;
+                drop(held);
+                return Ok(engine);
+            }
+            // Not re-added under the gate: a magnet's add waits for
+            // metadata, and every other add and removal would wait with it.
+            drop(held);
+            debug!(
+                info_hash = %handle.info_hash(),
+                "the torrent this add was handed was removed under it; adding it again"
+            );
+            handle = add_again().await?;
+            readded = true;
+        }
     }
 
     /// Existing engine for `info_hash`, or the in-flight magnet add for it --
@@ -2323,36 +2410,19 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             let hash = info_hash.clone();
             let trackers = trackers.clone();
             tokio::spawn(async move {
-                let source = TorrentSource::Url(format!("magnet:?xt=urn:btih:{hash}"));
-                let add = backend.add_torrent_placed(source, trackers.to_vec(), placement);
-                match tokio::time::timeout(METADATA_RESOLVE_TIMEOUT, add).await {
-                    Ok(Ok(handle)) => Ok(Self::register_engine(&engines, handle, parts).await),
-                    Ok(Err(error)) => Err(MagnetAddError::Backend {
-                        info_hash: hash,
-                        error: Arc::new(error),
-                    }),
-                    Err(_elapsed) => {
-                        // librqbit's `add_torrent` is not cancel-safe: dropping
-                        // it mid-way can leave the torrent inserted in the
-                        // session but never `start()`ed, so a retry would get
-                        // `AlreadyManaged` for a torrent that will never
-                        // resolve and the hash would be stuck. Best-effort
-                        // removal; the torrent usually does not exist yet, so
-                        // an error here is the normal case and is not
-                        // reported.
-                        if let Err(error) = backend.remove_torrent(&hash).await {
-                            debug!(
-                                info_hash = %hash,
-                                %error,
-                                "nothing to remove from the backend after metadata timeout"
-                            );
-                        }
-                        Err(MagnetAddError::MetadataTimeout {
-                            info_hash: hash,
-                            timeout: METADATA_RESOLVE_TIMEOUT,
-                        })
-                    }
-                }
+                let gate = parts.removal_gate.clone();
+                let add_bounded = || {
+                    Self::add_magnet_bounded(
+                        &backend,
+                        &engines,
+                        &gate,
+                        &hash,
+                        &trackers,
+                        placement.clone(),
+                    )
+                };
+                let handle = add_bounded().await?;
+                Self::publish_added(&*backend, &engines, handle, parts, add_bounded).await
             })
         };
         let abort = add.abort_handle();
@@ -2414,6 +2484,65 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             id,
             abort,
             joiners: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// The backend half of a magnet add, bounded by
+    /// [`METADATA_RESOLVE_TIMEOUT`].
+    async fn add_magnet_bounded(
+        backend: &Arc<B>,
+        engines: &EngineRegistry<B::Handle>,
+        gate: &RemovalGate,
+        hash: &str,
+        trackers: &[String],
+        placement: TorrentPlacement,
+    ) -> Result<B::Handle, MagnetAddError> {
+        let source = TorrentSource::Url(format!("magnet:?xt=urn:btih:{hash}"));
+        let add = backend.add_torrent_placed(source, trackers.to_vec(), placement);
+        match tokio::time::timeout(METADATA_RESOLVE_TIMEOUT, add).await {
+            Ok(Ok(handle)) => Ok(handle),
+            Ok(Err(error)) => Err(MagnetAddError::Backend {
+                info_hash: hash.to_string(),
+                error: Arc::new(error),
+            }),
+            Err(_elapsed) => {
+                // librqbit's `add_torrent` is not cancel-safe: dropping
+                // it mid-way can leave the torrent inserted in the
+                // session but never `start()`ed, so a retry would get
+                // `AlreadyManaged` for a torrent that will never
+                // resolve and the hash would be stuck. Best-effort
+                // removal; the torrent usually does not exist yet, so
+                // an error here is the normal case and is not
+                // reported.
+                //
+                // **Unless another add has published the hash meanwhile.**
+                // A `.torrent` add (`Self::add_torrent`) does not go through
+                // the magnet registry, and the torrent it put in the session
+                // and published is not this timeout's to remove: removed
+                // here, its engine went on wrapping a torrent the session
+                // no longer had. Asked and removed under the
+                // [`RemovalGate`], so an add that lands in between either
+                // published first (and is seen here) or waits and finds
+                // the torrent gone, and adds it again.
+                let held = gate.lock().await;
+                if engines.read().await.contains_key(hash) {
+                    debug!(
+                        info_hash = %hash,
+                        "another add published the torrent while this one timed out; left alone"
+                    );
+                } else if let Err(error) = backend.remove_torrent(hash).await {
+                    debug!(
+                        info_hash = %hash,
+                        %error,
+                        "nothing to remove from the backend after metadata timeout"
+                    );
+                }
+                drop(held);
+                Err(MagnetAddError::MetadataTimeout {
+                    info_hash: hash.to_string(),
+                    timeout: METADATA_RESOLVE_TIMEOUT,
+                })
+            }
         }
     }
 
@@ -5267,6 +5396,8 @@ mod tests {
         removed_with_files: Arc<Mutex<Vec<String>>>,
         /// The placement of every `add_torrent_placed`, in order.
         placements: Arc<Mutex<Vec<TorrentPlacement>>>,
+        /// How many adds of either kind the backend was asked for.
+        adds: Arc<AtomicUsize>,
         /// Test knob: `get_torrent` finds nothing (the torrent is gone from
         /// the session).
         hide_torrents: Arc<AtomicBool>,
@@ -5300,6 +5431,7 @@ mod tests {
                 removed: Arc::new(Mutex::new(Vec::new())),
                 removed_with_files: Arc::new(Mutex::new(Vec::new())),
                 placements: Arc::new(Mutex::new(Vec::new())),
+                adds: Arc::default(),
                 hide_torrents: Arc::new(AtomicBool::new(false)),
                 hold_add: Arc::new(AtomicBool::new(false)),
                 add_hold: Arc::new(tokio::sync::Semaphore::new(0)),
@@ -5322,6 +5454,7 @@ mod tests {
             _source: TorrentSource,
             _trackers: Vec<String>,
         ) -> Result<Self::Handle> {
+            self.adds.fetch_add(1, Ordering::SeqCst);
             let handle = self.handles[0].clone();
             handle.counters.paused.store(false, Ordering::SeqCst);
             Ok(handle)
@@ -5333,6 +5466,7 @@ mod tests {
             _trackers: Vec<String>,
             placement: TorrentPlacement,
         ) -> Result<Self::Handle> {
+            self.adds.fetch_add(1, Ordering::SeqCst);
             let handle = self.handles[0].clone();
             handle.counters.paused.store(false, Ordering::SeqCst);
             self.placements.lock().unwrap().push(placement);
@@ -17183,6 +17317,161 @@ mod tests {
         );
     }
 
+    /// Park the idle sweep inside its backend removal of `TEST_HASH`, the
+    /// engine left untouched for the whole inactivity window. Answers the
+    /// channel that lets the removal finish.
+    async fn park_the_idle_sweeps_removal(
+        enginefs: &BackendEngineFS<FakeBackend>,
+    ) -> tokio::sync::oneshot::Sender<()> {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *enginefs.backend.remove_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        tokio::time::timeout(
+            INACTIVE_TORRENT_REMOVE_TIMEOUT + Duration::from_secs(60),
+            entered_rx,
+        )
+        .await
+        .expect("the sweep reached the backend's removal")
+        .expect("the fake said so");
+        assert!(
+            enginefs.peek_engine(TEST_HASH).await.is_none(),
+            "the registry half of the removal is done"
+        );
+        release_tx
+    }
+
+    /// **An add that lands between the idle sweep's two halves waits, and
+    /// adds the torrent again** (review #42). The sweep took the engine out
+    /// of the registry and was inside the backend's removal when a
+    /// `.torrent` `/create` of the same hash came in: the backend handed it
+    /// the torrent that was going (`AlreadyManaged`), the registry had no
+    /// engine, and the add published one around a torrent the sweep then
+    /// deleted with its files.
+    #[tokio::test(start_paused = true)]
+    async fn a_torrent_add_under_the_idle_sweeps_removal_adds_again() {
+        let (enginefs, _counters) = test_enginefs_with_file_count(1);
+        nothing_torrent_is_playing(&enginefs);
+        let enginefs = Arc::new(enginefs);
+        let release = park_the_idle_sweeps_removal(&enginefs).await;
+
+        let add = tokio::spawn({
+            let enginefs = enginefs.clone();
+            async move {
+                enginefs
+                    .add_torrent(TorrentSource::Bytes(Vec::new()), None)
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !add.is_finished(),
+            "the add waits for the removal instead of publishing the torrent it is taking"
+        );
+        assert_eq!(enginefs.backend.adds.load(Ordering::SeqCst), 1);
+
+        // The removal takes the torrent out of the session and finishes.
+        enginefs.backend.hide_torrents.store(true, Ordering::SeqCst);
+        release.send(()).expect("the removal is waiting on this");
+        let engine = add.await.expect("the add task").expect("the add");
+        assert_eq!(
+            enginefs.backend.adds.load(Ordering::SeqCst),
+            2,
+            "the torrent the removal took is added again"
+        );
+        assert!(Arc::ptr_eq(
+            &enginefs.peek_engine(TEST_HASH).await.expect("published"),
+            &engine
+        ));
+    }
+
+    /// The same gap, reached by a magnet add -- a stream coming back to the
+    /// torrent, or a pin: it too was handed the torrent that was going.
+    #[tokio::test(start_paused = true)]
+    async fn a_magnet_add_under_the_idle_sweeps_removal_adds_again() {
+        let (enginefs, _counters) = test_enginefs_with_file_count(1);
+        nothing_torrent_is_playing(&enginefs);
+        let enginefs = Arc::new(enginefs);
+        let release = park_the_idle_sweeps_removal(&enginefs).await;
+
+        let add = tokio::spawn({
+            let enginefs = enginefs.clone();
+            async move { enginefs.get_or_add_magnet(TEST_HASH, None).await }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!add.is_finished(), "the add waits for the removal");
+
+        enginefs.backend.hide_torrents.store(true, Ordering::SeqCst);
+        release.send(()).expect("the removal is waiting on this");
+        add.await.expect("the add task").expect("the add");
+        assert_eq!(
+            enginefs.backend.adds.load(Ordering::SeqCst),
+            2,
+            "the torrent the removal took is added again"
+        );
+    }
+
+    /// **A magnet add's timeout does not remove a torrent another add
+    /// published meanwhile** (review #43). A `.torrent` add does not go
+    /// through the magnet registry; the timed-out magnet add's best-effort
+    /// `remove_torrent` took that torrent out of the session, and its engine
+    /// went on wrapping a torrent the session no longer had.
+    #[tokio::test(start_paused = true)]
+    async fn a_magnet_timeout_leaves_a_torrent_another_add_published() {
+        let root = tempfile::tempdir().unwrap();
+        let counters = Arc::new(FakeCounters::default());
+        let handle = FakeHandle {
+            info_hash: TEST_HASH.to_string(),
+            counters: counters.clone(),
+            files: vec![BackendFileInfo {
+                name: "video-0.mkv".to_string(),
+                length: 100,
+            }],
+            init: FakeInit::new(true, Duration::from_secs(60)),
+        };
+        let enginefs = Arc::new(BackendEngineFS::new_with_backend(
+            FakeBackend::new(vec![handle]),
+            HashMap::new(),
+            root.path().join("cache"),
+            root.path().join("downloads"),
+        ));
+        enginefs.backend.hold_add.store(true, Ordering::SeqCst);
+
+        let magnet = tokio::spawn({
+            let enginefs = enginefs.clone();
+            async move { enginefs.get_or_add_magnet(TEST_HASH, None).await }
+        });
+        assert!(
+            wait_until(TEST_WAIT_BOUND, || {
+                !enginefs.backend.placements.lock().unwrap().is_empty()
+            })
+            .await,
+            "the magnet add is inside the held backend add"
+        );
+        let published = enginefs
+            .add_torrent(TorrentSource::Bytes(Vec::new()), None)
+            .await
+            .expect("the .torrent add");
+
+        let result = magnet.await.expect("the magnet task");
+        assert!(
+            matches!(result, Err(MagnetAddError::MetadataTimeout { .. })),
+            "the held magnet add times out"
+        );
+        assert!(
+            enginefs.backend.removed.lock().unwrap().is_empty(),
+            "the torrent the other add published stays in the session"
+        );
+        assert!(Arc::ptr_eq(
+            &enginefs
+                .peek_engine(TEST_HASH)
+                .await
+                .expect("still published"),
+            &published
+        ));
+    }
+
     // --- season-pack episode guessing (server.js guessFileIdx parity) ---
 
     fn series(season: usize, episode: usize) -> crate::engine::SeriesInfo {
@@ -17337,8 +17626,10 @@ mod tests {
             }
         }
 
-        async fn get_torrent(&self, _info_hash: &str) -> Option<Self::Handle> {
-            None
+        /// The one torrent this backend adds, as a session that has
+        /// finished adding it answers.
+        async fn get_torrent(&self, info_hash: &str) -> Option<Self::Handle> {
+            (self.handle.info_hash == info_hash).then(|| self.handle.clone())
         }
 
         /// Records the request and answers like librqbit does for a torrent
