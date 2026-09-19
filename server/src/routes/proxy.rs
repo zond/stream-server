@@ -1652,7 +1652,10 @@ async fn proxy(
             break response;
         };
         if hops >= MAX_REDIRECTS {
-            tracing::warn!(url = %url, "too many redirects; giving up");
+            tracing::warn!(
+                target_origin = %url.origin().ascii_serialization(),
+                "too many redirects; giving up"
+            );
             return (StatusCode::BAD_GATEWAY, "Proxy error: too many redirects").into_response();
         }
         chain.stepped_to(&location);
@@ -1670,8 +1673,8 @@ async fn proxy(
                 .collect();
             if !dropped.is_empty() {
                 tracing::warn!(
-                    from = %fetched_url,
-                    to = %location,
+                    from = %fetched_url.origin().ascii_serialization(),
+                    to = %location.origin().ascii_serialization(),
                     headers = ?dropped,
                     "a redirect leaves what this chain may spend the caller's h= \
                      credentials on; not carrying them onto it"
@@ -1679,7 +1682,11 @@ async fn proxy(
             }
         }
         hops += 1;
-        tracing::debug!(from = %fetched_url, to = %location, "following a proxied redirect");
+        tracing::debug!(
+            from = %fetched_url.origin().ascii_serialization(),
+            to = %location.origin().ascii_serialization(),
+            "following a proxied redirect"
+        );
         fetched_url = location;
     };
 
@@ -1787,14 +1794,14 @@ async fn proxy(
     if is_playlist && encoded_body {
         tracing::warn!(
             content_encoding = %content_encoding,
-            url = %fetched_url,
+            answered_by = %fetched_url.origin().ascii_serialization(),
             "relaying a compressed playlist unrewritten; its segments will bypass the proxy"
         );
     }
     if is_playlist && !whole_body && status.is_success() && method != Method::HEAD {
         tracing::warn!(
             status = %status,
-            url = %fetched_url,
+            answered_by = %fetched_url.origin().ascii_serialization(),
             "relaying part of a playlist unrewritten; its segments will bypass the proxy"
         );
     }
@@ -1872,7 +1879,7 @@ async fn proxy(
                 // wrong answer.
                 Some(reason) => {
                     tracing::warn!(
-                        url = %fetched_url,
+                        answered_by = %fetched_url.origin().ascii_serialization(),
                         status = %status,
                         cached_total = cached.total,
                         content_range = ?res_headers.get(header::CONTENT_RANGE),

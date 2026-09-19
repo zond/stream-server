@@ -1,6 +1,6 @@
 use crate::archives::{self, ArchiveSession, ArchiveSource, CacheConfig};
 use crate::routes::compat;
-use crate::routes::util::parse_range;
+use crate::routes::util::{self, parse_range};
 use crate::state::AppState;
 use axum::{
     Json, Router,
@@ -136,7 +136,7 @@ async fn resolve_source(
         .find(|session| session.source.origin() == url)
     {
         tracing::info!(
-            origin = url,
+            origin = %util::log_origin(url),
             "reusing the archive an existing session holds"
         );
         return Ok(existing.source.clone());
@@ -259,7 +259,9 @@ async fn download_archive<P>(
 where
     P: Fn(&std::path::Path) -> Option<u64> + Clone + Send + 'static,
 {
-    tracing::info!("Downloading archive from URL: {}", url);
+    // The origin, never the URL: an archive link is the caller's and may
+    // carry credentials in its query (see `util::log_origin`).
+    tracing::info!(origin = %util::log_origin(url), "downloading an archive");
     // Without these a download that stalled -- an origin that stopped
     // sending, a link that dropped without a reset -- held its `/create`
     // open for as long as the socket lived.
@@ -272,12 +274,22 @@ where
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     let response = client.get(url).send().await.map_err(|e| {
-        tracing::error!("Failed to fetch URL {}: {}", url, e);
+        // `without_url`, because reqwest's `Display` names the URL it was
+        // fetching -- the caller's, credentials and all.
+        tracing::error!(
+            origin = %util::log_origin(url),
+            error = %e.without_url(),
+            "failed to fetch the archive"
+        );
         StatusCode::BAD_REQUEST
     })?;
 
     if !response.status().is_success() {
-        tracing::error!("URL {} returned status {}", url, response.status());
+        tracing::error!(
+            origin = %util::log_origin(url),
+            status = %response.status(),
+            "the archive's origin refused"
+        );
         return Err(StatusCode::NOT_FOUND);
     }
 
@@ -287,7 +299,7 @@ where
     let mut room = DownloadRoom::read(probe, cache_config.cache_dir.clone()).await;
     let too_big = || {
         tracing::warn!(
-            url,
+            origin = %util::log_origin(url),
             "the archive would take the cache volume under its free-space floor"
         );
         StatusCode::INSUFFICIENT_STORAGE
@@ -303,7 +315,7 @@ where
     while head.len() < SNIFF_BYTES {
         match content.next().await {
             Some(chunk) => head.extend_from_slice(&chunk.map_err(|e| {
-                tracing::error!("Download stream error: {}", e);
+                tracing::error!(error = %e.without_url(), "download stream error");
                 StatusCode::BAD_GATEWAY
             })?),
             None => break,
@@ -314,7 +326,7 @@ where
         .or_else(|| archives::archive_suffix_from_magic(&head))
         .ok_or_else(|| {
             tracing::warn!(
-                url,
+                origin = %util::log_origin(url),
                 "the URL names no archive format and the bytes are not one"
             );
             StatusCode::UNSUPPORTED_MEDIA_TYPE
@@ -340,7 +352,7 @@ where
             Some(head) => head,
             None => match content.next().await {
                 Some(chunk) => chunk.map_err(|e| {
-                    tracing::error!("Download stream error: {}", e);
+                    tracing::error!(error = %e.without_url(), "download stream error");
                     StatusCode::BAD_GATEWAY
                 })?,
                 None => break,
@@ -353,7 +365,11 @@ where
     }
     async_file.flush().await.map_err(write_error)?;
 
-    tracing::info!("Downloaded {} to {:?}", url, file.path());
+    tracing::info!(
+        origin = %util::log_origin(url),
+        path = ?file.path(),
+        "downloaded an archive"
+    );
     Ok(ArchiveSource::downloaded(
         file,
         url.to_string(),

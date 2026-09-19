@@ -53,6 +53,40 @@ pub(crate) fn parse_range(header: &str, size: u64) -> Option<(u64, u64)> {
     Some((start, end.min(size - 1)))
 }
 
+/// What a caller-supplied URL may appear as in a log: its origin,
+/// `scheme://host:port`, and never its path or query.
+///
+/// `/proxy`'s `d=`, `/ftp`'s and an archive `/create`'s URL are the
+/// caller's, and a signed CDN link or a debrid URL carries the viewer's
+/// credentials in the query -- the log files this process keeps for the
+/// last ten launches are the one place those must not turn up. The origin
+/// is what a field report is read for anyway: which host answered, and
+/// how. A URL that does not parse is `"<unparsed>"` rather than itself:
+/// the reason it did not parse may be exactly the interesting part of it,
+/// and that is no reason to write it down.
+pub(crate) fn log_origin(url: &str) -> String {
+    url::Url::parse(url)
+        .map(|parsed| parsed.origin().ascii_serialization())
+        .unwrap_or_else(|_| "<unparsed>".to_string())
+}
+
+/// The path of a request as a log may carry it: everything under `/proxy`
+/// and `/ftp` is elided to the route itself.
+///
+/// `/proxy` takes its target in the *path* as well as the query (the Core
+/// format is `/proxy/d=<url>&h=<header>/<name>`), so a request span built
+/// from `uri.path()` carried the proxied URL and the caller's `h=` headers
+/// -- `Authorization` among them -- into every line written under that
+/// span. `/ftp` spells its target the same way.
+pub(crate) fn log_path(path: &str) -> &str {
+    for route in ["/proxy", "/ftp"] {
+        if path == route || path.starts_with(&format!("{route}/")) {
+            return route;
+        }
+    }
+    path
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +146,42 @@ mod tests {
         assert_eq!(parse_range("bytes=0-1-2", 10), None);
         assert_eq!(parse_range("bytes=0", 10), None);
         assert_eq!(parse_range("", 10), None);
+    }
+}
+
+#[cfg(test)]
+mod log_redaction_tests {
+    use super::*;
+
+    /// A log may name the host and nothing else of a caller's URL (review
+    /// #17).
+    #[test]
+    fn log_origin_keeps_the_host_and_drops_everything_else() {
+        assert_eq!(
+            log_origin("https://cdn.example.org:8443/film.mkv?token=secret"),
+            "https://cdn.example.org:8443"
+        );
+        assert_eq!(log_origin("http://a.example/x"), "http://a.example");
+        assert_eq!(log_origin("not a url?token=secret"), "<unparsed>");
+    }
+
+    /// And a request span may not carry `/proxy`'s target, which lives in
+    /// the path as well as the query.
+    #[test]
+    fn log_path_elides_the_proxy_and_ftp_targets() {
+        assert_eq!(
+            log_path(
+                "/proxy/d=https%3A%2F%2Fcdn.example%2Ffilm.mkv&h=Authorization%3ABearer%20x/film.mkv"
+            ),
+            "/proxy"
+        );
+        assert_eq!(log_path("/proxy/"), "/proxy");
+        assert_eq!(log_path("/proxy"), "/proxy");
+        assert_eq!(
+            log_path("/ftp/ftp%3A%2F%2Fuser%3Apass%40host%2Ffilm.mkv"),
+            "/ftp"
+        );
+        assert_eq!(log_path("/heartbeat"), "/heartbeat");
+        assert_eq!(log_path("/proxying/x"), "/proxying/x");
     }
 }

@@ -1530,7 +1530,11 @@ pub fn build_router(state: AppState) -> Router {
                 tracing::info_span!(
                     "request",
                     method = %request.method(),
-                    path = request.uri().path(),
+                    // Not the path as it stands: `/proxy` and `/ftp` carry
+                    // the caller's target URL -- and its `h=` headers --
+                    // *in the path*, and this span decorates every line
+                    // those routes write. See `routes::util::log_path`.
+                    path = routes::util::log_path(request.uri().path()),
                 )
             }),
         )
@@ -1630,7 +1634,7 @@ fn build_lan_media_router(state: AppState) -> Router {
                     tracing::info_span!(
                         "lan-request",
                         method = %request.method(),
-                        path = request.uri().path(),
+                        path = routes::util::log_path(request.uri().path()),
                     )
                 })
                 // A span alone is not an event: it decorates the lines a
@@ -1644,7 +1648,7 @@ fn build_lan_media_router(state: AppState) -> Router {
                     lan_media.record_request();
                     tracing::info!(
                         method = %request.method(),
-                        path = %request.uri().path(),
+                        path = %routes::util::log_path(request.uri().path()),
                         peer = %peer_from_request(request)
                             .map_or_else(|| "unknown".to_string(), |peer| peer.to_string()),
                         "LAN media request"
