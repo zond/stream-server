@@ -5886,22 +5886,24 @@ mod tests {
     /// And the other half of that measure: a reader opened to fetch further
     /// ahead than the startup window -- a stream sized from the film's own
     /// bitrate reads far past it -- is still judged over the streaming
-    /// window. Five megabytes of file, so the two can be told apart.
+    /// window. The file is a megabyte longer than that window, sized off the
+    /// constant so the two can be told apart whatever it is.
     #[tokio::test(flavor = "multi_thread")]
     async fn startup_readiness_is_capped_at_the_startup_window_however_far_the_reader_fetches() {
         use crate::backend::TorrentHandle;
         use crate::backend::priorities::Fetching;
+        let startup =
+            crate::backend::priorities::librqbit_stream_lookahead_bytes(Fetching::Streaming);
+        let file_len = startup + 1024 * 1024;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
         let payload = dir.join("payload.bin");
-        write_payload(&payload, 5 * 1024 * 1024).await;
+        write_payload(&payload, file_len as usize).await;
         let (torrent_bytes, _hash) = make_torrent(&payload).await;
         let (_backend, handle) = backend_with_torrent(&dir, &torrent_bytes).await;
         handle.handle.wait_until_initialized().await.unwrap();
 
-        let startup =
-            crate::backend::priorities::librqbit_stream_lookahead_bytes(Fetching::Streaming);
-        let reaching_past_the_file = 5 * 1024 * 1024 + 1;
+        let reaching_past_the_file = file_len + 1;
         assert!(startup < reaching_past_the_file);
         let _reader = handle
             .get_file_reader(0, 0, 100, None, reaching_past_the_file)
@@ -8284,8 +8286,8 @@ mod tests {
     /// window and a 32-piece committed half.
     ///
     /// The window is narrower than the lookahead a stream with no stated
-    /// duration falls back to (`STREAMING_LOOKAHEAD_BYTES`, 4 MiB = 16
-    /// pieces), and it does not have to be wider: the reader is opened with
+    /// duration falls back to (`STREAMING_LOOKAHEAD_BYTES`, 32 MiB, the
+    /// whole of this file), and it does not have to be wider: the reader is opened with
     /// the smaller of that and the window's reach, so what the stream is
     /// about to read -- which librqbit rightly refuses to drop -- is inside
     /// what the policy is keeping anyway. The bound below is the policy's to
@@ -9170,14 +9172,23 @@ mod tests {
         let content = tmp.path().join("content");
         tokio::fs::create_dir_all(&content).await.unwrap();
         let payload = content.join("movie.bin");
-        write_payload(&payload, RETENTION_FILE_BYTES).await;
+        // Sized off what a stream with no stated duration reads ahead
+        // (`STREAMING_LOOKAHEAD_BYTES`), because this is about what is
+        // announced *behind* a playhead: the reader holds its lookahead
+        // whole, so a budget inside one lookahead leaves the policy nothing
+        // to commit and so nothing to announce. Two lookaheads of file
+        // against one and a half of budget.
+        let lookahead = crate::backend::priorities::STREAMING_LOOKAHEAD_BYTES;
+        let file_bytes = 2 * lookahead as usize;
+        let budget = lookahead + lookahead / 2;
+        write_payload(&payload, file_bytes).await;
         let (torrent_bytes, _) =
             make_torrent_with_piece_length(&payload, RETENTION_PIECE as u32).await;
 
         let client_dir = tmp.path().join("client");
         let (efs, client_addr) = streaming_engine_fs(&client_dir).await;
         let store = efs.piece_store();
-        efs.set_cache_budget(Some(RETENTION_BUDGET));
+        efs.set_cache_budget(Some(budget));
 
         let engine = efs
             .add_torrent(TorrentSource::Bytes(torrent_bytes.clone()), None)
@@ -9230,7 +9241,7 @@ mod tests {
 
         // Half the budget is the committed set, and the committed set is
         // the whole of what a peer is ever offered.
-        let committed_pieces = (RETENTION_BUDGET / RETENTION_PIECE / 2) as usize;
+        let committed_pieces = (budget / RETENTION_PIECE / 2) as usize;
         // Every piece the peer has taken off us at any point in the run.
         // Taken as we go, so a piece it got early and we reclaimed later
         // cannot slip past by the peer having dropped it too.
@@ -9238,7 +9249,7 @@ mod tests {
         let mut buf = vec![0u8; 64 * 1024];
         let mut done = 0usize;
         let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
-        while done < RETENTION_FILE_BYTES {
+        while done < file_bytes {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the stream stalled at {done} bytes"
@@ -9279,7 +9290,7 @@ mod tests {
             broken.len()
         );
         assert!(
-            told.len() < (RETENTION_FILE_BYTES as u64 / RETENTION_PIECE) as usize,
+            told.len() < (file_bytes as u64 / RETENTION_PIECE) as usize,
             "the peer was offered the whole torrent, so nothing was ever held back"
         );
 

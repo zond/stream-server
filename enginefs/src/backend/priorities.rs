@@ -157,7 +157,17 @@ pub enum Fetching {
 
 /// What a playing stream reads ahead of itself before a duration has been
 /// stated; see [`Fetching::Streaming`].
-pub const STREAMING_LOOKAHEAD_BYTES: u64 = 4 * 1024 * 1024;
+///
+/// **Eight pieces of the field's 4 MiB, not one.** It was 4 MiB, and the
+/// reader's lookahead is fixed when the reader opens: the viewer's own
+/// connection is opened before mpv has said how long the film is, so that
+/// stream kept a one-piece reach for as long as it lasted. The split depth
+/// is handed to the backend in pieces of that reach (`retention::deadline`),
+/// so a depth of six or eight had nothing to split and the trace reported
+/// a depth that could not bite (review 2026-09-19 #15). At a film's own
+/// rate this is about nine seconds of video, well inside every profile's
+/// window, and what is kept is still the retention pass's to say.
+pub const STREAMING_LOOKAHEAD_BYTES: u64 = 32 * 1024 * 1024;
 
 /// What a download reads ahead of itself, for its whole life; see
 /// [`Fetching::Download`].
@@ -385,19 +395,20 @@ mod tests {
         );
     }
 
-    /// A 4 MiB window inside a 16 MiB piece described a quantity that could
-    /// only read 0% or 100%: on a 7.5 GB torrent at 300 kB/s that is 55
-    /// seconds of "0%" while the download is perfectly healthy. The
-    /// denominator has to be what actually must arrive.
+    /// A window inside one piece described a quantity that could only read
+    /// 0% or 100%: on a 7.5 GB torrent at 300 kB/s that is 55 seconds of
+    /// "0%" while the download is perfectly healthy. The denominator has to
+    /// be what actually must arrive. The piece here is larger than
+    /// [`STREAMING_LOOKAHEAD_BYTES`], which is the case this is about.
     #[test]
     fn initial_window_progress_reports_the_piece_that_must_arrive() {
-        let piece = 16 * 1024 * 1024u64;
+        let piece = 64 * 1024 * 1024u64;
         let file_len = 8 * 1024 * 1024 * 1024u64;
         let have_none = |_: u64| false;
         assert_eq!(
             initial_window_progress(0, file_len, piece, STREAMING_LOOKAHEAD_BYTES, 0, have_none),
             (0, piece),
-            "the window is the piece, not the 4 MiB inside it"
+            "the window is the piece, not the lookahead inside it"
         );
         let have_first = |p: u64| p == 0;
         assert_eq!(
