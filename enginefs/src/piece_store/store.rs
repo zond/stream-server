@@ -238,6 +238,11 @@ pub(super) struct Inner {
     /// flush the way a busy eMMC does, or fails it the way a full one does.
     #[cfg(test)]
     before_sync: Mutex<Option<SyncHook>>,
+    /// Answers for the flush through the cached staged handle, in place of
+    /// the device: how a test makes the handle's own flush fail the way a
+    /// device error or a read-only handle on Windows does.
+    #[cfg(test)]
+    handle_sync: Mutex<Option<SyncHook>>,
 }
 
 #[cfg(test)]
@@ -561,6 +566,8 @@ impl PieceStore {
                 failed_commit: Mutex::new(None),
                 #[cfg(test)]
                 before_sync: Mutex::new(None),
+                #[cfg(test)]
+                handle_sync: Mutex::new(None),
                 #[cfg(test)]
                 opens: AtomicUsize::new(0),
                 #[cfg(test)]
@@ -999,9 +1006,19 @@ impl Inner {
         let injected = Ok(());
         let flushing = Instant::now();
         let index = u64::from(piece);
+        // By name only when the handle itself could not flush -- a read's
+        // handle, which Windows refuses a flush through, or one Android's
+        // FUSE layer no longer honours. Never after the device said no:
+        // on Linux a failed writeback marks the pages clean and consumes
+        // the error, so a second flush through a fresh descriptor answers
+        // 0 over bytes that never reached the device, and the rename below
+        // would put the final name over them.
         let synced = injected.and_then(|()| match handle {
-            Some(file) if file.sync_data().is_ok() => Ok(()),
-            _ => self.chunks.sync_staged(index),
+            Some(file) => match self.sync_handle(piece, &file) {
+                Err(error) if handle_cannot_flush(&error) => self.chunks.sync_staged(index),
+                flushed => flushed,
+            },
+            None => self.chunks.sync_staged(index),
         });
         self.count_sync();
         let sync_ms = flushing.elapsed().as_millis() as u64;
@@ -1304,6 +1321,20 @@ impl Inner {
 
     #[cfg(not(test))]
     fn count_staging_probe(&self) {}
+
+    /// Flush the piece's staged bytes through a handle to them.
+    #[cfg(test)]
+    fn sync_handle(&self, piece: u32, file: &File) -> io::Result<()> {
+        match self.handle_sync.lock().clone() {
+            Some(hook) => hook(piece),
+            None => file.sync_data(),
+        }
+    }
+
+    #[cfg(not(test))]
+    fn sync_handle(&self, _piece: u32, file: &File) -> io::Result<()> {
+        file.sync_data()
+    }
 
     #[cfg(test)]
     fn count_sync(&self) {
@@ -2131,6 +2162,17 @@ fn is_stale_handle(error: &io::Error) -> bool {
         error.raw_os_error(),
         Some(libc_ebadf) if libc_ebadf == 9
     ) || error.kind() == io::ErrorKind::NotFound
+}
+
+/// Whether a flush through a handle failed because of the handle rather
+/// than the device, so that flushing the same file by name is a real
+/// second attempt and not a repeat of one whose error was consumed.
+///
+/// Access denied is Windows refusing `FlushFileBuffers` through a handle
+/// opened for reading; the stale kinds are [`is_stale_handle`]'s. An I/O
+/// error, a full disk or a quota is the device, and is final.
+fn handle_cannot_flush(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::PermissionDenied || is_stale_handle(error)
 }
 
 #[cfg(unix)]
@@ -3293,6 +3335,57 @@ mod tests {
             "the kind reaches librqbit's error: {refused:#}"
         );
         assert!(store.complete_piece(3).is_err());
+    }
+
+    /// **A flush the device refused through the piece's own handle is
+    /// final.** Flushing again by name is not a second opinion on Linux: a
+    /// failed writeback marks the pages clean and hands its error to the
+    /// first descriptor to ask, so a fresh descriptor's `fdatasync` answers
+    /// 0 over bytes that never reached the device -- and the rename would
+    /// then put the final name over them. So the commit fails as a flush,
+    /// and the name never appears.
+    #[test]
+    fn a_handle_flush_the_device_refused_is_not_retried_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        store.seed_from_disk().unwrap();
+        let global = global_bytes(store.layout().total_length());
+        store.pwrite_all(2, 0, &global[16..24]).unwrap();
+        assert!(
+            store.inner.handles.get(2, true).is_some(),
+            "flushed through"
+        );
+        *store.inner.handle_sync.lock() = Some(Arc::new(|_| Err(io::Error::from_raw_os_error(5))));
+        store
+            .complete_piece(2)
+            .expect("accepted before the flush ran");
+        store.wait_for_commits();
+
+        assert!(
+            !store.piece_path(2).exists(),
+            "the final name stands over bytes whose flush failed"
+        );
+        assert!(!store.staging_path(2).exists());
+        assert!(!store.held().unwrap().contains(2));
+        assert!(store.pwrite_all(0, 0, &global[0..2]).is_err());
+    }
+
+    /// And a handle that could not flush *because of the handle* -- Windows
+    /// refuses a flush through one opened for reading -- is flushed again
+    /// by name, and the piece lands.
+    #[test]
+    fn a_handle_that_may_not_flush_is_flushed_again_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        store.seed_from_disk().unwrap();
+        let global = global_bytes(store.layout().total_length());
+        store.pwrite_all(2, 0, &global[16..24]).unwrap();
+        *store.inner.handle_sync.lock() = Some(Arc::new(|_| {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        }));
+        store.complete_piece_and_wait(2).unwrap();
+        assert!(store.has_piece(2));
+        assert_eq!(std::fs::read(store.piece_path(2)).unwrap(), global[16..24]);
     }
 
     /// A read that finds the staged copy while the committer renames it can
