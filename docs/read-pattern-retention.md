@@ -219,8 +219,11 @@ seek is also never-read, so under the blanket rule it outranks everything
 until all read data is gone; here it has an old fetch time, is not wanted, and
 is the first thing evicted.
 
-**Re-read promotion.** Effective age divided by `2^(reads - 1)`, to a ceiling.
-A piece read repeatedly survives longer, which keeps the `moov` -- re-read on
+**Re-read promotion.** Effective age divided by `2^(visits - 1)`, to a
+ceiling. A visit is a read by a different response from the last one that
+read the piece -- counted per read, one pass through a 4 MiB piece was
+sixteen of them and every played piece sat at the ceiling. A piece visited
+repeatedly survives longer, which keeps the `moov` -- re-read on
 every seek -- with nobody knowing where it is. This is what retires the
 container-parsing branch for good: we do not need to find the metadata if the
 reads point at it.
