@@ -974,7 +974,14 @@ async fn head_stream_video_with(
         (0, size.saturating_sub(1), false)
     };
 
-    let content_length = end.saturating_sub(start) + 1;
+    // An empty file is `(0, 0)` with no range, and an inclusive end of 0
+    // is a length of one: a `HEAD` used to promise a byte the `GET` has
+    // not got. (The archive routes answer the same case the same way.)
+    let content_length = if size == 0 {
+        0
+    } else {
+        end.saturating_sub(start) + 1
+    };
     let mut res_headers = header::HeaderMap::new();
     res_headers.insert(
         header::CONTENT_TYPE,
@@ -1293,7 +1300,11 @@ async fn stream_video_with(
         size
     );
 
-    if start >= size {
+    // `size == 0` is not a range that cannot be satisfied: it is a file
+    // with no bytes, and a request without a `Range` for it is a `200` with
+    // an empty body. A request *with* one is already a `416` above --
+    // `parse_range` refuses every range on an empty resource.
+    if size > 0 && start >= size {
         tracing::warn!(
             stream_id,
             info_hash = %info_hash,
