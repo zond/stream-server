@@ -136,12 +136,34 @@ fn format_headers(headers: &axum::http::HeaderMap) -> String {
     out
 }
 
+/// The names of a query string's parameters, without their values:
+/// `d, h, p`.
+///
+/// What is being diagnosed here is a request nothing served, and the shape
+/// of it -- which parameters were sent -- is what says whether the client
+/// called something that no longer exists or spelled a live route wrongly.
+/// The *values* are where a caller's URLs and credentials live (`/proxy`'s
+/// `d=` and `h=`, an archive `/create`'s `lz=`), and this line is written
+/// at ERROR, which is always on. See `routes::util::log_origin` for the
+/// same rule on the routes that do serve those requests.
+fn query_keys(query: Option<&str>) -> String {
+    query
+        .unwrap_or_default()
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| pair.split_once('=').map_or(pair, |(name, _)| name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Emit an ERROR log describing an unhandled route or request (a 404 fallback,
 /// a 405 method mismatch, or a catch-all route that matched but could not be
 /// served) with as much request context as is available: peer address, method,
-/// full URI, HTTP version, the common diagnostic headers broken out as their
-/// own fields, and a dump of every header. Centralised so that every
-/// "we did not serve this" code path logs identically and greppably.
+/// the path (with `/proxy`'s and `/ftp`'s caller-supplied targets elided --
+/// see [`crate::routes::util::log_path`]), the query's parameter names
+/// without their values, HTTP version, the common diagnostic headers broken
+/// out as their own fields, and a dump of every header. Centralised so that
+/// every "we did not serve this" code path logs identically and greppably.
 pub fn log_unhandled(
     reason: &str,
     status: u16,
@@ -168,9 +190,8 @@ pub fn log_unhandled(
         status,
         peer = %peer,
         method = %method,
-        uri = %uri,
-        path = uri.path(),
-        query = uri.query().unwrap_or(""),
+        path = %crate::routes::util::log_path(uri.path()),
+        query_keys = %query_keys(uri.query()),
         version = ?version,
         host = %header_value(&header::HOST),
         user_agent = %header_value(&header::USER_AGENT),

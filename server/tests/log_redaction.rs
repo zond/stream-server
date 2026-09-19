@@ -62,6 +62,7 @@ fn a_caller_supplied_url_is_logged_as_its_origin_only() -> anyhow::Result<()> {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.clone()),
         cache_dir: Some(dir.path().join("cache")),
+        lan_media_addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
         init_logging: true,
         resolve_dht_bootstrap_names: false,
         use_public_trackers: false,
@@ -100,6 +101,30 @@ fn a_caller_supplied_url_is_logged_as_its_origin_only() -> anyhow::Result<()> {
         .send()?;
     assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
 
+    // A request nothing serves, which is logged at ERROR with everything
+    // about it (review #93): the path and the query used to go in whole.
+    let response = client
+        .get(format!(
+            "{base}/no-such-route?d={encoded}&h={}",
+            urlencoding::encode(&format!("Authorization:Bearer {SECRET}"))
+        ))
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    // And one whose *path* carries the target: `/proxy` is not mounted on
+    // the LAN media listener, so a request for it there is unhandled -- and
+    // that path is the Core spelling, target and `h=` headers included.
+    handle.update_settings(serde_json::json!({ "lanMediaEnabled": true }))?;
+    let lan = handle
+        .set_lan_media(true)?
+        .ok_or_else(|| anyhow::anyhow!("the LAN listener answered with no address"))?;
+    let response = client
+        .get(format!(
+            "http://{lan}/proxy/d={encoded}&h={}/film.mkv",
+            urlencoding::encode(&format!("Authorization:Bearer {SECRET}"))
+        ))
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+
     // An archive create, whose download is logged at INFO and whose failure
     // at ERROR.
     let response = client
@@ -116,6 +141,10 @@ fn a_caller_supplied_url_is_logged_as_its_origin_only() -> anyhow::Result<()> {
     assert!(
         logs.contains("too many redirects"),
         "the relay said it gave up: {logs}"
+    );
+    assert!(
+        logs.contains("unhandled request") && logs.contains("query_keys"),
+        "the unhandled request is still reported, with the shape of what was asked: {logs}"
     );
     assert!(
         logs.contains("\"path\":\"/proxy\""),
