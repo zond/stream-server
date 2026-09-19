@@ -9507,14 +9507,45 @@ mod tests {
             done += n;
         }
         drop(reader);
-        // Not waiting for the queued renames to list what landed: the
-        // bucket has to be made unwritable while the download is still
-        // writing into it, and a piece accepted a moment ago may still be
-        // under its staged name.
         assert!(
             store.torrent_dir(&hash).join("0").is_dir(),
             "the bucket exists"
         );
+        // **One piece under its final name before the bucket is shut, and
+        // no more than that.** What this test reads off the disk after the
+        // error is what stands under final names, and a piece is renamed
+        // there by the store's committer thread, a flush after the
+        // completion that made it readable -- so a `chmod` that beat the
+        // first of those left the bucket holding staged copies alone, every
+        // queued rename failing against a directory it could no longer
+        // write, and nothing on the disk for the restart to find. Run
+        // inside the full suite the first rename usually won, which is what
+        // made this a flake rather than a failure (review #91).
+        //
+        // Waiting is bounded to the first one on purpose: the bucket has to
+        // be made unwritable while the download is still writing into it,
+        // and it is the *next* staged file, of the hundred-odd pieces still
+        // to come, that the mode below refuses. The download cannot run
+        // away while this waits, whatever the machine: the commit queue is
+        // eight deep and a completion that finds it full waits for room, so
+        // by the time the first rename has landed the writer is nine
+        // pieces past it at most, out of a hundred and twenty-eight.
+        //
+        // Listed here rather than through `on_disk`, which waits for every
+        // commit queued under the directory first: with the download still
+        // feeding the queue, that is a wait for the whole file.
+        let renamed = std::time::Instant::now() + TEST_WAIT_BOUND;
+        while crate::chunk_store::ChunkDir::new(store.torrent_dir(&hash))
+            .held()
+            .expect("the torrent's directory lists")
+            .is_empty()
+        {
+            assert!(
+                std::time::Instant::now() < renamed,
+                "no completed piece was ever renamed into place"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         // The bucket will take no new file. A process that ignores the mode
         // (root, and some CI containers) cannot be shown this.
