@@ -131,14 +131,24 @@ mod tests {
     /// #47): the caller keeps the top of this list.
     #[tokio::test]
     async fn a_tracker_that_does_not_answer_is_not_ranked() {
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
-                let _ = socket
-                    .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
-                    .await;
+                tokio::spawn(async move {
+                    // The request is read before the answer goes out, and
+                    // the write side is closed rather than dropped: a
+                    // socket dropped with bytes still unread is a reset on
+                    // Windows, and the probe then reads its own answer as
+                    // a tracker that did not answer.
+                    let mut head = [0u8; 1024];
+                    let _ = socket.read(&mut head).await;
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    let _ = socket.shutdown().await;
+                });
             }
         });
         let alive = format!("http://{addr}/announce");
