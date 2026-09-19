@@ -561,6 +561,27 @@ async fn create_session_internal(
         return (StatusCode::BAD_REQUEST, "No archive URL provided").into_response();
     };
 
+    // A key the caller chose (`/{fmt}/create/{key}`) may name a session
+    // that already exists, and replacing it points every later
+    // `/{fmt}/stream/{key}/...` at a different archive: the player that was
+    // reading one file seeks and reads another's bytes. A repeat of the
+    // same `/create` is the ordinary case (a re-play sends it again) and
+    // still lands; one that names a different archive is refused, and the
+    // caller can have a key of its own from `/{fmt}/create`.
+    if let Some(existing) = state.archive_cache.get(&key)
+        && existing.source.origin() != url.as_str()
+    {
+        tracing::warn!(
+            key = %key,
+            "a create under an existing session's key named a different archive; refused"
+        );
+        return (
+            StatusCode::CONFLICT,
+            "That session key is in use for another archive",
+        )
+            .into_response();
+    }
+
     let cache_config = archive_cache_config(&state).await;
     let source = match resolve_source(&state, url, cache_config).await {
         Ok(source) => source,
