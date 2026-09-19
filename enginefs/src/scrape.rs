@@ -385,7 +385,8 @@ pub const SCRAPE_STALE_AFTER: Duration = Duration::from_secs(60 * 60);
 /// Tracker scrapes in flight at once, across every torrent.
 const MAX_CONCURRENT_SCRAPES: usize = 4;
 /// A swarm this large is a tracker bug or a misparse, not a swarm. The value
-/// is logged and left out of the aggregate rather than shown.
+/// is logged once per answer and left out of the aggregate rather than
+/// shown.
 const IMPLAUSIBLE_COUNT: u64 = 100_000;
 /// Cached torrents untouched for this long are forgotten (a torrent nobody
 /// polls has no stats to fill in).
@@ -590,6 +591,15 @@ impl SwarmScraper {
         let entry = torrent.trackers.entry(tracker.to_string()).or_default();
         match outcome {
             ScrapeOutcome::Counts(counts) => {
+                // Said here, once per answer, and not where the aggregate
+                // leaves it out: the aggregate is recomputed on every stats
+                // poll, about once a second, for the hour the answer stays
+                // fresh.
+                for (what, value) in [("seeders", counts.seeders), ("leechers", counts.leechers)] {
+                    if !plausible(value) {
+                        warn!(%tracker, %what, value, "ignoring implausible tracker scrape count");
+                    }
+                }
                 entry.counts = Some((now, counts));
                 entry.failures = 0;
                 entry.next_attempt = Some(now + MIN_SCRAPE_INTERVAL);
@@ -644,8 +654,8 @@ fn aggregate(trackers: &HashMap<String, TrackerScrape>, now: Instant) -> SwarmSn
             continue;
         }
         snapshot.per_tracker.insert(url.clone(), counts);
-        merge_max(&mut snapshot.seeders, counts.seeders, url, "seeders");
-        merge_max(&mut snapshot.leechers, counts.leechers, url, "leechers");
+        merge_max(&mut snapshot.seeders, counts.seeders);
+        merge_max(&mut snapshot.leechers, counts.leechers);
         freshest = Some(freshest.map_or(age, |best| best.min(age)));
     }
     if snapshot.seeders.is_some() || snapshot.leechers.is_some() {
@@ -654,12 +664,16 @@ fn aggregate(trackers: &HashMap<String, TrackerScrape>, now: Instant) -> SwarmSn
     snapshot
 }
 
-fn merge_max(slot: &mut Option<u64>, value: u64, tracker: &str, what: &str) {
-    if value > IMPLAUSIBLE_COUNT {
-        warn!(%tracker, %what, value, "ignoring implausible tracker scrape count");
+/// Left out silently: `record` said so when the answer came in.
+fn merge_max(slot: &mut Option<u64>, value: u64) {
+    if !plausible(value) {
         return;
     }
     *slot = Some(slot.map_or(value, |current: u64| current.max(value)));
+}
+
+fn plausible(value: u64) -> bool {
+    value <= IMPLAUSIBLE_COUNT
 }
 
 #[cfg(test)]
@@ -1135,6 +1149,51 @@ mod tests {
 
     fn one_tracker() -> Vec<String> {
         vec!["udp://a.example:1337/announce".to_string()]
+    }
+
+    /// Counts WARN events, for the thread it is the default on.
+    struct WarnCounter(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl tracing::Subscriber for WarnCounter {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// **An implausible count is warned about once per answer, not once per
+    /// stats poll** (review #48). The aggregate that leaves it out is
+    /// recomputed on every poll -- about once a second, for the hour the
+    /// answer stays fresh -- and warned each time, into logs that are kept.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_implausible_count_is_warned_about_once() {
+        let warns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _default = tracing::subscriber::set_default(WarnCounter(warns.clone()));
+        let transport =
+            FakeTracker::answering(ScrapeOutcome::Counts(counts(IMPLAUSIBLE_COUNT + 1, 2)));
+        let scraper = SwarmScraper::with_transport(transport.clone());
+        let trackers = one_tracker();
+
+        poll(&scraper, &trackers);
+        settle().await;
+        for _ in 0..10 {
+            let snapshot = poll(&scraper, &trackers);
+            assert_eq!(snapshot.seeders, None, "left out");
+            assert_eq!(snapshot.leechers, Some(2));
+        }
+        assert_eq!(transport.calls(), 1);
+        assert_eq!(warns.load(Ordering::SeqCst), 1);
     }
 
     /// A poll every second must not become a scrape every second: one round,
