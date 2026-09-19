@@ -1407,6 +1407,46 @@ fn stats_json_reports_resolving_metadata_with_the_requests_trackers() -> anyhow:
     Ok(())
 }
 
+/// **A big `.torrent` is not a `413`** (review #65). The file arrives
+/// hex-encoded in a JSON body, so axum's default 2 MB limit refused every
+/// torrent over about a megabyte -- a 20,000-piece torrent -- with a status
+/// the client can only read as "the server would not take this file".
+#[test]
+fn a_large_torrent_file_is_not_refused_by_the_body_limit() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_dir.path().join("cache")),
+        ..offline_config()
+    })?;
+    let base = format!("http://{}", handle.http_addr());
+    let client = bearer_client(&handle)?;
+
+    // Well past the old limit: 3 MB of hex, which is a 1.5 MB "torrent".
+    // Not a valid one -- what matters is where the refusal comes from.
+    let big = hex::encode(vec![0u8; 1_500_000]);
+    let response = client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": big }))
+        .send()?;
+    assert_ne!(
+        response.status(),
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+        "the body limit refused a torrent the engine never saw"
+    );
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        "it reached the engine, which refused the bytes themselves"
+    );
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
 /// **A torrent file with no bytes is a `200` with no body** (review #64).
 /// `HEAD` promised `Content-Length: 1` -- the inclusive end of an empty
 /// range saturated to 0 and was read as one byte -- and the `GET` the

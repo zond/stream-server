@@ -554,20 +554,41 @@ impl ProxyCache {
 /// The port has to match too. Loopback alone is not this server: an addon or
 /// a debrid helper a viewer runs on the same machine is a perfectly ordinary
 /// origin, and refusing to cache it would refuse the case the cache is for.
+///
+/// Three spellings reach this listener without being the address it named:
+/// `0.0.0.0` (and `::`), which a client resolves to this host; the
+/// IPv4-mapped form `[::ffff:127.0.0.1]`, which `Ipv6Addr::is_loopback`
+/// answers `false` for; and, when the listener is bound to *every* address,
+/// any address this host's interfaces carry. Each of them used to be cached
+/// as somebody else's bytes, against the same volume's cap that the engine
+/// was already filling.
 fn names_this_server(url: &Url, self_addr: std::net::SocketAddr) -> bool {
+    use std::net::IpAddr;
+
     if url.port_or_known_default() != Some(self_addr.port()) {
         return false;
     }
-    match url.host() {
-        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
-        Some(url::Host::Ipv4(address)) => {
-            address.is_loopback() || self_addr.ip() == std::net::IpAddr::V4(address)
-        }
-        Some(url::Host::Ipv6(address)) => {
-            address.is_loopback() || self_addr.ip() == std::net::IpAddr::V6(address)
-        }
-        None => false,
+    let host = match url.host() {
+        Some(url::Host::Domain(name)) => return name.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => IpAddr::V4(address),
+        // `[::ffff:127.0.0.1]` is 127.0.0.1 in another spelling, and the
+        // rest of this function is about addresses rather than families.
+        Some(url::Host::Ipv6(address)) => address
+            .to_ipv4_mapped()
+            .map_or(IpAddr::V6(address), IpAddr::V4),
+        None => return false,
+    };
+    if host.is_loopback() || host.is_unspecified() || self_addr.ip() == host {
+        return true;
     }
+    // A listener bound to every address answers on every address this host
+    // has, so an addon URL naming the device's LAN address is this server.
+    // Enumerated only here, on the one path where the answer is not already
+    // known.
+    self_addr.ip().is_unspecified()
+        && crate::routes::system::local_ipv4_interfaces()
+            .iter()
+            .any(|iface| IpAddr::V4(iface.addr.ip) == host)
 }
 
 /// One cache key's directory: every entity ever stored for one request
@@ -1395,6 +1416,46 @@ mod tests {
     use axum::http::HeaderMap;
     use enginefs::chunk_store::CHUNKS_PER_DIRECTORY;
     use std::collections::{BTreeSet, HashSet};
+
+    /// **Every spelling that reaches this listener is this server** (review
+    /// #66). Each of these used to be cached as an ordinary origin, so the
+    /// engine's own bytes were written a second time against the volume's
+    /// cap.
+    #[test]
+    fn names_this_server_knows_the_spellings_that_reach_it() {
+        let loopback: std::net::SocketAddr = "127.0.0.1:11470".parse().unwrap();
+        let named = |url: &str, addr: std::net::SocketAddr| {
+            names_this_server(&Url::parse(url).unwrap(), addr)
+        };
+        for url in [
+            "http://127.0.0.1:11470/x",
+            "http://localhost:11470/x",
+            "http://[::1]:11470/x",
+            // A client resolves these to this host.
+            "http://0.0.0.0:11470/x",
+            "http://[::]:11470/x",
+            // 127.0.0.1 with an IPv6 face on.
+            "http://[::ffff:127.0.0.1]:11470/x",
+        ] {
+            assert!(named(url, loopback), "{url}");
+        }
+        // Another server on this machine is an ordinary origin, and so is
+        // this one's own address on a port it does not serve.
+        assert!(!named("http://127.0.0.1:9000/x", loopback));
+        assert!(!named("http://example.org:11470/x", loopback));
+
+        // Bound to every address, every address this host carries is it.
+        let every: std::net::SocketAddr = "0.0.0.0:11470".parse().unwrap();
+        for iface in crate::routes::system::local_ipv4_interfaces() {
+            let url = format!("http://{}:11470/x", iface.addr.ip);
+            assert!(named(&url, every), "{url}");
+            assert!(
+                iface.addr.ip.is_loopback() || !named(&url, loopback),
+                "a listener on loopback does not answer on {}",
+                iface.addr.ip
+            );
+        }
+    }
 
     /// The entity directory as the store sees it.
     fn chunks(dir: &Path) -> ChunkDir {
