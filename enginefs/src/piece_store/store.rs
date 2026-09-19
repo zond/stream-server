@@ -1238,19 +1238,26 @@ impl Inner {
         Ok(())
     }
 
-    /// Drop every cached handle of a piece: its files are about to be
-    /// renamed, deleted or shadowed.
-    /// The staged copy's length when it is a shadow -- shorter than its
-    /// piece while the store holds the piece -- and `None` when it is the
-    /// copy to read. See [`Self::open_for_read`].
+    /// The staged copy's length when it is a shadow -- shorter than a
+    /// whole copy of its piece while the store holds the piece -- and
+    /// `None` when it is the copy to read. See [`Self::open_for_read`].
+    ///
+    /// Whole means [`PieceLayout::written_length_of`], not the piece's
+    /// length: librqbit never writes a BEP-47 padding tail, so a padded
+    /// piece fetched again in full is exactly its payload long. Measured
+    /// against the piece's length it read as a shadow for ever, its own
+    /// hash check was served the old complete copy and passed, and the
+    /// new, unchecked staged bytes were renamed in as verified.
     fn shadowing(&self, piece: u32, staged: &File) -> Option<u64> {
         if !self.held.holds(piece) {
             return None;
         }
         let len = staged.metadata().ok()?.len();
-        (len < self.layout.piece_length_of(piece)).then_some(len)
+        (len < self.layout.written_length_of(piece)).then_some(len)
     }
 
+    /// Drop every cached handle of a piece: its files are about to be
+    /// renamed, deleted or shadowed.
     fn forget_handles(&self, piece: u32) {
         self.handles.forget(u64::from(piece));
     }
@@ -1438,7 +1445,8 @@ impl Inner {
     /// re-download of a held piece -- one the initial check rejected, whose
     /// held bit was seeded from the disk before the check ran -- is only
     /// read by its own hash check, which runs once every chunk is written
-    /// and so finds it full length. So a short staged copy of a held piece
+    /// and so finds it full length -- as long as its payload, for a piece
+    /// with a padding tail nobody writes. So a short staged copy of a held piece
     /// is passed over for the complete one, which is opened without being
     /// cached: if the staged copy does go on to complete, its rename must
     /// not be answered by a handle to the file it replaced.
@@ -4293,6 +4301,32 @@ mod tests {
         store.pread_exact(0, 0, &mut read).unwrap();
         assert_eq!(
             read, fresh,
+            "the re-downloaded bytes, which the check must see"
+        );
+    }
+
+    /// **A padded piece fetched again whole is a re-download, not a
+    /// shadow.** Its staged copy is as long as its payload -- nothing
+    /// writes the padding tail -- and its own hash check has to read those
+    /// bytes. Served the old complete copy instead, the check passes
+    /// whatever the new download holds, and the unchecked bytes are
+    /// renamed in as the verified piece.
+    #[test]
+    fn a_whole_staged_copy_of_a_padded_held_piece_is_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
+        let global = global_bytes(store.layout().total_length());
+        fill(&store, &global, 8);
+        assert!(store.inner.held.holds(1), "piece 1 ends in padding");
+
+        // File 0's last two bytes are piece 1's whole payload.
+        store.pwrite_all(0, 8, &[9u8, 9]).unwrap();
+
+        let mut read = [0u8; 2];
+        store.pread_exact(0, 8, &mut read).unwrap();
+        assert_eq!(
+            read,
+            [9, 9],
             "the re-downloaded bytes, which the check must see"
         );
     }
