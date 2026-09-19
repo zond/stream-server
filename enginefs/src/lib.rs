@@ -3704,7 +3704,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// pinned (the caller wants the download gone; a pin lost to a crash
     /// must not leave the bytes behind), see
     /// `Self::delete_download_data`: the whole torrent when this was its
-    /// last pin, only this file while other pins hold. A *dormant* pin has
+    /// last pin and nothing is reading it, only this file while other pins
+    /// hold or another file of the torrent is streaming. A *dormant* pin has
     /// no engine to delete anything through, so its bytes -- the torrent's
     /// directory in the piece store -- are taken by
     /// `Self::delete_dormant_download_data`, which first makes sure the
@@ -3821,13 +3822,25 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // asked for either way). Skipped when the whole torrent goes with
         // it -- there is no handle left to reconcile against, and nothing
         // left to want.
-        let drops_torrent = delete_files && !engine.is_pinned();
+        //
+        // The last pin going is not enough to take the torrent: something
+        // may be reading another file of it right now (the next episode of
+        // the season pack whose last one was just deleted), and removing
+        // the torrent under that reader fails its reads and deletes the
+        // pieces it is playing. The live registers are asked, after this
+        // file's own playback was forgotten above, the same evidence a
+        // refused pin reads before it drops its add; while anything is on
+        // the torrent only this file goes, through the per-file path.
+        let drops_torrent = delete_files
+            && !engine.is_pinned()
+            && !self.torrent_activity_registers(&info_hash, &engine).await;
         if (was_pinned || delete_files) && !drops_torrent {
             self.reconcile_with_active_selection(engine.clone(), "unpin_download")
                 .await;
         }
         let deleted_files = if delete_files {
-            self.delete_download_data(&engine, file_idx).await
+            self.delete_download_data(&engine, file_idx, drops_torrent)
+                .await
         } else {
             false
         };
@@ -4035,12 +4048,14 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     /// Delete what `file_idx` of `engine` occupies on disk, for an unpin
-    /// that was asked to take the data with it. With no pin left on the
-    /// torrent that is the whole torrent: dropped from the registry and
-    /// from the backend with its files and its (then empty) per-torrent
-    /// folder ([`TorrentBackend::remove_torrent_and_files`]). While other
-    /// files of it stay pinned the torrent must keep running, so only this
-    /// file goes. That is two deletions, because a torrent's bytes are piece
+    /// that was asked to take the data with it. With `whole_torrent` --
+    /// no pin left on the torrent and nothing of it being read -- that is
+    /// the whole torrent: dropped from the registry and from the backend
+    /// with its files and its (then empty) per-torrent folder
+    /// ([`TorrentBackend::remove_torrent_and_files`]). While other files of
+    /// it stay pinned, or another file of it is streaming (a season pack:
+    /// one episode deleted while the next plays), the torrent must keep
+    /// running, so only this file goes. That is two deletions, because a torrent's bytes are piece
     /// files ([`crate::piece_store`]) and the whole-file copy an earlier
     /// version of this server wrote may also still be sitting at the path
     /// the backend reports: **the dropped pieces**, and that path -- which is
@@ -4073,8 +4088,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// pieces: the claim is where their indices come from, and taking
     /// pieces a backend still believes it has is the corruption this whole
     /// dance exists to avoid.
-    async fn delete_download_data(&self, engine: &Arc<Engine<B::Handle>>, file_idx: usize) -> bool {
-        if engine.is_pinned() {
+    async fn delete_download_data(
+        &self,
+        engine: &Arc<Engine<B::Handle>>,
+        file_idx: usize,
+        whole_torrent: bool,
+    ) -> bool {
+        if !whole_torrent {
             let Some(path) = engine.handle.file_path(file_idx).await else {
                 tracing::warn!(
                     info_hash = %engine.info_hash,
@@ -16342,6 +16362,57 @@ mod tests {
                 .unpinned
         );
         assert_eq!(*counters.last_active_file.lock().unwrap(), Some(2));
+    }
+
+    /// The last pin going with its data does not take the torrent while
+    /// another file of it is being read: a season pack with episode 1
+    /// pinned and episode 2 playing, where deleting episode 1's download
+    /// used to remove the whole torrent -- failing episode 2's reads and
+    /// deleting the pieces it was playing. Only the deleted file goes,
+    /// through the per-file path; once nothing reads the torrent the same
+    /// delete takes all of it again.
+    #[tokio::test]
+    async fn deleting_the_last_pin_keeps_a_torrent_another_file_streams_from() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (enginefs, counters) = test_enginefs_with_file_count(3);
+        *counters.output_folder.lock().unwrap() = Some(tmp.path().to_path_buf());
+        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        enginefs
+            .active_file_streams
+            .write()
+            .await
+            .insert((TEST_HASH.to_string(), 1), 1);
+
+        assert!(
+            enginefs
+                .unpin_download(TEST_HASH, 0, true)
+                .await
+                .unwrap()
+                .unpinned
+        );
+        assert!(
+            enginefs
+                .get_backend()
+                .removed_with_files
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "the torrent another file streams from is not dropped"
+        );
+        assert!(enginefs.get_engine(TEST_HASH).await.is_some());
+        assert_eq!(
+            *counters.dropped_ranges.lock().unwrap(),
+            vec![(0..1, crate::backend::AfterRelease::Reselect)],
+            "only the deleted file's pieces are dropped"
+        );
+
+        // The stream ends; a delete now has nobody to keep the torrent for.
+        enginefs.active_file_streams.write().await.clear();
+        enginefs.unpin_download(TEST_HASH, 2, true).await.unwrap();
+        assert_eq!(
+            *enginefs.get_backend().removed_with_files.lock().unwrap(),
+            vec![TEST_HASH.to_string()]
+        );
     }
 
     /// A delete of a file nothing pinned (a pin lost to a crash, or a plain
