@@ -400,7 +400,11 @@ stream that has asked for the most bytes, and `Engine::player_stalled`
 does not count a report while it is `Some(true)`. Traced as
 `stage=player_stalled counted=<bool>`. A seek is a new stream from the
 floor, so the same rule covers seeks server-side as well; the player's
-reset is belt and braces.
+reset is belt and braces. That needed one more rule (review 2026-09-19
+#14): the stream a seek left stays live for thirty seconds with far more
+bytes to its name, so it answered for the viewer and a stall in the new
+stream's ramp was counted. A stream another live stream began after its
+last read is now passed over (`FileStreams::current_viewer`).
 
 ## Eighth field log: the depth flapped on the arithmetic alone (2026-09-17 12:22, xtremio b0e7659)
 

@@ -114,6 +114,10 @@ struct Stream {
     eaten: u64,
     /// When the last one did.
     seen: Instant,
+    /// When its first read arrived. What says a stream was started after
+    /// another's last read -- the viewer moving on from it; see
+    /// [`FileStreams::current_viewer`].
+    began: Instant,
     /// How fast this consumer is eating the file, in bytes a second, or
     /// `None` until a read has come back late enough to say anything. See
     /// [`Stream::sample`]: this is a *correction* to the file's own
@@ -568,6 +572,7 @@ impl FileStreams {
             last: read,
             reads: 1,
             seen: read.returned,
+            began: read.arrived,
             rate: None,
             window: 0,
             granted_for: None,
@@ -593,6 +598,26 @@ impl FileStreams {
         self.streams
             .iter()
             .filter(|stream| !stream.dormant(now))
+            .max_by_key(|stream| stream.eaten)
+    }
+
+    /// [`Self::viewer`], less every stream the file's reading has moved on
+    /// from: one that another live stream began after it was last read.
+    ///
+    /// A seek within one file is exactly that. The stream the viewer left
+    /// stays live for [`STREAM_DORMANT`] and has asked for more bytes than
+    /// the one it is on now for most of that, so by bytes alone it would be
+    /// the viewer for half a minute after every seek -- and it is the new
+    /// stream's window that is ramping. The crawler beside a viewer is not
+    /// moved on from: it began before the viewer's latest read, and the
+    /// viewer is read after it began, so both stay and bytes decide.
+    ///
+    /// Never empty while anything is live: the live stream that began last
+    /// began after nothing else was last read.
+    fn current_viewer(&self, now: Instant) -> Option<&Stream> {
+        let live = || self.streams.iter().filter(|stream| !stream.dormant(now));
+        live()
+            .filter(|stream| !live().any(|other| other.began > stream.seen))
             .max_by_key(|stream| stream.eaten)
     }
 }
@@ -998,7 +1023,10 @@ impl Streams {
     /// **Whether the viewer's window is still filling** -- the live stream
     /// that has asked for the most bytes, over every file of the entity,
     /// had its last grant cut short by the doubling ([`Stream::grant`]).
-    /// `None` for an entity nothing live is reading.
+    /// `None` for an entity nothing live is reading. Of each file's
+    /// streams only the ones its reading has not moved on from count
+    /// ([`FileStreams::current_viewer`]): after a seek, the stream being
+    /// ramped is the new one, not the one with the longer history.
     ///
     /// What a stall reported by the player is read against: a window
     /// reaches what its rate asks for in a handful of passes after an open
@@ -1011,7 +1039,7 @@ impl Streams {
     pub fn viewer_filling(&self, now: Instant) -> Option<bool> {
         self.by_file
             .values()
-            .filter_map(|streams| streams.viewer(now))
+            .filter_map(|streams| streams.current_viewer(now))
             .max_by_key(|stream| stream.eaten)
             .map(|stream| stream.filling)
     }
@@ -1676,6 +1704,7 @@ mod tests {
             last: read(0, 0, t0, 0),
             reads: 1,
             seen: t0,
+            began: t0,
             rate: Some(rate),
             window: u64::MAX,
             granted_for: None,
@@ -1970,6 +1999,50 @@ mod tests {
 
         // Everything dormant: nothing to say.
         assert_eq!(streams.viewer_filling(t0 + Duration::from_secs(600)), None);
+    }
+
+    /// **After a seek within one file, the window filling is the new
+    /// stream's.** The stream the viewer left stays live for
+    /// [`STREAM_DORMANT`] and has eaten far more, so by bytes alone it was
+    /// the viewer for half a minute after every seek, its full window said
+    /// "not filling", and a stall during the new stream's ramp was counted
+    /// against the swarm. A crawler that began before the viewer's latest
+    /// read does not take the viewer's place.
+    #[test]
+    fn after_a_seek_the_stall_rule_reads_the_stream_the_viewer_is_on_now() {
+        let t0 = Instant::now();
+        let mut streams = Streams::default();
+        stream_on(&mut streams, 0, 0, 100, 3_500_000, t0);
+        stream_on(&mut streams, 0, 0, 4_000, 3_500_000, t0);
+        stream_on(&mut streams, 0, 0, 5_000, 3_500_000, t0);
+        let file = streams.by_file.get_mut(&0).unwrap();
+        // The film before the seek: a full window, a history of bytes.
+        file.streams[0].eaten = 500 * PIECE;
+        file.streams[0].seen = t0 + Duration::from_secs(10);
+        // The crawler at the tail, opened after the film and read now and
+        // then; nothing granted it a window worth having yet.
+        file.streams[2].began = t0 + Duration::from_secs(1);
+        file.streams[2].eaten = PIECE / 100;
+        file.streams[2].seen = t0 + Duration::from_secs(11);
+        file.streams[2].filling = true;
+        assert_eq!(
+            streams.viewer_filling(t0 + Duration::from_secs(11)),
+            Some(false),
+            "before the seek: the film's full window, not the crawler's"
+        );
+
+        // The seek: a new stream, begun after the film's last read and
+        // ramping.
+        let file = streams.by_file.get_mut(&0).unwrap();
+        file.streams[1].began = t0 + Duration::from_secs(12);
+        file.streams[1].seen = t0 + Duration::from_secs(13);
+        file.streams[1].eaten = 4 * PIECE;
+        file.streams[1].filling = true;
+        assert_eq!(
+            streams.viewer_filling(t0 + Duration::from_secs(14)),
+            Some(true),
+            "the stream the viewer left answered for the one it is on"
+        );
     }
 
     /// **A window grows towards what the rate asks for; it never jumps to
