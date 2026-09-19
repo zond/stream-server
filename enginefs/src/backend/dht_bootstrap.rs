@@ -45,9 +45,11 @@
 //! v4 addresses only, because librqbit would otherwise retry the v6 ones
 //! forever. A dual-stack device keeps both, v4 first.
 //!
-//! Entries are resolved concurrently and the whole pass is bounded by
-//! [`RESOLUTION_BUDGET`]; if that elapses, the raw entries are handed to
-//! librqbit and start-up continues. **Nothing here may fail start-up or
+//! Entries are resolved concurrently, each entry's live steps (2 and 3) are
+//! bounded by [`LIVE_RESOLUTION_BUDGET`] so the cache is still reached on a
+//! network whose DNS times out rather than refuses, and the whole pass is
+//! bounded by [`RESOLUTION_BUDGET`]; if that elapses, the raw entries are
+//! handed to librqbit and start-up continues. **Nothing here may fail start-up or
 //! stall it for long.** The DHT bootstrapping late (or never) is a degraded
 //! peer source; a server that will not start is an outage.
 //!
@@ -85,7 +87,26 @@ pub const DOH_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 /// Entries resolve concurrently, so this is roughly one host's worst case,
 /// not the sum. On the normal path the pass costs a few milliseconds; this
 /// bound only exists so a pathological resolver cannot hold up start-up.
+///
+/// It is a backstop, and must never be what ends a pass whose resolvers
+/// merely failed slowly: when it fires every entry is handed over as a
+/// name, the cache fallback included and the hosts that did resolve
+/// included. That is what the live ladder's own, shorter
+/// [`LIVE_RESOLUTION_BUDGET`] is for.
 pub const RESOLUTION_BUDGET: Duration = Duration::from_secs(8);
+
+/// Ceiling on one entry's *live* resolution -- the system resolver and then
+/// DoH -- after which the entry falls through to the cache.
+///
+/// The live ladder's worst case is [`SYSTEM_LOOKUP_TIMEOUT`] plus one
+/// [`DOH_REQUEST_TIMEOUT`] per endpoint, 2 + 3 + 3 s: exactly
+/// [`RESOLUTION_BUDGET`], whose clock starts earlier (the cache load). On a
+/// network that drops DNS rather than refusing it -- where every step runs
+/// to its timeout -- the pass budget fired first, and the cache that exists
+/// for exactly that network was never read. Bounded here, each entry still
+/// reaches its cache step with [`RESOLUTION_BUDGET`] to spare; the second
+/// DoH endpoint gets what is left of this budget, which is the price.
+pub const LIVE_RESOLUTION_BUDGET: Duration = Duration::from_secs(6);
 
 /// Most addresses kept per host. A bootstrap node needs one working address,
 /// not every address its name has; the cap keeps a round-robin name from
@@ -590,34 +611,42 @@ async fn resolve_entry(
         );
     }
 
-    // 2. System resolver.
-    let system = resolvers.system.lookup(host, port).await;
-    if !system.is_empty() {
-        let ips = dedup_capped(system.into_iter().map(|a| a.ip()));
-        return (
-            ResolvedEntry {
-                entry: entry.to_string(),
-                addrs: ips.iter().map(|ip| literal(*ip, port)).collect(),
-                via: ResolvedVia::System,
-            },
-            Some((host.to_string(), ips)),
-        );
-    }
-
-    // 3. DoH, only because the system resolver found nothing.
-    if let Some(doh) = &resolvers.doh {
-        let answers = doh.lookup(host).await;
-        if !answers.is_empty() {
-            let ips = dedup_capped(answers.into_iter());
+    // 2 and 3, under their own budget so a resolver that fails slowly
+    // still leaves the cache its turn (see `LIVE_RESOLUTION_BUDGET`).
+    let live = tokio::time::timeout(LIVE_RESOLUTION_BUDGET, async {
+        // 2. System resolver.
+        let system = resolvers.system.lookup(host, port).await;
+        if !system.is_empty() {
+            return Some((
+                dedup_capped(system.into_iter().map(|a| a.ip())),
+                ResolvedVia::System,
+            ));
+        }
+        // 3. DoH, only because the system resolver found nothing.
+        let answers = match &resolvers.doh {
+            Some(doh) => doh.lookup(host).await,
+            None => Vec::new(),
+        };
+        (!answers.is_empty()).then(|| (dedup_capped(answers.into_iter()), ResolvedVia::Doh))
+    })
+    .await;
+    match live {
+        Ok(Some((ips, via))) => {
             return (
                 ResolvedEntry {
                     entry: entry.to_string(),
                     addrs: ips.iter().map(|ip| literal(*ip, port)).collect(),
-                    via: ResolvedVia::Doh,
+                    via,
                 },
                 Some((host.to_string(), ips)),
             );
         }
+        Ok(None) => {}
+        Err(_) => debug!(
+            host,
+            budget_secs = LIVE_RESOLUTION_BUDGET.as_secs(),
+            "live resolution of a DHT bootstrap host ran out of time; trying the cache"
+        ),
     }
 
     // 4. Whatever this host resolved to last time.
@@ -1245,6 +1274,89 @@ mod tests {
             ["1.2.3.4:25401"],
             "a later launch on a broken network should reuse the cached address"
         );
+    }
+
+    /// A system resolver and a DoH resolver that answer nothing, each
+    /// only after `delay` -- a network that drops DNS instead of refusing
+    /// it, where every step runs to its timeout.
+    struct Stalling(Duration);
+
+    #[async_trait::async_trait]
+    impl SystemDnsResolver for Stalling {
+        async fn lookup(&self, _host: &str, _port: u16) -> Vec<SocketAddr> {
+            tokio::time::sleep(self.0).await;
+            Vec::new()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DohDnsResolver for Stalling {
+        async fn lookup(&self, _host: &str) -> Vec<IpAddr> {
+            // Both endpoints, each to its timeout.
+            tokio::time::sleep(self.0 * 2).await;
+            Vec::new()
+        }
+    }
+
+    /// Only the host it names answers, at once; everything else stalls.
+    struct OneHostAnswers {
+        host: &'static str,
+        addr: SocketAddr,
+    }
+
+    #[async_trait::async_trait]
+    impl SystemDnsResolver for OneHostAnswers {
+        async fn lookup(&self, host: &str, _port: u16) -> Vec<SocketAddr> {
+            if host == self.host {
+                return vec![self.addr];
+            }
+            tokio::time::sleep(SYSTEM_LOOKUP_TIMEOUT).await;
+            Vec::new()
+        }
+    }
+
+    /// A dropped (not refused) DNS: the system resolver runs to its 2 s
+    /// timeout and both DoH endpoints to their 3 s each, 8 s in all -- the
+    /// whole pass budget, whose clock started before. The cache that exists
+    /// for exactly this network must still be read, and a host that did
+    /// resolve live must not be thrown away with the one that stalled.
+    #[tokio::test(start_paused = true)]
+    async fn a_dns_that_times_out_still_reaches_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dht-bootstrap.json");
+        let mut cache = BootstrapCache::default();
+        cache.remember("dht.libtorrent.org", &["1.2.3.4".parse().unwrap()]);
+        cache.store(&path).await;
+
+        let out = resolve_bootstrap_addrs(
+            &[
+                "dht.libtorrent.org:25401".to_string(),
+                "router.bittorrent.com:6881".to_string(),
+            ],
+            &resolvers(
+                Arc::new(OneHostAnswers {
+                    host: "router.bittorrent.com",
+                    addr: "5.6.7.8:6881".parse().unwrap(),
+                }),
+                Some(Arc::new(Stalling(DOH_REQUEST_TIMEOUT))),
+                Some(path),
+            ),
+        )
+        .await;
+        assert_eq!(out, ["1.2.3.4:25401", "5.6.7.8:6881"]);
+
+        // And with nothing cached and nothing answering, the pass still
+        // ends inside its budget with the names kept.
+        let out = resolve_bootstrap_addrs(
+            &["dht.libtorrent.org:25401".to_string()],
+            &resolvers(
+                Arc::new(Stalling(SYSTEM_LOOKUP_TIMEOUT)),
+                Some(Arc::new(Stalling(DOH_REQUEST_TIMEOUT))),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(out, ["dht.libtorrent.org:25401"]);
     }
 
     /// The cache keeps the *port* out of its key, so a host whose port
