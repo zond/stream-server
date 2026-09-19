@@ -399,26 +399,44 @@ const FLOOR_PIECES: u64 = 2;
 /// that has to hold the rest of a session.
 pub const COLDEST_REPORTED: usize = 8;
 
-/// The maximal unbroken stretch of `held` containing `piece`, inside
-/// `bound`, or `None` for a piece the disk does not have.
+/// The unbroken stretches of a listing, ascending: what the disk holds,
+/// in the shape the detector asks about it.
 ///
-/// A plain set rather than the piece store's own bitfield, because the
-/// proxy's held set is a set of chunk indices and the rule is the same for
-/// both: what a consumer may reach back to is however much of the disk was
-/// kept behind it.
-fn run_containing(held: &BTreeSet<u32>, piece: u32, bound: &Range<u32>) -> Option<Range<u32>> {
-    if !bound.contains(&piece) || !held.contains(&piece) {
-        return None;
+/// Built once per pass, because a read's run is looked up per read, and
+/// walking the held set outward from each read -- a lookup per piece, under
+/// the detector's lock the read path takes -- cost a fully cached film its
+/// whole length per read: five and a half thousand pieces, times every read
+/// a pass answers.
+#[derive(Debug, Default)]
+struct HeldRuns(Vec<Range<u32>>);
+
+impl HeldRuns {
+    fn of(held: &BTreeSet<u32>) -> Self {
+        let mut runs: Vec<Range<u32>> = Vec::new();
+        for &piece in held {
+            match runs.last_mut() {
+                Some(run) if run.end == piece => run.end = piece.saturating_add(1),
+                _ => runs.push(piece..piece.saturating_add(1)),
+            }
+        }
+        Self(runs)
     }
-    let mut start = piece;
-    while start > bound.start && held.contains(&(start - 1)) {
-        start -= 1;
+
+    /// The maximal unbroken stretch of the listing containing `piece`,
+    /// inside `bound`, or `None` for a piece the disk does not have.
+    ///
+    /// The listing rather than the piece store's own bitfield, because the
+    /// proxy's held set is a set of chunk indices and the rule is the same
+    /// for both: what a consumer may reach back to is however much of the
+    /// disk was kept behind it.
+    fn containing(&self, piece: u32, bound: &Range<u32>) -> Option<Range<u32>> {
+        if !bound.contains(&piece) {
+            return None;
+        }
+        let run = self.0.get(self.0.partition_point(|run| run.end <= piece))?;
+        run.contains(&piece)
+            .then(|| run.start.max(bound.start)..run.end.min(bound.end))
     }
-    let mut end = piece.saturating_add(1);
-    while end < bound.end && held.contains(&end) {
-        end = end.saturating_add(1);
-    }
-    Some(start..end)
 }
 
 /// Where one file lies in the torrent, which is what turns an offset
@@ -516,6 +534,7 @@ impl FileStreams {
     /// end is the first byte it does *not* have -- in no run by definition,
     /// and the reason the field showed twenty separate streams all ending
     /// at 23,320,330,240. Where it started is where it was.
+    #[cfg(test)]
     fn observe(
         &mut self,
         reader: u64,
@@ -523,8 +542,19 @@ impl FileStreams {
         held: &BTreeSet<u32>,
         piece: u64,
     ) -> Option<Rejected> {
+        self.observe_in(reader, read, &HeldRuns::of(held), piece)
+    }
+
+    /// [`Self::observe`] against a listing already cut into its runs.
+    fn observe_in(
+        &mut self,
+        reader: u64,
+        read: Read,
+        held: &HeldRuns,
+        piece: u64,
+    ) -> Option<Rejected> {
         let at = |offset: u64| self.geometry.at(piece, offset);
-        let run = run_containing(held, at(read.begin), &self.geometry.bound);
+        let run = held.containing(at(read.begin), &self.geometry.bound);
         let nearest = run.as_ref().and_then(|run| {
             self.streams
                 .iter()
@@ -845,6 +875,7 @@ impl Streams {
                 // The listing first, so a read of a piece that arrived this
                 // pass finds it in the ledger to stamp.
                 streams.ledger.settle(held, now);
+                let runs = HeldRuns::of(held);
                 for (at_file, reader, read) in pending {
                     if at_file != file {
                         waiting.push((at_file, reader, read));
@@ -852,7 +883,7 @@ impl Streams {
                     }
                     let pieces = streams.geometry.at(piece, read.begin)
                         ..=streams.geometry.at(piece, read.end.saturating_sub(1));
-                    last = streams.observe(reader, read, held, piece);
+                    last = streams.observe_in(reader, read, &runs, piece);
                     streams.ledger.read(pieces, reader, read.returned);
                 }
             }
@@ -2030,6 +2061,43 @@ mod tests {
         let later = t0 + STREAM_DORMANT + Duration::from_secs(1);
         streams.by_file.get_mut(&1).unwrap().streams[0].seen = later;
         assert_eq!(streams.settle_deadline(1, 2, later), Some(5));
+    }
+
+    /// **A listing's runs answer what walking the listing answered.** The
+    /// runs are cut once per pass so a read's run is a binary search, not
+    /// a walk the length of a fully cached film; the answer must be the
+    /// walk's, at every piece and every bound, gaps and edges included.
+    #[test]
+    fn a_listings_runs_answer_what_walking_it_answered() {
+        fn walked(held: &BTreeSet<u32>, piece: u32, bound: &Range<u32>) -> Option<Range<u32>> {
+            if !bound.contains(&piece) || !held.contains(&piece) {
+                return None;
+            }
+            let mut start = piece;
+            while start > bound.start && held.contains(&(start - 1)) {
+                start -= 1;
+            }
+            let mut end = piece + 1;
+            while end < bound.end && held.contains(&end) {
+                end += 1;
+            }
+            Some(start..end)
+        }
+        let held: BTreeSet<u32> = [0u32, 1, 2, 5, 7, 8, 9, 10, 15, 19]
+            .into_iter()
+            .chain(30..60)
+            .collect();
+        let runs = HeldRuns::of(&held);
+        for bound in [0..64, 3..9, 8..40, 31..32, 0..0, 59..70] {
+            for piece in 0..70 {
+                assert_eq!(
+                    runs.containing(piece, &bound),
+                    walked(&held, piece, &bound),
+                    "piece {piece} within {bound:?}"
+                );
+            }
+        }
+        assert_eq!(HeldRuns::of(&BTreeSet::new()).containing(0, &(0..8)), None);
     }
 
     /// **Granting publishes nothing.** The backing publishes what may not
