@@ -109,6 +109,21 @@ order to do them in.
   field, and to do it for every workspace -- this one, xtremio's `rust/`,
   and rqbit's.
 
+* **An engine with no reader downloads the whole torrent.** A new engine
+  wants every file, and the want set only narrows when a stream arrives.
+  Anything that creates engines early -- `/{hash}/create`, `/create`, a
+  stats request that lands before the stream request -- fetches everything
+  until a reader shows up (measured 2026-09-19: Tears of Steel, all 546 MB
+  at ~50 MB/s). It is not hit today because the player's stream request
+  follows its open by ~160 ms. This is why "start the engine when a source
+  is picked" was not done for the cold start: it needs a discover-only
+  state first, and rqbit drops peers when neither side is interested, so
+  only addresses and metadata would survive it. The cold start itself
+  (field 2026-09-17 16:36, on the phone) was a slow peer ramp -- peers found
+  in 2 s, 2 connected for 10 s, 32 after 50 s -- not discovery; the
+  `stream_progress` line now carries `queued`, `unique` and
+  `connection_tries` to tell "nothing found" from "nothing answering".
+
 * **Never `git checkout <file>` to undo an experiment.** It restores from
   HEAD, not from the working tree, so it discards everything uncommitted in
   that file. Copy the file to the scratchpad and copy it back instead.
