@@ -730,6 +730,36 @@ struct EngineParts {
     removal_gate: RemovalGate,
 }
 
+/// One caller's hold on a hash's entry in `BackendEngineFS::pin_locks`,
+/// which it releases when dropped: the entry goes once nobody else holds or
+/// waits for it (this clone plus the map's is everybody).
+///
+/// A guard rather than a call at the end of the function, because the
+/// function is a future and may never reach its end: a route whose client
+/// hung up during a pin's 90-second metadata wait drops the future at the
+/// `.await`, and the release written after it never ran -- the entry stayed
+/// for the life of the process.
+struct PinLock<'a> {
+    locks: &'a parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    info_hash: String,
+    lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl PinLock<'_> {
+    fn mutex(&self) -> &tokio::sync::Mutex<()> {
+        &self.lock
+    }
+}
+
+impl Drop for PinLock<'_> {
+    fn drop(&mut self) {
+        let mut locks = self.locks.lock();
+        if Arc::strong_count(&self.lock) == 2 {
+            locks.remove(&self.info_hash);
+        }
+    }
+}
+
 /// Held by whatever takes a torrent out of the registry and then out of
 /// the session, for the whole of both, and by every add for the moment it
 /// checks that the torrent it was handed is still in the session and
@@ -2701,7 +2731,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             && !self.live.is_torrent(&engine.info_hash)
         {
             let lock = self.pin_lock(&engine.info_hash);
-            if let Ok(guard) = lock.try_lock() {
+            if let Ok(guard) = lock.mutex().try_lock() {
                 self.remove_errored_engine_locked(engine).await;
                 drop(guard);
             } else {
@@ -2710,7 +2740,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     "a pin or unpin of an errored torrent is in flight; its removal waits for the next tick"
                 );
             }
-            self.release_pin_lock(&engine.info_hash, lock);
             return;
         }
         let Some(pass) = engine.retain(&self.registry, live).await else {
@@ -3682,33 +3711,27 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     ) -> Result<Arc<Engine<B::Handle>>, PinDownloadError> {
         let info_hash = info_hash.to_lowercase();
         let lock = self.pin_lock(&info_hash);
-        let guard = lock.lock().await;
-        let result = self
-            .pin_download_locked(&info_hash, file_idx, extra_trackers)
-            .await;
-        drop(guard);
-        self.release_pin_lock(&info_hash, lock);
-        result
+        let _guard = lock.mutex().lock().await;
+        self.pin_download_locked(&info_hash, file_idx, extra_trackers)
+            .await
     }
 
     /// The lock serialising [`Self::pin_download`] and
-    /// [`Self::unpin_download`] for one info hash, created on demand. Hand
-    /// it to [`Self::release_pin_lock`] once the guard is dropped.
-    fn pin_lock(&self, info_hash: &str) -> Arc<tokio::sync::Mutex<()>> {
-        self.pin_locks
+    /// [`Self::unpin_download`] for one info hash, created on demand; its
+    /// map entry goes when the returned [`PinLock`] drops with nobody else
+    /// holding or waiting for it. Lock it through [`PinLock::mutex`], with
+    /// the guard declared after the `PinLock` so it drops first.
+    fn pin_lock(&self, info_hash: &str) -> PinLock<'_> {
+        let lock = self
+            .pin_locks
             .lock()
             .entry(info_hash.to_string())
             .or_default()
-            .clone()
-    }
-
-    /// Drop the map's entry for a released [`Self::pin_lock`] when nobody
-    /// is waiting for it (`lock` is ours plus the map's -- a waiter holds
-    /// its own clone, which keeps the entry alive).
-    fn release_pin_lock(&self, info_hash: &str, lock: Arc<tokio::sync::Mutex<()>>) {
-        let mut locks = self.pin_locks.lock();
-        if Arc::strong_count(&lock) == 2 {
-            locks.remove(info_hash);
+            .clone();
+        PinLock {
+            locks: &self.pin_locks,
+            info_hash: info_hash.to_string(),
+            lock,
         }
     }
 
@@ -3885,13 +3908,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     ) -> Result<UnpinOutcome, PinDownloadError> {
         let info_hash = info_hash.to_lowercase();
         let lock = self.pin_lock(&info_hash);
-        let guard = lock.lock().await;
-        let result = self
-            .unpin_download_locked(&info_hash, file_idx, delete_files)
-            .await;
-        drop(guard);
-        self.release_pin_lock(&info_hash, lock);
-        result
+        let _guard = lock.mutex().lock().await;
+        self.unpin_download_locked(&info_hash, file_idx, delete_files)
+            .await
     }
 
     /// [`Self::unpin_download`] with the per-hash lock held.
@@ -7254,6 +7273,42 @@ mod tests {
                     file_idx: 2
                 }
             ]
+        );
+        assert!(enginefs.pin_locks.lock().is_empty(), "no lock left behind");
+    }
+
+    /// **A pin whose caller gave up leaves no lock behind** (review #49).
+    /// The route's future is dropped while the pin waits for metadata --
+    /// the client hung up -- and the release that followed the `.await`
+    /// never ran: the hash's entry stayed in `pin_locks` for good.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_pin_leaves_no_lock_behind() {
+        let root = tempfile::tempdir().unwrap();
+        let counters = Arc::new(FakeCounters::default());
+        let handle = FakeHandle {
+            info_hash: TEST_HASH.to_string(),
+            counters,
+            files: vec![BackendFileInfo {
+                name: "video-0.mkv".to_string(),
+                length: 100,
+            }],
+            init: FakeInit::new(true, Duration::from_secs(60)),
+        };
+        let enginefs = BackendEngineFS::new_with_backend(
+            FakeBackend::new(vec![handle]),
+            HashMap::new(),
+            root.path().join("cache"),
+            root.path().join("downloads"),
+        );
+        enginefs.backend.hold_add.store(true, Ordering::SeqCst);
+
+        let pin = enginefs.pin_download(TEST_HASH, 0, None);
+        // Given up on long before the metadata could come.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), pin)
+                .await
+                .is_err(),
+            "the pin is still waiting for its add"
         );
         assert!(enginefs.pin_locks.lock().is_empty(), "no lock left behind");
     }
@@ -16149,7 +16204,7 @@ mod tests {
 
         // A pin of this hash, holding its lock.
         let lock = enginefs.pin_lock(TEST_HASH);
-        let guard = lock.lock().await;
+        let guard = lock.mutex().lock().await;
         let tick = enginefs.live().reading();
         tokio::time::timeout(TEST_WAIT_BOUND, enginefs.retain_engine(&engine, &tick))
             .await
@@ -16167,7 +16222,7 @@ mod tests {
 
         // The pin is done; the next tick removes it.
         drop(guard);
-        enginefs.release_pin_lock(TEST_HASH, lock);
+        drop(lock);
         enginefs.retain_engine(&engine, &tick).await;
         assert!(enginefs.peek_engine(TEST_HASH).await.is_none());
     }
