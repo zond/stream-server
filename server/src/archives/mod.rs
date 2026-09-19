@@ -11,6 +11,7 @@ pub mod sevenz;
 pub mod source;
 pub mod tar;
 pub mod tgz;
+pub mod window;
 pub mod zip;
 
 pub use source::{ArchiveSession, ArchiveSource};

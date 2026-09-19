@@ -1,6 +1,7 @@
 use super::{
     ArchiveEntry, ArchiveReader, AsyncSeekableReader, CacheConfig, OpenedMember,
     cache::{CacheWriter, ProgressiveCache, SyncCacheWriter},
+    window::MemberWindow,
 };
 use anyhow::{Result, anyhow};
 use async_zip::tokio::read::seek::ZipFileReader;
@@ -64,6 +65,44 @@ async fn inflate_to_async(
         }
         out.write_all(&buf[..n]).await?;
     }
+}
+
+/// The fixed part of a ZIP local file header: signature, version, flags,
+/// method, time, date, CRC, the two sizes and the two length fields.
+const LOCAL_HEADER_BYTES: u64 = 30;
+const LOCAL_HEADER_SIGNATURE: u32 = 0x0403_4b50;
+/// General-purpose bit 0: the member's bytes are encrypted.
+const ENCRYPTED_FLAG: u16 = 1;
+
+/// Where the bytes of the member whose local header is at `header_offset`
+/// begin, or `None` when they are not plainly there to be read.
+///
+/// The central directory's own `header_size` is deliberately not used: the
+/// spec lets a member's extra field differ in length between the central
+/// directory and the local header, and an offset wrong by a few bytes is a
+/// film that will not decode. The local header is the one that describes
+/// the bytes that follow it, so it is the one that is read -- thirty bytes
+/// and the two lengths in them.
+async fn stored_member_offset(
+    reader: &mut Box<dyn AsyncSeekableReader>,
+    header_offset: u64,
+) -> Result<Option<u64>> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    reader.seek(std::io::SeekFrom::Start(header_offset)).await?;
+    let mut header = [0u8; LOCAL_HEADER_BYTES as usize];
+    reader.read_exact(&mut header).await?;
+    let field = |at: usize| u16::from_le_bytes([header[at], header[at + 1]]);
+    if u32::from_le_bytes([header[0], header[1], header[2], header[3]]) != LOCAL_HEADER_SIGNATURE {
+        return Ok(None);
+    }
+    // An encrypted member's bytes are not the member's, whatever its
+    // compression method says; it goes the way every other member this
+    // cannot serve directly does.
+    if field(6) & ENCRYPTED_FLAG != 0 {
+        return Ok(None);
+    }
+    let name_and_extra = u64::from(field(26)) + u64::from(field(28));
+    Ok(Some(header_offset + LOCAL_HEADER_BYTES + name_and_extra))
 }
 
 pub struct ZipHandler {
@@ -174,6 +213,42 @@ impl ArchiveReader for ZipHandler {
 
         let entry = archive.file().entries().get(index).unwrap();
         let size = entry.uncompressed_size();
+        let stored = entry.compression() == async_zip::Compression::Stored;
+        let header_offset = entry.header_offset();
+
+        // A stored member is a byte range of the archive, so there is
+        // nothing to decode and nothing to write: the member is served from
+        // wherever the archive is read from, which for the torrent form is
+        // the torrent itself. That is the case worth having -- a film put in
+        // a ZIP is normally stored, since it does not compress -- and it
+        // costs no extraction, no second copy under the cache root and no
+        // re-extraction per range request, because there is no extraction to
+        // repeat. A header that does not say what it should (no local
+        // signature, an encrypted member) falls through to the extraction
+        // below rather than being served as bytes nobody has checked.
+        if stored {
+            let mut source = archive.into_inner().into_inner().into_inner();
+            match stored_member_offset(&mut source, header_offset).await? {
+                Some(offset) => {
+                    return Ok(OpenedMember::Direct(Box::new(
+                        MemberWindow::new(source, offset, size).await?,
+                    )));
+                }
+                None => {
+                    tracing::debug!(
+                        member = path,
+                        "the local header of a stored member does not describe plain bytes; \
+                         extracting it"
+                    );
+                    // The archive reader was consumed to get at the source;
+                    // build another over the same source to extract from.
+                    archive = ZipFileReader::new(
+                        BufReader::with_capacity(INFLATE_CHUNK_BYTES, source).compat(),
+                    )
+                    .await?;
+                }
+            }
+        }
 
         // Use ProgressiveCache for robust seeking. The extracted member lands
         // in the archive scratch dir, which nothing counts and whose session
@@ -236,18 +311,77 @@ mod tests {
 
     /// A zip holding one deflated member.
     async fn write_zip(dir: &std::path::Path, name: &str, data: &[u8]) -> PathBuf {
+        write_zip_with(dir, name, data, async_zip::Compression::Deflate).await
+    }
+
+    async fn write_zip_with(
+        dir: &std::path::Path,
+        name: &str,
+        data: &[u8],
+        compression: async_zip::Compression,
+    ) -> PathBuf {
         let path = dir.join("fixture.zip");
         let file = File::create(&path).await.unwrap();
         let mut writer = async_zip::base::write::ZipFileWriter::with_tokio(file);
         writer
             .write_entry_whole(
-                async_zip::ZipEntryBuilder::new(name.into(), async_zip::Compression::Deflate),
+                async_zip::ZipEntryBuilder::new(name.into(), compression),
                 data,
             )
             .await
             .unwrap();
         writer.close().await.unwrap();
         path
+    }
+
+    /// **A stored member is a byte range of the archive**, so it is served
+    /// from the archive itself: no decoding, nothing written under the cache
+    /// root, and a range read out of the middle of it is that range. A
+    /// member that *is* compressed still goes through an extraction.
+    #[tokio::test]
+    async fn a_stored_member_is_served_from_the_archive_itself() {
+        let root = tempfile::tempdir().unwrap();
+        let member = content(512 * 1024);
+        let archive = write_zip_with(
+            root.path(),
+            "movie.bin",
+            &member,
+            async_zip::Compression::Stored,
+        )
+        .await;
+        let config = CacheConfig {
+            cache_dir: root.path().to_path_buf(),
+            _cache_size: 0,
+        };
+        let handler = ZipHandler::new(archive, config.clone());
+
+        let OpenedMember::Direct(mut reader) = handler.open_file("movie.bin").await.unwrap() else {
+            panic!("a stored member needs no extraction");
+        };
+        use tokio::io::AsyncSeekExt;
+        assert_eq!(
+            reader.seek(std::io::SeekFrom::End(0)).await.unwrap(),
+            member.len() as u64
+        );
+        reader
+            .seek(std::io::SeekFrom::Start(256 * 1024))
+            .await
+            .unwrap();
+        let mut middle = [0u8; 4096];
+        reader.read_exact(&mut middle).await.unwrap();
+        assert_eq!(middle.as_slice(), &member[256 * 1024..256 * 1024 + 4096]);
+        assert!(
+            !root.path().join(crate::archives::SCRATCH_DIR_NAME).exists(),
+            "nothing was written for it"
+        );
+
+        // The compressed member has to be decoded, so it is.
+        let deflated = write_zip(root.path(), "movie.bin", &member).await;
+        let handler = ZipHandler::new(deflated, config);
+        assert!(matches!(
+            handler.open_file("movie.bin").await.unwrap(),
+            OpenedMember::Extracted(_)
+        ));
     }
 
     /// The member is inflated while the runtime's only thread is held and

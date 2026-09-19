@@ -4204,22 +4204,23 @@ fn member_payload(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i.wrapping_mul(31) % 251) as u8).collect()
 }
 
-/// A zip holding one member, **stored** rather than deflated.
+/// A zip holding one member, written `compression`'s way.
 ///
-/// Stored because a fixture that leaves a hole in the middle of the archive
-/// needs to know where the member's bytes are: uncompressed, they run from a
-/// local header at the front to the central directory at the back, so a hole
-/// anywhere in the middle of the file is a hole in the member's data and
-/// nowhere else.
-fn stored_zip(member: &str, len: usize) -> Vec<u8> {
+/// The fixtures that leave a hole in the middle of the archive use `Stored`,
+/// because such a fixture needs to know where the member's bytes are:
+/// uncompressed, they run from a local header at the front to the central
+/// directory at the back, so a hole anywhere in the middle of the file is a
+/// hole in the member's data and nowhere else. `Stored` is also the member
+/// that is served from the torrent with no extraction at all, so a test
+/// about extractions asks for `Deflate`.
+fn member_zip(member: &str, len: usize, compression: async_zip::Compression) -> Vec<u8> {
     let data = member_payload(len);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     rt.block_on(async {
         let mut writer = async_zip::base::write::ZipFileWriter::with_tokio(Vec::new());
         writer
             .write_entry_whole(
-                async_zip::ZipEntryBuilder::new(member.into(), async_zip::Compression::Stored)
-                    .build(),
+                async_zip::ZipEntryBuilder::new(member.into(), compression).build(),
                 &data,
             )
             .await
@@ -4248,9 +4249,34 @@ fn archive_member_server(
     member_len: usize,
     hole: Option<std::ops::Range<u64>>,
 ) -> anyhow::Result<(ServerHandle, String, String)> {
+    archive_member_server_with(
+        config_dir,
+        cache_dir,
+        src,
+        member,
+        member_len,
+        hole,
+        async_zip::Compression::Stored,
+    )
+}
+
+/// [`archive_member_server`] with the member written `compression`'s way.
+#[allow(clippy::too_many_arguments)]
+fn archive_member_server_with(
+    config_dir: &std::path::Path,
+    cache_dir: &std::path::Path,
+    src: &std::path::Path,
+    member: &str,
+    member_len: usize,
+    hole: Option<std::ops::Range<u64>>,
+    compression: async_zip::Compression,
+) -> anyhow::Result<(ServerHandle, String, String)> {
     let content = src.join("Wanted");
     std::fs::create_dir_all(&content)?;
-    std::fs::write(content.join("fixture.zip"), stored_zip(member, member_len))?;
+    std::fs::write(
+        content.join("fixture.zip"),
+        member_zip(member, member_len, compression),
+    )?;
     let (torrent, info_hash) = real_torrent(&content);
 
     let cache_root = resolved(&cache_dir.join("cache"));
@@ -4295,6 +4321,76 @@ fn swarm_paused(
         .error_for_status()?
         .json()?;
     Ok(stats["swarmPaused"] == serde_json::json!(true))
+}
+
+/// The extraction files under a cache root's `.archives`.
+fn archive_extractions(cache_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(cache_root.join(".archives")) else {
+        return Vec::new();
+    };
+    entries
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("archive_extract_"))
+        })
+        .collect()
+}
+
+/// **A stored member inside a torrent is served from the torrent**, with no
+/// extraction at all: it is a byte range of the archive, so a range request
+/// on it is a range read of the torrent and nothing is written under the
+/// cache root. That is the ordinary case -- a film does not compress, so a
+/// film put in a ZIP is stored.
+#[test]
+fn a_stored_member_in_a_torrent_is_served_without_an_extraction() -> anyhow::Result<()> {
+    const MEMBER: &str = "member.bin";
+    const MEMBER_LEN: usize = 512 * 1024;
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+
+    let (handle, base, info_hash) = archive_member_server(
+        config_dir.path(),
+        cache_dir.path(),
+        src.path(),
+        MEMBER,
+        MEMBER_LEN,
+        None,
+    )?;
+    let cache_root = resolved(&cache_dir.path().join("cache"));
+    let payload = member_payload(MEMBER_LEN);
+    let anonymous = reqwest::blocking::Client::new();
+
+    let whole = anonymous
+        .get(archive_member_url(&base, &info_hash, MEMBER))
+        .send()?;
+    assert_eq!(whole.status(), reqwest::StatusCode::OK);
+    assert_eq!(whole.bytes()?.as_ref(), payload.as_slice());
+
+    let middle = anonymous
+        .get(archive_member_url(&base, &info_hash, MEMBER))
+        .header(
+            reqwest::header::RANGE,
+            format!("bytes={}-{}", 256 * 1024, 256 * 1024 + 4095),
+        )
+        .send()?;
+    assert_eq!(middle.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        middle.bytes()?.as_ref(),
+        &payload[256 * 1024..256 * 1024 + 4096]
+    );
+
+    assert!(
+        archive_extractions(&cache_root).is_empty(),
+        "a stored member was extracted: {:?}",
+        archive_extractions(&cache_root)
+    );
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
 }
 
 /// The stream an archive member read registers lasts as long as the

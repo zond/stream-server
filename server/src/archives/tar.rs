@@ -1,10 +1,7 @@
-use super::{ArchiveEntry, ArchiveReader, OpenedMember};
+use super::{ArchiveEntry, ArchiveReader, OpenedMember, window::MemberWindow};
 use anyhow::{Result, anyhow};
 use std::path::PathBuf;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use tokio::fs::File;
-use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt};
 
 pub struct TarHandler {
     path: PathBuf,
@@ -61,129 +58,75 @@ impl ArchiveReader for TarHandler {
         })
         .await??;
 
-        let slice = AsyncRawFileSlice::new(self.path.clone(), offset, size).await?;
-        Ok(OpenedMember::Direct(Box::new(slice)))
+        // A stored TAR member is a byte range of the archive: no decoding,
+        // no second copy on disk, and the reader is the shared window (see
+        // `archives::window`).
+        let member = MemberWindow::new(File::open(&self.path).await?, offset, size).await?;
+        Ok(OpenedMember::Direct(Box::new(member)))
     }
 }
 
-pub struct AsyncRawFileSlice {
-    file: File,
-    offset: u64,
-    size: u64,
-    pos: u64,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-impl AsyncRawFileSlice {
-    pub async fn new(path: PathBuf, offset: u64, size: u64) -> Result<Self> {
-        let mut file = File::open(path).await?;
-        file.seek(tokio::io::SeekFrom::Start(offset)).await?;
-        Ok(Self {
-            file,
-            offset,
-            size,
-            pos: 0,
-        })
+    fn content() -> Vec<u8> {
+        (0..40 * 1024u32)
+            .map(|i| (i.wrapping_mul(31) % 251) as u8)
+            .collect()
     }
-}
 
-impl AsyncRead for AsyncRawFileSlice {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        if self.pos >= self.size {
-            return Poll::Ready(Ok(()));
+    fn write_tar(dir: &std::path::Path) -> PathBuf {
+        let path = dir.join("fixture.tar");
+        let mut builder = tar::Builder::new(std::fs::File::create(&path).unwrap());
+        for (name, data) in [
+            ("first.txt", b"first".to_vec()),
+            ("videos/second.bin", content()),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, name, data.as_slice())
+                .unwrap();
         }
-
-        let remaining = (self.size - self.pos) as usize;
-        let want = buf.remaining().min(remaining);
-
-        if want == 0 {
-            return Poll::Ready(Ok(()));
-        }
-
-        // We need to limit the read.
-        // ReadBuf doesn't support `take` easily in poll without wrapper.
-        // We can assume file won't read past EOF if we seeked correctly?
-        // But the underlying file is larger than our slice.
-        // So we MUST limit.
-
-        let mut sub_buf = buf.take(want);
-        let start_filled = sub_buf.filled().len();
-
-        let poll = Pin::new(&mut self.file).poll_read(cx, &mut sub_buf);
-
-        match poll {
-            Poll::Ready(Ok(())) => {
-                let n = sub_buf.filled().len() - start_filled;
-                self.pos += n as u64;
-                Poll::Ready(Ok(()))
-            }
-            other => other,
-        }
+        builder.finish().unwrap();
+        path
     }
-}
 
-impl AsyncSeek for AsyncRawFileSlice {
-    fn start_seek(mut self: Pin<&mut Self>, position: std::io::SeekFrom) -> std::io::Result<()> {
-        let new_pos = match position {
-            std::io::SeekFrom::Start(p) => p,
-            std::io::SeekFrom::End(p) => {
-                if p < 0 {
-                    self.size.saturating_sub(p.unsigned_abs())
-                } else {
-                    self.size + p as u64
-                }
-            }
-            std::io::SeekFrom::Current(p) => {
-                let current = self.pos as i64;
-                let new_p = current + p;
-                if new_p < 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "Negative seek",
-                    ));
-                }
-                new_p as u64
-            }
+    /// A TAR member is served as a range of the archive -- no extraction,
+    /// nothing on disk -- and it is served *whole*: the slice reader this
+    /// replaced filled a `ReadBuf::take` sub-buffer and never advanced the
+    /// caller's, so every read reported zero bytes and the member went out
+    /// as an empty body.
+    #[tokio::test]
+    async fn a_member_is_read_whole_from_the_archive_itself() {
+        let root = tempfile::tempdir().unwrap();
+        let handler = TarHandler::new(write_tar(root.path()));
+
+        let OpenedMember::Direct(mut reader) =
+            handler.open_file("videos/second.bin").await.unwrap()
+        else {
+            panic!("a stored TAR member needs no extraction");
         };
+        assert_eq!(reader.seek(std::io::SeekFrom::End(0)).await.unwrap(), 40960);
+        reader.seek(std::io::SeekFrom::Start(0)).await.unwrap();
+        let mut read = Vec::new();
+        reader.read_to_end(&mut read).await.unwrap();
+        assert_eq!(read, content());
 
-        // Check bounds (optional, but good)
-        // Set pos.
-        // We need to seek the underlying file to offset + new_pos
-
-        // AsyncSeek works with `start_seek` then `poll_complete`.
-        // We calculate target absolute position.
-        let target = self.offset + new_pos;
-        match Pin::new(&mut self.file).start_seek(std::io::SeekFrom::Start(target)) {
-            Ok(()) => {
-                // If successful, we update local pos?
-                // Wait, logic: `start_seek` prepares. `poll_complete` confirms.
-                // We shouldn't update `pos` until `poll_complete` returns `Ready`.
-                // But `start_seek` requires we calculated `target` from `position`.
-                // `File::start_seek` doesn't know about our "virtual" pos if we used `Current` or `End`.
-                // EXCEPT we mapped everything to `Start` above!
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<u64>> {
-        match Pin::new(&mut self.file).poll_complete(cx) {
-            Poll::Ready(Ok(actual_abs_pos)) => {
-                // actual_abs_pos is relative to physical file start.
-                // We map back to slice relative.
-                if actual_abs_pos < self.offset {
-                    // This creates a weird state, but ok.
-                    self.pos = 0;
-                } else {
-                    self.pos = actual_abs_pos - self.offset;
-                }
-                Poll::Ready(Ok(self.pos))
-            }
-            other => other,
-        }
+        // And a range out of the middle of it is that range, not the
+        // archive's bytes at that offset.
+        let OpenedMember::Direct(mut reader) =
+            handler.open_file("videos/second.bin").await.unwrap()
+        else {
+            panic!("a stored TAR member needs no extraction");
+        };
+        reader.seek(std::io::SeekFrom::Start(1024)).await.unwrap();
+        let mut middle = [0u8; 512];
+        reader.read_exact(&mut middle).await.unwrap();
+        assert_eq!(middle.as_slice(), &content()[1024..1536]);
     }
 }
