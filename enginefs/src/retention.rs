@@ -189,13 +189,24 @@ impl SlackBell {
 pub(crate) fn playhead_piece(span: &FilePieceSpan, piece_length: u64, offset_in_file: u64) -> u32 {
     let absolute = span.offset.saturating_add(offset_in_file);
     let piece = absolute / piece_length;
+    // A file with no pieces at all -- a zero-length one, which a torrent
+    // may perfectly well carry -- has an empty range, and there is no last
+    // piece to clamp to: `clamp` would be handed a max below its min and
+    // panic, on a reader the route opens like any other (the empty body is
+    // `a_zero_length_torrent_file_is_an_empty_body_not_a_416`). Its first
+    // piece is the honest answer: nothing of it has to arrive.
+    let Some(last) = span
+        .pieces
+        .end
+        .checked_sub(1)
+        .filter(|last| *last >= span.pieces.start)
+    else {
+        return span.pieces.start;
+    };
     // The reader cannot be outside its own file, but a clamp is cheaper
     // than trusting arithmetic across a resize, and the policy clamps
     // the same way.
-    piece.clamp(
-        u64::from(span.pieces.start),
-        u64::from(span.pieces.end.saturating_sub(1)),
-    ) as u32
+    piece.clamp(u64::from(span.pieces.start), u64::from(last)) as u32
 }
 
 /// One reading of one file's retention policy: what range it governs, how
@@ -762,6 +773,26 @@ pub(crate) fn runs(pieces: &[u32]) -> Vec<Range<u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A zero-length file lies in no piece, and the clamp that keeps a
+    /// reader inside its own file has no last piece to clamp to.
+    #[test]
+    fn a_file_with_no_pieces_has_a_playhead_piece() {
+        let empty = crate::backend::FilePieceSpan {
+            pieces: 2..2,
+            offset: 8 * 1024,
+            bytes: 0,
+        };
+        assert_eq!(playhead_piece(&empty, 4096, 0), 2);
+        assert_eq!(playhead_piece(&empty, 4096, 99), 2, "and wherever it sits");
+        let one = crate::backend::FilePieceSpan {
+            pieces: 2..3,
+            offset: 8 * 1024,
+            bytes: 4096,
+        };
+        assert_eq!(playhead_piece(&one, 4096, 0), 2);
+        assert_eq!(playhead_piece(&one, 4096, 4096), 2, "clamped to its last");
+    }
 
     #[test]
     fn runs_are_the_fewest_ranges_that_cover_the_pieces() {
