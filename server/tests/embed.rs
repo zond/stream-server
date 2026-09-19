@@ -264,23 +264,18 @@ fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// CORS has to name what a Cast receiver asks for.
-///
-/// A Google Cast receiver plays through a browser media element, so the media
-/// request is a CORS request (Google's receiver docs are explicit that even a
-/// plain MP4 needs CORS once tracks are involved) and its preflight asks for
-/// `Content-Type`, `Accept-Encoding` and `Range`. The `*` wildcard
-/// `CorsLayer::permissive()` answered is not a guarantee -- and it never
-/// covers `Authorization`, which a browser-hosted client needs for the control
-/// API -- so the allow-list is spelled out. Seeking needs `Content-Range`,
-/// `Content-Length` and `Accept-Ranges` readable from script, so those are
-/// exposed by name -- and `Location` with them, which `/proxy` relays for a
-/// `3xx` it will not follow and which is unreadable from script otherwise.
-///
-/// The CORS layer answers a preflight itself, before routing, so this holds
-/// for every path on both listeners.
+/// **Loopback answers no CORS** (review #16). Loopback is not "only this
+/// app": any page a browser on the device has open reaches it, and the open
+/// routes fetch what the caller names -- `/proxy?d=http://192.168.1.1/admin`
+/// under `Access-Control-Allow-Origin: *` was a page reading the LAN through
+/// this server. Nothing that reads loopback is a browser (mpv, the
+/// embedder's HTTP client, stremio-core), so no response there grants a
+/// cross-origin read: not a preflight, not a media `GET`, not a control
+/// route. The Cast receiver's CORS lives on the LAN listener, and
+/// `lan_media_listener_serves_media_but_no_control_route` holds
+/// it there.
 #[test]
-fn cors_names_the_request_and_response_headers_a_cast_receiver_needs() -> anyhow::Result<()> {
+fn loopback_grants_no_cross_origin_read() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
     let handle = stream_server::start(stream_server::ServerConfig {
@@ -292,7 +287,7 @@ fn cors_names_the_request_and_response_headers_a_cast_receiver_needs() -> anyhow
     let base = format!("http://{}", handle.http_addr());
     let anonymous = reqwest::blocking::Client::new();
 
-    let response = anonymous
+    let preflight = anonymous
         .request(
             reqwest::Method::OPTIONS,
             format!("{base}/0123456789abcdef0123456789abcdef01234567/0"),
@@ -301,35 +296,24 @@ fn cors_names_the_request_and_response_headers_a_cast_receiver_needs() -> anyhow
         .header("access-control-request-method", "GET")
         .header("access-control-request-headers", "range")
         .send()?;
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        header_value(&response, "access-control-allow-origin"),
-        "*",
-        "a receiver's origin is opaque"
-    );
-    let allowed = header_value(&response, "access-control-allow-headers");
-    for header in ["accept-encoding", "authorization", "content-type", "range"] {
-        assert!(
-            allowed.contains(header),
-            "{header:?} must be an allowed request header, got {allowed:?}"
-        );
-    }
-
-    let response = anonymous
+    let get = anonymous
         .get(format!("{base}/heartbeat"))
         .header(reqwest::header::ORIGIN, "https://example.org")
         .send()?;
-    let exposed = header_value(&response, "access-control-expose-headers");
-    for header in [
-        "accept-ranges",
-        "content-length",
-        "content-range",
-        "content-type",
-        "location",
-    ] {
+    let ftp = anonymous
+        .get(format!("{base}/ftp/movie.mkv"))
+        .header(reqwest::header::ORIGIN, "https://example.org")
+        .send()?;
+    for response in [&preflight, &get, &ftp] {
+        let granted: Vec<_> = response
+            .headers()
+            .keys()
+            .filter(|name| name.as_str().starts_with("access-control-"))
+            .collect();
         assert!(
-            exposed.contains(header),
-            "{header:?} must be exposed to script, got {exposed:?}"
+            granted.is_empty(),
+            "{} answered {granted:?}",
+            response.url()
         );
     }
 
@@ -5251,6 +5235,9 @@ fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> 
     for header in ["accept-encoding", "content-type", "range"] {
         assert!(allowed.contains(header), "{header:?} in {allowed:?}");
     }
+    // No bearer header travels here: the LAN has no control route to send
+    // one to.
+    assert!(!allowed.contains("authorization"), "{allowed:?}");
     let response = anonymous
         .get(format!("{lan}/{info_hash}/{idx}"))
         .header(reqwest::header::ORIGIN, "https://example.org")
@@ -5260,6 +5247,8 @@ fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> 
     for header in ["accept-ranges", "content-length", "content-range"] {
         assert!(exposed.contains(header), "{header:?} in {exposed:?}");
     }
+    // And no `Location`: nothing on this listener relays a redirect.
+    assert!(!exposed.contains("location"), "{exposed:?}");
 
     handle.shutdown()?;
     handle.join()?;

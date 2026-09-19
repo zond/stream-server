@@ -336,8 +336,8 @@ const UNFRAMEABLE_RESPONSE_HEADERS: [&str; 3] =
 /// validating each name/value pair first so that a malicious or malformed
 /// header (e.g. containing a newline) can never poison the builder's
 /// internal error state. Invalid pairs -- and every name in
-/// [`UNFRAMEABLE_RESPONSE_HEADERS`] -- are skipped and logged at debug
-/// level rather than propagated.
+/// [`UNFRAMEABLE_RESPONSE_HEADERS`], and every `access-control-*` name --
+/// are skipped and logged at debug level rather than propagated.
 ///
 /// They **replace**, which is the whole of what `r=` is for. Appending
 /// them, as this did, left the origin's own header in place beside the
@@ -358,6 +358,20 @@ fn apply_custom_response_headers(
             HeaderValue::from_str(value),
         ) {
             (Ok(header_name), Ok(header_value)) => {
+                // Nor may it grant a browser the read this server withholds.
+                // The URL is the caller's, so `r=` is too: a web page on the
+                // device that could write `access-control-allow-origin:*`
+                // into it would have the relay hand it LAN and intranet
+                // responses, which is what answering no CORS on loopback is
+                // for (see `build_router`).
+                if header_name.as_str().starts_with("access-control-") {
+                    tracing::debug!(
+                        name = %header_name,
+                        "Skipping a CORS header from r= proxy param: this relay grants no \
+                         cross-origin reads"
+                    );
+                    continue;
+                }
                 if UNFRAMEABLE_RESPONSE_HEADERS.contains(&header_name.as_str()) {
                     tracing::debug!(
                         name = %header_name,
@@ -591,23 +605,6 @@ fn finalize_response(builder: Builder, body: axum::body::Body) -> Response {
             (StatusCode::BAD_GATEWAY, "Proxy response error").into_response()
         }
     }
-}
-
-/// The CORS headers every proxied response carries -- the relay, the
-/// rewritten playlist and the cache hit alike.
-///
-/// One function because these three headers are the same on all of them and
-/// must stay so: a browser-hosted client that could read a relayed body and
-/// not a cached one would be watching the cache decide what it may fetch.
-/// That is a claim about *these* headers only. The rest of a hit's are not
-/// the relay's -- `Server` and `Date` describe the hop that is not being
-/// made, and the framing is written from what the store holds; see
-/// [`cache_hit_response`].
-fn with_cors(builder: Builder) -> Builder {
-    builder
-        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS")
-        .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "*")
 }
 
 /// Whether the origin's own `Cache-Control` forbids keeping this response.
@@ -942,7 +939,6 @@ fn cache_hit_response(
         );
     }
     builder = apply_custom_response_headers(builder, response_header_overrides);
-    builder = with_cors(builder);
 
     // Read through the registry like any other proxied body: a client that
     // closes its player must break this read too, and a token retired while
@@ -1322,8 +1318,9 @@ async fn proxy(
     // Format 1: ?d=URL (standard)
     // Format 2: /<query_params>/<path> (Core) where query_params contains d=ORIGIN&h=HEADER&r=RESPONSE_HEADER
 
-    // Reads, and nothing else. The route is open and answers under a
-    // wildcard CORS, and it used to relay whatever method it was called
+    // Reads, and nothing else. The route is open (and used to answer under
+    // a wildcard CORS, which let a page read what it fetched: gone, see
+    // `build_router`), and it used to relay whatever method it was called
     // with, the caller's headers and body along with it -- so any page a
     // browser on this device had open, and on Android any app at all, could
     // make it `POST` or `DELETE` to whatever the device can reach, in its
@@ -2018,8 +2015,6 @@ async fn proxy(
     // Apply custom response headers (Core format), validated so a malformed
     // r= param can never poison the response builder.
     res_builder = apply_custom_response_headers(res_builder, &params.response_headers);
-
-    res_builder = with_cors(res_builder);
 
     if rewriting_playlist {
         // The playlist is rewritten as it arrives, a line at a time, and
@@ -3416,6 +3411,30 @@ mod tests {
         assert_eq!(response.headers().get("x-proxy-ok").unwrap(), "yes");
         assert!(response.headers().get("x-evil").is_none());
         assert!(!response.headers().contains_key("injected-header"));
+    }
+
+    /// `r=` is part of the caller's URL, so a web page on the device could
+    /// use it to grant itself the cross-origin read loopback withholds
+    /// (review #16): no `access-control-*` name gets through.
+    #[test]
+    fn r_cannot_grant_a_cross_origin_read() {
+        let mut headers = BTreeMap::new();
+        headers.insert("Access-Control-Allow-Origin".to_string(), "*".to_string());
+        headers.insert("access-control-expose-headers".to_string(), "*".to_string());
+        headers.insert("Content-Type".to_string(), "video/mp4".to_string());
+
+        let builder = apply_custom_response_headers(Response::builder().status(200), &headers);
+        let response = builder.body(axum::body::Body::empty()).unwrap();
+
+        assert!(
+            !response
+                .headers()
+                .keys()
+                .any(|name| name.as_str().starts_with("access-control-")),
+            "{:?}",
+            response.headers()
+        );
+        assert_eq!(response.headers().get("content-type").unwrap(), "video/mp4");
     }
 
     #[test]

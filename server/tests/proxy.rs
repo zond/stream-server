@@ -484,19 +484,31 @@ fn a_range_the_cache_holds_is_served_without_asking_the_origin() -> anyhow::Resu
 
     let first = client
         .get(&url)
+        .header(reqwest::header::ORIGIN, "https://example.org")
         .header(reqwest::header::RANGE, &two_chunks)
         .send()?;
     assert_eq!(first.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        header(first.headers(), "access-control-allow-origin"),
+        None,
+        "a relayed response is not readable by a page on the device (review #16)"
+    );
     assert_eq!(first.bytes()?.len() as u64, CHUNK * 2);
     assert_eq!(fixture.origin.next_request().range(), Some(&*two_chunks));
     wait_for_chunks(&fixture, 2);
 
     let second = client
         .get(&url)
+        .header(reqwest::header::ORIGIN, "https://example.org")
         .header(reqwest::header::RANGE, &two_chunks)
         .send()?;
     assert_eq!(second.status(), reqwest::StatusCode::PARTIAL_CONTENT);
     let headers = second.headers().clone();
+    assert_eq!(
+        header(&headers, "access-control-allow-origin"),
+        None,
+        "nor is a cache hit"
+    );
     assert_eq!(
         header(&headers, "content-range"),
         Some(format!("bytes 0-{}/{ORIGIN_LENGTH}", CHUNK * 2 - 1)).as_deref(),
@@ -5585,7 +5597,7 @@ fn a_redirect_chain_longer_than_the_hop_bound_is_given_up_on() -> anyhow::Result
 /// whatever a caller names must not do is let an *origin* send it somewhere
 /// no caller could have asked for.
 ///
-/// What the player used to get for that was `302 Found`, the CORS headers
+/// What the player used to get for that was `302 Found`, CORS headers
 /// and `content-length: 0` -- an unfollowable redirect and a headerless one
 /// spelled the same way, and nothing in either saying what happened. The
 /// `Location` comes back now, exactly as the origin wrote it.
@@ -5619,22 +5631,6 @@ fn an_unfollowed_redirect_still_says_where_it_pointed() -> anyhow::Result<()> {
             .and_then(|value| value.to_str().ok()),
         Some("ftp://files.example.com/film.mkv"),
         "the origin's own value, not one resolved or rewritten through the proxy"
-    );
-    // And readable by the client that has to act on it. A browser-hosted
-    // client sees only the headers CORS names, and `location` was not in
-    // the allow-list -- so the diagnostic this relay exists to be arrived
-    // and could not be read in exactly the client shape that reads headers
-    // by name.
-    assert!(
-        response
-            .headers()
-            .get("access-control-expose-headers")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .contains("location"),
-        "the relayed Location has to be readable from script: {:?}",
-        response.headers().get("access-control-expose-headers")
     );
 
     drop(fixture.handle);
