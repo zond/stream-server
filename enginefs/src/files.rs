@@ -47,6 +47,11 @@ struct ReadCursor {
     /// four seconds would then report having taken no time at all, which is
     /// the one number the consumer actually felt.
     arrived: Option<Instant>,
+    /// The file's first byte within the torrent, or `None` for a file the
+    /// retention owner has no entity for, which is the only place the
+    /// handle can learn it. What turns an offset in the file into the
+    /// torrent piece a blocked read names; see [`ReadCursor::piece_of`].
+    file_start: Option<u64>,
 }
 
 /// What one served read turned out to be.
@@ -83,11 +88,12 @@ impl Served {
 }
 
 impl ReadCursor {
-    fn new(position: u64) -> Self {
+    fn new(position: u64, file_start: Option<u64>) -> Self {
         Self {
             position,
             pending_since: None,
             arrived: None,
+            file_start,
         }
     }
 
@@ -135,18 +141,29 @@ impl ReadCursor {
         self.arrived = None;
     }
 
-    /// The absolute torrent piece `offset` sits in, `None` without a piece
-    /// length (no metadata, or a backend without pieces). `file_start` is
-    /// the file's offset within the torrent.
+    /// The absolute torrent piece `offset` of this file sits in; see
+    /// [`torrent_piece`].
     ///
     /// Takes the offset rather than reading the cursor, because the caller
     /// that matters asks *after* [`ReadCursor::resume`] has moved it, about
     /// the offset the read ran from.
-    fn piece_of(offset: u64, file_start: u64, piece_length: Option<u64>) -> Option<u64> {
-        piece_length
-            .filter(|len| *len > 0)
-            .map(|len| (file_start.saturating_add(offset)) / len)
+    fn piece_of(&self, offset: u64, piece_length: Option<u64>) -> Option<u64> {
+        torrent_piece(offset, self.file_start, piece_length)
     }
+}
+
+/// The absolute torrent piece `offset` sits in, `None` without a piece
+/// length (no metadata, or a backend without pieces) or without the file's
+/// offset within the torrent, `file_start`.
+///
+/// `None` rather than guessing zero. Every blocked-read line used to
+/// compute from zero, which is right for a single-file torrent and for the
+/// first file of any other, and named a piece thousands away for the
+/// second episode of a season pack -- and keyed the probe's one-line-per-
+/// piece throttle by it too.
+fn torrent_piece(offset: u64, file_start: Option<u64>, piece_length: Option<u64>) -> Option<u64> {
+    let len = piece_length.filter(|len| *len > 0)?;
+    Some(file_start?.saturating_add(offset) / len)
 }
 
 pub struct FileHandle<H: TorrentHandle> {
@@ -332,7 +349,12 @@ impl<H: TorrentHandle> FileHandle<H> {
             stream,
             engine,
             file_idx,
-            cursor: ReadCursor::new(start_offset),
+            // Where the file lies in the torrent is the entity's: the
+            // reader has it, and a handle with no entity names no piece.
+            cursor: ReadCursor::new(
+                start_offset,
+                reader.as_ref().map(|reader| reader.domain().file_offset()),
+            ),
             reader_id,
             reader,
             probe: Arc::default(),
@@ -363,7 +385,8 @@ impl<H: TorrentHandle> FileHandle<H> {
             .store(generation, std::sync::atomic::Ordering::SeqCst);
         let probe = self.probe.clone();
         let engine = self.engine.clone();
-        let (file_idx, offset) = (self.file_idx, self.cursor.position);
+        let (file_idx, offset, file_start) =
+            (self.file_idx, self.cursor.position, self.cursor.file_start);
         runtime.spawn(async move {
             let mut waited = Duration::ZERO;
             for delay in [BLOCKED_READ_PROBE_AFTER, BLOCKED_READ_PROBE_AGAIN] {
@@ -373,7 +396,7 @@ impl<H: TorrentHandle> FileHandle<H> {
                     return;
                 }
                 let piece_length = engine.handle.piece_length();
-                let piece = ReadCursor::piece_of(offset, 0, piece_length);
+                let piece = torrent_piece(offset, file_start, piece_length);
                 // One line per piece per second: mpv parks several ranges
                 // on the same piece at once, and each is its own read.
                 if !engine.blocked_probe_may_log(file_idx, piece.unwrap_or(offset)) {
@@ -422,7 +445,7 @@ impl<H: TorrentHandle> FileHandle<H> {
             info_hash = %self.engine.info_hash,
             file_idx = self.file_idx,
             offset = served.begin,
-            piece = ReadCursor::piece_of(served.begin, 0, piece_length),
+            piece = self.cursor.piece_of(served.begin, piece_length),
             piece_length,
             waited_ms = waited.as_millis() as u64,
             took_ms = served.took().as_millis() as u64,
@@ -554,7 +577,7 @@ impl<H: TorrentHandle> AsyncSeek for FileHandle<H> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BLOCKED_READ_LOG_THRESHOLD, ReadCursor};
+    use super::{BLOCKED_READ_LOG_THRESHOLD, ReadCursor, torrent_piece};
     use std::time::{Duration, Instant};
 
     /// The blocked-read line has to name the offset the read is parked on,
@@ -565,11 +588,8 @@ mod tests {
     #[test]
     fn read_cursor_reports_the_whole_wait_at_the_offset_it_parked_on() {
         let piece = 16 * 1024 * 1024u64;
-        let mut cursor = ReadCursor::new(piece);
-        assert_eq!(
-            ReadCursor::piece_of(cursor.position, 0, Some(piece)),
-            Some(1)
-        );
+        let mut cursor = ReadCursor::new(piece, Some(0));
+        assert_eq!(cursor.piece_of(cursor.position, Some(piece)), Some(1));
 
         // A served read advances the cursor and reports no wait.
         let t0 = Instant::now();
@@ -597,7 +617,7 @@ mod tests {
             "the offset it parked on, not the one the next read starts at"
         );
         assert_eq!(
-            ReadCursor::piece_of(served.begin, 0, Some(piece)),
+            cursor.piece_of(served.begin, Some(piece)),
             Some(1),
             "and so the piece it was actually waiting for"
         );
@@ -620,7 +640,7 @@ mod tests {
     #[test]
     fn one_read_is_stamped_once_however_often_it_is_polled() {
         let t0 = Instant::now();
-        let mut cursor = ReadCursor::new(0);
+        let mut cursor = ReadCursor::new(0, Some(0));
 
         assert!(!cursor.has_arrived(), "nothing is in flight yet");
         cursor.arrive(t0);
@@ -645,7 +665,7 @@ mod tests {
     /// happened.
     #[test]
     fn read_cursor_forgets_an_arrival_on_a_seek() {
-        let mut cursor = ReadCursor::new(0);
+        let mut cursor = ReadCursor::new(0, Some(0));
         cursor.arrive(Instant::now());
         cursor.seek_to(4_000_000_000);
         assert!(!cursor.has_arrived());
@@ -655,7 +675,7 @@ mod tests {
     /// the previous read parked on is not where the next one will.
     #[test]
     fn read_cursor_follows_a_seek() {
-        let mut cursor = ReadCursor::new(0);
+        let mut cursor = ReadCursor::new(0, Some(0));
         cursor.arrive(Instant::now());
         cursor.park(Instant::now());
         cursor.seek_to(4_000_000_000);
@@ -665,19 +685,25 @@ mod tests {
         // The piece index is absolute: the file's own offset in the torrent
         // counts, not just the offset within the file.
         let at = cursor.position;
+        assert_eq!(torrent_piece(at, Some(1_000), Some(1_000_000)), Some(4_000));
         assert_eq!(
-            ReadCursor::piece_of(at, 1_000, Some(1_000_000)),
-            Some(4_000)
-        );
-        assert_eq!(
-            ReadCursor::piece_of(at, 0, None),
+            torrent_piece(at, Some(0), None),
             None,
             "no metadata, no piece"
         );
         assert_eq!(
-            ReadCursor::piece_of(at, 0, Some(0)),
+            torrent_piece(at, Some(0), Some(0)),
             None,
             "never divides by zero"
         );
+        assert_eq!(
+            torrent_piece(at, None, Some(1_000_000)),
+            None,
+            "no idea where the file lies, no piece -- not the one it would be at zero"
+        );
+        // And a cursor names the piece where its file lies: the second
+        // episode of a season pack, four gigabytes into the torrent.
+        let episode = ReadCursor::new(0, Some(4_000_000_000));
+        assert_eq!(episode.piece_of(1_000_000, Some(1_000_000)), Some(4_001));
     }
 }
