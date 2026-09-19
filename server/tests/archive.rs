@@ -350,6 +350,39 @@ fn a_url_without_a_suffix_is_named_by_its_bytes() -> anyhow::Result<()> {
     fixture.finish()
 }
 
+/// An archive is fetched from a web address and from nowhere else.
+///
+/// The create routes are open to any loopback caller -- on Android, every
+/// app on the device, and any page in a browser on it -- and a `url` that
+/// was not http(s) was taken as a path on this machine: the members of any
+/// archive the server could read, its own private storage included, were
+/// served to whoever asked.
+#[test]
+fn an_archive_on_this_machines_disk_is_not_opened() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let bytes = reqwest::blocking::get(fixture.origin.url("/download?id=7"))?
+        .error_for_status()?
+        .bytes()?;
+    let local = tempfile::tempdir()?;
+    let path = local.path().join("private.7z");
+    std::fs::write(&path, &bytes)?;
+
+    for url in [
+        path.to_string_lossy().into_owned(),
+        format!("file://{}", path.display()),
+    ] {
+        let response = fixture.create(&url)?;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{url} was opened: {}",
+            response.text()?
+        );
+    }
+    assert!(fixture.scratch_files().is_empty());
+    fixture.finish()
+}
+
 /// Nothing a failed create fetched stays on disk: a body that is no archive
 /// is refused before it is stored, and one that claims to be an archive and
 /// will not open is deleted with the create that failed on it.

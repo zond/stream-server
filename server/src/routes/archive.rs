@@ -121,7 +121,7 @@ async fn archive_cache_config(state: &AppState) -> CacheConfig {
 
 /// The archive `url` names, as a source a session can own: the one an
 /// existing session already holds when there is one, else a fresh download
-/// (http/https) or the local path itself.
+/// (http/https). Nothing else is fetched: see the refusal below.
 ///
 /// Sharing is by the origin string. A player that re-plays a title sends the
 /// same `/create` again, and before this every send downloaded the whole
@@ -141,23 +141,19 @@ async fn resolve_source(
         );
         return Ok(existing.source.clone());
     }
-    if url.starts_with("http://") || url.starts_with("https://") {
-        download_archive(url, cache_config, crate::cache_budget::available_space)
-            .await
-            .map(Arc::new)
-    } else {
-        let path = PathBuf::from(url);
-        if !path.exists() {
-            // It might be a valid local path for some setups, but we generally expect existence
-            // For torrent relative paths, this function is used by 'create' which assumes local or http.
-            return Err(StatusCode::NOT_FOUND);
-        }
-        Ok(Arc::new(ArchiveSource::local(
-            path,
-            url.to_string(),
-            cache_config,
-        )))
+    // Only what the route is named for: an archive at a web address. This
+    // route is open to any loopback caller -- on Android, every app on the
+    // device, and any page in a browser on it -- so a URL that was taken as
+    // a local path served the members of any archive this process could
+    // read, its own private storage included. Stremio's own server takes
+    // these from an add-on's `rarUrls`/`zipUrls`, which are web addresses.
+    // `/ftp` was closed the same way.
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(StatusCode::BAD_REQUEST);
     }
+    download_archive(url, cache_config, crate::cache_budget::available_space)
+        .await
+        .map(Arc::new)
 }
 
 /// How much of a download is read before its file is named: enough to hold
