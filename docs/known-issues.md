@@ -417,3 +417,45 @@ pulsed nothing before), and a thirty-second backstop logs at info when it
 fires -- a line that in a field log means a wake-up is missing. CLAIMS.md,
 "When a refused peer asks again". The ten seconds of zero peers at open
 remain: peer discovery latency at cold start, a different problem.
+
+## Tenth field log: a finished piece shadowed by late chunks (2026-09-19 17:31, xtremio 717b0de)
+
+The TV on 5 GHz now (866 Mbps link; the 2.4 GHz link's ceiling had
+measured 4.6 MB/s against the film's 3.57), playing the 23 GB film after a
+jump to 5098 s. Piece 4342 completed, was verified, committed and read
+whole -- and 180 ms later `staged_over_held piece=4342`: a peer's chunks
+for it were written after it was done. `open_for_read` prefers a staged
+copy, so every later read was served that one: 33 times `reading 262144
+bytes at N of piece 4342` with N creeping up as more late chunks landed
+(EOF past them), zeros between them (mpv's `Invalid NAL unit size`), two
+`failBuffer` reopens that found the same shadow, and an OSD reading 20 s
+ahead off the complete copy nobody was served. Only a restart's
+`seed_from_disk` clears such a shadow. The third sighting of this shape,
+after piece 834 (rqbit `fcde3058`) and piece 3181 (line 228 above).
+
+Not a stale reclaim, as first guessed: `unlinked=0` throughout, and the
+warning itself needs the held bit still set. The log does not show which
+route left the peer holding a share of a finished piece -- every
+reservation path is guarded -- but one route is proven in code: a
+reselect (or asking a file back) during a piece's hash check wiped it and
+queued it for a second peer.
+
+Fixed from three sides, so none alone has to be right:
+
+- **rqbit `5acbd7d3`**: `write_to_disk` refuses a chunk for a piece that
+  is have or fully written, before the storage write, and logs it at info
+  with the piece and the peer; `reselect_pieces` and `update_only_files`
+  leave a piece being hash-checked alone; `reserve_piece` warns when handed
+  a finished piece, naming the route next time.
+- **stream-server `b287382b`**: a staged copy shorter than its piece, while
+  the store holds the piece, is a shadow; reads get the complete copy
+  (`stage="staged_shadow_bypassed"`, once per piece). A legitimate
+  re-download is full length when its own hash check reads it.
+- xtremio `00d6dc2` pins both.
+
+Also from this session, not code: the RD source that "failed to recognize
+file format" was a stored RAR of a cinema DCP (JPEG 2000 reels, separate
+PCM sound, teasers of other films). Comet sends a plain URL for it; the
+official client does no content sniffing either, and Torrentio answers
+such links with a "failed RAR" video. See the xtremio notes for what
+archive playback would take.
