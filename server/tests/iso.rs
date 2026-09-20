@@ -383,6 +383,54 @@ fn a_9660_image_inside_a_torrent_is_served_by_range() -> anyhow::Result<()> {
     server.finish()
 }
 
+/// **A container inside a torrent names its own member.** The `torrent:`
+/// form has no `/create` to be made at, and only the index knows what the
+/// members are called -- so a client that has just sniffed an `.iso` in a
+/// torrent has no member path to ask for. `GET /iso/stream/{key}` is where
+/// it is told: it indexes the container (the same `session_for` the member
+/// routes use) and redirects to the member the `/create` rule picks.
+///
+/// Before this, that route only *looked a session up*, so the redirect was
+/// a `404` for every torrent key -- and with it the whole torrent half of
+/// the archive layer was unreachable by any request a client could make.
+#[test]
+fn a_container_in_a_torrent_is_told_which_member_to_ask_for() -> anyhow::Result<()> {
+    let src = tempfile::tempdir()?;
+    let server = server()?;
+    let image = iso::minimal_iso();
+    let info_hash = server.add_image_torrent(src.path(), &image)?;
+
+    let key = format!("torrent:{info_hash}%2Ffixture.iso");
+    let redirect = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?
+        .get(format!("{}/iso/stream/{key}", server.base))
+        .send()?;
+    assert_eq!(
+        redirect.status(),
+        reqwest::StatusCode::TEMPORARY_REDIRECT,
+        "the redirect route indexes a torrent container"
+    );
+    let location = redirect
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        location.ends_with("/HELLO.TXT"),
+        "it names the member the /create rule picks: {location}"
+    );
+
+    // And what it named is served, which is the point of being told.
+    let member = reqwest::Url::parse(&format!("{}/iso/stream/{key}", server.base))?
+        .join(&location)?
+        .to_string();
+    assert_member_served(&member, &file_bytes(&image, iso::data_range(&image)))?;
+    server.assert_nothing_extracted();
+    server.finish()
+}
+
 /// The same image behind a URL: `/iso/create` reads the descriptors and
 /// the directory through the proxy cache's ranged reads, and the member is
 /// served out of the same cache. Nothing lands under the cache root but

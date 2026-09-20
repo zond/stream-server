@@ -582,14 +582,46 @@ async fn stream_redirection(
     State(state): State<AppState>,
     Extension(format): Extension<Format>,
     Path(key): Path<String>,
+    Query(selection): Query<MemberSelection>,
 ) -> Response {
-    if format.translator().is_none() {
+    let Some(translator) = format.translator() else {
         return no_translator_response(format);
-    }
-    let selected = state
-        .translated_archives
-        .get(&key)
-        .and_then(|session| session.selected().map(|member| member.name.clone()));
+    };
+    // **The session first, which for a `torrent:` key is what indexes it.**
+    // This only looked a session up, so a container inside a torrent -- which
+    // has no `/create` to be made at, and whose member names only its index
+    // knows -- was a `404` to every request a client could make: the one
+    // route that hands out a member name never reached the one function that
+    // creates the session. A client cannot ask for a member of a torrent's
+    // archive without being told its name first, so this is where it is told.
+    let session = match session_for(&state, translator.as_ref(), &key).await {
+        Ok(session) => session,
+        Err(response) => return *response,
+    };
+    // A session made by `/create` carries the member its request selected; a
+    // `torrent:` session was just made and carries none, so the same rule
+    // `/create` uses picks one -- `-1` and no filters unless the caller
+    // states them here, which is the contract `/create` has.
+    let selected = match session.selected().map(|member| member.name.clone()) {
+        Some(name) => Some(name),
+        None => {
+            let request = ArchiveCreateRequest {
+                urls: Vec::new(),
+                file_idx: selection.file_idx,
+                file_must_include: selection.file_must_include(),
+            };
+            match select_member(session.index(), &request) {
+                Ok(at) => at.and_then(|at| {
+                    session
+                        .index()
+                        .members
+                        .get(at)
+                        .map(|member| member.name.clone())
+                }),
+                Err(response) => return *response,
+            }
+        }
+    };
     match selected.as_deref() {
         Some(file) => Redirect::temporary(&format!(
             "./{}/{}",
@@ -598,6 +630,31 @@ async fn stream_redirection(
         ))
         .into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// Which member a redirect should pick, for a session that has not chosen
+/// one -- the same two things `/create`'s request carries, as query
+/// parameters, so a `torrent:` container can be pointed at a file the way a
+/// link-borne one can. `f` is the spelling the stream route already uses for
+/// its filters; `fileIdx` is `/create`'s.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct MemberSelection {
+    file_idx: Option<usize>,
+    #[serde(default, alias = "f")]
+    file_must_include: Option<String>,
+}
+
+impl MemberSelection {
+    fn file_must_include(&self) -> Vec<String> {
+        self.file_must_include
+            .iter()
+            .flat_map(|value| value.split(','))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect()
     }
 }
 
