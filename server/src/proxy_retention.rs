@@ -1318,6 +1318,14 @@ impl ProxyRetention {
         self.owner.readers()
     }
 
+    /// The cap a pass over this cache measures against, or `None` for a
+    /// cache nothing bounds: the owner's reading of the cell
+    /// `crate::cache_budget` publishes into
+    /// (`enginefs::retention::owner::Retention::cap`).
+    pub fn cap(&self) -> Option<u64> {
+        self.owner.cap()
+    }
+
     /// [`Self::reads`] for one entity directory: how many open reads of it
     /// have promised or delivered and not ended. What a fill asks before it
     /// removes a sibling entity under its key, for the same reason the

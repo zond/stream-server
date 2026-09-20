@@ -642,6 +642,22 @@ impl ServerHandle {
         self.state.proxy_cache.retention().reads()
     }
 
+    /// The cap the proxy cache's retention owner is enforcing right now, or
+    /// `None` for a cache nothing bounds
+    /// (`enginefs::retention::owner::Retention::cap`).
+    ///
+    /// **Not [`Self::cache_usage`]'s `limit_bytes`.** That one is the same
+    /// arithmetic (`cache_budget::CacheLimit::effective`) run again over a
+    /// fresh reading of the volume, so it says what a publication *would*
+    /// state; this is the number a pass will actually measure against,
+    /// read out of the cell every publication writes. A test whose whole
+    /// premise is that a stream ran past its budget has to assert the
+    /// second one: the first is true on a roomy volume whether or not
+    /// anything ever reached the owner.
+    pub fn proxy_cache_cap(&self) -> Option<u64> {
+        self.state.proxy_cache.retention().cap()
+    }
+
     /// Wait until the proxy cache has nothing left on the blocking pool: no
     /// chunk on its way to the disk and no retention pass on its way round
     /// it (`proxy_cache::DiskWork`).

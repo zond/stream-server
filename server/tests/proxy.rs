@@ -1945,6 +1945,14 @@ const RETENTION_BUDGET: u64 = 8 * 1024 * 1024;
 /// test runs on is roomy enough that `cacheSize` is the smaller of the two,
 /// so a volume too full to give the configured cap fails the test loudly
 /// instead of quietly making it prove nothing.
+///
+/// **And then the owner is asked what it is actually enforcing.** The
+/// reading above is that arithmetic run again over a fresh `statvfs`, so on
+/// a roomy volume it answers the configured number whether or not any
+/// publication ever reached the retention cell a pass measures against --
+/// which makes it a statement about this machine's disk and not about this
+/// process. Every test below whose premise is "the stream ran past its
+/// budget" rests on the second assertion, not the first.
 fn published_budget(fixture: &Fixture, bytes: u64) -> anyhow::Result<()> {
     fixture
         .handle
@@ -1954,6 +1962,12 @@ fn published_budget(fixture: &Fixture, bytes: u64) -> anyhow::Result<()> {
         Some(bytes),
         "a different cap is in force than the one configured; \
          the volume this test runs on cannot give {bytes} bytes"
+    );
+    assert_eq!(
+        fixture.handle.proxy_cache_cap(),
+        Some(bytes),
+        "the cap never reached the proxy cache's retention owner, so nothing \
+         below is bounded by it"
     );
     Ok(())
 }
@@ -2431,12 +2445,17 @@ fn a_seek_back_inside_the_window_is_served_from_disk_and_one_outside_it_is_not()
     );
 
     // The reclaim has caught up: what is left is about a window, not the
-    // sixteen megabytes that went past.
+    // sixteen megabytes that went past. The budget and not twice it, which
+    // is what the sentence above says and what the call used to allow --
+    // and the bound alone still cannot bite here, since `overhang` leaves
+    // more room than this play-through ever wrote. It is the settle and the
+    // last pass it arms that this call is here for; what says the cache
+    // really came down is `reclaimed_chunk_below` at the end.
     holds_no_more_than_after_the_last_byte(
         &fixture,
         &url,
         PLAYED_CHUNKS * CHUNK - 1,
-        (2 * RETENTION_BUDGET / CHUNK) as usize,
+        (RETENTION_BUDGET / CHUNK) as usize,
     );
     // What the player's own reads miss is the LRU's business -- a chunk it
     // read once and moved past is scrub-back, and scrub-back is what a full
@@ -6569,7 +6588,29 @@ fn cached_chunk_indices(fixture: &Fixture) -> Vec<u64> {
 /// reclaim is what such a test is about, so this waits for it rather than
 /// asking whether it has already happened. Bounded, so one that never
 /// happens fails instead of hanging.
+///
+/// **And the premise is stated here rather than assumed by the wait.** A
+/// wait says nothing about why it ended, and this one ended three times on
+/// CI with a panic that named only its own disappointment. What has to be
+/// true before a reclaim is owed at all is that a cap reached the owner a
+/// pass measures against and that what was played does not fit under it;
+/// both are asserted before the deadline starts, so a run where they do
+/// not hold says which one was missing instead of blaming the reclaim.
+/// What is left over after that -- the cache is over its cap, every pass
+/// has run, and not one chunk came back -- is a statement about the policy,
+/// and the panic says so in those words. It is a real state and not a
+/// timing accident: see the open entry in `docs/known-issues.md` for the
+/// detector rule that gets the cache there and what it was measured at.
 fn reclaimed_chunk_below(fixture: &Fixture, played: u64) -> u64 {
+    let cap = fixture
+        .handle
+        .proxy_cache_cap()
+        .expect("nothing bounds the proxy cache, so no pass is owed a reclaim");
+    assert!(
+        played * CHUNK > cap,
+        "the {played} chunks played fit under the cap of {cap} bytes, so the \
+         cache was never over its budget and no reclaim was ever owed"
+    );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         let held = cached_chunk_indices(fixture);
@@ -6578,7 +6619,9 @@ fn reclaimed_chunk_below(fixture: &Fixture, played: u64) -> u64 {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "the reclaim took nothing below chunk {played}"
+            "the cache still holds every one of the {played} chunks played -- \
+             {} bytes under a cap of {cap} -- and no pass gave one of them back",
+            held.len() as u64 * CHUNK
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
