@@ -167,16 +167,43 @@ order to do them in.
   `stream_progress` line now carries `queued`, `unique` and
   `connection_tries` to tell "nothing found" from "nothing answering".
 
-* **A seeded test torrent's pieces are reclaimed about two seconds after it
-  is added, and every torrent test in `server/tests/embed.rs` is racing that
-  timer.** Measured 2026-09-20 while writing the RAR set tests: with
+* **A torrent nobody is playing keeps nothing, about two seconds after the
+  last reader leaves -- so a test that seeds its own torrent data must run
+  with the pin set unknown.** Measured 2026-09-20 writing the RAR set tests,
+  established 2026-09-20 (review #103): under
   `ServerConfig::pins: Some(Default::default())` -- "an embedder that keeps a
-  record and wants nothing" -- the owner held 33 pieces and then none, even
-  under `pretend_volume_space(u64::MAX)`, and every later read parks for ever
-  because nothing seeds a test fixture. The existing tests pass because they
-  are quick. `pins: None` ("nobody said", so everything is kept) is what a
-  fixture wants; `server/tests/archive.rs`'s RAR set tests use it and say so.
-  The rest of `embed.rs` has not been swept.
+  pin record and has named nothing in it" -- a freshly added forty-piece
+  fixture held forty pieces and then none, one
+  `reconcile::RECONCILE_INTERVAL` after its initial check.
+
+  What takes them is `Engine::reclaim_rest` (`enginefs/src/engine.rs`),
+  reached from `EngineFS::reconcile_tick` -> `retain_engine` ->
+  `Engine::retain` whenever `!live.is_torrent(hash)`: it takes **every held
+  piece outside every holding extent**, and a torrent with no reader has no
+  extent. Proved causally by returning 0 from `reclaim_rest` alone, which
+  leaves the fixture whole. It asks no volume and no cap, which is why
+  `pretend_volume_space(root, u64::MAX)` does not save anything -- what it
+  acts on is "nobody wants this", not "the disk is short".
+
+  **This is the design, not a leak**: on a real torrent the bytes come back
+  from the swarm. It is worth knowing anyway, because the empty record is the
+  ordinary state of the ordinary install -- xtremio's `downloads::pins_in`
+  over a registry with no downloads in it answers exactly
+  `Some(<empty>)` -- so every viewer who has pinned nothing re-fetches their
+  buffer a couple of seconds after they stop. `embed.rs`'s
+  `an_embedder_that_has_pinned_nothing_keeps_no_torrent_nobody_plays` states
+  it.
+
+  **Nothing seeds a test fixture**, so for the tests it is fatal: a read
+  after the pass parks for ever. `pins: None` ("nobody said", which sets
+  `PinsUnknown` and reads as every file pinned) is the only cure, and
+  `server/tests/support/fixture_pins.rs` is the one place that says so;
+  `embed.rs::seeded_fixture_config` and `iso.rs::offline_config` are built
+  from it, and the tests that read seeded bytes use them. A test *about*
+  retention, idle pausing, the reconciler or the pin routes keeps the empty
+  record and controls the timer itself -- under `None` a torrent is reported
+  as pinned, so it is also exempt from idle removal and the reconciler keeps
+  it running.
 
 * **Never `git checkout <file>` to undo an experiment.** It restores from
   HEAD, not from the working tree, so it discards everything uncommitted in

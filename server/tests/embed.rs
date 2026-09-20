@@ -13,6 +13,11 @@ use stream_server::{ServerAuth, ServerConfig, ServerHandle, TorrentListenPort};
 #[path = "support/rar_fixtures.rs"]
 mod rar_fixtures;
 
+/// Why a test that seeds its own torrent data runs with the pin set
+/// unknown, and which tests may not (see the module).
+#[path = "support/fixture_pins.rs"]
+mod fixture_pins;
+
 /// Client builder that sends the server's bearer token on every request --
 /// every control route requires it, and every server has one.
 fn bearer_client_builder(handle: &ServerHandle) -> reqwest::blocking::ClientBuilder {
@@ -56,6 +61,18 @@ fn offline_config() -> ServerConfig {
         pins: Some(Default::default()),
         ..ServerConfig::default()
     }
+}
+
+/// [`offline_config`] for a test that seeds a torrent's pieces itself and
+/// then reads them back.
+///
+/// The one difference is the pin set: unknown rather than an empty record,
+/// so the retention pass never takes what the fixture wrote and the test is
+/// not racing a two-second timer. **A test about retention, idle pausing,
+/// the reconciler or the pin routes must not use this** -- it is about a
+/// cache that may not be touched. [`fixture_pins`] is the whole argument.
+fn seeded_fixture_config() -> ServerConfig {
+    fixture_pins::keep_what_the_fixture_seeded(offline_config())
 }
 
 /// Resolving bootstrap names is on in the stock configuration -- the Android
@@ -1476,7 +1493,7 @@ fn a_zero_length_torrent_file_is_an_empty_body_not_a_416() -> anyhow::Result<()>
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.path().join("config")),
         cache_dir: Some(cache_root.clone()),
-        ..offline_config()
+        ..seeded_fixture_config()
     })?;
     seed_piece_store(&cache_root, &torrent, &content);
     let base = format!("http://{}", handle.http_addr());
@@ -1883,8 +1900,13 @@ fn set_background_caps_the_torrent_and_still_streams() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
     let src = tempfile::tempdir()?;
-    let (handle, base, info_hash, idx, payload) =
-        lan_media_server(config_dir.path(), cache_dir.path(), src.path(), None)?;
+    let (handle, base, info_hash, idx, payload) = lan_media_server(
+        config_dir.path(),
+        cache_dir.path(),
+        src.path(),
+        None,
+        seeded_fixture_config(),
+    )?;
     let client = bearer_client(&handle)?;
 
     // The cap the torrent carries in the foreground is the session's
@@ -3665,11 +3687,20 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
 ///
 /// Returns the handle, the loopback base URL, the info hash, the file index
 /// and the payload the file holds.
+///
+/// `config` is the caller's, because this fixture is shared by two kinds of
+/// test. One reads bytes and wants [`seeded_fixture_config`], so that no
+/// pass takes what was seeded while it reads. The other is about the free
+/// space gate, the slack a switch gives back or the reconciler stopping an
+/// idle torrent, and must keep the empty pin record: under an unknown pin
+/// set nothing is slack, nothing is reclaimed and nothing is stopped, so
+/// there would be nothing left for it to be about. See [`fixture_pins`].
 fn lan_media_server(
     config_dir: &std::path::Path,
     cache_dir: &std::path::Path,
     src: &std::path::Path,
     lan_media_addr: Option<std::net::SocketAddr>,
+    config: ServerConfig,
 ) -> anyhow::Result<(ServerHandle, String, String, usize, Vec<u8>)> {
     let content = src.join("Movie");
     std::fs::create_dir_all(&content)?;
@@ -3687,7 +3718,7 @@ fn lan_media_server(
         lan_media_addr,
         config_dir: Some(config_dir.join("config")),
         cache_dir: Some(cache_root.clone()),
-        ..offline_config()
+        ..config
     })?;
     // After the start, and before the add: the launch sweep has run and has
     // nothing to say about a torrent that does not exist yet.
@@ -4258,6 +4289,14 @@ fn member_zip(member: &str, len: usize, compression: async_zip::Compression) -> 
 /// The volume is declared roomy: every arm of the reconciler's ladder above
 /// the idle one is about the disk, and a test about the idle one wants none
 /// of them.
+///
+/// `config` is the caller's, because the two kinds of test that share this
+/// fixture want opposite things of it. One asks which bytes a member maps
+/// to and wants [`seeded_fixture_config`], so that no pass takes what was
+/// seeded while it reads. The other is about the reconciler stopping a
+/// torrent nobody reads, and that cannot be asked under an unknown pin set
+/// at all: it reads as pinned, so the torrent is exempt from idle removal
+/// and is never stopped. See [`fixture_pins`].
 fn archive_member_server(
     config_dir: &std::path::Path,
     cache_dir: &std::path::Path,
@@ -4265,6 +4304,7 @@ fn archive_member_server(
     member: &str,
     member_len: usize,
     hole: Option<std::ops::Range<u64>>,
+    config: ServerConfig,
 ) -> anyhow::Result<(ServerHandle, String, String)> {
     archive_member_server_with(
         config_dir,
@@ -4274,6 +4314,7 @@ fn archive_member_server(
         member_len,
         hole,
         async_zip::Compression::Stored,
+        config,
     )
 }
 
@@ -4287,6 +4328,7 @@ fn archive_member_server_with(
     member_len: usize,
     hole: Option<std::ops::Range<u64>>,
     compression: async_zip::Compression,
+    config: ServerConfig,
 ) -> anyhow::Result<(ServerHandle, String, String)> {
     let content = src.join("Wanted");
     std::fs::create_dir_all(&content)?;
@@ -4302,7 +4344,7 @@ fn archive_member_server_with(
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.join("config")),
         cache_dir: Some(cache_root.clone()),
-        ..offline_config()
+        ..config
     })?;
     // After the start, never before (see `seed_piece_store_pieces`).
     seed_piece_store_pieces(&cache_root, &torrent, &content, None, hole);
@@ -4381,6 +4423,7 @@ fn a_compressed_member_in_a_torrent_is_refused_rather_than_extracted() -> anyhow
         MEMBER_LEN,
         None,
         async_zip::Compression::Deflate,
+        seeded_fixture_config(),
     )?;
     let cache_root = resolved(&cache_dir.path().join("cache"));
     let anonymous = reqwest::blocking::Client::new();
@@ -4431,6 +4474,7 @@ fn a_stored_member_in_a_torrent_is_served_without_an_extraction() -> anyhow::Res
         MEMBER,
         MEMBER_LEN,
         None,
+        seeded_fixture_config(),
     )?;
     let cache_root = resolved(&cache_dir.path().join("cache"));
     let payload = member_payload(MEMBER_LEN);
@@ -4534,18 +4578,11 @@ fn rar_set_server(
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.join("config")),
         cache_dir: Some(cache_root.clone()),
-        // **`None`, not the empty pin record `offline_config` spreads.**
-        // An embedder that keeps a pin record and names nothing in it has
-        // said that nothing is wanted, and the retention owner reclaims a
-        // seeded fixture's pieces about two seconds in -- after which a
-        // read parks for ever, because no peer will ever bring them back
-        // (these torrents are seeded by nobody). The tests around this one
-        // race that timer and win because they are quick; this one asks
-        // for three volumes' worth of ranges and would be flaky. `None` is
-        // "nobody said", which keeps every torrent's data -- and what this
-        // test is about is which bytes a member maps to, not retention.
-        pins: None,
-        ..offline_config()
+        // What this test is about is which bytes a member maps to, not
+        // retention, and it asks for three volumes' worth of ranges: it
+        // needs the pin set unknown, or it is racing a two-second timer
+        // (`fixture_pins`).
+        ..seeded_fixture_config()
     })?;
     // After the start, never before (see `seed_piece_store_pieces`).
     seed_piece_store(&cache_root, &torrent, &content);
@@ -4741,6 +4778,10 @@ fn an_archive_body_keeps_its_torrent_running_while_it_is_open() -> anyhow::Resul
         MEMBER,
         MEMBER_LEN,
         Some(128 * 1024..192 * 1024),
+        // The empty pin record, because this test is about the reconciler
+        // stopping a torrent nobody reads: an unknown pin set reads as pinned
+        // and nothing would ever be stopped (`fixture_pins`).
+        offline_config(),
     )?;
     let client = bearer_client(&handle)?;
 
@@ -4838,6 +4879,9 @@ fn an_archive_member_read_lets_the_torrent_be_stopped_again_when_it_is_done() ->
         MEMBER,
         MEMBER_LEN,
         None,
+        // About the reconciler, so the empty pin record (see
+        // `archive_member_server`).
+        offline_config(),
     )?;
     let client = bearer_client(&handle)?;
 
@@ -4972,8 +5016,13 @@ fn head_on_the_torrent_left(budget: std::time::Duration) -> anyhow::Result<Optio
     let cache_root = resolved(&cache_dir.path().join("cache"));
     stream_server::pretend_volume_space(&cache_root, u64::MAX);
     stream_server::pretend_available_space(&cache_root, u64::MAX);
-    let (handle, base, left_hash, left_idx, _) =
-        lan_media_server(config_dir.path(), cache_dir.path(), src.path(), None)?;
+    let (handle, base, left_hash, left_idx, _) = lan_media_server(
+        config_dir.path(),
+        cache_dir.path(),
+        src.path(),
+        None,
+        offline_config(),
+    )?;
     let client = bearer_client(&handle)?;
 
     let other_content = src.path().join("Other");
@@ -5075,8 +5124,13 @@ fn a_television_above_its_own_floor_streams() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
     let src = tempfile::tempdir()?;
-    let (handle, base, _info_hash, _idx, _payload) =
-        lan_media_server(config_dir.path(), cache_dir.path(), src.path(), None)?;
+    let (handle, base, _info_hash, _idx, _payload) = lan_media_server(
+        config_dir.path(),
+        cache_dir.path(),
+        src.path(),
+        None,
+        offline_config(),
+    )?;
     let cache_root = resolved(&cache_dir.path().join("cache"));
     let client = bearer_client(&handle)?;
     let anonymous = reqwest::blocking::Client::new();
@@ -5125,8 +5179,13 @@ fn a_stream_below_the_free_space_floor_is_refused_not_degraded() -> anyhow::Resu
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
     let src = tempfile::tempdir()?;
-    let (handle, base, info_hash, idx, payload) =
-        lan_media_server(config_dir.path(), cache_dir.path(), src.path(), None)?;
+    let (handle, base, info_hash, idx, payload) = lan_media_server(
+        config_dir.path(),
+        cache_dir.path(),
+        src.path(),
+        None,
+        offline_config(),
+    )?;
     let cache_root = resolved(&cache_dir.path().join("cache"));
     let client = bearer_client(&handle)?;
     let anonymous = reqwest::blocking::Client::new();
@@ -5241,8 +5300,13 @@ fn a_stream_refused_for_space_frees_the_slack_and_asks_again() -> anyhow::Result
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
     let src = tempfile::tempdir()?;
-    let (handle, base, info_hash, idx, payload) =
-        lan_media_server(config_dir.path(), cache_dir.path(), src.path(), None)?;
+    let (handle, base, info_hash, idx, payload) = lan_media_server(
+        config_dir.path(),
+        cache_dir.path(),
+        src.path(),
+        None,
+        offline_config(),
+    )?;
     let cache_root = resolved(&cache_dir.path().join("cache"));
     let client = bearer_client(&handle)?;
     let anonymous = reqwest::blocking::Client::new();
@@ -5363,7 +5427,7 @@ fn stats_json_reports_the_piece_the_open_reader_waits_for() -> anyhow::Result<()
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.path().join("config")),
         cache_dir: Some(cache_root.clone()),
-        ..offline_config()
+        ..seeded_fixture_config()
     })?;
     // After the start (see `seed_piece_store_pieces`).
     seed_piece_store_pieces(
@@ -5470,6 +5534,7 @@ fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> 
         src.path(),
         // Port 0: the OS picks, so any number of these run in parallel.
         Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
+        seeded_fixture_config(),
     )?;
 
     let lan_addr = start_lan_media(&handle)?;
@@ -5814,6 +5879,7 @@ fn set_lan_media_toggles_the_listener_and_the_setting_can_forbid_it() -> anyhow:
         cache_dir.path(),
         src.path(),
         Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
+        seeded_fixture_config(),
     )?;
 
     // Loopback media, hammered from another thread for as long as the
@@ -6022,6 +6088,7 @@ fn a_configured_lan_media_address_binds_nothing_until_a_cast_asks() -> anyhow::R
         cache_dir.path(),
         src.path(),
         Some(contested),
+        seeded_fixture_config(),
     )?;
 
     // The server is up and serving, on loopback, with the LAN address held
@@ -6093,6 +6160,7 @@ fn the_lan_listener_counts_the_requests_that_reach_it() -> anyhow::Result<()> {
         cache_dir.path(),
         src.path(),
         Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
+        seeded_fixture_config(),
     )?;
     let lan_addr = start_lan_media(&handle)?;
     let lan = format!("http://{lan_addr}");
@@ -6240,8 +6308,13 @@ fn buffer_profile_is_a_setting_and_a_stream_query_override() -> anyhow::Result<(
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
     let src = tempfile::tempdir()?;
-    let (handle, base, info_hash, idx, payload) =
-        lan_media_server(config_dir.path(), cache_dir.path(), src.path(), None)?;
+    let (handle, base, info_hash, idx, payload) = lan_media_server(
+        config_dir.path(),
+        cache_dir.path(),
+        src.path(),
+        None,
+        offline_config(),
+    )?;
     let client = bearer_client(&handle)?;
 
     // The default is today's behaviour, and the library agrees with the route.
@@ -6361,6 +6434,9 @@ fn a_torrent_source_registers_its_stream_and_seeks_past_what_it_does_not_need() 
         MEMBER,
         MEMBER_LEN,
         Some(128 * 1024..192 * 1024),
+        // About the reconciler, so the empty pin record (see
+        // `archive_member_server`).
+        offline_config(),
     )?;
     let client = bearer_client(&handle)?;
 
@@ -6474,6 +6550,177 @@ fn a_torrent_source_registers_its_stream_and_seeks_past_what_it_does_not_need() 
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// **An embedder that keeps a pin record and has named nothing in it keeps
+/// no torrent nobody is playing.** Not a cap, not the volume: everything.
+///
+/// `ServerConfig::pins: Some(Default::default())` is what a client with a
+/// downloads registry and no downloads in it publishes -- xtremio's
+/// `downloads::pins_in` over an empty registry answers exactly this -- so it
+/// is the ordinary state of the ordinary install, not a corner. Under it the
+/// reconciler's retention pass reaches `Engine::reclaim_rest` for every
+/// torrent nothing is reading, and that call takes every held piece outside
+/// every holding extent. A torrent that was just added has no reader, so no
+/// extent, so the first tick after its initial check takes all of it: one
+/// `reconcile::RECONCILE_INTERVAL`, about two seconds.
+///
+/// The volume is declared enormous here on purpose. `reclaim_rest` asks no
+/// volume and no cap -- what it acts on is "nobody wants this", not "the
+/// disk is short" -- so a machine with infinite room reclaims just the same,
+/// and a test that seeds a fixture cannot buy its way out with space.
+///
+/// On a real torrent the bytes come back from the swarm, which is why this
+/// is the design and not a leak. Nothing seeds these fixtures, which is why
+/// every test here that reads seeded bytes runs under [`fixture_pins`]
+/// instead; its sibling
+/// `a_seeded_fixture_is_still_read_after_the_pass_that_would_have_taken_it`
+/// is that half.
+#[test]
+fn an_embedder_that_has_pinned_nothing_keeps_no_torrent_nobody_plays() -> anyhow::Result<()> {
+    const PIECE: u64 = 16 * 1024;
+    const PIECES: u64 = 40;
+
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let cache_root = resolved(&cache_dir.path().join("cache"));
+    // Declared before the server starts, so nothing here ever reads this
+    // machine's real free space.
+    stream_server::pretend_volume_space(&cache_root, u64::MAX);
+
+    let content = src.path().join("Film");
+    std::fs::create_dir_all(&content)?;
+    write_payload(&content.join("film.bin"), (PIECES * PIECE) as usize);
+    let (torrent, info_hash) = real_torrent(&content);
+
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_root.clone()),
+        // The empty record, deliberately: this test is what it does.
+        ..offline_config()
+    })?;
+    // After the start, never before (see `seed_piece_store_pieces`), and
+    // before the `/create`: until the torrent is added there is no engine
+    // and so no pass, which is what makes this reading of the fixture
+    // safe rather than a race of its own.
+    seed_piece_store(&cache_root, &torrent, &content);
+    assert_eq!(
+        pieces_held(&cache_root, &info_hash) as u64,
+        PIECES,
+        "the fixture seeded something other than the whole file"
+    );
+
+    let base = format!("http://{}", handle.http_addr());
+    let client = bearer_client(&handle)?;
+    client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
+        .send()?
+        .error_for_status()?;
+    stats_after_check(&client, &base, &info_hash)?;
+
+    let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
+    loop {
+        let held = pieces_held(&cache_root, &info_hash);
+        if held == 0 {
+            break;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the pass never took the pieces of a torrent nobody plays: \
+             {held} still held after {CHECK_WAIT_BOUND:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// **A seeded fixture is still there, and still served, after the pass that
+/// would have taken it.** The other half of
+/// `an_embedder_that_has_pinned_nothing_keeps_no_torrent_nobody_plays`, and
+/// the proof that [`seeded_fixture_config`] is what the tests here need.
+///
+/// It waits three ticks with nothing reading the torrent -- the state in
+/// which the empty pin record loses everything -- and then reads a range.
+/// Under the empty record this fails twice over: the pieces are gone by the
+/// first assertion, and the read parks for ever, because no peer will bring
+/// them back. Under the unknown pin set nothing is taken and the bytes are
+/// the fixture's.
+///
+/// The read is given a timeout rather than left to hang, so a regression
+/// here is a failure with a message and not a suite that never finishes.
+#[test]
+fn a_seeded_fixture_is_still_read_after_the_pass_that_would_have_taken_it() -> anyhow::Result<()> {
+    const PIECE: u64 = 16 * 1024;
+    const PIECES: u64 = 40;
+    /// Long enough that the pass has run several times over.
+    const WAITED: std::time::Duration =
+        std::time::Duration::from_secs(3 * enginefs::FREE_SPACE_WATCH_INTERVAL.as_secs());
+    /// A read that parks is the failure this test exists to catch, so it is
+    /// bounded.
+    const READ_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let cache_root = resolved(&cache_dir.path().join("cache"));
+    stream_server::pretend_volume_space(&cache_root, u64::MAX);
+
+    let content = src.path().join("Film");
+    std::fs::create_dir_all(&content)?;
+    write_payload(&content.join("film.bin"), (PIECES * PIECE) as usize);
+    let payload = std::fs::read(content.join("film.bin"))?;
+    let (torrent, info_hash) = real_torrent(&content);
+
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_root.clone()),
+        ..seeded_fixture_config()
+    })?;
+    seed_piece_store(&cache_root, &torrent, &content);
+    let base = format!("http://{}", handle.http_addr());
+    let client = bearer_client(&handle)?;
+    client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
+        .send()?
+        .error_for_status()?;
+    let stats = stats_after_check(&client, &base, &info_hash)?;
+    let idx = file_index(&stats, "film.bin");
+
+    std::thread::sleep(WAITED);
+    assert_eq!(
+        pieces_held(&cache_root, &info_hash) as u64,
+        PIECES,
+        "a pass took the fixture's pieces although the pin set is unknown"
+    );
+
+    let anonymous = reqwest::blocking::Client::new();
+    let from = 20 * PIECE;
+    let response = anonymous
+        .get(format!("{base}/{info_hash}/{idx}"))
+        .header(
+            reqwest::header::RANGE,
+            format!("bytes={from}-{}", from + PIECE - 1),
+        )
+        .timeout(READ_BOUND)
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        response.bytes()?.as_ref(),
+        &payload[from as usize..(from + PIECE) as usize],
+        "the bytes served after the wait are not the fixture's"
+    );
+
     handle.shutdown()?;
     handle.join()?;
     Ok(())

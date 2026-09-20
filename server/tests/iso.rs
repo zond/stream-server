@@ -19,13 +19,26 @@ use std::sync::Arc;
 use stream_server::images::fixtures::{iso, udf};
 use stream_server::{ServerConfig, ServerHandle};
 
+/// Why every server in this file runs with the pin set unknown, and which
+/// tests may not (see the module).
+#[path = "support/fixture_pins.rs"]
+mod fixture_pins;
+
+/// Offline, and with the pin set unknown.
+///
+/// Every server here reads a disc image this file seeded into the piece
+/// store itself, and nothing ever seeds it again: under the empty pin
+/// record an embedder publishes when it has pinned nothing, the retention
+/// pass takes a torrent nobody is playing about two seconds after it is
+/// added, and every read after that parks for ever ([`fixture_pins`]).
+/// Nothing in this file is about retention, so nothing here wants that
+/// timer.
 fn offline_config() -> ServerConfig {
-    ServerConfig {
+    fixture_pins::keep_what_the_fixture_seeded(ServerConfig {
         resolve_dht_bootstrap_names: false,
         use_public_trackers: false,
-        pins: Some(Default::default()),
         ..ServerConfig::default()
-    }
+    })
 }
 
 /// How long a torrent's initial check is given (`embed.rs` waits the same).
