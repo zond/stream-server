@@ -60,10 +60,10 @@ pub(crate) fn media_body<R: tokio::io::AsyncRead>(reader: R) -> ReaderStream<R> 
 /// The prefix used to be decorative: one handler set served every format
 /// and worked out which it was from the file's suffix. It is the format
 /// now, because that is what says *which translator reads this* -- and
-/// which of the two layers the request belongs to while both exist. ZIP
-/// and TAR are translated (`crate::translators`); RAR and 7z are still
-/// read by the old extracting handlers, until steps 3 and 5 of
-/// `docs/translated-sources.md` convert them.
+/// which of the two layers the request belongs to while both exist. ZIP,
+/// TAR and RAR are translated (`crate::translators`); 7z is still read by
+/// the old extracting handler, until step 5 of
+/// `docs/translated-sources.md` converts it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Rar,
@@ -79,14 +79,20 @@ pub enum Format {
 
 impl Format {
     /// The translator for this format, or `None` for one the old
-    /// extracting path still owns.
+    /// extracting path still owns -- and for RAR in a build without the
+    /// `rar` feature, which has no reader for it at all and answers
+    /// [`rar_disabled_response`] instead.
     fn translator(self) -> Option<Box<dyn Translator>> {
         match self {
             Self::Zip => Some(Box::new(crate::translators::zip::Zip)),
             Self::Tar => Some(Box::new(crate::translators::tar::Tar)),
             Self::TarGz => Some(Box::new(crate::translators::TarGz)),
             Self::Iso => Some(Box::new(crate::translators::iso::Iso)),
-            Self::Rar | Self::SevenZ => None,
+            #[cfg(feature = "rar")]
+            Self::Rar => Some(Box::new(crate::translators::rar::Rar)),
+            #[cfg(not(feature = "rar"))]
+            Self::Rar => None,
+            Self::SevenZ => None,
         }
     }
 }
@@ -652,11 +658,13 @@ async fn create_session_internal(
         Some(translator) => {
             create_translated(&state, translator.as_ref(), key, method, payload).await
         }
+        #[cfg(not(feature = "rar"))]
+        None if format == Format::Rar => rar_disabled_response(),
         None => create_downloaded(state, key, method, payload).await,
     }
 }
 
-/// `/{zip|tar|tgz}/create`: every URL becomes a [`ProxySource`], the
+/// `/{zip|tar|tgz|rar}/create`: every URL becomes a [`ProxySource`], the
 /// translator indexes them, and what is remembered under the key is the
 /// index -- no file, nothing on disk, nothing to sweep but memory.
 async fn create_translated(
@@ -847,10 +855,10 @@ fn select_member(
         })
 }
 
-/// `/{rar|7zip}/create`: the archive is fetched whole into
-/// `<cacheRoot>/.archives` and read as a file. **The old shape**, kept
-/// only for the two formats whose translators have not landed yet (steps
-/// 3 and 5 of `docs/translated-sources.md`); it goes with them.
+/// `/7zip/create`: the archive is fetched whole into `<cacheRoot>/.archives`
+/// and read as a file. **The old shape**, kept only for the one format
+/// whose translator has not landed yet (step 5 of
+/// `docs/translated-sources.md`); it goes with it.
 async fn create_downloaded(
     state: AppState,
     key: String,
@@ -989,7 +997,7 @@ async fn stream_redirection(
 }
 
 /// One member of one session, as a range of bytes: the translated path for
-/// the formats that have one, the old extracting path for the two that do
+/// the formats that have one, the old extracting path for 7z, which does
 /// not yet.
 async fn stream_member(
     state: &AppState,
@@ -1000,6 +1008,10 @@ async fn stream_member(
 ) -> Response {
     if let Some(translator) = format.translator() {
         return stream_translated(state, translator.as_ref(), key, file, headers).await;
+    }
+    #[cfg(not(feature = "rar"))]
+    if format == Format::Rar {
+        return rar_disabled_response();
     }
     // The old path names its member in the URL, or takes the one the
     // create chose.
@@ -1182,7 +1194,7 @@ fn is_storage_full(error: &anyhow::Error) -> bool {
 }
 
 /// A member of a downloaded archive, extracted if the format needs it:
-/// **the old path**, and only for RAR and 7z. See [`create_downloaded`].
+/// **the old path**, and only for 7z. See [`create_downloaded`].
 async fn stream_file(
     state: &AppState,
     key: &str,
@@ -1190,10 +1202,9 @@ async fn stream_file(
     headers: &header::HeaderMap,
 ) -> Result<Response, StatusCode> {
     // The `torrent:` form belongs to the translated path now. It never
-    // worked for these two formats anyway -- a RAR handler reads a
-    // `std::fs::File` and 7z's decoder wants a seekable one -- so this is
-    // the same refusal under the same status, said before the torrent is
-    // looked at rather than after a stream has been registered on it.
+    // worked for 7z anyway -- its decoder wants a seekable file -- so this
+    // is the same refusal under the same status, said before the torrent
+    // is looked at rather than after a stream has been registered on it.
     if let Some(rest) = key.strip_prefix("torrent:") {
         let extension = rest
             .rsplit_once('.')

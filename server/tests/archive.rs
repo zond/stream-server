@@ -8,6 +8,12 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+/// The hand-built RAR archives (see the module), shared with the
+/// translator's own tests.
+#[cfg(feature = "rar")]
+#[path = "support/rar_fixtures.rs"]
+mod rar_fixtures;
+
 fn offline_config() -> stream_server::ServerConfig {
     stream_server::ServerConfig {
         resolve_dht_bootstrap_names: false,
@@ -278,7 +284,8 @@ fn fixture() -> anyhow::Result<Fixture> {
     let config_dir = tempfile::tempdir()?;
     let cache_root = tempfile::tempdir()?;
     let archive = fixture_7z(cache_root.path());
-    let origin = Origin::start(HashMap::from([
+    #[allow(unused_mut)]
+    let mut bodies = HashMap::from([
         ("/fixture.7z".to_string(), archive.clone()),
         // The same archive behind a URL that names no format.
         ("/download?id=7".to_string(), archive),
@@ -301,7 +308,10 @@ fn fixture() -> anyhow::Result<Fixture> {
             "/fixture.rar".to_string(),
             b"Rar!\x1a\x07\x01\x00 and then garbage".to_vec(),
         ),
-    ]))?;
+    ]);
+    #[cfg(feature = "rar")]
+    bodies.extend(rar_bodies());
+    let origin = Origin::start(bodies)?;
     let cache_dir = cache_root.path().join("cache");
     let handle = stream_server::start(stream_server::ServerConfig {
         http_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -319,6 +329,59 @@ fn fixture() -> anyhow::Result<Fixture> {
         _config_dir: config_dir,
     })
 }
+
+/// The RAR archives the origin serves: the same two members as the other
+/// fixtures, stored in one volume and across three, and one archive for
+/// each way a RAR is refused.
+#[cfg(feature = "rar")]
+fn rar_bodies() -> HashMap<String, Vec<u8>> {
+    use rar_fixtures::{Method, Rar5Options};
+    let second = second_content();
+    let members = [
+        ("first.txt", FIRST_CONTENT),
+        ("videos/second.bin", &second[..]),
+    ];
+    let mut bodies = HashMap::from([
+        ("/film.rar".to_string(), rar_fixtures::rar5_stored(&members)),
+        (
+            "/packed.rar".to_string(),
+            rar_fixtures::rar5_archive(
+                &members,
+                &Rar5Options {
+                    method: Method::Normal,
+                    ..Default::default()
+                },
+            ),
+        ),
+        (
+            "/locked.rar".to_string(),
+            rar_fixtures::rar5_header_encrypted(),
+        ),
+        (
+            "/solid.rar".to_string(),
+            rar_fixtures::rar5_archive(
+                &members,
+                &Rar5Options {
+                    solid: true,
+                    method: Method::Normal,
+                    ..Default::default()
+                },
+            ),
+        ),
+    ]);
+    // Three volumes: the first holds `first.txt` and the head of the film,
+    // the third its tail (see `RAR_VOLUME_BYTES`).
+    let volumes = rar_fixtures::rar5_volumes(&members, RAR_VOLUME_BYTES);
+    assert_eq!(volumes.len(), 3, "the fixture is a three-volume set");
+    for (at, volume) in volumes.into_iter().enumerate() {
+        bodies.insert(format!("/film.part{}.rar", at + 1), volume);
+    }
+    bodies
+}
+
+/// How much member data each volume of the RAR set holds.
+#[cfg(feature = "rar")]
+const RAR_VOLUME_BYTES: usize = 100_000;
 
 impl Fixture {
     /// `POST /7zip/create` for `url`; the session key on success.
@@ -831,6 +894,129 @@ fn a_7z_inside_a_torrent_is_refused_as_unreadable_rather_than_missing() -> anyho
         "ab".repeat(20)
     ))?;
     assert_eq!(response.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
+    fixture.finish()
+}
+
+/// Whole, by range, backwards and `HEAD`: the same four requests the zip
+/// and tar test makes, over `member`, against `expected`.
+#[cfg(feature = "rar")]
+fn assert_served_by_range(
+    client: &reqwest::blocking::Client,
+    member: &str,
+    expected: &[u8],
+) -> anyhow::Result<()> {
+    let whole = client.get(member).send()?;
+    assert_eq!(whole.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        whole
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()),
+        Some(expected.len().to_string().as_str())
+    );
+    assert_eq!(whole.bytes()?.as_ref(), expected);
+
+    let tail = client
+        .get(member)
+        .header(
+            reqwest::header::RANGE,
+            format!("bytes={}-", expected.len() - 1024),
+        )
+        .send()?;
+    assert_eq!(tail.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        tail.headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok()),
+        Some(
+            format!(
+                "bytes {}-{}/{}",
+                expected.len() - 1024,
+                expected.len() - 1,
+                expected.len()
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(tail.bytes()?.as_ref(), &expected[expected.len() - 1024..]);
+
+    let back = client
+        .get(member)
+        .header(reqwest::header::RANGE, "bytes=4096-8191")
+        .send()?;
+    assert_eq!(back.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(back.bytes()?.as_ref(), &expected[4096..8192]);
+
+    let head = client.head(member).send()?;
+    assert_eq!(head.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        head.headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()),
+        Some(expected.len().to_string().as_str())
+    );
+    assert!(head.bytes()?.is_empty());
+    Ok(())
+}
+
+/// **A stored RAR member behind a link is byte ranges of the archive**,
+/// like a zip's: nothing downloaded, nothing extracted, nothing under
+/// `.archives`. Until this step `/rar/create` fetched the whole archive
+/// into the cache root before it could name a member.
+#[cfg(feature = "rar")]
+#[test]
+fn a_stored_rar_member_behind_a_link_is_served_by_range_and_nothing_is_written()
+-> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let client = reqwest::blocking::Client::new();
+    let key = fixture.create_key_for("rar", &fixture.origin.url("/film.rar"))?;
+    let member = format!("{}/rar/stream/{key}/videos/second.bin", fixture.base);
+    assert_served_by_range(&client, &member, &second_content())?;
+    assert!(
+        !fixture.scratch_dir.exists(),
+        "the translated path wrote under the cache root: {:?}",
+        fixture.scratch_files()
+    );
+    fixture.finish()
+}
+
+/// **A RAR that cannot be served by range is refused with a sentence**, at
+/// the create: a compressed member (`rar`'s default), an archive whose
+/// headers are encrypted, a solid archive. Each is `415` with the kind the
+/// client switches on, and none of them puts a byte under `.archives`.
+#[cfg(feature = "rar")]
+#[test]
+fn a_rar_that_cannot_be_served_by_range_is_refused_with_a_sentence() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    for (archive, kind, says) in [
+        (
+            "/packed.rar",
+            "compressed",
+            "compressed inside the rar (normal)",
+        ),
+        ("/locked.rar", "encrypted", "encrypted"),
+        ("/solid.rar", "solid", "solid block"),
+    ] {
+        let response = fixture.create_for("rar", &fixture.origin.url(archive))?;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "{archive}"
+        );
+        let body: serde_json::Value = response.json()?;
+        assert_eq!(body["refused"], kind, "{archive}: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(says)),
+            "{archive}: {body}"
+        );
+    }
+    assert!(
+        !fixture.scratch_dir.exists(),
+        "{:?}",
+        fixture.scratch_files()
+    );
     fixture.finish()
 }
 

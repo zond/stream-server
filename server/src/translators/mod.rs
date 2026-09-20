@@ -26,9 +26,13 @@
 use crate::sources::{ByteSource, Extent};
 use async_trait::async_trait;
 use std::fmt;
+use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod iso;
+#[cfg(feature = "rar")]
+pub mod rar;
 pub mod session;
 pub mod tar;
 pub mod zip;
@@ -175,6 +179,17 @@ pub trait Translator: Send + Sync {
     /// volume list, in order; a single-volume format reads `sources[0]`
     /// and says so about the rest.
     async fn index(&self, sources: &[Arc<dyn ByteSource>]) -> Result<Index, Refusal>;
+
+    /// The files among `siblings` that make up the container `named` is a
+    /// volume of, in volume order -- what the `torrent:` form hands to
+    /// [`Translator::index`] when the container is a file of a torrent and
+    /// the rest of it is the files beside that one. Every single-file
+    /// format is its own answer, which is the default; a format that comes
+    /// in sets (RAR) knows its naming rules and says which siblings are
+    /// its volumes, or that one of them is missing.
+    fn volumes(&self, named: &str, _siblings: &[String]) -> Result<Vec<String>, Refusal> {
+        Ok(vec![named.to_string()])
+    }
 }
 
 /// How many bytes reading one container's index may cost.
@@ -270,6 +285,115 @@ impl<'a> Budget<'a> {
     }
 }
 
+/// A source as a blocking `Read + Seek`, for the format crates whose
+/// parsers are synchronous (RAR's `parse_volume_facts`, 7z's
+/// `Archive::read`): [`Budget`]'s twin for a parser that does its own
+/// reading.
+///
+/// It runs on the blocking pool and reads through the runtime handle it
+/// was made under, so the source's `read_at` -- a seek of the piece store,
+/// a ranged request through the proxy cache -- is the same call an index
+/// read makes anywhere else, and lands in a [`crate::sources::testing::
+/// CountingSource`] the same way. A seek here is a number: nothing is
+/// fetched until the parser reads, which is how a walk that seeks past
+/// every member's data by its size costs the headers alone.
+///
+/// The same bound as [`Budget`], per reader -- one reader per volume, so a
+/// set costs at most the bound per volume -- and reached the same way: a
+/// read past it is an error the parser surfaces and the translator turns
+/// into a refusal ([`IndexReader::is_over_budget`]), not a slower answer.
+pub struct IndexReader {
+    source: Arc<dyn ByteSource>,
+    runtime: tokio::runtime::Handle,
+    position: u64,
+    left: u64,
+    /// Shared, because the parser consumes the reader and the caller still
+    /// wants the figure afterwards.
+    used: Arc<AtomicU64>,
+}
+
+/// The error a read past [`INDEX_BUDGET_BYTES`] answers with, wrapped in
+/// an `io::Error` so a synchronous parser carries it out unchanged.
+#[derive(Debug)]
+pub struct OverBudget;
+
+impl fmt::Display for OverBudget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "reading the index passed {INDEX_BUDGET_BYTES} bytes, so it is not an index"
+        )
+    }
+}
+
+impl std::error::Error for OverBudget {}
+
+impl IndexReader {
+    /// Over `source`, positioned at its start, with a whole budget to
+    /// spend. Made on a runtime thread (it takes the current handle) and
+    /// used off one.
+    pub fn new(source: Arc<dyn ByteSource>) -> Self {
+        Self {
+            source,
+            runtime: tokio::runtime::Handle::current(),
+            position: 0,
+            left: INDEX_BUDGET_BYTES,
+            used: Arc::default(),
+        }
+    }
+
+    /// The running count of bytes read through this reader, to keep after
+    /// the parser has taken the reader itself.
+    pub fn tally(&self) -> Arc<AtomicU64> {
+        self.used.clone()
+    }
+
+    /// Whether `error` -- one a parser handed back -- is this reader
+    /// refusing to read past the budget.
+    pub fn is_over_budget(error: &io::Error) -> bool {
+        error
+            .get_ref()
+            .is_some_and(|inner| inner.is::<OverBudget>())
+    }
+}
+
+impl io::Read for IndexReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let len = self.source.len();
+        if buf.is_empty() || self.position >= len {
+            return Ok(0);
+        }
+        if self.left == 0 {
+            return Err(io::Error::other(OverBudget));
+        }
+        let want = (buf.len() as u64).min(len - self.position).min(self.left) as usize;
+        let read = self
+            .runtime
+            .block_on(self.source.read_at(self.position, &mut buf[..want]))?;
+        self.position += read as u64;
+        self.left -= read as u64;
+        self.used.fetch_add(read as u64, Ordering::Relaxed);
+        Ok(read)
+    }
+}
+
+impl io::Seek for IndexReader {
+    fn seek(&mut self, to: io::SeekFrom) -> io::Result<u64> {
+        let (base, delta) = match to {
+            io::SeekFrom::Start(at) => (at, 0i64),
+            io::SeekFrom::End(delta) => (self.source.len(), delta),
+            io::SeekFrom::Current(delta) => (self.position, delta),
+        };
+        self.position = base.checked_add_signed(delta).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a seek before the start of the source",
+            )
+        })?;
+        Ok(self.position)
+    }
+}
+
 /// `sources[0]`, or a refusal when there are none: every translator here
 /// reads one volume, and a create with no URL at all is refused before it
 /// reaches one.
@@ -350,7 +474,7 @@ pub(crate) fn direct_extent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sources::testing::MemorySource;
+    use crate::sources::testing::{CountingSource, MemorySource};
 
     fn source(bytes: Vec<u8>) -> Arc<dyn ByteSource> {
         Arc::new(MemorySource::new("fixture", bytes))
@@ -416,6 +540,64 @@ mod tests {
         assert_eq!(budget.read_exact(0, 10).await.unwrap(), vec![7u8; 10]);
         let refusal = budget.read_exact(4, 10).await.expect_err("truncated");
         assert!(matches!(refusal, Refusal::Malformed(_)), "{refusal:?}");
+    }
+
+    /// The blocking shim is a handle a synchronous parser can seek about
+    /// in, and **a seek fetches nothing**: what a walk that skips past
+    /// every member's data by size costs is the headers it reads, which is
+    /// what the counting source underneath sees.
+    #[tokio::test]
+    async fn the_blocking_shim_reads_what_it_is_asked_and_seeks_for_free() {
+        use std::io::{Read, Seek, SeekFrom};
+        let counting = Arc::new(CountingSource::new(Arc::new(MemorySource::new(
+            "volume.rar",
+            (0..=255u8).cycle().take(100_000).collect::<Vec<_>>(),
+        ))));
+        let counts = counting.counts();
+        let mut reader = IndexReader::new(counting.clone() as Arc<dyn ByteSource>);
+        let tally = reader.tally();
+        let read = tokio::task::spawn_blocking(move || {
+            let mut head = [0u8; 8];
+            reader.read_exact(&mut head).unwrap();
+            // Past the member's data by its size, then the trailer.
+            assert_eq!(reader.seek(SeekFrom::Current(90_000)).unwrap(), 90_008);
+            let mut tail = [0u8; 4];
+            reader.read_exact(&mut tail).unwrap();
+            assert_eq!(reader.seek(SeekFrom::End(-2)).unwrap(), 99_998);
+            let mut end = Vec::new();
+            reader.read_to_end(&mut end).unwrap();
+            assert_eq!(end.len(), 2);
+            (head, tail)
+        })
+        .await
+        .unwrap();
+        assert_eq!(read.0, [0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(read.1[0], (90_008 % 256) as u8);
+        assert_eq!(tally.load(Ordering::Relaxed), 14);
+        assert_eq!(counts.read_at_bytes(), 14);
+        assert!(!counts.read_any_of(8, 90_000), "{:?}", counts.ranges());
+        assert_eq!(counts.opens(), 0);
+    }
+
+    /// And it stops at the budget the way `Budget` does: with an error the
+    /// parser hands back and the translator recognises, not by reading on.
+    #[tokio::test]
+    async fn the_blocking_shim_refuses_to_read_past_the_budget() {
+        use std::io::Read;
+        let held = source(vec![0u8; 1024]);
+        let mut reader = IndexReader::new(held);
+        reader.left = 10;
+        let error = tokio::task::spawn_blocking(move || {
+            let mut buf = [0u8; 32];
+            assert_eq!(reader.read(&mut buf).unwrap(), 10);
+            reader.read(&mut buf).unwrap_err()
+        })
+        .await
+        .unwrap();
+        assert!(IndexReader::is_over_budget(&error), "{error}");
+        assert!(!IndexReader::is_over_budget(&io::Error::other(
+            "something else"
+        )));
     }
 
     /// An extent a container states outside itself is refused where it is

@@ -5409,7 +5409,16 @@ fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> 
         // The byte-serving half of the same prefix *is* on the LAN: a
         // request with no session key is refused by the route itself, on
         // both listeners alike, and a key nobody created is a `404` that
-        // opened nothing.
+        // opened nothing -- except under `/rar` in a build without the
+        // `rar` feature, which has no RAR reader at all and says so
+        // (`501`) before it looks anything up. Either answer is the route
+        // being there and nothing being opened, which is what this is
+        // about.
+        let missing_session = if cfg!(feature = "rar") || prefix != "/rar" {
+            reqwest::StatusCode::NOT_FOUND
+        } else {
+            reqwest::StatusCode::NOT_IMPLEMENTED
+        };
         let stream = format!("{prefix}/stream");
         for origin in [&lan, &base] {
             assert_eq!(
@@ -5422,7 +5431,7 @@ fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> 
                     .get(format!("{origin}{stream}/no-such-session/movie.mkv"))
                     .send()?
                     .status(),
-                reqwest::StatusCode::NOT_FOUND,
+                missing_session,
                 "{origin}{stream}/no-such-session/movie.mkv"
             );
         }
