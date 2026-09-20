@@ -263,9 +263,13 @@ The formats, and what each one's translator is:
   bridge (the 9660 tree is enough), but **Blu-ray images are UDF 2.50
   only**, with no 9660 tree at all. UDF: anchor at sector 256, the volume
   descriptor sequence, the file set descriptor, file entries whose
-  allocation descriptors are extents -- again `Direct(extents)`. UDF is a
-  separate step after 9660, and until it lands a UDF-only image is
-  `Malformed("UDF only; not yet")`, named as such.
+  allocation descriptors are extents -- again `Direct(extents)`. **Both are
+  written** (`server/src/images/`, 2026-09-20: two independently written
+  parsers, which index a real bridge image to identical extents). What UDF
+  refuses by name is a **metadata partition map** -- UDF 2.50 remaps logical
+  blocks through a metadata file, so an extent computed without it is the
+  wrong range of the image -- and that is the gap a real Blu-ray image hits
+  first, and the next UDF increment.
 
 ### 2.3 `MemberView`: a member as a file
 
@@ -388,7 +392,9 @@ never kept beside it.
    #99 becomes the rule in §2.2.4).
 5. **7z translator** (COPY blocks direct, all else refused) and delete
    `sevenz.rs`'s extraction.
-6. **ISO 9660 translator**, `iso` route prefix, sniff signature already in
+6. **The images module behind `ByteSource`** -- it is written, with its own
+   small `ImageReader` trait (`len` + `read_at`), so what is left is an
+   adapter, the refusal mapping of §3, and the `iso` route prefix, sniff signature already in
    xtremio's `archive_sniff` (`CD001` at 32769). Fixture: a tiny image
    built in the test (PVD + root record + one file, 2048-byte sectors) and,
    if `genisoimage`/`xorriso` is on the CI runner, a real one. Then **UDF**
