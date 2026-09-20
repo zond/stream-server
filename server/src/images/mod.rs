@@ -39,6 +39,7 @@ use std::io;
 use std::sync::Arc;
 
 pub mod iso9660;
+pub mod udf;
 
 #[cfg(test)]
 pub(crate) mod fixtures;
@@ -143,6 +144,9 @@ pub enum ImageFormat {
     /// supplementary descriptor, `rock_ridge` when any name came from a
     /// Rock Ridge `NM` entry.
     Iso9660 { joliet: bool, rock_ridge: bool },
+    /// UDF, at the revision the logical volume's domain identifier states
+    /// (`0x0250` for the Blu-ray case), or `None` when it states none.
+    Udf { revision: Option<u16> },
 }
 
 impl fmt::Display for ImageFormat {
@@ -158,6 +162,10 @@ impl fmt::Display for ImageFormat {
                 }
                 Ok(())
             }
+            Self::Udf { revision } => match revision {
+                Some(r) => write!(f, "UDF {:x}.{:02x}", r >> 8, r & 0xff),
+                None => f.write_str("UDF"),
+            },
         }
     }
 }
@@ -214,12 +222,27 @@ impl std::error::Error for Refusal {}
 
 /// Index whatever the image is.
 ///
-/// ISO 9660 for now. **UDF is the next step and it matters**: a DVD-Video
-/// image is a bridge disc, both ISO 9660 and UDF, and its 9660 tree is
-/// enough -- but a Blu-ray image is UDF 2.50 with no 9660 tree at all, so
-/// until that step lands a BD image is refused here and says so.
+/// ISO 9660 is tried first, because a bridge disc -- a DVD-Video image,
+/// which is both ISO 9660 and UDF -- holds the same files in both trees and
+/// the 9660 tree is the cheaper walk. A UDF-only image (every Blu-ray) has
+/// no `CD001` descriptor at all and falls through to UDF.
+///
+/// The refusal returned when neither recognises the image is the *9660*
+/// one only when 9660 got far enough to recognise something; otherwise the
+/// UDF refusal is the more informative and is what comes back.
 pub async fn index(reader: &dyn ImageReader) -> Result<ImageIndex, Refusal> {
-    iso9660::index(reader).await
+    let iso = iso9660::index(reader).await;
+    match iso {
+        Ok(index) => Ok(index),
+        Err(Refusal::NotAnImage { detail }) => match udf::index(reader).await {
+            Ok(index) => Ok(index),
+            Err(Refusal::NotAnImage { detail: udf_detail }) => Err(Refusal::NotAnImage {
+                detail: format!("{detail}; {udf_detail}"),
+            }),
+            Err(other) => Err(other),
+        },
+        Err(other) => Err(other),
+    }
 }
 
 /// How many bytes an index is allowed to read.
@@ -356,6 +379,37 @@ pub(crate) fn le_u32(b: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
 }
 
+pub(crate) fn le_u64(b: &[u8], at: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(b.get(at..at + 8)?.try_into().ok()?))
+}
+
+/// Trim a file's extents so that they sum to exactly `len`.
+///
+/// Both formats round the last extent up to a block boundary, and UDF
+/// states the real length separately in the file entry. Serving the padding
+/// would append the block's tail to the film, so the extents are cut to the
+/// stated length here, once, for both parsers. Extents that sum to *less*
+/// than the stated length are a contradiction the caller refuses; this
+/// returns the sum so it can.
+pub(crate) fn trim_to_len(extents: &mut Vec<Extent>, len: u64) -> u64 {
+    let mut kept = 0u64;
+    let mut cut = extents.len();
+    for (i, e) in extents.iter_mut().enumerate() {
+        if kept >= len {
+            cut = i;
+            break;
+        }
+        let room = len - kept;
+        if e.len > room {
+            e.len = room;
+        }
+        kept += e.len;
+    }
+    extents.truncate(cut);
+    extents.retain(|e| e.len > 0);
+    kept
+}
+
 /// Every extent lies inside the image, and none of them overflows.
 pub(crate) fn extents_within(extents: &[Extent], image_len: u64) -> Result<(), String> {
     for e in extents {
@@ -378,7 +432,7 @@ pub(crate) fn extents_within(extents: &[Extent], image_len: u64) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::images::fixtures::{self, CountingImage, iso};
+    use crate::images::fixtures::{self, CountingImage, iso, udf as udf_fx};
 
     #[tokio::test]
     async fn an_iso_9660_image_is_indexed_through_its_own_tree() {
@@ -390,13 +444,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bytes_that_are_not_an_image_are_refused_naming_what_was_missing() {
+    async fn a_udf_only_image_falls_through_to_udf() {
+        let image = MemoryImage::new(udf_fx::minimal_udf());
+        let idx = index(&image).await.expect("indexed");
+        assert!(matches!(idx.format, ImageFormat::Udf { .. }));
+        assert_eq!(idx.files[0].path, "/MOVIE.BIN");
+    }
+
+    #[tokio::test]
+    async fn a_bridge_image_is_indexed_through_its_9660_tree() {
+        // Both descriptor sets present: the 9660 answer is the one taken,
+        // which is what `docs/translated-sources.md` §2.2 says a bridge
+        // disc should cost.
+        let image = MemoryImage::new(udf_fx::bridge_image());
+        let idx = index(&image).await.expect("indexed");
+        assert!(matches!(idx.format, ImageFormat::Iso9660 { .. }));
+    }
+
+    #[tokio::test]
+    async fn bytes_that_are_neither_format_are_refused_naming_both() {
         let image = MemoryImage::new(vec![0u8; 600 * 1024]);
         let err = index(&image).await.expect_err("refused");
         let Refusal::NotAnImage { detail } = &err else {
             panic!("expected NotAnImage, got {err:?}");
         };
         assert!(detail.contains("CD001"), "{detail}");
+        assert!(detail.contains("anchor"), "{detail}");
     }
 
     #[tokio::test]
@@ -424,6 +497,39 @@ mod tests {
             "the index read file data: {:?}",
             image.reads()
         );
+    }
+
+    #[test]
+    fn trimming_cuts_the_padding_and_drops_extents_past_the_end() {
+        let mut extents = vec![
+            Extent {
+                offset: 0,
+                len: 2048,
+            },
+            Extent {
+                offset: 4096,
+                len: 2048,
+            },
+        ];
+        assert_eq!(trim_to_len(&mut extents, 3000), 3000);
+        assert_eq!(
+            extents,
+            vec![
+                Extent {
+                    offset: 0,
+                    len: 2048
+                },
+                Extent {
+                    offset: 4096,
+                    len: 952
+                }
+            ]
+        );
+
+        let mut short = vec![Extent { offset: 0, len: 10 }];
+        // A stated length the extents cannot cover comes back as the sum,
+        // so the caller can call it the contradiction it is.
+        assert_eq!(trim_to_len(&mut short, 99), 10);
     }
 
     #[tokio::test]
@@ -457,18 +563,19 @@ mod tests {
         assert_eq!(budget.used(), INDEX_READ_BUDGET);
     }
 
-    /// A real image, written by a real tool, with the extents checked
-    /// against the bytes they claim to be. A fixture built in the test
-    /// proves the parser matches this reading of the standard; only a
-    /// tool's image proves it matches what tools write.
+    /// A real image, written by a real tool, indexed through both of its
+    /// trees -- and the extents checked against the bytes they claim to
+    /// be. A fixture built in the test proves the parser matches this
+    /// reading of the standard; only a tool's image proves it matches
+    /// what tools write.
     ///
     /// Skipped, loudly, when no tool is installed: this must not be the
     /// test that fails on a machine that never had `genisoimage`.
     #[tokio::test]
-    async fn a_real_image_indexes_and_its_extents_hold_the_right_bytes() {
+    async fn a_real_bridge_image_indexes_identically_through_9660_and_udf() {
         let Some(tool) = image_writer() else {
             eprintln!(
-                "skipping a_real_image_indexes_and_its_extents_hold_the_right_bytes: \
+                "skipping a_real_bridge_image_indexes_identically_through_9660_and_udf: \
                  none of genisoimage, mkisofs or xorriso is installed"
             );
             return;
@@ -495,6 +602,7 @@ mod tests {
             .arg("-quiet")
             .arg("-r")
             .arg("-J")
+            .arg("-udf")
             .arg("-o")
             .arg(&iso_path)
             .arg(&src)
@@ -505,29 +613,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let image = CountingImage::new(bytes.clone());
-        let idx = index(&image).await.expect("indexed");
-        let mut files = idx.files.clone();
-        files.sort_by(|a, b| a.path.cmp(&b.path));
+        let iso_index = iso9660::index(&image).await.expect("indexed as ISO 9660");
+        let udf_index = udf::index(&image).await.expect("indexed as UDF");
+
+        // The same files, at the same ranges of the same image, through
+        // two completely separate parsers: the strongest check there is
+        // that neither is reading the standard wrong.
+        let mut iso_files = iso_index.files.clone();
+        let mut udf_files = udf_index.files.clone();
+        iso_files.sort_by(|a, b| a.path.cmp(&b.path));
+        udf_files.sort_by(|a, b| a.path.cmp(&b.path));
         assert_eq!(
-            files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            iso_files, udf_files,
+            "the two trees of a bridge image disagree"
+        );
+        assert_eq!(
+            iso_files
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>(),
             vec!["/HELLO.TXT", "/SUBDIR/NESTED.BIN"]
         );
 
         // And the extents are the bytes they say they are.
-        let hello = &files[0];
+        let hello = &iso_files[0];
         assert_eq!(hello.len, top.len() as u64);
         let at = hello.extents[0].offset as usize;
         assert_eq!(&bytes[at..at + top.len()], top);
-        let big = &files[1];
+        let big = &iso_files[1];
         assert_eq!(big.len, nested.len() as u64);
         let at = big.extents[0].offset as usize;
         assert_eq!(&bytes[at..at + nested.len()], &nested[..]);
 
-        // An index of a 5 KB-plus image, and still nothing like a read of
-        // its contents.
+        // Two indexes of a 5 KB-plus image, and still nothing like a read
+        // of its contents.
         assert!(
             image.total() < 64 * SECTOR,
-            "read {} bytes to index a real image",
+            "read {} bytes to index a real image twice",
             image.total()
         );
     }

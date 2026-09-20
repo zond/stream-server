@@ -115,6 +115,18 @@ impl ImageReader for FailingImage {
     }
 }
 
+fn put_u16(b: &mut [u8], at: usize, v: u16) {
+    b[at..at + 2].copy_from_slice(&v.to_le_bytes());
+}
+
+fn put_u32(b: &mut [u8], at: usize, v: u32) {
+    b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+fn put_u64(b: &mut [u8], at: usize, v: u64) {
+    b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+}
+
 /// ISO 9660 images.
 pub mod iso {
     use super::*;
@@ -396,5 +408,751 @@ pub mod iso {
         let dir = at(&mut image, 18);
         dir[..rec.len()].copy_from_slice(&rec);
         image
+    }
+}
+
+/// UDF images.
+pub mod udf {
+    use super::*;
+    use crate::images::udf::crc_itu_t;
+
+    pub const SECTORS: u64 = 320;
+    /// The main volume descriptor sequence.
+    pub const VDS_SECTOR: u64 = 32;
+    pub const ANCHOR_SECTOR: u64 = 256;
+    /// Where the one partition starts, in sectors.
+    pub const PARTITION_START: u32 = 64;
+    pub const PARTITION_BLOCKS: u32 = 240;
+
+    /// Partition blocks, by what lives in them.
+    pub const FSD_BLOCK: u32 = 0;
+    pub const ROOT_FE_BLOCK: u32 = 1;
+    pub const ROOT_DIR_BLOCK: u32 = 2;
+    pub const FILE_FE_BLOCK: u32 = 3;
+    pub const FILE_DATA_BLOCK: u32 = 4;
+
+    pub const FILE_LEN: u64 = 1234;
+
+    /// An allocation descriptor as a test writes it.
+    pub enum Ad {
+        /// `kind` is the top two bits of the length field: 0 recorded,
+        /// 1 allocated but not recorded, 3 a continuation.
+        Short { kind: u32, len: u32, block: u32 },
+        /// `part` is the partition *reference* number, which only a long
+        /// descriptor carries -- a short one is always in its file entry's
+        /// own partition.
+        Long {
+            kind: u32,
+            len: u32,
+            block: u32,
+            part: u16,
+        },
+    }
+
+    pub struct Builder {
+        pub image: Vec<u8>,
+    }
+
+    impl Default for Builder {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl Builder {
+        pub fn new() -> Self {
+            Self {
+                image: vec![0u8; (SECTORS * SECTOR) as usize],
+            }
+        }
+
+        fn sector(&mut self, sector: u64) -> &mut [u8] {
+            let start = (sector * SECTOR) as usize;
+            &mut self.image[start..start + SECTOR as usize]
+        }
+
+        pub fn block_offset(block: u32) -> u64 {
+            (PARTITION_START as u64 + block as u64) * SECTOR
+        }
+
+        /// Write a descriptor and seal its tag: the CRC over the body, then
+        /// the checksum over the tag.
+        fn seal(&mut self, sector: u64, ident: u16, location: u32, body_len: usize) {
+            let start = (sector * SECTOR) as usize;
+            let d = &mut self.image[start..start + SECTOR as usize];
+            put_u16(d, 0, ident);
+            put_u16(d, 2, 2);
+            put_u16(d, 6, 1);
+            let crc = crc_itu_t(&d[16..16 + body_len]);
+            put_u16(d, 8, crc);
+            put_u16(
+                d,
+                10,
+                u16::try_from(body_len).expect("a test body is short"),
+            );
+            put_u32(d, 12, location);
+            d[4] = 0;
+            let sum: u32 = d[..4].iter().map(|&b| b as u32).sum::<u32>()
+                + d[5..16].iter().map(|&b| b as u32).sum::<u32>();
+            d[4] = (sum & 0xff) as u8;
+        }
+
+        /// The volume recognition sequence at sector 16. Not read by the
+        /// parser -- the anchor is what it looks for -- but a real image
+        /// has it and the bridge fixture needs the sectors accounted for.
+        pub fn vrs(&mut self) -> &mut Self {
+            for (i, id) in [b"BEA01", b"NSR03", b"TEA01"].iter().enumerate() {
+                let d = self.sector(16 + i as u64);
+                d[0] = 0;
+                d[1..6].copy_from_slice(*id);
+                d[6] = 1;
+            }
+            self
+        }
+
+        pub fn anchor(&mut self, vds_sectors: u32) -> &mut Self {
+            {
+                let d = self.sector(ANCHOR_SECTOR);
+                put_u32(d, 16, vds_sectors * SECTOR as u32);
+                put_u32(d, 20, VDS_SECTOR as u32);
+            }
+            self.seal(ANCHOR_SECTOR, 2, ANCHOR_SECTOR as u32, 496);
+            self
+        }
+
+        pub fn primary_volume(&mut self) -> &mut Self {
+            self.seal(VDS_SECTOR, 1, VDS_SECTOR as u32, 496);
+            self
+        }
+
+        pub fn partition(&mut self, start: u32, blocks: u32) -> &mut Self {
+            {
+                let d = self.sector(VDS_SECTOR + 1);
+                put_u16(d, 22, 0);
+                put_u32(d, 188, start);
+                put_u32(d, 192, blocks);
+            }
+            self.seal(VDS_SECTOR + 1, 5, VDS_SECTOR as u32 + 1, 496);
+            self
+        }
+
+        /// The logical volume descriptor, with a type 1 partition map.
+        pub fn logical_volume(&mut self, revision: u16, fsd_block: u32) -> &mut Self {
+            {
+                let d = self.sector(VDS_SECTOR + 2);
+                put_u32(d, 212, SECTOR as u32);
+                d[217..217 + 19].copy_from_slice(b"*OSTA UDF Compliant");
+                put_u16(d, 216 + 24, revision);
+                // LogicalVolumeContentsUse: the file set descriptor's
+                // long_ad.
+                put_u32(d, 248, SECTOR as u32);
+                put_u32(d, 252, fsd_block);
+                put_u16(d, 256, 0);
+                put_u32(d, 264, 6);
+                put_u32(d, 268, 1);
+                d[440] = 1;
+                d[441] = 6;
+                put_u16(d, 442, 1);
+                put_u16(d, 444, 0);
+            }
+            self.seal(VDS_SECTOR + 2, 6, VDS_SECTOR as u32 + 2, 430);
+            self
+        }
+
+        /// A logical volume descriptor whose one partition map is a type 2
+        /// map of the named kind.
+        pub fn logical_volume_with_type2_map(&mut self, name: &str) -> &mut Self {
+            {
+                let d = self.sector(VDS_SECTOR + 2);
+                put_u32(d, 212, SECTOR as u32);
+                d[217..217 + 19].copy_from_slice(b"*OSTA UDF Compliant");
+                put_u16(d, 216 + 24, 0x0250);
+                put_u32(d, 248, SECTOR as u32);
+                put_u32(d, 252, FSD_BLOCK);
+                put_u32(d, 264, 64);
+                put_u32(d, 268, 1);
+                d[440] = 2;
+                d[441] = 64;
+                d[445..445 + name.len()].copy_from_slice(name.as_bytes());
+            }
+            self.seal(VDS_SECTOR + 2, 6, VDS_SECTOR as u32 + 2, 488);
+            self
+        }
+
+        pub fn terminator(&mut self) -> &mut Self {
+            self.seal(VDS_SECTOR + 3, 8, VDS_SECTOR as u32 + 3, 496);
+            self
+        }
+
+        pub fn file_set(&mut self, root_block: u32) -> &mut Self {
+            let sector = PARTITION_START as u64 + FSD_BLOCK as u64;
+            {
+                let d = self.sector(sector);
+                put_u32(d, 400, SECTOR as u32);
+                put_u32(d, 404, root_block);
+                put_u16(d, 408, 0);
+            }
+            self.seal(sector, 256, FSD_BLOCK, 496);
+            self
+        }
+
+        /// A file entry (tag 261) or extended file entry (tag 266).
+        #[allow(clippy::too_many_arguments)]
+        pub fn file_entry(
+            &mut self,
+            block: u32,
+            extended: bool,
+            file_type: u8,
+            strategy: u16,
+            ad_type: u16,
+            info_len: u64,
+            ads: &[Ad],
+            inline: &[u8],
+        ) -> &mut Self {
+            let sector = PARTITION_START as u64 + block as u64;
+            let (len_ad_at, fixed) = if extended { (212, 216) } else { (172, 176) };
+            let mut descriptors = Vec::new();
+            for ad in ads {
+                match ad {
+                    Ad::Short { kind, len, block } => {
+                        let mut b = [0u8; 8];
+                        put_u32(&mut b, 0, (kind << 30) | len);
+                        put_u32(&mut b, 4, *block);
+                        descriptors.extend_from_slice(&b);
+                    }
+                    Ad::Long {
+                        kind,
+                        len,
+                        block,
+                        part,
+                    } => {
+                        let mut b = [0u8; 16];
+                        put_u32(&mut b, 0, (kind << 30) | len);
+                        put_u32(&mut b, 4, *block);
+                        put_u16(&mut b, 8, *part);
+                        descriptors.extend_from_slice(&b);
+                    }
+                }
+            }
+            if ad_type == 3 {
+                descriptors = inline.to_vec();
+            }
+            {
+                let d = self.sector(sector);
+                put_u16(d, 20, strategy);
+                d[27] = file_type;
+                put_u16(d, 34, ad_type);
+                put_u64(d, 56, info_len);
+                put_u32(d, len_ad_at, descriptors.len() as u32);
+                d[fixed..fixed + descriptors.len()].copy_from_slice(&descriptors);
+            }
+            let ident = if extended { 266 } else { 261 };
+            self.seal(sector, ident, block, fixed + descriptors.len() - 16);
+            self
+        }
+
+        /// A directory's file identifier descriptors: the parent entry and
+        /// then `(name, is_dir, icb block)` for each child.
+        pub fn directory(
+            &mut self,
+            block: u32,
+            parent: u32,
+            children: &[(&str, bool, u32)],
+        ) -> u64 {
+            let sector = PARTITION_START as u64 + block as u64;
+            let mut fids: Vec<Vec<u8>> = vec![fid(&[], 0x0a, parent)];
+            for (name, is_dir, icb) in children {
+                let mut raw = vec![8u8];
+                raw.extend_from_slice(name.as_bytes());
+                fids.push(fid(&raw, if *is_dir { 0x02 } else { 0x00 }, *icb));
+            }
+            let mut pos = 0usize;
+            for bytes in &fids {
+                let start = (sector * SECTOR) as usize + pos;
+                self.image[start..start + bytes.len()].copy_from_slice(bytes);
+                // Each descriptor seals its own tag in place.
+                let crc_len = bytes.len() - 16;
+                let d = &mut self.image[start..start + bytes.len()];
+                put_u16(d, 0, 257);
+                put_u16(d, 2, 2);
+                put_u16(d, 6, 1);
+                let crc = crc_itu_t(&d[16..16 + crc_len]);
+                put_u16(d, 8, crc);
+                put_u16(d, 10, crc_len as u16);
+                put_u32(d, 12, block);
+                d[4] = 0;
+                let sum: u32 = d[..4].iter().map(|&b| b as u32).sum::<u32>()
+                    + d[5..16].iter().map(|&b| b as u32).sum::<u32>();
+                d[4] = (sum & 0xff) as u8;
+                pos += bytes.len();
+            }
+            pos as u64
+        }
+
+        pub fn finish(self) -> Vec<u8> {
+            self.image
+        }
+    }
+
+    /// One file identifier descriptor, tag left unsealed, padded to four
+    /// bytes as the standard requires.
+    fn fid(name: &[u8], characteristics: u8, icb_block: u32) -> Vec<u8> {
+        let total = 38 + name.len();
+        let padded = total.next_multiple_of(4);
+        let mut b = vec![0u8; padded];
+        put_u16(&mut b, 16, 1);
+        b[18] = characteristics;
+        b[19] = u8::try_from(name.len()).expect("a test name fits in a byte");
+        put_u32(&mut b, 20, SECTOR as u32);
+        put_u32(&mut b, 24, icb_block);
+        put_u16(&mut b, 28, 0);
+        put_u16(&mut b, 36, 0);
+        b[38..38 + name.len()].copy_from_slice(name);
+        b
+    }
+
+    /// The volume descriptors every fixture here shares.
+    fn volume() -> Builder {
+        let mut b = Builder::new();
+        b.vrs()
+            .anchor(4)
+            .primary_volume()
+            .partition(PARTITION_START, PARTITION_BLOCKS)
+            .logical_volume(0x0250, FSD_BLOCK)
+            .terminator()
+            .file_set(ROOT_FE_BLOCK);
+        b
+    }
+
+    /// Descriptors, a root directory with one file, and the file's data.
+    pub fn minimal_udf() -> Vec<u8> {
+        let mut b = volume();
+        let dir_len = b.directory(
+            ROOT_DIR_BLOCK,
+            ROOT_FE_BLOCK,
+            &[("MOVIE.BIN", false, FILE_FE_BLOCK)],
+        );
+        b.file_entry(
+            ROOT_FE_BLOCK,
+            false,
+            4,
+            4,
+            0,
+            dir_len,
+            &[Ad::Short {
+                kind: 0,
+                len: SECTOR as u32,
+                block: ROOT_DIR_BLOCK,
+            }],
+            &[],
+        );
+        b.file_entry(
+            FILE_FE_BLOCK,
+            false,
+            5,
+            4,
+            0,
+            FILE_LEN,
+            &[Ad::Short {
+                kind: 0,
+                len: FILE_LEN as u32,
+                block: FILE_DATA_BLOCK,
+            }],
+            &[],
+        );
+        let mut image = b.finish();
+        let data = Builder::block_offset(FILE_DATA_BLOCK) as usize;
+        image[data..data + FILE_LEN as usize].fill(b'M');
+        image
+    }
+
+    /// Where [`minimal_udf`]'s file data is.
+    pub fn data_range(_image: &[u8]) -> (u64, u64) {
+        (Builder::block_offset(FILE_DATA_BLOCK), FILE_LEN)
+    }
+
+    /// `/BDMV/STREAM/00000.m2ts`, in two extents, the Blu-ray shape.
+    pub fn udf_with_subdirectory() -> Vec<u8> {
+        let mut b = volume();
+        let root_len = b.directory(ROOT_DIR_BLOCK, ROOT_FE_BLOCK, &[("BDMV", true, 5)]);
+        b.file_entry(
+            ROOT_FE_BLOCK,
+            false,
+            4,
+            4,
+            0,
+            root_len,
+            &[Ad::Short {
+                kind: 0,
+                len: SECTOR as u32,
+                block: ROOT_DIR_BLOCK,
+            }],
+            &[],
+        );
+        let bdmv_len = b.directory(6, ROOT_FE_BLOCK, &[("STREAM", true, 7)]);
+        b.file_entry(
+            5,
+            false,
+            4,
+            4,
+            0,
+            bdmv_len,
+            &[Ad::Short {
+                kind: 0,
+                len: SECTOR as u32,
+                block: 6,
+            }],
+            &[],
+        );
+        let stream_len = b.directory(8, 5, &[("00000.m2ts", false, 9)]);
+        b.file_entry(
+            7,
+            false,
+            4,
+            4,
+            0,
+            stream_len,
+            &[Ad::Short {
+                kind: 0,
+                len: SECTOR as u32,
+                block: 8,
+            }],
+            &[],
+        );
+        b.file_entry(
+            9,
+            false,
+            5,
+            4,
+            0,
+            SECTOR + 1000,
+            &[
+                Ad::Short {
+                    kind: 0,
+                    len: SECTOR as u32,
+                    block: 10,
+                },
+                Ad::Short {
+                    kind: 0,
+                    len: 1000,
+                    block: 11,
+                },
+            ],
+            &[],
+        );
+        b.finish()
+    }
+
+    /// The same one-file image with the tag 266 file entry, whose fields
+    /// sit at different offsets.
+    pub fn udf_with_extended_file_entry() -> Vec<u8> {
+        one_file_image(|b| {
+            b.file_entry(
+                FILE_FE_BLOCK,
+                true,
+                5,
+                4,
+                0,
+                FILE_LEN,
+                &[Ad::Short {
+                    kind: 0,
+                    len: FILE_LEN as u32,
+                    block: FILE_DATA_BLOCK,
+                }],
+                &[],
+            );
+        })
+    }
+
+    pub fn udf_with_long_ads() -> Vec<u8> {
+        one_file_image(|b| {
+            b.file_entry(
+                FILE_FE_BLOCK,
+                false,
+                5,
+                4,
+                1,
+                FILE_LEN,
+                &[Ad::Long {
+                    kind: 0,
+                    len: FILE_LEN as u32,
+                    block: FILE_DATA_BLOCK,
+                    part: 0,
+                }],
+                &[],
+            );
+        })
+    }
+
+    /// Inline (embedded) data: the file's bytes are inside its file entry.
+    pub fn udf_with_inline_file() -> Vec<u8> {
+        one_file_image(|b| {
+            b.file_entry(
+                FILE_FE_BLOCK,
+                false,
+                5,
+                4,
+                3,
+                20,
+                &[],
+                b"twenty bytes inline!",
+            );
+        })
+    }
+
+    /// Where [`udf_with_inline_file`]'s data is: inside the file entry,
+    /// after its fixed part.
+    pub fn inline_data_range(_image: &[u8]) -> (u64, u64) {
+        (Builder::block_offset(FILE_FE_BLOCK) + 176, 20)
+    }
+
+    /// A whole block allocated for a 300-byte file.
+    pub fn udf_with_padded_last_extent() -> Vec<u8> {
+        one_file_image(|b| {
+            b.file_entry(
+                FILE_FE_BLOCK,
+                false,
+                5,
+                4,
+                0,
+                300,
+                &[Ad::Short {
+                    kind: 0,
+                    len: SECTOR as u32,
+                    block: FILE_DATA_BLOCK,
+                }],
+                &[],
+            );
+        })
+    }
+
+    /// An extent that is allocated but not recorded: a hole.
+    pub fn udf_with_sparse_file() -> Vec<u8> {
+        one_file_image(|b| {
+            b.file_entry(
+                FILE_FE_BLOCK,
+                false,
+                5,
+                4,
+                0,
+                SECTOR * 2,
+                &[
+                    Ad::Short {
+                        kind: 0,
+                        len: SECTOR as u32,
+                        block: FILE_DATA_BLOCK,
+                    },
+                    Ad::Short {
+                        kind: 1,
+                        len: SECTOR as u32,
+                        block: 0,
+                    },
+                ],
+                &[],
+            );
+        })
+    }
+
+    pub fn udf_with_strategy_4096() -> Vec<u8> {
+        one_file_image(|b| {
+            b.file_entry(
+                FILE_FE_BLOCK,
+                false,
+                5,
+                4096,
+                0,
+                FILE_LEN,
+                &[Ad::Short {
+                    kind: 0,
+                    len: FILE_LEN as u32,
+                    block: FILE_DATA_BLOCK,
+                }],
+                &[],
+            );
+        })
+    }
+
+    /// A file whose extent is outside the partition.
+    pub fn udf_with_block_past_the_partition() -> Vec<u8> {
+        one_file_image(|b| {
+            b.file_entry(
+                FILE_FE_BLOCK,
+                false,
+                5,
+                4,
+                0,
+                FILE_LEN,
+                &[Ad::Short {
+                    kind: 0,
+                    len: FILE_LEN as u32,
+                    block: PARTITION_BLOCKS + 1000,
+                }],
+                &[],
+            );
+        })
+    }
+
+    /// A good image with one byte of a file entry flipped after its tag
+    /// was sealed.
+    pub fn udf_with_corrupted_file_entry() -> Vec<u8> {
+        let mut image = minimal_udf();
+        let at = Builder::block_offset(FILE_FE_BLOCK) as usize + 56;
+        image[at] ^= 0xff;
+        image
+    }
+
+    /// A subdirectory whose ICB is the root's own.
+    pub fn udf_with_directory_cycle() -> Vec<u8> {
+        let mut b = volume();
+        let dir_len = b.directory(
+            ROOT_DIR_BLOCK,
+            ROOT_FE_BLOCK,
+            &[("LOOP", true, ROOT_FE_BLOCK)],
+        );
+        b.file_entry(
+            ROOT_FE_BLOCK,
+            false,
+            4,
+            4,
+            0,
+            dir_len,
+            &[Ad::Short {
+                kind: 0,
+                len: SECTOR as u32,
+                block: ROOT_DIR_BLOCK,
+            }],
+            &[],
+        );
+        b.finish()
+    }
+
+    /// A chain of directories deeper than the walk's limit, two blocks
+    /// per level and no block used twice, so it is a depth bomb and not a
+    /// cycle.
+    pub fn udf_with_a_depth_bomb() -> Vec<u8> {
+        let mut b = volume();
+        let levels = 90u32;
+        let mut fe = ROOT_FE_BLOCK;
+        let mut dir = ROOT_DIR_BLOCK;
+        for level in 0..levels {
+            let next_fe = 5 + level * 2;
+            let next_dir = next_fe + 1;
+            let dir_len = b.directory(dir, fe, &[("D", true, next_fe)]);
+            b.file_entry(
+                fe,
+                false,
+                4,
+                4,
+                0,
+                dir_len,
+                &[Ad::Short {
+                    kind: 0,
+                    len: SECTOR as u32,
+                    block: dir,
+                }],
+                &[],
+            );
+            fe = next_fe;
+            dir = next_dir;
+        }
+        b.finish()
+    }
+
+    /// A long allocation descriptor naming a partition the volume does
+    /// not have. Only a parser that reads the descriptor's own sixteen
+    /// bytes sees the partition field at all.
+    pub fn udf_with_a_long_ad_in_another_partition() -> Vec<u8> {
+        one_file_image(|b| {
+            b.file_entry(
+                FILE_FE_BLOCK,
+                false,
+                5,
+                4,
+                1,
+                FILE_LEN,
+                &[Ad::Long {
+                    kind: 0,
+                    len: FILE_LEN as u32,
+                    block: FILE_DATA_BLOCK,
+                    part: 1,
+                }],
+                &[],
+            );
+        })
+    }
+
+    /// A file identifier whose name holds a path separator.
+    pub fn udf_with_a_separator_in_a_name() -> Vec<u8> {
+        let mut b = volume();
+        let dir_len = b.directory(
+            ROOT_DIR_BLOCK,
+            ROOT_FE_BLOCK,
+            &[("../../etc/passwd", false, FILE_FE_BLOCK)],
+        );
+        b.file_entry(
+            ROOT_FE_BLOCK,
+            false,
+            4,
+            4,
+            0,
+            dir_len,
+            &[Ad::Short {
+                kind: 0,
+                len: SECTOR as u32,
+                block: ROOT_DIR_BLOCK,
+            }],
+            &[],
+        );
+        b.finish()
+    }
+
+    /// A logical volume whose one partition map remaps blocks.
+    pub fn udf_with_metadata_partition() -> Vec<u8> {
+        let mut b = Builder::new();
+        b.vrs()
+            .anchor(4)
+            .primary_volume()
+            .partition(PARTITION_START, PARTITION_BLOCKS)
+            .logical_volume_with_type2_map("*UDF Metadata Partition")
+            .terminator();
+        b.finish()
+    }
+
+    /// An image that is both ISO 9660 and UDF, which is what a DVD-Video
+    /// disc is.
+    pub fn bridge_image() -> Vec<u8> {
+        let mut image = minimal_udf();
+        let iso = super::iso::minimal_iso();
+        // The 9660 descriptors and tree sit where the volume recognition
+        // sequence was; a real bridge disc shares the area the same way.
+        image[(16 * SECTOR) as usize..iso.len()].copy_from_slice(&iso[(16 * SECTOR) as usize..]);
+        image
+    }
+
+    /// The volume descriptors, a root directory of one file, and the file
+    /// entry the caller writes.
+    fn one_file_image(file: impl FnOnce(&mut Builder)) -> Vec<u8> {
+        let mut b = volume();
+        let dir_len = b.directory(
+            ROOT_DIR_BLOCK,
+            ROOT_FE_BLOCK,
+            &[("MOVIE.BIN", false, FILE_FE_BLOCK)],
+        );
+        b.file_entry(
+            ROOT_FE_BLOCK,
+            false,
+            4,
+            4,
+            0,
+            dir_len,
+            &[Ad::Short {
+                kind: 0,
+                len: SECTOR as u32,
+                block: ROOT_DIR_BLOCK,
+            }],
+            &[],
+        );
+        file(&mut b);
+        b.finish()
     }
 }
