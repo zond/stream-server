@@ -24,11 +24,17 @@ pub struct AppState {
     /// `ServerAuth`); `None` is only the value a hand-built state starts
     /// with, and `auth::require_bearer` refuses rather than opens on it.
     pub auth_token: Option<Arc<str>>,
-    /// Translated containers, swept when idle: an index and the sources it
-    /// was read from, and **no file at all** (see
-    /// `crate::translators::session`). Both forms live here -- a
-    /// `/{fmt}/create` from URLs and the `torrent:` key, which has no
-    /// create and indexes itself on first use.
+    /// Translated containers: an index and the sources it was read from,
+    /// and **no file at all** (see `crate::translators::session`). Both
+    /// forms live here -- a `/{fmt}/create` from URLs and the `torrent:`
+    /// key, which has no create and indexes itself on first use.
+    ///
+    /// Kept for as long as the bytes they index are: while nothing else
+    /// has become live, and gone when the viewer opens something that is
+    /// not this container. The map holds no clock and starts no task; the
+    /// rule is handed to it by the switch task in `crate::run`, on the
+    /// same signal the torrent and proxy retention owners drop their slack
+    /// on.
     pub translated_archives:
         crate::translators::session::Sessions<crate::translators::session::TranslatedSession>,
     /// What `GET /casting` answers with. Always empty: the SSDP discovery
@@ -111,7 +117,7 @@ impl AppState {
             http_addr: SocketAddr::from(([127, 0, 0, 1], 11470)),
             auth_token: None,
             translated_archives: crate::translators::session::Sessions::new(
-                crate::translators::session::SESSION_IDLE_TIMEOUT,
+                crate::translators::session::SESSION_CAP,
             ),
             devices: Arc::new(RwLock::new(Vec::new())),
             proxy_streams: Arc::new(crate::proxy_streams::ProxyStreams::new()),

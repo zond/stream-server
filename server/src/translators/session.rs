@@ -1,17 +1,16 @@
 //! **An indexed container, in memory, leased** -- what a `/{fmt}/create`
 //! leaves behind and every response body reads from -- and the keyed map
-//! that hands them out and sweeps them when nobody has used them.
+//! that hands them out and drops them when the viewer has moved on.
 //!
 //! **A session owns no file.** An archive session used to own a download
 //! under `<cacheRoot>/.archives` and one extraction per member beside it,
 //! and the sweep that took the session unlinked them. What is here instead
 //! is the container's [`Index`] and the [`ByteSource`]s it was read from,
-//! so what the sweep frees is memory and -- for a torrent -- the stream
-//! registration the source holds. For a proxied URL it frees nothing at
-//! all: the bytes are the proxy cache's, under its own retention owner,
+//! so what dropping one frees is memory. For a proxied URL it frees nothing
+//! at all: the bytes are the proxy cache's, under its own retention owner,
 //! exactly as if the player had fetched the file through `/proxy` itself.
 //!
-//! A re-index after a sweep is therefore a few small ranged reads, which
+//! A re-index after a drop is therefore a few small ranged reads, which
 //! the proxy cache answers from disk and a torrent from its piece store.
 //! That is the whole cost of forgetting one.
 //!
@@ -25,44 +24,72 @@
 //! behind whatever the session owned -- in those days a downloaded archive
 //! on disk -- for the life of the process.
 //!
-//! [`Sessions`] gives a session a lifetime measured from its last use. A
-//! use is a lookup: [`Sessions::get`] hands out a [`Lease`], and a session
-//! with a lease outstanding is in use for as long as the lease lives -- a
-//! route keeps the lease inside the response body it is streaming, so a
-//! player reading for two hours holds the session for two hours -- and the
-//! idle clock starts when the last lease is dropped. Sessions idle for
-//! longer than [`SESSION_IDLE_TIMEOUT`] are removed by a sweep.
+//! ## What ends a session: a *what*, not a *when*
 //!
-//! The sweep runs on every insert, and from a janitor task the map starts
-//! for itself on the first insert made inside a tokio runtime. The task
-//! holds only a `Weak` reference, so it ends when the map does and keeps
-//! nothing alive.
+//! [`Sessions`] used to give a session a lifetime measured from its last
+//! use: ten idle minutes and it was swept. **That was a clock, and the
+//! retention design abolished clocks for exactly this question** -- see
+//! `enginefs::retention::live`, which says it plainly: "a stream that has
+//! stopped is not a stream that has been replaced. Pausing for an hour
+//! changes nothing on the disk; opening something else changes it at
+//! once." Torrent pieces and proxy ranges are kept while nothing else has
+//! become live and go the moment something has, bounded by the cache
+//! budget. A session is the index of the container those bytes are in, and
+//! it now has the same life:
+//!
+//! * A session with a [`Lease`] out is in use and is never taken -- a route
+//!   keeps the lease inside the response body it is streaming, so a player
+//!   reading for two hours holds the session for two hours, and a cast
+//!   receiver reading holds it while it reads.
+//! * A session whose container **is** the entity being played is kept
+//!   ([`TranslatedSession::is_live`]).
+//! * Every other session goes when the live entity moves to something that
+//!   is not it. The map does not decide that: [`Sessions::retain`] is
+//!   handed the rule by whoever watches the cell, which for this server is
+//!   the switch task in `crate::run` -- the same signal the torrent and
+//!   proxy owners drop their slack on.
+//! * Nothing else ends one. A session left with no lease and no switch
+//!   after it survives the process, which is the point: a cast paused
+//!   overnight comes back to the session it was reading, and
+//!   `/{fmt}/create` is not on the LAN listener, so a receiver that lost
+//!   one had no way to make another (`docs/CASTING.md` in xtremio).
+//!
+//! ## The backstop, and why it is not a timer either
+//!
+//! A live entity that never moves must not let the map grow without bound,
+//! so there is a **cap on entries** ([`SESSION_CAP`]) and the least
+//! recently used unleased session is evicted when a new one takes the map
+//! over it. A count, not a clock: the thing that must not run away is the
+//! number of indexes held, and evicting by *how long ago* a session was
+//! read would be the timer coming back in through the window. Nothing here
+//! calls `Instant::now()`, and a session that nothing displaces is not
+//! displaced by time passing.
+//!
+//! "Least recently used" is an ordering, and it is kept as one -- a
+//! monotonic counter stamped on the map's own uses ([`Usage`]) -- rather
+//! than as an instant that could be compared against a duration.
 
 use super::{Body, Index, Member};
 use crate::sources::{ByteSource, MemberView};
 use dashmap::DashMap;
+use enginefs::retention::live::Reading;
 use std::io;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
-// tokio's Instant rather than std's so a paused test clock moves the idle
-// clock too.
-use tokio::time::Instant;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-/// How long a session outlives its last use before it is swept.
+/// How many sessions one map holds before a new one evicts the least
+/// recently used session that has no lease out.
 ///
-/// A use is a request, or a response body still being read. The clock
-/// therefore starts when the player has closed every connection to the
-/// session, and what the timeout has to cover is the player that comes
-/// back after that: one that fetches by fixed-size range and closes
-/// between fetches, paused, or one restarting after an error. Its session
-/// key is in the URL it holds and nothing else can mint that key again, so
-/// a session swept under it is a failed resume. Ten minutes is long for a
-/// pause that stays paused and cheap against what a session costs while it
-/// waits -- which, since nothing here owns a file any more, is an index in
-/// memory and, for a torrent, nothing at all (see [`SessionSources`]).
-pub const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// The backstop and nothing more: what ordinarily ends a session is the
+/// viewer opening something else (see the module doc), and this is the
+/// bound for the case where they never do. An index is kilobytes and a
+/// viewer's real working set is one container, or the handful a set of
+/// volumes and a subtitle make; thirty-two distinct containers opened
+/// without one single switch of the live entity between them is not a
+/// viewing pattern, it is a leak, and the oldest unread of them is the
+/// honest thing to drop.
+pub const SESSION_CAP: usize = 32;
 
 /// Sessions of one kind, keyed by the string the client uses in URLs.
 pub struct Sessions<T> {
@@ -79,8 +106,11 @@ impl<T> Clone for Sessions<T> {
 
 struct Inner<T> {
     map: DashMap<String, Entry<T>>,
-    idle_timeout: Duration,
-    janitor_started: AtomicBool,
+    cap: usize,
+    /// The map's own use counter: the ordering eviction is by. Bumped once
+    /// per lease taken and once per lease dropped, and never read as a
+    /// time.
+    uses: Arc<AtomicU64>,
 }
 
 struct Entry<T> {
@@ -88,33 +118,46 @@ struct Entry<T> {
     usage: Arc<Usage>,
 }
 
-/// When a session was last used, and how many leases are out on it now.
+/// Where a session sits in the map's use order, and how many leases are out
+/// on it now.
 struct Usage {
     leases: AtomicUsize,
-    last_used: Mutex<Instant>,
+    /// The use counter's value at this session's last lease taken or
+    /// dropped. **An ordering, not an instant**: it is only ever compared
+    /// with another session's, never with a duration.
+    last_used: AtomicU64,
+    uses: Arc<AtomicU64>,
 }
 
 impl Usage {
-    fn touch(&self) {
-        *self
-            .last_used
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+    fn new(uses: Arc<AtomicU64>) -> Self {
+        let usage = Self {
+            leases: AtomicUsize::new(0),
+            last_used: AtomicU64::new(0),
+            uses,
+        };
+        usage.touch();
+        usage
     }
 
-    fn idle_for(&self, now: Instant) -> Duration {
-        now.saturating_duration_since(
-            *self
-                .last_used
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        )
+    fn touch(&self) {
+        let stamp = self.uses.fetch_add(1, Ordering::SeqCst);
+        self.last_used.store(stamp, Ordering::SeqCst);
+    }
+
+    fn stamp(&self) -> u64 {
+        self.last_used.load(Ordering::SeqCst)
+    }
+
+    fn leased(&self) -> bool {
+        self.leases.load(Ordering::SeqCst) > 0
     }
 }
 
 /// A session handed out by [`Sessions::get`]. Dereferences to the session;
-/// while it exists the session cannot be swept, and dropping it restarts the
-/// session's idle clock.
+/// while it exists the session cannot be taken, by an eviction or by the
+/// live entity moving off it, and dropping it moves the session to the
+/// front of the use order.
 pub struct Lease<T> {
     value: Arc<T>,
     usage: Arc<Usage>,
@@ -153,34 +196,36 @@ impl<T> Drop for Lease<T> {
 }
 
 impl<T: Send + Sync + 'static> Sessions<T> {
-    /// A registry whose sessions are removed once no lease has been out on
-    /// them for `idle_timeout`.
-    pub fn new(idle_timeout: Duration) -> Self {
+    /// A registry holding at most `cap` sessions -- see [`SESSION_CAP`] for
+    /// what the cap is and is not.
+    pub fn new(cap: usize) -> Self {
         Self {
             inner: Arc::new(Inner {
                 map: DashMap::new(),
-                idle_timeout,
-                janitor_started: AtomicBool::new(false),
+                cap: cap.max(1),
+                uses: Arc::new(AtomicU64::new(0)),
             }),
         }
     }
 
-    /// Store `value` under `key`, replacing a session already there. Expired
-    /// sessions are swept first, so a registry nobody looks at between
-    /// inserts still does not grow without bound.
-    pub fn insert(&self, key: String, value: T) {
-        self.inner.sweep(Instant::now());
-        self.ensure_janitor();
-        self.inner.map.insert(
-            key,
-            Entry {
-                value: Arc::new(value),
-                usage: Arc::new(Usage {
-                    leases: AtomicUsize::new(0),
-                    last_used: Mutex::new(Instant::now()),
-                }),
-            },
-        );
+    /// Store `value` under `key`, replacing a session already there, and
+    /// hand back a lease on it.
+    ///
+    /// **Leased, and not merely inserted.** The caller of an insert is
+    /// about to use what it inserted, and between the insert and a
+    /// following `get` the live entity can move -- a container's first read
+    /// is what moves it -- so a session inserted and then looked up again
+    /// was a session that could be gone by the time its own maker asked for
+    /// it.
+    pub fn insert(&self, key: String, value: T) -> Lease<T> {
+        let entry = Entry {
+            value: Arc::new(value),
+            usage: Arc::new(Usage::new(self.inner.uses.clone())),
+        };
+        let lease = Lease::new(&entry);
+        self.inner.map.insert(key, entry);
+        self.inner.evict_over_cap();
+        lease
     }
 
     /// The session under `key`, leased -- see [`Lease`]. No lock on the map
@@ -198,20 +243,22 @@ impl<T: Send + Sync + 'static> Sessions<T> {
     /// exists to do once. `make` runs under the map's own lock, so it is a
     /// constructor and nothing else -- no I/O, no await.
     pub fn get_or_insert_with(&self, key: &str, make: impl FnOnce() -> T) -> Lease<T> {
-        self.inner.sweep(Instant::now());
-        self.ensure_janitor();
-        let entry = self
-            .inner
-            .map
-            .entry(key.to_string())
-            .or_insert_with(|| Entry {
-                value: Arc::new(make()),
-                usage: Arc::new(Usage {
-                    leases: AtomicUsize::new(0),
-                    last_used: Mutex::new(Instant::now()),
-                }),
-            });
-        Lease::new(&entry)
+        let uses = self.inner.uses.clone();
+        // The map's lock is dropped before the eviction walk, which takes
+        // shard locks of its own.
+        let lease = {
+            let entry = self
+                .inner
+                .map
+                .entry(key.to_string())
+                .or_insert_with(|| Entry {
+                    value: Arc::new(make()),
+                    usage: Arc::new(Usage::new(uses)),
+                });
+            Lease::new(&entry)
+        };
+        self.inner.evict_over_cap();
+        lease
     }
 
     /// The first session `matches` accepts, leased. For finding a session
@@ -224,6 +271,26 @@ impl<T: Send + Sync + 'static> Sessions<T> {
             .map(|entry| Lease::new(&entry))
     }
 
+    /// Drop every session with no lease out that `keep` does not accept.
+    ///
+    /// **The rule is the caller's**, which is what keeps this map honest
+    /// for anything else that ever stores something in one: a `Sessions<T>`
+    /// knows what a lease is and knows nothing about what a `T` is for. For
+    /// this server the caller is the switch task in `crate::run`, the rule
+    /// is [`TranslatedSession::is_live`], and the signal is the one the
+    /// retention owners answer -- the live entity moving.
+    ///
+    /// A lease outranks the rule: a body streaming to a player, or to a
+    /// cast receiver, is not taken out from under its reader whatever the
+    /// cell says. `retain` holds each shard's write lock while it decides
+    /// and [`Sessions::get`] takes its lease under the shard's read lock,
+    /// so a session cannot be leased and dropped at once.
+    pub fn retain(&self, keep: impl Fn(&T) -> bool) {
+        self.inner
+            .map
+            .retain(|_, entry| entry.usage.leased() || keep(&entry.value));
+    }
+
     pub fn len(&self) -> usize {
         self.inner.map.len()
     }
@@ -231,61 +298,34 @@ impl<T: Send + Sync + 'static> Sessions<T> {
     pub fn is_empty(&self) -> bool {
         self.inner.map.is_empty()
     }
-
-    /// Remove every session with no lease out that has been idle for the
-    /// timeout, as of `now`. The janitor and every insert call this; a test
-    /// may call it with a chosen `now`.
-    pub fn sweep(&self, now: Instant) {
-        self.inner.sweep(now);
-    }
-
-    /// Start the janitor once, and only when there is a runtime to run it
-    /// on. Outside a runtime the sweep on insert is all there is, which is
-    /// enough for a registry that only ever sees inserts from request
-    /// handlers -- those always run inside one.
-    fn ensure_janitor(&self) {
-        if self.inner.janitor_started.load(Ordering::SeqCst) {
-            return;
-        }
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        if self
-            .inner
-            .janitor_started
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return;
-        }
-        let registry: Weak<Inner<T>> = Arc::downgrade(&self.inner);
-        // Often enough that a session outlives its timeout by a fraction of
-        // it, not so often that the map is walked for nothing.
-        let period = (self.inner.idle_timeout / 4).max(Duration::from_secs(1));
-        runtime.spawn(async move {
-            let mut ticks = tokio::time::interval(period);
-            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                ticks.tick().await;
-                let Some(registry) = registry.upgrade() else {
-                    break;
-                };
-                registry.sweep(Instant::now());
-            }
-        });
-    }
 }
 
 impl<T> Inner<T> {
-    fn sweep(&self, now: Instant) {
-        let idle_timeout = self.idle_timeout;
-        // `retain` holds each shard's write lock while it decides, and
-        // `get` takes a lease under the shard's read lock, so a session
-        // cannot be leased and removed at once.
-        self.map.retain(|_, entry| {
-            entry.usage.leases.load(Ordering::SeqCst) > 0
-                || entry.usage.idle_for(now) < idle_timeout
-        });
+    /// Bring the map back to its cap by dropping unleased sessions, oldest
+    /// in the use order first.
+    ///
+    /// The candidates are read into a list before anything is removed: the
+    /// iterator holds shard locks, and a removal taken under it would be a
+    /// deadlock rather than an eviction. Each removal then asks again under
+    /// the shard's write lock, so a session that took a lease while the
+    /// list was being read stays.
+    fn evict_over_cap(&self) {
+        if self.map.len() <= self.cap {
+            return;
+        }
+        let mut unleased: Vec<(u64, String)> = self
+            .map
+            .iter()
+            .filter(|entry| !entry.usage.leased())
+            .map(|entry| (entry.usage.stamp(), entry.key().clone()))
+            .collect();
+        unleased.sort_unstable_by_key(|(stamp, _)| *stamp);
+        for (_, key) in unleased {
+            if self.map.len() <= self.cap {
+                break;
+            }
+            self.map.remove_if(&key, |_, entry| !entry.usage.leased());
+        }
     }
 }
 
@@ -364,6 +404,28 @@ impl TranslatedSession {
         };
         MemberView::new(member.name.clone(), sources, extents.clone())
     }
+
+    /// Whether this session's container is the entity being played -- the
+    /// one question [`Sessions::retain`] is given for this map (see the
+    /// module doc).
+    ///
+    /// **Per torrent, not per file of one.** A set's volumes are several
+    /// files of one torrent and a body crosses from one to the next as it
+    /// reads, so the cell names `part1` for a while and `part2` after it;
+    /// a rule that asked for the exact file would drop the session at the
+    /// volume boundary of the very container it is reading. The same
+    /// reasoning makes a *link*-borne container's rule "any of my sources
+    /// is the live one" rather than "the first is".
+    ///
+    /// A source that reads bytes this server does not retain answers
+    /// `false` and cannot be live (`ByteSource::is_live`), which is why
+    /// nothing has to special-case one.
+    pub fn is_live(&self, reading: &Reading) -> bool {
+        match &self.sources {
+            SessionSources::Held(sources) => sources.iter().any(|source| source.is_live(reading)),
+            SessionSources::Torrent { info_hash, .. } => reading.is_torrent(info_hash),
+        }
+    }
 }
 
 /// Where a session's bytes come from, and -- the part that matters -- for
@@ -380,8 +442,10 @@ pub enum SessionSources {
     /// A `TorrentFileSource` registers a stream on its torrent for as long
     /// as it lives (`sources::torrent::TorrentMemberStream`), and that
     /// registration is what tells this server a player is reading: hold
-    /// one for the session's ten idle minutes and the reconciler cannot
-    /// stop a torrent the viewer left ten minutes ago. So the session
+    /// one for the session's life and the reconciler could never stop a
+    /// torrent whose container was once opened -- which, now that a
+    /// session lives until the viewer opens something else, would be for
+    /// as long as they stay on it. So the session
     /// keeps the *index*, which is what was expensive to read, and each
     /// body opens its own sources -- which is a file lookup and a
     /// reconcile per volume, not a fetch.
@@ -400,6 +464,9 @@ pub enum SessionSources {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use enginefs::retention::live::{Live, LiveEntity};
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
 
     /// A session's owned state, whose drop the tests observe.
     struct Owned(Arc<AtomicBool>);
@@ -414,68 +481,120 @@ mod tests {
         Owned(dropped.clone())
     }
 
-    const TIMEOUT: Duration = Duration::from_secs(600);
+    /// The old idle timeout, so the test that says time does not end a
+    /// session can say it in the units the clock was written in.
+    const OLD_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
-    /// A session nobody has looked at since the timeout goes, one with a
-    /// lease out stays however long it has been, and the clock counts from
-    /// the lease's drop -- when it goes, the session's owned state goes
-    /// with it.
+    /// **Time does not end a session.** Nothing reads this one, nothing
+    /// leases it and nothing else becomes live, and a day of the clock
+    /// goes past: it is still there, because what would take it is a
+    /// viewer opening something else and no viewer has.
+    ///
+    /// The paused cast is the case in the field (`docs/CASTING.md` in
+    /// xtremio): the receiver stops reading, its lease goes, and the key
+    /// in the URL it holds is one nothing else can mint again -- there is
+    /// no `/create` on the LAN listener -- so a session taken from under
+    /// it is a `404` with no way back.
     #[tokio::test(start_paused = true)]
-    async fn idle_sessions_go_leased_ones_stay() {
-        let sessions = Sessions::new(TIMEOUT);
-        let idle_dropped = Arc::new(AtomicBool::new(false));
-        let leased_dropped = Arc::new(AtomicBool::new(false));
-        sessions.insert("idle".into(), session(&idle_dropped));
-        sessions.insert("leased".into(), session(&leased_dropped));
-        let lease = sessions.get("leased").expect("just inserted");
+    async fn a_session_nothing_reads_outlives_any_clock() {
+        let sessions = Sessions::new(SESSION_CAP);
+        let dropped = Arc::new(AtomicBool::new(false));
+        drop(sessions.insert("paused".into(), session(&dropped)));
 
-        tokio::time::advance(TIMEOUT).await;
-        sessions.sweep(Instant::now());
-        assert!(sessions.get("idle").is_none(), "idle past the timeout");
-        assert!(idle_dropped.load(Ordering::SeqCst), "and dropped with it");
-        assert!(sessions.get("leased").is_some(), "a lease is a use");
-        assert!(!leased_dropped.load(Ordering::SeqCst));
-
-        // Two leases were out (the one above and the check's); the idle
-        // clock starts when the last of them goes, not the first.
-        drop(lease);
-        tokio::time::advance(TIMEOUT - Duration::from_secs(1)).await;
-        sessions.sweep(Instant::now());
-        assert!(sessions.get("leased").is_some(), "not idle for long enough");
-        tokio::time::advance(TIMEOUT).await;
-        sessions.sweep(Instant::now());
-        assert!(sessions.get("leased").is_none());
-        assert!(leased_dropped.load(Ordering::SeqCst));
+        // Advanced in the janitor's old period, so a sweep on a timer
+        // would have run its ticks rather than been skipped over by one
+        // long jump of the paused clock.
+        for _ in 0..(24 * 4) {
+            tokio::time::sleep(OLD_IDLE_TIMEOUT).await;
+        }
+        assert!(sessions.get("paused").is_some(), "a clock took the session");
+        assert!(!dropped.load(Ordering::SeqCst));
     }
 
-    /// The janitor removes an expired session with nothing else calling in.
-    #[tokio::test(start_paused = true)]
-    async fn the_janitor_sweeps_on_its_own() {
-        let sessions = Sessions::new(TIMEOUT);
-        let dropped = Arc::new(AtomicBool::new(false));
-        sessions.insert("k".into(), session(&dropped));
-        assert_eq!(sessions.len(), 1);
+    /// What does end one: the rule its caller hands to [`Sessions::retain`].
+    /// Everything the rule rejects goes, and its owned state with it.
+    #[test]
+    fn retain_drops_what_the_rule_rejects() {
+        let sessions = Sessions::new(SESSION_CAP);
+        let kept = Arc::new(AtomicBool::new(false));
+        let taken = Arc::new(AtomicBool::new(false));
+        drop(sessions.insert("keep".into(), session(&kept)));
+        drop(sessions.insert("drop".into(), session(&taken)));
 
-        // The paused clock advances only as far as the next timer, so this
-        // runs the janitor's ticks rather than waiting on them; the bound
-        // is there so a janitor that never sweeps fails instead of hanging.
-        for _ in 0..32 {
-            tokio::time::sleep(TIMEOUT / 4).await;
-            if sessions.is_empty() {
-                break;
-            }
-        }
-        assert!(sessions.is_empty(), "the janitor never swept");
+        sessions.retain(|value| Arc::ptr_eq(&value.0, &kept));
+        assert!(sessions.get("keep").is_some());
+        assert!(!kept.load(Ordering::SeqCst));
+        assert!(sessions.get("drop").is_none());
+        assert!(taken.load(Ordering::SeqCst), "and dropped with it");
+    }
+
+    /// **A lease outranks the rule.** A body streaming to a player, or to
+    /// a cast receiver, is not taken out from under its reader whatever
+    /// the cell says -- and the session goes on the first rule that runs
+    /// after the lease is dropped.
+    #[test]
+    fn a_leased_session_is_not_taken_by_a_rule_that_rejects_it() {
+        let sessions = Sessions::new(SESSION_CAP);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let lease = sessions.insert("reading".into(), session(&dropped));
+
+        sessions.retain(|_| false);
+        assert!(sessions.get("reading").is_some(), "a lease is a use");
+        assert!(!dropped.load(Ordering::SeqCst));
+
+        drop(lease);
+        sessions.retain(|_| false);
+        assert!(sessions.get("reading").is_none());
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    /// The backstop: over the cap, the least recently used session with no
+    /// lease out goes, and a leased one is passed over however old it is.
+    #[test]
+    fn the_cap_evicts_the_least_recently_used_unleased_session() {
+        let sessions: Sessions<u32> = Sessions::new(2);
+        let held = sessions.insert("oldest".into(), 1);
+        drop(sessions.insert("middle".into(), 2));
+        // Used again, so "middle" is now the older of the two unleased.
+        drop(sessions.get("oldest"));
+        assert_eq!(sessions.len(), 2);
+
+        drop(sessions.insert("newest".into(), 3));
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.get("middle").is_none(), "the least recently used");
+        assert!(sessions.get("oldest").is_some());
+        assert!(sessions.get("newest").is_some());
+
+        // And a leased session is not evicted, even though holding it
+        // leaves the map over its cap: a reader is never dropped under.
+        drop(held);
+        let held = sessions.get("oldest").expect("still there");
+        drop(sessions.insert("another".into(), 4));
+        assert!(sessions.get("oldest").is_some(), "leased");
+        assert_eq!(sessions.len(), 2);
+        drop(held);
+    }
+
+    /// `insert` hands back a lease, so a session cannot be taken between
+    /// being made and being used by its maker -- which is exactly the
+    /// window a container's first read opens, because that read is what
+    /// moves the live entity.
+    #[test]
+    fn insert_leases_what_it_made() {
+        let sessions: Sessions<u32> = Sessions::new(SESSION_CAP);
+        let lease = sessions.insert("k".into(), 7);
+        sessions.retain(|_| false);
+        assert_eq!(*lease, 7);
+        assert!(sessions.get("k").is_some(), "taken from under its maker");
     }
 
     /// `get_or_insert_with` makes one session per key however many callers
     /// ask at once -- a player's opening is several requests on the same
     /// member -- and leases what it hands back, so a session created for
     /// one request is in use by it.
-    #[tokio::test(start_paused = true)]
-    async fn racing_callers_get_one_session() {
-        let sessions: Sessions<u32> = Sessions::new(TIMEOUT);
+    #[test]
+    fn racing_callers_get_one_session() {
+        let sessions: Sessions<u32> = Sessions::new(SESSION_CAP);
         let made = Arc::new(AtomicUsize::new(0));
         let make = || {
             let made = made.clone();
@@ -494,15 +613,13 @@ mod tests {
 
         // Both leases are uses: the session stays while either is out.
         drop(first);
-        tokio::time::advance(TIMEOUT * 2).await;
-        sessions.sweep(Instant::now());
+        sessions.retain(|_| false);
         assert_eq!(sessions.len(), 1, "a lease is a use");
         drop(second);
-        tokio::time::advance(TIMEOUT * 2).await;
-        sessions.sweep(Instant::now());
+        sessions.retain(|_| false);
         assert!(sessions.is_empty());
 
-        // And a key that has been swept is made again rather than missing.
+        // And a key that has been taken is made again rather than missing.
         let again = sessions.get_or_insert_with("k", make());
         assert_eq!(*again, 7);
         assert_eq!(made.load(Ordering::SeqCst), 2);
@@ -520,7 +637,7 @@ mod tests {
     /// the time.
     #[test]
     fn one_maker_runs_when_callers_race() {
-        let sessions: Sessions<u32> = Sessions::new(TIMEOUT);
+        let sessions: Sessions<u32> = Sessions::new(SESSION_CAP);
         let made = Arc::new(AtomicUsize::new(0));
         let start = std::sync::Barrier::new(4);
         std::thread::scope(|scope| {
@@ -545,16 +662,77 @@ mod tests {
 
     /// `find` leases what it finds, so a session found for reuse is a
     /// session in use.
-    #[tokio::test(start_paused = true)]
-    async fn find_leases_the_match() {
-        let sessions: Sessions<u32> = Sessions::new(TIMEOUT);
-        sessions.insert("a".into(), 1);
-        sessions.insert("b".into(), 2);
+    #[test]
+    fn find_leases_the_match() {
+        let sessions: Sessions<u32> = Sessions::new(SESSION_CAP);
+        drop(sessions.insert("a".into(), 1));
+        drop(sessions.insert("b".into(), 2));
         let found = sessions.find(|value| *value == 2).expect("b");
         assert_eq!(*found, 2);
-        tokio::time::advance(TIMEOUT).await;
-        sessions.sweep(Instant::now());
+        sessions.retain(|_| false);
         assert!(sessions.get("a").is_none());
         assert!(sessions.get("b").is_some(), "found is leased");
+    }
+
+    fn torrent_session(info_hash: &str) -> TranslatedSession {
+        TranslatedSession::new(
+            format!("torrent:{info_hash}/film.rar"),
+            SessionSources::Torrent {
+                info_hash: info_hash.to_string(),
+                paths: vec!["film.part1.rar".into(), "film.part2.rar".into()],
+            },
+            Index {
+                members: Vec::new(),
+            },
+            None,
+        )
+    }
+
+    /// The rule this map is given: **a session whose container is the live
+    /// entity stays, whichever of its files is being read**, and one whose
+    /// container is not goes.
+    ///
+    /// The second half is the volume boundary: a set's parts are separate
+    /// files of one torrent and the cell names whichever the body is
+    /// inside, so a per-file rule would take the session of the very
+    /// container the viewer is watching as it crossed from part one into
+    /// part two.
+    #[test]
+    fn a_switch_keeps_the_live_containers_session_and_takes_the_rest() {
+        let sessions = Sessions::new(SESSION_CAP);
+        let live = Live::new();
+        drop(sessions.insert("aa".into(), torrent_session("aa")));
+        drop(sessions.insert("bb".into(), torrent_session("bb")));
+
+        let switch = |live: &Live, entity| {
+            live.open(entity, false);
+            let reading = live.reading();
+            sessions.retain(|value: &TranslatedSession| value.is_live(&reading));
+        };
+
+        switch(
+            &live,
+            LiveEntity::Torrent {
+                info_hash: "aa".into(),
+                file_idx: 0,
+            },
+        );
+        assert!(sessions.get("aa").is_some(), "its own container is playing");
+        assert!(sessions.get("bb").is_none(), "and nothing else is");
+
+        // The body crosses into the second volume: another file of the
+        // same torrent, and the same container.
+        switch(
+            &live,
+            LiveEntity::Torrent {
+                info_hash: "aa".into(),
+                file_idx: 1,
+            },
+        );
+        assert!(sessions.get("aa").is_some(), "the set is one container");
+
+        // A proxied body opens: nothing of this torrent is playing now.
+        switch(&live, LiveEntity::Proxy { dir: "/one".into() });
+        assert!(sessions.get("aa").is_none());
     }
 }

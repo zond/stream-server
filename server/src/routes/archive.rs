@@ -533,10 +533,10 @@ async fn create_translated(
     let selected_name = selected
         .and_then(|at| index.members.get(at))
         .map(|member| member.name.clone());
-    state.translated_archives.insert(
+    drop(state.translated_archives.insert(
         key.clone(),
         TranslatedSession::new(origin, SessionSources::Held(sources), index, selected),
-    );
+    ));
 
     if method == Method::GET
         && let Some(file) = selected_name
@@ -826,8 +826,12 @@ async fn session_for(
         tracing::warn!(%info_hash, archive = path, %refusal, "the archive could not be indexed");
         Box::new(refusal_response(&refusal))
     })?;
-    // The sources are **not** kept: see `SessionSources::Torrent`.
-    state.translated_archives.insert(
+    // The sources are **not** kept: see `SessionSources::Torrent`. The
+    // insert leases what it made, so the read that follows cannot find it
+    // gone: indexing the container is itself what moved the live entity,
+    // and a look-up after the insert would be a second chance for the cell
+    // to move again in between.
+    Ok(state.translated_archives.insert(
         key.to_string(),
         TranslatedSession::new(
             key,
@@ -838,11 +842,7 @@ async fn session_for(
             index,
             None,
         ),
-    );
-    state
-        .translated_archives
-        .get(key)
-        .ok_or_else(|| Box::new(StatusCode::INTERNAL_SERVER_ERROR.into_response()))
+    ))
 }
 
 /// The sources a body of this session reads through -- the ones it holds,
