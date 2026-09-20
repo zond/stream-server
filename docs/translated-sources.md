@@ -559,6 +559,24 @@ step 7 half.
 
 ## 7. What this does not do
 
+**Block-compressed formats with a seek table are declined too, deliberately**
+(zond, 2026-09-20). Some codecs do offer random access -- an xz stream
+written in multi-block mode carries an index, zstd has a seekable format
+with a table in a skippable frame, and a 7z *block* is independently
+decodable -- and a third body kind (a block list, decoded one block at a
+time in memory) would fit this design without storing anything. It was
+priced and declined on coverage, not on taste: block compression buys entry
+points, and a seek costs decoding from the nearest one, so the value is
+entirely about block size. RAR's and deflate's compressed modes have no
+entry points at all; a film in a 7z is normally *one* block, so its only
+entry is byte zero; and the formats with real indexes (tar.xz, tar.zst) are
+how software is shipped, not films -- which arrive stored in RAR or ZIP,
+which this design already serves. The cost would have been ~1200-1600 lines
+plus C-linked decoders in four build targets. **What replaces it is
+evidence**: every refusal names the container and the exact method, so a
+field log says which codec actually cost a playback, and one that keeps
+appearing is the one to build for.
+
 It does not decode. A compressed film stays unplayable through this
 server, by decision. It does not transcode, does not remux, and does not
 turn a DVD's `VIDEO_TS` folder into one stream: an ISO's members are its
