@@ -1495,12 +1495,16 @@ fn a_zero_length_torrent_file_is_an_empty_body_not_a_416() -> anyhow::Result<()>
     assert!(get.bytes()?.is_empty());
 
     // A `Range` on an empty file is the one thing that is a 416: there is
-    // no byte for it to name.
+    // no byte for it to name. And it names the file's length, so the
+    // player can ask again for something that is there -- the same
+    // refusal an archive member answers, because it is the same framing
+    // (`routes::util::MediaRange`).
     let ranged = anonymous
         .get(&url)
         .header(reqwest::header::RANGE, "bytes=0-0")
         .send()?;
     assert_eq!(ranged.status(), reqwest::StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(header_value(&ranged, "content-range"), "bytes */0");
 
     handle.shutdown()?;
     handle.join()?;

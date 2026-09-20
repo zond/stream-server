@@ -599,6 +599,47 @@ mod tests {
         assert_eq!(read, member);
     }
 
+    /// **A seek inside the extent a reader is already open on moves that
+    /// reader**, rather than opening another at the new offset.
+    ///
+    /// That is what a source's reader being a handle on its file buys
+    /// (`sources::SeekableReader`): the member's position is translated
+    /// into the source's and the handle goes there -- a seek of the piece
+    /// store, or one ranged request through the proxy cache. Crossing into
+    /// another extent is still an `open`, because that is a different
+    /// source's span.
+    #[tokio::test]
+    async fn a_seek_inside_the_open_extent_moves_the_reader_it_has() {
+        let (view, first, second) = split_view();
+        let member = member();
+        let mut reader = view.reader();
+        let mut read = [0u8; 8];
+        reader.read_exact(&mut read).await.unwrap();
+        assert_eq!(read.to_vec(), member[..8]);
+        assert_eq!(first.counts().opens(), 1);
+
+        // Forwards and then backwards, both inside the first extent
+        // (which is the member's first 64 bytes).
+        for at in [40usize, 8] {
+            reader.seek(SeekFrom::Start(at as u64)).await.unwrap();
+            reader.read_exact(&mut read).await.unwrap();
+            assert_eq!(read.to_vec(), member[at..at + 8]);
+        }
+        assert_eq!(
+            first.counts().opens(),
+            1,
+            "a seek inside the open extent opened the source again"
+        );
+
+        // And into the second extent, which is another source: that one
+        // has to be opened.
+        reader.seek(SeekFrom::Start(70)).await.unwrap();
+        reader.read_exact(&mut read).await.unwrap();
+        assert_eq!(read.to_vec(), member[70..78]);
+        assert_eq!(second.counts().opens(), 1);
+        assert_eq!(first.counts().opens(), 1);
+    }
+
     /// Seeks are in the member's coordinates -- `Start` from its first
     /// byte, `End` from its last, `Current` from where the reader is --
     /// and never the container's.
