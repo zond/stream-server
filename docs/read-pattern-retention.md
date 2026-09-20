@@ -321,6 +321,23 @@ less, so the same scrub lands outside and is a new stream. It both allows
 and limits back-scrub membership, and it is why none of the rules below
 needs a tuned distance.
 
+**With one thing the disk cannot answer, added 2026-09-20: a read that
+begins exactly where its own reader's last read ended is that reader
+carrying on, held or not.** The run rule reads the disk as the proof of who
+a consumer is, and between two responses that is the right proof; inside one
+response it fails exactly where the delivery is ahead of the writer. A
+proxied response reports each chunk as it goes past and a chunk enters the
+listing only once it is whole, so the read that delivered one begins in a
+piece no listing holds -- and one 16 MiB sequential body of one URL was
+counted as **32 consumers**, each granted the two-piece floor that no unlink
+may touch. Their floors together came to more than the whole allowance, so
+the pass computed an overhang and was then forbidden to take a single piece
+of it, and the cache settled at 38-41 chunks against an allowance of 31 for
+the life of the stream. With the continuation rule it is one stream and 31
+chunks. Exactly, and for the same reader only: a read *past a hole*
+continues nothing, so it is still a seek and still a consumer of its own,
+which is what the torrent side does and goes on doing.
+
 Three rules were tried against the field before this one, and each was a
 guess about byte geometry:
 

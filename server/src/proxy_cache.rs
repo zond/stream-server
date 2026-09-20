@@ -2125,6 +2125,58 @@ mod tests {
         );
     }
 
+    /// **One sequential body is one consumer**, however far its delivery
+    /// runs ahead of what is on the disk.
+    ///
+    /// A fill reports every slice the origin pushes as it goes past, and a
+    /// chunk is written only once it is whole -- so slice after slice
+    /// begins in a chunk no listing holds. Under the run rule alone each of
+    /// them was `Rejected::Outside` and started a consumer of its own: one
+    /// 16 MiB play-through of one URL was counted as thirty-two of them,
+    /// each granted the two-piece floor that no unlink may touch, and the
+    /// cache settled over its cap for the life of the stream. Here the
+    /// slices are a quarter of a chunk, which is the shape of a real body,
+    /// and the pass is let run after each one.
+    #[tokio::test]
+    async fn a_body_pushed_in_slices_the_disk_does_not_hold_yet_is_one_consumer() {
+        use enginefs::retention::live::Live;
+
+        let dir = tempfile::tempdir().expect("a scratch root");
+        let budget = Arc::new(enginefs::retention::RetentionBudget::default());
+        budget.set(Some(8 * CHUNK_BYTES), None);
+        let cache = ProxyCache::new(dir.path(), budget, Arc::new(Live::default()));
+
+        let entry = entry_of(&cache, "https://host/film.mkv");
+        let total = 16 * CHUNK_BYTES;
+        let entity = entry
+            .dir
+            .join(entity_dir_name(total, "video/mp4", VALIDATOR));
+        let mut filler = entry.fill(total, "video/mp4", VALIDATOR, 0);
+        let slice = (CHUNK_BYTES / 4) as usize;
+        let slices = 6 * 4;
+        for _ in 0..slices {
+            filler.take(&vec![7u8; slice]);
+            cache.settled().await;
+        }
+
+        let heads = cache.retention().heads_of(&entity);
+        assert_eq!(
+            heads.len(),
+            1,
+            "one body is one consumer, and not one per slice the disk had \
+             not caught up with: {heads:?}"
+        );
+        // How many of the slices a pass has answered by now is the pass's
+        // own timing -- a read waits for one, and the last few are still
+        // pending -- so what is asserted is that they joined *this*
+        // consumer and carried it along.
+        let (at, reads) = heads[0];
+        assert!(
+            reads > 1 && at > CHUNK_BYTES,
+            "the slices did not carry the consumer: {heads:?}"
+        );
+    }
+
     /// The count is asserted against the directory itself at each step
     /// rather than against an arithmetic of chunk lengths: what it has to
     /// be right about is the disk, and a count that agreed with a

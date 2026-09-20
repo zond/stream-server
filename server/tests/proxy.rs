@@ -2841,7 +2841,23 @@ fn a_clean_leaves_the_chunks_a_proxied_player_is_inside() -> anyhow::Result<()> 
     let before = cached_chunk_indices(&fixture);
     let report = fixture.handle.clean_cache_now()?;
     let left = cached_chunk_indices(&fixture);
-    assert!(report.over_limit > 0, "and it says so again: {report:?}");
+    // **Not "still over the cap" any more, and that is the fix and not a
+    // regression.** What protects a proxied stream is one consumer's
+    // window; it used to be a two-chunk floor apiece for every phantom
+    // stream the detector had made of one body, and thirty-two of those
+    // covered more than the whole allowance, so a clean here could never
+    // reach the cap whatever it took (`docs/known-issues.md`, closed
+    // 2026-09-20). It can now, and a run that leaves the disk at exactly
+    // one chunk reports nothing over the cap -- correctly. What still has
+    // to hold is that the report describes the disk it left rather than
+    // the cap it was handed.
+    assert_eq!(
+        report.over_limit,
+        report
+            .total
+            .saturating_sub(report.limit.expect("a cap is in force")),
+        "the report does not describe what it left: {report:?}"
+    );
     assert!(
         left.len() <= before.len(),
         "the pass grew the disk: {before:?} before, {left:?} after"

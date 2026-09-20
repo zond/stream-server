@@ -509,10 +509,17 @@ impl FileStreams {
     /// Take account of one served read, and say why it had to start a new
     /// stream when it did.
     ///
-    /// **A read joins the stream that is in the same unbroken stretch of
-    /// disk it is.** A consumer *is* the run of bytes it caused to be
-    /// there, so two reads belong to one consumer exactly when the disk
-    /// between them is whole, and a hole an eviction left is what ends one.
+    /// **A read continues its own reader's stream, or it joins the stream
+    /// that is in the same unbroken stretch of disk it is.**
+    ///
+    /// The second is the general rule and the first is what it cannot see.
+    /// A consumer *is* the run of bytes it caused to be there, so two reads
+    /// belong to one consumer exactly when the disk between them is whole,
+    /// and a hole an eviction left is what ends one -- but that reads the
+    /// disk as the proof of who a consumer is, and one response can be
+    /// ahead of the disk it is writing. So a read that begins exactly where
+    /// this same reader's last read ended is that reader carrying on,
+    /// whatever the listing holds; see [`Self::observe_in`].
     ///
     /// Which makes the tolerance a measurement rather than a choice, and
     /// scales it the right way: a cache with room holds a long run, so a
@@ -572,18 +579,56 @@ impl FileStreams {
                 .max_by_key(|(_, stream)| (stream.reader == reader, stream.seen))
                 .map(|(index, _)| index)
         });
+        // **A continuation is never a new consumer, whatever the listing
+        // holds.** The run rule asks the disk who a reader is, and between
+        // two responses that is the right question; within one response it
+        // is a proxy that fails exactly where the delivery runs ahead of
+        // the writer. A proxied response reports each chunk as it goes past
+        // and a chunk enters the listing only once it is whole, so the read
+        // that delivered one begins in a piece no listing holds -- and one
+        // 16 MiB play-through of one URL was counted as thirty-two
+        // consumers, each granted its [`FLOOR_PIECES`] that no unlink may
+        // touch. Their floors together came to more than the whole
+        // allowance, so the pass computed an overhang it was then forbidden
+        // to take a piece of, and the cache settled over its cap for the
+        // life of the stream.
+        //
+        // One response reads forward and never comes back to a byte it has
+        // left, so a read beginning exactly where this reader's own stream
+        // last ended is that stream going on. Exactly, and for the same
+        // reader only: anything looser is the guess-a-distance rule the run
+        // rule replaced. It leaves the torrent side as it was -- a read
+        // *past a hole* did not continue anything, so it is still a seek
+        // and still a consumer of its own.
+        let nearest = nearest.or_else(|| {
+            self.streams
+                .iter()
+                .enumerate()
+                .filter(|(_, stream)| {
+                    stream.reader == reader
+                        && stream.last.end == read.begin
+                        && !stream.dormant(read.returned)
+                })
+                .max_by_key(|(_, stream)| stream.seen)
+                .map(|(index, _)| index)
+        });
 
-        if let (Some(index), Some(run)) = (nearest, run) {
+        if let Some(index) = nearest {
             // How far the read is from running out of held bytes: the
             // first missing piece of its run, or nothing when the run
             // reaches the file's end -- the film's own end is not a hole.
-            let missing_within = if run.end >= self.geometry.bound.end {
-                u64::MAX
-            } else {
-                let into_piece = self.geometry.offset.saturating_add(read.end) % piece.max(1);
-                u64::from(run.end.saturating_sub(at(read.end.saturating_sub(1))))
-                    .saturating_mul(piece)
-                    .saturating_sub(into_piece)
+            // A read in no run at all has run out already: the piece it
+            // began in is not on the disk, so the fetch is needed where it
+            // is and the position is placed outright.
+            let missing_within = match &run {
+                None => 0,
+                Some(run) if run.end >= self.geometry.bound.end => u64::MAX,
+                Some(run) => {
+                    let into_piece = self.geometry.offset.saturating_add(read.end) % piece.max(1);
+                    u64::from(run.end.saturating_sub(at(read.end.saturating_sub(1))))
+                        .saturating_mul(piece)
+                        .saturating_sub(into_piece)
+                }
             };
             let stream = &mut self.streams[index];
             stream.sample(&read, self.ceiling);
@@ -1233,6 +1278,88 @@ mod tests {
             "and the reopen behind it is the same consumer: the disk is whole between them"
         );
         assert_eq!(streams.streams.len(), 1);
+    }
+
+    /// **One response reading on past what the disk holds is one
+    /// consumer.**
+    ///
+    /// A proxied response reports every chunk as it goes past, and a chunk
+    /// enters the listing only once it is whole, so read after read begins
+    /// in a piece no listing holds. Under the run rule alone each of them
+    /// started a stream of its own: one 16 MiB play-through was counted as
+    /// thirty-two consumers, each granted its [`FLOOR_PIECES`] of window
+    /// that no unlink may touch. Their floors together came to more than
+    /// the whole allowance, so the pass computed an overhang and was
+    /// forbidden to take any of it, and the cache settled over its cap.
+    #[test]
+    fn a_response_reading_on_past_what_the_disk_holds_is_one_stream() {
+        let t0 = Instant::now();
+        // Nothing has landed yet: every one of these reads is in no run.
+        let held = BTreeSet::new();
+        let mut streams = file_at(0);
+
+        assert_eq!(
+            streams.observe(1, read(0, PIECE, t0, 0), &held, PIECE),
+            Some(Rejected::Outside),
+            "the first read of a session joins nothing"
+        );
+        for chunk in 1..8u64 {
+            assert_eq!(
+                streams.observe(
+                    1,
+                    read(chunk * PIECE, (chunk + 1) * PIECE, t0, chunk),
+                    &held,
+                    PIECE
+                ),
+                None,
+                "chunk {chunk} carries on where the same response left off"
+            );
+        }
+        assert_eq!(
+            streams.streams.len(),
+            1,
+            "one response is one consumer, whatever the listing says"
+        );
+        assert_eq!(
+            streams.streams[0].end,
+            8 * PIECE,
+            "and the position is where the reading is, not a piece behind it: \
+             a read in no run has run out of held bytes already"
+        );
+    }
+
+    /// **A second response on bytes the disk lacks is a stream of its
+    /// own**, and a read past a hole is still a seek.
+    ///
+    /// The continuation rule is one reader's alone. Two bodies reading the
+    /// same unheld stretch are what the run rule exists to tell apart, and
+    /// a rule that merged them on the offsets would be the guess-a-distance
+    /// rule the run rule replaced. The same holds within one body across a
+    /// hole: the read after a seek continues nothing, so it is a consumer
+    /// of its own and is fetched for as one.
+    #[test]
+    fn a_second_response_on_bytes_the_disk_lacks_is_a_stream_of_its_own() {
+        let t0 = Instant::now();
+        let held = BTreeSet::new();
+        let mut streams = file_at(0);
+
+        assert_eq!(
+            streams.observe(1, read(0, PIECE, t0, 0), &held, PIECE),
+            Some(Rejected::Outside),
+            "the first response starts one"
+        );
+        assert_eq!(
+            streams.observe(2, read(PIECE, 2 * PIECE, t0, 1), &held, PIECE),
+            Some(Rejected::Outside),
+            "and the second response starts its own, held or not"
+        );
+        assert_eq!(streams.streams.len(), 2);
+        assert_eq!(
+            streams.observe(1, read(900 * PIECE, 901 * PIECE, t0, 2), &held, PIECE),
+            Some(Rejected::Outside),
+            "and the first response's seek is a third: it continues nothing"
+        );
+        assert_eq!(streams.streams.len(), 3);
     }
 
     /// **Which of a file's readers is the viewer, when both are a
