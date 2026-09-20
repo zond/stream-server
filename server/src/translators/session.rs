@@ -306,21 +306,27 @@ impl<T> Inner<T> {
     ///
     /// The candidates are read into a list before anything is removed: the
     /// iterator holds shard locks, and a removal taken under it would be a
-    /// deadlock rather than an eviction. Each removal then asks again under
-    /// the shard's write lock, so a session that took a lease while the
-    /// list was being read stays.
+    /// deadlock rather than an eviction.
+    ///
+    /// **Whether a session is leased is asked at the removal and not while
+    /// the list is being read**, under the shard's write lock, which is
+    /// the only place the answer cannot go stale between the asking and
+    /// the unlink -- exactly as [`Sessions::retain`] and
+    /// [`Sessions::get`] pair. A map whose oldest sessions are all leased
+    /// therefore stays over its cap until one of them is let go, which is
+    /// the right way round: the cap bounds what is *kept*, and a reader is
+    /// never dropped under for it.
     fn evict_over_cap(&self) {
         if self.map.len() <= self.cap {
             return;
         }
-        let mut unleased: Vec<(u64, String)> = self
+        let mut candidates: Vec<(u64, String)> = self
             .map
             .iter()
-            .filter(|entry| !entry.usage.leased())
             .map(|entry| (entry.usage.stamp(), entry.key().clone()))
             .collect();
-        unleased.sort_unstable_by_key(|(stamp, _)| *stamp);
-        for (_, key) in unleased {
+        candidates.sort_unstable_by_key(|(stamp, _)| *stamp);
+        for (_, key) in candidates {
             if self.map.len() <= self.cap {
                 break;
             }
@@ -553,26 +559,46 @@ mod tests {
     #[test]
     fn the_cap_evicts_the_least_recently_used_unleased_session() {
         let sessions: Sessions<u32> = Sessions::new(2);
-        let held = sessions.insert("oldest".into(), 1);
+        drop(sessions.insert("oldest".into(), 1));
         drop(sessions.insert("middle".into(), 2));
-        // Used again, so "middle" is now the older of the two unleased.
+        // Used again, so "middle" is now the older of the two and the two
+        // are told apart by their order and not by their age.
         drop(sessions.get("oldest"));
         assert_eq!(sessions.len(), 2);
 
         drop(sessions.insert("newest".into(), 3));
         assert_eq!(sessions.len(), 2);
         assert!(sessions.get("middle").is_none(), "the least recently used");
-        assert!(sessions.get("oldest").is_some());
+        assert!(
+            sessions.get("oldest").is_some(),
+            "used since \"middle\" was"
+        );
         assert!(sessions.get("newest").is_some());
+    }
 
-        // And a leased session is not evicted, even though holding it
-        // leaves the map over its cap: a reader is never dropped under.
-        drop(held);
-        let held = sessions.get("oldest").expect("still there");
-        drop(sessions.insert("another".into(), 4));
-        assert!(sessions.get("oldest").is_some(), "leased");
-        assert_eq!(sessions.len(), 2);
-        drop(held);
+    /// **A leased session is passed over by the eviction even when it is
+    /// the oldest thing in the map**, which leaves the map over its cap
+    /// until the lease goes: the cap is a bound on what is *kept*, and a
+    /// reader is never dropped under for it.
+    #[test]
+    fn the_eviction_passes_over_a_leased_session_and_takes_it_once_it_is_free() {
+        let sessions: Sessions<u32> = Sessions::new(1);
+        let reading = sessions.insert("reading".into(), 1);
+        drop(sessions.insert("other".into(), 2));
+        assert!(
+            sessions.get("reading").is_some(),
+            "a reader was dropped under the cap"
+        );
+        assert_eq!(sessions.len(), 2, "over the cap, deliberately");
+
+        // And once the lease is gone it is an ordinary candidate, oldest
+        // first.
+        drop(reading);
+        drop(sessions.insert("third".into(), 3));
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions.get("reading").is_none());
+        assert!(sessions.get("other").is_none());
+        assert!(sessions.get("third").is_some());
     }
 
     /// `insert` hands back a lease, so a session cannot be taken between
