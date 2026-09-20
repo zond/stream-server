@@ -90,6 +90,7 @@ mod cache_budget;
 mod cache_cleaner;
 mod devices;
 mod diagnostics;
+pub mod images;
 // What an embedder needs to apply this switch itself. xtremio starts this
 // server with `init_logging: false` and owns the process's one subscriber,
 // so [`diagnostics::logging::set_diagnostics_trace`] has no filter to
