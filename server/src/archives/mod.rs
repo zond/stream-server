@@ -4,8 +4,6 @@ use std::path::{Path, PathBuf};
 use tokio::io::{AsyncRead, AsyncSeek};
 
 pub mod cache;
-#[cfg(feature = "rar")]
-pub mod rar;
 pub mod sessions;
 pub mod sevenz;
 pub mod source;
@@ -27,12 +25,6 @@ pub use source::{ArchiveSession, ArchiveSource};
 /// (see [`SCRATCH_DIR_NAME`]: nothing else in the process speaks for
 /// them).
 pub const SESSION_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
-
-/// Error message used when a RAR archive is requested but this binary was
-/// built without the "rar" cargo feature.
-#[cfg(not(feature = "rar"))]
-pub const RAR_DISABLED_ERROR: &str =
-    "RAR support is not compiled into this build (rebuild with the \"rar\" cargo feature)";
 
 /// Represents a file inside an archive
 #[derive(Debug, Clone)]
@@ -110,9 +102,9 @@ impl CacheConfig {
 /// The suffixes the readers are chosen by, longest first so `.tar.gz` is
 /// found before `.gz` would not be.
 ///
-/// Still all six, though only two of them reach a reader here: the list is
-/// what names a download's scratch file, and a file whose suffix the
-/// dispatch does not know is one that will never be opened by mistake.
+/// Still all six, though only **one** of them reaches a reader here: the
+/// list is what names a download's scratch file, and a file whose suffix
+/// the dispatch does not know is one that will never be opened by mistake.
 const ARCHIVE_SUFFIXES: [&str; 6] = [".tar.gz", ".tgz", ".zip", ".rar", ".7z", ".tar"];
 
 /// The recognised archive suffix `name` ends with (case-insensitively), as
@@ -179,8 +171,8 @@ impl<T: AsyncRead + AsyncSeek + Unpin + Send> AsyncSeekableReader for T {}
 /// `ArchiveSource::open_member`). A format that needs no decoding returns a
 /// reader over the archive itself; there is nothing to keep. **Nothing
 /// takes the second arm any more**: the formats that can point at a
-/// member's bytes are translated now (`crate::translators`), and these two
-/// are what is left until steps 3 and 5 of the design convert them.
+/// member's bytes are translated now (`crate::translators`), and 7z is the
+/// one format left until step 5 of the design converts it.
 pub enum OpenedMember {
     Extracted(cache::ProgressiveCache),
     Direct(Box<dyn AsyncSeekableReader>),
@@ -214,28 +206,6 @@ pub async fn get_archive_reader_with_config(
     // The reader is chosen by suffix, which is why a download has to be
     // given one (`scratch_file`).
     match archive_suffix(&path.to_string_lossy()) {
-        Some(".rar") => {
-            #[cfg(feature = "rar")]
-            {
-                tracing::info!(
-                    "Archive detected: RAR at {:?}, cache_dir={:?}",
-                    path,
-                    cache_config.cache_dir
-                );
-                Ok(Box::new(rar::RarHandler::new_with_config(
-                    path.to_path_buf(),
-                    cache_config,
-                )))
-            }
-            #[cfg(not(feature = "rar"))]
-            {
-                tracing::warn!(
-                    "RAR archive requested but RAR support is not compiled in: {:?}",
-                    path
-                );
-                Err(anyhow::anyhow!(RAR_DISABLED_ERROR))
-            }
-        }
         Some(".7z") => {
             tracing::info!(
                 "Archive detected: 7z at {:?}, cache_dir={:?}",

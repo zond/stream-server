@@ -152,6 +152,19 @@ impl TorrentFileSource {
         Self::at(engine, info_hash, file_idx, &files).await
     }
 
+    /// The names of the torrent's files, in the torrent's own order --
+    /// what a translator that comes in sets is handed to pick its sibling
+    /// volumes out of (`Translator::volumes`). The order is the list's,
+    /// not the set's: the naming rules put the volumes in order, and a
+    /// torrent lists what it lists.
+    pub async fn file_names(
+        engine: &Arc<enginefs::EngineFS>,
+        info_hash: &str,
+    ) -> io::Result<Vec<String>> {
+        let files = Self::files(engine, &info_hash.to_lowercase()).await?;
+        Ok(files.into_iter().map(|file| file.name).collect())
+    }
+
     /// The torrent's file list. `get_files` and not `stats()`: the latter
     /// builds the whole snapshot -- per-file progress, trackers, a scrape
     /// scheduled -- for a name lookup.

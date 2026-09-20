@@ -60,10 +60,10 @@ pub(crate) fn media_body<R: tokio::io::AsyncRead>(reader: R) -> ReaderStream<R> 
 /// The prefix used to be decorative: one handler set served every format
 /// and worked out which it was from the file's suffix. It is the format
 /// now, because that is what says *which translator reads this* -- and
-/// which of the two layers the request belongs to while both exist. ZIP
-/// and TAR are translated (`crate::translators`); RAR and 7z are still
-/// read by the old extracting handlers, until steps 3 and 5 of
-/// `docs/translated-sources.md` convert them.
+/// which of the two layers the request belongs to while both exist. ZIP,
+/// TAR and RAR are translated (`crate::translators`); 7z is still read by
+/// the old extracting handler, until step 5 of
+/// `docs/translated-sources.md` converts it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Rar,
@@ -79,14 +79,20 @@ pub enum Format {
 
 impl Format {
     /// The translator for this format, or `None` for one the old
-    /// extracting path still owns.
+    /// extracting path still owns -- and for RAR in a build without the
+    /// `rar` feature, which has no reader for it at all and answers
+    /// [`rar_disabled_response`] instead.
     fn translator(self) -> Option<Box<dyn Translator>> {
         match self {
             Self::Zip => Some(Box::new(crate::translators::zip::Zip)),
             Self::Tar => Some(Box::new(crate::translators::tar::Tar)),
             Self::TarGz => Some(Box::new(crate::translators::TarGz)),
             Self::Iso => Some(Box::new(crate::translators::iso::Iso)),
-            Self::Rar | Self::SevenZ => None,
+            #[cfg(feature = "rar")]
+            Self::Rar => Some(Box::new(crate::translators::rar::Rar)),
+            #[cfg(not(feature = "rar"))]
+            Self::Rar => None,
+            Self::SevenZ => None,
         }
     }
 }
@@ -177,6 +183,14 @@ pub fn stream_router(format: Format) -> Router<AppState> {
         .layer(Extension(format))
 }
 
+/// What a build without the `rar` cargo feature says about a RAR. The
+/// feature is off in the MIT build, because `unrar-rs` is GPL-3.0 (see
+/// `server/Cargo.toml` and AGENTS.md) -- so such a build has no RAR
+/// reader at all, and says so rather than failing as some other error.
+#[cfg(not(feature = "rar"))]
+const RAR_DISABLED_ERROR: &str =
+    "RAR support is not compiled into this build (rebuild with the \"rar\" cargo feature)";
+
 /// 501 JSON response returned for RAR requests when the "rar" cargo feature
 /// is not compiled into this build.
 #[cfg(not(feature = "rar"))]
@@ -184,15 +198,9 @@ fn rar_disabled_response() -> Response {
     tracing::warn!("RAR request rejected: RAR support is not compiled into this build");
     (
         StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({ "error": crate::archives::RAR_DISABLED_ERROR })),
+        Json(serde_json::json!({ "error": RAR_DISABLED_ERROR })),
     )
         .into_response()
-}
-
-/// True when `path` points at a RAR archive that this build cannot handle.
-#[cfg(not(feature = "rar"))]
-fn is_unsupported_rar(path: &std::path::Path) -> bool {
-    path.to_string_lossy().to_lowercase().ends_with(".rar")
 }
 
 /// Where the archive handlers write, from the live settings: the cache root
@@ -652,13 +660,34 @@ async fn create_session_internal(
         Some(translator) => {
             create_translated(&state, translator.as_ref(), key, method, payload).await
         }
+        #[cfg(not(feature = "rar"))]
+        None if format == Format::Rar => rar_disabled_response(),
         None => create_downloaded(state, key, method, payload).await,
     }
 }
 
-/// `/{zip|tar|tgz}/create`: every URL becomes a [`ProxySource`], the
-/// translator indexes them, and what is remembered under the key is the
-/// index -- no file, nothing on disk, nothing to sweep but memory.
+/// How a set of volumes is named as one session.
+///
+/// **Every** URL, and not the first: `rarUrls` is a list of volumes, two
+/// sets can share a `.part1.rar` and differ after it, and a session found
+/// by the first URL alone would answer one set's index over the other's
+/// bytes. A newline cannot occur inside a URL, so the join is unambiguous.
+/// A single-volume archive's origin is its URL, exactly as before.
+fn set_origin(urls: &[String]) -> String {
+    urls.join("\n")
+}
+
+/// `/{zip|tar|rar}/create`: every URL becomes a [`ProxySource`], the
+/// translator indexes them **in the order they were given**, and what is
+/// remembered under the key is the index -- no file, nothing on disk,
+/// nothing to sweep but memory.
+///
+/// The list is the volume list. For RAR that is the ordinary case: from an
+/// addon, `rarUrls` *is* `.part1.rar`, `.part2.rar`, ... in order, and the
+/// extents a member is made of name the volume each part is in
+/// (`docs/translated-sources.md` §2.2). A format that does not come in
+/// sets reads `sources[0]` and says so about the rest, which is what every
+/// translator but RAR does.
 async fn create_translated(
     state: &AppState,
     translator: &dyn Translator,
@@ -666,39 +695,31 @@ async fn create_translated(
     method: Method,
     payload: ArchiveCreateRequest,
 ) -> Response {
-    if payload.urls.len() > 1 {
-        // A set of volumes is RAR's case, and step 3 of the design is
-        // where it lands. One archive in several parts is not a zip or a
-        // tar.
-        tracing::warn!(
-            key = %key,
-            url_count = payload.urls.len(),
-            "multi-volume archive compatibility requested but not implemented"
-        );
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            "Multi-volume archive streaming is not implemented",
-        )
-            .into_response();
-    }
     let Some(url) = payload.urls.first() else {
         return (StatusCode::BAD_REQUEST, "No archive URL provided").into_response();
     };
-    // Only what the route is named for: an archive at a web address. This
+    // Only what the route is named for: archives at web addresses. This
     // route is open to any loopback caller -- on Android, every app on the
     // device, and any page in a browser on it -- so a URL that was taken
     // as a local path served the members of any archive this process could
-    // read, its own private storage included.
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
+    // read, its own private storage included. Every volume is checked, not
+    // just the first: a set is read whole, so a local path anywhere in the
+    // list would be read.
+    if !payload
+        .urls
+        .iter()
+        .all(|url| url.starts_with("http://") || url.starts_with("https://"))
+    {
         return (StatusCode::BAD_REQUEST, "Failed to resolve archive URL").into_response();
     }
+    let origin = set_origin(&payload.urls);
     // A key the caller chose (`/{fmt}/create/{key}`) may name a session
     // that already exists, and replacing it points every later
     // `/{fmt}/stream/{key}/...` at a different archive: the player that
     // was reading one file seeks and reads another's bytes. A repeat of
     // the same create is the ordinary case (a re-play sends it again).
     if let Some(existing) = state.translated_archives.get(&key)
-        && existing.origin() != url.as_str()
+        && existing.origin() != origin
     {
         tracing::warn!(
             key = %key,
@@ -716,7 +737,7 @@ async fn create_translated(
     // should cost neither.
     let indexed = match state
         .translated_archives
-        .find(|session| session.origin() == url.as_str())
+        .find(|session| session.origin() == origin)
     {
         Some(existing) => {
             tracing::info!(
@@ -731,42 +752,50 @@ async fn create_translated(
             (sources.clone(), existing.index().clone())
         }
         None => {
-            let parsed = match url::Url::parse(url) {
-                Ok(parsed) => parsed,
-                Err(error) => {
-                    tracing::warn!(
-                        origin = %util::log_origin(url),
-                        %error,
-                        "the archive URL does not parse"
-                    );
-                    return (StatusCode::BAD_REQUEST, "Failed to resolve archive URL")
-                        .into_response();
-                }
-            };
-            let source = match ProxySource::open(
-                state.proxy_cache.clone(),
-                state.http_addr,
-                parsed,
-                Default::default(),
-            )
-            .await
-            {
-                Ok(source) => source,
-                Err(error) => {
-                    tracing::warn!(
-                        origin = %util::log_origin(url),
-                        %error,
-                        "the archive URL cannot be read by range"
-                    );
-                    return source_error_response(&error);
-                }
-            };
-            let sources: Vec<Arc<dyn ByteSource>> = vec![Arc::new(source)];
+            // One source per volume, in the order they were given: an
+            // `Extent`'s `source` is an index into this list, so a set
+            // probed out of order would serve every part of the film from
+            // the wrong volume.
+            let mut sources: Vec<Arc<dyn ByteSource>> = Vec::with_capacity(payload.urls.len());
+            for url in &payload.urls {
+                let parsed = match url::Url::parse(url) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        tracing::warn!(
+                            origin = %util::log_origin(url),
+                            %error,
+                            "the archive URL does not parse"
+                        );
+                        return (StatusCode::BAD_REQUEST, "Failed to resolve archive URL")
+                            .into_response();
+                    }
+                };
+                let source = match ProxySource::open(
+                    state.proxy_cache.clone(),
+                    state.http_addr,
+                    parsed,
+                    Default::default(),
+                )
+                .await
+                {
+                    Ok(source) => source,
+                    Err(error) => {
+                        tracing::warn!(
+                            origin = %util::log_origin(url),
+                            %error,
+                            "the archive URL cannot be read by range"
+                        );
+                        return source_error_response(&error);
+                    }
+                };
+                sources.push(Arc::new(source));
+            }
             match translator.index(&sources).await {
                 Ok(index) => (sources, index),
                 Err(refusal) => {
                     tracing::warn!(
                         origin = %util::log_origin(url),
+                        volumes = payload.urls.len(),
                         %refusal,
                         "the archive could not be indexed"
                     );
@@ -800,7 +829,7 @@ async fn create_translated(
         .map(|member| member.name.clone());
     state.translated_archives.insert(
         key.clone(),
-        TranslatedSession::new(url.clone(), SessionSources::Held(sources), index, selected),
+        TranslatedSession::new(origin, SessionSources::Held(sources), index, selected),
     );
 
     if method == Method::GET
@@ -847,16 +876,20 @@ fn select_member(
         })
 }
 
-/// `/{rar|7zip}/create`: the archive is fetched whole into
-/// `<cacheRoot>/.archives` and read as a file. **The old shape**, kept
-/// only for the two formats whose translators have not landed yet (steps
-/// 3 and 5 of `docs/translated-sources.md`); it goes with them.
+/// `/7zip/create`: the archive is fetched whole into `<cacheRoot>/.archives`
+/// and read as a file. **The old shape**, kept only for the one format
+/// whose translator has not landed yet (step 5 of
+/// `docs/translated-sources.md`); it goes with it.
 async fn create_downloaded(
     state: AppState,
     key: String,
     method: Method,
     payload: ArchiveCreateRequest,
 ) -> Response {
+    // The one format left on this path is 7z, and a `.7z.001` set is not
+    // something a whole-archive download reads either. The translated
+    // path takes its URL list as the volume list; this one goes with the
+    // download (step 5 of `docs/translated-sources.md`).
     if payload.urls.len() > 1 {
         tracing::warn!(
             key = %key,
@@ -900,11 +933,6 @@ async fn create_downloaded(
         Ok(source) => source,
         Err(status) => return (status, "Failed to resolve archive URL").into_response(),
     };
-
-    #[cfg(not(feature = "rar"))]
-    if is_unsupported_rar(source.path()) {
-        return rar_disabled_response();
-    }
 
     // A failure from here on drops `source`, and with it a download nothing
     // else holds -- the file goes, rather than staying on disk with no
@@ -989,7 +1017,7 @@ async fn stream_redirection(
 }
 
 /// One member of one session, as a range of bytes: the translated path for
-/// the formats that have one, the old extracting path for the two that do
+/// the formats that have one, the old extracting path for 7z, which does
 /// not yet.
 async fn stream_member(
     state: &AppState,
@@ -1000,6 +1028,10 @@ async fn stream_member(
 ) -> Response {
     if let Some(translator) = format.translator() {
         return stream_translated(state, translator.as_ref(), key, file, headers).await;
+    }
+    #[cfg(not(feature = "rar"))]
+    if format == Format::Rar {
+        return rar_disabled_response();
     }
     // The old path names its member in the URL, or takes the one the
     // create chose.
@@ -1114,13 +1146,34 @@ async fn session_for(
     let Some((info_hash, path)) = rest.split_once('/') else {
         return Err(Box::new(StatusCode::BAD_REQUEST.into_response()));
     };
-    let source = TorrentFileSource::open(state.engine.clone(), info_hash, path)
+    // The named file may be one volume of a set, and for RAR it usually
+    // is: the rest of the set is the files beside it in the torrent, and
+    // the translator's own naming rules say which and in what order
+    // (`translators::rar::volume_set`). A format that does not come in
+    // sets answers with the one file, which is the trait's default.
+    let siblings = TorrentFileSource::file_names(&state.engine, info_hash)
         .await
         .map_err(|error| {
-            tracing::warn!(%info_hash, archive = path, %error, "no such archive in that torrent");
+            tracing::warn!(%info_hash, %error, "no such torrent in this engine");
             Box::new(StatusCode::NOT_FOUND.into_response())
         })?;
-    let sources: Vec<Arc<dyn ByteSource>> = vec![Arc::new(source)];
+    let paths = translator.volumes(path, &siblings).map_err(|refusal| {
+        // A set with a hole in it is `Malformed`, naming the volume it
+        // wanted -- `422`, and said at the index rather than as a short
+        // read in the middle of a film.
+        tracing::warn!(%info_hash, archive = path, %refusal, "the set is not all there");
+        Box::new(refusal_response(&refusal))
+    })?;
+    let mut sources: Vec<Arc<dyn ByteSource>> = Vec::with_capacity(paths.len());
+    for volume in &paths {
+        let source = TorrentFileSource::open(state.engine.clone(), info_hash, volume)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%info_hash, archive = %volume, %error, "no such archive in that torrent");
+                Box::new(StatusCode::NOT_FOUND.into_response())
+            })?;
+        sources.push(Arc::new(source));
+    }
     let index = translator.index(&sources).await.map_err(|refusal| {
         tracing::warn!(%info_hash, archive = path, %refusal, "the archive could not be indexed");
         Box::new(refusal_response(&refusal))
@@ -1132,7 +1185,7 @@ async fn session_for(
             key,
             SessionSources::Torrent {
                 info_hash: info_hash.to_string(),
-                path: path.to_string(),
+                paths,
             },
             index,
             None,
@@ -1152,14 +1205,20 @@ async fn sources_for(
 ) -> Result<Vec<Arc<dyn ByteSource>>, Box<Response>> {
     match session.sources() {
         SessionSources::Held(sources) => Ok(sources.clone()),
-        SessionSources::Torrent { info_hash, path } => {
-            let source = TorrentFileSource::open(state.engine.clone(), info_hash, path)
-                .await
-                .map_err(|error| {
-                    tracing::warn!(%info_hash, archive = %path, %error, "the torrent this archive is in is gone");
-                    Box::new(StatusCode::NOT_FOUND.into_response())
-                })?;
-            Ok(vec![Arc::new(source)])
+        SessionSources::Torrent { info_hash, paths } => {
+            // Every volume, in the order the index was read in: an
+            // `Extent`'s `source` indexes this list.
+            let mut sources: Vec<Arc<dyn ByteSource>> = Vec::with_capacity(paths.len());
+            for path in paths {
+                let source = TorrentFileSource::open(state.engine.clone(), info_hash, path)
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(%info_hash, archive = %path, %error, "the torrent this archive is in is gone");
+                        Box::new(StatusCode::NOT_FOUND.into_response())
+                    })?;
+                sources.push(Arc::new(source));
+            }
+            Ok(sources)
         }
     }
 }
@@ -1182,7 +1241,7 @@ fn is_storage_full(error: &anyhow::Error) -> bool {
 }
 
 /// A member of a downloaded archive, extracted if the format needs it:
-/// **the old path**, and only for RAR and 7z. See [`create_downloaded`].
+/// **the old path**, and only for 7z. See [`create_downloaded`].
 async fn stream_file(
     state: &AppState,
     key: &str,
@@ -1190,10 +1249,9 @@ async fn stream_file(
     headers: &header::HeaderMap,
 ) -> Result<Response, StatusCode> {
     // The `torrent:` form belongs to the translated path now. It never
-    // worked for these two formats anyway -- a RAR handler reads a
-    // `std::fs::File` and 7z's decoder wants a seekable one -- so this is
-    // the same refusal under the same status, said before the torrent is
-    // looked at rather than after a stream has been registered on it.
+    // worked for 7z anyway -- its decoder wants a seekable file -- so this
+    // is the same refusal under the same status, said before the torrent
+    // is looked at rather than after a stream has been registered on it.
     if let Some(rest) = key.strip_prefix("torrent:") {
         let extension = rest
             .rsplit_once('.')
@@ -1209,11 +1267,6 @@ async fn stream_file(
     // The session this request reads from, leased for as long as the
     // response body lives (see `archives::sessions`).
     let session = state.archive_cache.get(key).ok_or(StatusCode::NOT_FOUND)?;
-
-    #[cfg(not(feature = "rar"))]
-    if is_unsupported_rar(session.source.path()) {
-        return Ok(rar_disabled_response());
-    }
 
     // One extraction per member per archive, whatever the number of
     // requests on it (see `ArchiveSource::open_member`).
