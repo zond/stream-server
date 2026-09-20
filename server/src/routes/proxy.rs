@@ -548,7 +548,7 @@ fn without_credentials(headers: &HeaderMap) -> HeaderMap {
 /// host it is often not even the same party's; and a default port spelled
 /// out is neither.
 #[derive(Clone)]
-struct CredentialChain {
+pub(crate) struct CredentialChain {
     /// The origin the caller named in `d=`, when the caller named a
     /// cleartext one: the single origin this chain has already published
     /// the credentials to, and so the only one a chain that is not all
@@ -794,9 +794,46 @@ fn cacheable_entity(
     )
 }
 
+/// What a `206` to a ranged probe says about the entity behind it, for a
+/// caller that is opening a source on it rather than answering a request
+/// from it ([`crate::sources::ProxySource`]).
+///
+/// `None` for anything but a `206` with a `Content-Range` naming an entity
+/// length -- which is, in the one place this is asked, an origin that will
+/// not serve a range, and so one this server refuses to read a member out
+/// of rather than download whole.
+pub(crate) fn probed_entity(status: StatusCode, res_headers: &HeaderMap) -> Option<ProbedEntity> {
+    if status != StatusCode::PARTIAL_CONTENT {
+        return None;
+    }
+    let (_, _, total) = res_headers
+        .get(header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_content_range)?;
+    Some(ProbedEntity {
+        total,
+        content_type: res_headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string(),
+        // The same validator the store files by and the narrowed fetch
+        // asks `If-Range` under, so a source and the route describe one
+        // entity the same way.
+        validator: EntityValidator::of(res_headers).map(|validator| validator.filed()),
+    })
+}
+
+/// What [`probed_entity`] learned.
+pub(crate) struct ProbedEntity {
+    pub(crate) total: u64,
+    pub(crate) content_type: String,
+    pub(crate) validator: Option<String>,
+}
+
 /// What [`cacheable_entity`] found: the entity, and where in it this body
 /// begins.
-struct CacheableEntity {
+pub(crate) struct CacheableEntity {
     /// The absolute offset of the body's first byte -- zero for a `200`, the
     /// `Content-Range`'s first byte for a `206`.
     first: u64,
@@ -1370,16 +1407,6 @@ async fn proxy(
             .into_response();
     }
 
-    // What the cache can do for this request, asked here and nowhere else:
-    // `url` is final by now and no origin socket has been opened, so a hit
-    // answers without one and a partial hit narrows the `Range` the loop
-    // below is about to send. `entry` is `None` for a request the cache will
-    // not touch at all -- see [`crate::proxy_cache::ProxyCache::entry`] for
-    // the whole of that list.
-    //
-    // The lookup lists one directory per thousand chunks of the range -- a
-    // few `getdents` for a cached film, still filesystem reads -- so it goes
-    // to the blocking pool rather than onto the reactor.
     let ranged = headers.contains_key(header::RANGE);
     // Needed before the lookup, not after it: it is an input to the playlist
     // verdict, and every hit has to reach that verdict before it answers or
@@ -1392,79 +1419,39 @@ async fn proxy(
         &headers,
         state.http_addr,
     );
-    let (cache_entry, cached) = match cache_entry {
-        Some(entry) => {
-            let range = headers
-                .get(header::RANGE)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string);
-            match tokio::task::spawn_blocking(move || {
-                let cached = entry.look_up(range.as_deref());
-                (entry, cached)
-            })
-            .await
-            {
-                Ok((entry, cached)) => (Some(entry), cached),
-                Err(error) => {
-                    tracing::debug!(%error, "the proxy cache lookup did not finish");
-                    (None, None)
-                }
-            }
-        }
-        None => (None, None),
+    // The whole of what follows -- the lookup, the narrowed conditional
+    // fetch, the stitch guard and the fill's verdict -- is
+    // [`cache_assisted_range`], which `crate::sources::ProxySource` calls
+    // too: an archive member behind a URL is read by the same sequence,
+    // under the same key, so there is one answer to each of these questions
+    // and not two.
+    let answer = match cache_assisted_range(
+        cache_entry,
+        &method,
+        &url,
+        &headers,
+        &params.request_headers,
+        forced_content_type.as_deref(),
+    )
+    .await
+    {
+        Ok(answer) => answer,
+        Err(failure) => return failure.into_response(),
     };
-
-    // **Is this a request whose body we would replace?** Asked of everything
-    // the cache found, before any of it is used for anything, because the
-    // answer decides both of the things a hit can do: answer outright, and
-    // narrow the fetch.
-    //
-    // The store never holds a playlist ([`cacheable_entity`] refuses one),
-    // but whether a stored body *is* one is not decided by the stored bytes
-    // alone: `r=Content-Type:application/x-mpegURL` -- what stremio-core
-    // sends for an HLS stream -- forces the verdict over an origin that
-    // mislabels, and `r=` is deliberately not in the cache key. So the same
-    // URL was rewritten on a miss and relayed raw on a hit, which is the
-    // rewrite failing exactly for the second player of a stream. Asking
-    // [`is_a_playlist`] here, with the same inputs the fetch would give it,
-    // is what makes the key's promise true: the store keeps origin bytes, and
-    // what is done with them is one question with one answer.
-    //
-    // A hit whose answer is "playlist" steps aside **whole**: the entry is
-    // dropped, the player's own `Range` goes to the origin unnarrowed, and
-    // the response is classified and rewritten the way any fetched one is.
-    // Stepping aside only when the hit was complete was the same bug one
-    // step further along. A partial hit went on to narrow the fetch to the
-    // bytes it did not hold, the tail came back a playlist, the stitch guard
-    // below dropped the head it could not join to one -- and what reached the
-    // player was the origin's `206`: raw unrewritten bytes, under a
-    // `Content-Range` naming a range it never asked for, with every segment
-    // line pointing straight at the origin. One request had three answers,
-    // chosen by how much of it happened to be on disk.
-    let cached = match cached {
-        Some(cached)
-            if is_a_playlist(
-                &url,
-                None,
-                &cached.content_type.to_ascii_lowercase(),
-                forced_content_type.as_deref(),
-            ) =>
-        {
-            tracing::debug!(
-                url = %url,
-                "this request would rewrite the body the cache holds; fetching it instead"
-            );
-            None
-        }
+    let OriginAnswer {
+        response,
+        fetched_url,
+        chain,
+        status,
+        res_headers,
+        rewritable_body,
+        rewriting_playlist,
+        cacheable,
+        entry: cache_entry,
+        head: stitched,
+    } = match answer {
         // The whole of what was asked for is here, and it is ours to send.
-        // Nothing is fetched, and the origin never learns this read happened.
-        Some(cached) if cached.complete() => {
-            tracing::debug!(
-                url = %url,
-                first = cached.first,
-                last = cached.last,
-                "answering a proxied range from the cache"
-            );
+        RangeAnswer::Hit(cached) => {
             return cache_hit_response(
                 &state,
                 player_token,
@@ -1473,425 +1460,7 @@ async fn proxy(
                 cached,
             );
         }
-        held => held,
-    };
-
-    // Part of it is here, so the origin is asked for the rest and for
-    // nothing else. `held_to + 1` is a chunk boundary, which is what makes
-    // what comes back fill whole chunks and not two half ones.
-    //
-    // And it is asked *conditionally*, under the validator the head is filed
-    // by. A narrowed range is only worth asking for while the head it was
-    // narrowed against is still part of the entity; `If-Range` is the one
-    // question that says so, and an origin that honours it answers the whole
-    // of the new entity when the head has gone stale -- which is a correct
-    // answer to the player rather than a tail it did not ask for. It is not
-    // the guard -- an origin is free to ignore it; the guard is the
-    // comparison below, on what actually came back.
-    let narrowed = cached.as_ref().map(|cached| {
-        (
-            cached.remaining_range(),
-            EntityValidator::from_filed(&cached.validator).map(|validator| validator.value),
-        )
-    });
-
-    let custom_request_headers = custom_request_headers(&params.request_headers);
-    let uncredentialed_request_headers = without_credentials(&custom_request_headers);
-    let build_request = |client: &Client, url: &Url, carry_credentials: bool| {
-        let mut req_builder = client.request(method.clone(), url.clone());
-
-        // What the player asked for, forwarded as it asked for it -- see
-        // [`FORWARDED_REQUEST_HEADERS`] for what is on that list and what is
-        // not.
-        for name in FORWARDED_REQUEST_HEADERS {
-            // What is left of the player's `Range` after the cache, in place
-            // of the player's own. `RequestBuilder::header` *appends*, so
-            // this has to be a substitution and not an addition beside it:
-            // sending both left the origin to choose, and it chose the first
-            // -- the whole range, which is exactly the fetch the cache was
-            // narrowing away.
-            if name == "range"
-                && let Some((range, _)) = narrowed.as_ref()
-            {
-                req_builder = req_builder.header(header::RANGE, range);
-                continue;
-            }
-            // The player's own `if-range` never reaches here with a narrowed
-            // range beside it: a request carrying one is not a request the
-            // cache touches at all ([`crate::proxy_cache::ProxyCache::entry`]
-            // refuses it), so there is nothing of the player's to displace.
-            if name == "if-range"
-                && let Some((_, Some(validator))) = narrowed.as_ref()
-            {
-                req_builder = req_builder.header(header::IF_RANGE, validator);
-                continue;
-            }
-            if let Some(value) = headers.get(name) {
-                req_builder = req_builder.header(name, value);
-            }
-        }
-
-        // `accept-encoding` is answered here rather than forwarded. This
-        // client has no gzip/brotli/deflate feature, so it decodes nothing,
-        // and a playlist arrives as bytes we cannot rewrite -- while the
-        // player's own `accept-encoding: gzip` invited exactly that. Asking
-        // for `identity` says what we can actually take. An origin that
-        // compresses anyway is still relayed honestly: `content-encoding`
-        // travels back with the body it describes (see the relayed-body
-        // headers below).
-        req_builder = req_builder.header(header::ACCEPT_ENCODING, "identity");
-
-        // The `h=` overrides last, and replacing rather than adding to what
-        // the player sent: an override that leaves the original in place
-        // is not one. Every hop of a redirect chain is built through here,
-        // so every hop gets them (see the loop below) -- minus the
-        // credentials once the chain has stepped down to cleartext.
-        req_builder = req_builder.headers(if carry_credentials {
-            custom_request_headers.clone()
-        } else {
-            uncredentialed_request_headers.clone()
-        });
-        req_builder
-    };
-
-    // The redirect chain is walked here, one hop at a time, rather than
-    // left to reqwest -- and the reason is `h=`. reqwest's default policy
-    // strips `Authorization`, `Cookie` and `Proxy-Authorization` on any
-    // cross-host *or cross-port* redirect, which is exactly the shape of an
-    // authenticated stream behind a CDN that hands off to an edge: the
-    // playlist fetched `200` and everything it named `403`, with the origin
-    // logging no credential at all. The reference's answer is structural --
-    // `redirect: "manual"`, its own loop, and
-    // `opts.h.forEach(headers.set(...))` re-applied on every hop -- and this
-    // is that: each hop is built by `build_request`, so each hop carries the
-    // headers the caller asked for.
-    //
-    // Say plainly what that costs, because it was chosen and not
-    // overlooked: reqwest's policy calls those three headers sensitive and
-    // drops them across hosts (`remove_sensitive_headers`) precisely so a
-    // redirect cannot walk a credential to a host the caller never named,
-    // and re-applying `h=` per hop gives that protection up. What is left
-    // holding the line is the set of statuses we follow
-    // ([`FOLLOWED_REDIRECTS`]) and the hop bound ([`MAX_REDIRECTS`]): the
-    // credential travels only where the *resource* moved, only a bounded
-    // number of times, and never to a host an origin nominated as a proxy
-    // to route us through. The header is the addon's and it goes where the
-    // origin sent the resource; that is the trade the caller made by naming
-    // a header for a stream, and the alternative is the `403`.
-    //
-    // **One thing that trade does not cover is the wire going cleartext.**
-    // [`redirect_target`] takes any `http` or `https` target without
-    // comparing it to the scheme it came from, and a `Location` that
-    // arrived in the clear is not something the origin can be said to have
-    // written. A `302` from `https` to `http` would have the caller's
-    // `Authorization` -- or `Cookie` -- re-applied on a hop anyone on the
-    // path can read: not "the credential goes where the resource went" but
-    // the origin choosing to publish it, and no `403` is avoided by
-    // obliging. A `302` sent *over* cleartext named its target in the clear
-    // too, so whoever could read the credential could also have chosen who
-    // receives it next -- which is why even a target on the very host that
-    // redirected us is not one this hop can trust the answer about, and why
-    // an upgrade back to `https` brings nothing back.
-    //
-    // Which hops carry them is therefore not decided here. It is decided by
-    // [`CredentialChain::may_carry_to`], which this loop asks about every
-    // hop and which is asked again, unchanged, about every line of a
-    // playlist the chain comes back with. What it answers is one rule, and
-    // it is the whole of the guarantee: **the credentials leave the origin
-    // the caller named only over `https`.** An `https` chain carries them
-    // across `https` hosts, which is the trade that buys the `403` above
-    // back; any other chain spends them on `url` when the caller named
-    // `url` in the clear -- and by naming it chose to publish them there --
-    // and on nobody else, at any depth, an `https` target included. A chain
-    // that started `https` and stepped down has published nothing and so
-    // spends nothing anywhere. The rest of `h=` still travels either way
-    // (see [`without_credentials`]).
-    //
-    // "Every hop" has to include the ones this route does not make itself.
-    // A playlist is rewritten line by line into `/proxy/` URLs the player
-    // then fetches, and each of those lines is written with `h=` on it --
-    // so a chain that ended here is continued, credentials and all, by the
-    // very next request the player makes. That the two agree is no longer
-    // something this comment asks of whoever edits the other one: they are
-    // the same call ([`CarriedParams::for_target`] is the other caller),
-    // because for four rounds agreement was a discipline, and four times
-    // the discipline failed.
-    //
-    // The method is kept across hops, as the reference keeps it. A `303`
-    // asks for a `GET` and a browser would give it one, but this route is
-    // reached with a `GET`, a `HEAD` or an `OPTIONS` from a player and
-    // never with a body, so there is nothing for the distinction to change.
-    let mut fetched_url = url.clone();
-    let mut hops = 0usize;
-    // What the caller named, and what has happened to the chain since.
-    // Nothing else in this loop decides what a request carries.
-    let mut chain = CredentialChain::named_by(&url);
-    let response = loop {
-        // Asked per hop, and the one question there is to ask: the same
-        // call decides every line of a playlist this chain returns.
-        let carry_credentials = chain.may_carry_to(&fetched_url);
-        let Some(client) = http_client() else {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Proxy client unavailable",
-            )
-                .into_response();
-        };
-
-        let response = match build_request(client, &fetched_url, carry_credentials)
-            .send()
-            .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                return (StatusCode::BAD_GATEWAY, format!("Proxy error: {}", e)).into_response();
-            }
-        };
-
-        let Some(location) = redirect_target(&response, &fetched_url) else {
-            break response;
-        };
-        if hops >= MAX_REDIRECTS {
-            tracing::warn!(
-                target_origin = %url.origin().ascii_serialization(),
-                "too many redirects; giving up"
-            );
-            return (StatusCode::BAD_GATEWAY, "Proxy error: too many redirects").into_response();
-        }
-        chain.stepped_to(&location);
-        if carry_credentials && !chain.may_carry_to(&location) {
-            // At WARN only when there was something to drop, and by header
-            // name rather than value: a stream that now `403`s has to be
-            // diagnosable, and a chain with no credential in it is not an
-            // event. Once per hop that loses them rather than once per
-            // chain, since a chain that is not all `https` may step back
-            // onto the origin the caller named and be carrying them again.
-            let dropped: Vec<&str> = custom_request_headers
-                .keys()
-                .map(|name| name.as_str())
-                .filter(|name| CREDENTIAL_REQUEST_HEADERS.contains(name))
-                .collect();
-            if !dropped.is_empty() {
-                tracing::warn!(
-                    from = %fetched_url.origin().ascii_serialization(),
-                    to = %location.origin().ascii_serialization(),
-                    headers = ?dropped,
-                    "a redirect leaves what this chain may spend the caller's h= \
-                     credentials on; not carrying them onto it"
-                );
-            }
-        }
-        hops += 1;
-        tracing::debug!(
-            from = %fetched_url.origin().ascii_serialization(),
-            to = %location.origin().ascii_serialization(),
-            "following a proxied redirect"
-        );
-        fetched_url = location;
-    };
-
-    // `fetched_url` is where the body actually came from, `url` where the
-    // caller pointed us. A playlist's relative lines are relative to the URL
-    // it *arrived* at: rewriting against the URL we asked for sends every
-    // segment back to the host that redirected us, and to its directory,
-    // which for a CDN-to-edge `302` -- the ordinary HLS deployment -- is
-    // every segment of every stream served that way.
-    let status = response.status();
-    let res_headers = response.headers().clone();
-
-    // What the origin answered, for the switch that asks (see
-    // [`PROXY_TRACE_TARGET`]). Origins and never URLs: `d=` carries the
-    // caller's credentials in its query, and a log is the one place they
-    // must not turn up. The caller's `Range` is safe -- it is a byte
-    // count -- and is half of what tells a player that opened mid-file
-    // from one that could not read the container at all.
-    tracing::info!(
-        target: crate::diagnostics::logging::PROXY_TRACE_TARGET,
-        method = %method,
-        target_origin = %url.origin().ascii_serialization(),
-        answered_by = %fetched_url.origin().ascii_serialization(),
-        hops,
-        range = headers
-            .get(header::RANGE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("none"),
-        status = status.as_u16(),
-        content_type = res_headers
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or(""),
-        content_length = res_headers
-            .get(header::CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or(""),
-        content_range = res_headers
-            .get(header::CONTENT_RANGE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or(""),
-        "what the origin answered",
-    );
-
-    // The origin's own type, beside the caller's forced one from above:
-    // asked separately, see [`forced_content_type`] for why merging them was
-    // the bug.
-    let origin_content_type = origin_content_type(&res_headers);
-    let is_playlist = is_a_playlist(
-        &url,
-        Some(&fetched_url),
-        &origin_content_type,
-        forced_content_type.as_deref(),
-    );
-
-    // A body under a content coding we cannot decode is a body we must not
-    // rewrite: the lines are not text yet. We relay it whole instead --
-    // its segment URLs then point straight at the origin, which loses the
-    // `h=` request headers, so say so rather than serving the player a
-    // rewritten playlist made of compressed bytes.
-    let content_encoding = res_headers
-        .get(header::CONTENT_ENCODING)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
-    let encoded_body =
-        !content_encoding.is_empty() && !content_encoding.eq_ignore_ascii_case("identity");
-    // Only a body that is actually a playlist is rewritten as one, and a
-    // status code is half of what says so. A 404's error page served at a
-    // `.m3u8` URL was being rewritten line by line and handed back as a
-    // playlist of fabricated proxy URLs -- an origin's "Not found" became a
-    // segment list. It falls through to the plain relay, which is what it
-    // always should have been.
-    // A rewritten body replaces the origin's, so the response has to be one
-    // that *is* the whole body. `status.is_success()` was not that test: a
-    // `206` passed it, and a rewritten fragment of a playlist is a body
-    // whose length is not the length the range promised and whose edge
-    // lines are cut in half. A `206` that carries the whole entity is
-    // different, and it is not a corner -- it is what an origin answers the
-    // `Range: bytes=0-` a player opens a stream with -- so it is rewritten
-    // and answered as the `200` it has become. The reference guards none of
-    // this; it rewrites a `206` and relays its `Content-Range` beside a body
-    // that no longer matches it.
-    let whole_body = status == StatusCode::OK
-        || (status == StatusCode::PARTIAL_CONTENT
-            && res_headers
-                .get(header::CONTENT_RANGE)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(covers_the_whole_entity));
-    // Whether the body this response describes is one we would replace.
-    // Not the same question as whether we are writing one now: a `HEAD`
-    // has no body to rewrite, so it is not rewritten -- but it still
-    // *describes* the resource a `GET` would be answered with, and that is
-    // a rewritten playlist.
-    //
-    // Answering it from the relay branch instead had `HEAD` and `GET`
-    // disagree about the same URL: measured, the `HEAD` advertised the
-    // origin's `Content-Length: 67` and `Accept-Ranges: bytes` while the
-    // `GET` returned 199 chunked bytes and `Accept-Ranges: none`, so a
-    // player that sized the resource and then sent `Range: bytes=0-66` got
-    // a `200` carrying 199. Framing headers for a body we would not serve
-    // are worse than none: every field below is now decided by what the
-    // resource *is*, and only the body itself by the method.
-    let rewritable_body = is_playlist && !encoded_body && whole_body;
-    let rewriting_playlist = rewritable_body && method != Method::HEAD;
-    if is_playlist && encoded_body {
-        tracing::warn!(
-            content_encoding = %content_encoding,
-            answered_by = %fetched_url.origin().ascii_serialization(),
-            "relaying a compressed playlist unrewritten; its segments will bypass the proxy"
-        );
-    }
-    if is_playlist && !whole_body && status.is_success() && method != Method::HEAD {
-        tracing::warn!(
-            status = %status,
-            answered_by = %fetched_url.origin().ascii_serialization(),
-            "relaying part of a playlist unrewritten; its segments will bypass the proxy"
-        );
-    }
-
-    // The entity this response describes, when it is one the cache may keep
-    // -- and `None` for every response it may not. See [`cacheable_entity`]
-    // for the list and the reason behind each entry. `is_playlist` and
-    // `encoded_body` are the verdicts already reached above rather than a
-    // second opinion about the same body.
-    let cacheable = cache_entry
-        .as_ref()
-        .and_then(|_| cacheable_entity(status, &res_headers, is_playlist, encoded_body));
-
-    // Whether the cached head may go in front of what the origin just sent.
-    // What has to hold is that the two are parts of **one entity**, adjacent
-    // and in the same coding, and "one entity" is the whole of the question:
-    //
-    // * the origin **names the same validator** the head is filed under
-    //   ([`EntityValidator`]). Length and type cannot say this. A resource
-    //   replaced by one of the same size and type is invisible to both, and
-    //   splicing across that change produces a body half of one generation
-    //   and half of another with nothing anywhere able to notice -- not the
-    //   player, which was told a coherent `Content-Range`, and not this
-    //   store, which has no hash to check its own bytes against. Every other
-    //   way this join can go wrong ends in a read that visibly breaks; this
-    //   one ends in a file that plays and is wrong, which is why it is the
-    //   question the guard is built around;
-    // * its `Content-Range` begins exactly where the cache left off, in an
-    //   entity of the same length;
-    // * it is a `206`, under no content coding, and not a playlist.
-    //
-    // [`stitch_refusal`] is those conditions, one reason each, in the words
-    // the refusal is then logged in.
-    //
-    // An origin that ignored the narrowed range and sent the whole file
-    // (`200`) is answered honestly: the head is dropped and the origin's own
-    // response relayed, which costs a re-fetch of bytes we held and nothing
-    // else. That is also what an origin that honours the `If-Range` above
-    // answers when the head has gone stale, and it is why the condition is
-    // worth sending -- the player gets the whole of the entity that exists
-    // now, which is a correct answer to a range request.
-    //
-    // **The one case that is not free** is an origin that ignored the
-    // condition and answered the narrowed range out of a *different* entity.
-    // The head is dropped and its `206` is relayed as it stands, which is an
-    // answer to the narrowed range and not to the one the player asked for;
-    // the player reads the `Content-Range`, finds bytes it did not ask for
-    // and re-reads. That re-read is clean, because the fill below has by then
-    // filed the entity the origin just described and dropped the one it
-    // replaced -- but it is a broken read, it is logged as one, and it is the
-    // price of narrowing a range against a store that never revalidates. A
-    // broken read is a price worth paying; a silent splice is not, because
-    // nothing downstream could ever find out it had been paid.
-    //
-    // A tail that turns out to be a **playlist** costs the same and is not a
-    // stale head either: the hit's classification asked about the type the
-    // store filed, and this one also asks about the URL the body came from,
-    // which only the fetch knows -- a redirect to a `.m3u8` is enough to
-    // turn the verdict over between them. What that answers with is a
-    // playlist fragment relayed unrewritten, which is what a `206` of a
-    // playlist always is here.
-    let stitched = match cached {
-        Some(cached) => {
-            match stitch_refusal(
-                StitchHead::of(&cached),
-                status,
-                &res_headers,
-                is_playlist,
-                encoded_body,
-            ) {
-                None => Some(cached),
-                // Which of the conditions failed, said in the log rather than
-                // left for a reader to work out from the fields -- a refusal
-                // reported as some other refusal is a wrong answer about a
-                // wrong answer.
-                Some(reason) => {
-                    tracing::warn!(
-                        answered_by = %fetched_url.origin().ascii_serialization(),
-                        status = %status,
-                        cached_total = cached.total,
-                        content_range = ?res_headers.get(header::CONTENT_RANGE),
-                        reason,
-                        "the cached head is not the head of what the origin answered; relaying \
-                         that answer and dropping what was cached"
-                    );
-                    None
-                }
-            }
-        }
-        None => None,
+        RangeAnswer::Origin(origin) => *origin,
     };
 
     // A rewritten playlist is the whole resource however it was asked for,
@@ -2106,29 +1675,10 @@ async fn proxy(
     // it; the read broke only when the tail was first polled. Wrapped last,
     // the close is polled on every poll of the body, head reads included
     // (`ClosableStream::poll_next`).
-    let mut body: std::pin::Pin<
-        Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>,
-    > = Box::pin(
-        response
-            .bytes_stream()
-            .map(|chunk| chunk.map_err(std::io::Error::other)),
+    let body = with_cached_head(
+        cache_filling(origin_body(response), cacheable, cache_entry),
+        stitched,
     );
-    if let Some(entity) = cacheable
-        && let Some(entry) = cache_entry
-    {
-        body = Box::pin(crate::proxy_cache::Filling::new(
-            body,
-            entry.fill(
-                entity.total,
-                &entity.content_type,
-                &entity.validator.filed(),
-                entity.first,
-            ),
-        ));
-    }
-    if let Some(cached) = stitched {
-        body = Box::pin(cached.body().chain(body));
-    }
     finalize_response(
         res_builder,
         axum::body::Body::from_stream(registration.wrap(body)),
@@ -2470,6 +2020,680 @@ fn rewrite_playlist_carrying(body: &str, base: &Url, carried: CarriedParams) -> 
     let mut rewritten = rewriter.push(body.as_bytes());
     rewritten.append(&mut rewriter.finish());
     String::from_utf8(rewritten).expect("text in, text out")
+}
+
+/// What a cache-assisted ranged read came back with: the disk answered the
+/// whole of it, or the origin was asked for the rest.
+pub(crate) enum RangeAnswer {
+    /// Every byte the request asked for is on disk. Nothing was fetched and
+    /// the origin never learned the read happened.
+    Hit(crate::proxy_cache::Cached),
+    /// The origin answered. Boxed because it carries a whole response and
+    /// the hit does not, which is the one case `clippy::large_enum_variant`
+    /// is actually about.
+    Origin(Box<OriginAnswer>),
+}
+
+/// The origin's answer and everything already decided about it: the
+/// verdicts a caller must not reach a second opinion on.
+pub(crate) struct OriginAnswer {
+    /// The origin's response, its body still unread.
+    pub(crate) response: reqwest::Response,
+    /// Where the body actually came from, which is where a playlist's
+    /// relative lines resolve -- not where the caller pointed us.
+    pub(crate) fetched_url: Url,
+    /// What the chain has published and what it may still spend: asked
+    /// again of every line of a playlist this response turns out to be.
+    pub(crate) chain: CredentialChain,
+    pub(crate) status: StatusCode,
+    pub(crate) res_headers: HeaderMap,
+    /// Whether the body this response describes is one we would replace
+    /// with a rewritten playlist -- true of a `HEAD` for such a body too,
+    /// since what it describes is that same response.
+    pub(crate) rewritable_body: bool,
+    /// And whether one is actually being written now, which a `HEAD` is
+    /// not.
+    pub(crate) rewriting_playlist: bool,
+    /// The entity this response describes, when it is one the cache may
+    /// keep -- see [`cacheable_entity`].
+    pub(crate) cacheable: Option<CacheableEntity>,
+    /// The entry the lookup was made against, still open for the fill.
+    pub(crate) entry: Option<crate::proxy_cache::Entry>,
+    /// The cached run that may go in front of this body, when the stitch
+    /// guard allowed it.
+    pub(crate) head: Option<crate::proxy_cache::Cached>,
+}
+
+/// Why a fetch never produced a response. Each one is a status the route
+/// answers with and an error a source fails its read with; the mapping is
+/// here so the two cannot drift.
+pub(crate) enum FetchFailure {
+    /// The process-wide client would not build -- see [`http_client`].
+    NoClient,
+    /// The origin could not be reached, or dropped the connection.
+    Transport(String),
+    /// The chain never stopped redirecting ([`MAX_REDIRECTS`]).
+    TooManyRedirects,
+}
+
+impl FetchFailure {
+    /// What `/proxy` answers.
+    fn into_response(self) -> Response {
+        match self {
+            Self::NoClient => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Proxy client unavailable".to_string(),
+            ),
+            Self::Transport(error) => (StatusCode::BAD_GATEWAY, format!("Proxy error: {error}")),
+            Self::TooManyRedirects => (
+                StatusCode::BAD_GATEWAY,
+                "Proxy error: too many redirects".to_string(),
+            ),
+        }
+        .into_response()
+    }
+
+    /// And what a [`crate::sources::ByteSource`] read of the same entity
+    /// fails with.
+    pub(crate) fn into_io_error(self) -> std::io::Error {
+        match self {
+            Self::NoClient => std::io::Error::other("the proxy's HTTP client is unavailable"),
+            Self::Transport(error) => {
+                std::io::Error::new(std::io::ErrorKind::ConnectionAborted, error)
+            }
+            Self::TooManyRedirects => std::io::Error::other("the origin never stopped redirecting"),
+        }
+    }
+}
+
+/// The stream a proxied body is built as, and the one shape its two halves
+/// -- what came off the disk and what came off the socket -- are chained
+/// in.
+pub(crate) type ProxiedBody = std::pin::Pin<
+    Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>,
+>;
+
+/// The origin's own bytes, as that stream.
+pub(crate) fn origin_body(response: reqwest::Response) -> ProxiedBody {
+    Box::pin(
+        response
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(std::io::Error::other)),
+    )
+}
+
+/// `body` with the cache writer over it, when the response is one the rules
+/// allow us to keep and there is an entry to keep it under.
+///
+/// It goes **over the origin's bytes only, never over a cached head**: what
+/// is on disk is not written again.
+pub(crate) fn cache_filling(
+    body: ProxiedBody,
+    cacheable: Option<CacheableEntity>,
+    entry: Option<crate::proxy_cache::Entry>,
+) -> ProxiedBody {
+    match (cacheable, entry) {
+        (Some(entity), Some(entry)) => Box::pin(crate::proxy_cache::Filling::new(
+            body,
+            entry.fill(
+                entity.total,
+                &entity.content_type,
+                &entity.validator.filed(),
+                entity.first,
+            ),
+        )),
+        _ => body,
+    }
+}
+
+/// `body` with the cached head the stitch guard licensed in front of it.
+pub(crate) fn with_cached_head(
+    body: ProxiedBody,
+    head: Option<crate::proxy_cache::Cached>,
+) -> ProxiedBody {
+    match head {
+        Some(cached) => Box::pin(cached.body().chain(body)),
+        None => body,
+    }
+}
+
+/// **One ranged read of an entity, cache first.** The whole of the path
+/// `/proxy` answers a player's `Range` with once the target is settled: the
+/// lookup, the narrowed conditional fetch for what the disk does not hold,
+/// the guard on joining the two, and the verdict on whether what came back
+/// may be kept.
+///
+/// It is a function rather than a stretch of [`proxy`] because it has a
+/// second caller: [`crate::sources::ProxySource`], which is how a
+/// translated archive member reads the bytes of an archive behind a URL.
+/// A member's read and a player's read are the same read -- same key, same
+/// narrowing, same `If-Range`, same fill -- and two copies of that
+/// sequence would be two answers to every question this route has spent
+/// four rounds getting right. What the two callers do differ about is what
+/// they make of the answer: the route frames a response around it, the
+/// source reads it as a stream of bytes.
+///
+/// What the cache can do for this request, asked here and nowhere else:
+/// `url` is final by now and no origin socket has been opened, so a hit
+/// answers without one and a partial hit narrows the `Range` the loop
+/// below is about to send. `entry` is `None` for a request the cache will
+/// not touch at all -- see [`crate::proxy_cache::ProxyCache::entry`] for
+/// the whole of that list.
+///
+/// The lookup lists one directory per thousand chunks of the range -- a
+/// few `getdents` for a cached film, still filesystem reads -- so it goes
+/// to the blocking pool rather than onto the reactor.
+pub(crate) async fn cache_assisted_range(
+    cache_entry: Option<crate::proxy_cache::Entry>,
+    method: &Method,
+    url: &Url,
+    player_headers: &HeaderMap,
+    request_header_overrides: &BTreeMap<String, String>,
+    forced_content_type: Option<&str>,
+) -> Result<RangeAnswer, FetchFailure> {
+    let (cache_entry, cached) = match cache_entry {
+        Some(entry) => {
+            let range = player_headers
+                .get(header::RANGE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            match tokio::task::spawn_blocking(move || {
+                let cached = entry.look_up(range.as_deref());
+                (entry, cached)
+            })
+            .await
+            {
+                Ok((entry, cached)) => (Some(entry), cached),
+                Err(error) => {
+                    tracing::debug!(%error, "the proxy cache lookup did not finish");
+                    (None, None)
+                }
+            }
+        }
+        None => (None, None),
+    };
+
+    // **Is this a request whose body we would replace?** Asked of everything
+    // the cache found, before any of it is used for anything, because the
+    // answer decides both of the things a hit can do: answer outright, and
+    // narrow the fetch.
+    //
+    // The store never holds a playlist ([`cacheable_entity`] refuses one),
+    // but whether a stored body *is* one is not decided by the stored bytes
+    // alone: `r=Content-Type:application/x-mpegURL` -- what stremio-core
+    // sends for an HLS stream -- forces the verdict over an origin that
+    // mislabels, and `r=` is deliberately not in the cache key. So the same
+    // URL was rewritten on a miss and relayed raw on a hit, which is the
+    // rewrite failing exactly for the second player of a stream. Asking
+    // [`is_a_playlist`] here, with the same inputs the fetch would give it,
+    // is what makes the key's promise true: the store keeps origin bytes, and
+    // what is done with them is one question with one answer.
+    //
+    // A hit whose answer is "playlist" steps aside **whole**: the entry is
+    // dropped, the player's own `Range` goes to the origin unnarrowed, and
+    // the response is classified and rewritten the way any fetched one is.
+    // Stepping aside only when the hit was complete was the same bug one
+    // step further along. A partial hit went on to narrow the fetch to the
+    // bytes it did not hold, the tail came back a playlist, the stitch guard
+    // below dropped the head it could not join to one -- and what reached the
+    // player was the origin's `206`: raw unrewritten bytes, under a
+    // `Content-Range` naming a range it never asked for, with every segment
+    // line pointing straight at the origin. One request had three answers,
+    // chosen by how much of it happened to be on disk.
+    let cached = match cached {
+        Some(cached)
+            if is_a_playlist(
+                url,
+                None,
+                &cached.content_type.to_ascii_lowercase(),
+                forced_content_type,
+            ) =>
+        {
+            tracing::debug!(
+                url = %url,
+                "this request would rewrite the body the cache holds; fetching it instead"
+            );
+            None
+        }
+        // The whole of what was asked for is here, and it is ours to send.
+        // Nothing is fetched, and the origin never learns this read happened.
+        Some(cached) if cached.complete() => {
+            tracing::debug!(
+                url = %url,
+                first = cached.first,
+                last = cached.last,
+                "answering a proxied range from the cache"
+            );
+            return Ok(RangeAnswer::Hit(cached));
+        }
+        held => held,
+    };
+
+    // Part of it is here, so the origin is asked for the rest and for
+    // nothing else. `held_to + 1` is a chunk boundary, which is what makes
+    // what comes back fill whole chunks and not two half ones.
+    //
+    // And it is asked *conditionally*, under the validator the head is filed
+    // by. A narrowed range is only worth asking for while the head it was
+    // narrowed against is still part of the entity; `If-Range` is the one
+    // question that says so, and an origin that honours it answers the whole
+    // of the new entity when the head has gone stale -- which is a correct
+    // answer to the player rather than a tail it did not ask for. It is not
+    // the guard -- an origin is free to ignore it; the guard is the
+    // comparison below, on what actually came back.
+    let narrowed = cached.as_ref().map(|cached| {
+        (
+            cached.remaining_range(),
+            EntityValidator::from_filed(&cached.validator).map(|validator| validator.value),
+        )
+    });
+
+    let custom_request_headers = custom_request_headers(request_header_overrides);
+    let uncredentialed_request_headers = without_credentials(&custom_request_headers);
+    let build_request = |client: &Client, url: &Url, carry_credentials: bool| {
+        let mut req_builder = client.request(method.clone(), url.clone());
+
+        // What the player asked for, forwarded as it asked for it -- see
+        // [`FORWARDED_REQUEST_HEADERS`] for what is on that list and what is
+        // not.
+        for name in FORWARDED_REQUEST_HEADERS {
+            // What is left of the player's `Range` after the cache, in place
+            // of the player's own. `RequestBuilder::header` *appends*, so
+            // this has to be a substitution and not an addition beside it:
+            // sending both left the origin to choose, and it chose the first
+            // -- the whole range, which is exactly the fetch the cache was
+            // narrowing away.
+            if name == "range"
+                && let Some((range, _)) = narrowed.as_ref()
+            {
+                req_builder = req_builder.header(header::RANGE, range);
+                continue;
+            }
+            // The player's own `if-range` never reaches here with a narrowed
+            // range beside it: a request carrying one is not a request the
+            // cache touches at all ([`crate::proxy_cache::ProxyCache::entry`]
+            // refuses it), so there is nothing of the player's to displace.
+            if name == "if-range"
+                && let Some((_, Some(validator))) = narrowed.as_ref()
+            {
+                req_builder = req_builder.header(header::IF_RANGE, validator);
+                continue;
+            }
+            if let Some(value) = player_headers.get(name) {
+                req_builder = req_builder.header(name, value);
+            }
+        }
+
+        // `accept-encoding` is answered here rather than forwarded. This
+        // client has no gzip/brotli/deflate feature, so it decodes nothing,
+        // and a playlist arrives as bytes we cannot rewrite -- while the
+        // player's own `accept-encoding: gzip` invited exactly that. Asking
+        // for `identity` says what we can actually take. An origin that
+        // compresses anyway is still relayed honestly: `content-encoding`
+        // travels back with the body it describes (see the relayed-body
+        // headers below).
+        req_builder = req_builder.header(header::ACCEPT_ENCODING, "identity");
+
+        // The `h=` overrides last, and replacing rather than adding to what
+        // the player sent: an override that leaves the original in place
+        // is not one. Every hop of a redirect chain is built through here,
+        // so every hop gets them (see the loop below) -- minus the
+        // credentials once the chain has stepped down to cleartext.
+        req_builder = req_builder.headers(if carry_credentials {
+            custom_request_headers.clone()
+        } else {
+            uncredentialed_request_headers.clone()
+        });
+        req_builder
+    };
+
+    // The redirect chain is walked here, one hop at a time, rather than
+    // left to reqwest -- and the reason is `h=`. reqwest's default policy
+    // strips `Authorization`, `Cookie` and `Proxy-Authorization` on any
+    // cross-host *or cross-port* redirect, which is exactly the shape of an
+    // authenticated stream behind a CDN that hands off to an edge: the
+    // playlist fetched `200` and everything it named `403`, with the origin
+    // logging no credential at all. The reference's answer is structural --
+    // `redirect: "manual"`, its own loop, and
+    // `opts.h.forEach(headers.set(...))` re-applied on every hop -- and this
+    // is that: each hop is built by `build_request`, so each hop carries the
+    // headers the caller asked for.
+    //
+    // Say plainly what that costs, because it was chosen and not
+    // overlooked: reqwest's policy calls those three headers sensitive and
+    // drops them across hosts (`remove_sensitive_headers`) precisely so a
+    // redirect cannot walk a credential to a host the caller never named,
+    // and re-applying `h=` per hop gives that protection up. What is left
+    // holding the line is the set of statuses we follow
+    // ([`FOLLOWED_REDIRECTS`]) and the hop bound ([`MAX_REDIRECTS`]): the
+    // credential travels only where the *resource* moved, only a bounded
+    // number of times, and never to a host an origin nominated as a proxy
+    // to route us through. The header is the addon's and it goes where the
+    // origin sent the resource; that is the trade the caller made by naming
+    // a header for a stream, and the alternative is the `403`.
+    //
+    // **One thing that trade does not cover is the wire going cleartext.**
+    // [`redirect_target`] takes any `http` or `https` target without
+    // comparing it to the scheme it came from, and a `Location` that
+    // arrived in the clear is not something the origin can be said to have
+    // written. A `302` from `https` to `http` would have the caller's
+    // `Authorization` -- or `Cookie` -- re-applied on a hop anyone on the
+    // path can read: not "the credential goes where the resource went" but
+    // the origin choosing to publish it, and no `403` is avoided by
+    // obliging. A `302` sent *over* cleartext named its target in the clear
+    // too, so whoever could read the credential could also have chosen who
+    // receives it next -- which is why even a target on the very host that
+    // redirected us is not one this hop can trust the answer about, and why
+    // an upgrade back to `https` brings nothing back.
+    //
+    // Which hops carry them is therefore not decided here. It is decided by
+    // [`CredentialChain::may_carry_to`], which this loop asks about every
+    // hop and which is asked again, unchanged, about every line of a
+    // playlist the chain comes back with. What it answers is one rule, and
+    // it is the whole of the guarantee: **the credentials leave the origin
+    // the caller named only over `https`.** An `https` chain carries them
+    // across `https` hosts, which is the trade that buys the `403` above
+    // back; any other chain spends them on `url` when the caller named
+    // `url` in the clear -- and by naming it chose to publish them there --
+    // and on nobody else, at any depth, an `https` target included. A chain
+    // that started `https` and stepped down has published nothing and so
+    // spends nothing anywhere. The rest of `h=` still travels either way
+    // (see [`without_credentials`]).
+    //
+    // "Every hop" has to include the ones this route does not make itself.
+    // A playlist is rewritten line by line into `/proxy/` URLs the player
+    // then fetches, and each of those lines is written with `h=` on it --
+    // so a chain that ended here is continued, credentials and all, by the
+    // very next request the player makes. That the two agree is no longer
+    // something this comment asks of whoever edits the other one: they are
+    // the same call ([`CarriedParams::for_target`] is the other caller),
+    // because for four rounds agreement was a discipline, and four times
+    // the discipline failed.
+    //
+    // The method is kept across hops, as the reference keeps it. A `303`
+    // asks for a `GET` and a browser would give it one, but this route is
+    // reached with a `GET`, a `HEAD` or an `OPTIONS` from a player and
+    // never with a body, so there is nothing for the distinction to change.
+    let mut fetched_url = url.clone();
+    let mut hops = 0usize;
+    // What the caller named, and what has happened to the chain since.
+    // Nothing else in this loop decides what a request carries.
+    let mut chain = CredentialChain::named_by(url);
+    let response = loop {
+        // Asked per hop, and the one question there is to ask: the same
+        // call decides every line of a playlist this chain returns.
+        let carry_credentials = chain.may_carry_to(&fetched_url);
+        let Some(client) = http_client() else {
+            return Err(FetchFailure::NoClient);
+        };
+
+        let response = match build_request(client, &fetched_url, carry_credentials)
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                return Err(FetchFailure::Transport(e.to_string()));
+            }
+        };
+
+        let Some(location) = redirect_target(&response, &fetched_url) else {
+            break response;
+        };
+        if hops >= MAX_REDIRECTS {
+            tracing::warn!(
+                target_origin = %url.origin().ascii_serialization(),
+                "too many redirects; giving up"
+            );
+            return Err(FetchFailure::TooManyRedirects);
+        }
+        chain.stepped_to(&location);
+        if carry_credentials && !chain.may_carry_to(&location) {
+            // At WARN only when there was something to drop, and by header
+            // name rather than value: a stream that now `403`s has to be
+            // diagnosable, and a chain with no credential in it is not an
+            // event. Once per hop that loses them rather than once per
+            // chain, since a chain that is not all `https` may step back
+            // onto the origin the caller named and be carrying them again.
+            let dropped: Vec<&str> = custom_request_headers
+                .keys()
+                .map(|name| name.as_str())
+                .filter(|name| CREDENTIAL_REQUEST_HEADERS.contains(name))
+                .collect();
+            if !dropped.is_empty() {
+                tracing::warn!(
+                    from = %fetched_url.origin().ascii_serialization(),
+                    to = %location.origin().ascii_serialization(),
+                    headers = ?dropped,
+                    "a redirect leaves what this chain may spend the caller's h= \
+                     credentials on; not carrying them onto it"
+                );
+            }
+        }
+        hops += 1;
+        tracing::debug!(
+            from = %fetched_url.origin().ascii_serialization(),
+            to = %location.origin().ascii_serialization(),
+            "following a proxied redirect"
+        );
+        fetched_url = location;
+    };
+
+    // `fetched_url` is where the body actually came from, `url` where the
+    // caller pointed us. A playlist's relative lines are relative to the URL
+    // it *arrived* at: rewriting against the URL we asked for sends every
+    // segment back to the host that redirected us, and to its directory,
+    // which for a CDN-to-edge `302` -- the ordinary HLS deployment -- is
+    // every segment of every stream served that way.
+    let status = response.status();
+    let res_headers = response.headers().clone();
+
+    // What the origin answered, for the switch that asks (see
+    // [`PROXY_TRACE_TARGET`]). Origins and never URLs: `d=` carries the
+    // caller's credentials in its query, and a log is the one place they
+    // must not turn up. The caller's `Range` is safe -- it is a byte
+    // count -- and is half of what tells a player that opened mid-file
+    // from one that could not read the container at all.
+    tracing::info!(
+        target: crate::diagnostics::logging::PROXY_TRACE_TARGET,
+        method = %method,
+        target_origin = %url.origin().ascii_serialization(),
+        answered_by = %fetched_url.origin().ascii_serialization(),
+        hops,
+        range = player_headers
+            .get(header::RANGE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("none"),
+        status = status.as_u16(),
+        content_type = res_headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or(""),
+        content_length = res_headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or(""),
+        content_range = res_headers
+            .get(header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or(""),
+        "what the origin answered",
+    );
+
+    // The origin's own type, beside the caller's forced one from above:
+    // asked separately, see [`forced_content_type`] for why merging them was
+    // the bug.
+    let origin_content_type = origin_content_type(&res_headers);
+    let is_playlist = is_a_playlist(
+        url,
+        Some(&fetched_url),
+        &origin_content_type,
+        forced_content_type,
+    );
+
+    // A body under a content coding we cannot decode is a body we must not
+    // rewrite: the lines are not text yet. We relay it whole instead --
+    // its segment URLs then point straight at the origin, which loses the
+    // `h=` request headers, so say so rather than serving the player a
+    // rewritten playlist made of compressed bytes.
+    let content_encoding = res_headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+    let encoded_body =
+        !content_encoding.is_empty() && !content_encoding.eq_ignore_ascii_case("identity");
+    // Only a body that is actually a playlist is rewritten as one, and a
+    // status code is half of what says so. A 404's error page served at a
+    // `.m3u8` URL was being rewritten line by line and handed back as a
+    // playlist of fabricated proxy URLs -- an origin's "Not found" became a
+    // segment list. It falls through to the plain relay, which is what it
+    // always should have been.
+    // A rewritten body replaces the origin's, so the response has to be one
+    // that *is* the whole body. `status.is_success()` was not that test: a
+    // `206` passed it, and a rewritten fragment of a playlist is a body
+    // whose length is not the length the range promised and whose edge
+    // lines are cut in half. A `206` that carries the whole entity is
+    // different, and it is not a corner -- it is what an origin answers the
+    // `Range: bytes=0-` a player opens a stream with -- so it is rewritten
+    // and answered as the `200` it has become. The reference guards none of
+    // this; it rewrites a `206` and relays its `Content-Range` beside a body
+    // that no longer matches it.
+    let whole_body = status == StatusCode::OK
+        || (status == StatusCode::PARTIAL_CONTENT
+            && res_headers
+                .get(header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(covers_the_whole_entity));
+    // Whether the body this response describes is one we would replace.
+    // Not the same question as whether we are writing one now: a `HEAD`
+    // has no body to rewrite, so it is not rewritten -- but it still
+    // *describes* the resource a `GET` would be answered with, and that is
+    // a rewritten playlist.
+    //
+    // Answering it from the relay branch instead had `HEAD` and `GET`
+    // disagree about the same URL: measured, the `HEAD` advertised the
+    // origin's `Content-Length: 67` and `Accept-Ranges: bytes` while the
+    // `GET` returned 199 chunked bytes and `Accept-Ranges: none`, so a
+    // player that sized the resource and then sent `Range: bytes=0-66` got
+    // a `200` carrying 199. Framing headers for a body we would not serve
+    // are worse than none: every field below is now decided by what the
+    // resource *is*, and only the body itself by the method.
+    let rewritable_body = is_playlist && !encoded_body && whole_body;
+    let rewriting_playlist = rewritable_body && *method != Method::HEAD;
+    if is_playlist && encoded_body {
+        tracing::warn!(
+            content_encoding = %content_encoding,
+            answered_by = %fetched_url.origin().ascii_serialization(),
+            "relaying a compressed playlist unrewritten; its segments will bypass the proxy"
+        );
+    }
+    if is_playlist && !whole_body && status.is_success() && *method != Method::HEAD {
+        tracing::warn!(
+            status = %status,
+            answered_by = %fetched_url.origin().ascii_serialization(),
+            "relaying part of a playlist unrewritten; its segments will bypass the proxy"
+        );
+    }
+
+    // The entity this response describes, when it is one the cache may keep
+    // -- and `None` for every response it may not. See [`cacheable_entity`]
+    // for the list and the reason behind each entry. `is_playlist` and
+    // `encoded_body` are the verdicts already reached above rather than a
+    // second opinion about the same body.
+    let cacheable = cache_entry
+        .as_ref()
+        .and_then(|_| cacheable_entity(status, &res_headers, is_playlist, encoded_body));
+
+    // Whether the cached head may go in front of what the origin just sent.
+    // What has to hold is that the two are parts of **one entity**, adjacent
+    // and in the same coding, and "one entity" is the whole of the question:
+    //
+    // * the origin **names the same validator** the head is filed under
+    //   ([`EntityValidator`]). Length and type cannot say this. A resource
+    //   replaced by one of the same size and type is invisible to both, and
+    //   splicing across that change produces a body half of one generation
+    //   and half of another with nothing anywhere able to notice -- not the
+    //   player, which was told a coherent `Content-Range`, and not this
+    //   store, which has no hash to check its own bytes against. Every other
+    //   way this join can go wrong ends in a read that visibly breaks; this
+    //   one ends in a file that plays and is wrong, which is why it is the
+    //   question the guard is built around;
+    // * its `Content-Range` begins exactly where the cache left off, in an
+    //   entity of the same length;
+    // * it is a `206`, under no content coding, and not a playlist.
+    //
+    // [`stitch_refusal`] is those conditions, one reason each, in the words
+    // the refusal is then logged in.
+    //
+    // An origin that ignored the narrowed range and sent the whole file
+    // (`200`) is answered honestly: the head is dropped and the origin's own
+    // response relayed, which costs a re-fetch of bytes we held and nothing
+    // else. That is also what an origin that honours the `If-Range` above
+    // answers when the head has gone stale, and it is why the condition is
+    // worth sending -- the player gets the whole of the entity that exists
+    // now, which is a correct answer to a range request.
+    //
+    // **The one case that is not free** is an origin that ignored the
+    // condition and answered the narrowed range out of a *different* entity.
+    // The head is dropped and its `206` is relayed as it stands, which is an
+    // answer to the narrowed range and not to the one the player asked for;
+    // the player reads the `Content-Range`, finds bytes it did not ask for
+    // and re-reads. That re-read is clean, because the fill below has by then
+    // filed the entity the origin just described and dropped the one it
+    // replaced -- but it is a broken read, it is logged as one, and it is the
+    // price of narrowing a range against a store that never revalidates. A
+    // broken read is a price worth paying; a silent splice is not, because
+    // nothing downstream could ever find out it had been paid.
+    //
+    // A tail that turns out to be a **playlist** costs the same and is not a
+    // stale head either: the hit's classification asked about the type the
+    // store filed, and this one also asks about the URL the body came from,
+    // which only the fetch knows -- a redirect to a `.m3u8` is enough to
+    // turn the verdict over between them. What that answers with is a
+    // playlist fragment relayed unrewritten, which is what a `206` of a
+    // playlist always is here.
+    let stitched = match cached {
+        Some(cached) => {
+            match stitch_refusal(
+                StitchHead::of(&cached),
+                status,
+                &res_headers,
+                is_playlist,
+                encoded_body,
+            ) {
+                None => Some(cached),
+                // Which of the conditions failed, said in the log rather than
+                // left for a reader to work out from the fields -- a refusal
+                // reported as some other refusal is a wrong answer about a
+                // wrong answer.
+                Some(reason) => {
+                    tracing::warn!(
+                        answered_by = %fetched_url.origin().ascii_serialization(),
+                        status = %status,
+                        cached_total = cached.total,
+                        content_range = ?res_headers.get(header::CONTENT_RANGE),
+                        reason,
+                        "the cached head is not the head of what the origin answered; relaying \
+                         that answer and dropping what was cached"
+                    );
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    Ok(RangeAnswer::Origin(Box::new(OriginAnswer {
+        response,
+        fetched_url,
+        chain,
+        status,
+        res_headers,
+        rewritable_body,
+        rewriting_playlist,
+        cacheable,
+        entry: cache_entry,
+        head: stitched,
+    })))
 }
 
 #[cfg(test)]

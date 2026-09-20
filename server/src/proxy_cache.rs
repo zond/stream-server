@@ -610,6 +610,19 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// This key's directory: every entity ever stored for one request
+    /// shape.
+    ///
+    /// A test's accessor and nothing else's: what it is for is asserting
+    /// that a `crate::sources::ProxySource` and `/proxy` agree about the
+    /// key for one URL, which is a claim about two callers of
+    /// [`ProxyCache::entry`] and not about anything the server does with
+    /// the path.
+    #[cfg(test)]
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// What is on disk for the range this request asked for, or `None` when
     /// there is nothing here the request can be answered from.
     ///

@@ -1,6 +1,7 @@
 use crate::archives::{self, ArchiveSession, ArchiveSource, CacheConfig};
 use crate::routes::compat;
 use crate::routes::util::{self, parse_range};
+use crate::sources::torrent::TorrentMemberStream;
 use crate::state::AppState;
 use axum::{
     Json, Router,
@@ -686,66 +687,6 @@ fn encode_path_segments(path: &str) -> String {
         .map(|segment| urlencoding::encode(segment).into_owned())
         .collect::<Vec<_>>()
         .join("/")
-}
-
-/// Registers a stream on a torrent for as long as the archive response
-/// body reading from it lives.
-///
-/// The `torrent:` form of [`stream_file`] opens a file reader on a live
-/// torrent, and until this existed it registered nothing at all: no
-/// `on_stream_start`, no reconcile, no entry in any activity register.
-/// Two things follow from that, and both are the failure the
-/// `PlaybackStart` reconcile in `EngineFS::on_stream_start` was written to
-/// prevent.
-///
-/// * The reconciler's own tick reads `playing` from those registers, so
-///   with seeding off and the grace elapsed it pauses the torrent this
-///   response body is streaming from -- mid-body, dropping its peers,
-///   while a reader is still being served out of it.
-/// * A request arriving on a torrent an earlier pass already stopped asks
-///   the reconciler nothing, and `LibrqbitBackend::get_file_reader` accepts
-///   a paused torrent and hands back a reader: the read then parks on
-///   pieces nobody is fetching, with no end and no error.
-///
-/// This is the sibling of the stream route's call site, and it registers
-/// the same way for the same reasons -- including the handover:
-/// `on_stream_start` and the guard that ends it are one call with no await
-/// between them, because a cancel can only land at an await and a
-/// registration nobody holds is never ended (see
-/// `crate::routes::stream::StreamLifecycleGuard::start`).
-struct TorrentMemberStream {
-    engine: Arc<enginefs::EngineFS>,
-    info_hash: String,
-    file_idx: usize,
-}
-
-impl TorrentMemberStream {
-    async fn start(engine: Arc<enginefs::EngineFS>, info_hash: String, file_idx: usize) -> Self {
-        engine.on_stream_start(&info_hash, file_idx).await;
-        Self {
-            engine,
-            info_hash,
-            file_idx,
-        }
-    }
-}
-
-impl Drop for TorrentMemberStream {
-    fn drop(&mut self) {
-        let engine = self.engine.clone();
-        let info_hash = std::mem::take(&mut self.info_hash);
-        let file_idx = self.file_idx;
-        // Spawned because the registers are behind async locks and a
-        // `Drop` cannot await one.
-        tokio::spawn(async move {
-            engine.on_stream_end(&info_hash, file_idx).await;
-            tracing::debug!(
-                info_hash = %info_hash,
-                file_idx,
-                "archive member stream ended"
-            );
-        });
-    }
 }
 
 /// A torrent's file reader as an archive source: the bridge from

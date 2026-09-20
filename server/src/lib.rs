@@ -104,6 +104,16 @@ mod proxy_cache;
 mod proxy_retention;
 mod proxy_streams;
 mod routes;
+/// **The seam every translated container reads through**: a file whose
+/// bytes something else fetched and keeps -- a torrent's piece store, the
+/// proxy cache -- asked for by byte range and never copied anywhere. See
+/// the module's own documentation and `docs/translated-sources.md`.
+///
+/// Public, and `doc(hidden)`, so the integration tests can build the
+/// sources and the counting wrapper the index bounds are stated in. It is
+/// not part of the embeddable API.
+#[doc(hidden)]
+pub mod sources;
 mod state;
 pub mod stream_numbers;
 
@@ -236,6 +246,20 @@ pub struct ServerHandle {
 impl ServerHandle {
     pub fn http_addr(&self) -> SocketAddr {
         self.http_addr
+    }
+
+    /// This server's torrent engine, and the runtime it runs on, for a
+    /// test that has to reach a `crate::sources::TorrentFileSource` rather
+    /// than go through a route.
+    ///
+    /// `#[doc(hidden)]` and no part of the embeddable API: an embedder
+    /// drives torrents through the methods below. The runtime comes with
+    /// the engine because the two cannot be used apart -- librqbit's
+    /// session spawns on the runtime it was started on, and a reader
+    /// polled anywhere else is a `Handle::current` away from a panic.
+    #[doc(hidden)]
+    pub fn engine_for_tests(&self) -> (Arc<enginefs::EngineFS>, tokio::runtime::Handle) {
+        (self.state.engine.clone(), self.runtime.clone())
     }
 
     pub fn bound_http_addr(&self) -> SocketAddr {

@@ -6073,3 +6073,163 @@ fn buffer_profile_is_a_setting_and_a_stream_query_override() -> anyhow::Result<(
 
     Ok(())
 }
+
+/// **A `TorrentFileSource` registers its torrent's stream for as long as it
+/// is held, and a read of it seeks in the piece store** rather than reading
+/// its way to the byte it wants.
+///
+/// The two claims step 1 of `docs/translated-sources.md` makes about the
+/// torrent half of the seam, and both are observable from outside the
+/// source:
+///
+/// * the registration is AGENTS.md's rule for every route that opens a
+///   reader on a torrent -- register a stream first, or the reconciler
+///   pauses the torrent under the read, mid-body, dropping its peers. The
+///   source holds it for its whole life rather than for the length of one
+///   response, because a translator reads an index, waits, and reads a body
+///   afterwards. As in
+///   [`an_archive_body_keeps_its_torrent_running_while_it_is_open`], the
+///   proof that the arm was firing at all is a second torrent nobody is
+///   reading, which the test waits for the reconciler to stop first;
+/// * the seek is what the whole design rests on: a byte in the middle of a
+///   file costs the bytes asked for and not the bytes before it. The
+///   fixture's piece store has a hole at 128..192 KiB that no peer will ever
+///   fill, so a read that walked to 400 KiB would park there forever and one
+///   that seeks past it answers at once.
+#[test]
+fn a_torrent_source_registers_its_stream_and_seeks_past_what_it_does_not_need() -> anyhow::Result<()>
+{
+    use stream_server::sources::{ByteSource, TorrentFileSource};
+
+    const MEMBER: &str = "member.bin";
+    const MEMBER_LEN: usize = 512 * 1024;
+    /// Well past the hole, so only a seek reaches it.
+    const READ_AT: u64 = 400 * 1024;
+
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let (handle, base, info_hash) = archive_member_server(
+        config_dir.path(),
+        cache_dir.path(),
+        src.path(),
+        MEMBER,
+        MEMBER_LEN,
+        Some(128 * 1024..192 * 1024),
+    )?;
+    let client = bearer_client(&handle)?;
+
+    // The control: a torrent of the same server that nobody reads.
+    let idle_content = src.path().join("Idle");
+    std::fs::create_dir_all(&idle_content)?;
+    write_payload(&idle_content.join("idle.bin"), 16 * 1024);
+    let (idle_torrent, idle_hash) = real_torrent(&idle_content);
+    client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&idle_torrent) }))
+        .send()?
+        .error_for_status()?;
+    stats_after_check(&client, &base, &idle_hash)?;
+
+    // The source, opened on the torrent's one file and held for the rest of
+    // the test -- which is what a translated session does with it.
+    let (engine, runtime) = handle.engine_for_tests();
+    let source = runtime.block_on(TorrentFileSource::open(engine, &info_hash, "fixture.zip"))?;
+    let opened = std::time::Instant::now();
+
+    // **Before any read**, which is what makes this about the
+    // registration and nothing else: the source opens its reader lazily,
+    // so no file handle is open yet and the only thing that can make this
+    // server say a player is reading is `on_stream_start`
+    // (`EngineFS::playback_is_live` is the two of them, in that order).
+    assert!(
+        handle.background_traffic()?.playing,
+        "the source opened without registering a stream on its torrent"
+    );
+
+    // The archive as the fixture wrote it: what the read is checked
+    // against, so "it answered" is not mistaken for "it answered rightly".
+    let archive = std::fs::read(src.path().join("Wanted").join("fixture.zip"))?;
+    assert_eq!(source.len(), archive.len() as u64);
+
+    // The seek. Bounded, because the failure this is about is a read that
+    // never returns rather than one that returns the wrong thing.
+    let mut read = [0u8; 64];
+    let filled = runtime.block_on(async {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            source.read_at(READ_AT, &mut read),
+        )
+        .await
+    })??;
+    assert_eq!(filled, read.len());
+    assert_eq!(
+        read.as_slice(),
+        &archive[READ_AT as usize..READ_AT as usize + read.len()],
+        "the read answered from somewhere other than the offset it was given"
+    );
+
+    // And a second read *backwards*, which is what an index is made of:
+    // the source keeps one reader and seeks it, so this has to land where
+    // it was told rather than carry on from where the last one stopped.
+    // Still past the hole, since nothing will ever fill that.
+    const READ_BACK_AT: u64 = 300 * 1024;
+    let mut back = [0u8; 64];
+    let filled = runtime.block_on(async {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            source.read_at(READ_BACK_AT, &mut back),
+        )
+        .await
+    })??;
+    assert_eq!(filled, back.len());
+    assert_eq!(
+        back.as_slice(),
+        &archive[READ_BACK_AT as usize..READ_BACK_AT as usize + back.len()],
+        "the second read carried on from the first instead of seeking"
+    );
+
+    // Seeding off, as the viewer of this feature would have it: a torrent
+    // nobody is playing is stopped either way.
+    handle.update_settings(serde_json::json!({ "seedingEnabled": false }))?;
+
+    // Wait until both are true: the control torrent has been stopped, and
+    // enough ticks have passed that a torrent this one's size would have
+    // been stopped several times over.
+    let would_have_stopped = opened + 3 * enginefs::FREE_SPACE_WATCH_INTERVAL;
+    let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
+    loop {
+        if swarm_paused(&client, &base, &idle_hash)?
+            && std::time::Instant::now() >= would_have_stopped
+        {
+            break;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the reconciler never stopped the torrent nobody was reading"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        !swarm_paused(&client, &base, &info_hash)?,
+        "the torrent a source is open on was stopped under it"
+    );
+
+    // On the runtime, because ending the registration is an async call a
+    // `Drop` cannot make itself and so spawns (`TorrentMemberStream`).
+    // And it does end: without that spawn every member ever read would
+    // leave a stream registered for the life of the process.
+    runtime.block_on(async move { drop(source) });
+    let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
+    while handle.background_traffic()?.playing {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the dropped source left a stream registered: this server still \
+             says a player is reading from it"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
