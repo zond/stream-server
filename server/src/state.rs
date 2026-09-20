@@ -24,19 +24,13 @@ pub struct AppState {
     /// `ServerAuth`); `None` is only the value a hand-built state starts
     /// with, and `auth::require_bearer` refuses rather than opens on it.
     pub auth_token: Option<Arc<str>>,
-    /// Downloaded-archive sessions, swept when idle (see
-    /// `crate::archives::sessions`); a swept session's downloaded archive
-    /// goes with it. **The old layer**: RAR and 7z alone, until steps 3
-    /// and 5 of `docs/translated-sources.md` convert them, and it goes
-    /// with them.
-    pub archive_cache: crate::archives::sessions::Sessions<crate::archives::ArchiveSession>,
     /// Translated containers, swept when idle: an index and the sources it
     /// was read from, and **no file at all** (see
     /// `crate::translators::session`). Both forms live here -- a
     /// `/{fmt}/create` from URLs and the `torrent:` key, which has no
     /// create and indexes itself on first use.
     pub translated_archives:
-        crate::archives::sessions::Sessions<crate::translators::session::TranslatedSession>,
+        crate::translators::session::Sessions<crate::translators::session::TranslatedSession>,
     /// What `GET /casting` answers with. Always empty: the SSDP discovery
     /// loop that filled it went with the daemon, and nothing could be cast
     /// to an entry anyway (see `crate::devices`).
@@ -116,11 +110,8 @@ impl AppState {
             base_url: "http://127.0.0.1:11470".to_string(),
             http_addr: SocketAddr::from(([127, 0, 0, 1], 11470)),
             auth_token: None,
-            archive_cache: crate::archives::sessions::Sessions::new(
-                crate::archives::SESSION_IDLE_TIMEOUT,
-            ),
-            translated_archives: crate::archives::sessions::Sessions::new(
-                crate::archives::SESSION_IDLE_TIMEOUT,
+            translated_archives: crate::translators::session::Sessions::new(
+                crate::translators::session::SESSION_IDLE_TIMEOUT,
             ),
             devices: Arc::new(RwLock::new(Vec::new())),
             proxy_streams: Arc::new(crate::proxy_streams::ProxyStreams::new()),

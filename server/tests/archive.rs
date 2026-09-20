@@ -308,8 +308,9 @@ struct Fixture {
     handle: stream_server::ServerHandle,
     base: String,
     origin: Origin,
-    /// `<cache root>/.archives`, where everything the archive routes write
-    /// must land.
+    /// `<cache root>/.archives`, where the archive routes used to put a
+    /// downloaded archive and a member extracted from it. **Nothing writes
+    /// it now**, and the tests here assert it is not so much as created.
     scratch_dir: PathBuf,
     _cache_root: tempfile::TempDir,
     _config_dir: tempfile::TempDir,
@@ -635,13 +636,15 @@ fn a_stored_member_behind_a_link_is_served_by_range_and_nothing_is_written() -> 
     let client = reqwest::blocking::Client::new();
     let expected = second_content();
 
-    let mut containers = vec![
+    let containers = [
         ("zip", "/fixture.zip"),
         ("tar", "/fixture.tar"),
         ("7zip", "/fixture.7z"),
+        // A build without the `rar` feature has no RAR reader at all, and
+        // answers `501` rather than bytes (see the test below).
+        #[cfg(feature = "rar")]
+        ("rar", "/film.rar"),
     ];
-    #[cfg(feature = "rar")]
-    containers.push(("rar", "/film.rar"));
     for (prefix, archive) in containers {
         let key = fixture.create_key_for(prefix, &fixture.origin.url(archive))?;
         let member = format!("{}/{prefix}/stream/{key}/videos/second.bin", fixture.base);

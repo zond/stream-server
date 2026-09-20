@@ -43,6 +43,26 @@ reads the shape (`grep` over `xtremio/lib` and `xtremio/rust/src` on
 2026-09-19 found neither the fields nor the struct), so no app change was
 needed for it.
 
+**The whole extracting archive layer went on 2026-09-20**, with steps 5
+and 4 of `docs/translated-sources.md`: 7z was the last format on it, and
+`translators/sevenz.rs` reads a 7z's index and points at a stored member's
+bytes instead. Deleted with it: `archives/cache.rs` (`ProgressiveCache`,
+`VolumeRoom`, `ABANDONED_AFTER` and the reader/writer notify dance an
+AGENTS gotcha used to describe), `archives/source.rs`, `archives/sevenz.rs`
+and `archives/mod.rs` -- the `ArchiveReader` trait, `OpenedMember`, the
+suffix dispatch, `CacheConfig`, `scratch_file` and `SCRATCH_DIR_NAME` --
+together 2,359 lines, plus `routes/archive.rs`'s download half
+(`download_archive`, `DownloadRoom`, `resolve_source`, `create_downloaded`,
+the old `stream_file`, `is_storage_full`, `SNIFF_BYTES`, the download
+timeouts and the `501` a second URL used to get), and `AppState::
+archive_cache`. `archives/sessions.rs` survives, merged into
+`translators/session.rs` beside the session it now leases. **Nothing in
+the workspace writes under `<cacheRoot>/.archives`**, and the suite asserts
+the directory is not created by a test that plays a member of every
+format; what an older build left there is deleted once, at the next launch
+(`LEGACY_ARCHIVE_SCRATCH_DIR` in `server/src/lib.rs`), because no owner
+speaks for those bytes and nothing else would ever take them.
+
 The rest of that struct went the same way on 2026-09-20 (zond's call):
 every field of it answered zero -- `LibrqbitBackend::memory_diagnostics`
 returned `default()` -- and the only caller of
@@ -231,8 +251,9 @@ nobody reopens them without knowing why they were shut.
   a trade about (step 2 of `docs/translated-sources.md`): a zip inside a
   torrent is read as byte ranges through a `TorrentFileSource`, at
   `Fetching::Streaming`, and there is no extraction thread to park and no
-  `ABANDONED_AFTER` to reach. What still extracts -- 7z alone, since step
-  3 -- reads a file on disk, which was never the case this was about.
+  `ABANDONED_AFTER` to reach. **Nothing extracts at all** since step 4
+  (2026-09-20): the progressive cache, the whole-archive download and the
+  reader dispatch are deleted, and so is `<cacheRoot>/.archives`.
 - **A stored RAR member in a torrent has no path** (review 2026-09-19
   #102). Closed 2026-09-20 by step 3 of `docs/translated-sources.md`:
   `translators/rar.rs` maps a stored member to the `(volume, offset, len)`
@@ -240,7 +261,7 @@ nobody reopens them without knowing why they were shut.
   the `torrent:` form finds the set's volumes among the named file's
   siblings (`Translator::volumes`). A scene release in a torrent --
   `film.part1.rar`, `film.part2.rar`, ... -- is served by range across the
-  volumes, with no second copy and nothing under `.archives`.
+  volumes, with no second copy and nothing written anywhere.
   `server/src/archives/rar.rs` is deleted; the `rar` cargo feature stays,
   for the licence, and now turns on the translator.
 - **xtremio's desktop builds only run in CI, and iOS does not build**

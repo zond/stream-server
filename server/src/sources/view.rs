@@ -11,8 +11,9 @@
 //!
 //! **Several sources, not one**, because a RAR set is one member across
 //! `.part1.rar`, `.part2.rar` and `.part3.rar`, and an ISO file over 4 GiB
-//! is several directory records under one name. `archives::window::
-//! MemberWindow` is the one-extent case of this and is replaced by it.
+//! is several directory records under one name. The single-extent case --
+//! a stored ZIP or TAR member, which is what `archives::window::
+//! MemberWindow` used to be on its own -- is this with one extent.
 //!
 //! The member and a read of it are two types. [`MemberView`] is the member
 //! -- what it is made of, with no read in progress -- and is the

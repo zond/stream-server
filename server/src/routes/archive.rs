@@ -1,11 +1,9 @@
-use crate::archives::sessions::Lease;
-use crate::archives::{self, ArchiveSession, ArchiveSource, CacheConfig};
 use crate::routes::compat;
 use crate::routes::util::{self, MediaRange};
 use crate::sources::proxy::ProxySourceError;
 use crate::sources::{ByteSource, ProxySource, TorrentFileSource};
 use crate::state::AppState;
-use crate::translators::session::{SessionSources, TranslatedSession};
+use crate::translators::session::{Lease, SessionSources, TranslatedSession};
 use crate::translators::{Body as MemberBody, Refusal, Translator};
 use axum::{
     Json, Router,
@@ -17,9 +15,8 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
@@ -41,13 +38,14 @@ struct CreateQuery {
 
 /// How much a member body asks its reader for per chunk.
 ///
-/// `ReaderStream::new` reads 4 KiB at a time, and for an archive member that
-/// is 4 KiB per `spawn_blocking` round trip through the progressive cache's
-/// `tokio::fs::File`, per boxed future, per socket write -- measured at some
-/// fourteen times the CPU per byte of a 256 KiB read on a desktop core, on
-/// what is the streaming hot path of the weakest devices this runs on. The
-/// same figure the torrent stream route reads with (`routes::stream`), and
-/// the same 256 KiB per active stream it costs.
+/// `ReaderStream::new` reads 4 KiB at a time, and for an archive member
+/// that is 4 KiB per read of whatever holds the container's bytes -- a
+/// seek of the piece store, a ranged read through the proxy cache -- per
+/// boxed future, per socket write; measured at some fourteen times the CPU
+/// per byte of a 256 KiB read on a desktop core, on what is the streaming
+/// hot path of the weakest devices this runs on. The same figure the
+/// torrent stream route reads with (`routes::stream`), and the same
+/// 256 KiB per active stream it costs.
 pub(crate) const MEDIA_BODY_CHUNK_BYTES: usize = 256 * 1024;
 
 /// The response body for a media reader: [`MEDIA_BODY_CHUNK_BYTES`] per read.
@@ -148,11 +146,11 @@ pub fn router(format: Format) -> Router<AppState> {
     stream_router(format).merge(session_router(format))
 }
 
-/// The session-creating half: `/create` takes an archive by URL (fetched
-/// whole, from wherever the caller names) or by torrent file, opens it and
-/// remembers the choice under a key. Loopback only -- see
-/// `crate::lan_media_routes` for why the LAN listener never mounts this
-/// half.
+/// The session-creating half: `/create` takes a container by URL -- the
+/// volume list, from wherever the caller names -- reads its index off it
+/// and remembers that, with the member chosen, under a key. Loopback only:
+/// it reaches out to a caller-named address, which is why the LAN listener
+/// never mounts this half (see `crate::lan_media_routes`).
 pub fn session_router(format: Format) -> Router<AppState> {
     Router::new()
         .route(
@@ -197,292 +195,6 @@ fn rar_disabled_response() -> Response {
         Json(serde_json::json!({ "error": RAR_DISABLED_ERROR })),
     )
         .into_response()
-}
-
-/// Where the archive handlers write, from the live settings: the cache root
-/// (see `CacheConfig::scratch_dir` for what goes under it).
-async fn archive_cache_config(state: &AppState) -> CacheConfig {
-    let settings = state.settings.read().await;
-    CacheConfig {
-        cache_dir: PathBuf::from(&settings.cache_root),
-        _cache_size: crate::routes::system::cache_size_bytes(settings.cache_size),
-    }
-}
-
-/// The archive `url` names, as a source a session can own: the one an
-/// existing session already holds when there is one, else a fresh download
-/// (http/https). Nothing else is fetched: see the refusal below.
-///
-/// Sharing is by the origin string. A player that re-plays a title sends the
-/// same `/create` again, and before this every send downloaded the whole
-/// archive again beside the last copy.
-async fn resolve_source(
-    state: &AppState,
-    url: &str,
-    cache_config: CacheConfig,
-) -> Result<Arc<ArchiveSource>, StatusCode> {
-    if let Some(existing) = state
-        .archive_cache
-        .find(|session| session.source.origin() == url)
-    {
-        tracing::info!(
-            origin = %util::log_origin(url),
-            "reusing the archive an existing session holds"
-        );
-        return Ok(existing.source.clone());
-    }
-    // Only what the route is named for: an archive at a web address. This
-    // route is open to any loopback caller -- on Android, every app on the
-    // device, and any page in a browser on it -- so a URL that was taken as
-    // a local path served the members of any archive this process could
-    // read, its own private storage included. Stremio's own server takes
-    // these from an add-on's `rarUrls`/`zipUrls`, which are web addresses.
-    // `/ftp` was closed the same way.
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    download_archive(url, cache_config, crate::cache_budget::available_space)
-        .await
-        .map(Arc::new)
-}
-
-/// How much of a download is read before its file is named: enough to hold
-/// every signature `archives::archive_suffix_from_magic` looks for.
-const SNIFF_BYTES: usize = 512;
-
-/// How long a download may take to connect, and how long it may then go
-/// without a byte, before it is given up. There is no bound on the whole:
-/// an archive is gigabytes over whatever link the origin has.
-const DOWNLOAD_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-const DOWNLOAD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// How much a download writes before it reads the volume again. Everything
-/// else on the device writes to the same volume in the meantime -- torrents
-/// above all -- so one reading at the start is not enough for gigabytes.
-const DOWNLOAD_RECHECK_BYTES: u64 = 64 * 1024 * 1024;
-
-/// What a download may still write under the cache root: the volume's free
-/// space above the floor, read on the blocking pool and again every
-/// [`DOWNLOAD_RECHECK_BYTES`].
-///
-/// A download goes under the cache root, on the volume the torrent cache
-/// and the proxy cache are capped against, and it was written whole with
-/// nothing asking the volume anything: a large enough archive went through
-/// the floor the rest of the server keeps, to ENOSPC. An unreadable volume
-/// is not a full one, as everywhere else.
-struct DownloadRoom<P> {
-    probe: P,
-    dir: PathBuf,
-    /// Bytes above the floor at the last reading; `None` when it failed.
-    room: Option<u64>,
-    written_since: u64,
-}
-
-impl<P> DownloadRoom<P>
-where
-    P: Fn(&std::path::Path) -> Option<u64> + Clone + Send + 'static,
-{
-    async fn read(probe: P, dir: PathBuf) -> Self {
-        let mut room = Self {
-            probe,
-            dir,
-            room: None,
-            written_since: 0,
-        };
-        room.reread().await;
-        room
-    }
-
-    async fn reread(&mut self) {
-        let probe = self.probe.clone();
-        let dir = self.dir.clone();
-        self.room = tokio::task::spawn_blocking(move || {
-            // The floor is the volume's own, read beside its free space.
-            let floor = enginefs::free_space_floor(enginefs::volume_total(&dir));
-            probe(&dir).map(|available| available.saturating_sub(floor))
-        })
-        .await
-        .ok()
-        .flatten();
-        self.written_since = 0;
-    }
-
-    /// Whether `len` bytes would fit above the floor as of the last reading,
-    /// booking nothing: for a length an origin states up front, which is
-    /// refused before a byte of it is fetched.
-    fn fits(&self, len: u64) -> bool {
-        self.room
-            .is_none_or(|room| self.written_since.saturating_add(len) <= room)
-    }
-
-    /// Whether `len` more bytes fit above the floor, booking them if so.
-    async fn take(&mut self, len: u64) -> bool {
-        if self.written_since >= DOWNLOAD_RECHECK_BYTES {
-            self.reread().await;
-        }
-        match self.room {
-            None => true,
-            Some(room) if self.written_since.saturating_add(len) > room => false,
-            Some(_) => {
-                self.written_since += len;
-                true
-            }
-        }
-    }
-}
-
-/// Fetch `url` whole into a scratch file under the cache root and hand it
-/// back owned, so it is deleted with the last session holding it.
-///
-/// The file needs an archive suffix, because that is how the reader is
-/// chosen -- a download that went without one (every download used to)
-/// could never be opened, and the create failed after the whole transfer.
-/// The URL's own suffix is used when it has a recognised one; otherwise the
-/// first bytes of the body say what it is, and a body that is neither is
-/// `415` before it is stored. Nothing is kept on any error: the scratch
-/// file is a `NamedTempFile` until the source takes it.
-async fn download_archive<P>(
-    url: &str,
-    cache_config: CacheConfig,
-    probe: P,
-) -> Result<ArchiveSource, StatusCode>
-where
-    P: Fn(&std::path::Path) -> Option<u64> + Clone + Send + 'static,
-{
-    // The origin, never the URL: an archive link is the caller's and may
-    // carry credentials in its query (see `util::log_origin`).
-    tracing::info!(origin = %util::log_origin(url), "downloading an archive");
-    // Without these a download that stalled -- an origin that stopped
-    // sending, a link that dropped without a reset -- held its `/create`
-    // open for as long as the socket lived.
-    let client = enginefs::http_client_builder()
-        .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
-        .read_timeout(DOWNLOAD_READ_TIMEOUT)
-        .build()
-        .map_err(|e| {
-            tracing::error!("Failed to build HTTP client: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    let response = client.get(url).send().await.map_err(|e| {
-        // `without_url`, because reqwest's `Display` names the URL it was
-        // fetching -- the caller's, credentials and all.
-        tracing::error!(
-            origin = %util::log_origin(url),
-            error = %e.without_url(),
-            "failed to fetch the archive"
-        );
-        StatusCode::BAD_REQUEST
-    })?;
-
-    if !response.status().is_success() {
-        tracing::error!(
-            origin = %util::log_origin(url),
-            status = %response.status(),
-            "the archive's origin refused"
-        );
-        return Err(StatusCode::NOT_FOUND);
-    }
-
-    // The volume the cache root is on, read before a byte is stored; a
-    // length the origin states that will not fit is refused before one is
-    // even fetched.
-    let mut room = DownloadRoom::read(probe, cache_config.cache_dir.clone()).await;
-    let too_big = || {
-        tracing::warn!(
-            origin = %util::log_origin(url),
-            "the archive would take the cache volume under its free-space floor"
-        );
-        StatusCode::INSUFFICIENT_STORAGE
-    };
-    if let Some(length) = response.content_length()
-        && !room.fits(length)
-    {
-        return Err(too_big());
-    }
-
-    let mut content = response.bytes_stream();
-    let mut head = Vec::with_capacity(SNIFF_BYTES);
-    while head.len() < SNIFF_BYTES {
-        match content.next().await {
-            Some(chunk) => head.extend_from_slice(&chunk.map_err(|e| {
-                tracing::error!(error = %e.without_url(), "download stream error");
-                StatusCode::BAD_GATEWAY
-            })?),
-            None => break,
-        }
-    }
-
-    let suffix = archives::archive_suffix(&url_file_name(url))
-        .or_else(|| archives::archive_suffix_from_magic(&head))
-        .ok_or_else(|| {
-            tracing::warn!(
-                origin = %util::log_origin(url),
-                "the URL names no archive format and the bytes are not one"
-            );
-            StatusCode::UNSUPPORTED_MEDIA_TYPE
-        })?;
-
-    let file = archives::scratch_file(&cache_config, suffix).map_err(|e| {
-        tracing::error!("Failed to create archive scratch file: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    let std_handle = file.as_file().try_clone().map_err(|e| {
-        tracing::error!("Failed to open archive scratch file: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    let mut async_file = tokio::fs::File::from_std(std_handle);
-
-    let write_error = |e: std::io::Error| {
-        tracing::error!("Failed to write archive scratch file: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    };
-    let mut pending = Some(bytes::Bytes::from(head));
-    loop {
-        let chunk = match pending.take() {
-            Some(head) => head,
-            None => match content.next().await {
-                Some(chunk) => chunk.map_err(|e| {
-                    tracing::error!(error = %e.without_url(), "download stream error");
-                    StatusCode::BAD_GATEWAY
-                })?,
-                None => break,
-            },
-        };
-        if !room.take(chunk.len() as u64).await {
-            return Err(too_big());
-        }
-        async_file.write_all(&chunk).await.map_err(write_error)?;
-    }
-    async_file.flush().await.map_err(write_error)?;
-
-    tracing::info!(
-        origin = %util::log_origin(url),
-        path = ?file.path(),
-        "downloaded an archive"
-    );
-    Ok(ArchiveSource::downloaded(
-        file,
-        url.to_string(),
-        cache_config,
-    ))
-}
-
-/// The last path segment of `url`, percent-decoded -- what a suffix would
-/// be on, without the query a `?dl=1` would otherwise end it with -- or the
-/// whole URL when it does not parse.
-fn url_file_name(url: &str) -> String {
-    url::Url::parse(url)
-        .ok()
-        .and_then(|parsed| {
-            parsed.path_segments().and_then(|mut segments| {
-                segments.next_back().map(|segment| {
-                    urlencoding::decode(segment)
-                        .map(|decoded| decoded.into_owned())
-                        .unwrap_or_else(|_| segment.to_string())
-                })
-            })
-        })
-        .unwrap_or_else(|| url.to_string())
 }
 
 fn parse_create_request(
@@ -575,49 +287,6 @@ fn archive_url_from_value(value: &serde_json::Value) -> Option<String> {
     })
 }
 
-async fn select_archive_file(
-    source: &ArchiveSource,
-    request: &ArchiveCreateRequest,
-) -> Result<Option<String>, StatusCode> {
-    let path = source.path();
-    let reader = source.reader().await.map_err(|err| {
-        tracing::error!(path = %path.display(), error = %err, "failed to create archive reader");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    let entries = reader.list_files().await.map_err(|err| {
-        tracing::error!(path = %path.display(), error = %err, "failed to list archive files");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    let files = entries
-        .iter()
-        .filter(|entry| !entry.is_dir)
-        .enumerate()
-        .map(|(index, entry)| compat::FileCandidate {
-            index,
-            name: entry.path.clone(),
-            length: entry.size,
-        })
-        .collect::<Vec<_>>();
-
-    if files.is_empty() {
-        return Ok(None);
-    }
-
-    let requested_idx = request
-        .file_idx
-        .map(|idx| idx.to_string())
-        .unwrap_or_else(|| "-1".to_string());
-    let selected_idx = compat::resolve_file_idx(&requested_idx, &files, &request.file_must_include)
-        .map_err(|err| {
-            tracing::warn!(error = %err, "failed to resolve archive file");
-            StatusCode::NOT_FOUND
-        })?;
-    Ok(files
-        .into_iter()
-        .find(|file| file.index == selected_idx)
-        .map(|file| file.name))
-}
-
 async fn create_session_auto(
     State(state): State<AppState>,
     Extension(format): Extension<Format>,
@@ -652,14 +321,26 @@ async fn create_session_internal(
         Ok(payload) => payload,
         Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
     };
-    match format.translator() {
-        Some(translator) => {
-            create_translated(&state, translator.as_ref(), key, method, payload).await
-        }
-        #[cfg(not(feature = "rar"))]
-        None if format == Format::Rar => rar_disabled_response(),
-        None => create_downloaded(state, key, method, payload).await,
+    let Some(translator) = format.translator() else {
+        return no_translator_response(format);
+    };
+    create_translated(&state, translator.as_ref(), key, method, payload).await
+}
+
+/// What a format this build has no reader for answers.
+///
+/// There is exactly one: RAR in a build without the `rar` cargo feature,
+/// which leaves `unrar-rs` out for its licence (`server/Cargo.toml`) and
+/// so has no RAR reader at all. Every other format the router mounts is
+/// compiled in, so the arm after it is unreachable -- answered rather than
+/// panicked, because a route that answers beats a process that goes down.
+fn no_translator_response(format: Format) -> Response {
+    #[cfg(not(feature = "rar"))]
+    if format == Format::Rar {
+        return rar_disabled_response();
     }
+    tracing::error!(?format, "this build mounted a format it cannot read");
+    StatusCode::NOT_IMPLEMENTED.into_response()
 }
 
 /// How a set of volumes is named as one session.
@@ -872,94 +553,6 @@ fn select_member(
         })
 }
 
-/// `/7zip/create`: the archive is fetched whole into `<cacheRoot>/.archives`
-/// and read as a file. **The old shape**, kept only for the one format
-/// whose translator has not landed yet (step 5 of
-/// `docs/translated-sources.md`); it goes with it.
-async fn create_downloaded(
-    state: AppState,
-    key: String,
-    method: Method,
-    payload: ArchiveCreateRequest,
-) -> Response {
-    // The one format left on this path is 7z, and a `.7z.001` set is not
-    // something a whole-archive download reads either. The translated
-    // path takes its URL list as the volume list; this one goes with the
-    // download (step 5 of `docs/translated-sources.md`).
-    if payload.urls.len() > 1 {
-        tracing::warn!(
-            key = %key,
-            url_count = payload.urls.len(),
-            "multi-volume archive compatibility requested but not implemented"
-        );
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            "Multi-volume archive streaming is not implemented",
-        )
-            .into_response();
-    }
-
-    let Some(url) = payload.urls.first() else {
-        return (StatusCode::BAD_REQUEST, "No archive URL provided").into_response();
-    };
-
-    // A key the caller chose (`/{fmt}/create/{key}`) may name a session
-    // that already exists, and replacing it points every later
-    // `/{fmt}/stream/{key}/...` at a different archive: the player that was
-    // reading one file seeks and reads another's bytes. A repeat of the
-    // same `/create` is the ordinary case (a re-play sends it again) and
-    // still lands; one that names a different archive is refused, and the
-    // caller can have a key of its own from `/{fmt}/create`.
-    if let Some(existing) = state.archive_cache.get(&key)
-        && existing.source.origin() != url.as_str()
-    {
-        tracing::warn!(
-            key = %key,
-            "a create under an existing session's key named a different archive; refused"
-        );
-        return (
-            StatusCode::CONFLICT,
-            "That session key is in use for another archive",
-        )
-            .into_response();
-    }
-
-    let cache_config = archive_cache_config(&state).await;
-    let source = match resolve_source(&state, url, cache_config).await {
-        Ok(source) => source,
-        Err(status) => return (status, "Failed to resolve archive URL").into_response(),
-    };
-
-    // A failure from here on drops `source`, and with it a download nothing
-    // else holds -- the file goes, rather than staying on disk with no
-    // session to name it.
-    let selected_file = match select_archive_file(&source, &payload).await {
-        Ok(file) => file,
-        Err(status) => return (status, "Failed to select archive file").into_response(),
-    };
-
-    state.archive_cache.insert(
-        key.clone(),
-        ArchiveSession {
-            source,
-            selected_file: selected_file.clone(),
-        },
-    );
-
-    if method == Method::GET
-        && let Some(file) = selected_file
-    {
-        return Redirect::temporary(&format!(
-            "./stream/{}/{}",
-            urlencoding::encode(&key),
-            encode_path_segments(&file)
-        ))
-        .into_response();
-    }
-
-    Json(CreateResponse { key }).into_response()
-}
-
 async fn stream_content_query(
     State(state): State<AppState>,
     Extension(format): Extension<Format>,
@@ -990,17 +583,13 @@ async fn stream_redirection(
     Extension(format): Extension<Format>,
     Path(key): Path<String>,
 ) -> Response {
-    let selected = if format.translator().is_some() {
-        state
-            .translated_archives
-            .get(&key)
-            .and_then(|session| session.selected().map(|member| member.name.clone()))
-    } else {
-        state
-            .archive_cache
-            .get(&key)
-            .and_then(|session| session.selected_file.clone())
-    };
+    if format.translator().is_none() {
+        return no_translator_response(format);
+    }
+    let selected = state
+        .translated_archives
+        .get(&key)
+        .and_then(|session| session.selected().map(|member| member.name.clone()));
     match selected.as_deref() {
         Some(file) => Redirect::temporary(&format!(
             "./{}/{}",
@@ -1012,9 +601,7 @@ async fn stream_redirection(
     }
 }
 
-/// One member of one session, as a range of bytes: the translated path for
-/// the formats that have one, the old extracting path for 7z, which does
-/// not yet.
+/// One member of one session, as a range of bytes.
 async fn stream_member(
     state: &AppState,
     format: Format,
@@ -1022,31 +609,10 @@ async fn stream_member(
     file: Option<&str>,
     headers: &header::HeaderMap,
 ) -> Response {
-    if let Some(translator) = format.translator() {
-        return stream_translated(state, translator.as_ref(), key, file, headers).await;
-    }
-    #[cfg(not(feature = "rar"))]
-    if format == Format::Rar {
-        return rar_disabled_response();
-    }
-    // The old path names its member in the URL, or takes the one the
-    // create chose.
-    let file = match file {
-        Some(file) => file.to_string(),
-        None => {
-            let Some(session) = state.archive_cache.get(key) else {
-                return StatusCode::NOT_FOUND.into_response();
-            };
-            let Some(file) = session.selected_file.clone() else {
-                return StatusCode::NOT_FOUND.into_response();
-            };
-            file
-        }
+    let Some(translator) = format.translator() else {
+        return no_translator_response(format);
     };
-    match stream_file(state, key, &file, headers).await {
-        Ok(response) => response,
-        Err(status) => status.into_response(),
-    }
+    stream_translated(state, translator.as_ref(), key, file, headers).await
 }
 
 /// A member of a translated container, served as byte ranges of whatever
@@ -1226,108 +792,6 @@ fn encode_path_segments(path: &str) -> String {
         .join("/")
 }
 
-/// Whether `error` is the volume's free-space floor refusing an
-/// extraction ([`crate::archives::cache::VolumeRoom`]).
-fn is_storage_full(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.kind() == std::io::ErrorKind::StorageFull)
-    })
-}
-
-/// A member of a downloaded archive, extracted if the format needs it:
-/// **the old path**, and only for 7z. See [`create_downloaded`].
-async fn stream_file(
-    state: &AppState,
-    key: &str,
-    file_path_in_archive: &str,
-    headers: &header::HeaderMap,
-) -> Result<Response, StatusCode> {
-    // The `torrent:` form belongs to the translated path now. It never
-    // worked for 7z anyway -- its decoder wants a seekable file -- so this
-    // is the same refusal under the same status, said before the torrent
-    // is looked at rather than after a stream has been registered on it.
-    if let Some(rest) = key.strip_prefix("torrent:") {
-        let extension = rest
-            .rsplit_once('.')
-            .map(|(_, extension)| extension)
-            .unwrap_or("");
-        return Ok((
-            StatusCode::NOT_IMPLEMENTED,
-            format!("Archives of type .{extension} cannot be read from inside a torrent"),
-        )
-            .into_response());
-    }
-
-    // The session this request reads from, leased for as long as the
-    // response body lives (see `archives::sessions`).
-    let session = state.archive_cache.get(key).ok_or(StatusCode::NOT_FOUND)?;
-
-    // One extraction per member per archive, whatever the number of
-    // requests on it (see `ArchiveSource::open_member`).
-    let mut reader = session
-        .source
-        .open_member(file_path_in_archive)
-        .await
-        .map_err(|e| {
-            tracing::warn!(
-                archive = %session.source.path().display(),
-                member = file_path_in_archive,
-                error = %e,
-                "archive member could not be opened"
-            );
-            // A member that will not fit above the volume's free-space
-            // floor is not a missing one: the extraction is refused, and
-            // `507` says which of the two it was (the download half of
-            // this route answers the same status for the same reason).
-            if is_storage_full(&e) {
-                StatusCode::INSUFFICIENT_STORAGE
-            } else {
-                StatusCode::NOT_FOUND
-            }
-        })?;
-    let session_in_use = Some(session);
-
-    // The same framing as every other media response (`util::MediaRange`).
-    let size = reader
-        .seek(tokio::io::SeekFrom::End(0))
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let range = headers
-        .get(header::RANGE)
-        .and_then(|value| value.to_str().ok());
-    let Some(framing) = MediaRange::of(range, size) else {
-        return Ok(util::range_not_satisfiable(size));
-    };
-    reader
-        .seek(tokio::io::SeekFrom::Start(framing.start))
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let limited_reader = reader.take(framing.content_length(size));
-
-    // The session lease rides inside the body: the session is in use for
-    // as long as the player reads, and its idle clock starts when the body
-    // is dropped.
-    let body = Body::from_stream(media_body(limited_reader).map(move |chunk| {
-        let _in_use = &session_in_use;
-        chunk
-    }));
-
-    let mut res_headers = header::HeaderMap::new();
-    res_headers.insert(
-        header::CONTENT_TYPE,
-        mime_guess::from_path(file_path_in_archive)
-            .first_or_octet_stream()
-            .as_ref()
-            .parse()
-            .unwrap(),
-    );
-    framing.write_headers(size, &mut res_headers);
-    compat::add_dlna_headers(&mut res_headers);
-    Ok((framing.status(), res_headers, body).into_response())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1341,141 +805,5 @@ mod tests {
         let mut body = media_body(std::io::Cursor::new(data));
         let first = body.next().await.expect("a chunk").expect("no error");
         assert_eq!(first.len(), MEDIA_BODY_CHUNK_BYTES);
-    }
-
-    /// How an [`origin`] answers.
-    #[derive(Clone, Copy)]
-    enum Answer {
-        /// The whole body, with its length stated.
-        Stated,
-        /// The whole body, delimited by the close alone.
-        Unstated,
-        /// A stated length, and then nothing: the body never comes.
-        StatedThenStall,
-    }
-
-    /// An origin that answers every request with `body_len` bytes -- a
-    /// zip's signature and then filler -- as `answer` says.
-    fn origin(body_len: usize, answer: Answer) -> String {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { break };
-                std::thread::spawn(move || {
-                    // The whole request head, so nothing unread is left on
-                    // the socket to turn the close into a reset.
-                    let mut request = Vec::new();
-                    let mut byte = [0u8; 1];
-                    while !request.ends_with(b"\r\n\r\n") {
-                        match stream.read(&mut byte) {
-                            Ok(1) => request.push(byte[0]),
-                            _ => return,
-                        }
-                    }
-                    let length = match answer {
-                        Answer::Unstated => String::new(),
-                        _ => format!("Content-Length: {body_len}\r\n"),
-                    };
-                    let head = format!("HTTP/1.1 200 OK\r\n{length}Connection: close\r\n\r\n");
-                    let _ = stream.write_all(head.as_bytes());
-                    if let Answer::StatedThenStall = answer {
-                        std::thread::sleep(std::time::Duration::from_secs(120));
-                        return;
-                    }
-                    let mut body = b"PK\x03\x04".to_vec();
-                    body.resize(body_len, 0);
-                    let _ = stream.write_all(&body);
-                });
-            }
-        });
-        format!("http://{addr}/archive.zip")
-    }
-
-    fn scratch(root: &std::path::Path) -> Vec<std::path::PathBuf> {
-        std::fs::read_dir(root.join(archives::SCRATCH_DIR_NAME))
-            .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
-            .unwrap_or_default()
-    }
-
-    /// Room above the free-space floor for `bytes`, whatever the volume.
-    fn room_for(bytes: u64) -> impl Fn(&std::path::Path) -> Option<u64> + Clone + Send + 'static {
-        move |_: &std::path::Path| Some(crate::cache_budget::CACHE_FREE_SPACE_FLOOR + bytes)
-    }
-
-    /// The `507` an extraction refused for want of room answers with is
-    /// decided by this (review #18): a member that will not fit is not a
-    /// missing one.
-    #[test]
-    fn a_storage_full_extraction_is_told_apart_from_a_missing_member() {
-        let full: anyhow::Error = std::io::Error::new(
-            std::io::ErrorKind::StorageFull,
-            "the extraction needs more than the volume has above its floor",
-        )
-        .into();
-        assert!(is_storage_full(&full.context("opening the member")));
-        let missing: anyhow::Error =
-            std::io::Error::new(std::io::ErrorKind::NotFound, "no such member").into();
-        assert!(!is_storage_full(&missing));
-        assert!(!is_storage_full(&anyhow::anyhow!("not an io error at all")));
-    }
-
-    fn config(root: &std::path::Path) -> CacheConfig {
-        CacheConfig {
-            cache_dir: root.to_path_buf(),
-            _cache_size: 0,
-        }
-    }
-
-    /// A download whose stated length the volume has no room for above the
-    /// floor is refused with 507 before its body is read -- this origin
-    /// never sends one.
-    #[tokio::test]
-    async fn a_stated_length_with_no_room_is_refused_before_the_body() {
-        let root = tempfile::tempdir().unwrap();
-        let url = origin(1024 * 1024, Answer::StatedThenStall);
-        let refused = tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            download_archive(&url, config(root.path()), room_for(512 * 1024)),
-        )
-        .await
-        .expect("the refusal waited for a body");
-        assert_eq!(refused.err(), Some(StatusCode::INSUFFICIENT_STORAGE));
-        assert!(scratch(root.path()).is_empty());
-    }
-
-    /// A body that says nothing of its length is refused at the byte that
-    /// would take the volume under the floor, and what it had written goes
-    /// with the refusal; with room it is stored.
-    #[tokio::test]
-    async fn a_body_that_would_cross_the_floor_is_refused_and_leaves_nothing() {
-        let root = tempfile::tempdir().unwrap();
-        let url = origin(1024 * 1024, Answer::Unstated);
-        let refused = download_archive(&url, config(root.path()), room_for(512 * 1024)).await;
-        assert_eq!(refused.err(), Some(StatusCode::INSUFFICIENT_STORAGE));
-        assert!(
-            scratch(root.path()).is_empty(),
-            "{:?}",
-            scratch(root.path())
-        );
-
-        for answer in [Answer::Unstated, Answer::Stated] {
-            let url = origin(1024 * 1024, answer);
-            let stored =
-                download_archive(&url, config(root.path()), room_for(2 * 1024 * 1024)).await;
-            assert!(stored.is_ok());
-        }
-    }
-
-    #[test]
-    fn the_file_name_is_the_last_path_segment_without_the_query() {
-        assert_eq!(
-            url_file_name("http://h/dl/Show.S01.rar?token=abc&dl=1"),
-            "Show.S01.rar"
-        );
-        assert_eq!(url_file_name("http://h/dl/a%20b.zip"), "a b.zip");
-        assert_eq!(url_file_name("http://h/download?id=1"), "download");
-        assert_eq!(url_file_name("not a url"), "not a url");
     }
 }

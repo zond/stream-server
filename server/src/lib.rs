@@ -84,7 +84,13 @@ pub(crate) const DEFAULT_LOG_FILTER: &str = "stream_server=info,tower_http=info,
 /// here needs a fixed port.
 pub const DEFAULT_HTTP_PORT: u16 = 11470;
 
-mod archives;
+/// The directory an **older build** kept its archive extractions in,
+/// `<cacheRoot>/.archives`. Nothing writes it now: a member of a container
+/// is ranges of the container (`crate::translators`), so there is nothing
+/// to extract and nothing to download whole. The name survives for one
+/// purpose, in `run`: deleting what such a build left behind.
+const LEGACY_ARCHIVE_SCRATCH_DIR: &str = ".archives";
+
 mod auth;
 mod cache_budget;
 mod cache_cleaner;
@@ -1284,23 +1290,27 @@ pub async fn run(
         }
     }
 
-    // The archive scratch directory's launch sweep, for the same reason and
-    // at the same moment. Its files are unlinked when the session holding
-    // them drops, and a killed process drops nothing -- Android's low-memory
-    // killer takes this process as a matter of course -- so every archive
-    // played since the last clean exit stood there, twice over, counted by
-    // nobody. Session keys are minted per process: nothing a previous run
-    // left there can be named by any request this one receives. See
-    // `archives::SCRATCH_DIR_NAME`. Not the piece store's sweep's to do: that
-    // one exempts `.archives` by name, and this is the archive layer's own.
+    // And what an **older build** left under `<cacheRoot>/.archives`: the
+    // extraction cache the archive layer used to keep, which this server
+    // does not write any more (see `crate::translators` -- a member is
+    // ranges of the container, and nothing is extracted). On an install
+    // upgraded into this build the directory can be gigabytes, about twice
+    // the size of every archive played since that build's last clean exit
+    // -- the download and the extraction -- and **nothing else will ever
+    // take it**: no retention owner speaks for those bytes, no cache
+    // figure counts them, and the piece store's own legacy sweep walks
+    // `<cacheRoot>/rqbit-downloads`, one level below this. So it goes
+    // here, once, on the first launch of a build that has no use for it.
     {
-        let cache_root = torrent_data_root.clone();
-        match tokio::task::spawn_blocking(move || archives::sweep_scratch(&cache_root)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "the archive scratch sweep did not finish");
-            }
-            Err(error) => tracing::warn!(%error, "the archive scratch sweep did not finish"),
+        let stale = torrent_data_root.join(LEGACY_ARCHIVE_SCRATCH_DIR);
+        if let Err(error) =
+            tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&stale) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+                _ => Ok(()),
+            })
+            .await
+        {
+            tracing::warn!(%error, "the sweep of a previous build's archive scratch did not finish");
         }
     }
 

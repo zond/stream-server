@@ -1953,18 +1953,25 @@ fn set_background_caps_the_torrent_and_still_streams() -> anyhow::Result<()> {
 /// `cacheRoot` is the one torrent-data root, and the only thing that decides
 /// where a torrent's bytes go.
 ///
-/// A librqbit session's storage is fixed when the session opens, so a
-/// What the archive routes write under `<cacheRoot>/.archives` is unlinked
-/// when the session holding it drops, and a killed process drops nothing.
-/// Session keys are per process, so nothing a previous run left there can
-/// be asked for again -- and the launch sweeps it, before the router opens.
+/// **What an older build left under `<cacheRoot>/.archives` is deleted at
+/// launch.** That directory was the archive layer's extraction cache: an
+/// archive downloaded whole and a member extracted beside it, about twice
+/// the film, unlinked only when the session holding them dropped -- and a
+/// killed process drops nothing, which on Android is the ordinary end.
+/// Nothing writes the directory now (`crate::translators`: a member is
+/// ranges of the container), so on an upgraded install it is bytes no
+/// retention owner speaks for, no cache figure counts, and nothing else
+/// will ever take: the piece store's own legacy sweep walks
+/// `<cacheRoot>/rqbit-downloads`, one level below this. So this launch
+/// takes it, once, and leaves everything beside it alone.
 #[test]
-fn a_killed_process_s_archive_scratch_is_gone_at_the_next_start() -> anyhow::Result<()> {
+fn a_previous_builds_archive_scratch_is_gone_at_the_next_start() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
     let cache_root = cache_dir.path().join("cache");
-    // The name is the on-disk contract (`archives::SCRATCH_DIR_NAME`), and
-    // a test of what is on disk spells it.
+    // The name is the on-disk contract
+    // (`stream_server::LEGACY_ARCHIVE_SCRATCH_DIR`), and a test of what is
+    // on disk spells it.
     let scratch = cache_root.join(".archives");
     std::fs::create_dir_all(&scratch)?;
     let leftover = scratch.join("archive_abc123.zip");
@@ -1986,7 +1993,7 @@ fn a_killed_process_s_archive_scratch_is_gone_at_the_next_start() -> anyhow::Res
     );
     assert!(
         !scratch.exists(),
-        "the directory goes with it; the next play recreates it"
+        "the directory goes with it, and nothing recreates it"
     );
     assert!(neighbour.is_file(), "and nothing beside it is touched");
     handle.shutdown()?;
@@ -4078,9 +4085,9 @@ fn a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it() -> anyhow
 /// An archive member served out of a live torrent is a playback too, and
 /// the route that serves it says so.
 ///
-/// `routes::archive::stream_file`'s `torrent:` form opens a file reader on
-/// a torrent exactly the way the stream route does, and registered nothing
-/// at all: no `on_stream_start`, no reconcile. Two failures follow, and
+/// The `torrent:` form opens a file reader on a torrent exactly the way
+/// the stream route does, and registered nothing at all: no
+/// `on_stream_start`, no reconcile. Two failures follow, and
 /// this test drives the one that can be observed from outside without
 /// racing a timer -- an archive request landing on a torrent the last
 /// reconciler pass already stopped, which is left parked on pieces nobody
@@ -4111,9 +4118,9 @@ fn an_archive_member_request_starts_the_torrent_it_reads_from() -> anyhow::Resul
 
     // A torrent whose one file is an archive. Its bytes are never read --
     // no peer will bring them -- so what is in it does not matter, but the
-    // suffix does: it is what picks the reader, and only the two formats
-    // `archives::get_archive_reader_from_stream` can drive from a stream
-    // get as far as reading the torrent at all.
+    // suffix does: the `torrent:` form takes the format from the URL
+    // prefix, and the file it names has to be the container that prefix
+    // reads for the request to get as far as the torrent at all.
     let content = src.path().join("Wanted");
     std::fs::create_dir_all(&content)?;
     write_payload(&content.join("fixture.zip"), 64 * 1024);

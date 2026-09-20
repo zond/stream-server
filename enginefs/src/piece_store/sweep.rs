@@ -167,8 +167,7 @@ pub async fn sweep_before_session(download_dir: &Path, pins: Option<&PinSet>) ->
 ///
 /// `.pieces` is [`sweep_unadopted`]'s, and it is the embedder's pin set that
 /// decides what survives there. `.proxy` is the proxy cache's, emptied by its own
-/// launch sweep. `.archives` is the archive scratch's, emptied by the server's
-/// own launch sweep of it. Handing any of them to [`sweep_legacy_downloads`] would be
+/// launch sweep. Handing either of them to [`sweep_legacy_downloads`] would be
 /// one sweep deciding another's business, and for `.pieces` it would delete
 /// every pin. **A new directory under the download root goes on this list,
 /// or the next launch deletes it.**
@@ -180,7 +179,15 @@ pub async fn sweep_before_session(download_dir: &Path, pins: Option<&PinSet>) ->
 /// this crate, the server nor librqbit writes or reads either, and
 /// librqbit's own session files sit directly under the root, where
 /// [`is_session_artifact`] names them.
-const NOT_OURS: [&str; 3] = [".pieces", ".proxy", ".archives"];
+///
+/// `.archives` was on it too, for the archive layer's extraction cache.
+/// Nothing writes that directory any more -- an archive member is ranges
+/// of the archive now, and there is nothing to extract -- and it never
+/// sat under *this* root anyway: it was `<cacheRoot>/.archives`, one level
+/// above the download dir this walks, which is why the exemption was never
+/// load-bearing. The server deletes what an older build left there, once,
+/// at launch (`stream_server::LEGACY_ARCHIVE_SCRATCH_DIR`).
+const NOT_OURS: [&str; 2] = [".pieces", ".proxy"];
 
 /// Whether `name`, directly under the download root, is something the
 /// session writes and reads.
@@ -383,16 +390,24 @@ mod tests {
         std::fs::write(root.join(format!("{ADOPTED}.torrent")), b"d4:infod").unwrap();
         std::fs::write(root.join(format!("{ADOPTED}.bitv")), [0u8; 8]).unwrap();
         std::fs::write(root.join("pinned-downloads.json.tmp-7"), b"{}").unwrap();
-        // And the three directories that reconcile themselves.
-        for name in [".pieces", ".proxy", ".archives"] {
+        // And the two directories that reconcile themselves.
+        for name in [".pieces", ".proxy"] {
             std::fs::create_dir_all(root.join(name).join("inside")).unwrap();
         }
+        // `.archives` was exempt too, for an archive layer that no longer
+        // exists. It is a previous release's data now like anything else
+        // here -- though nothing ever put one *here*: the extraction cache
+        // was `<cacheRoot>/.archives`, a level above this root, which is
+        // why the exemption never did anything. See `NOT_OURS`.
+        std::fs::create_dir_all(root.join(".archives")).unwrap();
+        std::fs::write(root.join(".archives").join("archive_x.7z"), [3u8; 2048]).unwrap();
 
         let report = sweep_legacy_downloads(root);
         assert_eq!(
-            report.removed, 4,
-            "the film's directory, the loose file, .cache and .metadata"
+            report.removed, 5,
+            "the film's directory, the loose file, .cache, .metadata and .archives"
         );
+        assert!(!root.join(".archives").exists(), "nothing exempts it now");
         assert_eq!(report.errors, 0);
         assert!(report.freed_bytes >= 4096 + 2048, "{report:?}");
 
@@ -412,7 +427,7 @@ mod tests {
         }
         assert!(root.join(format!("{ADOPTED}.torrent")).is_file());
         assert!(root.join(format!("{ADOPTED}.bitv")).is_file());
-        for name in [".pieces", ".proxy", ".archives"] {
+        for name in [".pieces", ".proxy"] {
             assert!(
                 root.join(name).join("inside").exists(),
                 "{name} reconciles itself and is not this sweep's"

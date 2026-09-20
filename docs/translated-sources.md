@@ -46,7 +46,8 @@ What exists that the new shape keeps:
   (data offset from the member's *local* header, because its extra-field
   length may differ from the central directory's).
 * `archives::sessions::Sessions`: a leased, idle-swept map. It survives, but
-  a session no longer owns files.
+  a session no longer owns files. (Now `translators::session::Sessions`,
+  merged with the session it leases -- step 4.)
 * `routes::compat::resolve_file_idx` with `fileIdx` / `fileMustInclude`: the
   member selection stremio-core's `rarUrls`/`zipUrls` contract needs.
 * `TorrentMemberStream`: the stream registration a torrent-backed body
@@ -224,8 +225,9 @@ Rules every translator obeys:
    "extract it then", no partial decode, no "serve sequentially but refuse
    seeks". A compressed film is a refusal with a reason the player shows.
 3. **A translator never writes.** Not to disk, not to a temp file, not to
-   the cache root. `.archives` ceases to exist -- for ZIP and TAR it
-   already has, and the suite asserts the directory does not appear.
+   the cache root. `.archives` ceases to exist -- since step 4 nothing in
+   the workspace writes it, and the suite asserts the directory does not
+   appear after a test that plays a member of every format.
 4. **Verification is the fetcher's.** A torrent's bytes are piece-verified
    by librqbit; a proxy entity is what the origin served. A translator does
    not checksum a member on the way through: a CRC over a member is a read
@@ -317,7 +319,8 @@ about a member's HTTP behaviour is allowed to differ from a plain file's.
 
 ### 2.4 Sessions: an index, in memory, leased
 
-`archives::sessions::Sessions<TranslatedSession>` stays as the map; the
+`translators::session::Sessions<TranslatedSession>` (was
+`archives::sessions`) stays as the map; the
 session becomes `{ origin, sources, index, selected: Option<usize> }` and
 owns **no file**. A *torrent-backed* session holds the hash and path
 rather than the source: a `TorrentFileSource` registers a stream for as
@@ -363,22 +366,47 @@ a source error mid-body is the body's error, as for a plain stream.
 
 ## 4. What is deleted
 
+**All of it is gone**, as of 2026-09-20. What actually went, by commit:
+
 | Gone | Lines | Why |
 |---|---|---|
-| `server/src/archives/cache.rs` (`ProgressiveCache`, `VolumeRoom`, `ABANDONED_AFTER`, the reader/writer notify dance the AGENTS gotcha describes) | 1245 | No extraction, so no extraction cache. |
-| ~~`server/src/archives/torrent.rs`~~ (`TorrentArchives`) | 420 | **Gone, step 2.** Sessions hold indexes, not extractions; the `torrent:` form joins the ordinary session map. |
-| `server/src/archives/source.rs` (`ArchiveSource`, `MemberCaches`, the `NamedTempFile` ownership) | ~300 of 363 | A source is a `ByteSource` now; the origin string survives as the session's identity. |
-| ~~`server/src/archives/tgz.rs`~~ | 289 | **Gone, step 2.** gzip has no random access. |
-| ~~`server/src/archives/window.rs`~~ | 184 | **Gone, step 2.** Generalised into `MemberView`. |
-| ~~`server/src/archives/{zip,tar}.rs`~~, `streams_from_a_reader`, `get_archive_reader_from_stream` | 573 | **Gone, step 2.** Both formats are translated. |
-| `routes/archive.rs`: `download_archive`, `DownloadRoom`, `SNIFF_BYTES`, the download timeouts, `archive_cache_config`, `CacheConfig`, the `507` extraction arm | ~450 | Nothing is downloaded by this layer. |
-| `archives::sweep_scratch`, the `.archives` entry in `piece_store::sweep::NOT_OURS`, `.archives` in `server/src/lib.rs` startup, the AGENTS/README paragraphs about it | ~80 | The directory ceases to exist. |
-| ~~`rar::RarHandler`~~ (file-based extraction), `sevenz.rs`'s extraction, ~~`zip.rs`'s inflate thread~~, the `ArchiveReader` trait and `OpenedMember` | ~900 | Replaced by translators. **`RarHandler` gone, step 3** (431 lines, with its five tests), and with it the `.rar` arm of the reader dispatch; `archives::RAR_DISABLED_ERROR` moved to `routes::archive`, which is its only caller. |
+| ~~`server/src/archives/torrent.rs`~~ (`TorrentArchives`) | 420 | **Step 2.** Sessions hold indexes, not extractions; the `torrent:` form joins the ordinary session map. |
+| ~~`server/src/archives/tgz.rs`~~ | 289 | **Step 2.** gzip has no random access. |
+| ~~`server/src/archives/window.rs`~~ | 184 | **Step 2.** Generalised into `MemberView`. |
+| ~~`server/src/archives/{zip,tar}.rs`~~, `streams_from_a_reader`, `get_archive_reader_from_stream` | 573 | **Step 2.** Both formats are translated. |
+| ~~`rar::RarHandler`~~ (file-based extraction) and the `.rar` arm of the reader dispatch | 431 | **Step 3.** `archives::RAR_DISABLED_ERROR` moved to `routes::archive`, its only caller. |
+| ~~`server/src/archives/cache.rs`~~ (`ProgressiveCache`, `VolumeRoom`, `ABANDONED_AFTER`, the reader/writer notify dance the AGENTS gotcha described) | 1245 | **Step 4.** No extraction, so no extraction cache. |
+| ~~`server/src/archives/source.rs`~~ (`ArchiveSource`, `ArchiveSession`, `MemberCaches`, the `NamedTempFile` ownership) | 363 | **Step 4.** A source is a `ByteSource`; the origin string survives on `TranslatedSession`. |
+| ~~`server/src/archives/sevenz.rs`~~ (`SevenZHandler`, the block decoder into a cache) | 470 | **Step 4**, once `translators/sevenz.rs` landed in step 5. |
+| ~~`server/src/archives/mod.rs`~~ (the `ArchiveReader` trait, `OpenedMember`, `AsyncSeekableReader`, `CacheConfig`, `scratch_file`, `archive_suffix{,_from_magic}`, `SCRATCH_DIR_NAME`, `sweep_scratch`) | 281 | **Step 4.** Nothing dispatches by suffix and nothing writes. |
+| `routes/archive.rs`: `download_archive`, `DownloadRoom`, `SNIFF_BYTES`, the download timeouts, `resolve_source`, `archive_cache_config`, `select_archive_file`, `url_file_name`, `create_downloaded`, the old `stream_file`, `is_storage_full`, and the `urls.len() > 1 -> 501` | 716 (of 45 added back) | **Step 4.** Nothing is downloaded by this layer. |
+| `AppState::archive_cache` | ~12 | **Step 4.** One session map, holding indexes. |
+| The `.archives` entry in `piece_store::sweep::NOT_OURS`, and the `piece_store/mod.rs` comment naming it | ~10 | **Step 4.** Nothing writes the name. See below. |
 
-About 3900 lines out; the new layer is roughly 1500 in (sources ~450,
-translators: zip ~250, tar ~150, rar ~400 incl. the volume naming and the
-blocking shim, 7z ~150, iso9660 ~350; view ~200; route glue net negative).
-UDF is another ~400 on its own step.
+**Kept, and moved**: `archives/sessions.rs` (418 lines) is the leased,
+idle-swept map both layers used. It is now `translators/session.rs`,
+merged with `TranslatedSession` -- one module for "an indexed container,
+leased, swept when idle" -- and `SESSION_IDLE_TIMEOUT` came with it from
+`archives/mod.rs`.
+
+**Kept, deliberately**: one constant and about fifteen lines in
+`server/src/lib.rs`, `LEGACY_ARCHIVE_SCRATCH_DIR`, which deletes
+`<cacheRoot>/.archives` at launch. The design says the directory ceases to
+exist, and it does -- for a fresh install. For an **upgraded** one it is
+already there, holding about twice the size of every archive played since
+that build's last clean exit, and nothing else would ever take it: no
+retention owner speaks for those bytes, `GET /cache.json` does not count
+them, and the piece store's legacy sweep walks
+`<cacheRoot>/rqbit-downloads`, one level *below* where `.archives` sits.
+(Which is also why removing it from `NOT_OURS` frees nothing by itself:
+that list is about names directly under the download dir, and `.archives`
+was never one of them. The exemption was never load-bearing; it is removed
+because the name means nothing now.)
+
+About 4,700 lines out across the four steps; the new layer is roughly
+1,900 in (sources ~900, translators: zip ~250, tar ~200, rar ~450 incl.
+the volume naming and the blocking shim, 7z ~200, iso ~200 over
+`images/`; view ~350; route glue net negative).
 
 ## 5. Steps, in order, each shippable
 
@@ -431,15 +459,45 @@ never kept beside it.
    business and not this server's (§2.2.4). What the layout API refuses
    that real releases do use is written up in the step's report: nothing
    found so far beyond the refusals above.
-4. **Delete the rest** (7z is the only caller left): `cache.rs`, the download path,
-   `sweep_scratch`, the sweep entries, `CacheConfig`; docs: AGENTS.md
-   (workspace map, the gotcha about the progressive cache, the "every byte
-   has an owner" list loses `.archives` and gains "a translated member owns
-   nothing"), README, known-issues (#18/#99 close -- #102 closed with
-   step 3; the CRC note from
-   #99 becomes the rule in §2.2.4).
+4. **Delete the rest.** *(Landed 2026-09-20, after step 5, which is what
+   left it with no callers.)* `cache.rs`, `source.rs`, `sevenz.rs` and
+   `mod.rs` -- the whole `archives/` module -- the download path,
+   `sweep_scratch`, `CacheConfig`, `AppState::archive_cache`, and the
+   `.archives` entry in `piece_store::sweep::NOT_OURS`. §4 above is the
+   inventory of what actually went. Two things differ from the sketch.
+   `archives/sessions.rs` is **kept**, merged into
+   `translators/session.rs`: the translated sessions are leased out of it.
+   And the launch removal of `<cacheRoot>/.archives` is **kept** as fifteen
+   lines in `lib.rs` rather than deleted with `sweep_scratch`, because
+   removing it from `NOT_OURS` frees nothing -- that list names directories
+   directly under `<cacheRoot>/rqbit-downloads`, and `.archives` sat a
+   level above it -- so deleting both would leave an upgraded install's
+   extraction cache on the disk for ever, counted by nobody. Docs: AGENTS.md
+   (workspace map, the progressive-cache gotcha is gone whole, the "every
+   byte has an owner" list loses `.archives` and gains "a translated
+   container's member owns nothing"), README (the archive section and the
+   project tree), known-issues (the `.archives` mentions and the "Dead
+   modules" entry).
 5. **7z translator** (COPY blocks direct, all else refused) and delete
-   `sevenz.rs`'s extraction.
+   `sevenz.rs`'s extraction. *(Landed 2026-09-20: `translators/sevenz.rs`,
+   `Format::SevenZ` translated. The offset is the crate's own -- `32 +
+   pack_pos + pack_stream_offsets[block_first_pack_stream_index[block]]`,
+   where `ArchiveReader::build_decode_stack` seeks before decoding -- plus
+   the sum of the sizes of the files before it in the same block, which is
+   sound because a COPY block's output **is** its packed bytes; proven by
+   reading the fixtures' members back, including three files sharing one
+   COPY block. Refusals: an AES coder anywhere in the block, or an index
+   the crate wants a password for, is `Encrypted`; a block that is not COPY
+   and holds several files is `Solid` (chosen over `Compressed` because it
+   says the stronger thing -- a decoder could not enter there either);
+   one that holds a single file is `Compressed`, naming the coder chain; a
+   multi-part set is `Malformed`, whether it arrives as several URLs or as
+   a first part whose stated index is past its own end. The signature
+   header is read by hand before the crate sees the file, because a 7z
+   whose start-header fields are all zero sends `Archive::read` scanning
+   backwards over the last mebibyte **one byte at a time**, which over a
+   piece store is a million round trips. A 256 KiB stored fixture indexes
+   for 191 bytes, none of them the member's.)*
 6. **The images module behind `ByteSource`** -- it is written, with its own
    small `ImageReader` trait (`len` + `read_at`), so what is left is an
    adapter, the refusal mapping of §3, and the `iso` route prefix, sniff signature already in
