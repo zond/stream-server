@@ -59,11 +59,8 @@ pub(crate) fn media_body<R: tokio::io::AsyncRead>(reader: R) -> ReaderStream<R> 
 ///
 /// The prefix used to be decorative: one handler set served every format
 /// and worked out which it was from the file's suffix. It is the format
-/// now, because that is what says *which translator reads this* -- and
-/// which of the two layers the request belongs to while both exist. ZIP,
-/// TAR and RAR are translated (`crate::translators`); 7z is still read by
-/// the old extracting handler, until step 5 of
-/// `docs/translated-sources.md` converts it.
+/// now, because that is what says *which translator reads this*
+/// (`crate::translators`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Rar,
@@ -78,21 +75,20 @@ pub enum Format {
 }
 
 impl Format {
-    /// The translator for this format, or `None` for one the old
-    /// extracting path still owns -- and for RAR in a build without the
-    /// `rar` feature, which has no reader for it at all and answers
-    /// [`rar_disabled_response`] instead.
+    /// The translator for this format -- `None` only for RAR in a build
+    /// without the `rar` feature, which has no reader for it at all and
+    /// answers [`rar_disabled_response`] instead.
     fn translator(self) -> Option<Box<dyn Translator>> {
         match self {
             Self::Zip => Some(Box::new(crate::translators::zip::Zip)),
             Self::Tar => Some(Box::new(crate::translators::tar::Tar)),
             Self::TarGz => Some(Box::new(crate::translators::TarGz)),
             Self::Iso => Some(Box::new(crate::translators::iso::Iso)),
+            Self::SevenZ => Some(Box::new(crate::translators::sevenz::SevenZ)),
             #[cfg(feature = "rar")]
             Self::Rar => Some(Box::new(crate::translators::rar::Rar)),
             #[cfg(not(feature = "rar"))]
             Self::Rar => None,
-            Self::SevenZ => None,
         }
     }
 }

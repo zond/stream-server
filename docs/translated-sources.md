@@ -25,8 +25,9 @@ What the archive routes do now, per case:
 | Stored RAR member, in a torrent or behind a link, one volume or a set | Served by byte range from wherever the volumes are -- one extent per part, per volume. Nothing downloaded, nothing extracted, nothing written. `archives/rar.rs` is gone. (Step 3, 2026-09-20.) |
 | Compressed, encrypted or solid RAR member | Refused: `415` with `{"refused", "message"}`. An encrypted *stored* member too, whose bytes the crate could map. (Step 3.) |
 | A RAR set with a volume missing, or a chain still open after the last | Refused: `422`, naming the volume it wanted. (Step 3.) |
-| Compressed member of a 7z, any source | Extracted whole into `archives::cache::ProgressiveCache` under `<cache root>/.archives`: a second copy of the film, bounded by the volume floor, swept when idle. Step 5. |
-| 7z behind a web link (`/7zip/create` with `urls`) | The **whole archive is downloaded** to `.archives` first (`routes::archive::download_archive`, `DownloadRoom`), then read as a file. Step 5. |
+| Stored (COPY) 7z member, in a torrent or behind a link | Served by byte range, like a stored ZIP member: `translators::sevenz::SevenZ` over `sevenz-rust2`'s `Archive::read`. Nothing downloaded, nothing extracted, nothing written. (Step 5, 2026-09-20.) |
+| Compressed, solid or encrypted 7z member | Refused: `415` with `{"refused", "message"}`. A block that is not COPY and holds several files is `Solid` rather than `Compressed`: a decoder could not enter at it either. (Step 5.) |
+| A multi-part 7z (`.7z.001`, `.7z.002`, ...) | Refused: `422`, saying it is one file cut up. (Step 5.) |
 | An origin that will not serve ranges | Refused, `501`, with a sentence: serving it would mean downloading the archive. (Step 2.) |
 | Multi-volume RAR (`rarUrls` with several entries) | The list **is** the volume list, in order; from a torrent the volumes are the named file's siblings by the two naming rules. (Step 3, 2026-09-20.) |
 | ISO 9660 or UDF image, in a torrent or behind a web link | Served by byte range like a stored ZIP member: `/iso/create` and the `torrent:` form, `translators::iso::Iso` over `server/src/images/`. A UDF metadata partition map (the first thing a real Blu-ray image hits) is refused `415 unsupported`, naming the map. (Step 6, 2026-09-20.) |

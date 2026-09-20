@@ -34,6 +34,7 @@ pub mod iso;
 #[cfg(feature = "rar")]
 pub mod rar;
 pub mod session;
+pub mod sevenz;
 pub mod tar;
 pub mod zip;
 

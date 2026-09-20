@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 /// The hand-built RAR archives (see the module), shared with the
@@ -49,26 +49,54 @@ fn signposted_film() -> Vec<u8> {
     rar_fixtures::signposted(256 * 1024)
 }
 
-/// A 7z archive with two members, as bytes. 7z because `sevenz-rust2` can
-/// write one and is already a dependency.
-fn fixture_7z(dir: &Path) -> Vec<u8> {
+/// The same two members as a **store-method** 7z (`7z a -mx0`), one block
+/// per entry: the shape whose members are byte ranges of the archive.
+fn fixture_7z() -> Vec<u8> {
+    sevenz(
+        vec![sevenz_rust2::EncoderConfiguration::new(
+            sevenz_rust2::EncoderMethod::COPY,
+        )],
+        &[
+            ("first.txt", FIRST_CONTENT.to_vec()),
+            ("videos/second.bin", second_content()),
+        ],
+    )
+}
+
+/// And the same two members packed with LZMA2, which is what `7z a`
+/// writes by default and what a 7z of a film off the internet nearly
+/// always is: a refusal, with a sentence.
+fn fixture_7z_packed() -> Vec<u8> {
+    sevenz(
+        vec![sevenz_rust2::EncoderConfiguration::new(
+            sevenz_rust2::EncoderMethod::LZMA2,
+        )],
+        &[
+            ("first.txt", FIRST_CONTENT.to_vec()),
+            ("videos/second.bin", second_content()),
+        ],
+    )
+}
+
+/// A 7z in memory, one block per entry, packed `methods`' way.
+fn sevenz(
+    methods: Vec<sevenz_rust2::EncoderConfiguration>,
+    entries: &[(&str, Vec<u8>)],
+) -> Vec<u8> {
     use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
-    let path = dir.join("fixture.7z");
-    let mut writer = ArchiveWriter::create(&path).expect("create 7z writer");
-    writer
-        .push_archive_entry(
-            ArchiveEntry::new_file("first.txt"),
-            Some(std::io::Cursor::new(FIRST_CONTENT.to_vec())),
-        )
-        .expect("push first entry");
-    writer
-        .push_archive_entry(
-            ArchiveEntry::new_file("videos/second.bin"),
-            Some(std::io::Cursor::new(second_content())),
-        )
-        .expect("push second entry");
-    writer.finish().expect("finish 7z archive");
-    std::fs::read(&path).expect("read fixture back")
+    let mut writer =
+        ArchiveWriter::new(std::io::Cursor::new(Vec::new())).expect("create 7z writer");
+    writer.set_content_methods(methods);
+    writer.set_encrypt_header(false);
+    for (name, data) in entries {
+        writer
+            .push_archive_entry(
+                ArchiveEntry::new_file(name),
+                Some(std::io::Cursor::new(data.clone())),
+            )
+            .expect("push an entry");
+    }
+    writer.finish().expect("finish 7z archive").into_inner()
 }
 
 /// The same two members as a `.tar.gz`, and an empty one.
@@ -290,12 +318,11 @@ struct Fixture {
 fn fixture() -> anyhow::Result<Fixture> {
     let config_dir = tempfile::tempdir()?;
     let cache_root = tempfile::tempdir()?;
-    let archive = fixture_7z(cache_root.path());
     #[allow(unused_mut)]
     let mut bodies = HashMap::from([
-        ("/fixture.7z".to_string(), archive.clone()),
-        // The same archive behind a URL that names no format.
-        ("/download?id=7".to_string(), archive),
+        ("/fixture.7z".to_string(), fixture_7z()),
+        // The same members, packed the way `7z a` packs by default.
+        ("/packed.7z".to_string(), fixture_7z_packed()),
         ("/fixture.tgz".to_string(), fixture_tgz()),
         ("/fixture.zip".to_string(), fixture_zip()),
         ("/fixture.tar".to_string(), fixture_tar()),
@@ -493,7 +520,7 @@ impl Fixture {
 fn a_create_cannot_take_over_another_archives_session_key() -> anyhow::Result<()> {
     let fixture = fixture()?;
     let url = fixture.origin.url("/fixture.7z");
-    let other = fixture.origin.url("/download?id=7");
+    let other = fixture.origin.url("/packed.7z");
     let client = reqwest::blocking::Client::new();
     let create_with_key = |key: &str, url: &str| -> anyhow::Result<reqwest::blocking::Response> {
         Ok(client
@@ -525,107 +552,6 @@ fn a_create_cannot_take_over_another_archives_session_key() -> anyhow::Result<()
     fixture.finish()
 }
 
-/// An archive fetched by URL is stored under the cache root with the suffix
-/// the reader is chosen by -- so it can be opened at all, which a download
-/// without one never could -- a member of it is served with ranges, and a
-/// second create of the same URL reuses the download rather than fetching
-/// it again.
-#[test]
-fn an_archive_by_url_is_kept_under_the_cache_root_and_fetched_once() -> anyhow::Result<()> {
-    let fixture = fixture()?;
-    let url = fixture.origin.url("/fixture.7z");
-
-    let key = fixture.create_key(&url)?;
-    let files = fixture.scratch_files();
-    assert_eq!(
-        files.len(),
-        1,
-        "the download, under the cache root: {files:?}"
-    );
-    assert!(
-        files[0].starts_with("archive_") && files[0].ends_with(".7z"),
-        "{files:?}"
-    );
-
-    let client = reqwest::blocking::Client::new();
-    let member = format!("{}/7zip/stream/{key}/videos/second.bin", fixture.base);
-    let expected = second_content();
-    let whole = client.get(&member).send()?;
-    assert_eq!(whole.status(), reqwest::StatusCode::OK);
-    assert_eq!(whole.bytes()?.as_ref(), expected.as_slice());
-
-    let ranged = client
-        .get(&member)
-        .header(reqwest::header::RANGE, "bytes=40000-40999")
-        .send()?;
-    assert_eq!(ranged.status(), reqwest::StatusCode::PARTIAL_CONTENT);
-    assert_eq!(
-        ranged
-            .headers()
-            .get(reqwest::header::CONTENT_RANGE)
-            .and_then(|value| value.to_str().ok()),
-        Some(format!("bytes 40000-40999/{}", expected.len()).as_str())
-    );
-    assert_eq!(ranged.bytes()?.as_ref(), &expected[40000..41000]);
-
-    let again = client.get(&member).send()?;
-    assert_eq!(again.status(), reqwest::StatusCode::OK);
-
-    // Three requests on the member -- the shape of a player's head, tail
-    // and seek -- were one extraction, kept beside the download for the
-    // next request, not one per request.
-    let files = fixture.scratch_files();
-    assert_eq!(
-        files
-            .iter()
-            .filter(|name| name.starts_with("archive_extract_"))
-            .count(),
-        1,
-        "one extraction for three requests: {files:?}"
-    );
-    assert_eq!(
-        files.iter().filter(|name| name.ends_with(".7z")).count(),
-        1,
-        "{files:?}"
-    );
-
-    let second_key = fixture.create_key(&url)?;
-    assert_ne!(second_key, key, "a session per create");
-    assert_eq!(
-        fixture.origin.requests_for("/fixture.7z"),
-        1,
-        "the second create reused the first's download"
-    );
-    assert_eq!(
-        fixture
-            .scratch_files()
-            .iter()
-            .filter(|name| name.ends_with(".7z"))
-            .count(),
-        1,
-        "and downloaded nothing"
-    );
-
-    fixture.finish()
-}
-
-/// A URL that names no format is still an archive if its bytes are one:
-/// the download is named by what it holds.
-#[test]
-fn a_url_without_a_suffix_is_named_by_its_bytes() -> anyhow::Result<()> {
-    let fixture = fixture()?;
-    let key = fixture.create_key(&fixture.origin.url("/download?id=7"))?;
-    let files = fixture.scratch_files();
-    assert_eq!(files.len(), 1, "{files:?}");
-    assert!(files[0].ends_with(".7z"), "{files:?}");
-
-    let body = reqwest::blocking::get(format!("{}/7zip/stream/{key}/first.txt", fixture.base))?
-        .error_for_status()?
-        .bytes()?;
-    assert_eq!(body.as_ref(), FIRST_CONTENT);
-    fixture.finish()
-}
-
 /// An archive is fetched from a web address and from nowhere else.
 ///
 /// The create routes are open to any loopback caller -- on Android, every
@@ -636,7 +562,7 @@ fn a_url_without_a_suffix_is_named_by_its_bytes() -> anyhow::Result<()> {
 #[test]
 fn an_archive_on_this_machines_disk_is_not_opened() -> anyhow::Result<()> {
     let fixture = fixture()?;
-    let bytes = reqwest::blocking::get(fixture.origin.url("/download?id=7"))?
+    let bytes = reqwest::blocking::get(fixture.origin.url("/fixture.7z"))?
         .error_for_status()?
         .bytes()?;
     let local = tempfile::tempdir()?;
@@ -659,34 +585,30 @@ fn an_archive_on_this_machines_disk_is_not_opened() -> anyhow::Result<()> {
     fixture.finish()
 }
 
-/// Nothing a failed create fetched stays on disk: a body that is no archive
-/// is refused before it is stored, and one that claims to be an archive and
-/// will not open is deleted with the create that failed on it.
+/// A create that cannot read what it was pointed at says so and leaves
+/// nothing behind: a body that is no 7z at all and one that claims to be
+/// an archive and will not parse are both `422` -- the container
+/// contradicts itself -- and an origin with nothing at that address is
+/// `404`. None of the three writes a byte anywhere.
 #[test]
 fn a_failed_create_leaves_nothing_behind() -> anyhow::Result<()> {
     let fixture = fixture()?;
 
-    let response = fixture.create(&fixture.origin.url("/notes.txt"))?;
-    assert_eq!(
-        response.status(),
-        reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE
-    );
-    assert!(
-        fixture.scratch_files().is_empty(),
-        "{:?}",
-        fixture.scratch_files()
-    );
-
-    let response = fixture.create(&fixture.origin.url("/broken.zip"))?;
-    assert_eq!(
-        response.status(),
-        reqwest::StatusCode::INTERNAL_SERVER_ERROR
-    );
-    assert!(
-        fixture.scratch_files().is_empty(),
-        "{:?}",
-        fixture.scratch_files()
-    );
+    for url in ["/notes.txt", "/broken.zip"] {
+        let response = fixture.create(&fixture.origin.url(url))?;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "{url}"
+        );
+        let body: serde_json::Value = response.json()?;
+        assert_eq!(body["refused"], "malformed", "{url}: {body}");
+        assert!(
+            fixture.scratch_files().is_empty(),
+            "{:?}",
+            fixture.scratch_files()
+        );
+    }
 
     let response = fixture.create(&fixture.origin.url("/missing.7z"))?;
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
@@ -696,11 +618,12 @@ fn a_failed_create_leaves_nothing_behind() -> anyhow::Result<()> {
 }
 
 /// **A stored member behind a web link is served as byte ranges of the
-/// link**, whole and by range and backwards, and nothing is written
-/// anywhere: the archive is never downloaded, the member is never
-/// extracted, and `<cacheRoot>/.archives` -- which every archive this
-/// server played used to put two copies of the film in -- is not so much
-/// as created.
+/// link**, in every container this server reads, whole and by range and
+/// backwards -- and nothing is written anywhere: the archive is never
+/// downloaded, the member is never extracted, and `<cacheRoot>/.archives`
+/// -- which every archive this server played used to put two copies of the
+/// film in -- is not so much as created. (An ISO image is the same claim
+/// over the same assertion in `server/tests/iso.rs`.)
 ///
 /// The seek backwards is the case the old shape could not do at all
 /// without paying for the member again: a player opens, reads the head,
@@ -712,7 +635,14 @@ fn a_stored_member_behind_a_link_is_served_by_range_and_nothing_is_written() -> 
     let client = reqwest::blocking::Client::new();
     let expected = second_content();
 
-    for (prefix, archive) in [("zip", "/fixture.zip"), ("tar", "/fixture.tar")] {
+    let mut containers = vec![
+        ("zip", "/fixture.zip"),
+        ("tar", "/fixture.tar"),
+        ("7zip", "/fixture.7z"),
+    ];
+    #[cfg(feature = "rar")]
+    containers.push(("rar", "/film.rar"));
+    for (prefix, archive) in containers {
         let key = fixture.create_key_for(prefix, &fixture.origin.url(archive))?;
         let member = format!("{}/{prefix}/stream/{key}/videos/second.bin", fixture.base);
 
@@ -920,20 +850,101 @@ fn an_empty_member_is_empty_and_a_range_past_the_end_is_refused() -> anyhow::Res
     fixture.finish()
 }
 
-/// A 7z inside a torrent is refused as a format the torrent form cannot
-/// read, before anything looks for the torrent. It used to go through the
-/// torrent's file list, register a stream -- which starts a torrent the
-/// reconciler had stopped -- and open a reader, and then answer 404 for any
-/// member at all, because the 7z handler refuses a stream at its first open.
+/// **A second create of the same archive reuses the index the first one
+/// read**: the origin is asked for nothing more. A re-play sends the same
+/// `/create` again, and before the translated path each send downloaded
+/// the whole archive a second time, beside the first copy.
 #[test]
-fn a_7z_inside_a_torrent_is_refused_as_unreadable_rather_than_missing() -> anyhow::Result<()> {
+fn a_second_create_of_the_same_archive_reuses_its_index() -> anyhow::Result<()> {
     let fixture = fixture()?;
-    let response = reqwest::blocking::get(format!(
-        "{}/7zip/stream/torrent:{}%2Ffixture.7z/first.txt",
-        fixture.base,
-        "ab".repeat(20)
-    ))?;
-    assert_eq!(response.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
+    let url = fixture.origin.url("/fixture.7z");
+
+    let key = fixture.create_key(&url)?;
+    let asked = fixture.origin.requests_for("/fixture.7z");
+    assert!(asked > 0, "the first create read the index off the origin");
+
+    let again = fixture.create_key(&url)?;
+    assert_ne!(again, key, "a session per create");
+    assert_eq!(
+        fixture.origin.requests_for("/fixture.7z"),
+        asked,
+        "the second create read the index again instead of reusing it"
+    );
+    assert!(!fixture.scratch_dir.exists());
+    fixture.finish()
+}
+
+/// **A 7z of a film is LZMA2 in practice, and is refused with a sentence.**
+///
+/// 7-Zip compresses by default: the archive this asks for is what `7z a`
+/// writes. It used to be *extracted whole* into `<cacheRoot>/.archives`,
+/// a second copy of the film that a seek to the end paid for in full.
+/// Now the create says so, before a byte of the member is fetched, with
+/// the method named.
+#[test]
+fn a_packed_7z_is_refused_with_a_sentence_naming_its_method() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let client = reqwest::blocking::Client::new();
+    let url = fixture.origin.url("/packed.7z");
+
+    let refused = client
+        .post(format!("{}/7zip/create", fixture.base))
+        .json(&serde_json::json!({ "urls": [url.clone()] }))
+        .send()?;
+    assert_eq!(
+        refused.status(),
+        reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
+    let body: serde_json::Value = refused.json()?;
+    assert_eq!(body["refused"], "compressed", "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("LZMA2")),
+        "{body}"
+    );
+
+    // And at the member, for a client that asks for it by name anyway.
+    let key = fixture.create_key_for("7zip", &fixture.origin.url("/fixture.7z"))?;
+    let refused = client
+        .get(format!(
+            "{}/7zip/stream/{key}/videos/second.bin",
+            fixture.base
+        ))
+        .send()?;
+    assert_eq!(refused.status(), reqwest::StatusCode::OK, "the stored one");
+
+    assert!(!fixture.scratch_dir.exists(), "nothing was extracted");
+    fixture.finish()
+}
+
+/// **A multi-part 7z (`.7z.001`, `.7z.002`, ...) is refused, naming what
+/// it is.** It is one file cut into pieces, not a set of archives: every
+/// piece but the first is a headless slab, so there is nothing to index
+/// until they are joined -- and joining them is fetching all of them,
+/// which is the thing this design exists to stop.
+#[test]
+fn a_multi_part_7z_is_refused_as_one_file_cut_up() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let response = reqwest::blocking::Client::new()
+        .post(format!("{}/7zip/create", fixture.base))
+        .json(&serde_json::json!({
+            "urls": [
+                fixture.origin.url("/fixture.7z"),
+                fixture.origin.url("/packed.7z"),
+            ]
+        }))
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = response.json()?;
+    assert_eq!(body["refused"], "malformed", "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains(".7z.001")),
+        "{body}"
+    );
+    assert!(!fixture.scratch_dir.exists());
     fixture.finish()
 }
 
