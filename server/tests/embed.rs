@@ -5377,7 +5377,7 @@ fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> 
     // looking `"rar"` up as an info hash and finding nothing; the keyed
     // form has three segments and reaches the fallback; `POST` is a method
     // the stream route does not take.
-    for prefix in ["/rar", "/zip", "/7zip", "/tar", "/tgz"] {
+    for prefix in ["/rar", "/zip", "/7zip", "/tar", "/tgz", "/iso"] {
         let create = format!("{prefix}/create");
         assert_eq!(
             anonymous.get(format!("{base}{create}")).send()?.status(),

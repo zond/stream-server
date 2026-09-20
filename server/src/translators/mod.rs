@@ -28,6 +28,7 @@ use async_trait::async_trait;
 use std::fmt;
 use std::sync::Arc;
 
+pub mod iso;
 pub mod session;
 pub mod tar;
 pub mod zip;
@@ -76,6 +77,12 @@ pub enum Refusal {
     /// The container as a whole has no way in at the middle: `tar.gz` is
     /// one gzip stream, and reaching its end means inflating all of it.
     NoRandomAccess { format: &'static str },
+    /// A well-formed container using a structure this server does not
+    /// read yet, named: a UDF image's metadata partition map, which remaps
+    /// every block, so an extent computed without it would be the wrong
+    /// bytes. Refused rather than guessed at, and `415` like the others a
+    /// player cannot do anything about.
+    Unsupported { format: &'static str, what: String },
 }
 
 impl Refusal {
@@ -88,6 +95,7 @@ impl Refusal {
             Self::Solid => "solid",
             Self::Malformed(_) => "malformed",
             Self::NoRandomAccess { .. } => "noRandomAccess",
+            Self::Unsupported { .. } => "unsupported",
         }
     }
 }
@@ -117,6 +125,11 @@ impl fmt::Display for Refusal {
                 f,
                 "a {format} is one compressed stream with no way in at the middle, so playing it \
                  would mean unpacking the whole thing first"
+            ),
+            Self::Unsupported { format, what } => write!(
+                f,
+                "this {format} uses {what}; that is not supported yet, so it cannot be read as \
+                 byte ranges"
             ),
         }
     }
@@ -356,6 +369,10 @@ mod tests {
             Refusal::Solid,
             Refusal::Malformed("the central directory is not there".into()),
             Refusal::NoRandomAccess { format: "tar.gz" },
+            Refusal::Unsupported {
+                format: "UDF image",
+                what: "a type 2 partition map".into(),
+            },
         ];
         for refusal in refusals {
             let sentence = refusal.to_string();

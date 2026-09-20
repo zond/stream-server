@@ -73,6 +73,8 @@ pub enum Format {
     /// `.tar.gz`, which is a refusal rather than a container: see
     /// [`crate::translators::TarGz`].
     TarGz,
+    /// A disc image, ISO 9660 or UDF: see [`crate::translators::iso`].
+    Iso,
 }
 
 impl Format {
@@ -83,6 +85,7 @@ impl Format {
             Self::Zip => Some(Box::new(crate::translators::zip::Zip)),
             Self::Tar => Some(Box::new(crate::translators::tar::Tar)),
             Self::TarGz => Some(Box::new(crate::translators::TarGz)),
+            Self::Iso => Some(Box::new(crate::translators::iso::Iso)),
             Self::Rar | Self::SevenZ => None,
         }
     }
@@ -98,7 +101,8 @@ fn refusal_response(refusal: &Refusal) -> Response {
         Refusal::Compressed { .. }
         | Refusal::Encrypted
         | Refusal::Solid
-        | Refusal::NoRandomAccess { .. } => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        | Refusal::NoRandomAccess { .. }
+        | Refusal::Unsupported { .. } => StatusCode::UNSUPPORTED_MEDIA_TYPE,
         Refusal::Malformed(_) => StatusCode::UNPROCESSABLE_ENTITY,
     };
     (

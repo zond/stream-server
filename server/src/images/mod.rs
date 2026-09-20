@@ -41,8 +41,13 @@ use std::sync::Arc;
 pub mod iso9660;
 pub mod udf;
 
-#[cfg(test)]
-pub(crate) mod fixtures;
+/// **Not behind `#[cfg(test)]`**, for the same reason `sources::testing`
+/// is not: the integration tests put these images inside a torrent and
+/// behind a URL and read them back through the routes, and a fixture that
+/// existed only in unit builds would leave the end-to-end claim untested.
+/// Nothing in it reads a file or opens a socket; it is a few functions
+/// that fill a `Vec<u8>` with descriptors.
+pub mod fixtures;
 
 /// A disc image's sectors are 2048 bytes on every optical medium this
 /// parser is for, and both formats' fixed locations are stated in them:

@@ -27,7 +27,7 @@ What the archive routes do now, per case:
 | RAR or 7z behind a web link (`/{rar\|7zip}/create` with `urls`) | The **whole archive is downloaded** to `.archives` first (`routes::archive::download_archive`, `DownloadRoom`), then read as a file. Steps 3 and 5. |
 | An origin that will not serve ranges | Refused, `501`, with a sentence: serving it would mean downloading the archive. (Step 2.) |
 | Multi-volume RAR (`rarUrls` with several entries) | Refused, `501`. Step 3. |
-| ISO | Indexed by `server/src/images/` (ISO 9660 + UDF), wired to no route. Step 6. |
+| ISO 9660 or UDF image, in a torrent or behind a web link | Served by byte range like a stored ZIP member: `/iso/create` and the `torrent:` form, `translators::iso::Iso` over `server/src/images/`. A UDF metadata partition map (the first thing a real Blu-ray image hits) is refused `415 unsupported`, naming the map. (Step 6, 2026-09-20.) |
 
 The cost of that shape is not only disk: an extraction has to reach the
 byte the player wants before it can be served, so a seek to the end of a
@@ -430,7 +430,22 @@ never kept beside it.
    xtremio's `archive_sniff` (`CD001` at 32769). Fixture: a tiny image
    built in the test (PVD + root record + one file, 2048-byte sectors) and,
    if `genisoimage`/`xorriso` is on the CI runner, a real one. Then **UDF**
-   as its own step with a Blu-ray-shaped fixture.
+   as its own step with a Blu-ray-shaped fixture. *(Landed 2026-09-20:
+   `translators/iso.rs`, `Format::Iso`, `/iso` in the prefixes. The
+   mapping needed one variant the sketch above lacks, `Refusal::Unsupported
+   { format, what }` (`415`, kind `unsupported`), for a well-formed image
+   using a structure the parser names and does not read -- the UDF
+   metadata partition map first of all, so a Blu-ray image today answers
+   `415` with "this UDF image uses a type 2 partition map (...), which
+   remaps logical blocks; that is not supported yet". `images::Refusal` maps
+   as `Unsupported`/`Encrypted` -> `415`, `Malformed`/`NotAnImage` ->
+   `422`, `Unreadable` -> `Malformed` carrying the read error, as
+   `translators::Budget` words one. The images module's own 8 MiB
+   `Budget` is the bound; the translator adds no second counter.
+   `images::fixtures` is no longer `#[cfg(test)]`, so `server/tests/iso.rs`
+   can put the same images in a torrent and behind a URL. The real-tool
+   image test skips when no writer is installed. The UDF increment that
+   is still open is the metadata partition map itself.)*
 7. **xtremio**: a URL stream whose first bytes say RAR/ZIP/7z/ISO is sent to
    `/{fmt}/create` with `urls: [url]` instead of shown the message; the
    message is shown when the server answers `415`/`422`/`501`, with the

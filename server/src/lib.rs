@@ -1737,6 +1737,7 @@ fn archive_prefixes(
         .nest("/7zip", router(Format::SevenZ))
         .nest("/tar", router(Format::Tar))
         .nest("/tgz", router(Format::TarGz))
+        .nest("/iso", router(Format::Iso))
 }
 
 /// The whole archive API: a session created from an archive named by URL or

@@ -27,7 +27,7 @@ The torrent engine is [`librqbit`](https://github.com/ikatson/rqbit) -- the **so
 | **Transcoding** | ❌ Not the server's job -- client plays containers/codecs directly | ✅ HLS transcoding via FFmpeg |
 | **Torrent backend** | Pure-Rust `librqbit`, the only backend | `libtorrent` (C++) or `librqbit` |
 | **Open Source** | ✅ Source is MIT; default binary is GPL-3.0 (see [License](#license)) | ✅ (it replaces the closed-source `server.js`) |
-| **Archive Streaming** | ✅ ZIP/7Z/TAR/TGZ/RAR built in (pure Rust) | ✅ |
+| **Archive Streaming** | ✅ ZIP/7Z/TAR/TGZ/RAR and ISO 9660/UDF disc images built in (pure Rust) | ✅ |
 | **Headless** | ✅ No tray, no desktop GUI in this repo | Varies |
 
 This is not a drop-in replacement for `server.js` -- the API surface it exposes is intentionally smaller. It's built to be the backend of one specific client, not a generic Stremio-compatible service.
@@ -42,7 +42,7 @@ This is not a drop-in replacement for `server.js` -- the API surface it exposes 
 - **HTTP Range Requests**: torrent pieces are streamed straight to HTTP range requests for instant seeking -- direct play, no transcoding step in between
 
 ### Media & Archives
-- **Archive Streaming**: direct playback from ZIP, 7Z, TAR and RAR archives out of the box (all pure Rust). A ZIP or TAR member that is *stored* -- which is what a film in one normally is -- is served as byte ranges of the archive itself, wherever the archive lives: nothing is downloaded, nothing is extracted, nothing is written. A member that would have to be decoded to be seeked in is **refused**, with a sentence to show the viewer, rather than unpacked into a second copy of the film (`415`; a `.tar.gz` is refused whole, since gzip has no way in at the middle). RAR is **on by default** via `unrar-rs`, which is GPL-3.0-or-later, so a program that links this library with RAR on is GPL-3.0-or-later -- see [License](#license); build `--no-default-features` to link no GPL code and have no RAR
+- **Archive Streaming**: direct playback from ZIP, 7Z, TAR and RAR archives and from ISO 9660/UDF disc images out of the box (all pure Rust). A ZIP or TAR member that is *stored* -- which is what a film in one normally is -- is served as byte ranges of the archive itself, wherever the archive lives: nothing is downloaded, nothing is extracted, nothing is written. A member that would have to be decoded to be seeked in is **refused**, with a sentence to show the viewer, rather than unpacked into a second copy of the film (`415`; a `.tar.gz` is refused whole, since gzip has no way in at the middle). RAR is **on by default** via `unrar-rs`, which is GPL-3.0-or-later, so a program that links this library with RAR on is GPL-3.0-or-later -- see [License](#license); build `--no-default-features` to link no GPL code and have no RAR
 - Subtitles are the client's job: there is no subtitle conversion, track discovery or OpenSubtitles hashing in the server (see [Removed routes](#removed-routes))
 
 ### Control API
@@ -681,7 +681,7 @@ cargo test -p server --no-default-features  # no RAR, no GPL code linked
 |---|---|---|
 | `rar` (**on by default**) | RAR archive streaming through the pure-Rust `unrar-rs` | None |
 
-ZIP, 7Z and TAR streaming are always built in and not gated by any feature (the `tgz` prefix still exists and answers `415`: gzip has no way in at the middle). Because `unrar-rs` is GPL-3.0-or-later, a program that links this library with `rar` on is GPL-3.0-or-later; without it, RAR requests return a 501 JSON error. See [License](#license).
+ZIP, 7Z, TAR and ISO streaming are always built in and not gated by any feature (the `tgz` prefix still exists and answers `415`: gzip has no way in at the middle). Because `unrar-rs` is GPL-3.0-or-later, a program that links this library with `rar` on is GPL-3.0-or-later; without it, RAR requests return a 501 JSON error. See [License](#license).
 
 ### CI
 
@@ -707,7 +707,8 @@ stream-server/
 │   ├── src/lib.rs    # ServerConfig, start/run, ServerHandle -- the whole public API
 │   ├── src/auth.rs   # ServerAuth + the bearer middleware
 │   ├── src/sources/  # ByteSource: a file somebody else fetches, read by range
-│   ├── src/translators/ # What a container says about the bytes inside it (ZIP, TAR)
+│   ├── src/images/   # ISO 9660 + UDF: which byte ranges of a disc image are each file
+│   ├── src/translators/ # What a container says about the bytes inside it (ZIP, TAR, ISO)
 │   └── src/archives/ # What still extracts: 7Z (always on) + RAR (default-on "rar" feature)
 ├── enginefs/         # Torrent engine abstraction
 │   └── src/backend/
