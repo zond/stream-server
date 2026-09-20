@@ -179,6 +179,22 @@ impl ByteSource for MemberView {
         self.member.name.clone()
     }
 
+    /// A view is live when **any** source its extents run over is: the
+    /// bytes it reads are theirs, and a member that spans a set of volumes
+    /// is being played whichever of them the reader is inside -- the same
+    /// reason `TranslatedSession::is_live` asks the same way.
+    ///
+    /// A view is a `ByteSource` so that a translator can sit on another
+    /// translator's member, and this is what keeps that honest: the
+    /// default answer of `false` is right for a source over bytes nobody
+    /// retains, and a view over a proxied body is not one of those.
+    fn is_live(&self, reading: &enginefs::retention::live::Reading) -> bool {
+        self.member
+            .sources
+            .iter()
+            .any(|source| source.is_live(reading))
+    }
+
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
         // Straight through to the sources rather than through a reader: an
         // index read is a handful of scattered reads and must not disturb
@@ -488,6 +504,71 @@ mod tests {
     use super::*;
     use crate::sources::testing::{CountingSource, MemorySource};
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    /// A source over bytes something else keeps -- the only kind that can
+    /// be the live entity -- with the answer fixed, so what the tests
+    /// below are about is who is asked rather than what the cell holds.
+    struct Retained(MemorySource, bool);
+
+    #[async_trait::async_trait]
+    impl ByteSource for Retained {
+        fn len(&self) -> u64 {
+            self.0.len()
+        }
+
+        fn describe(&self) -> String {
+            self.0.describe()
+        }
+
+        fn is_live(&self, _reading: &enginefs::retention::live::Reading) -> bool {
+            self.1
+        }
+
+        async fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.read_at(offset, buf).await
+        }
+
+        async fn open(&self, offset: u64, hint: ReadHint) -> io::Result<Box<dyn SeekableReader>> {
+            self.0.open(offset, hint).await
+        }
+    }
+
+    /// **A view answers for the sources under it**, and so does the
+    /// counting wrapper between them: a member that spans a set is being
+    /// played whichever volume the reader is inside, and a wrapper that
+    /// answered for itself would report the viewer had moved on while they
+    /// were watching (`crate::translators::session`).
+    #[test]
+    fn a_view_is_live_when_any_source_beneath_it_is() {
+        let view = |live: [bool; 2]| {
+            let sources: Vec<Arc<dyn ByteSource>> = live
+                .iter()
+                .enumerate()
+                .map(|(at, &live)| {
+                    Arc::new(CountingSource::new(Arc::new(Retained(
+                        MemorySource::new(format!("volume {at}"), vec![0u8; 8]),
+                        live,
+                    )))) as Arc<dyn ByteSource>
+                })
+                .collect();
+            MemberView::new(
+                "film.mkv",
+                sources,
+                (0..2)
+                    .map(|source| Extent {
+                        source,
+                        offset: 0,
+                        len: 8,
+                    })
+                    .collect(),
+            )
+            .expect("extents inside their sources")
+        };
+        let reading = enginefs::retention::live::Reading::nothing();
+        assert!(!view([false, false]).is_live(&reading));
+        assert!(view([true, false]).is_live(&reading), "the first volume");
+        assert!(view([false, true]).is_live(&reading), "the second");
+    }
 
     /// The member's own bytes: `i * 7 % 251` at `i`, so a byte says where
     /// in the member it came from.

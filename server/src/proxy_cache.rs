@@ -613,12 +613,15 @@ impl Entry {
     /// This key's directory: every entity ever stored for one request
     /// shape.
     ///
-    /// A test's accessor and nothing else's: what it is for is asserting
-    /// that a `crate::sources::ProxySource` and `/proxy` agree about the
-    /// key for one URL, which is a claim about two callers of
-    /// [`ProxyCache::entry`] and not about anything the server does with
-    /// the path.
-    #[cfg(test)]
+    /// **The key, not the bytes.** What is under it is one directory per
+    /// generation of the resource, and which of those a reader is in is
+    /// the retention cell's business (`crate::proxy_retention`), not this
+    /// accessor's. Two callers: `crate::sources::ProxySource`, which asks
+    /// whether the body being played is one of *its* URL's -- a question
+    /// about the resource, which is all a holder of a URL knows -- and a
+    /// test asserting that a source and `/proxy` agree about the key for
+    /// one URL, which is a claim about two callers of
+    /// [`ProxyCache::entry`].
     pub(crate) fn dir(&self) -> &Path {
         &self.dir
     }

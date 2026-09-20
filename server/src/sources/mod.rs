@@ -148,6 +148,32 @@ pub trait ByteSource: Send + Sync {
     /// [`ReadHint`] for what `hint` is spent on, and [`SeekableReader`] for
     /// why a seek on one is a seek rather than a refusal.
     async fn open(&self, offset: u64, hint: ReadHint) -> io::Result<Box<dyn SeekableReader>>;
+
+    /// Whether the entity `reading` names -- the one stream this server is
+    /// playing (`enginefs::retention::live`) -- is this source's own file.
+    ///
+    /// What it is for: a translated container's session is kept while its
+    /// container is what is playing and goes when the viewer opens
+    /// something else, and the container is a list of these
+    /// (`crate::translators::session`). A source is the only thing that
+    /// knows which retained entity its bytes are, so it is the thing that
+    /// answers.
+    ///
+    /// **The default is `false`, and it is the honest answer for a source
+    /// whose bytes this server does not retain** -- a view over other
+    /// sources, a fixture in memory: nothing in the retention cell could
+    /// ever name one, so nothing could keep it alive and nothing should
+    /// pretend to. A source added later over bytes this server *does* keep
+    /// must answer for itself; a `false` from one of those would read as
+    /// "the viewer has moved on" every time the cell was consulted.
+    ///
+    /// Cheap and synchronous by contract: it is asked of every session in
+    /// the map at the instant the live entity moves, so it may compute a
+    /// key but it may not go to the disk or the network.
+    fn is_live(&self, reading: &enginefs::retention::live::Reading) -> bool {
+        let _ = reading;
+        false
+    }
 }
 
 /// One run of one source's bytes: where a member's bytes physically are.

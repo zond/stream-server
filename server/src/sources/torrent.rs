@@ -264,6 +264,19 @@ impl ByteSource for TorrentFileSource {
         self.len
     }
 
+    /// The entity being played is this source's own when **any file of
+    /// this torrent** is it.
+    ///
+    /// Per torrent rather than per file, for the same reason the retention
+    /// window is not: a container made of several files of one torrent --
+    /// a RAR set -- is read by a body that crosses from one to the next,
+    /// and the cell names whichever of them the body is inside. See
+    /// `crate::translators::session::TranslatedSession::is_live`, which is
+    /// what asks.
+    fn is_live(&self, reading: &enginefs::retention::live::Reading) -> bool {
+        reading.is_torrent(&self.info_hash)
+    }
+
     fn describe(&self) -> String {
         format!("{} in torrent {}", self.name, self.info_hash)
     }

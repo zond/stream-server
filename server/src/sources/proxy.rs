@@ -261,6 +261,25 @@ impl ByteSource for ProxySource {
         self.entity.total
     }
 
+    /// The entity being played is this source's own when it is a proxied
+    /// body filed under this source's key -- the key `/proxy` would mint
+    /// for the same URL and the same `h=` headers, which is the same call
+    /// ([`Self::entry`]).
+    ///
+    /// Asked of the *key* and not of the entity directory under it: the
+    /// entity is one generation of the resource, and a container indexed
+    /// from a link is still the same container after the origin has
+    /// revalidated it (`Reading::proxy_under`). A target the cache will
+    /// not touch -- a credentialed one, this server's own listener -- has
+    /// no key, and nothing the cell can name; it reads every time as
+    /// "not playing", which is correct, since nothing here retains a byte
+    /// of it either.
+    fn is_live(&self, reading: &enginefs::retention::live::Reading) -> bool {
+        self.entity
+            .entry()
+            .is_some_and(|entry| reading.proxy_under(entry.dir()))
+    }
+
     fn describe(&self) -> String {
         self.entity.describe.clone()
     }
@@ -642,6 +661,55 @@ mod tests {
             "the fill wrote no chunk under {}",
             entity.display()
         );
+        drop(root);
+    }
+
+    /// **A source that has read is the live entity, and a probe is not a
+    /// read.** This is the whole rule a link-borne container's session
+    /// hangs on (`crate::translators::session`): the session stays while
+    /// its own container is what is playing, and this is how the container
+    /// says so.
+    ///
+    /// The probe goes to the origin with no cache entry at all, so it
+    /// opens no reader and moves nothing -- a `/{fmt}/create` that only
+    /// asked whether an origin ranges has not made the viewer's stream --
+    /// and the first real read does.
+    #[tokio::test]
+    async fn a_source_is_the_live_entity_once_it_has_read_and_not_before() {
+        use enginefs::retention::live::{Live, LiveEntity};
+
+        let origin = Origin::start(true);
+        let root = tempfile::tempdir().expect("a scratch root");
+        let live = Arc::new(Live::new());
+        let cache = Arc::new(crate::proxy_cache::ProxyCache::new(
+            root.path(),
+            Arc::default(),
+            live.clone(),
+        ));
+        let source = ProxySource::open(cache.clone(), SELF_ADDR, origin.url(), BTreeMap::new())
+            .await
+            .expect("an origin that ranges");
+        assert!(
+            !ByteSource::is_live(&source, &live.reading()),
+            "the probe opened a reader"
+        );
+
+        let mut buf = vec![0u8; 1024];
+        source.read_at(0, &mut buf).await.unwrap();
+        assert!(
+            ByteSource::is_live(&source, &live.reading()),
+            "a read through the source did not make it the live entity"
+        );
+
+        // And the viewer opens something else.
+        live.open(
+            LiveEntity::Torrent {
+                info_hash: "aa".into(),
+                file_idx: 0,
+            },
+            false,
+        );
+        assert!(!ByteSource::is_live(&source, &live.reading()));
         drop(root);
     }
 

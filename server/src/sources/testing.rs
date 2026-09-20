@@ -163,6 +163,14 @@ impl ByteSource for CountingSource {
         self.inner.describe()
     }
 
+    /// The source underneath's answer, not this wrapper's. Counting a
+    /// source does not change whose bytes they are, and a wrapper that
+    /// answered for itself would say "the viewer has moved on" about the
+    /// very thing they are watching.
+    fn is_live(&self, reading: &enginefs::retention::live::Reading) -> bool {
+        self.inner.is_live(reading)
+    }
+
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
         let read = self.inner.read_at(offset, buf).await?;
         self.counts.read_at_calls.fetch_add(1, Ordering::Relaxed);

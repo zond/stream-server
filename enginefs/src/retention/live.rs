@@ -231,6 +231,22 @@ impl Reading {
         matches!(&self.0, Some(LiveEntity::Proxy { dir: playing }) if playing == dir)
     }
 
+    /// Whether the proxied body being played is filed **anywhere under**
+    /// `key_dir` -- one URL's key directory, which holds one directory per
+    /// generation of the entity behind it.
+    ///
+    /// The question [`Self::is_proxy`] asks is about the bytes: the entity
+    /// directory is where the chunks are, and a chunk of a superseded
+    /// generation is not the live one's. The question here is about the
+    /// *resource*, which is what something holding a URL knows: a
+    /// container indexed from a link is the same container after the
+    /// origin has revalidated it under a new tag, and asking by entity
+    /// would say the viewer had moved on when all that moved was the
+    /// `ETag` (`server::translators::session`).
+    pub fn proxy_under(&self, key_dir: &Path) -> bool {
+        matches!(&self.0, Some(LiveEntity::Proxy { dir: playing }) if playing.starts_with(key_dir))
+    }
+
     /// Which file of `info_hash` is being played, and `None` when the
     /// entity being played is another torrent, a proxied body, or nothing.
     pub fn file_of(&self, info_hash: &str) -> Option<usize> {
@@ -296,6 +312,36 @@ mod tests {
             })
         );
         assert!(!live.is_torrent("aa"));
+    }
+
+    /// A key directory holds one directory per generation of the entity
+    /// behind one URL, and the cell names the generation: a holder of the
+    /// URL asks about the key, a holder of the bytes about the entity.
+    #[test]
+    fn a_proxied_body_is_under_its_key_directory_and_not_under_another() {
+        let key = Path::new("/cache/proxy/aa");
+        let live = Live::new();
+        assert!(!Reading::nothing().proxy_under(key));
+
+        live.open(
+            LiveEntity::Proxy {
+                dir: key.join("1024_video%2Fmp4_etag%3A%22one%22"),
+            },
+            false,
+        );
+        let reading = live.reading();
+        assert!(reading.proxy_under(key));
+        assert!(
+            !reading.is_proxy(key),
+            "the key directory is not where the chunks are"
+        );
+        assert!(!reading.proxy_under(Path::new("/cache/proxy/bb")));
+        // Not a prefix match on the *name*: `/cache/proxy/a` is another
+        // key, whatever its spelling shares with this one.
+        assert!(!reading.proxy_under(Path::new("/cache/proxy/a")));
+
+        live.open(torrent("aa", 0), false);
+        assert!(!live.reading().proxy_under(key), "a torrent is playing");
     }
 
     /// A hand-on moves the cell only off the entity it names.
