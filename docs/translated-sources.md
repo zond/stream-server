@@ -46,8 +46,9 @@ What exists that the new shape keeps:
   (data offset from the member's *local* header, because its extra-field
   length may differ from the central directory's).
 * `archives::sessions::Sessions`: a leased, idle-swept map. It survives, but
-  a session no longer owns files. (Now `translators::session::Sessions`,
-  merged with the session it leases -- step 4.)
+  a session no longer owns files, and the idle sweep is gone too -- see
+  §2.4. (Now `translators::session::Sessions`, merged with the session it
+  leases -- step 4.)
 * `routes::compat::resolve_file_idx` with `fileIdx` / `fileMustInclude`: the
   member selection stremio-core's `rarUrls`/`zipUrls` contract needs.
 * `TorrentMemberStream`: the stream registration a torrent-backed body
@@ -324,16 +325,43 @@ about a member's HTTP behaviour is allowed to differ from a plain file's.
 session becomes `{ origin, sources, index, selected: Option<usize> }` and
 owns **no file**. A *torrent-backed* session holds the hash and path
 rather than the source: a `TorrentFileSource` registers a stream for as
-long as it lives, and holding one for the session's ten idle minutes
-would keep a torrent the viewer left ten minutes ago running, so each
+long as it lives, and holding one for the session's life would keep a
+torrent the viewer left running, so each
 body opens its own -- a file lookup and a reconcile, not a fetch. The
 index, which is what was expensive to read, is what the session is for. It is created by `/{fmt}/create` (from URLs) or on first use by
-the `torrent:` form (from a torrent file and its sibling volumes), leased
-by every response body, and swept `SESSION_IDLE_TIMEOUT` after the last
-lease as now. What sweeping frees is memory and, for a torrent, the stream
-registration; for a proxy source, nothing at all -- the cache's bytes are
-the cache's, under its own retention, exactly as if the player had fetched
-them through `/proxy`.
+the `torrent:` form (from a torrent file and its sibling volumes), and
+leased by every response body. What dropping one frees is memory and, for
+a torrent, the stream registration; for a proxy source, nothing at all --
+the cache's bytes are the cache's, under its own retention, exactly as if
+the player had fetched them through `/proxy`.
+
+**A session's life is the live entity's, not a clock's** (2026-09-20; it
+was ten idle minutes, `SESSION_IDLE_TIMEOUT`). The bytes a session indexes
+-- a torrent's pieces, a proxied entity's ranges -- are kept while nothing
+else has become live and go the moment something has, bounded by the cache
+budget; `enginefs::retention::live` states why, and the index of a
+container is not a different question from the bytes in it. So:
+
+* a lease out keeps a session, as before -- a body streaming to a player
+  or to a cast receiver is never dropped under its reader;
+* a session whose container **is** the live entity is kept
+  (`TranslatedSession::is_live`: any file of its torrent, or any of its
+  `ProxySource`s' keys, because a body crosses volumes while it reads);
+* every other session goes when the live entity moves. `Sessions<T>` holds
+  no rule of its own and runs no janitor: `Sessions::retain` is handed the
+  rule by the switch task in `server::run`, the same signal the two
+  retention owners drop their slack on;
+* the backstop is a **cap on entries** (`SESSION_CAP`, 32) evicting the
+  least recently used unleased session, not a longer timeout. A count, not
+  a clock: nothing in the module calls `Instant::now()`, and "least
+  recently used" is kept as an ordering (a monotonic counter over the
+  map's own uses) so it cannot be compared against a duration.
+
+What this closes: a cast paused longer than the old timeout lost a
+link-borne container's session, and `/create` is not on the LAN listener,
+so the receiver got a `404` with no way to make another (xtremio
+`docs/CASTING.md`). A paused cast now keeps its session for as long as
+nothing else is opened.
 
 ## 3. Routes and the contract with the client
 
@@ -388,11 +416,12 @@ a source error mid-body is the body's error, as for a plain stream.
 | `AppState::archive_cache` | ~12 | **Step 4.** One session map, holding indexes. |
 | The `.archives` entry in `piece_store::sweep::NOT_OURS`, and the `piece_store/mod.rs` comment naming it | ~10 | **Step 4.** Nothing writes the name. See below. |
 
-**Kept, and moved**: `archives/sessions.rs` (418 lines) is the leased,
-idle-swept map both layers used. It is now `translators/session.rs`,
-merged with `TranslatedSession` -- one module for "an indexed container,
-leased, swept when idle" -- and `SESSION_IDLE_TIMEOUT` came with it from
-`archives/mod.rs`.
+**Kept, and moved**: `archives/sessions.rs` (418 lines) is the leased map
+both layers used. It is now `translators/session.rs`, merged with
+`TranslatedSession` -- one module for "an indexed container, leased, kept
+while the viewer is in it". `SESSION_IDLE_TIMEOUT` came with it from
+`archives/mod.rs` and is since gone: see the end of §2.4 for what replaced
+it and why.
 
 **Kept, deliberately**: one constant and about fifteen lines in
 `server/src/lib.rs`, `LEGACY_ARCHIVE_SCRATCH_DIR`, which deletes
