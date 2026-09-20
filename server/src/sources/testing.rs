@@ -101,6 +101,11 @@ pub struct Counts {
     read_at_bytes: AtomicU64,
     opens: AtomicU64,
     opened_bytes: AtomicU64,
+    /// Every `(offset, len)` a [`ByteSource::read_at`] actually returned,
+    /// in order. A total is not enough for the claim these exist for: a
+    /// parser that read a film in small pieces would pass a byte count and
+    /// fail this -- see [`Counts::read_any_of`].
+    ranges: std::sync::Mutex<Vec<(u64, u64)>>,
 }
 
 impl Counts {
@@ -128,6 +133,23 @@ impl Counts {
     /// an index bound is stated in.
     pub fn bytes(&self) -> u64 {
         self.read_at_bytes() + self.opened_bytes()
+    }
+
+    /// The ranges [`ByteSource::read_at`] answered, in order.
+    pub fn ranges(&self) -> Vec<(u64, u64)> {
+        self.ranges
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Whether any read overlapped `offset..offset + len`. **The assertion
+    /// the whole design rests on**: an index that touched the film's bytes
+    /// is not an index, however few bytes it read in total.
+    pub fn read_any_of(&self, offset: u64, len: u64) -> bool {
+        self.ranges()
+            .iter()
+            .any(|(at, read)| *at < offset + len && offset < at + read)
     }
 }
 
@@ -169,6 +191,11 @@ impl ByteSource for CountingSource {
         self.counts
             .read_at_bytes
             .fetch_add(read as u64, Ordering::Relaxed);
+        self.counts
+            .ranges
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((offset, read as u64));
         Ok(read)
     }
 

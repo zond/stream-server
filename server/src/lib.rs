@@ -116,6 +116,14 @@ mod routes;
 pub mod sources;
 mod state;
 pub mod stream_numbers;
+/// What a container says about the bytes inside it: the translators (see
+/// the module's own documentation and `docs/translated-sources.md`).
+///
+/// Public, and `doc(hidden)`, for the same reason [`sources`] is: the
+/// integration tests state what indexing a real archive may read, and say
+/// it in the same types the routes do. Not part of the embeddable API.
+#[doc(hidden)]
+pub mod translators;
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
