@@ -4090,10 +4090,18 @@ mod tests {
 
         handle.stop_torrent().await.expect("a live torrent pauses");
         assert_eq!(wait_until_settled(&handle).await, RunState::Paused);
-        assert!(
-            handle.stop_torrent().await.is_err(),
-            "a paused torrent is not paused twice"
-        );
+        // **A second pause is accepted, and leaves it paused.** librqbit
+        // 193a5bd8 turned pause-on-an-already-paused-torrent from an error
+        // into a second release of its file handles, so the old assertion
+        // (an `Err`) was asserting a contract upstream no longer keeps. What
+        // this ever meant to say is that a redundant stop does not disturb
+        // the state, and the reconciler never issues one anyway: it stops
+        // only what it has just seen `Live` (`stop_if_running`).
+        handle
+            .stop_torrent()
+            .await
+            .expect("a paused torrent takes a second pause");
+        assert_eq!(wait_until_settled(&handle).await, RunState::Paused);
         assert!(
             !handle.is_out_of_space().await && !handle.is_in_error_state().await,
             "paused is not the error state"
@@ -4637,9 +4645,17 @@ mod tests {
             handle.handle.is_paused(),
             "...and the flag agrees: there is nothing left to diverge"
         );
+        // A second pause is a second release of the file handles now, not
+        // an error (librqbit 193a5bd8), and the torrent is still parked
+        // afterwards -- which is what this line was using the error to say.
+        backend
+            .session
+            .pause(&handle.handle)
+            .await
+            .expect("a parked torrent takes a second pause");
         assert!(
-            backend.session.pause(&handle.handle).await.is_err(),
-            "librqbit refuses to pause a torrent it already has paused"
+            handle.handle.is_paused(),
+            "and it is still parked afterwards"
         );
     }
 
