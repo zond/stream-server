@@ -26,6 +26,26 @@ pub fn payload(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i.wrapping_mul(31) % 251) as u8).collect()
 }
 
+/// [`payload`] with the offset stamped into every kibibyte of it.
+///
+/// For the multi-volume tests: a member spread over three volumes is three
+/// extents of three different files, and a byte served out of the wrong
+/// one is then a wrong *sentence* -- `[offset 000099328]` where
+/// `[offset 000199680]` was asked for -- rather than a subtle byte
+/// somebody has to decode a diff to see. Between the stamps the payload's
+/// own every-251-bytes-differs property catches an offset that is wrong by
+/// less than a kibibyte.
+pub fn signposted(len: usize) -> Vec<u8> {
+    let mut bytes = payload(len);
+    let mut at = 0;
+    while at + 20 <= len {
+        let stamp = format!("[offset {at:09}]");
+        bytes[at..at + stamp.len()].copy_from_slice(stamp.as_bytes());
+        at += 1024;
+    }
+    bytes
+}
+
 /// Standard reflected CRC-32 (ISO-HDLC / zlib), as both RAR generations
 /// store for headers and data. Table-less so the fixture pulls in nothing.
 pub fn crc32(data: &[u8]) -> u32 {

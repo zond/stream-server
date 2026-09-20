@@ -7,6 +7,12 @@
 
 use stream_server::{ServerAuth, ServerConfig, ServerHandle, TorrentListenPort};
 
+/// The hand-built RAR archives (see the module), shared with
+/// `tests/archive.rs` and the translator's own unit tests.
+#[cfg(feature = "rar")]
+#[path = "support/rar_fixtures.rs"]
+mod rar_fixtures;
+
 /// Client builder that sends the server's bearer token on every request --
 /// every control route requires it, and every server has one.
 fn bearer_client_builder(handle: &ServerHandle) -> reqwest::blocking::ClientBuilder {
@@ -4470,6 +4476,217 @@ fn a_stored_member_in_a_torrent_is_served_without_an_extraction() -> anyhow::Res
     assert!(
         !cache_root.join(".archives").exists(),
         "the translated path wrote under the cache root: {:?}",
+        archive_extractions(&cache_root)
+    );
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// A film inside a three-volume RAR set, as the volumes and the member
+/// name a test asserts against.
+///
+/// `RAR_SET_VOLUME_BYTES` of member data per volume and a film of four
+/// times that: `rar5_volumes` splits it into three, so the film is three
+/// extents of three different files of the torrent.
+#[cfg(feature = "rar")]
+const RAR_SET_MEMBER: &str = "videos/film.bin";
+#[cfg(feature = "rar")]
+const RAR_SET_FILM_LEN: usize = 256 * 1024;
+#[cfg(feature = "rar")]
+const RAR_SET_VOLUME_BYTES: usize = 100_000;
+
+/// A server whose torrent holds `volumes` of a RAR set, named
+/// `film.part1.rar`, `film.part2.rar`, ... -- but only the ones `keep`
+/// says, so a test can leave a hole in the middle of the set.
+#[cfg(feature = "rar")]
+fn rar_set_server(
+    config_dir: &std::path::Path,
+    cache_dir: &std::path::Path,
+    src: &std::path::Path,
+    keep: &[usize],
+) -> anyhow::Result<(ServerHandle, String, String)> {
+    let film = rar_fixtures::signposted(RAR_SET_FILM_LEN);
+    let volumes = rar_fixtures::rar5_volumes(&[(RAR_SET_MEMBER, &film[..])], RAR_SET_VOLUME_BYTES);
+    assert_eq!(volumes.len(), 3, "the fixture is a three-volume set");
+
+    let content = src.join("Wanted");
+    std::fs::create_dir_all(&content)?;
+    for number in keep {
+        std::fs::write(
+            content.join(format!("film.part{number}.rar")),
+            &volumes[number - 1],
+        )?;
+    }
+    let (torrent, info_hash) = real_torrent(&content);
+
+    let cache_root = resolved(&cache_dir.join("cache"));
+    stream_server::pretend_volume_space(&cache_root, u64::MAX);
+    let handle = stream_server::start(ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.join("config")),
+        cache_dir: Some(cache_root.clone()),
+        // **`None`, not the empty pin record `offline_config` spreads.**
+        // An embedder that keeps a pin record and names nothing in it has
+        // said that nothing is wanted, and the retention owner reclaims a
+        // seeded fixture's pieces about two seconds in -- after which a
+        // read parks for ever, because no peer will ever bring them back
+        // (these torrents are seeded by nobody). The tests around this one
+        // race that timer and win because they are quick; this one asks
+        // for three volumes' worth of ranges and would be flaky. `None` is
+        // "nobody said", which keeps every torrent's data -- and what this
+        // test is about is which bytes a member maps to, not retention.
+        pins: None,
+        ..offline_config()
+    })?;
+    // After the start, never before (see `seed_piece_store_pieces`).
+    seed_piece_store(&cache_root, &torrent, &content);
+    let base = format!("http://{}", handle.http_addr());
+    let client = bearer_client(&handle)?;
+    client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
+        .send()?
+        .error_for_status()?;
+    stats_after_check(&client, &base, &info_hash)?;
+    Ok((handle, base, info_hash))
+}
+
+/// **A film stored across three RAR volumes of one torrent is one file.**
+///
+/// This is what a scene release is: `film.part1.rar`, `film.part2.rar`,
+/// `film.part3.rar` beside each other in a torrent, with the film stored
+/// (not compressed) and split across all three. The URL names **one**
+/// volume -- `torrent:<hash>/film.part1.rar` -- and the rest of the set is
+/// found beside it by the naming rules
+/// (`translators::rar::volume_set`, wired through `Translator::volumes`).
+///
+/// The member is then three extents, one per volume, and what proves the
+/// mapping is a range that spans a volume boundary: its bytes have to be
+/// the film's on both sides of it. The film's every kibibyte states its
+/// own offset, so a part read out of the wrong volume is a wrong sentence.
+/// Nothing is extracted and nothing is written: until this step a RAR in a
+/// torrent was `501`, because the reader took a `std::fs::File`.
+#[cfg(feature = "rar")]
+#[test]
+fn a_stored_film_across_three_rar_volumes_in_a_torrent_is_served_by_range() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let (handle, base, info_hash) =
+        rar_set_server(config_dir.path(), cache_dir.path(), src.path(), &[1, 2, 3])?;
+    let cache_root = resolved(&cache_dir.path().join("cache"));
+    let film = rar_fixtures::signposted(RAR_SET_FILM_LEN);
+    let member = format!("{base}/rar/stream/torrent:{info_hash}%2Ffilm.part1.rar/{RAR_SET_MEMBER}");
+    let anonymous = reqwest::blocking::Client::new();
+
+    // Whole: three volumes' worth of extents, read end to end.
+    let whole = anonymous.get(&member).send()?;
+    assert_eq!(whole.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        whole
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()),
+        Some(RAR_SET_FILM_LEN.to_string().as_str())
+    );
+    assert_eq!(whole.bytes()?.as_ref(), film.as_slice());
+
+    // A range across each boundary between two volumes: 4 KiB centred on
+    // it, which no single-volume mapping can answer correctly.
+    for boundary in [RAR_SET_VOLUME_BYTES, 2 * RAR_SET_VOLUME_BYTES] {
+        let (from, to) = (boundary - 2048, boundary + 2047);
+        let across = anonymous
+            .get(&member)
+            .header(reqwest::header::RANGE, format!("bytes={from}-{to}"))
+            .send()?;
+        assert_eq!(across.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            across
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok()),
+            Some(format!("bytes {from}-{to}/{RAR_SET_FILM_LEN}").as_str())
+        );
+        assert_eq!(
+            across.bytes()?.as_ref(),
+            &film[from..=to],
+            "the bytes across the volume boundary at {boundary}"
+        );
+    }
+
+    // A backwards seek into the **first** volume after reading the third:
+    // the player's index-then-head move, across two volumes of the set.
+    let tail_from = 2 * RAR_SET_VOLUME_BYTES + 4096;
+    let tail = anonymous
+        .get(&member)
+        .header(reqwest::header::RANGE, format!("bytes={tail_from}-"))
+        .send()?;
+    assert_eq!(tail.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(tail.bytes()?.as_ref(), &film[tail_from..]);
+    let back = anonymous
+        .get(&member)
+        .header(reqwest::header::RANGE, "bytes=1024-5119")
+        .send()?;
+    assert_eq!(back.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(back.bytes()?.as_ref(), &film[1024..5120]);
+
+    // A `HEAD` promises what the `GET` delivered, as for a plain file.
+    let head = anonymous.head(&member).send()?;
+    assert_eq!(head.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        head.headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()),
+        Some(RAR_SET_FILM_LEN.to_string().as_str())
+    );
+    assert!(head.bytes()?.is_empty());
+
+    assert!(
+        !cache_root.join(".archives").exists(),
+        "the translated path wrote under the cache root: {:?}",
+        archive_extractions(&cache_root)
+    );
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// **A set with a hole in it is refused, `422`, naming the volume it
+/// wanted.** The torrent holds `film.part1.rar` and `film.part3.rar`, so
+/// the naming rules find a gap in the run before a single header is read
+/// -- and say which file is missing, which is the one thing a viewer can
+/// act on. Serving it as a film with a silent gap where the second
+/// volume's bytes should be is the alternative, and it is not one.
+#[cfg(feature = "rar")]
+#[test]
+fn a_rar_set_in_a_torrent_missing_its_middle_volume_is_refused_by_name() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let (handle, base, info_hash) =
+        rar_set_server(config_dir.path(), cache_dir.path(), src.path(), &[1, 3])?;
+    let cache_root = resolved(&cache_dir.path().join("cache"));
+
+    let refused = reqwest::blocking::Client::new()
+        .get(format!(
+            "{base}/rar/stream/torrent:{info_hash}%2Ffilm.part1.rar/{RAR_SET_MEMBER}"
+        ))
+        .send()?;
+    assert_eq!(refused.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = refused.json()?;
+    assert_eq!(body["refused"], serde_json::json!("malformed"), "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("film.part2.rar")),
+        "the sentence does not name the volume that is missing: {body}"
+    );
+    assert!(
+        !cache_root.join(".archives").exists(),
+        "the refusal wrote under the cache root: {:?}",
         archive_extractions(&cache_root)
     );
 

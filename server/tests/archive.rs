@@ -42,6 +42,13 @@ fn second_content() -> Vec<u8> {
         .collect()
 }
 
+/// The film the multi-volume fixtures put in a set: signposted, so a part
+/// served out of the wrong volume is loud (see [`rar_fixtures::signposted`]).
+#[cfg(feature = "rar")]
+fn signposted_film() -> Vec<u8> {
+    rar_fixtures::signposted(256 * 1024)
+}
+
 /// A 7z archive with two members, as bytes. 7z because `sevenz-rust2` can
 /// write one and is already a dependency.
 fn fixture_7z(dir: &Path) -> Vec<u8> {
@@ -370,8 +377,13 @@ fn rar_bodies() -> HashMap<String, Vec<u8>> {
         ),
     ]);
     // Three volumes: the first holds `first.txt` and the head of the film,
-    // the third its tail (see `RAR_VOLUME_BYTES`).
-    let volumes = rar_fixtures::rar5_volumes(&members, RAR_VOLUME_BYTES);
+    // the third its tail (see `RAR_VOLUME_BYTES`). The film in the *set*
+    // is signposted so a part read out of the wrong volume is loud.
+    let film = signposted_film();
+    let volumes = rar_fixtures::rar5_volumes(
+        &[("first.txt", FIRST_CONTENT), ("videos/film.bin", &film[..])],
+        RAR_VOLUME_BYTES,
+    );
     assert_eq!(volumes.len(), 3, "the fixture is a three-volume set");
     for (at, volume) in volumes.into_iter().enumerate() {
         bodies.insert(format!("/film.part{}.rar", at + 1), volume);
@@ -398,6 +410,34 @@ impl Fixture {
             .post(format!("{}/{prefix}/create", self.base))
             .json(&serde_json::json!({ "urls": [url] }))
             .send()?)
+    }
+
+    /// `POST /{prefix}/create` for a whole set of volumes, in order --
+    /// what stremio-core builds from an addon's `rarUrls`. Only RAR comes
+    /// in sets, so only a build with the feature has a caller.
+    #[cfg(feature = "rar")]
+    fn create_set_for(
+        &self,
+        prefix: &str,
+        urls: &[String],
+    ) -> anyhow::Result<reqwest::blocking::Response> {
+        Ok(reqwest::blocking::Client::new()
+            .post(format!("{}/{prefix}/create", self.base))
+            .json(&serde_json::json!({ "urls": urls }))
+            .send()?)
+    }
+
+    #[cfg(feature = "rar")]
+    fn create_set_key_for(&self, prefix: &str, urls: &[String]) -> anyhow::Result<String> {
+        let response = self.create_set_for(prefix, urls)?;
+        anyhow::ensure!(
+            response.status() == reqwest::StatusCode::OK,
+            "create answered {}: {}",
+            response.status(),
+            response.text()?
+        );
+        let body: serde_json::Value = response.json()?;
+        Ok(body["key"].as_str().expect("a key").to_string())
     }
 
     fn create_key_for(&self, prefix: &str, url: &str) -> anyhow::Result<String> {
@@ -977,6 +1017,202 @@ fn a_stored_rar_member_behind_a_link_is_served_by_range_and_nothing_is_written()
         "the translated path wrote under the cache root: {:?}",
         fixture.scratch_files()
     );
+    fixture.finish()
+}
+
+/// The bytes `member` answers for `range`, asserted to be a `206` of
+/// exactly that range.
+#[cfg(feature = "rar")]
+fn ranged(
+    client: &reqwest::blocking::Client,
+    member: &str,
+    range: std::ops::Range<usize>,
+    total: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let response = client
+        .get(member)
+        .header(
+            reqwest::header::RANGE,
+            format!("bytes={}-{}", range.start, range.end - 1),
+        )
+        .send()?;
+    anyhow::ensure!(
+        response.status() == reqwest::StatusCode::PARTIAL_CONTENT,
+        "{range:?} answered {}",
+        response.status()
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok()),
+        Some(format!("bytes {}-{}/{total}", range.start, range.end - 1).as_str()),
+        "{range:?}"
+    );
+    Ok(response.bytes()?.to_vec())
+}
+
+/// Where the film's bytes cross from one volume of the fixture set into
+/// the next. The first volume spends `FIRST_CONTENT` of its room on
+/// `first.txt` before the film starts, so every boundary is that much
+/// earlier in the film than the volume size (see `rar5_volumes`).
+#[cfg(feature = "rar")]
+fn volume_boundaries() -> [usize; 2] {
+    [
+        RAR_VOLUME_BYTES - FIRST_CONTENT.len(),
+        2 * RAR_VOLUME_BYTES - FIRST_CONTENT.len(),
+    ]
+}
+
+/// **A stored film across three volumes behind three links is one file.**
+///
+/// This is the ordinary RAR case and the one this server could not do at
+/// all until now: `rarUrls` is a list of volumes, and the film inside is a
+/// *part* of each of them. The member is three extents -- `(volume 0,
+/// ..)`, `(volume 1, ..)`, `(volume 2, ..)` -- and what proves the mapping
+/// is that a range spanning a volume boundary comes back as the film's own
+/// bytes on both sides of it. The content is signposted with its own
+/// offsets, so reading a part out of the wrong volume is a wrong sentence
+/// and not a subtle byte.
+///
+/// Nothing is downloaded: until this step `/rar/create` with several URLs
+/// answered `501`, and with one it fetched the whole archive into
+/// `.archives` first.
+#[cfg(feature = "rar")]
+#[test]
+fn a_stored_film_across_three_rar_volumes_behind_links_is_served_by_range() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let client = reqwest::blocking::Client::new();
+    let urls: Vec<String> = (1..=3)
+        .map(|volume| fixture.origin.url(&format!("/film.part{volume}.rar")))
+        .collect();
+    let key = fixture.create_set_key_for("rar", &urls)?;
+    let member = format!("{}/rar/stream/{key}/videos/film.bin", fixture.base);
+    let expected = signposted_film();
+
+    // Whole, a tail range, a range seeked backwards to, and a `HEAD`.
+    assert_served_by_range(&client, &member, &expected)?;
+
+    // And the mapping itself: 4 KiB centred on each boundary between two
+    // volumes, which no single-volume mapping can answer correctly.
+    for boundary in volume_boundaries() {
+        let range = boundary - 2048..boundary + 2048;
+        assert_eq!(
+            ranged(&client, &member, range.clone(), expected.len())?,
+            expected[range.clone()],
+            "the bytes across the volume boundary at {boundary}"
+        );
+    }
+    // A range wholly inside the last volume: the extent's own offset in
+    // volume 3 is not the film's offset, and a translator that confused
+    // the two would serve the head of the volume here.
+    let tail = volume_boundaries()[1] + 4096..volume_boundaries()[1] + 8192;
+    assert_eq!(
+        ranged(&client, &member, tail.clone(), expected.len())?,
+        expected[tail],
+        "a range inside the third volume"
+    );
+
+    assert!(
+        !fixture.scratch_dir.exists(),
+        "the translated path wrote under the cache root: {:?}",
+        fixture.scratch_files()
+    );
+    fixture.finish()
+}
+
+/// **A set with a hole in it is refused, `422`, naming the volume it
+/// wanted** -- and not served as a film with a silent gap where the
+/// missing volume's bytes should be. The volumes state their own number,
+/// so the third handed over as the second is caught before any member is
+/// named.
+#[cfg(feature = "rar")]
+#[test]
+fn a_rar_set_missing_its_middle_volume_is_refused_as_malformed() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let urls = vec![
+        fixture.origin.url("/film.part1.rar"),
+        fixture.origin.url("/film.part3.rar"),
+    ];
+    let response = fixture.create_set_for("rar", &urls)?;
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = response.json()?;
+    assert_eq!(body["refused"], "malformed", "{body}");
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("volume 3") && message.contains("volume 2"),
+        "the sentence does not name the volume that is missing: {body}"
+    );
+    assert!(
+        !fixture.scratch_dir.exists(),
+        "the refusal wrote under the cache root: {:?}",
+        fixture.scratch_files()
+    );
+    fixture.finish()
+}
+
+/// **A session is named by its whole volume list, not by its first
+/// volume.** Two sets can share a `.part1.rar` -- the same release
+/// re-uploaded, a repack -- and a session found by the first URL alone
+/// would answer the set that was asked for with the index of the set that
+/// was created, which is one film's extents over another film's bytes.
+/// Here the second create names a set that is missing a volume, and has to
+/// be refused rather than handed the first set's index.
+#[cfg(feature = "rar")]
+#[test]
+fn a_set_is_found_by_every_volume_and_not_by_its_first() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let whole: Vec<String> = (1..=3)
+        .map(|volume| fixture.origin.url(&format!("/film.part{volume}.rar")))
+        .collect();
+    let key = fixture.create_set_key_for("rar", &whole)?;
+
+    // Same first volume, a different set after it.
+    let holed = vec![whole[0].clone(), whole[2].clone()];
+    let response = fixture.create_set_for("rar", &holed)?;
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "the shorter set was answered with the whole set's index"
+    );
+
+    // And the first session is untouched: it still serves its own film.
+    let member = format!("{}/rar/stream/{key}/videos/film.bin", fixture.base);
+    let client = reqwest::blocking::Client::new();
+    let expected = signposted_film();
+    assert_eq!(
+        client.get(&member).send()?.bytes()?.as_ref(),
+        expected.as_slice()
+    );
+    fixture.finish()
+}
+
+/// **Every volume of a set is checked for being a web address, not just
+/// the first.** This route is open to any loopback caller -- on Android,
+/// every app on the device -- and a set is read whole, so a local path in
+/// the second entry of `rarUrls` would be read as a volume of it.
+#[cfg(feature = "rar")]
+#[test]
+fn a_local_path_anywhere_in_a_volume_list_is_refused() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    for urls in [
+        vec![
+            fixture.origin.url("/film.part1.rar"),
+            "/etc/passwd".to_string(),
+        ],
+        vec![
+            fixture.origin.url("/film.part1.rar"),
+            fixture.origin.url("/film.part2.rar"),
+            "file:///etc/passwd".to_string(),
+        ],
+    ] {
+        let response = fixture.create_set_for("rar", &urls)?;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{urls:?}"
+        );
+    }
     fixture.finish()
 }
 

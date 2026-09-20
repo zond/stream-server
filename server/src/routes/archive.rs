@@ -664,9 +664,28 @@ async fn create_session_internal(
     }
 }
 
-/// `/{zip|tar|tgz|rar}/create`: every URL becomes a [`ProxySource`], the
-/// translator indexes them, and what is remembered under the key is the
-/// index -- no file, nothing on disk, nothing to sweep but memory.
+/// How a set of volumes is named as one session.
+///
+/// **Every** URL, and not the first: `rarUrls` is a list of volumes, two
+/// sets can share a `.part1.rar` and differ after it, and a session found
+/// by the first URL alone would answer one set's index over the other's
+/// bytes. A newline cannot occur inside a URL, so the join is unambiguous.
+/// A single-volume archive's origin is its URL, exactly as before.
+fn set_origin(urls: &[String]) -> String {
+    urls.join("\n")
+}
+
+/// `/{zip|tar|rar}/create`: every URL becomes a [`ProxySource`], the
+/// translator indexes them **in the order they were given**, and what is
+/// remembered under the key is the index -- no file, nothing on disk,
+/// nothing to sweep but memory.
+///
+/// The list is the volume list. For RAR that is the ordinary case: from an
+/// addon, `rarUrls` *is* `.part1.rar`, `.part2.rar`, ... in order, and the
+/// extents a member is made of name the volume each part is in
+/// (`docs/translated-sources.md` §2.2). A format that does not come in
+/// sets reads `sources[0]` and says so about the rest, which is what every
+/// translator but RAR does.
 async fn create_translated(
     state: &AppState,
     translator: &dyn Translator,
@@ -674,39 +693,31 @@ async fn create_translated(
     method: Method,
     payload: ArchiveCreateRequest,
 ) -> Response {
-    if payload.urls.len() > 1 {
-        // A set of volumes is RAR's case, and step 3 of the design is
-        // where it lands. One archive in several parts is not a zip or a
-        // tar.
-        tracing::warn!(
-            key = %key,
-            url_count = payload.urls.len(),
-            "multi-volume archive compatibility requested but not implemented"
-        );
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            "Multi-volume archive streaming is not implemented",
-        )
-            .into_response();
-    }
     let Some(url) = payload.urls.first() else {
         return (StatusCode::BAD_REQUEST, "No archive URL provided").into_response();
     };
-    // Only what the route is named for: an archive at a web address. This
+    // Only what the route is named for: archives at web addresses. This
     // route is open to any loopback caller -- on Android, every app on the
     // device, and any page in a browser on it -- so a URL that was taken
     // as a local path served the members of any archive this process could
-    // read, its own private storage included.
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
+    // read, its own private storage included. Every volume is checked, not
+    // just the first: a set is read whole, so a local path anywhere in the
+    // list would be read.
+    if !payload
+        .urls
+        .iter()
+        .all(|url| url.starts_with("http://") || url.starts_with("https://"))
+    {
         return (StatusCode::BAD_REQUEST, "Failed to resolve archive URL").into_response();
     }
+    let origin = set_origin(&payload.urls);
     // A key the caller chose (`/{fmt}/create/{key}`) may name a session
     // that already exists, and replacing it points every later
     // `/{fmt}/stream/{key}/...` at a different archive: the player that
     // was reading one file seeks and reads another's bytes. A repeat of
     // the same create is the ordinary case (a re-play sends it again).
     if let Some(existing) = state.translated_archives.get(&key)
-        && existing.origin() != url.as_str()
+        && existing.origin() != origin
     {
         tracing::warn!(
             key = %key,
@@ -724,7 +735,7 @@ async fn create_translated(
     // should cost neither.
     let indexed = match state
         .translated_archives
-        .find(|session| session.origin() == url.as_str())
+        .find(|session| session.origin() == origin)
     {
         Some(existing) => {
             tracing::info!(
@@ -739,42 +750,50 @@ async fn create_translated(
             (sources.clone(), existing.index().clone())
         }
         None => {
-            let parsed = match url::Url::parse(url) {
-                Ok(parsed) => parsed,
-                Err(error) => {
-                    tracing::warn!(
-                        origin = %util::log_origin(url),
-                        %error,
-                        "the archive URL does not parse"
-                    );
-                    return (StatusCode::BAD_REQUEST, "Failed to resolve archive URL")
-                        .into_response();
-                }
-            };
-            let source = match ProxySource::open(
-                state.proxy_cache.clone(),
-                state.http_addr,
-                parsed,
-                Default::default(),
-            )
-            .await
-            {
-                Ok(source) => source,
-                Err(error) => {
-                    tracing::warn!(
-                        origin = %util::log_origin(url),
-                        %error,
-                        "the archive URL cannot be read by range"
-                    );
-                    return source_error_response(&error);
-                }
-            };
-            let sources: Vec<Arc<dyn ByteSource>> = vec![Arc::new(source)];
+            // One source per volume, in the order they were given: an
+            // `Extent`'s `source` is an index into this list, so a set
+            // probed out of order would serve every part of the film from
+            // the wrong volume.
+            let mut sources: Vec<Arc<dyn ByteSource>> = Vec::with_capacity(payload.urls.len());
+            for url in &payload.urls {
+                let parsed = match url::Url::parse(url) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        tracing::warn!(
+                            origin = %util::log_origin(url),
+                            %error,
+                            "the archive URL does not parse"
+                        );
+                        return (StatusCode::BAD_REQUEST, "Failed to resolve archive URL")
+                            .into_response();
+                    }
+                };
+                let source = match ProxySource::open(
+                    state.proxy_cache.clone(),
+                    state.http_addr,
+                    parsed,
+                    Default::default(),
+                )
+                .await
+                {
+                    Ok(source) => source,
+                    Err(error) => {
+                        tracing::warn!(
+                            origin = %util::log_origin(url),
+                            %error,
+                            "the archive URL cannot be read by range"
+                        );
+                        return source_error_response(&error);
+                    }
+                };
+                sources.push(Arc::new(source));
+            }
             match translator.index(&sources).await {
                 Ok(index) => (sources, index),
                 Err(refusal) => {
                     tracing::warn!(
                         origin = %util::log_origin(url),
+                        volumes = payload.urls.len(),
                         %refusal,
                         "the archive could not be indexed"
                     );
@@ -808,7 +827,7 @@ async fn create_translated(
         .map(|member| member.name.clone());
     state.translated_archives.insert(
         key.clone(),
-        TranslatedSession::new(url.clone(), SessionSources::Held(sources), index, selected),
+        TranslatedSession::new(origin, SessionSources::Held(sources), index, selected),
     );
 
     if method == Method::GET
@@ -865,6 +884,10 @@ async fn create_downloaded(
     method: Method,
     payload: ArchiveCreateRequest,
 ) -> Response {
+    // The one format left on this path is 7z, and a `.7z.001` set is not
+    // something a whole-archive download reads either. The translated
+    // path takes its URL list as the volume list; this one goes with the
+    // download (step 5 of `docs/translated-sources.md`).
     if payload.urls.len() > 1 {
         tracing::warn!(
             key = %key,
@@ -1126,13 +1149,34 @@ async fn session_for(
     let Some((info_hash, path)) = rest.split_once('/') else {
         return Err(Box::new(StatusCode::BAD_REQUEST.into_response()));
     };
-    let source = TorrentFileSource::open(state.engine.clone(), info_hash, path)
+    // The named file may be one volume of a set, and for RAR it usually
+    // is: the rest of the set is the files beside it in the torrent, and
+    // the translator's own naming rules say which and in what order
+    // (`translators::rar::volume_set`). A format that does not come in
+    // sets answers with the one file, which is the trait's default.
+    let siblings = TorrentFileSource::file_names(&state.engine, info_hash)
         .await
         .map_err(|error| {
-            tracing::warn!(%info_hash, archive = path, %error, "no such archive in that torrent");
+            tracing::warn!(%info_hash, %error, "no such torrent in this engine");
             Box::new(StatusCode::NOT_FOUND.into_response())
         })?;
-    let sources: Vec<Arc<dyn ByteSource>> = vec![Arc::new(source)];
+    let paths = translator.volumes(path, &siblings).map_err(|refusal| {
+        // A set with a hole in it is `Malformed`, naming the volume it
+        // wanted -- `422`, and said at the index rather than as a short
+        // read in the middle of a film.
+        tracing::warn!(%info_hash, archive = path, %refusal, "the set is not all there");
+        Box::new(refusal_response(&refusal))
+    })?;
+    let mut sources: Vec<Arc<dyn ByteSource>> = Vec::with_capacity(paths.len());
+    for volume in &paths {
+        let source = TorrentFileSource::open(state.engine.clone(), info_hash, volume)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%info_hash, archive = %volume, %error, "no such archive in that torrent");
+                Box::new(StatusCode::NOT_FOUND.into_response())
+            })?;
+        sources.push(Arc::new(source));
+    }
     let index = translator.index(&sources).await.map_err(|refusal| {
         tracing::warn!(%info_hash, archive = path, %refusal, "the archive could not be indexed");
         Box::new(refusal_response(&refusal))
@@ -1144,7 +1188,7 @@ async fn session_for(
             key,
             SessionSources::Torrent {
                 info_hash: info_hash.to_string(),
-                path: path.to_string(),
+                paths,
             },
             index,
             None,
@@ -1164,14 +1208,20 @@ async fn sources_for(
 ) -> Result<Vec<Arc<dyn ByteSource>>, Box<Response>> {
     match session.sources() {
         SessionSources::Held(sources) => Ok(sources.clone()),
-        SessionSources::Torrent { info_hash, path } => {
-            let source = TorrentFileSource::open(state.engine.clone(), info_hash, path)
-                .await
-                .map_err(|error| {
-                    tracing::warn!(%info_hash, archive = %path, %error, "the torrent this archive is in is gone");
-                    Box::new(StatusCode::NOT_FOUND.into_response())
-                })?;
-            Ok(vec![Arc::new(source)])
+        SessionSources::Torrent { info_hash, paths } => {
+            // Every volume, in the order the index was read in: an
+            // `Extent`'s `source` indexes this list.
+            let mut sources: Vec<Arc<dyn ByteSource>> = Vec::with_capacity(paths.len());
+            for path in paths {
+                let source = TorrentFileSource::open(state.engine.clone(), info_hash, path)
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(%info_hash, archive = %path, %error, "the torrent this archive is in is gone");
+                        Box::new(StatusCode::NOT_FOUND.into_response())
+                    })?;
+                sources.push(Arc::new(source));
+            }
+            Ok(sources)
         }
     }
 }

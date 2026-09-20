@@ -22,10 +22,14 @@ use std::sync::Arc;
 /// One container, indexed: where its bytes come from, what is in it, and
 /// which member the `/create` that made it chose.
 pub struct TranslatedSession {
-    /// What this was made from -- a URL, or a `torrent:<hash>/<path>` key.
-    /// Two creates naming the same origin are the same session's business;
-    /// one naming a different origin under a key already in use is
-    /// refused, because every `/{fmt}/stream/{key}/...` after it would
+    /// What this was made from -- the volume list, or a
+    /// `torrent:<hash>/<path>` key. A set is **every** volume's URL and
+    /// not the first alone (`routes::archive::set_origin`): two sets can
+    /// share a `.part1.rar` and differ after it, and a session found by
+    /// the first URL would then serve one set's index over another's
+    /// bytes. Two creates naming the same origin are the same session's
+    /// business; one naming a different origin under a key already in use
+    /// is refused, because every `/{fmt}/stream/{key}/...` after it would
     /// read a different archive (`routes::archive`).
     origin: String,
     /// Where the container's bytes come from -- see [`SessionSources`].
@@ -99,7 +103,9 @@ pub enum SessionSources {
     /// cache owns nothing and registers nothing, so keeping the source is
     /// keeping a URL, a length and a validator.
     Held(Vec<Arc<dyn ByteSource>>),
-    /// A file of a torrent, **opened per read and dropped with the body**.
+    /// The files of a torrent the container is made of -- one for an
+    /// ordinary archive, the volumes in order for a set -- **opened per
+    /// read and dropped with the body**.
     ///
     /// A `TorrentFileSource` registers a stream on its torrent for as long
     /// as it lives (`sources::torrent::TorrentMemberStream`), and that
@@ -107,7 +113,16 @@ pub enum SessionSources {
     /// one for the session's ten idle minutes and the reconciler cannot
     /// stop a torrent the viewer left ten minutes ago. So the session
     /// keeps the *index*, which is what was expensive to read, and each
-    /// body opens its own source -- which is a file lookup and a
-    /// reconcile, not a fetch.
-    Torrent { info_hash: String, path: String },
+    /// body opens its own sources -- which is a file lookup and a
+    /// reconcile per volume, not a fetch.
+    ///
+    /// The **paths** are kept and not the file indices, because the index
+    /// list is the torrent's and a session outlives a restart of it; they
+    /// are what `Translator::volumes` answered when the index was read, so
+    /// a body reopens the same volumes in the same order the extents were
+    /// computed against.
+    Torrent {
+        info_hash: String,
+        paths: Vec<String>,
+    },
 }
