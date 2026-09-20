@@ -1,8 +1,9 @@
 # Known issues, redundancy and stale docs
 
 Last checked 2026-09-16, against the tree at `bd48aac`. What was checked
-on that date: the **open list**, which was empty then and carries one
-entry now (the proxy detector's phantom streams, found 2026-09-20); the
+on that date: the **open list**, which was empty then, took one entry on
+2026-09-20 (the proxy detector's phantom streams) and is empty again, that
+entry having been closed the same day; the
 **standing hazards**,
 each re-run rather than re-read (`librqbit` resolves to one source in this
 repo's, rqbit's and xtremio's lock files; CI is green on every pushed
@@ -121,58 +122,9 @@ Still stale:
 
 ### Open in this repo
 
-Each entry carries its plan, agreed with zond on 2026-09-15. Order is the
-order to do them in.
-
-- **A proxied play-through is counted as dozens of consumers, and the
-  cache settles over its cap** (found 2026-09-20 diagnosing review row
-  #100; the CI flake in
-  `server/tests/proxy.rs a_seek_back_inside_the_window_is_served_from_disk_and_one_outside_it_is_not`
-  is this and nothing else).
-
-  A read joins the stream that is in the same unbroken run of held pieces
-  (`enginefs::retention::streams::FileStreams::observe_in`), and a
-  proxied response reports each chunk as it goes past while the chunk is
-  written only once it is whole -- so read after read begins in a piece no
-  listing holds, is `Rejected::Outside`, and starts a stream of its own.
-  Measured on one 16 MiB sequential play-through of one URL under an 8 MiB
-  cap: **32 live streams**, each granted its `FLOOR_PIECES` of window that
-  no unlink may touch and none of them dormant for `STREAM_DORMANT`
-  (30 s). Their floors together cover more than the whole allowance, so
-  the pass computes an overhang -- `over = 1 835 008`, `how_many = 7` --
-  and `coldest_of` returns nothing at all, because `kept` already contains
-  every piece `held` does. The cache then sits at 38-41 chunks against an
-  allowance of 31 for the life of the stream, and no later pass can bring
-  it down: nothing moves the equilibrium, since the windows sit where the
-  data is. Each reclaim that does land fragments the run further, which
-  starts more streams, which is why it is self-reinforcing.
-
-  Two consequences, one already costing us:
-
-  * A relayed stream holds up to twice its published budget on the disk.
-    On the device the budget exists for that is the difference the floor
-    was sized to keep.
-  * The test above asks for a chunk below the playhead that the cache gave
-    up. Locally one run in sixty reaches that point with the cache holding
-    all 64 chunks it played; on a runner it has stuck there three times
-    (2026-09-16, and twice on 2026-09-19/20, Linux and Windows). It is a
-    true witness and not a flake: it now says which precondition failed
-    rather than blaming the reclaim.
-
-  **Not fixed here, because the obvious fix moves the sharing.** Joining a
-  read to its own reader's stream when it continues exactly where that
-  stream last ended -- the same reader id, `stream.last.end ==
-  read.begin`, not dormant -- collapses the 32 streams to 1, settles the
-  proxy cache at exactly 31 chunks, and makes the test deterministic (33
-  reclaimed chunks on 80 of 80 runs, against a spread of 0 to 33 before).
-  It also empties the torrent's committed set:
-  `a_restart_out_of_error_has_its_hold_back_issued_again_by_the_next_pass`
-  goes from `{5, 8, 9}` to `{}` after 4 MiB of play, and from
-  `{5, 8, 9, 18, 20, 26, 29, 44}` to `{}` after 12 MiB -- so under a tight
-  budget the sharing half of a `Shape::Split` would never fill, and what
-  fills it today is the phantom windows. Which of those two is right is a
-  decision about what we announce to peers, and it wants zond. The patch
-  is kept out of the tree deliberately.
+Nothing. The one entry this list carried -- the proxy detector's phantom
+streams, found 2026-09-20 -- was closed the same day; see **Closed
+2026-09-20** below.
 
 ### Standing hazards
 
@@ -257,6 +209,53 @@ order to do them in.
 * **Never `git checkout <file>` to undo an experiment.** It restores from
   HEAD, not from the working tree, so it discards everything uncommitted in
   that file. Copy the file to the scratchpad and copy it back instead.
+
+## Closed 2026-09-20
+
+- **A proxied play-through is counted as dozens of consumers, and the
+  cache settles over its cap** (found 2026-09-20 diagnosing review row
+  #100; the CI flake in
+  `server/tests/proxy.rs a_seek_back_inside_the_window_is_served_from_disk_and_one_outside_it_is_not`
+  was this and nothing else).
+
+  A read joined the stream that was in the same unbroken run of held
+  pieces, and a proxied response reports each chunk as it goes past while
+  the chunk is written only once it is whole -- so read after read began in
+  a piece no listing held, was `Rejected::Outside`, and started a stream of
+  its own. Measured on one 16 MiB sequential play-through of one URL under
+  an 8 MiB cap: **32 live streams**, each granted its `FLOOR_PIECES` of
+  window that no unlink may touch. Their floors together covered more than
+  the whole allowance, so the pass computed an overhang -- `over =
+  1 835 008`, `how_many = 7` -- and `coldest_of` returned nothing at all,
+  because `kept` already contained every piece `held` did. The cache sat at
+  38-41 chunks against an allowance of 31 for the life of the stream, and
+  each reclaim that did land fragmented the run further, which started more
+  streams.
+
+  **Fixed on both counts, which zond decided after reading the
+  diagnosis.** A read that begins exactly where its own reader's last read
+  ended is that reader carrying on, whatever the listing holds
+  (`FileStreams::observe_in`): one body is one consumer, the proxy cache
+  settles at exactly its 31-chunk allowance, and the test above reclaimed
+  33 chunks on 30 of 30 runs. A read *past a hole* continues nothing, so
+  the torrent side is unchanged -- that is still a seek and still a
+  consumer of its own.
+
+  What that alone did to the sharing was not a trade but a sampling
+  weakness it exposed: a drawn piece was committed only when a **pass**
+  found it in a listing it takes every couple of seconds, so a drawn piece
+  fetched and given back between two passes was never announced, and how
+  much a session shared came out of how much the cache happened to be
+  holding when a pass looked -- which is exactly what the first fix
+  reduces. `a_restart_out_of_error_has_its_hold_back_issued_again_by_the_next_pass`
+  went from `{5, 8, 9}` to `{}` for that reason. So a drawn piece is now
+  committed on the **completion event** (`PieceStore::complete_piece` ->
+  `StoreRegistry`'s `PieceCompleted` watcher -> `Retention::commit_completed`,
+  which takes the file's turn off librqbit's path and announces the one
+  piece), and what we share no longer depends on the window size or the
+  pass timing. The pass still commits what the event missed, still vetoes a
+  committed piece from every reclaim, and a piece a pass has doomed is
+  refused here as it is there.
 
 ## Closed 2026-09-15
 
