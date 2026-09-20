@@ -714,6 +714,9 @@ pub struct BackendEngineFS<B: TorrentBackend> {
 #[derive(Clone)]
 struct EngineParts {
     clock: Clock,
+    /// Where a new engine registers what is to hear this torrent's piece
+    /// completions; see `Engine::completions`.
+    registry: Arc<crate::piece_store::StoreRegistry>,
     volumes: Arc<crate::reconcile::Volumes>,
     budget: Arc<crate::retention::RetentionBudget>,
     live: Arc<crate::retention::live::Live>,
@@ -1078,6 +1081,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             if restored_unsettled {
                 engine.mark_unsettled();
             }
+            // What commits a drawn piece as it completes, rather than when
+            // a pass next samples the listing; see
+            // `Engine::completions`.
+            registry.watch(&hash, engine.completions());
             engines_map.insert(hash.clone(), Arc::new(engine));
         }
 
@@ -2104,6 +2111,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     fn engine_parts(&self) -> EngineParts {
         EngineParts {
             clock: self.clock,
+            registry: self.registry.clone(),
             volumes: self.volumes.clone(),
             budget: self.budget.clone(),
             live: self.live.clone(),
@@ -2157,6 +2165,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             parts.live,
             parts.pins_unknown,
         ));
+        // What commits a drawn piece as it completes, rather than when a
+        // pass next samples the listing; see `Engine::completions`. Before
+        // the engine is visible, so no piece of a torrent this process is
+        // playing completes unwatched.
+        parts.registry.watch(&info_hash, engine.completions());
         let dormant = parts
             .dormant_pins
             .lock()

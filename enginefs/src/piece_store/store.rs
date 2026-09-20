@@ -954,6 +954,24 @@ impl Inner {
             // always was before there was one.
             None => commit.run(),
         }
+        // **The piece is ours, and whatever shares it wants to know now.**
+        // Here, with the held bit, because the bit is what "we hold it"
+        // means everywhere else: the retention pass reads it out of the
+        // listing this set answers, and a piece that is in it is readable,
+        // whole and checked -- from its staged copy until the rename above
+        // lands, which is the promise this method's return already makes to
+        // librqbit. Said after the commit is queued rather than before, so
+        // the flush is under way by the time anybody is told; said whether
+        // or not it lands, because a commit that fails clears the bit again
+        // and the next pass withdraws what went out under it.
+        //
+        // Cheap by contract ([`PieceCompleted`]): a map lookup and a
+        // spawn. This is a peer's `block_in_place`.
+        if let Some(registration) = &self.registration {
+            registration
+                .registry
+                .completed(&registration.info_hash, piece);
+        }
         // An earlier commit that failed, a commit made in place that did,
         // or one that failed while this waited for room: librqbit's to hear
         // about now, where it is fatal to the torrent.

@@ -55,11 +55,40 @@ pub struct StoreRegistry {
     /// the process goes through a registered store.
     root: StoreRoot,
     by_hash: Mutex<HashMap<String, Weak<Inner>>>,
+    /// Who to tell when a store under this root accepts a piece, by the
+    /// hash it is the watcher for. See [`PieceCompleted`].
+    ///
+    /// `Weak`, like a registration: the watcher is the torrent's engine,
+    /// and an engine that has gone leaves an entry the next completion of
+    /// its hash drops. Keyed by hash rather than by store, so the fresh
+    /// store a restart out of error builds is watched by the same engine
+    /// without re-registering.
+    watchers: Mutex<HashMap<String, Weak<dyn PieceCompleted>>>,
     /// The last epoch handed out, to any store under this root. One counter
     /// rather than one per hash because it is only ever compared with
     /// itself, and a hash that has had two stores is what it exists to
     /// tell apart -- see [`Self::insert`].
     epochs: AtomicU64,
+}
+
+/// Told when a piece of one torrent has been accepted: whole, hash-checked,
+/// and held by the store from that instant.
+///
+/// **The one event that says a drawn piece is ours.** What may be shared is
+/// drawn when the policy is built and committed as we are found to hold it
+/// (`crate::piece_store::policy`), and "found to hold it" used to mean a
+/// retention pass finding it in a listing it takes every couple of seconds
+/// -- so a drawn piece fetched and given back between two passes was never
+/// announced, and what a session shared came out of what the cache happened
+/// to be holding when a pass ran.
+///
+/// **Called on librqbit's own path**, inside a peer connection's
+/// `block_in_place` and concurrent across peers, so an implementation takes
+/// no lock a slow reader holds, does no I/O, and hands the work on rather
+/// than doing it here.
+pub trait PieceCompleted: Send + Sync + 'static {
+    /// Piece `piece` of the torrent this was registered under is held.
+    fn piece_completed(self: Arc<Self>, piece: u32);
 }
 
 /// What [`StoreRegistry::delete`] did.
@@ -87,8 +116,45 @@ impl StoreRegistry {
         Self {
             root,
             by_hash: Mutex::new(HashMap::new()),
+            watchers: Mutex::new(HashMap::new()),
             epochs: AtomicU64::new(0),
         }
+    }
+
+    /// Tell `watcher` about every piece the store for `info_hash` accepts,
+    /// for as long as the watcher is alive.
+    ///
+    /// One watcher per hash -- the torrent's engine, which is the thing
+    /// that has a retention owner to commit into -- so a second registration
+    /// replaces the first, as a second store registration does.
+    pub fn watch(&self, info_hash: &str, watcher: Weak<dyn PieceCompleted>) {
+        self.watchers
+            .lock()
+            .insert(info_hash.to_ascii_lowercase(), watcher);
+    }
+
+    /// A piece of `info_hash` has been accepted: whole, hash-checked and
+    /// held. From [`super::store::PieceStore`]'s completion and nowhere
+    /// else.
+    ///
+    /// The map lock is dropped before the watcher is called: this runs on
+    /// librqbit's own completion path, and a watcher that took its time
+    /// under this lock would hold up every other torrent's completions too.
+    /// A watcher that has gone takes its entry with it here, which is the
+    /// only pruning the map needs -- an engine outlives a piece.
+    pub(super) fn completed(&self, info_hash: &str, piece: u32) {
+        let key = info_hash.to_ascii_lowercase();
+        let watcher = {
+            let mut watchers = self.watchers.lock();
+            match watchers.get(&key).and_then(Weak::upgrade) {
+                Some(watcher) => watcher,
+                None => {
+                    watchers.remove(&key);
+                    return;
+                }
+            }
+        };
+        watcher.piece_completed(piece);
     }
 
     /// The root the registered stores are under.
@@ -354,6 +420,45 @@ mod tests {
 
     fn held_of(registry: &StoreRegistry) -> Option<BTreeSet<u32>> {
         registry.held(HASH).map(|held| held.in_range(0..4))
+    }
+
+    /// **A piece the store accepts reaches the torrent's watcher**, which is
+    /// what commits a drawn piece on the event rather than on the next
+    /// retention pass's reading of a listing.
+    ///
+    /// And a watcher that has gone -- the torrent's engine dropped -- takes
+    /// its registration with it, so a later completion finds nothing and
+    /// leaves nothing behind.
+    #[test]
+    fn a_completed_piece_reaches_the_torrents_watcher() {
+        struct Heard(Mutex<Vec<u32>>);
+        impl PieceCompleted for Heard {
+            fn piece_completed(self: Arc<Self>, piece: u32) {
+                self.0.lock().push(piece);
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = registry(tmp.path());
+        let store = store_under(&registry);
+        std::fs::create_dir_all(store.dir()).unwrap();
+        store.init_for_tests().unwrap();
+
+        let heard = Arc::new(Heard(Mutex::new(Vec::new())));
+        registry.watch(HASH, Arc::downgrade(&heard) as Weak<dyn PieceCompleted>);
+        write_piece(&store, 1);
+        write_piece(&store, 2);
+        assert_eq!(
+            *heard.0.lock(),
+            vec![1, 2],
+            "the store accepted two pieces and said so"
+        );
+
+        // A hash nothing watches is nobody's business, and a watcher that
+        // has gone is forgotten at the completion that finds it gone.
+        drop(heard);
+        write_piece(&store, 0);
+        assert!(registry.watchers.lock().is_empty());
     }
 
     /// The store the factory makes is the one the registry answers for, and

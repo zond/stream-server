@@ -92,6 +92,15 @@
 //! learn we have those bytes *while* the viewer is watching, which is when the
 //! upload switch lets us serve them.
 //!
+//! **And the moment is the completion, not the next pass.** It was the pass
+//! for as long as "found to hold it" was a listing sampled every couple of
+//! seconds: a drawn piece fetched and given back between two passes was
+//! never announced at all, and how much a session shared came out of how
+//! much the cache happened to be holding when a pass looked -- which is a
+//! property of the window and the tick and not of the draw.
+//! [`RetentionPolicy::commit_drawn`] is what the completion calls, and the
+//! pass still commits whatever it finds held that the event missed.
+//!
 //! **Nothing once committed is ever un-announced or reclaimed**, and that is
 //! now a property of the design rather than a consequence of a capacity never
 //! being reached. There is no un-have in BitTorrent: hiding a piece changes
@@ -702,6 +711,47 @@ impl RetentionPolicy {
         // Chosen as well as committed: a piece we announce is one nothing
         // may reclaim, and [`Self::advance`] reads that off the chosen set.
         next.chosen.extend(next.committed.iter().copied());
+    }
+
+    /// **Commit `piece`, which we have just been found to hold**, and say
+    /// whether it joined the set.
+    ///
+    /// The same rule [`Self::advance`] applies to a held piece, asked one
+    /// piece at a time so that the answer does not depend on when a pass
+    /// happens to run. A pass samples the listing every couple of seconds,
+    /// so a drawn piece fetched and given back between two of them was
+    /// never announced at all, and how much a session shared came out of
+    /// how much the cache happened to be holding when a pass looked.
+    /// Completion is the event that says a piece is ours, and this is what
+    /// hears it; see [`crate::retention::owner::Retention::commit_completed`].
+    ///
+    /// The drawn set alone, so [`Shape::Whole`] is untouched: a budget that
+    /// covers the file reclaims nothing, so there is no window for a piece
+    /// to be lost in and nothing for the sampling to miss -- the pass
+    /// commits the whole file as it arrives, as it always did.
+    ///
+    /// The capacity is respected by [`Self::chosen`] being sized from it,
+    /// which is the same thing that bounds `advance`; nothing here can
+    /// commit a piece the draw did not choose.
+    pub fn commit_drawn(&mut self, piece: u32) -> bool {
+        if !self.draws(piece) {
+            return false;
+        }
+        self.committed.insert(piece)
+    }
+
+    /// Whether [`Self::commit_drawn`] would have anything to do for
+    /// `piece`: the draw chose it and it is not committed yet.
+    ///
+    /// Asked before the entity's turn is taken, so that the completion of a
+    /// piece nothing can be done about does not queue behind a retention
+    /// pass to find that out. On the field's film the draw is a few dozen
+    /// pieces of five and a half thousand, so this refuses all but a
+    /// fraction of a percent of the completions outright.
+    pub fn draws(&self, piece: u32) -> bool {
+        self.pieces.contains(&piece)
+            && self.chosen.contains(&piece)
+            && !self.committed.contains(&piece)
     }
 
     /// Decide, for a playhead on `playhead` over the pieces we currently

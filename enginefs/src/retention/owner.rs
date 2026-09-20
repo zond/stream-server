@@ -1733,6 +1733,108 @@ impl<B: Backing> Retention<B> {
             .map(|guard| Claim { guard, about: None })
     }
 
+    /// **A piece the backing has just accepted is ours: commit it if the
+    /// draw chose it, and announce it.** Says whether a peer was told.
+    ///
+    /// The committed set is a draw fixed when the policy is built, and a
+    /// drawn piece is committed the moment we are found to hold it. That
+    /// moment used to be a pass finding it in a listing taken every couple
+    /// of seconds, which made what we share a function of the window and
+    /// the tick: a drawn piece fetched and given back between two passes
+    /// was never announced, and the tighter the budget the less of the draw
+    /// ever filled. This is the same rule asked of the completion itself,
+    /// so what we share stops depending on when a pass happens to run.
+    ///
+    /// **Off the path that told us.** The caller is librqbit's completion
+    /// and may not block, so it hands this to a task; here the entity's
+    /// turn is taken like any other writer of a policy, which is what makes
+    /// a commit and a pass one order instead of two.
+    ///
+    /// What can have happened while this waited for the turn is refused
+    /// rather than raced. A pass that gave the piece back meanwhile has
+    /// **doomed** it, and a doomed piece is never put back into what we
+    /// announce ([`State::doomed`]) -- the pass's own belt, worn here for
+    /// the same reason. A pass that committed it already, or a policy that
+    /// was replaced under it, leaves nothing to commit
+    /// ([`RetentionPolicy::commit_drawn`]); a piece the draw did not choose
+    /// is not ours to announce whatever we hold. The deleters that hold no
+    /// turn -- an unpin, the boot sweep, an `ENOSPC` recovery, none of
+    /// which touches an entity being played -- are answered as they are for
+    /// a piece any pass committed: the next pass finds it committed and no
+    /// longer held, and withdraws it ([`Decision::withdrawn`]).
+    ///
+    /// Committed first and announced after, as the pass does it: the
+    /// commit is what takes the piece out of reach of every reclaim, so
+    /// doing it second would leave a moment in which an announced piece
+    /// could still be taken. An announce the backend refuses leaves a piece
+    /// we keep and do not share, which is the pass's answer to the same
+    /// failure.
+    pub async fn commit_completed(&self, piece: u32) -> bool {
+        if B::SHARE == Share::Nothing {
+            return false;
+        }
+        let Some(key) = self.drawn_in(piece) else {
+            return false;
+        };
+        let Some(entity) = self.lookup(&key) else {
+            return false;
+        };
+        // No owner lock held across the turn (rule 3), and the policy is
+        // asked again under it: the key above is a reading the wait for the
+        // turn may have made stale.
+        let Some(mut claim) = self.turn(&key).await else {
+            return false;
+        };
+        if !entity.state.lock().commit_drawn(&mut claim.guard, piece) {
+            return false;
+        }
+        match self
+            .backing
+            .advertise(piece..piece.saturating_add(1), true)
+            .await
+        {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    piece,
+                    error = %format!("{error:#}"),
+                    "could not announce a drawn piece as it completed; it stays ours and unshared"
+                );
+                false
+            }
+        }
+    }
+
+    /// The key of the entity whose standing policy has drawn `piece` and
+    /// not committed it yet, or `None` -- which is every piece of every
+    /// file nothing is bounding, and all but a fraction of a percent of
+    /// what a bounded one completes.
+    ///
+    /// **Asked before the turn**, so that the completions nothing can be
+    /// done about do not queue behind a retention pass to find that out. It
+    /// is a reading and not a decision: the turn is taken after it and the
+    /// policy is asked again under it
+    /// ([`RetentionPolicy::commit_drawn`]).
+    ///
+    /// L1 and one L2 read per entity, no I/O: the shape [`Self::holdings`]
+    /// has, without copying a committed set out per piece. A torrent has
+    /// one policy standing at a time, so this is a walk of one or two
+    /// entities.
+    fn drawn_in(&self, piece: u32) -> Option<B::Key> {
+        let entities = self.entities.lock();
+        entities
+            .iter()
+            .find(|(_, entity)| {
+                entity
+                    .state
+                    .lock()
+                    .installed
+                    .as_ref()
+                    .is_some_and(|installed| installed.policy.draws(piece))
+            })
+            .map(|(key, _)| key.clone())
+    }
+
     /// One pass over `key`, with its turn in hand and the [`Mode`] its
     /// driver decided.
     ///
@@ -2979,6 +3081,24 @@ impl<B: Backing> State<B> {
         Some((decision, installed.policy.clone()))
     }
 
+    /// Commit `piece` into what the standing policy announces, now that the
+    /// backing holds it, and say whether it joined the set. Under the turn;
+    /// see [`Retention::commit_completed`].
+    ///
+    /// A piece this state's last pass doomed is refused: the runs it
+    /// doomed are on their way off the disk, and putting one back into what
+    /// we announce is the advertise-then-refuse the whole policy exists to
+    /// avoid. It is the same check the pass's own advertise makes of
+    /// `decision.committed`, made here for the same reason.
+    fn commit_drawn(&mut self, _turn: &mut Turn, piece: u32) -> bool {
+        if self.doomed.iter().any(|run| run.contains(&piece)) {
+            return false;
+        }
+        self.installed
+            .as_mut()
+            .is_some_and(|installed| installed.policy.commit_drawn(piece))
+    }
+
     /// The epoch the standing policy's hold-back was issued under, or
     /// `None` when no pass has read one; asked only where a policy is
     /// known to stand. See [`Installed::asserted_epoch`].
@@ -3673,6 +3793,125 @@ mod tests {
         );
         drop(again);
         assert!(probe.woken.load(Ordering::SeqCst));
+    }
+
+    /// **A drawn piece is announced when it completes, and no pass has to
+    /// have seen it.**
+    ///
+    /// The committed set is a draw fixed when the policy is built and
+    /// filled from what we are found to hold. While "found to hold it" was
+    /// a pass reading a listing every couple of seconds, a drawn piece
+    /// fetched and given back between two passes was never announced at
+    /// all: what a session shared came out of how much the cache happened
+    /// to be holding when a pass looked, which is a property of the budget
+    /// and the tick and not of the draw. Here every piece of the file
+    /// arrives and is gone again before any pass runs, so a pass would have
+    /// found nothing whatever, and the draw's two pieces are announced.
+    #[tokio::test]
+    async fn a_drawn_piece_completing_between_two_passes_is_announced_without_one() {
+        let (backing, owner, _budget) = torrent();
+        // An empty disk, so nothing here can be a listing's answer.
+        backing.held.lock().clear();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        // The hold-back the install made is not what this is about.
+        backing.advertised.lock().clear();
+
+        let mut announced = Vec::new();
+        for piece in 0..8u32 {
+            backing.holds([piece]);
+            if owner.commit_completed(piece).await {
+                announced.push(piece);
+            }
+            // And the window moves on: nothing is left for a pass to find.
+            backing.held.lock().remove(&piece);
+        }
+
+        let committed = owner
+            .holding(&0)
+            .and_then(|holding| holding.installed)
+            .expect("the policy the install put in")
+            .committed;
+        assert_eq!(
+            committed.iter().copied().collect::<Vec<u32>>(),
+            announced,
+            "what was announced is what was committed, and nothing else"
+        );
+        assert_eq!(
+            announced.len(),
+            2,
+            "this budget's committed half is two pieces, and the draw filled it: {announced:?}"
+        );
+        assert_eq!(
+            *backing.advertised.lock(),
+            announced
+                .iter()
+                .map(|piece| (*piece..piece + 1, true))
+                .collect::<Vec<_>>(),
+            "one announcement per drawn piece, as it completed"
+        );
+        // And a piece that completes again -- the same bytes downloaded a
+        // second time -- is announced once: a committed piece is committed.
+        backing.holds(announced.iter().copied());
+        for piece in &announced {
+            assert!(
+                !owner.commit_completed(*piece).await,
+                "piece {piece} was announced twice"
+            );
+        }
+        assert_eq!(backing.advertised.lock().len(), announced.len());
+    }
+
+    /// **A piece a pass is taking off the disk is not announced because it
+    /// completed.**
+    ///
+    /// The race the event opens: a piece is fetched, a pass decides to give
+    /// it back, and the commit waiting for that pass's turn wakes on the
+    /// far side of the unlink. Announcing it there is the
+    /// advertise-then-refuse the whole policy exists to prevent, so the
+    /// runs a pass doomed are refused here exactly as they are refused at
+    /// the pass's own advertise.
+    #[tokio::test]
+    async fn a_piece_the_pass_has_doomed_is_not_announced_as_it_completes() {
+        let (backing, owner, _budget) = torrent();
+        backing.held.lock().clear();
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        backing.advertised.lock().clear();
+        // Which pieces the draw chose, taken from the policy rather than
+        // guessed at: they are the only ones a completion can announce.
+        let drawn: Vec<u32> = {
+            let mut drawn = Vec::new();
+            for piece in 0..8u32 {
+                if owner.commit_completed(piece).await {
+                    drawn.push(piece);
+                }
+            }
+            drawn
+        };
+        assert_eq!(drawn.len(), 2);
+
+        // A second policy over the same file, so the draw is the same and
+        // nothing is committed yet.
+        owner.clear(&0).await;
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        backing.advertised.lock().clear();
+        {
+            let entity = owner.entity(0, domain(0, 0..8));
+            let mut state = entity.state.lock();
+            let mut turn = Turn(());
+            state.doom(&mut turn, runs(&drawn[..1]));
+        }
+        assert!(
+            !owner.commit_completed(drawn[0]).await,
+            "a doomed piece was announced back into what we share"
+        );
+        assert!(
+            owner.commit_completed(drawn[1]).await,
+            "and the piece beside it, which nothing is taking, still is"
+        );
+        assert_eq!(
+            *backing.advertised.lock(),
+            vec![(drawn[1]..drawn[1] + 1, true)]
+        );
     }
 
     /// **A clear the backend refuses keeps the policy**, and a later clear

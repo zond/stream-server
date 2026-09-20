@@ -384,6 +384,47 @@ pub(crate) struct TorrentBacking<H: TorrentHandle> {
     refused: Arc<AtomicUsize>,
 }
 
+/// **What hears that a piece of this torrent is ours**, and hands it to the
+/// retention owner to commit and announce.
+///
+/// The piece store calls this from librqbit's completion path, where it may
+/// not block and may do no I/O, so all it does here is spawn: the commit
+/// takes the file's turn like every other writer of a policy, and waiting
+/// for that turn on a peer's thread would hold up the download behind a
+/// retention pass.
+///
+/// Registered with the store registry as a `Weak` under this torrent's hash
+/// ([`crate::piece_store::StoreRegistry::watch`]), so it lives and dies with
+/// the engine and the fresh store a restart out of error builds is watched
+/// by the same one.
+pub(crate) struct CommitOnCompletion<H: TorrentHandle> {
+    retention: Arc<Retention<TorrentBacking<H>>>,
+    info_hash: String,
+}
+
+impl<H: TorrentHandle> crate::piece_store::PieceCompleted for CommitOnCompletion<H> {
+    fn piece_completed(self: Arc<Self>, piece: u32) {
+        // No runtime to spawn on is no announcement now; the next pass
+        // commits the piece out of its listing, as every pass did before
+        // this event existed. It is not a case a shipped build reaches --
+        // librqbit completes a piece inside a peer's `block_in_place`, on
+        // the reactor it was spawned from -- and a test store driven
+        // straight from a thread is.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
+            if self.retention.commit_completed(piece).await {
+                tracing::trace!(
+                    info_hash = %self.info_hash,
+                    piece,
+                    "a drawn piece was announced as it completed"
+                );
+            }
+        });
+    }
+}
+
 impl<H: TorrentHandle> TorrentBacking<H> {
     /// Stop wanting `run` (`AfterRelease::LeaveDropped`), unlink what
     /// arrived under the drop that nothing keeps, and want again whatever a
@@ -1278,6 +1319,11 @@ pub struct Engine<H: TorrentHandle> {
     /// [`Retention::install`], which clears every other file first and runs
     /// one at a time over the torrent, as `announce` made it.
     pub(crate) retention: Arc<Retention<TorrentBacking<H>>>,
+    /// What the piece store tells this torrent's completions to, held here
+    /// because the registry keeps only a `Weak` of it: the watcher lives
+    /// exactly as long as the engine whose owner it commits into. See
+    /// [`CommitOnCompletion`].
+    completions: Arc<CommitOnCompletion<H>>,
     /// Which entity the server is playing, shared with the whole process.
     /// Read for a fresh copy where a caller needs one of its own -- the
     /// switch task, a usage figure -- and handed to the pass by the tick,
@@ -1371,6 +1417,10 @@ impl<H: TorrentHandle> Engine<H> {
             }),
             budget,
         );
+        let completions = Arc::new(CommitOnCompletion {
+            retention: retention.clone(),
+            info_hash: info_hash.to_string(),
+        });
         #[cfg(test)]
         let interleave: Interleave = Arc::new(parking_lot::Mutex::new(None));
         #[cfg(test)]
@@ -1399,12 +1449,21 @@ impl<H: TorrentHandle> Engine<H> {
             blocked_probes: parking_lot::Mutex::new(HashMap::new()),
             streams,
             retention,
+            completions,
             live,
             rest: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             interleave,
             refused_reclaims,
         }
+    }
+
+    /// What the store registry is to tell this torrent's piece completions
+    /// to; see [`CommitOnCompletion`]. A `Weak`, so the registration goes
+    /// when the engine does and never keeps one alive.
+    pub(crate) fn completions(&self) -> std::sync::Weak<dyn crate::piece_store::PieceCompleted> {
+        let watcher: Arc<dyn crate::piece_store::PieceCompleted> = self.completions.clone();
+        Arc::downgrade(&watcher)
     }
 
     /// How many pieces this engine's passes have been refused; see the
