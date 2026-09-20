@@ -22,11 +22,13 @@ What the archive routes do now, per case:
 | Stored ZIP or TAR member, in a torrent or behind a web link | Served by byte range from wherever the container is -- the piece store, or the proxy cache through one ranged request -- as a `MemberView` over a `ByteSource`. Nothing downloaded, nothing extracted, nothing written. (Step 2, 2026-09-20.) |
 | Compressed or encrypted ZIP or TAR member | Refused: `415` with `{"refused", "message"}`, one sentence for the player. (Step 2.) |
 | `tar.gz` | Refused whole: `415 noRandomAccess`. `archives/tgz.rs` is gone. (Step 2.) |
-| Any RAR inside a torrent | Refused, `501`: `rar::RarHandler` reads a `std::fs::File`. Step 3. |
-| Compressed member of a RAR or a 7z, any source | Extracted whole into `archives::cache::ProgressiveCache` under `<cache root>/.archives`: a second copy of the film, bounded by the volume floor, swept when idle. Steps 3 and 5. |
-| RAR or 7z behind a web link (`/{rar\|7zip}/create` with `urls`) | The **whole archive is downloaded** to `.archives` first (`routes::archive::download_archive`, `DownloadRoom`), then read as a file. Steps 3 and 5. |
+| Stored RAR member, in a torrent or behind a link, one volume or a set | Served by byte range from wherever the volumes are -- one extent per part, per volume. Nothing downloaded, nothing extracted, nothing written. `archives/rar.rs` is gone. (Step 3, 2026-09-20.) |
+| Compressed, encrypted or solid RAR member | Refused: `415` with `{"refused", "message"}`. An encrypted *stored* member too, whose bytes the crate could map. (Step 3.) |
+| A RAR set with a volume missing, or a chain still open after the last | Refused: `422`, naming the volume it wanted. (Step 3.) |
+| Compressed member of a 7z, any source | Extracted whole into `archives::cache::ProgressiveCache` under `<cache root>/.archives`: a second copy of the film, bounded by the volume floor, swept when idle. Step 5. |
+| 7z behind a web link (`/7zip/create` with `urls`) | The **whole archive is downloaded** to `.archives` first (`routes::archive::download_archive`, `DownloadRoom`), then read as a file. Step 5. |
 | An origin that will not serve ranges | Refused, `501`, with a sentence: serving it would mean downloading the archive. (Step 2.) |
-| Multi-volume RAR (`rarUrls` with several entries) | Refused, `501`. Step 3. |
+| Multi-volume RAR (`rarUrls` with several entries) | The list **is** the volume list, in order; from a torrent the volumes are the named file's siblings by the two naming rules. (Step 3, 2026-09-20.) |
 | ISO 9660 or UDF image, in a torrent or behind a web link | Served by byte range like a stored ZIP member: `/iso/create` and the `torrent:` form, `translators::iso::Iso` over `server/src/images/`. A UDF metadata partition map (the first thing a real Blu-ray image hits) is refused `415 unsupported`, naming the map. (Step 6, 2026-09-20.) |
 
 The cost of that shape is not only disk: an extraction has to reach the
@@ -370,7 +372,7 @@ a source error mid-body is the body's error, as for a plain stream.
 | ~~`server/src/archives/{zip,tar}.rs`~~, `streams_from_a_reader`, `get_archive_reader_from_stream` | 573 | **Gone, step 2.** Both formats are translated. |
 | `routes/archive.rs`: `download_archive`, `DownloadRoom`, `SNIFF_BYTES`, the download timeouts, `archive_cache_config`, `CacheConfig`, the `507` extraction arm | ~450 | Nothing is downloaded by this layer. |
 | `archives::sweep_scratch`, the `.archives` entry in `piece_store::sweep::NOT_OURS`, `.archives` in `server/src/lib.rs` startup, the AGENTS/README paragraphs about it | ~80 | The directory ceases to exist. |
-| `rar::RarHandler` (file-based extraction), `sevenz.rs`'s extraction, `zip.rs`'s inflate thread, the `ArchiveReader` trait and `OpenedMember` | ~900 | Replaced by translators. |
+| ~~`rar::RarHandler`~~ (file-based extraction), `sevenz.rs`'s extraction, ~~`zip.rs`'s inflate thread~~, the `ArchiveReader` trait and `OpenedMember` | ~900 | Replaced by translators. **`RarHandler` gone, step 3** (431 lines, with its five tests), and with it the `.rar` arm of the reader dispatch; `archives::RAR_DISABLED_ERROR` moved to `routes::archive`, which is its only caller. |
 
 About 3900 lines out; the new layer is roughly 1500 in (sources ~450,
 translators: zip ~250, tar ~150, rar ~400 incl. the volume naming and the
@@ -404,7 +406,7 @@ never kept beside it.
    where they test stored members and are rewritten where they tested
    extraction. After this step **`.archives` is created by nothing for
    ZIP/TAR**; assert the directory does not exist after the suite.
-3. **RAR translator: single volume, then multi-volume.** The blocking shim;
+3. **RAR translator: single volume, then multi-volume.** *(Landed 2026-09-20.)* The blocking shim;
    `parse_volume_facts` + `StoredLayoutBuilder`; the two naming rules for
    sibling volumes in a torrent; `rarUrls` order for URLs. Fixtures:
    `archives/rar.rs` already builds store-method RAR5 archives by hand for
@@ -416,11 +418,24 @@ never kept beside it.
    missing its middle volume -> `422`. Delete `RarHandler`'s extraction
    and the `rar` feature's file path; the feature flag stays (licence).
    **This is the step that changes what a user sees tonight.**
-4. **Delete the rest**: `cache.rs`, `torrent.rs`, the download path,
+   Done as written, with three things worth recording. The volume list is
+   what names a session (`routes::archive::set_origin` joins every URL):
+   two sets can share a `.part1.rar` and differ after it, and a session
+   found by the first URL alone would answer one set's index over
+   another's bytes. `Translator::volumes(named, siblings)` is the hook the
+   `torrent:` form finds a set through -- a default of "just this file"
+   for every other format. And a **member whose only checksum is
+   BLAKE2sp, or none, is served**: `unrar-rs` marks such a member
+   ineligible because *it* cannot verify one out of order, which is its
+   business and not this server's (§2.2.4). What the layout API refuses
+   that real releases do use is written up in the step's report: nothing
+   found so far beyond the refusals above.
+4. **Delete the rest** (7z is the only caller left): `cache.rs`, the download path,
    `sweep_scratch`, the sweep entries, `CacheConfig`; docs: AGENTS.md
    (workspace map, the gotcha about the progressive cache, the "every byte
    has an owner" list loses `.archives` and gains "a translated member owns
-   nothing"), README, known-issues (#18/#99/#102 close; the CRC note from
+   nothing"), README, known-issues (#18/#99 close -- #102 closed with
+   step 3; the CRC note from
    #99 becomes the rule in §2.2.4).
 5. **7z translator** (COPY blocks direct, all else refused) and delete
    `sevenz.rs`'s extraction.

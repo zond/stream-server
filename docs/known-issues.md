@@ -220,8 +220,18 @@ nobody reopens them without knowing why they were shut.
   a trade about (step 2 of `docs/translated-sources.md`): a zip inside a
   torrent is read as byte ranges through a `TorrentFileSource`, at
   `Fetching::Streaming`, and there is no extraction thread to park and no
-  `ABANDONED_AFTER` to reach. What still extracts -- RAR and 7z -- reads
-  a file on disk, which was never the case this was about.
+  `ABANDONED_AFTER` to reach. What still extracts -- 7z alone, since step
+  3 -- reads a file on disk, which was never the case this was about.
+- **A stored RAR member in a torrent has no path** (review 2026-09-19
+  #102). Closed 2026-09-20 by step 3 of `docs/translated-sources.md`:
+  `translators/rar.rs` maps a stored member to the `(volume, offset, len)`
+  of each of its parts through `unrar-rs` 0.10.5's stored-layout API, and
+  the `torrent:` form finds the set's volumes among the named file's
+  siblings (`Translator::volumes`). A scene release in a torrent --
+  `film.part1.rar`, `film.part2.rar`, ... -- is served by range across the
+  volumes, with no second copy and nothing under `.archives`.
+  `server/src/archives/rar.rs` is deleted; the `rar` cargo feature stays,
+  for the licence, and now turns on the translator.
 - **xtremio's desktop builds only run in CI, and iOS does not build**
   (`librqbit-dualstack-sockets` `bind_device`). Not going to be worked on.
 - **The detector dragging a viewer's stream to mpv's tail crawl.** Fixed
