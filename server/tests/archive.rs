@@ -82,6 +82,64 @@ fn fixture_tgz() -> Vec<u8> {
         .expect("finish gzip")
 }
 
+/// The same three members as a zip: one stored (a film does not compress,
+/// so a film in a zip is stored), one deflated, and an empty one.
+fn fixture_zip() -> Vec<u8> {
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime to write the fixture with");
+    runtime.block_on(async {
+        let mut writer = async_zip::base::write::ZipFileWriter::with_tokio(Vec::new());
+        for (name, data, compression) in [
+            (
+                "first.txt",
+                FIRST_CONTENT.to_vec(),
+                async_zip::Compression::Stored,
+            ),
+            (
+                "videos/second.bin",
+                second_content(),
+                async_zip::Compression::Stored,
+            ),
+            // Deliberately smaller than the stored member, so that the
+            // member a create with no `fileIdx` picks -- the largest --
+            // is the stored one, as it is in a real archive of a film.
+            (
+                "videos/packed.bin",
+                second_content()[..64 * 1024].to_vec(),
+                async_zip::Compression::Deflate,
+            ),
+            ("empty.txt", Vec::new(), async_zip::Compression::Stored),
+        ] {
+            writer
+                .write_entry_whole(
+                    async_zip::ZipEntryBuilder::new(name.into(), compression).build(),
+                    &data,
+                )
+                .await
+                .expect("write the member");
+        }
+        writer.close().await.expect("close the zip").into_inner()
+    })
+}
+
+/// The same members as a plain `.tar`, where every one of them is stored.
+fn fixture_tar() -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for (name, data) in [
+        ("first.txt", FIRST_CONTENT.to_vec()),
+        ("videos/second.bin", second_content()),
+        ("empty.txt", Vec::new()),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, name, data.as_slice())
+            .expect("append tar entry");
+    }
+    builder.into_inner().expect("finish tar")
+}
+
 /// An HTTP/1.1 origin serving fixed bodies by path, counting the requests
 /// for each. `Connection: close` on every response keeps it to one request
 /// per socket.
@@ -122,6 +180,11 @@ impl Origin {
     }
 }
 
+/// Everything under this prefix is served **without** honouring `Range`:
+/// an origin that answers a ranged request with the whole entity, which is
+/// the one a translated source refuses rather than downloads.
+const NO_RANGES: &str = "/whole-only";
+
 fn serve_one(
     mut stream: TcpStream,
     bodies: &HashMap<String, Vec<u8>>,
@@ -132,29 +195,72 @@ fn serve_one(
     if reader.read_line(&mut line).is_err() {
         return;
     }
+    let mut range = None;
     loop {
         let mut header = String::new();
         match reader.read_line(&mut header) {
             Ok(0) => break,
             Ok(_) if header.trim().is_empty() => break,
-            Ok(_) => {}
+            Ok(_) => {
+                if let Some(value) = header.to_ascii_lowercase().strip_prefix("range:") {
+                    range = parse_range(value.trim());
+                }
+            }
             Err(_) => break,
         }
     }
     let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
     *seen.lock().unwrap().entry(path.clone()).or_default() += 1;
-    let (status, body) = match bodies.get(&path) {
-        Some(body) => ("200 OK", body.as_slice()),
-        None => ("404 Not Found", &b"nope"[..]),
+    let Some(body) = bodies.get(&path) else {
+        let body = &b"nope"[..];
+        let head = format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(body);
+        return;
     };
-    let head = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/octet-stream\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
+    // A real origin: ranges answered as ranges, with the validator the
+    // cache files the entity by.
+    let head = match range.filter(|_| !path.starts_with(NO_RANGES)) {
+        Some((first, last)) if first < body.len() => {
+            let last = last.min(body.len() - 1);
+            let slice = &body[first..=last];
+            let head = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Type: application/octet-stream\r\n\
+                 ETag: \"the-archive\"\r\nAccept-Ranges: bytes\r\n\
+                 Content-Range: bytes {first}-{last}/{}\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                body.len(),
+                slice.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(slice);
+            let _ = stream.flush();
+            return;
+        }
+        _ => format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+             ETag: \"the-archive\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        ),
+    };
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(body);
     let _ = stream.flush();
+}
+
+/// `bytes=first-last`, as this origin needs it.
+fn parse_range(value: &str) -> Option<(usize, usize)> {
+    let (first, last) = value.strip_prefix("bytes=")?.split_once('-')?;
+    let first = first.parse().ok()?;
+    let last = if last.is_empty() {
+        usize::MAX
+    } else {
+        last.parse().ok()?
+    };
+    Some((first, last))
 }
 
 struct Fixture {
@@ -177,6 +283,11 @@ fn fixture() -> anyhow::Result<Fixture> {
         // The same archive behind a URL that names no format.
         ("/download?id=7".to_string(), archive),
         ("/fixture.tgz".to_string(), fixture_tgz()),
+        ("/fixture.zip".to_string(), fixture_zip()),
+        ("/fixture.tar".to_string(), fixture_tar()),
+        // The same zip behind an origin that answers a ranged request
+        // with the whole entity.
+        (format!("{NO_RANGES}/fixture.zip"), fixture_zip()),
         (
             "/notes.txt".to_string(),
             b"just some text, not an archive".to_vec(),
@@ -216,6 +327,26 @@ impl Fixture {
             .post(format!("{}/7zip/create", self.base))
             .json(&serde_json::json!({ "urls": [url] }))
             .send()?)
+    }
+
+    /// `POST /{prefix}/create` for `url`.
+    fn create_for(&self, prefix: &str, url: &str) -> anyhow::Result<reqwest::blocking::Response> {
+        Ok(reqwest::blocking::Client::new()
+            .post(format!("{}/{prefix}/create", self.base))
+            .json(&serde_json::json!({ "urls": [url] }))
+            .send()?)
+    }
+
+    fn create_key_for(&self, prefix: &str, url: &str) -> anyhow::Result<String> {
+        let response = self.create_for(prefix, url)?;
+        anyhow::ensure!(
+            response.status() == reqwest::StatusCode::OK,
+            "create answered {}: {}",
+            response.status(),
+            response.text()?
+        );
+        let body: serde_json::Value = response.json()?;
+        Ok(body["key"].as_str().expect("a key").to_string())
     }
 
     fn create_key(&self, url: &str) -> anyhow::Result<String> {
@@ -461,28 +592,181 @@ fn a_failed_create_leaves_nothing_behind() -> anyhow::Result<()> {
     fixture.finish()
 }
 
-/// A member of a `.tar.gz` is served, whole and by range. Every request for
-/// one used to be a 500: the extraction's cache was made without the
-/// member's length, and the route's seek from the end to learn it failed.
+/// **A stored member behind a web link is served as byte ranges of the
+/// link**, whole and by range and backwards, and nothing is written
+/// anywhere: the archive is never downloaded, the member is never
+/// extracted, and `<cacheRoot>/.archives` -- which every archive this
+/// server played used to put two copies of the film in -- is not so much
+/// as created.
+///
+/// The seek backwards is the case the old shape could not do at all
+/// without paying for the member again: a player opens, reads the head,
+/// jumps to the tail for the index, and comes back. Here each of those is
+/// one ranged read of the link.
 #[test]
-fn a_tgz_member_is_served_whole_and_by_range() -> anyhow::Result<()> {
+fn a_stored_member_behind_a_link_is_served_by_range_and_nothing_is_written() -> anyhow::Result<()> {
     let fixture = fixture()?;
-    let key = fixture.create_key(&fixture.origin.url("/fixture.tgz"))?;
     let client = reqwest::blocking::Client::new();
-    let member = format!("{}/tgz/stream/{key}/videos/second.bin", fixture.base);
     let expected = second_content();
 
-    let whole = client.get(&member).send()?;
-    assert_eq!(whole.status(), reqwest::StatusCode::OK);
-    assert_eq!(whole.bytes()?.as_ref(), expected.as_slice());
+    for (prefix, archive) in [("zip", "/fixture.zip"), ("tar", "/fixture.tar")] {
+        let key = fixture.create_key_for(prefix, &fixture.origin.url(archive))?;
+        let member = format!("{}/{prefix}/stream/{key}/videos/second.bin", fixture.base);
 
-    let ranged = client
-        .get(&member)
-        .header(reqwest::header::RANGE, "bytes=40000-40999")
+        let whole = client.get(&member).send()?;
+        assert_eq!(whole.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            whole
+                .headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some(expected.len().to_string().as_str())
+        );
+        assert_eq!(whole.bytes()?.as_ref(), expected.as_slice());
+
+        // The tail, and then a seek back to the head: two ranges out of
+        // the middle of one member, each answered as itself.
+        let tail = client
+            .get(&member)
+            .header(
+                reqwest::header::RANGE,
+                format!("bytes={}-", expected.len() - 1024),
+            )
+            .send()?;
+        assert_eq!(tail.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            tail.headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok()),
+            Some(
+                format!(
+                    "bytes {}-{}/{}",
+                    expected.len() - 1024,
+                    expected.len() - 1,
+                    expected.len()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(tail.bytes()?.as_ref(), &expected[expected.len() - 1024..]);
+
+        let back = client
+            .get(&member)
+            .header(reqwest::header::RANGE, "bytes=4096-8191")
+            .send()?;
+        assert_eq!(back.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(back.bytes()?.as_ref(), &expected[4096..8192]);
+
+        // And a `HEAD` promises exactly what the `GET` delivered.
+        let head = client.head(&member).send()?;
+        assert_eq!(head.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            head.headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some(expected.len().to_string().as_str())
+        );
+        assert!(head.bytes()?.is_empty());
+    }
+
+    assert!(
+        !fixture.scratch_dir.exists(),
+        "the translated path wrote under the cache root: {:?}",
+        fixture.scratch_files()
+    );
+    fixture.finish()
+}
+
+/// **A compressed member is refused, with a sentence the player shows.**
+/// It is not extracted, not partially decoded and not served
+/// sequentially: reaching the end of a deflated film means inflating the
+/// whole of it, which is the thing this server does not do.
+#[test]
+fn a_compressed_member_is_refused_with_a_sentence() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let url = fixture.origin.url("/fixture.zip");
+    let client = reqwest::blocking::Client::new();
+
+    // At the create, which is where a player learns it before it starts.
+    let refused = client
+        .post(format!("{}/zip/create", fixture.base))
+        .json(&serde_json::json!({ "urls": [url], "fileMustInclude": ["packed.bin"] }))
         .send()?;
-    assert_eq!(ranged.status(), reqwest::StatusCode::PARTIAL_CONTENT);
-    assert_eq!(ranged.bytes()?.as_ref(), &expected[40000..41000]);
+    assert_eq!(
+        refused.status(),
+        reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
+    let body: serde_json::Value = refused.json()?;
+    assert_eq!(body["refused"], serde_json::json!("compressed"));
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(message.contains("deflate"), "{body}");
 
+    // And at the member, for a client that asks for it by name anyway.
+    let key = fixture.create_key_for("zip", &url)?;
+    let member = client
+        .get(format!(
+            "{}/zip/stream/{key}/videos/packed.bin",
+            fixture.base
+        ))
+        .send()?;
+    assert_eq!(member.status(), reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(
+        member.json::<serde_json::Value>()?["refused"],
+        serde_json::json!("compressed")
+    );
+
+    assert!(!fixture.scratch_dir.exists(), "nothing was extracted");
+    fixture.finish()
+}
+
+/// **A `tar.gz` is refused whole**: gzip is one stream with no way in at
+/// the middle, so there is no member of it this server can point at. It
+/// used to be extracted, every time, in full.
+#[test]
+fn a_tar_gz_is_refused_because_it_has_no_way_in() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let refused = reqwest::blocking::Client::new()
+        .post(format!("{}/tgz/create", fixture.base))
+        .json(&serde_json::json!({ "urls": [fixture.origin.url("/fixture.tgz")] }))
+        .send()?;
+    assert_eq!(
+        refused.status(),
+        reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
+    let body: serde_json::Value = refused.json()?;
+    assert_eq!(body["refused"], serde_json::json!("noRandomAccess"));
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("tar.gz")),
+        "{body}"
+    );
+    assert!(!fixture.scratch_dir.exists(), "nothing was extracted");
+    fixture.finish()
+}
+
+/// **An origin that will not serve ranges is refused**, and the refusal
+/// says why in a sentence: serving a member out of it would mean
+/// downloading the whole archive, which is what this design exists to
+/// stop. `501`, because it is this server that declines to do the work.
+#[test]
+fn an_origin_that_will_not_range_is_refused() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let refused = reqwest::blocking::Client::new()
+        .post(format!("{}/zip/create", fixture.base))
+        .json(&serde_json::json!({
+            "urls": [fixture.origin.url(&format!("{NO_RANGES}/fixture.zip"))]
+        }))
+        .send()?;
+    assert_eq!(refused.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
+    let body: serde_json::Value = refused.json()?;
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("byte ranges")),
+        "{body}"
+    );
+    assert!(!fixture.scratch_dir.exists());
     fixture.finish()
 }
 
@@ -490,14 +774,19 @@ fn a_tgz_member_is_served_whole_and_by_range() -> anyhow::Result<()> {
 /// `Content-Length: 1` over a body that ended at once -- and a range past
 /// the end of a member is a `416` naming its length, not the whole member
 /// under a `200`.
+///
+/// Over a `.tar` where it used to be over a `.tar.gz`: the claim is about
+/// the framing every media response shares (`routes::util::MediaRange`),
+/// and the container it is made through is now one whose members can be
+/// pointed at.
 #[test]
 fn an_empty_member_is_empty_and_a_range_past_the_end_is_refused() -> anyhow::Result<()> {
     let fixture = fixture()?;
-    let key = fixture.create_key(&fixture.origin.url("/fixture.tgz"))?;
+    let key = fixture.create_key_for("tar", &fixture.origin.url("/fixture.tar"))?;
     let client = reqwest::blocking::Client::new();
 
     let empty = client
-        .get(format!("{}/tgz/stream/{key}/empty.txt", fixture.base))
+        .get(format!("{}/tar/stream/{key}/empty.txt", fixture.base))
         .send()?;
     assert_eq!(empty.status(), reqwest::StatusCode::OK);
     assert_eq!(
@@ -512,7 +801,7 @@ fn an_empty_member_is_empty_and_a_range_past_the_end_is_refused() -> anyhow::Res
     let len = second_content().len();
     let past = client
         .get(format!(
-            "{}/tgz/stream/{key}/videos/second.bin",
+            "{}/tar/stream/{key}/videos/second.bin",
             fixture.base
         ))
         .header(reqwest::header::RANGE, format!("bytes={len}-"))

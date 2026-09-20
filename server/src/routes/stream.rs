@@ -1,5 +1,5 @@
 use crate::routes::compat;
-use crate::routes::util::parse_range;
+use crate::routes::util;
 use crate::state::AppState;
 use axum::{
     body::Body,
@@ -964,37 +964,19 @@ async fn head_stream_video_with(
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let (start, end, is_partial) = if let Some(range) = &range_header {
-        if let Some((start, end)) = parse_range(range, size) {
-            (start, end, true)
-        } else {
-            return (StatusCode::RANGE_NOT_SATISFIABLE, "Range Not Satisfiable").into_response();
-        }
-    } else {
-        (0, size.saturating_sub(1), false)
+    // The one framing, shared with the archive routes: a member of an
+    // archive has to behave exactly like a plain file over HTTP, and that
+    // is only true if neither route writes its own (`util::MediaRange`).
+    let Some(framing) = util::MediaRange::of(range_header.as_deref(), size) else {
+        return util::range_not_satisfiable(size);
     };
-
-    // An empty file is `(0, 0)` with no range, and an inclusive end of 0
-    // is a length of one: a `HEAD` used to promise a byte the `GET` has
-    // not got. (The archive routes answer the same case the same way.)
-    let content_length = if size == 0 {
-        0
-    } else {
-        end.saturating_sub(start) + 1
-    };
+    let (start, end, is_partial) = (framing.start, framing.end, framing.partial);
     let mut res_headers = header::HeaderMap::new();
     res_headers.insert(
         header::CONTENT_TYPE,
         content_type_for_name(name).parse().unwrap(),
     );
-    res_headers.insert(header::CONTENT_LENGTH, content_length.into());
-    res_headers.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
-    if is_partial {
-        res_headers.insert(
-            header::CONTENT_RANGE,
-            format!("bytes {}-{}/{}", start, end, size).parse().unwrap(),
-        );
-    }
+    framing.write_headers(size, &mut res_headers);
     if is_download {
         res_headers.insert(
             header::CONTENT_DISPOSITION,
@@ -1135,27 +1117,18 @@ async fn stream_video_with(
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let (start, end, is_partial) = if let Some(range) = &range_header {
-        if let Some((start, end)) = parse_range(range, size) {
-            (start, end, true)
-        } else {
-            tracing::warn!(
-                stream_id,
-                info_hash = %info_hash,
-                file_idx = idx,
-                range = %range,
-                "stream_video invalid range header"
-            );
-            return (StatusCode::RANGE_NOT_SATISFIABLE, "Range Not Satisfiable").into_response();
-        }
-    } else {
-        (0, size.saturating_sub(1), false)
+    let Some(framing) = util::MediaRange::of(range_header.as_deref(), size) else {
+        tracing::warn!(
+            stream_id,
+            info_hash = %info_hash,
+            file_idx = idx,
+            range = ?range_header,
+            "stream_video invalid range header"
+        );
+        return util::range_not_satisfiable(size);
     };
-    let requested_content_length = if size == 0 {
-        0
-    } else {
-        end.saturating_sub(start) + 1
-    };
+    let (start, end, is_partial) = (framing.start, framing.end, framing.partial);
+    let requested_content_length = framing.content_length(size);
     // --- Stream Lifecycle: registered before the disk gate. ---
     // Registration and the guard that ends it, with no await between them,
     // so a cancelled request never leaves a stream registered that nothing
@@ -1313,7 +1286,7 @@ async fn stream_video_with(
             size,
             "stream_video range not satisfiable"
         );
-        return (StatusCode::RANGE_NOT_SATISFIABLE, "Range Not Satisfiable").into_response();
+        return util::range_not_satisfiable(size);
     }
 
     // Seek to the start position
@@ -1354,15 +1327,7 @@ async fn stream_video_with(
     );
 
     res_headers.insert(header::CONTENT_TYPE, mime.parse().unwrap());
-
-    res_headers.insert(header::CONTENT_LENGTH, content_length.into());
-    res_headers.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
-    if is_partial {
-        res_headers.insert(
-            header::CONTENT_RANGE,
-            format!("bytes {}-{}/{}", start, end, size).parse().unwrap(),
-        );
-    }
+    framing.write_headers(size, &mut res_headers);
     if is_download {
         res_headers.insert(
             header::CONTENT_DISPOSITION,

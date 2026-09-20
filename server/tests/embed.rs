@@ -4338,26 +4338,18 @@ fn archive_extractions(cache_root: &std::path::Path) -> Vec<std::path::PathBuf> 
         .collect()
 }
 
-/// **Two ranged reads of one member inside a torrent are one extraction**
-/// (review #18's leftover).
+/// **A compressed member inside a torrent is refused**, with the sentence
+/// the player shows and nothing written anywhere.
 ///
-/// The `torrent:` form has no `/create`, so until it had a session of its
-/// own (`archives::torrent::TorrentArchives`) every request built its own
-/// reader on the torrent and decoded the member again: a player seeking in
-/// a film inside an archive wrote a second copy of the film per range
-/// request, each one held to the volume's free-space floor and each one
-/// paid for again.
-///
-/// The oracle is the disk, not a counter the route keeps: the files under
-/// `<cacheRoot>/.archives` are one per extraction (`ProgressiveCache`
-/// creates its scratch file before it returns, so a second extraction is
-/// already on disk by the time the second response's headers are sent),
-/// and what is asserted is that the file the second read is served from is
-/// **the same file** the first one made -- a count alone would read a
-/// second extraction that replaced the first as one extraction. The member
-/// is deflated, because a stored one is not extracted at all.
+/// This test used to prove that two ranged reads of a deflated member were
+/// *one* extraction rather than two -- a second copy of the film per range
+/// request was the bug, and one copy was the fix. There is no extraction
+/// now: reaching the end of a deflated film means inflating all of it, so
+/// the member is refused instead, by decision
+/// (`docs/translated-sources.md` §2.2). What the disk is asked here is
+/// what it was asked then, and the answer is stronger: not one copy, none.
 #[test]
-fn two_ranged_reads_of_a_member_in_a_torrent_are_one_extraction() -> anyhow::Result<()> {
+fn a_compressed_member_in_a_torrent_is_refused_rather_than_extracted() -> anyhow::Result<()> {
     const MEMBER: &str = "member.bin";
     const MEMBER_LEN: usize = 512 * 1024;
     let config_dir = tempfile::tempdir()?;
@@ -4374,36 +4366,27 @@ fn two_ranged_reads_of_a_member_in_a_torrent_are_one_extraction() -> anyhow::Res
         async_zip::Compression::Deflate,
     )?;
     let cache_root = resolved(&cache_dir.path().join("cache"));
-    let payload = member_payload(MEMBER_LEN);
     let anonymous = reqwest::blocking::Client::new();
 
-    // The head of the member, as a player asks for it first.
-    let head = anonymous
+    let refused = anonymous
         .get(archive_member_url(&base, &info_hash, MEMBER))
         .header(reqwest::header::RANGE, "bytes=0-4095")
         .send()?;
-    assert_eq!(head.status(), reqwest::StatusCode::PARTIAL_CONTENT);
-    assert_eq!(head.bytes()?.as_ref(), &payload[..4096]);
-    let extraction = archive_extractions(&cache_root);
-    assert_eq!(extraction.len(), 1);
-
-    // And then a seek into the middle of it.
-    let middle = anonymous
-        .get(archive_member_url(&base, &info_hash, MEMBER))
-        .header(
-            reqwest::header::RANGE,
-            format!("bytes={}-{}", 256 * 1024, 256 * 1024 + 4095),
-        )
-        .send()?;
-    assert_eq!(middle.status(), reqwest::StatusCode::PARTIAL_CONTENT);
     assert_eq!(
-        middle.bytes()?.as_ref(),
-        &payload[256 * 1024..256 * 1024 + 4096]
+        refused.status(),
+        reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE
     );
-    assert_eq!(
-        archive_extractions(&cache_root),
-        extraction,
-        "the seek extracted the member a second time"
+    let body: serde_json::Value = refused.json()?;
+    assert_eq!(body["refused"], serde_json::json!("compressed"));
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("deflate")),
+        "{body}"
+    );
+    assert!(
+        !cache_root.join(".archives").exists(),
+        "the refusal wrote under the cache root"
     );
 
     handle.shutdown()?;
@@ -4455,9 +4438,34 @@ fn a_stored_member_in_a_torrent_is_served_without_an_extraction() -> anyhow::Res
         &payload[256 * 1024..256 * 1024 + 4096]
     );
 
+    // And back to the head of the member, which is the seek a player makes
+    // after reading a film's index: the torrent's own handle moves, and
+    // nothing reads through the bytes in between.
+    let back = anonymous
+        .get(archive_member_url(&base, &info_hash, MEMBER))
+        .header(reqwest::header::RANGE, "bytes=1024-5119")
+        .send()?;
+    assert_eq!(back.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(back.bytes()?.as_ref(), &payload[1024..5120]);
+
+    // A `HEAD` promises what the `GET` delivered, as it does for a plain
+    // file: same framing, same headers (`routes::util::MediaRange`).
+    let head = anonymous
+        .head(archive_member_url(&base, &info_hash, MEMBER))
+        .send()?;
+    assert_eq!(head.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        head.headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()),
+        Some(MEMBER_LEN.to_string().as_str())
+    );
+
+    // **Nothing under the cache root at all**: not an extraction, not the
+    // directory extractions used to land in.
     assert!(
-        archive_extractions(&cache_root).is_empty(),
-        "a stored member was extracted: {:?}",
+        !cache_root.join(".archives").exists(),
+        "the translated path wrote under the cache root: {:?}",
         archive_extractions(&cache_root)
     );
 

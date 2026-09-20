@@ -10,7 +10,7 @@
 //! it in a release build costs a few hundred bytes of text and buys one
 //! definition instead of two.
 
-use super::{ByteSource, ReadHint, SourceReader};
+use super::{ByteSource, ReadHint, SeekableReader};
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -23,11 +23,6 @@ use tokio::io::{AsyncRead, ReadBuf};
 pub struct MemorySource {
     name: String,
     bytes: Vec<u8>,
-    /// Whether an opened reader stops at its hint. A [`ReadHint`] is a
-    /// bound a reader *may* end at and not one it must, so both answers
-    /// are conforming -- and what reads from a source that carries on is
-    /// whatever is reading it. See [`MemorySource::reading_past_the_hint`].
-    stops_at_the_hint: bool,
 }
 
 impl MemorySource {
@@ -35,19 +30,7 @@ impl MemorySource {
         Self {
             name: name.into(),
             bytes: bytes.into(),
-            stops_at_the_hint: true,
         }
-    }
-
-    /// The same source, with readers that run on to the end of it whatever
-    /// they were hinted -- a torrent's file handle is one of these, since
-    /// the engine spends the hint on the swarm's lookahead and not on where
-    /// the reader stops. A caller that must not read past a span is the one
-    /// that has to keep it inside: [`crate::sources::MemberReader`] does,
-    /// with the run of the extent it is in.
-    pub fn reading_past_the_hint(mut self) -> Self {
-        self.stops_at_the_hint = false;
-        self
     }
 }
 
@@ -73,20 +56,15 @@ impl ByteSource for MemorySource {
         Ok(take)
     }
 
-    async fn open(&self, offset: u64, hint: ReadHint) -> io::Result<Box<dyn SourceReader>> {
-        // Ending at the hint, as an HTTP source does: a reader opened for
-        // a header must not be able to read the whole file through, or the
-        // tests would let a translator do exactly what this design forbids.
-        let hint = if self.stops_at_the_hint {
-            hint
-        } else {
-            ReadHint::REST
-        };
-        let Some(last) = hint.last_byte(offset, self.len()) else {
-            return Ok(Box::new(io::Cursor::new(Vec::new())));
-        };
-        let span = self.bytes[offset as usize..=last as usize].to_vec();
-        Ok(Box::new(io::Cursor::new(span)))
+    async fn open(&self, offset: u64, _hint: ReadHint) -> io::Result<Box<dyn SeekableReader>> {
+        // The whole source, positioned at `offset`: a reader is a handle
+        // on the file and not a window onto a span of it, and the hint is
+        // advisory (see [`ReadHint`]). What a reader here can be seen to
+        // do -- read on past the hint, seek backwards -- is what a
+        // torrent's file handle does.
+        let mut reader = io::Cursor::new(self.bytes.clone());
+        reader.set_position(offset.min(self.bytes.len() as u64));
+        Ok(Box::new(reader))
     }
 }
 
@@ -199,7 +177,7 @@ impl ByteSource for CountingSource {
         Ok(read)
     }
 
-    async fn open(&self, offset: u64, hint: ReadHint) -> io::Result<Box<dyn SourceReader>> {
+    async fn open(&self, offset: u64, hint: ReadHint) -> io::Result<Box<dyn SeekableReader>> {
         let reader = self.inner.open(offset, hint).await?;
         self.counts.opens.fetch_add(1, Ordering::Relaxed);
         Ok(Box::new(CountingReader {
@@ -213,7 +191,7 @@ impl ByteSource for CountingSource {
 /// as it is opened, because what a test asks is how many bytes actually
 /// left the source.
 struct CountingReader {
-    reader: Box<dyn SourceReader>,
+    reader: Box<dyn SeekableReader>,
     counts: Arc<Counts>,
 }
 
@@ -234,20 +212,39 @@ impl AsyncRead for CountingReader {
     }
 }
 
+impl tokio::io::AsyncSeek for CountingReader {
+    fn start_seek(self: Pin<&mut Self>, position: io::SeekFrom) -> io::Result<()> {
+        Pin::new(&mut self.get_mut().reader).start_seek(position)
+    }
+
+    fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+        Pin::new(&mut self.get_mut().reader).poll_complete(cx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-    /// A reader ends at its hint, so nothing that opened one for a header
-    /// can read the file through it.
+    /// A reader is a handle on the file: it starts where it was opened,
+    /// reads on past its hint, and **seeks**, backwards included. The hint
+    /// is advice about how much is coming, not a cap -- a cap here would
+    /// be a second, weaker copy of a bound the fetcher already keeps, and
+    /// one no other consumer of a fetched file is held to.
     #[tokio::test]
-    async fn an_opened_reader_stops_at_the_hint() {
+    async fn an_opened_reader_is_a_handle_and_not_a_window() {
         let source = MemorySource::new("archive.zip", (0..100u8).collect::<Vec<_>>());
         let mut reader = source.open(10, ReadHint::of(4)).await.unwrap();
-        let mut read = Vec::new();
-        reader.read_to_end(&mut read).await.unwrap();
-        assert_eq!(read, vec![10, 11, 12, 13]);
+        let mut read = [0u8; 8];
+        reader.read_exact(&mut read).await.unwrap();
+        assert_eq!(read, [10, 11, 12, 13, 14, 15, 16, 17]);
+
+        // Backwards, which is what a format parser does and what the old
+        // forward-only reader could not answer at all.
+        reader.seek(io::SeekFrom::Start(2)).await.unwrap();
+        reader.read_exact(&mut read).await.unwrap();
+        assert_eq!(read, [2, 3, 4, 5, 6, 7, 8, 9]);
 
         let mut rest = source.open(96, ReadHint::REST).await.unwrap();
         let mut read = Vec::new();
@@ -271,8 +268,8 @@ mod tests {
         assert_eq!(counts.read_at_bytes(), 10);
 
         let mut reader = counting.open(0, ReadHint::of(20)).await.unwrap();
-        let mut read = Vec::new();
-        reader.read_to_end(&mut read).await.unwrap();
+        let mut read = [0u8; 20];
+        reader.read_exact(&mut read).await.unwrap();
         assert_eq!(counts.opens(), 1);
         assert_eq!(counts.opened_bytes(), 20);
         assert_eq!(counts.bytes(), 30);

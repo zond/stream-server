@@ -31,7 +31,7 @@
 //! along, so a reader that does not say what it read reports zero bytes.
 //! That bug served every `.tar` member as an empty body.
 
-use super::{ByteSource, Extent, ReadHint, SourceReader, open_owned};
+use super::{ByteSource, Extent, ReadHint, SeekableReader, open_owned};
 use std::future::Future;
 use std::io::{self, SeekFrom};
 use std::pin::Pin;
@@ -40,7 +40,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 
 /// A source's `open` in flight, as a reader's state machine holds it.
-type Opening = Pin<Box<dyn Future<Output = io::Result<Box<dyn SourceReader>>> + Send>>;
+type Opening = Pin<Box<dyn Future<Output = io::Result<Box<dyn SeekableReader>>> + Send>>;
 
 /// What a member is made of. Shared by every reader of it.
 struct Member {
@@ -205,10 +205,10 @@ impl ByteSource for MemberView {
         Ok(filled)
     }
 
-    async fn open(&self, offset: u64, _hint: ReadHint) -> io::Result<Box<dyn SourceReader>> {
+    async fn open(&self, offset: u64, _hint: ReadHint) -> io::Result<Box<dyn SeekableReader>> {
         // The hint is spent by the extents the reader opens as it reaches
-        // them -- each one asks its own source for exactly its own bytes,
-        // and no more -- so there is nothing here to narrow it against.
+        // them -- each one asks its own source for its own span -- so
+        // there is nothing here to narrow it against.
         Ok(Box::new(self.reader_at(offset)))
     }
 }
@@ -216,15 +216,25 @@ impl ByteSource for MemberView {
 /// What a reader is doing right now.
 enum State {
     /// Nothing open: the next read opens the extent its position is in.
-    /// Where every reader starts, and where a seek puts one.
+    /// Where every reader starts, and where a seek out of the open extent
+    /// puts one.
     Idle,
     /// A source's `open` is in flight for extent `index`.
     Opening { index: usize, open: Opening },
+    /// A seek of the open reader is in flight, to `left` bytes before the
+    /// end of extent `index`: a seek **inside** the extent a reader is
+    /// already open on is that reader's own seek, not another `open`.
+    Seeking {
+        index: usize,
+        reader: Box<dyn SeekableReader>,
+        left: u64,
+    },
     /// A reader is open with `left` bytes of its extent still to come.
     /// `left` is what keeps the read inside the extent: the source has the
     /// container's other bytes after it, and they are not the member's.
     Reading {
-        reader: Box<dyn SourceReader>,
+        index: usize,
+        reader: Box<dyn SeekableReader>,
         left: u64,
     },
 }
@@ -311,13 +321,42 @@ impl AsyncRead for MemberReader {
                             let extent = this.member.extents[index];
                             let within = this.pos - this.member.starts[index];
                             this.state = State::Reading {
+                                index,
                                 reader,
                                 left: extent.len - within,
                             };
                         }
                     }
                 }
-                State::Reading { reader, left } => {
+                State::Seeking {
+                    index,
+                    reader,
+                    left,
+                } => match Pin::new(reader).poll_complete(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(error)) => {
+                        this.state = State::Idle;
+                        return Poll::Ready(Err(error));
+                    }
+                    Poll::Ready(Ok(_)) => {
+                        let (index, left) = (*index, *left);
+                        let State::Seeking { reader, .. } =
+                            std::mem::replace(&mut this.state, State::Idle)
+                        else {
+                            unreachable!("just matched")
+                        };
+                        this.state = State::Reading {
+                            index,
+                            reader,
+                            left,
+                        };
+                    }
+                },
+                State::Reading {
+                    index: _,
+                    reader,
+                    left,
+                } => {
                     // As above: the comparison is in `u64` because
                     // `*left` does not fit a 32-bit `usize`, and the
                     // result does by construction.
@@ -378,19 +417,66 @@ impl AsyncSeek for MemberReader {
         Ok(())
     }
 
-    fn poll_complete(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+    fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
         let this = self.get_mut();
         if let Some(target) = this.seeking.take()
             && target != this.pos
         {
             this.pos = target;
-            // **A seek is a new read.** The reader that was open is
-            // positioned where the last read left it and cannot be moved
-            // without asking its source again -- which is what opening at
-            // the new offset is, and the only thing an HTTP source could
-            // do anyway. Dropping it here is what makes that cost visible
-            // rather than hidden inside a `poll_seek`.
-            this.state = State::Idle;
+            // **A seek inside the open extent is that reader's own seek.**
+            // A source's reader is a handle on the file it came from (see
+            // `sources::SeekableReader`), so the member's coordinates are
+            // translated to the source's and the handle moves; a target
+            // in another extent -- or past the member's end -- is a new
+            // reader, because it is a different source's span.
+            let open = std::mem::replace(&mut this.state, State::Idle);
+            if let State::Reading { index, reader, .. } | State::Seeking { index, reader, .. } =
+                open
+                && let Some((at, extent, within)) = this.member.extent_at(target)
+                && at == index
+            {
+                let mut reader = reader;
+                match Pin::new(&mut reader).start_seek(SeekFrom::Start(extent.offset + within)) {
+                    Ok(()) => {
+                        this.state = State::Seeking {
+                            index,
+                            reader,
+                            left: extent.len - within,
+                        };
+                    }
+                    // A reader that will not take the seek is simply
+                    // replaced: the position is the member's, and the next
+                    // read opens the extent it is in.
+                    Err(_) => this.state = State::Idle,
+                }
+            }
+        }
+        // A seek of the inner reader started above -- or left over from a
+        // read that was polled while one was in flight -- is driven here,
+        // so the position this returns is one the next read can start at.
+        if let State::Seeking { reader, .. } = &mut this.state {
+            match Pin::new(reader).poll_complete(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => {
+                    this.state = State::Idle;
+                    return Poll::Ready(Err(error));
+                }
+                Poll::Ready(Ok(_)) => {
+                    let State::Seeking {
+                        index,
+                        reader,
+                        left,
+                    } = std::mem::replace(&mut this.state, State::Idle)
+                    else {
+                        unreachable!("just matched")
+                    };
+                    this.state = State::Reading {
+                        index,
+                        reader,
+                        left,
+                    };
+                }
+            }
         }
         Poll::Ready(Ok(this.pos))
     }
@@ -472,11 +558,12 @@ mod tests {
     }
 
     /// **A member ends where its extents end, whatever its sources hand
-    /// out.** A [`ReadHint`] is a bound a reader may stop at, not one it
-    /// must -- a torrent's file handle runs to the end of the file -- so
-    /// what keeps a read inside the member is the run of the extent it is
-    /// in, checked here against sources that read straight past the hint
-    /// into the container's own bytes on either side.
+    /// out.** A [`ReadHint`] is advice about how much is coming and not a
+    /// cap -- a source's reader is a handle on the whole file, and a
+    /// torrent's runs to the end of it -- so what keeps a read inside the
+    /// member is the run of the extent it is in. Checked here with the
+    /// container's own bytes on either side of every extent, which a
+    /// reader that trusted its source to stop would hand to the player.
     #[tokio::test]
     async fn a_source_that_reads_past_its_hint_still_reads_only_the_member() {
         let member = member();
@@ -489,10 +576,8 @@ mod tests {
         let view = MemberView::new(
             "film.mkv",
             vec![
-                Arc::new(MemorySource::new("volume 1", first).reading_past_the_hint())
-                    as Arc<dyn ByteSource>,
-                Arc::new(MemorySource::new("volume 2", second).reading_past_the_hint())
-                    as Arc<dyn ByteSource>,
+                Arc::new(MemorySource::new("volume 1", first)) as Arc<dyn ByteSource>,
+                Arc::new(MemorySource::new("volume 2", second)) as Arc<dyn ByteSource>,
             ],
             vec![
                 Extent {

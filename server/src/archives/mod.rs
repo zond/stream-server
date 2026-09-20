@@ -9,11 +9,6 @@ pub mod rar;
 pub mod sessions;
 pub mod sevenz;
 pub mod source;
-pub mod tar;
-pub mod tgz;
-pub mod torrent;
-pub mod window;
-pub mod zip;
 
 pub use source::{ArchiveSession, ArchiveSource};
 
@@ -114,6 +109,10 @@ impl CacheConfig {
 
 /// The suffixes the readers are chosen by, longest first so `.tar.gz` is
 /// found before `.gz` would not be.
+///
+/// Still all six, though only two of them reach a reader here: the list is
+/// what names a download's scratch file, and a file whose suffix the
+/// dispatch does not know is one that will never be opened by mistake.
 const ARCHIVE_SUFFIXES: [&str; 6] = [".tar.gz", ".tgz", ".zip", ".rar", ".7z", ".tar"];
 
 /// The recognised archive suffix `name` ends with (case-insensitively), as
@@ -177,9 +176,11 @@ impl<T: AsyncRead + AsyncSeek + Unpin + Send> AsyncSeekableReader for T {}
 /// reader from it, so the caller can keep it and serve every later request
 /// for the same member -- a player's range requests, one per seek -- from
 /// the one extraction rather than starting another (see
-/// `ArchiveSource::open_member`). A format that needs no decoding (a stored
-/// TAR member is a slice of the archive) returns a reader over the archive
-/// itself; there is nothing to keep.
+/// `ArchiveSource::open_member`). A format that needs no decoding returns a
+/// reader over the archive itself; there is nothing to keep. **Nothing
+/// takes the second arm any more**: the formats that can point at a
+/// member's bytes are translated now (`crate::translators`), and these two
+/// are what is left until steps 3 and 5 of the design convert them.
 pub enum OpenedMember {
     Extracted(cache::ProgressiveCache),
     Direct(Box<dyn AsyncSeekableReader>),
@@ -213,13 +214,6 @@ pub async fn get_archive_reader_with_config(
     // The reader is chosen by suffix, which is why a download has to be
     // given one (`scratch_file`).
     match archive_suffix(&path.to_string_lossy()) {
-        Some(".zip") => {
-            tracing::info!("Archive detected: ZIP at {:?}", path);
-            Ok(Box::new(zip::ZipHandler::new(
-                path.to_path_buf(),
-                cache_config,
-            )))
-        }
         Some(".rar") => {
             #[cfg(feature = "rar")]
             {
@@ -253,17 +247,6 @@ pub async fn get_archive_reader_with_config(
                 cache_config,
             )))
         }
-        Some(".tar") => {
-            tracing::info!("Archive detected: TAR at {:?}", path);
-            Ok(Box::new(tar::TarHandler::new(path.to_path_buf()))) // TODO: Async Tar
-        }
-        Some(".tar.gz" | ".tgz") => {
-            tracing::info!("Archive detected: TGZ at {:?}", path);
-            Ok(Box::new(tgz::TgzHandler::new(
-                path.to_path_buf(),
-                cache_config,
-            ))) // TODO: Async Tgz
-        }
         Some(_) | None => {
             tracing::info!("Normal file detected (not an archive): {:?}", path);
             Err(anyhow::anyhow!(
@@ -271,32 +254,6 @@ pub async fn get_archive_reader_with_config(
                 path.extension()
             ))
         }
-    }
-}
-
-/// Whether [`get_archive_reader_from_stream`] can read archives with this
-/// extension (without its dot, any case): zip alone. 7z's decoder wants a
-/// seekable `std` file, and its handler was handed a stream only to refuse
-/// it at the first open.
-pub fn streams_from_a_reader(extension: &str) -> bool {
-    extension.eq_ignore_ascii_case("zip")
-}
-
-pub fn get_archive_reader_from_stream(
-    reader: Box<dyn AsyncSeekableReader>,
-    extension: &str,
-    cache_config: CacheConfig,
-) -> Result<Box<dyn ArchiveReader>> {
-    if streams_from_a_reader(extension) {
-        Ok(Box::new(zip::ZipHandler::new_with_reader(
-            reader,
-            cache_config,
-        )))
-    } else {
-        Err(anyhow::anyhow!(
-            "Unsupported archive type for streaming: .{}",
-            extension
-        ))
     }
 }
 

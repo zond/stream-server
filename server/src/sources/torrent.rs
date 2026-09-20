@@ -24,12 +24,12 @@
 //!   every read through it, and every index read between reads, is inside
 //!   it.
 
-use super::{ByteSource, ReadHint, SeekableReader, SourceReader, read_filling};
+use super::{ByteSource, ReadHint, SeekableReader, read_filling};
 use enginefs::backend::TorrentHandle;
 use enginefs::backend::priorities::{BufferProfile, Fetching};
 use std::io::{self, SeekFrom};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::AsyncSeekExt;
 
 /// What a player's read is worth to the engine: the same priority
 /// `routes::stream` gives a request that names none, which is what an
@@ -214,8 +214,8 @@ impl TorrentFileSource {
     /// viewer's buffer profile and what the retention budget can keep --
     /// which is the whole reason to go through it rather than through
     /// `get_file_reader`, whose lookahead argument installs no policy to
-    /// keep what it pulls. A [`ReadHint`] therefore bounds the *reader*
-    /// here (see [`ByteSource::open`]) rather than the fetch.
+    /// keep what it pulls. A [`ReadHint`] is therefore spent on nothing
+    /// at all here (see [`ByteSource::open`]).
     async fn reader(&self, offset: u64) -> io::Result<Box<dyn SeekableReader>> {
         let torrent = self
             .engine
@@ -269,12 +269,23 @@ impl ByteSource for TorrentFileSource {
         read_filling(reader, &mut buf[..want]).await
     }
 
-    async fn open(&self, offset: u64, hint: ReadHint) -> io::Result<Box<dyn SourceReader>> {
+    async fn open(&self, offset: u64, _hint: ReadHint) -> io::Result<Box<dyn SeekableReader>> {
         if offset >= self.len {
-            return Ok(Box::new(tokio::io::empty()));
+            return Ok(Box::new(std::io::Cursor::new(Vec::new())));
         }
-        // Ended at the hint, as every source's reader is: a reader opened
-        // for a header must not be able to read the film through.
-        Ok(Box::new(self.reader(offset).await?.take(hint.bytes())))
+        // **The offset is told twice, and has to be.** The engine takes it
+        // as where the read is about to be, which is what the intent
+        // prioritises around; the handle itself still starts at the top of
+        // the file, exactly as `routes::stream` finds it. A body served
+        // without this seek is the archive's first bytes under the
+        // member's name.
+        //
+        // The hint is spent by the engine and not here: it works the
+        // lookahead out from the intent, the film's measured bitrate and
+        // what the retention budget can keep, which is a better answer
+        // than a caller has. See [`ReadHint`].
+        let mut reader = self.reader(offset).await?;
+        reader.seek(SeekFrom::Start(offset)).await?;
+        Ok(reader)
     }
 }

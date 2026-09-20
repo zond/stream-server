@@ -28,6 +28,7 @@ use async_trait::async_trait;
 use std::fmt;
 use std::sync::Arc;
 
+pub mod session;
 pub mod tar;
 pub mod zip;
 

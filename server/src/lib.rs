@@ -1725,15 +1725,18 @@ fn lan_stream_routes() -> Router<AppState> {
         )
 }
 
-/// The archive formats' prefixes, each mounting `router` -- one handler set
-/// serves RAR/ZIP/7Z/TAR/TGZ alike.
-fn archive_prefixes(router: impl Fn() -> Router<AppState>) -> Router<AppState> {
+/// The archive formats' prefixes, each mounting `router` for the format it
+/// names -- which is what picks the translator (`routes::archive::Format`).
+fn archive_prefixes(
+    router: impl Fn(routes::archive::Format) -> Router<AppState>,
+) -> Router<AppState> {
+    use routes::archive::Format;
     Router::new()
-        .nest("/rar", router())
-        .nest("/zip", router())
-        .nest("/7zip", router())
-        .nest("/tar", router())
-        .nest("/tgz", router())
+        .nest("/rar", router(Format::Rar))
+        .nest("/zip", router(Format::Zip))
+        .nest("/7zip", router(Format::SevenZ))
+        .nest("/tar", router(Format::Tar))
+        .nest("/tgz", router(Format::TarGz))
 }
 
 /// The whole archive API: a session created from an archive named by URL or

@@ -2433,7 +2433,14 @@ pub(crate) async fn cache_assisted_range(
         {
             Ok(resp) => resp,
             Err(e) => {
-                return Err(FetchFailure::Transport(e.to_string()));
+                // `without_url`, because reqwest's `Display` names the URL
+                // it was fetching -- the caller's, credentials and all --
+                // and this string travels: into `/proxy`'s response body,
+                // into the `io::Error` a `ByteSource` read fails with, and
+                // from there into whatever logs that (`routes::archive`
+                // does). The origin is what a field report is read for
+                // anyway; see `routes::util::log_origin`.
+                return Err(FetchFailure::Transport(e.without_url().to_string()));
             }
         };
 

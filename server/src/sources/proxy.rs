@@ -21,7 +21,7 @@
 //! and which reach no log -- [`ByteSource::describe`] is the target's
 //! origin and nothing else.
 
-use super::{ByteSource, ReadHint, SourceReader, read_filling};
+use super::{ByteSource, ReadHint, SeekableReader, read_filling};
 use crate::routes::proxy::{
     FetchFailure, OriginAnswer, ProxiedBody, RangeAnswer, cache_assisted_range, cache_filling,
     origin_body, with_cached_head,
@@ -72,6 +72,13 @@ impl From<FetchFailure> for ProxySourceError {
 
 /// One HTTP entity, read by range through the proxy cache.
 pub struct ProxySource {
+    entity: Arc<Entity>,
+}
+
+/// What issuing a ranged read of this entity takes. Behind an `Arc`
+/// because a reader outlives the call that opened it and has to be able to
+/// ask again -- which is what a seek on one is.
+struct Entity {
     /// The cache the reads go through. The entry is taken per read, as the
     /// route takes one per request: an `Entry` is a key's directory and
     /// the doors onto it, and asking again is what makes a source built
@@ -112,11 +119,9 @@ impl ProxySource {
     /// ranged request, and a store that never revalidates cannot answer
     /// that; a byte off the disk would say only what it did once.
     ///
-    /// Nothing in the server calls this yet: the archive routes move onto
-    /// the seam in the next step, which is when a `/{fmt}/create` with
-    /// `urls` builds one of these per URL. It is `pub(crate)` rather than
-    /// `pub` because a `ProxyCache` is not part of the embeddable API.
-    #[allow(dead_code)]
+    /// `pub(crate)` rather than `pub` because a `ProxyCache` is not part
+    /// of the embeddable API; `routes::archive` builds one of these per
+    /// URL a `/{fmt}/create` names.
     pub(crate) async fn open(
         cache: Arc<crate::proxy_cache::ProxyCache>,
         self_addr: SocketAddr,
@@ -150,29 +155,33 @@ impl ProxySource {
             });
         };
         Ok(Self {
-            cache,
-            self_addr,
-            describe: crate::routes::util::log_origin(url.as_str()),
-            url,
-            request_headers,
-            total: entity.total,
-            content_type: entity.content_type,
-            validator: entity.validator,
+            entity: Arc::new(Entity {
+                cache,
+                self_addr,
+                describe: crate::routes::util::log_origin(url.as_str()),
+                url,
+                request_headers,
+                total: entity.total,
+                content_type: entity.content_type,
+                validator: entity.validator,
+            }),
         })
     }
 
     /// The type the origin labelled the entity with, for a caller that has
     /// to say what a member of it is.
     pub fn content_type(&self) -> &str {
-        &self.content_type
+        &self.entity.content_type
     }
 
     /// How the origin identifies the entity, as the store files it, or
     /// `None` for one that identifies it by nothing.
     pub fn validator(&self) -> Option<&str> {
-        self.validator.as_deref()
+        self.entity.validator.as_deref()
     }
+}
 
+impl Entity {
     /// The cache entry these reads go through: **the very same one
     /// `/proxy` would use for this URL and these `h=` headers**, because it
     /// is the same call. `None` for a target the cache will not touch --
@@ -249,31 +258,176 @@ impl ProxySource {
 #[async_trait::async_trait]
 impl ByteSource for ProxySource {
     fn len(&self) -> u64 {
-        self.total
+        self.entity.total
     }
 
     fn describe(&self) -> String {
-        self.describe.clone()
+        self.entity.describe.clone()
     }
 
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
-        let Some(last) = ReadHint::of(buf.len() as u64).last_byte(offset, self.total) else {
+        let Some(last) = ReadHint::of(buf.len() as u64).last_byte(offset, self.entity.total) else {
             return Ok(0);
         };
-        let stream = self.ranged(offset, last).await?;
+        let stream = self.entity.ranged(offset, last).await?;
         let mut reader = tokio_util::io::StreamReader::new(stream);
         read_filling(&mut reader, buf).await
     }
 
-    async fn open(&self, offset: u64, hint: ReadHint) -> io::Result<Box<dyn SourceReader>> {
-        let Some(last) = hint.last_byte(offset, self.total) else {
-            return Ok(Box::new(tokio::io::empty()));
+    async fn open(&self, offset: u64, hint: ReadHint) -> io::Result<Box<dyn SeekableReader>> {
+        Ok(Box::new(ProxyReader {
+            entity: self.entity.clone(),
+            pos: offset,
+            // One ranged request for the whole span the caller says it
+            // wants, which is what the hint is for: a body read that asked
+            // per chunk would be a request per chunk at the origin. A
+            // reader that runs past it simply asks for the next span.
+            until: hint.last_byte(offset, self.entity.total),
+            state: ReaderState::Idle,
+            seeking: None,
+        }))
+    }
+}
+
+/// A ranged fetch in flight, as the reader's state machine holds it.
+type Fetching =
+    std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<ProxiedBody>> + Send>>;
+
+/// A handle on the entity: reads through the cache, and **seeks by ending
+/// the response it is reading and asking for one at the new offset**.
+///
+/// That is what a seek on a proxied file already is -- a player dragging
+/// the scrubber through `/proxy` makes exactly this request -- and it is
+/// the one thing an HTTP source can do about a seek. What it costs is one
+/// request, and what it saves is every consumer of a fetched file being
+/// able to treat it as a file (see [`super::SeekableReader`]).
+struct ProxyReader {
+    entity: Arc<Entity>,
+    /// Where the next byte comes from.
+    pos: u64,
+    /// The last byte of the span the current -- or next -- fetch covers,
+    /// or `None` for "to the end of the entity".
+    until: Option<u64>,
+    state: ReaderState,
+    /// Where `start_seek` said to go, until `poll_complete` takes it.
+    seeking: Option<u64>,
+}
+
+enum ReaderState {
+    /// Nothing open: the next read asks for the span at `pos`.
+    Idle,
+    /// A ranged read is being set up.
+    Fetching(Fetching),
+    /// A response is being read.
+    Reading(tokio_util::io::StreamReader<ProxiedBody, bytes::Bytes>),
+}
+
+impl tokio::io::AsyncRead for ProxyReader {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        loop {
+            match &mut this.state {
+                ReaderState::Idle => {
+                    if this.pos >= this.entity.total {
+                        return Poll::Ready(Ok(()));
+                    }
+                    let last = this.until.unwrap_or(this.entity.total - 1).max(this.pos);
+                    let entity = this.entity.clone();
+                    let first = this.pos;
+                    this.state =
+                        ReaderState::Fetching(Box::pin(
+                            async move { entity.ranged(first, last).await },
+                        ));
+                }
+                ReaderState::Fetching(fetch) => match fetch.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(error)) => {
+                        this.state = ReaderState::Idle;
+                        return Poll::Ready(Err(error));
+                    }
+                    Poll::Ready(Ok(body)) => {
+                        this.state = ReaderState::Reading(tokio_util::io::StreamReader::new(body));
+                    }
+                },
+                ReaderState::Reading(reader) => {
+                    let before = buf.filled().len();
+                    match std::pin::Pin::new(reader).poll_read(cx, buf) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Err(error)) => {
+                            this.state = ReaderState::Idle;
+                            return Poll::Ready(Err(error));
+                        }
+                        Poll::Ready(Ok(())) => {
+                            let read = (buf.filled().len() - before) as u64;
+                            if read == 0 {
+                                // The response this was reading is over.
+                                // A reader is a handle on the whole
+                                // entity and not a window onto the span
+                                // it was hinted, so a caller still
+                                // reading gets the next span -- one more
+                                // request, to the end. A response that
+                                // ends while *that* is what is being read
+                                // is the entity's own end.
+                                this.state = ReaderState::Idle;
+                                match this.until.take() {
+                                    Some(_) if this.pos < this.entity.total => continue,
+                                    _ => return Poll::Ready(Ok(())),
+                                }
+                            }
+                            this.pos += read;
+                            return Poll::Ready(Ok(()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl tokio::io::AsyncSeek for ProxyReader {
+    fn start_seek(self: std::pin::Pin<&mut Self>, position: io::SeekFrom) -> io::Result<()> {
+        let this = self.get_mut();
+        let target = match position {
+            io::SeekFrom::Start(from_start) => from_start,
+            io::SeekFrom::End(from_end) => {
+                if from_end < 0 {
+                    this.entity.total.saturating_sub(from_end.unsigned_abs())
+                } else {
+                    this.entity.total.saturating_add(from_end as u64)
+                }
+            }
+            io::SeekFrom::Current(from_here) => {
+                let there = this.pos as i128 + i128::from(from_here);
+                if there < 0 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "Negative seek"));
+                }
+                there as u64
+            }
         };
-        // One ranged request for the whole span, which is what the hint is
-        // for: a body read that asked per chunk would be a request per
-        // chunk at the origin.
-        let stream = self.ranged(offset, last).await?;
-        Ok(Box::new(tokio_util::io::StreamReader::new(stream)))
+        this.seeking = Some(target);
+        Ok(())
+    }
+
+    fn poll_complete(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<u64>> {
+        let this = self.get_mut();
+        if let Some(target) = this.seeking.take()
+            && target != this.pos
+        {
+            this.pos = target;
+            // The response being read covers the old offset and nothing
+            // else; the next read asks for one that covers this one.
+            this.state = ReaderState::Idle;
+            this.until = None;
+        }
+        std::task::Poll::Ready(Ok(this.pos))
     }
 }
 
@@ -283,7 +437,7 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
     /// One byte of the origin's body at `offset`: a pattern, so a range
     /// can be checked to have come from the offset it claims rather than
@@ -468,7 +622,10 @@ mod tests {
                 SELF_ADDR,
             )
             .expect("a cacheable target");
-        assert_eq!(route_entry.dir(), source.entry().expect("an entry").dir());
+        assert_eq!(
+            route_entry.dir(),
+            source.entity.entry().expect("an entry").dir()
+        );
 
         // And there really are chunks under it.
         let entity = std::fs::read_dir(route_entry.dir())
@@ -579,9 +736,60 @@ mod tests {
             .expect("an origin that ranges");
         let probed = origin.asked();
         let mut reader = source.open(1000, ReadHint::of(64)).await.unwrap();
-        let mut read = Vec::new();
-        reader.read_to_end(&mut read).await.unwrap();
-        assert_eq!(read, (1000..1064).map(byte_at).collect::<Vec<_>>());
-        assert_eq!(origin.asked(), probed + 1);
+        let mut read = [0u8; 64];
+        reader.read_exact(&mut read).await.unwrap();
+        assert_eq!(read.to_vec(), (1000..1064).map(byte_at).collect::<Vec<_>>());
+        assert_eq!(origin.asked(), probed + 1, "one request for the span");
+
+        // **The hint is advice, not a cap.** A caller that reads on past
+        // it gets the bytes after it -- one more request, for the rest --
+        // rather than a short read it would have to work out for itself.
+        let mut past = [0u8; 8];
+        reader.read_exact(&mut past).await.unwrap();
+        assert_eq!(past.to_vec(), (1064..1072).map(byte_at).collect::<Vec<_>>());
+    }
+
+    /// **A seek on a reader is one new ranged request at the new offset**,
+    /// which is exactly what a player dragging the scrubber through
+    /// `/proxy` already makes. The response being read is ended; nothing
+    /// is read through from the old offset to the new one.
+    #[tokio::test]
+    async fn a_seek_ends_the_response_and_asks_for_the_new_offset() {
+        let origin = Origin::start(true);
+        let (_root, cache) = cache();
+        let source = ProxySource::open(cache, SELF_ADDR, origin.url(), BTreeMap::new())
+            .await
+            .expect("an origin that ranges");
+        let mut reader = source.open(0, ReadHint::of(64)).await.unwrap();
+        let mut read = [0u8; 64];
+        reader.read_exact(&mut read).await.unwrap();
+        let after_first = origin.asked();
+
+        // Forwards, over a span nothing has fetched: one request, and it
+        // starts where the seek said.
+        let far = (ORIGIN_LENGTH - 1024) as u64;
+        assert_eq!(reader.seek(io::SeekFrom::Start(far)).await.unwrap(), far);
+        reader.read_exact(&mut read).await.unwrap();
+        assert_eq!(
+            read.to_vec(),
+            (far as usize..far as usize + 64)
+                .map(byte_at)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(origin.asked(), after_first + 1, "one request for the seek");
+
+        // And backwards, which is the seek an HTTP reader could not make
+        // at all before this: one request at the new offset, not a read
+        // through everything between it and where the reader was.
+        let back = origin.asked();
+        assert_eq!(reader.seek(io::SeekFrom::Start(8)).await.unwrap(), 8);
+        let mut early = [0u8; 8];
+        reader.read_exact(&mut early).await.unwrap();
+        assert_eq!(early.to_vec(), (8..16).map(byte_at).collect::<Vec<_>>());
+        assert!(
+            origin.asked() <= back + 1,
+            "a seek backwards cost {} requests",
+            origin.asked() - back
+        );
     }
 }

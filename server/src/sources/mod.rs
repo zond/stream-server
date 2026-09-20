@@ -40,40 +40,35 @@ pub use proxy::ProxySource;
 pub use torrent::TorrentFileSource;
 pub use view::{MemberReader, MemberView};
 
-/// A reader over one span of a source's bytes, for one sequential pass.
+/// A reader over a source's bytes: what [`ByteSource::open`] hands out.
 ///
-/// **Read-only and forward-only on purpose.** The doc's trait said
-/// `AsyncSeekableReader` here, and for a torrent that would be honest --
-/// librqbit's reader seeks, and cheaply. For an HTTP entity it would not
-/// be: the only thing behind a seek is another ranged request, and a
-/// `poll_seek` that quietly refetches is how a translator ends up
-/// downloading a file it meant to read a kilobyte of. Seeking a source is
-/// therefore spelled [`ByteSource::open`] again, at the new offset, where
-/// the cost is visible. [`MemberView`], which *is* seekable because the
-/// route above it frames ranges against it, implements its own seek as
-/// exactly that reopen.
-pub trait SourceReader: AsyncRead + Send + Unpin {}
-impl<T: AsyncRead + Send + Unpin> SourceReader for T {}
-
-/// A reader that can also seek: what a torrent's file handle is, and what
-/// [`MemberView`] is, so the stream route's range framing can sit on one.
+/// **Seekable, like every other handle on a fetched file.** A fetcher
+/// already assumes a consumer it does not understand -- mpv seeks
+/// anywhere, the piece store and the proxy cache serve what they hold and
+/// fetch the rest, the stream detector and the cache's own bound cope with
+/// whatever that consumer does. A translator is one more such consumer,
+/// and a forward-only handle capped at its hint would be a second, weaker
+/// copy of a protection the fetcher already gives -- one no other consumer
+/// is held to, and one the format crates fight, since their parsers take
+/// `Read + Seek`. So a seek is a seek: cheap in the piece store, and one
+/// new ranged request through the proxy cache, which is exactly what a
+/// player's seek through `/proxy` already is.
+///
+/// What keeps an index read small is therefore not the handle. It is the
+/// translator's own read budget, counted and asserted
+/// (`crate::translators::Budget`, and `crate::images` before it).
 pub trait SeekableReader: AsyncRead + AsyncSeek + Send + Unpin {}
 impl<T: AsyncRead + AsyncSeek + Send + Unpin> SeekableReader for T {}
 
 /// How far from the offset the caller expects to read, handed to
 /// [`ByteSource::open`].
 ///
-/// It exists because the two fetchers spend it differently and neither can
-/// work it out for itself: a torrent turns it into the reader's lookahead
-/// -- how far ahead of the playhead the swarm is asked for -- and an HTTP
-/// source turns it into the `Range`'s last byte, which is one request
-/// instead of one per chunk.
-///
-/// **It is a bound and not a wish.** A reader may end at it, because for an
-/// HTTP source it is literally where the response stops; a caller that
-/// wants more opens again at the new offset. That is the honest shape: a
-/// hint that only sped things up would let a translator read a whole file
-/// through a reader it opened for a header.
+/// **Advisory.** It exists because an HTTP source can spend it -- one
+/// ranged request for the whole span instead of one per chunk -- and a
+/// torrent cannot: the engine works the lookahead out from the intent, the
+/// film's measured bitrate and what the retention budget can keep, which
+/// is a better answer than any caller has. A reader may read past its
+/// hint, and the one that does simply asks its source for the next span.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadHint {
     bytes: u64,
@@ -148,10 +143,11 @@ pub trait ByteSource: Send + Sync {
     /// reason it could not.
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize>;
 
-    /// A reader positioned at `offset` for a long sequential read: the body
-    /// of a response. See [`ReadHint`] for what `hint` is spent on and why
-    /// the reader may end at it.
-    async fn open(&self, offset: u64, hint: ReadHint) -> io::Result<Box<dyn SourceReader>>;
+    /// A reader positioned at `offset`, for a long read: the body of a
+    /// response, or a format parser that wants to seek about. See
+    /// [`ReadHint`] for what `hint` is spent on, and [`SeekableReader`] for
+    /// why a seek on one is a seek rather than a refusal.
+    async fn open(&self, offset: u64, hint: ReadHint) -> io::Result<Box<dyn SeekableReader>>;
 }
 
 /// One run of one source's bytes: where a member's bytes physically are.
@@ -178,7 +174,7 @@ pub(crate) async fn open_owned(
     source: Arc<dyn ByteSource>,
     offset: u64,
     hint: ReadHint,
-) -> io::Result<Box<dyn SourceReader>> {
+) -> io::Result<Box<dyn SeekableReader>> {
     source.open(offset, hint).await
 }
 
