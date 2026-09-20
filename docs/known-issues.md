@@ -147,6 +147,17 @@ order to do them in.
   `stream_progress` line now carries `queued`, `unique` and
   `connection_tries` to tell "nothing found" from "nothing answering".
 
+* **A seeded test torrent's pieces are reclaimed about two seconds after it
+  is added, and every torrent test in `server/tests/embed.rs` is racing that
+  timer.** Measured 2026-09-20 while writing the RAR set tests: with
+  `ServerConfig::pins: Some(Default::default())` -- "an embedder that keeps a
+  record and wants nothing" -- the owner held 33 pieces and then none, even
+  under `pretend_volume_space(u64::MAX)`, and every later read parks for ever
+  because nothing seeds a test fixture. The existing tests pass because they
+  are quick. `pins: None` ("nobody said", so everything is kept) is what a
+  fixture wants; `server/tests/archive.rs`'s RAR set tests use it and say so.
+  The rest of `embed.rs` has not been swept.
+
 * **Never `git checkout <file>` to undo an experiment.** It restores from
   HEAD, not from the working tree, so it discards everything uncommitted in
   that file. Copy the file to the scratchpad and copy it back instead.
