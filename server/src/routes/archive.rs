@@ -183,6 +183,14 @@ pub fn stream_router(format: Format) -> Router<AppState> {
         .layer(Extension(format))
 }
 
+/// What a build without the `rar` cargo feature says about a RAR. The
+/// feature is off in the MIT build, because `unrar-rs` is GPL-3.0 (see
+/// `server/Cargo.toml` and AGENTS.md) -- so such a build has no RAR
+/// reader at all, and says so rather than failing as some other error.
+#[cfg(not(feature = "rar"))]
+const RAR_DISABLED_ERROR: &str =
+    "RAR support is not compiled into this build (rebuild with the \"rar\" cargo feature)";
+
 /// 501 JSON response returned for RAR requests when the "rar" cargo feature
 /// is not compiled into this build.
 #[cfg(not(feature = "rar"))]
@@ -190,15 +198,9 @@ fn rar_disabled_response() -> Response {
     tracing::warn!("RAR request rejected: RAR support is not compiled into this build");
     (
         StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({ "error": crate::archives::RAR_DISABLED_ERROR })),
+        Json(serde_json::json!({ "error": RAR_DISABLED_ERROR })),
     )
         .into_response()
-}
-
-/// True when `path` points at a RAR archive that this build cannot handle.
-#[cfg(not(feature = "rar"))]
-fn is_unsupported_rar(path: &std::path::Path) -> bool {
-    path.to_string_lossy().to_lowercase().ends_with(".rar")
 }
 
 /// Where the archive handlers write, from the live settings: the cache root
@@ -932,11 +934,6 @@ async fn create_downloaded(
         Err(status) => return (status, "Failed to resolve archive URL").into_response(),
     };
 
-    #[cfg(not(feature = "rar"))]
-    if is_unsupported_rar(source.path()) {
-        return rar_disabled_response();
-    }
-
     // A failure from here on drops `source`, and with it a download nothing
     // else holds -- the file goes, rather than staying on disk with no
     // session to name it.
@@ -1270,11 +1267,6 @@ async fn stream_file(
     // The session this request reads from, leased for as long as the
     // response body lives (see `archives::sessions`).
     let session = state.archive_cache.get(key).ok_or(StatusCode::NOT_FOUND)?;
-
-    #[cfg(not(feature = "rar"))]
-    if is_unsupported_rar(session.source.path()) {
-        return Ok(rar_disabled_response());
-    }
 
     // One extraction per member per archive, whatever the number of
     // requests on it (see `ArchiveSource::open_member`).
