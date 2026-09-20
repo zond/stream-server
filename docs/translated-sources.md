@@ -19,13 +19,15 @@ What the archive routes do now, per case:
 
 | Case | Today |
 |---|---|
-| Stored ZIP or TAR member inside a torrent | Served by byte range from the torrent through `archives::window::MemberWindow`. No copy. (Landed 2026-09-20, review #99.) |
-| Any RAR inside a torrent | Refused, `501`: the `torrent:` form is ZIP-only (`archives::streams_from_a_reader`), and `rar::RarHandler` reads a `std::fs::File`. |
-| Compressed member, any container, any source | Extracted whole into `archives::cache::ProgressiveCache` under `<cache root>/.archives`: a second copy of the film, bounded by the volume floor, swept when idle. |
-| Archive behind a web link (`/{fmt}/create` with `urls`) | The **whole archive is downloaded** to `.archives` first (`routes::archive::download_archive`, `DownloadRoom`), then read as a file. A compressed member is then extracted beside it: two copies. |
-| `tar.gz` | Always extracted; gzip has no random access. |
-| Multi-volume RAR (`rarUrls` with several entries) | Refused, `501`. |
-| ISO | Nothing. |
+| Stored ZIP or TAR member, in a torrent or behind a web link | Served by byte range from wherever the container is -- the piece store, or the proxy cache through one ranged request -- as a `MemberView` over a `ByteSource`. Nothing downloaded, nothing extracted, nothing written. (Step 2, 2026-09-20.) |
+| Compressed or encrypted ZIP or TAR member | Refused: `415` with `{"refused", "message"}`, one sentence for the player. (Step 2.) |
+| `tar.gz` | Refused whole: `415 noRandomAccess`. `archives/tgz.rs` is gone. (Step 2.) |
+| Any RAR inside a torrent | Refused, `501`: `rar::RarHandler` reads a `std::fs::File`. Step 3. |
+| Compressed member of a RAR or a 7z, any source | Extracted whole into `archives::cache::ProgressiveCache` under `<cache root>/.archives`: a second copy of the film, bounded by the volume floor, swept when idle. Steps 3 and 5. |
+| RAR or 7z behind a web link (`/{rar\|7zip}/create` with `urls`) | The **whole archive is downloaded** to `.archives` first (`routes::archive::download_archive`, `DownloadRoom`), then read as a file. Steps 3 and 5. |
+| An origin that will not serve ranges | Refused, `501`, with a sentence: serving it would mean downloading the archive. (Step 2.) |
+| Multi-volume RAR (`rarUrls` with several entries) | Refused, `501`. Step 3. |
+| ISO | Indexed by `server/src/images/` (ISO 9660 + UDF), wired to no route. Step 6. |
 
 The cost of that shape is not only disk: an extraction has to reach the
 byte the player wants before it can be served, so a seek to the end of a
@@ -57,7 +59,10 @@ What exists that the new shape keeps:
   `AsyncRead + AsyncSeek`, registers the position with the retention pass
   and follows a seek.
 * In the format crates: `async_zip` 0.0.18 (central directory, entry
-  `compression()`, `header_offset`); `unrar-rs` 0.10.5's
+  `compression()`, `header_offset`) -- **not used in the end**: the ZIP
+  index is parsed by hand, because what is wanted is a stated number of
+  bytes at stated offsets, counted, and a `BufReader`'s fills are its own
+  business. The crate stays a dependency, for writing the fixtures; `unrar-rs` 0.10.5's
   `RarArchive::parse_volume_facts(Read + Seek)` and
   `stored_layout::{StoredLayoutBuilder, StoredMember, StoredMemberPart,
   MemberEligibility, MappedSlice}`, built for exactly this (stored members
@@ -91,10 +96,13 @@ pub trait ByteSource: Send + Sync {
     /// `buf.len()` bytes at `offset`, or fewer at the end of the file.
     /// For indexes: small, scattered reads.
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize>;
-    /// A reader positioned at `offset` for a long sequential read:
-    /// the body of a response. `hint` is how far the caller expects to read,
-    /// which is what a torrent turns into a lookahead and an HTTP fetch
-    /// into a Range end.
+    /// A reader positioned at `offset` for a long read: the body of a
+    /// response, or a parser that seeks about. Seekable, like every other
+    /// handle on a fetched file: a seek is a seek of the piece store, or
+    /// one new ranged request through the proxy cache. `hint` is advice
+    /// about how much is coming -- an HTTP source spends it on the Range's
+    /// last byte; a torrent spends it on nothing, since the engine works
+    /// the lookahead out from the intent -- and never a cap.
     async fn open(&self, offset: u64, hint: ReadHint) -> io::Result<Box<dyn AsyncSeekableReader>>;
 }
 ```
@@ -176,9 +184,16 @@ pub enum Refusal {
 
 #[async_trait]
 pub trait Translator: Send + Sync {
+    /// What this reads, for the sentences a refusal is made of.
+    fn format(&self) -> &'static str;
     /// Read the container's index from its sources. Reads what the format
     /// needs and nothing else: the reads are bounded, small and counted.
-    async fn index(sources: &[Arc<dyn ByteSource>]) -> Result<Index, Refusal>;
+    ///
+    /// Written as an associated function here; it takes `&self` as built,
+    /// because that is what makes the trait object-safe, and the route
+    /// has a format prefix in a URL and needs *a* translator for it at
+    /// run time. Every implementation is a unit struct.
+    async fn index(&self, sources: &[Arc<dyn ByteSource>]) -> Result<Index, Refusal>;
 }
 
 pub struct Index { pub members: Vec<Member> }
@@ -189,8 +204,16 @@ Rules every translator obeys:
 1. **Index reads are small and bounded.** A translator may read headers,
    directories and trailers. It may not read a member's data to index it.
    The test suite counts bytes read per index against a per-format bound
-   (ZIP: the end-of-central-directory search window plus the directory plus
-   one local header per selected member; RAR: the headers of each volume;
+   -- and asserts **by range** that no read overlapped the member's own
+   data, which a byte count alone would not catch -- through a
+   `Budget` the translator reads everything through (`crate::translators`,
+   after `crate::images`). This, and not the shape of the handle, is what
+   keeps an index an index: a reader is seekable and uncapped, like every
+   other handle on a fetched file (§2.1).
+   (ZIP: the end record -- the last 22 bytes, widening to the 64 KiB
+   comment window only when they are not it -- plus the directory plus one
+   30-byte local header per *stored* member, since a compressed one is
+   refused without reading its header at all; RAR: the headers of each volume;
    7z: the signature header and the packed header at the end; ISO: the
    descriptors and the directory tree; TAR: one 512-byte header per member,
    the data skipped by size).
@@ -198,7 +221,8 @@ Rules every translator obeys:
    "extract it then", no partial decode, no "serve sequentially but refuse
    seeks". A compressed film is a refusal with a reason the player shows.
 3. **A translator never writes.** Not to disk, not to a temp file, not to
-   the cache root. `.archives` ceases to exist.
+   the cache root. `.archives` ceases to exist -- for ZIP and TAR it
+   already has, and the suite asserts the directory does not appear.
 4. **Verification is the fetcher's.** A torrent's bytes are piece-verified
    by librqbit; a proxy entity is what the origin served. A translator does
    not checksum a member on the way through: a CRC over a member is a read
@@ -275,11 +299,13 @@ The formats, and what each one's translator is:
 
 `MemberView { member: Member, sources: Vec<Arc<dyn ByteSource>> }` implements
 `AsyncRead + AsyncSeek` -- and `ByteSource`, for nesting. A seek to `p`
-finds the extent holding `p` (binary search on the running offsets),
-`open`s that extent's source at `extent.offset + (p - extent.start)` with a
-hint of `extent.len - ...`, and reads; crossing an extent's end closes
-that reader and opens the next. `MemberWindow` is this with one extent, and
-is replaced by it.
+finds the extent holding `p` (binary search on the running offsets) and,
+when that is the extent a reader is already open on, **seeks that reader**
+to `extent.offset + (p - extent.start)`; a seek into another extent, or
+crossing one's end, opens the next source's reader. What keeps a read
+inside the member is the run of the extent it is in, not the source
+stopping: a source's reader is a handle on the whole container.
+`MemberWindow` is this with one extent, and is replaced by it.
 
 For the response body, the stream route's own range framing is reused:
 `Content-Length`, `Content-Range`, `206`/`416`, `HEAD`, the same functions
@@ -289,8 +315,13 @@ about a member's HTTP behaviour is allowed to differ from a plain file's.
 ### 2.4 Sessions: an index, in memory, leased
 
 `archives::sessions::Sessions<TranslatedSession>` stays as the map; the
-session becomes `{ sources, index, selected: Option<usize> }` and owns
-**no file**. It is created by `/{fmt}/create` (from URLs) or on first use by
+session becomes `{ origin, sources, index, selected: Option<usize> }` and
+owns **no file**. A *torrent-backed* session holds the hash and path
+rather than the source: a `TorrentFileSource` registers a stream for as
+long as it lives, and holding one for the session's ten idle minutes
+would keep a torrent the viewer left ten minutes ago running, so each
+body opens its own -- a file lookup and a reconcile, not a fetch. The
+index, which is what was expensive to read, is what the session is for. It is created by `/{fmt}/create` (from URLs) or on first use by
 the `torrent:` form (from a torrent file and its sibling volumes), leased
 by every response body, and swept `SESSION_IDLE_TIMEOUT` after the last
 lease as now. What sweeping frees is memory and, for a torrent, the stream
@@ -332,13 +363,14 @@ a source error mid-body is the body's error, as for a plain stream.
 | Gone | Lines | Why |
 |---|---|---|
 | `server/src/archives/cache.rs` (`ProgressiveCache`, `VolumeRoom`, `ABANDONED_AFTER`, the reader/writer notify dance the AGENTS gotcha describes) | 1245 | No extraction, so no extraction cache. |
-| `server/src/archives/torrent.rs` (`TorrentArchives`, `MemberCaches` use) | 420 | Sessions hold indexes, not extractions; the `torrent:` form joins the ordinary session map. |
+| ~~`server/src/archives/torrent.rs`~~ (`TorrentArchives`) | 420 | **Gone, step 2.** Sessions hold indexes, not extractions; the `torrent:` form joins the ordinary session map. |
 | `server/src/archives/source.rs` (`ArchiveSource`, `MemberCaches`, the `NamedTempFile` ownership) | ~300 of 363 | A source is a `ByteSource` now; the origin string survives as the session's identity. |
-| `server/src/archives/tgz.rs` | 289 | gzip has no random access. |
+| ~~`server/src/archives/tgz.rs`~~ | 289 | **Gone, step 2.** gzip has no random access. |
+| ~~`server/src/archives/window.rs`~~ | 184 | **Gone, step 2.** Generalised into `MemberView`. |
+| ~~`server/src/archives/{zip,tar}.rs`~~, `streams_from_a_reader`, `get_archive_reader_from_stream` | 573 | **Gone, step 2.** Both formats are translated. |
 | `routes/archive.rs`: `download_archive`, `DownloadRoom`, `SNIFF_BYTES`, the download timeouts, `archive_cache_config`, `CacheConfig`, the `507` extraction arm | ~450 | Nothing is downloaded by this layer. |
 | `archives::sweep_scratch`, the `.archives` entry in `piece_store::sweep::NOT_OURS`, `.archives` in `server/src/lib.rs` startup, the AGENTS/README paragraphs about it | ~80 | The directory ceases to exist. |
 | `rar::RarHandler` (file-based extraction), `sevenz.rs`'s extraction, `zip.rs`'s inflate thread, the `ArchiveReader` trait and `OpenedMember` | ~900 | Replaced by translators. |
-| `archives/window.rs` | 184 | Generalised into `MemberView`. |
 
 About 3900 lines out; the new layer is roughly 1500 in (sources ~450,
 translators: zip ~250, tar ~150, rar ~400 incl. the volume naming and the
@@ -351,7 +383,7 @@ Each step lands green on master with its own tests, revert-proven hunk by
 hunk, behind no flag: the old path is removed as its replacement lands,
 never kept beside it.
 
-1. **`ByteSource`, `MemberView`, `TorrentFileSource`, `ProxySource`.**
+1. **`ByteSource`, `MemberView`, `TorrentFileSource`, `ProxySource`.** *(Landed 2026-09-20.)*
    New module `server/src/sources/`. Tests: `MemberView` over several
    extents across two `MemorySource`s (reads, seeks, boundaries, `SeekFrom::End`);
    `ProxySource` against the test origin: the second read of a range is
@@ -365,7 +397,7 @@ never kept beside it.
    the refactor is one.
 2. **ZIP and TAR translators; the routes switch to `MemberView`; compressed
    members refused; `tgz.rs`, `window.rs`, the extraction paths for zip/tar
-   deleted.** Tests: index read bounds (counting source); stored member end
+   deleted.** *(Landed 2026-09-20.)* Tests: index read bounds (counting source); stored member end
    to end from a torrent and from a URL (existing fixtures); deflate member
    -> `415` with the message; `tar.gz` -> `415`; the existing zip/tar
    fixtures under `server/tests/archive.rs` and `embed.rs` keep passing

@@ -42,7 +42,7 @@ This is not a drop-in replacement for `server.js` -- the API surface it exposes 
 - **HTTP Range Requests**: torrent pieces are streamed straight to HTTP range requests for instant seeking -- direct play, no transcoding step in between
 
 ### Media & Archives
-- **Archive Streaming**: direct playback from ZIP, 7Z, TAR, tgz (`.tar.gz`) and RAR archives out of the box (all pure Rust). RAR is **on by default** via `unrar-rs`, which is GPL-3.0-or-later, so a program that links this library with RAR on is GPL-3.0-or-later -- see [License](#license); build `--no-default-features` to link no GPL code and have no RAR
+- **Archive Streaming**: direct playback from ZIP, 7Z, TAR and RAR archives out of the box (all pure Rust). A ZIP or TAR member that is *stored* -- which is what a film in one normally is -- is served as byte ranges of the archive itself, wherever the archive lives: nothing is downloaded, nothing is extracted, nothing is written. A member that would have to be decoded to be seeked in is **refused**, with a sentence to show the viewer, rather than unpacked into a second copy of the film (`415`; a `.tar.gz` is refused whole, since gzip has no way in at the middle). RAR is **on by default** via `unrar-rs`, which is GPL-3.0-or-later, so a program that links this library with RAR on is GPL-3.0-or-later -- see [License](#license); build `--no-default-features` to link no GPL code and have no RAR
 - Subtitles are the client's job: there is no subtitle conversion, track discovery or OpenSubtitles hashing in the server (see [Removed routes](#removed-routes))
 
 ### Control API
@@ -245,7 +245,13 @@ Unknown paths get `404`, a wrong method on a known path `405` (or `401` first, o
 
 RAR routes return a `501` JSON error in a `--no-default-features` build.
 
-**Archive members.** A member of a ZIP, TAR or tgz (`.tar.gz`/`.tgz`) archive is served with ranges; a tgz member streams as it is decompressed, its length read from its tar header first. An unsatisfiable `Range` on a member is `416` with `Content-Range: bytes */<len>`, and an empty member is an empty body. The `torrent:` form (`/{format}/stream/torrent:<infoHash>%2F<path>/{member}`) reads a ZIP inside a torrent and nothing else: any other format there -- a 7z, whose decoder wants a seekable file -- is `501` before the torrent is looked at. An archive named by URL is downloaded by `/create` into `<cacheRoot>/.archives`, with a 30 s connect timeout and a 60 s timeout between reads (the whole has no bound: an archive is gigabytes over whatever link the origin has); it is refused with `507` when the volume has no room for it above the free-space floor (see [What bounds the cache](#what-bounds-the-cache)) -- before the body when the origin states a length that will not fit, and otherwise when the download reaches the floor. **Extracting a member is held to that same floor**, and it is the larger of the two writes that goes unbounded without it: the member is a whole second copy of the file, in no cap at all (nothing counts `.archives`). The member's own stated length is checked before a byte is decoded -- `507` then, as for the download -- and the volume is asked again every 8 MB, so an extraction that reaches the floor fails rather than filling the disk under the torrents and the proxy cache. **A member that is *stored* -- written into the archive uncompressed, which is what a film in a ZIP or a TAR normally is -- is not extracted at all**: it is a byte range of the archive, so it is served from wherever the archive is read from, and a seek in it is a seek there. **A member that has to be decoded is decoded once.** The URL form's session has always owned that one extraction; the `torrent:` form now owns one too, keyed by the info hash and the archive's path inside the torrent, so a player's ranged requests on one member share it instead of each paying for a copy of the film. That session holds its extractions for as long as a response body reads from it and ten minutes past the last one, and then they are unlinked with it.
+**Archive members.** A member is served with ranges, with the same framing a plain file gets from the stream route (`Content-Length`, `Content-Range`, `206`/`416`, `HEAD`): an unsatisfiable `Range` is `416` with `Content-Range: bytes */<len>`, and an empty member is an empty body.
+
+**ZIP and TAR are read as byte ranges and nothing is stored.** `/{zip|tar}/create` with `urls` reads the archive's index through the same ranged reads and the same cache `/proxy` uses -- the end record, the central directory, one local header per stored member for a ZIP; one 512-byte header per member for a TAR -- and remembers *that*: an index in memory, no file. A member's bytes are then a range of the archive, so a range request for the film is one ranged request at the origin, a seek is one more, and **nothing is ever written under the cache root**. The `torrent:` form (`/{fmt}/stream/torrent:<infoHash>%2F<path>/{member}`) is the same thing over a torrent's own file: a seek in the member is a seek in the piece store. An origin that answers a ranged request with the whole file is **refused** with `501` and a sentence saying so -- serving it would mean downloading the archive to reach the member, which is the thing this design exists to stop.
+
+**A member that cannot be pointed at is refused, not unpacked.** A compressed or encrypted member, a solid block, and a `.tar.gz` as a whole are `415` with `{"refused": "...", "message": "..."}` -- one sentence, for a player to show; an archive that contradicts itself is `422`. Reaching the end of a deflated film means inflating all of it, and this server does not download a file to seek in it.
+
+**RAR and 7z still work the old way, for now.** `/{rar|7zip}/create` downloads the archive whole into `<cacheRoot>/.archives`, with a 30 s connect timeout and a 60 s timeout between reads (the whole has no bound: an archive is gigabytes over whatever link the origin has); it is refused with `507` when the volume has no room for it above the free-space floor (see [What bounds the cache](#what-bounds-the-cache)) -- before the body when the origin states a length that will not fit, and otherwise when the download reaches the floor. Extracting a member is held to that same floor, checked before a byte is decoded and again every 8 MB. A member is extracted once and every request on it reads that one extraction, which the session holds for as long as a response body reads from it and ten minutes past the last one. The `torrent:` form of these two prefixes is `501`: their decoders want a seekable file. Both formats move onto the ranged path in the steps `docs/translated-sources.md` sets out, and `.archives` goes with them.
 
 ### Settings
 
@@ -675,7 +681,7 @@ cargo test -p server --no-default-features  # no RAR, no GPL code linked
 |---|---|---|
 | `rar` (**on by default**) | RAR archive streaming through the pure-Rust `unrar-rs` | None |
 
-ZIP, 7Z, TAR and tgz streaming are always built in and not gated by any feature. Because `unrar-rs` is GPL-3.0-or-later, a program that links this library with `rar` on is GPL-3.0-or-later; without it, RAR requests return a 501 JSON error. See [License](#license).
+ZIP, 7Z and TAR streaming are always built in and not gated by any feature (the `tgz` prefix still exists and answers `415`: gzip has no way in at the middle). Because `unrar-rs` is GPL-3.0-or-later, a program that links this library with `rar` on is GPL-3.0-or-later; without it, RAR requests return a 501 JSON error. See [License](#license).
 
 ### CI
 
@@ -700,7 +706,9 @@ stream-server/
 ├── server/           # The library: HTTP server (media + token-protected control routers)
 │   ├── src/lib.rs    # ServerConfig, start/run, ServerHandle -- the whole public API
 │   ├── src/auth.rs   # ServerAuth + the bearer middleware
-│   └── src/archives/ # ZIP/7Z/TAR/tgz (always on) + RAR (default-on "rar" feature), all pure Rust
+│   ├── src/sources/  # ByteSource: a file somebody else fetches, read by range
+│   ├── src/translators/ # What a container says about the bytes inside it (ZIP, TAR)
+│   └── src/archives/ # What still extracts: 7Z (always on) + RAR (default-on "rar" feature)
 ├── enginefs/         # Torrent engine abstraction
 │   └── src/backend/
 │       └── librqbit.rs   # The sole torrent backend (pure Rust)

@@ -216,10 +216,12 @@ nobody reopens them without knowing why they were shut.
 - **A seek to unheld ground ramps its window from the two-piece floor.**
   Accepted as a cost of streaming a torrent: audio, subtitle and video
   streams cannot be told apart, so a new stream has no window to inherit.
-- **The zip-inside-a-torrent reactor trade.** Not going to be worked on.
-  The archive route's torrent reader is a raw `FileStream`, not a
-  `FileHandle`, and a thread parked in it would never reach
-  `ABANDONED_AFTER`.
+- **The zip-inside-a-torrent reactor trade.** Gone with the thing it was
+  a trade about (step 2 of `docs/translated-sources.md`): a zip inside a
+  torrent is read as byte ranges through a `TorrentFileSource`, at
+  `Fetching::Streaming`, and there is no extraction thread to park and no
+  `ABANDONED_AFTER` to reach. What still extracts -- RAR and 7z -- reads
+  a file on disk, which was never the case this was about.
 - **xtremio's desktop builds only run in CI, and iOS does not build**
   (`librqbit-dualstack-sockets` `bind_device`). Not going to be worked on.
 - **The detector dragging a viewer's stream to mpv's tail crawl.** Fixed
