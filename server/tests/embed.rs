@@ -1209,11 +1209,25 @@ fn stats_json_exposes_startup_phase_fields_additively() -> anyhow::Result<()> {
             .json()?;
         match stats["phase"].as_str() {
             Some("checking") if std::time::Instant::now() < deadline => {
-                assert!(
-                    stats["checkedBytes"].is_u64(),
-                    "checking exposes checkedBytes: {stats}"
-                );
-                assert_eq!(stats["checkTotalBytes"], 1700, "{stats}");
+                // **Both or neither, and never a number that is really a
+                // fact about timing.** A check that has begun but not yet
+                // reported states no bytes -- both fields are absent --
+                // and a runner caught exactly that: `phase: "checking"`
+                // with `checkedBytes` and `checkTotalBytes` null, which
+                // asserting `is_u64()` read as a broken contract. What the
+                // contract says is that the pair travels together and
+                // describes this torrent when it is there at all.
+                match (&stats["checkedBytes"], &stats["checkTotalBytes"]) {
+                    (serde_json::Value::Null, serde_json::Value::Null) => {}
+                    (checked, total) => {
+                        assert!(checked.is_u64(), "a stated check states its bytes: {stats}");
+                        assert_eq!(total, &serde_json::json!(1700), "{stats}");
+                        assert!(
+                            checked.as_u64().is_some_and(|done| done <= 1700),
+                            "and never more than the whole of it: {stats}"
+                        );
+                    }
+                }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             _ => break stats,
