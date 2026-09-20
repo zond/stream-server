@@ -796,10 +796,14 @@ fn an_origin_that_will_not_range_is_refused() -> anyhow::Result<()> {
         .send()?;
     assert_eq!(refused.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
     let body: serde_json::Value = refused.json()?;
+    // A refusal, in the shape every other refusal has, and its own kind:
+    // a client tells it from the other `501` -- a build with no reader --
+    // by the kind, never by matching the English.
+    assert_eq!(body["refused"].as_str(), Some("noRanges"), "{body}");
     assert!(
-        body["error"]
+        body["message"]
             .as_str()
-            .is_some_and(|error| error.contains("byte ranges")),
+            .is_some_and(|message| message.contains("byte ranges")),
         "{body}"
     );
     assert!(!fixture.scratch_dir.exists());
@@ -1283,10 +1287,15 @@ fn a_build_without_rar_refuses_a_rar_archive_as_not_implemented() -> anyhow::Res
         .send()?;
     assert_eq!(response.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
     let body: serde_json::Value = response.json()?;
+    // `noReader` and not `noRanges`: this is a fact about the build, and
+    // the sentence beside it names a cargo feature -- which is for whoever
+    // built the app and must never reach a television, so the client shows
+    // its own words for this kind and the server's for the other.
+    assert_eq!(body["refused"].as_str(), Some("noReader"), "{body}");
     assert!(
-        body["error"]
+        body["message"]
             .as_str()
-            .is_some_and(|error| error.contains("RAR")),
+            .is_some_and(|message| message.contains("RAR")),
         "{body}"
     );
     fixture.finish()

@@ -361,7 +361,12 @@ Nothing the client sends changes.
 
 Error mapping, once, in one function: `Refusal::Compressed|Encrypted|Solid`
 -> `415`; `NoRandomAccess` -> `415`; `Malformed` -> `422`; an origin that
-will not range -> `501` (it is *this server* that declines to do the work);
+will not range -> `501` with `refused: "noRanges"` (it is *this server* that
+declines to do the work), and a build with no reader for the format -> `501`
+with `refused: "noReader"`, whose message names a cargo feature and is for
+whoever built the app, never for a viewer -- two different things that shared
+one status and one untyped `error`, so a client had to match English to tell
+them apart;
 a source error mid-body is the body's error, as for a plain stream.
 
 ## 4. What is deleted

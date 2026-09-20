@@ -121,16 +121,33 @@ fn refusal_response(refusal: &Refusal) -> Response {
 /// downloading the whole archive first, which is the thing the design
 /// exists to stop.
 fn source_error_response(error: &ProxySourceError) -> Response {
-    let status = match error {
-        ProxySourceError::WillNotRange => StatusCode::NOT_IMPLEMENTED,
-        ProxySourceError::Origin(StatusCode::NOT_FOUND) => StatusCode::NOT_FOUND,
-        ProxySourceError::Origin(_) | ProxySourceError::Fetch(_) => StatusCode::BAD_GATEWAY,
-    };
-    (
-        status,
-        Json(serde_json::json!({ "error": error.to_string() })),
-    )
-        .into_response()
+    // `noRanges` is a *refusal*, in the same shape as a translator's, and
+    // not an `error`: it is a thing about this source that the viewer can
+    // be told in the viewer's own words ("this link will not serve the
+    // film in pieces"), and a client that has to tell it from the other
+    // `501` -- a build with no reader for the format, which is a sentence
+    // for whoever built the app and never for a television -- would
+    // otherwise have to match English. See [`no_reader_response`].
+    match error {
+        ProxySourceError::WillNotRange => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "refused": "noRanges",
+                "message": error.to_string(),
+            })),
+        )
+            .into_response(),
+        ProxySourceError::Origin(StatusCode::NOT_FOUND) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+        ProxySourceError::Origin(_) | ProxySourceError::Fetch(_) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Debug)]
@@ -190,9 +207,21 @@ const RAR_DISABLED_ERROR: &str =
 #[cfg(not(feature = "rar"))]
 fn rar_disabled_response() -> Response {
     tracing::warn!("RAR request rejected: RAR support is not compiled into this build");
+    no_reader_response(RAR_DISABLED_ERROR)
+}
+
+/// **This build has no reader for the format**, which is a fact about the
+/// build and not about the source: `noReader`, so a client shows its own
+/// sentence ("this build cannot read RAR archives") rather than the one
+/// here, which names a cargo feature and is for whoever builds the app.
+/// The `message` travels all the same, for a log and for a developer.
+fn no_reader_response(message: &str) -> Response {
     (
         StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({ "error": RAR_DISABLED_ERROR })),
+        Json(serde_json::json!({
+            "refused": "noReader",
+            "message": message,
+        })),
     )
         .into_response()
 }
@@ -340,7 +369,7 @@ fn no_translator_response(format: Format) -> Response {
         return rar_disabled_response();
     }
     tracing::error!(?format, "this build mounted a format it cannot read");
-    StatusCode::NOT_IMPLEMENTED.into_response()
+    no_reader_response("this build has no reader for that format")
 }
 
 /// How a set of volumes is named as one session.
