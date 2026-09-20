@@ -1376,8 +1376,18 @@ pub async fn run(
                 proxy_cache.retention().drop_slack().await;
             }) as BoxFuture<'static, ()>
         };
+        // And the translated containers, which is where this server's
+        // sessions get the rule the map itself does not hold: a session
+        // stays while its own container is what is playing, and a lease
+        // out on one outranks that (`translators::session`).
+        let sessions = {
+            let translated = state.translated_archives.clone();
+            move |reading: &enginefs::retention::live::Reading| {
+                translated.retain(|session| session.is_live(reading));
+            }
+        };
         tokio::spawn(drop_slack_on_switch_and_bell(
-            changed, bell, torrents, proxied,
+            changed, bell, torrents, proxied, sessions,
         ))
     });
     // And the cache budget, which the cache cleaner used to state on its
@@ -1471,8 +1481,9 @@ pub async fn run(
     Ok(shutdown_source)
 }
 
-/// The slack drops that do not wait for the reconciler's tick: one when the
-/// viewer opens something else, one when the volume is running low.
+/// What a viewer opening something else costs the thing they left: the
+/// slack drops that do not wait for the reconciler's tick, and the
+/// translated sessions of containers nobody is in any more.
 ///
 /// **Both owners answer a switch**, because the liveness cell is one cell:
 /// a proxied body opening makes a torrent's file slack and a torrent stream
@@ -1491,9 +1502,19 @@ pub async fn run(
 /// rings while a switch is mid-pass has nothing to add -- the switch's own
 /// pass covers every slack entity there is.
 ///
-/// The two passes are taken as closures rather than as the owners
-/// themselves so that this shape can be tested for what it does with each
-/// signal, which is the whole of what it is.
+/// **The sessions go on a switch and on nothing else.** A translated
+/// container's session is the index of bytes the two owners above have just
+/// been told are slack, and it has the same life for the same reason
+/// (`enginefs::retention::live`, and `translators::session` for what that
+/// means for a map that used to hold a ten-minute idle clock). It is handed
+/// the reading the switch landed on rather than asking the cell again:
+/// every consumer of one switch answers the same reading, as everywhere
+/// else. It is not called on the bell -- a volume running low is a reason
+/// to give bytes back, and an index in memory is not bytes on the volume.
+///
+/// The three are taken as closures rather than as the owners themselves so
+/// that this shape can be tested for what it does with each signal, which
+/// is the whole of what it is.
 ///
 /// The receiver is made by the caller, and `watch::Sender::subscribe` marks
 /// the value it was made on as seen: the first wake-up is the first real
@@ -1504,6 +1525,7 @@ async fn drop_slack_on_switch_and_bell(
     bell: Arc<enginefs::retention::SlackBell>,
     torrents: impl Fn() -> BoxFuture<'static, ()>,
     proxied: impl Fn() -> BoxFuture<'static, ()>,
+    sessions: impl Fn(&enginefs::retention::live::Reading),
 ) {
     loop {
         tokio::select! {
@@ -1513,6 +1535,21 @@ async fn drop_slack_on_switch_and_bell(
                 if moved.is_err() {
                     return;
                 }
+                // The reading is taken and the borrow dropped before
+                // anything is awaited: it holds the cell's own lock, and
+                // the writer of the next switch would wait on it.
+                let reading = {
+                    let value = switched.borrow_and_update();
+                    value
+                        .clone()
+                        .map_or_else(
+                            enginefs::retention::live::Reading::nothing,
+                            enginefs::retention::live::Reading::of,
+                        )
+                };
+                // First, because it is synchronous and instant and frees
+                // memory, while the two below go to the disk.
+                sessions(&reading);
                 torrents().await;
                 proxied().await;
             }
@@ -1912,15 +1949,18 @@ mod slack_task_tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Which signal makes which owner give its slack back.
+    /// Which signal makes which owner give its slack back, and which one
+    /// takes the sessions.
     ///
-    /// A **switch** is both: the cell is one cell, so a proxied body opening
-    /// makes a torrent's file disposable and a torrent stream opening makes
-    /// a proxied body disposable. The **bell** is the proxy's alone -- the
-    /// torrent's slack passes ride the same tick that takes the volume
-    /// reading the bell was rung from, and running them here as well would
-    /// be that pass twice in one instant, while the proxy has no tick at
-    /// all.
+    /// A **switch** is all three: the cell is one cell, so a proxied body
+    /// opening makes a torrent's file disposable and a torrent stream
+    /// opening makes a proxied body disposable, and either way a container
+    /// indexed from what was playing is a container nobody is in. The
+    /// **bell** is the proxy's alone -- the torrent's slack passes ride the
+    /// same tick that takes the volume reading the bell was rung from, and
+    /// running them here as well would be that pass twice in one instant,
+    /// while the proxy has no tick at all; and an index in memory is not
+    /// bytes on the volume the bell was rung for.
     ///
     /// Asserted on the passes rather than on the owners, because that is
     /// the whole of what this task is: two signals and which call each of
@@ -1940,11 +1980,27 @@ mod slack_task_tests {
                 }) as BoxFuture<'static, ()>
             }
         };
+        // What the sessions side was handed, switch by switch: the
+        // reading, so that a task passing a stale or re-read one shows up
+        // here rather than as a session taken while its own container was
+        // playing.
+        let readings: Arc<std::sync::Mutex<Vec<enginefs::retention::live::Reading>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = |readings: &Arc<std::sync::Mutex<Vec<enginefs::retention::live::Reading>>>| {
+            let readings = readings.clone();
+            move |reading: &enginefs::retention::live::Reading| {
+                readings
+                    .lock()
+                    .expect("no panic held it")
+                    .push(reading.clone());
+            }
+        };
         let task = tokio::spawn(drop_slack_on_switch_and_bell(
             live.changed(),
             bell.clone(),
             count(&torrents),
             count(&proxied),
+            record(&readings),
         ));
         let until = |counter: &Arc<AtomicUsize>, want: usize| {
             let counter = counter.clone();
@@ -1963,12 +2019,25 @@ mod slack_task_tests {
         until(&torrents, 1).await;
         until(&proxied, 1).await;
 
+        assert_eq!(
+            readings.lock().expect("no panic held it").as_slice(),
+            &[enginefs::retention::live::Reading::of(LiveEntity::Proxy {
+                dir: "/one".into()
+            })],
+            "the sessions side was handed the reading the switch landed on"
+        );
+
         bell.ring();
         until(&proxied, 2).await;
         assert_eq!(
             torrents.load(Ordering::SeqCst),
             1,
             "the torrent side answers the tick the reading came from, not the bell"
+        );
+        assert_eq!(
+            readings.lock().expect("no panic held it").len(),
+            1,
+            "a volume running low is not a viewer opening something else"
         );
 
         // And the value as it stands when the task starts is not a change:
@@ -1979,6 +2048,7 @@ mod slack_task_tests {
             Arc::new(SlackBell::default()),
             count(&torrents),
             count(&proxied),
+            record(&readings),
         ));
         tokio::task::yield_now().await;
         assert_eq!(torrents.load(Ordering::SeqCst), 1, "nothing switched");
