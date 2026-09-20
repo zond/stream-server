@@ -21,6 +21,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+/// Reading the log files back, which is what this test asserts over.
+#[path = "support/log_lines.rs"]
+mod log_lines;
+
+/// The stage this file is about.
+const STAGE: &str = "http_proxy_body_end";
+
 /// The proxy cache's chunk size: a range shorter than one stores nothing,
 /// so the range the cache-hit case asks for is spelled in these.
 const CHUNK: u64 = stream_server::PROXY_CACHE_CHUNK_BYTES;
@@ -221,54 +228,6 @@ fn encode(value: &str) -> String {
     encoded
 }
 
-/// Every end-of-body line the process has written so far, as the JSON log
-/// files carry it -- which is the form a tool reads a field report in.
-fn body_end_lines(config_dir: &std::path::Path) -> Vec<serde_json::Value> {
-    let mut lines = vec![];
-    let Ok(dir) = std::fs::read_dir(config_dir.join("logs")) else {
-        return lines;
-    };
-    for entry in dir.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        for line in text.lines() {
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
-            };
-            if value["fields"]["stage"] == "http_proxy_body_end" {
-                lines.push(value);
-            }
-        }
-    }
-    lines
-}
-
-/// The end-of-body line `wanted` describes, waited for: the log writer is
-/// not blocking, so a line reaches the file some short while after the body
-/// it describes ended.
-fn wait_for_line(
-    config_dir: &std::path::Path,
-    described: &str,
-    wanted: impl Fn(&serde_json::Value) -> bool,
-) -> anyhow::Result<serde_json::Value> {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let lines = body_end_lines(config_dir);
-        if let Some(found) = lines.iter().find(|line| wanted(&line["fields"])) {
-            return Ok(found.clone());
-        }
-        if Instant::now() >= deadline {
-            anyhow::bail!("no line for {described} in {lines:#?}");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
 /// The chunk files the proxy cache holds, which is what says a fill has
 /// landed and the next read of the same bytes will be a hit.
 fn cached_chunks(cache_root: &std::path::Path) -> usize {
@@ -333,9 +292,10 @@ fn every_proxied_body_says_what_left_the_server() -> anyhow::Result<()> {
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(response.bytes()?.len(), SHORT_LEN);
 
-    let complete = wait_for_line(&config_dir, "a body delivered whole", |fields| {
-        fields["reason"] == "complete" && fields["answered_by"] == origin_base.as_str()
-    })?;
+    let complete =
+        log_lines::wait_for_line(&config_dir, STAGE, "a body delivered whole", |fields| {
+            fields["reason"] == "complete" && fields["answered_by"] == origin_base.as_str()
+        })?;
     let fields = &complete["fields"];
     assert_eq!(fields["bytes_sent"], SHORT_LEN);
     assert_eq!(
@@ -369,9 +329,10 @@ fn every_proxied_body_says_what_left_the_server() -> anyhow::Result<()> {
         "the body stopped short of the length it promised"
     );
 
-    let broken = wait_for_line(&config_dir, "an origin that hung up", |fields| {
-        fields["reason"] == "reader-error"
-    })?;
+    let broken =
+        log_lines::wait_for_line(&config_dir, STAGE, "an origin that hung up", |fields| {
+            fields["reason"] == "reader-error"
+        })?;
     let fields = &broken["fields"];
     assert_eq!(fields["requested_len"], SHORT_LEN);
     assert!(
@@ -390,11 +351,11 @@ fn every_proxied_body_says_what_left_the_server() -> anyhow::Result<()> {
     // The `HEAD` answered before that `GET` was sent, so by now a line about
     // it would be in the file. A body that is never sent is not a body.
     assert!(
-        body_end_lines(&config_dir)
+        log_lines::lines_at_stage(&config_dir, STAGE)
             .iter()
             .all(|line| line["fields"]["method"] != "HEAD"),
         "a HEAD was reported as a body that ended: {:#?}",
-        body_end_lines(&config_dir)
+        log_lines::lines_at_stage(&config_dir, STAGE)
     );
 
     // A playlist, which is not relayed but rewritten: our body, framed as it
@@ -409,7 +370,7 @@ fn every_proxied_body_says_what_left_the_server() -> anyhow::Result<()> {
     let rewritten = playlist.text()?;
     assert!(rewritten.contains("/proxy/"), "the lines were rewritten");
 
-    let written = wait_for_line(&config_dir, "a rewritten playlist", |fields| {
+    let written = log_lines::wait_for_line(&config_dir, STAGE, "a rewritten playlist", |fields| {
         fields["requested_len"] == 0 && fields["answered_by"] == origin_base.as_str()
     })?;
     let fields = &written["fields"];
@@ -450,9 +411,12 @@ fn every_proxied_body_says_what_left_the_server() -> anyhow::Result<()> {
         "a range the cache holds whole makes no origin request"
     );
 
-    let hit = wait_for_line(&config_dir, "a range served off the cache", |fields| {
-        fields["answered_by"] == "cache"
-    })?;
+    let hit = log_lines::wait_for_line(
+        &config_dir,
+        STAGE,
+        "a range served off the cache",
+        |fields| fields["answered_by"] == "cache",
+    )?;
     let fields = &hit["fields"];
     assert_eq!(fields["reason"], "complete");
     assert_eq!(fields["bytes_sent"], CHUNK * 2);
@@ -482,7 +446,7 @@ fn every_proxied_body_says_what_left_the_server() -> anyhow::Result<()> {
     assert!(read > 0, "the proxied body started arriving");
     drop(socket);
 
-    let cut = wait_for_line(&config_dir, "a player that hung up", |fields| {
+    let cut = log_lines::wait_for_line(&config_dir, STAGE, "a player that hung up", |fields| {
         fields["reason"] == "client-disconnect"
     })?;
     let fields = &cut["fields"];
@@ -495,7 +459,7 @@ fn every_proxied_body_says_what_left_the_server() -> anyhow::Result<()> {
 
     // The line is the one place a failed playback is read from, and it may
     // not be the place a caller's credentials are filed.
-    let lines = body_end_lines(&config_dir);
+    let lines = log_lines::lines_at_stage(&config_dir, STAGE);
     assert!(
         !format!("{lines:?}").contains(SECRET),
         "a caller's credential reached the end-of-body line: {lines:#?}"

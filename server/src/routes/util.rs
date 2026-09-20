@@ -250,11 +250,7 @@ impl BodyProgress {
         self.outcome.get_or_insert(BodyOutcome::Complete);
     }
 
-    pub(crate) fn outcome(&self) -> BodyOutcome {
-        self.outcome_of(0)
-    }
-
-    /// The outcome read against the length the response promised.
+    /// The outcome, read against the length the response promised.
     ///
     /// **A body that delivered every byte it promised was not hung up on,
     /// whatever it recorded.** hyper stops polling a body of declared
@@ -267,7 +263,10 @@ impl BodyProgress {
     ///
     /// A `promised` of nought is a response that declared no length -- a
     /// rewritten playlist is framed as it is written -- and such a body is
-    /// polled to its end, so what it recorded is what happened.
+    /// polled to its end, so what it recorded is what happened. It is the
+    /// only way to ask what a body recorded and nothing else, and there is
+    /// no second accessor for it: reading an outcome without the promise
+    /// beside it is the defect above.
     pub(crate) fn outcome_of(&self, promised: u64) -> BodyOutcome {
         match self.outcome {
             Some(outcome) => outcome,
@@ -423,7 +422,7 @@ mod body_progress_tests {
     fn body_progress_tells_a_hung_up_player_from_a_delivered_range() {
         let mut dropped = BodyProgress::default();
         dropped.record_chunk(4 * 1024 * 1024);
-        assert_eq!(dropped.outcome(), BodyOutcome::ClientDisconnect);
+        assert_eq!(dropped.outcome_of(0), BodyOutcome::ClientDisconnect);
         assert_eq!(dropped.bytes_sent, 4 * 1024 * 1024);
         assert_eq!(dropped.error, None);
 
@@ -431,7 +430,7 @@ mod body_progress_tests {
         delivered.record_chunk(10);
         delivered.record_chunk(20);
         delivered.record_end();
-        assert_eq!(delivered.outcome(), BodyOutcome::Complete);
+        assert_eq!(delivered.outcome_of(0), BodyOutcome::Complete);
         assert_eq!(delivered.bytes_sent, 30);
 
         let mut failed = BodyProgress::default();
@@ -440,7 +439,7 @@ mod body_progress_tests {
         // A stream may still report end-of-stream after erroring; the error
         // is what ended it.
         failed.record_end();
-        assert_eq!(failed.outcome(), BodyOutcome::ReaderError);
+        assert_eq!(failed.outcome_of(0), BodyOutcome::ReaderError);
         assert_eq!(failed.bytes_sent, 7);
         assert_eq!(failed.error.as_deref(), Some("piece read failed"));
     }

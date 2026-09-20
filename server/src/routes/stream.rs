@@ -188,6 +188,12 @@ impl StreamLifecycleGuard {
         // INFO, not DEBUG: this is the only record that a playback session
         // ended and the only one that says how much of what was asked for
         // actually left the server.
+        //
+        // The reason is read against what the response promised, never off
+        // the body alone: hyper stops polling a body of declared length the
+        // moment that length is met, so a range delivered whole records no
+        // end at all and every completed playback was filed here as a
+        // `client-disconnect` (see [`util::BodyProgress::outcome_of`]).
         tracing::info!(
             stream_id,
             info_hash = %info_hash,
@@ -195,7 +201,7 @@ impl StreamLifecycleGuard {
             bytes_sent = self.progress.bytes_sent,
             requested_len = self.requested_len,
             duration_ms = self.started.elapsed().as_millis() as u64,
-            reason = self.progress.outcome().as_str(),
+            reason = self.progress.outcome_of(self.requested_len).as_str(),
             error = self.progress.error.as_deref().unwrap_or(""),
             stage = "http_stream_end",
             "stream ended"
