@@ -762,9 +762,11 @@ async fn stream_translated(
 
     // The reader starts where the range does and stops where it ends; the
     // session's lease rides inside the body, so the session is in use for
-    // as long as the player reads and its idle clock starts when the body
-    // is dropped. For a torrent-backed member the source inside the view
-    // holds the stream registration, and it goes the same way.
+    // as long as the player reads and cannot be taken under it -- not by
+    // the cap and not by the viewer opening something else, which is what
+    // ends an unleased one (`translators::session`). For a torrent-backed
+    // member the source inside the view holds the stream registration, and
+    // it goes the same way.
     let reader = view
         .reader_at(framing.start)
         .take(framing.content_length(size));
