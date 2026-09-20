@@ -63,16 +63,16 @@ What exists that the new shape keeps:
   offset, priority, Fetching::Streaming, profile)` -> `FileHandle`, which is
   `AsyncRead + AsyncSeek`, registers the position with the retention pass
   and follows a seek.
-* In the format crates: `async_zip` 0.0.18 (central directory, entry
+* In the format crates: `async_zip` 0.0.19 (central directory, entry
   `compression()`, `header_offset`) -- **not used in the end**: the ZIP
   index is parsed by hand, because what is wanted is a stated number of
   bytes at stated offsets, counted, and a `BufReader`'s fills are its own
-  business. The crate stays a dependency, for writing the fixtures; `unrar-rs` 0.10.5's
+  business. The crate stays a dependency, for writing the fixtures; `unrar-rs` 0.10.8's
   `RarArchive::parse_volume_facts(Read + Seek)` and
   `stored_layout::{StoredLayoutBuilder, StoredMember, StoredMemberPart,
   MemberEligibility, MappedSlice}`, built for exactly this (stored members
   mapped to physical ranges across a multi-volume set, eligibility per
-  member, encryption reported rather than hidden); `sevenz-rust2` 0.22.2's
+  member, encryption reported rather than hidden); `sevenz-rust2` 0.23.0's
   `Archive::read(Read + Seek)` with `pack_pos()`, `pack_sizes()`,
   `StreamMap::{pack_stream_offsets, block_first_pack_stream_index,
   file_block_index}` and `Block::coders` (method id `[0x00]` is COPY),
