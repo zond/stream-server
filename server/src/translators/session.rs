@@ -48,11 +48,12 @@
 //!   handed the rule by whoever watches the cell, which for this server is
 //!   the switch task in `crate::run` -- the same signal the torrent and
 //!   proxy owners drop their slack on.
-//! * Nothing else ends one. A session left with no lease and no switch
-//!   after it survives the process, which is the point: a cast paused
-//!   overnight comes back to the session it was reading, and
-//!   `/{fmt}/create` is not on the LAN listener, so a receiver that lost
-//!   one had no way to make another (`docs/CASTING.md` in xtremio).
+//! * Nothing else ends one, short of the process. A session with no lease
+//!   and no switch after it lasts as long as the server does, which is the
+//!   point: a cast paused overnight comes back to the session it was
+//!   reading, and `/{fmt}/create` is not on the LAN listener, so a
+//!   receiver that lost one had no way to make another (`docs/CASTING.md`
+//!   in xtremio).
 //!
 //! ## The backstop, and why it is not a timer either
 //!
