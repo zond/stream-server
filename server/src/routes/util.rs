@@ -180,6 +180,103 @@ pub(crate) fn log_path(path: &str) -> &str {
     path
 }
 
+/// How a response body finished, for the line a route writes when one
+/// ends.
+///
+/// A capture of four failing streams had nothing in it about why any of
+/// them stopped. The distinction that mattered was invisible: four bodies
+/// died after about ten seconds having delivered ~4 MiB of a multi-gigabyte
+/// range, i.e. the player hung up, not the server.
+///
+/// **One vocabulary, because two routes are asked the same question.** A
+/// torrent file and a proxied URL fail a player in the same ways, and a
+/// field report that had to be read with a glossary per route would answer
+/// neither: see `routes::stream`'s `http_stream_end` line and
+/// `routes::proxy`'s `http_proxy_body_end` one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BodyOutcome {
+    /// The body was dropped before the range was delivered: the player
+    /// disconnected, or the request was cancelled.
+    ClientDisconnect,
+    /// The whole requested range was delivered.
+    Complete,
+    /// The reader failed part-way (see the `error` field).
+    ReaderError,
+}
+
+impl BodyOutcome {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientDisconnect => "client-disconnect",
+            Self::Complete => "complete",
+            Self::ReaderError => "reader-error",
+        }
+    }
+}
+
+/// What a response body delivered, accumulated as it is polled.
+#[derive(Debug, Default)]
+pub(crate) struct BodyProgress {
+    pub(crate) bytes_sent: u64,
+    /// `None` until the body ends by itself; a body dropped before that is
+    /// a player that hung up.
+    pub(crate) outcome: Option<BodyOutcome>,
+    pub(crate) error: Option<String>,
+}
+
+impl BodyProgress {
+    pub(crate) fn record_chunk(&mut self, len: usize) {
+        self.bytes_sent = self.bytes_sent.saturating_add(len as u64);
+    }
+
+    /// The reader failed. First error wins: what broke the stream is more
+    /// use than whatever the stream said on its way out.
+    ///
+    /// Anything that can be shown, because the two routes fail with
+    /// different errors -- a reader's `io::Error`, an `axum::Error` off a
+    /// relayed body -- and what a report needs is the text either way.
+    pub(crate) fn record_error(&mut self, error: &dyn std::fmt::Display) {
+        if self.outcome.is_none() {
+            self.outcome = Some(BodyOutcome::ReaderError);
+            self.error = Some(error.to_string());
+        }
+    }
+
+    /// The reader ran out, which for a `take`-limited body means the whole
+    /// requested range was delivered. For a relayed one it is the origin's
+    /// body ending, and `bytes_sent` beside the length the response
+    /// promised is what says whether that was all of it.
+    pub(crate) fn record_end(&mut self) {
+        self.outcome.get_or_insert(BodyOutcome::Complete);
+    }
+
+    pub(crate) fn outcome(&self) -> BodyOutcome {
+        self.outcome_of(0)
+    }
+
+    /// The outcome read against the length the response promised.
+    ///
+    /// **A body that delivered every byte it promised was not hung up on,
+    /// whatever it recorded.** hyper stops polling a body of declared
+    /// length the moment that length is met -- the message is finished
+    /// without a further poll -- so [`Self::record_end`] never runs, and a
+    /// body read to its end by a happy client is indistinguishable from
+    /// one dropped part-way. Measured on `/proxy`: 65,536 bytes sent of
+    /// 65,536 promised, to a client that read all of them, filed as a
+    /// disconnect.
+    ///
+    /// A `promised` of nought is a response that declared no length -- a
+    /// rewritten playlist is framed as it is written -- and such a body is
+    /// polled to its end, so what it recorded is what happened.
+    pub(crate) fn outcome_of(&self, promised: u64) -> BodyOutcome {
+        match self.outcome {
+            Some(outcome) => outcome,
+            None if promised > 0 && self.bytes_sent >= promised => BodyOutcome::Complete,
+            None => BodyOutcome::ClientDisconnect,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +407,67 @@ mod log_redaction_tests {
         );
         assert_eq!(log_path("/heartbeat"), "/heartbeat");
         assert_eq!(log_path("/proxying/x"), "/proxying/x");
+    }
+}
+
+#[cfg(test)]
+mod body_progress_tests {
+    use super::*;
+
+    /// A capture of four failing streams said nothing about why any of them
+    /// stopped. What mattered was the distinction between a body that
+    /// delivered its range and one the player hung up on part-way -- so a
+    /// body that never ended by itself must read as a disconnect, and the
+    /// first error must survive whatever the stream says afterwards.
+    #[test]
+    fn body_progress_tells_a_hung_up_player_from_a_delivered_range() {
+        let mut dropped = BodyProgress::default();
+        dropped.record_chunk(4 * 1024 * 1024);
+        assert_eq!(dropped.outcome(), BodyOutcome::ClientDisconnect);
+        assert_eq!(dropped.bytes_sent, 4 * 1024 * 1024);
+        assert_eq!(dropped.error, None);
+
+        let mut delivered = BodyProgress::default();
+        delivered.record_chunk(10);
+        delivered.record_chunk(20);
+        delivered.record_end();
+        assert_eq!(delivered.outcome(), BodyOutcome::Complete);
+        assert_eq!(delivered.bytes_sent, 30);
+
+        let mut failed = BodyProgress::default();
+        failed.record_chunk(7);
+        failed.record_error(&std::io::Error::other("piece read failed"));
+        // A stream may still report end-of-stream after erroring; the error
+        // is what ended it.
+        failed.record_end();
+        assert_eq!(failed.outcome(), BodyOutcome::ReaderError);
+        assert_eq!(failed.bytes_sent, 7);
+        assert_eq!(failed.error.as_deref(), Some("piece read failed"));
+    }
+
+    /// hyper never polls a body of declared length again once that length
+    /// is met, so a body read to its end by a happy client records no end
+    /// at all -- and read without the promise beside it, every delivered
+    /// response is a disconnect.
+    #[test]
+    fn a_body_that_delivered_what_it_promised_was_not_hung_up_on() {
+        let mut delivered = BodyProgress::default();
+        delivered.record_chunk(64 * 1024);
+        assert_eq!(delivered.outcome_of(64 * 1024), BodyOutcome::Complete);
+        // Short of the promise is the player hanging up, which is the
+        // distinction the line exists for.
+        assert_eq!(
+            delivered.outcome_of(128 * 1024),
+            BodyOutcome::ClientDisconnect
+        );
+        // A response that promised no length says only what it recorded.
+        assert_eq!(delivered.outcome_of(0), BodyOutcome::ClientDisconnect);
+
+        // And what a body did report is never overruled by the arithmetic:
+        // a reader that failed after delivering the promised bytes failed.
+        let mut failed = BodyProgress::default();
+        failed.record_chunk(64 * 1024);
+        failed.record_error(&std::io::Error::other("piece read failed"));
+        assert_eq!(failed.outcome_of(64 * 1024), BodyOutcome::ReaderError);
     }
 }

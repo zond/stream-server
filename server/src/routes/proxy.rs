@@ -1,3 +1,4 @@
+use crate::routes::util;
 use crate::state::AppState;
 use axum::{
     Json, Router,
@@ -6,11 +7,14 @@ use axum::{
     response::{IntoResponse, Response},
     routing::any,
 };
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use reqwest::{Client, Method};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::pin::Pin;
 use std::sync::OnceLock;
+use std::task::{Context, Poll};
+use std::time::Instant;
 use url::Url;
 
 /// Lazily-built, process-wide reqwest client for the proxy route: the one
@@ -594,6 +598,167 @@ impl CredentialChain {
     }
 }
 
+/// One line for every proxied body this route serves, written when that
+/// body ends however it ends.
+///
+/// What it answers, about a playback that failed at the player: how many
+/// bytes actually left this server, of how many the response promised; how
+/// long the body was open; and what ended it -- the player hanging up, the
+/// origin or the disk failing part-way, the client closing its own stream,
+/// or nothing at all because the whole of it was delivered. A proxied
+/// stream had none of that: `/proxy` said what the origin answered (see
+/// [`crate::diagnostics::logging::PROXY_TRACE_TARGET`]) and then went
+/// silent, so a body that stopped at 4 MiB of a 2 GiB range and a body that
+/// was delivered whole left the same trace -- and a range served entirely
+/// off disk left no trace at all.
+///
+/// Origins, never the URL: `d=` carries the caller's credentials in its
+/// query and the log is the one place those must not turn up, which is why
+/// the trace line beside this one names `target_origin` and `answered_by`
+/// and nothing else. What answered here is an origin, or `cache` when the
+/// disk held the whole of what was asked for and no origin was opened.
+///
+/// INFO, and not under the trace switch, for the reason the torrent
+/// route's `http_stream_end` line is (`routes::stream`): it is the only
+/// record that a proxied playback ended, and a field report is read as it
+/// arrives, with whatever was on.
+struct ProxyBodyLog {
+    /// When the request arrived, not when the body was framed: what a
+    /// player experienced includes however long the origin took to answer.
+    started: Instant,
+    method: Method,
+    target_origin: String,
+    answered_by: String,
+    /// What the player asked for, which is half of what tells a reader that
+    /// opened mid-file from one that could not read the container at all.
+    range: String,
+    /// The response's own framing, read off it in [`with_body_end_log`]:
+    /// the status it went out under, and the length it promised -- which is
+    /// what `bytes_sent` falls short of when a body fails. A rewritten
+    /// playlist promises no length (it is framed as it is written), so it
+    /// states nought and its `bytes_sent` stands alone.
+    status: u16,
+    requested_len: u64,
+    progress: util::BodyProgress,
+}
+
+impl ProxyBodyLog {
+    /// The line's subject: what was asked for, and what is answering.
+    ///
+    /// `None` for a method whose response carries no body. A `HEAD` is
+    /// answered with the framing of a body that is never sent and hyper
+    /// drops it unread, so a line about the bytes that left would be a line
+    /// about a body there never was.
+    fn for_method(
+        started: Instant,
+        method: &Method,
+        target: &Url,
+        answered_by: &str,
+        player_headers: &HeaderMap,
+    ) -> Option<Self> {
+        if method == Method::HEAD {
+            return None;
+        }
+        Some(Self {
+            started,
+            method: method.clone(),
+            target_origin: target.origin().ascii_serialization(),
+            answered_by: answered_by.to_string(),
+            range: player_headers
+                .get(header::RANGE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("none")
+                .to_string(),
+            status: 0,
+            requested_len: 0,
+            progress: util::BodyProgress::default(),
+        })
+    }
+}
+
+/// A proxied body with its log over it: every chunk counted, the end
+/// recorded however it comes, and the line written when the body is
+/// dropped.
+///
+/// **The line is written here and nowhere else**, which is what makes it
+/// one line per body rather than one per decision: a refusal that never
+/// serves a body (a `410` for a retired token) drops its log unattached and
+/// says nothing, and a body that is dropped without ever ending -- which is
+/// every player that hangs up -- still says what it managed to deliver.
+struct LoggedBody<S> {
+    inner: S,
+    log: ProxyBodyLog,
+}
+
+impl<S> Stream for LoggedBody<S>
+where
+    S: Stream<Item = Result<bytes::Bytes, axum::Error>> + Unpin,
+{
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let polled = Pin::new(&mut self.inner).poll_next(cx);
+        match &polled {
+            Poll::Ready(Some(Ok(chunk))) => self.log.progress.record_chunk(chunk.len()),
+            Poll::Ready(Some(Err(error))) => self.log.progress.record_error(error),
+            Poll::Ready(None) => self.log.progress.record_end(),
+            Poll::Pending => {}
+        }
+        polled
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<S> Drop for LoggedBody<S> {
+    fn drop(&mut self) {
+        let log = &self.log;
+        tracing::info!(
+            method = %log.method,
+            target_origin = %log.target_origin,
+            answered_by = %log.answered_by,
+            status = log.status,
+            range = %log.range,
+            bytes_sent = log.progress.bytes_sent,
+            requested_len = log.requested_len,
+            duration_ms = log.started.elapsed().as_millis() as u64,
+            reason = log.progress.outcome_of(log.requested_len).as_str(),
+            error = log.progress.error.as_deref().unwrap_or(""),
+            stage = "http_proxy_body_end",
+            "proxied body ended"
+        );
+    }
+}
+
+/// `response` with [`ProxyBodyLog`] over its body, and the framing the
+/// response itself states read off it.
+///
+/// Every proxied body passes through here -- the cache hit, the rewritten
+/// playlist and the relayed origin alike -- because the question the line
+/// answers is asked of a failed playback without knowing which of the three
+/// it was. `None` is a response with no body to account for, and is handed
+/// back as it came.
+fn with_body_end_log(response: Response, log: Option<ProxyBodyLog>) -> Response {
+    let Some(mut log) = log else {
+        return response;
+    };
+    log.status = response.status().as_u16();
+    log.requested_len = response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    response.map(|body| {
+        axum::body::Body::from_stream(LoggedBody {
+            inner: body.into_data_stream(),
+            log,
+        })
+    })
+}
+
 /// Finishes building a response, turning a builder error (which can no
 /// longer happen for headers we control, but is handled defensively for any
 /// other builder failure) into a 502 instead of panicking via `.unwrap()`.
@@ -954,6 +1119,7 @@ fn cache_hit_response(
     response_header_overrides: &BTreeMap<String, String>,
     ranged: bool,
     cached: crate::proxy_cache::Cached,
+    log: Option<ProxyBodyLog>,
 ) -> Response {
     let mut builder = Response::builder().status(if ranged {
         StatusCode::PARTIAL_CONTENT
@@ -994,7 +1160,10 @@ fn cache_hit_response(
         )
             .into_response();
     };
-    finalize_response(builder, axum::body::Body::from_stream(body))
+    with_body_end_log(
+        finalize_response(builder, axum::body::Body::from_stream(body)),
+        log,
+    )
 }
 
 /// The proxy's own parameters, in whichever URL shape carried them: the
@@ -1355,6 +1524,11 @@ async fn proxy(
     // Format 1: ?d=URL (standard)
     // Format 2: /<query_params>/<path> (Core) where query_params contains d=ORIGIN&h=HEADER&r=RESPONSE_HEADER
 
+    // What the end-of-body line measures against: a player waits for the
+    // origin's first byte as surely as for the last one. See
+    // [`ProxyBodyLog`].
+    let started = Instant::now();
+
     // Reads, and nothing else. The route is open (and used to answer under
     // a wildcard CORS, which let a page read what it fetched: gone, see
     // `build_router`), and it used to relay whatever method it was called
@@ -1452,16 +1626,25 @@ async fn proxy(
     } = match answer {
         // The whole of what was asked for is here, and it is ours to send.
         RangeAnswer::Hit(cached) => {
+            // `cache`, because no origin was opened: the one place the
+            // end-of-body line names something that is not a host.
+            let log = ProxyBodyLog::for_method(started, &method, &url, "cache", &headers);
             return cache_hit_response(
                 &state,
                 player_token,
                 &params.response_headers,
                 ranged,
                 cached,
+                log,
             );
         }
         RangeAnswer::Origin(origin) => *origin,
     };
+    // Which host actually answered, which is not always the one the caller
+    // named: a redirect chain ends where it ends. The value
+    // [`cache_assisted_range`]'s trace line states as `answered_by`, said
+    // again by the end-of-body line below so the two read alike.
+    let answered_by = fetched_url.origin().ascii_serialization();
 
     // A rewritten playlist is the whole resource however it was asked for,
     // so it is answered `200` even when the origin said `206` -- and a
@@ -1628,8 +1811,12 @@ async fn proxy(
         // and what the hops since have cost. The two URLs part company at a
         // redirect, and only the first of them says where a line resolves.
         let carried = params.carried(&chain);
+        let log = ProxyBodyLog::for_method(started, &method, &url, &answered_by, &headers);
         let rewritten = rewritten_playlist_body(chunks, fetched_url, carried);
-        return finalize_response(res_builder, axum::body::Body::from_stream(rewritten));
+        return with_body_end_log(
+            finalize_response(res_builder, axum::body::Body::from_stream(rewritten)),
+            log,
+        );
     }
 
     // Registered under the client's token, so the client can end this exact
@@ -1679,9 +1866,13 @@ async fn proxy(
         cache_filling(origin_body(response), cacheable, cache_entry),
         stitched,
     );
-    finalize_response(
-        res_builder,
-        axum::body::Body::from_stream(registration.wrap(body)),
+    let log = ProxyBodyLog::for_method(started, &method, &url, &answered_by, &headers);
+    with_body_end_log(
+        finalize_response(
+            res_builder,
+            axum::body::Body::from_stream(registration.wrap(body)),
+        ),
+        log,
     )
 }
 
