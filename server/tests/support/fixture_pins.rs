@@ -37,6 +37,15 @@
 //! reconciler or the pin routes themselves must keep the empty record and
 //! control the timer itself: under `None` it would be asserting about a
 //! cache that may not be touched and a torrent that may not be stopped.
+//!
+//! **The cost, measured.** "May not be stopped" is not a manner of
+//! speaking: `reader_less_fetch.rs` puts a real seeder in front of both
+//! settings and reads what each one fetches with nothing reading the
+//! torrent. Under the empty record the fetching stops one reconcile
+//! interval after the add and never resumes; under `None` it never stops,
+//! and unthrottled it took a whole 256 MiB torrent in 2.6 seconds. That
+//! file is the one test here that may name `None` as its *subject* rather
+//! than as scaffolding, and it seeds no store at all.
 
 use stream_server::ServerConfig;
 

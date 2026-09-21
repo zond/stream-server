@@ -153,20 +153,66 @@ streams, found 2026-09-20 -- was closed the same day; see **Closed
   field, and to do it for every workspace -- this one, xtremio's `rust/`,
   and rqbit's.
 
-* **An engine with no reader downloads the whole torrent.** A new engine
-  wants every file, and the want set only narrows when a stream arrives.
-  Anything that creates engines early -- `/{hash}/create`, `/create`, a
-  stats request that lands before the stream request -- fetches everything
-  until a reader shows up (measured 2026-09-19: Tears of Steel, all 546 MB
-  at ~50 MB/s). It is not hit today because the player's stream request
-  follows its open by ~160 ms. This is why "start the engine when a source
-  is picked" was not done for the cold start: it needs a discover-only
-  state first, and rqbit drops peers when neither side is interested, so
-  only addresses and metadata would survive it. The cold start itself
-  (field 2026-09-17 16:36, on the phone) was a slow peer ramp -- peers found
-  in 2 s, 2 connected for 10 s, 32 after 50 s -- not discovery; the
-  `stream_progress` line now carries `queued`, `unique` and
-  `connection_tries` to tell "nothing found" from "nothing answering".
+* **An engine with no reader fetches for one reconcile interval and is then
+  stopped -- unless nobody told the server what is pinned, in which case it
+  fetches the lot.** A new engine wants every file, and the want set only
+  narrows when a stream arrives, so anything that creates an engine early --
+  `/{hash}/create`, `/create`, a stats request that lands before the stream
+  request -- fetches at whatever rate its peers give it until something
+  stops it. What stops it is the reconciler's timer, and which of the two
+  readings below you get is decided by one config field.
+
+  **Under the shipping configuration it stops.**
+  `ServerConfig::pins: Some(Default::default())` is what xtremio publishes
+  for a user who has pinned nothing (`rust/src/server.rs` ->
+  `downloads::pins()`), and under it the ladder's last arm
+  (`reconcile::desired`: `if conditions.playing || conditions.pinned`)
+  answers `Stop` for a torrent with no reader and no pin. Measured
+  2026-09-21 against a real local seeder: the stop lands **2.0 s after the
+  add** -- one `reconcile::RECONCILE_INTERVAL`, with no dwell, since the
+  dwell guards only `start_if_stopped` -- and nothing arrives after it. In
+  those 2.0 s it took 5.7 to 6.5 MiB (fourteen runs) from a seeder held to
+  2 MiB/s, and 186 MiB of a 256 MiB torrent with the limiter off. **The bound is the window, not the
+  byte count**: on a fast link one interval is a hundred megabytes and more.
+
+  **Under `pins: None` it never stops.** `None` is "nobody said", which sets
+  `PinsUnknown`, under which `Engine::is_pinned` answers true for every
+  torrent there is (`enginefs/src/engine.rs`) -- so that same arm reads
+  `pinned` and answers `Run` for ever -- and `Engine::reclaim_rest` breaks
+  before it takes a piece, so what arrives is also kept. Measured the same
+  day: the whole 256 MiB in 2.6 s, with nothing reading it.
+  **`ServerConfig::default()` sets `pins: None`**, so a harness that spreads
+  the default measures this and not what the app does.
+
+  **What the 2026-09-19 reading was.** Tears of Steel, all 546 MB at
+  ~50 MB/s with no reader: real, and it is the second case. 546 MB at
+  50 MB/s is eleven seconds of running, five intervals over; a configuration
+  whose reconciler stops reader-less torrents cannot produce it. The entry
+  it was written into read the number as unbounded fetching in general, and
+  that is true of `PinsUnknown` alone.
+
+  **What is left.** One reconcile interval at line rate, per engine created
+  and never read -- ~100 MB on the field's 50 MB/s link, and the pieces are
+  then reclaimed, so it is spent bandwidth rather than spent disk. It is not
+  hit hard today because the player's stream request follows its open by
+  ~160 ms, so a reader is registered long before the tick and the want set
+  narrows; what pays it in full is a `/create` nobody follows with a play.
+  Making it smaller means adding a discover-only state, which is why "start
+  the engine when a source is picked" was not done for the cold start:
+  rqbit drops peers when neither side is interested, so only addresses and
+  metadata would survive it.
+
+  Both readings are pinned by `server/tests/reader_less_fetch.rs`, which is
+  the one test here with a real seeder in it:
+  `a_torrent_nobody_reads_stops_fetching_within_a_few_reconcile_intervals`
+  bounds the first, and
+  `an_unknown_pin_set_never_stops_a_torrent_nobody_reads` records the second
+  as the documented exception.
+
+  The cold start itself (field 2026-09-17 16:36, on the phone) was a slow
+  peer ramp -- peers found in 2 s, 2 connected for 10 s, 32 after 50 s --
+  not discovery; the `stream_progress` line now carries `queued`, `unique`
+  and `connection_tries` to tell "nothing found" from "nothing answering".
 
 * **A torrent nobody is playing keeps nothing, about two seconds after the
   last reader leaves -- so a test that seeds its own torrent data must run
