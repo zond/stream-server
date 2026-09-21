@@ -2013,7 +2013,11 @@ impl TorrentBackend for LibrqbitBackend {
     }
 
     /// `placement.only_files` is the torrent's initial want-set; librqbit
-    /// rejects an out-of-range index at add time. No output folder is ever
+    /// rejects an out-of-range index at add time. `placement.choose` is the
+    /// same want-set named by file rather than by index, and is settled by
+    /// [`LibrqbitHandle::want_the_chosen_file`] below -- it cannot be an
+    /// `only_files` here, since the indices it resolves to are indices into
+    /// a file list this call is what produces. No output folder is ever
     /// named -- librqbit picks its own, and the payload goes to the piece
     /// store either way. `overwrite: true` always: resuming on top of
     /// existing files is the normal case here (a restart).
@@ -2040,7 +2044,7 @@ impl TorrentBackend for LibrqbitBackend {
                 Some(librqbit::AddTorrentOptions {
                     overwrite: true,
                     trackers: Some(trackers),
-                    only_files: placement.only_files,
+                    only_files: placement.only_files.clone(),
                     // What makes `ManagedTorrent::drop_pieces` -- and so
                     // `LibrqbitHandle::drop_file_pieces` -- available on
                     // this torrent. Off, librqbit refuses to forget a piece
@@ -2064,9 +2068,17 @@ impl TorrentBackend for LibrqbitBackend {
             .await
             .context("Failed to add torrent to librqbit")?;
 
+        // Whether this call is the one that added the torrent. librqbit
+        // ignores an already-managed torrent's options, and so must the
+        // want-set: a second `/create` for a hash somebody is already
+        // streaming must not pull the selection out from under the reader.
+        let mut added = false;
         let (_id, handle) = match response {
-            librqbit::AddTorrentResponse::Added(id, handle)
-            | librqbit::AddTorrentResponse::AlreadyManaged(id, handle) => (id, handle),
+            librqbit::AddTorrentResponse::Added(id, handle) => {
+                added = true;
+                (id, handle)
+            }
+            librqbit::AddTorrentResponse::AlreadyManaged(id, handle) => (id, handle),
             _ => return Err(anyhow::anyhow!("Unexpected response from librqbit")),
         };
         // Under the footprint lock, so a change racing this add cannot
@@ -2077,7 +2089,7 @@ impl TorrentBackend for LibrqbitBackend {
         }
 
         let info_hash = handle.info_hash().as_string();
-        Ok(LibrqbitHandle {
+        let handle = LibrqbitHandle {
             handle,
             info_hash,
             session: self.session.clone(),
@@ -2086,7 +2098,11 @@ impl TorrentBackend for LibrqbitBackend {
             reported_errors: self.reported_errors.clone(),
             stream_positions: self.stream_positions.clone(),
             swarm_scraper: self.swarm_scraper.clone(),
-        })
+        };
+        if added {
+            handle.want_the_chosen_file(&placement).await;
+        }
+        Ok(handle)
     }
 
     async fn get_torrent(&self, info_hash: &str) -> Option<Self::Handle> {
@@ -3268,6 +3284,54 @@ impl LibrqbitHandle {
                 }
             },
         );
+    }
+
+    /// Settle an add's [`TorrentPlacement::choose`]: want the one file the
+    /// request named, and nothing else.
+    ///
+    /// Runs inside `add_torrent_placed`, before the handle is returned and
+    /// so before any engine is published -- nothing can be reading this
+    /// torrent yet. It is the same `SelectionOp::Prepare` a stream request
+    /// makes, so a stream that names another file supersedes it (which is
+    /// how a wrong guess on a season pack recovers), and it unions the
+    /// pinned set like every other plan, so it cannot deselect an offline
+    /// download.
+    ///
+    /// Four ways to do nothing, all of them right:
+    /// - the torrent was already in the session, so this add settled
+    ///   nothing and the caller is joining whatever it already wants (the
+    ///   caller's check, above);
+    /// - the caller named indices itself (`only_files`) -- it has already
+    ///   answered the question, and a pin's want-set is not this one's to
+    ///   rewrite;
+    /// - the choice resolves to no file (an empty request, metadata that is
+    ///   somehow not there) -- the torrent keeps wanting everything, never
+    ///   nothing;
+    /// - the torrent has one file, which `plan_selection` never narrows.
+    async fn want_the_chosen_file(&self, placement: &TorrentPlacement) {
+        if placement.only_files.is_some() {
+            return;
+        }
+        let Some(choice) = placement.choose.as_ref() else {
+            return;
+        };
+        let files = self.get_files().await;
+        let Some(idx) = choice.resolve(&files) else {
+            return;
+        };
+        // Deferred, not waited on: a fresh add is Initializing (the on-disk
+        // check), librqbit refuses a selection update in that state, and the
+        // add must not block on a check that can be a whole re-hash. A
+        // torrent asks for no piece while it initializes, so the parked op
+        // lands before the first one is requested.
+        let _ = self
+            .apply_selection(
+                SelectionOp::Prepare(idx),
+                files.len(),
+                "add_torrent_placed",
+                InitPolicy::Defer,
+            )
+            .await;
     }
 
     /// Apply a selection op, handling the Initializing state per `policy`
@@ -8115,6 +8179,7 @@ mod tests {
                 vec![],
                 TorrentPlacement {
                     only_files: Some(vec![b]),
+                    ..Default::default()
                 },
             )
             .await
@@ -8139,6 +8204,7 @@ mod tests {
                 vec![],
                 TorrentPlacement {
                     only_files: Some(vec![2]),
+                    ..Default::default()
                 },
             )
             .await
@@ -8147,6 +8213,239 @@ mod tests {
             Err(err) => err,
         };
         assert!(format!("{err:#}").contains("out of range"), "{err:#}");
+    }
+
+    /// The want-set `TorrentPlacement::choose` names, settled by the add
+    /// itself: the indices it resolves to are indices into a file list the
+    /// add is what produces, so no caller can pass them as `only_files`.
+    ///
+    /// Then the three things it must never do: fight a caller that named
+    /// indices outright (a pin), narrow a single-file torrent, and -- the
+    /// one that matters -- leave the torrent wanting nothing when the
+    /// choice picks no file, since an empty want-set makes librqbit's
+    /// `is_finished()` true and parks the torrent.
+    #[tokio::test]
+    async fn add_torrent_placed_wants_the_file_the_choice_names() {
+        use crate::backend::TorrentHandle;
+        use crate::engine::{FileChoice, SeriesInfo};
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        tokio::fs::create_dir_all(&src).await.unwrap();
+        // The episode asked for is the smaller file, so a guess that finds
+        // it did so by its tag and not by the largest-media fallback.
+        write_payload(&src.join("Show.S01E01.mkv"), 32 * 1024).await;
+        write_payload(&src.join("Show.S01E02.mkv"), 48 * 1024).await;
+        let (bytes, hash) = make_torrent(&src).await;
+        let one = torrent_file_index(&bytes, "Show.S01E01.mkv");
+        let two = torrent_file_index(&bytes, "Show.S01E02.mkv");
+
+        let dl = tmp.path().join("dl");
+        let backend = LibrqbitBackend::new_for_tests(dl.clone())
+            .await
+            .expect("hermetic session");
+        let episode_one = FileChoice {
+            must_include: Vec::new(),
+            guess: Some(SeriesInfo {
+                season: Some(1),
+                episode: Some(1),
+            }),
+        };
+
+        let handle = backend
+            .add_torrent_placed(
+                TorrentSource::Bytes(bytes.clone()),
+                vec![],
+                TorrentPlacement {
+                    only_files: None,
+                    choose: Some(episode_one.clone()),
+                },
+            )
+            .await
+            .expect("add with a choice");
+        assert_eq!(
+            wait_for_selection(&handle).await,
+            vec![one],
+            "the episode the guess named, not the pack"
+        );
+
+        // A wrong guess is undone by the stream that names another file:
+        // the same `SelectionOp::Prepare`, so it simply supersedes.
+        handle.prepare_file_for_streaming(two).await.unwrap();
+        assert_eq!(handle.handle.only_files(), Some(vec![two]));
+
+        // And a second create for a torrent the session already has settles
+        // nothing: it joins what the torrent wants, rather than pulling the
+        // selection out from under whoever is reading it.
+        backend
+            .add_torrent_placed(
+                TorrentSource::Bytes(bytes.clone()),
+                vec![],
+                TorrentPlacement {
+                    only_files: None,
+                    choose: Some(episode_one.clone()),
+                },
+            )
+            .await
+            .expect("add an already-managed torrent");
+        assert_eq!(settled_selection(&handle).await, Some(vec![two]));
+        backend.remove_torrent(&hash).await.unwrap();
+
+        // A caller that named indices has already answered the question,
+        // and a pin's want-set is not the choice's to rewrite.
+        let handle = backend
+            .add_torrent_placed(
+                TorrentSource::Bytes(bytes.clone()),
+                vec![],
+                TorrentPlacement {
+                    only_files: Some(vec![two]),
+                    choose: Some(episode_one),
+                },
+            )
+            .await
+            .expect("add with both");
+        assert_eq!(settled_selection(&handle).await, Some(vec![two]));
+        backend.remove_torrent(&hash).await.unwrap();
+
+        // A choice that names no file leaves the torrent wanting
+        // everything, never nothing.
+        let handle = backend
+            .add_torrent_placed(
+                TorrentSource::Bytes(bytes),
+                vec![],
+                TorrentPlacement {
+                    only_files: None,
+                    choose: Some(FileChoice::default()),
+                },
+            )
+            .await
+            .expect("add with an empty choice");
+        assert_eq!(
+            settled_selection(&handle).await,
+            None,
+            "everything, as before"
+        );
+        backend.remove_torrent(&hash).await.unwrap();
+
+        // And a single-file torrent is never narrowed: `plan_selection`
+        // refuses, so the whole (one-file) torrent stays wanted.
+        let solo = tmp.path().join("solo");
+        tokio::fs::create_dir_all(&solo).await.unwrap();
+        write_payload(&solo.join("Show.S01E01.mkv"), 32 * 1024).await;
+        let (solo_bytes, _) = make_torrent(&solo).await;
+        let handle = backend
+            .add_torrent_placed(
+                TorrentSource::Bytes(solo_bytes),
+                vec![],
+                TorrentPlacement {
+                    only_files: None,
+                    choose: Some(FileChoice {
+                        must_include: vec!["S01E01".to_string()],
+                        guess: None,
+                    }),
+                },
+            )
+            .await
+            .expect("add a single-file torrent with a choice");
+        assert_eq!(settled_selection(&handle).await, None);
+    }
+
+    /// What a choice-narrowed torrent reports while nothing is streaming:
+    /// `stats.json`'s phase is "every *wanted* file is whole on the disk",
+    /// so narrowing moves the denominator a poller between `/create` and the
+    /// stream request reads. The seeded episode is all this torrent wants,
+    /// so it is `Ready`; the same fixture wanting the pack is `Buffering`,
+    /// and the second half is what makes the first a statement about the
+    /// want-set rather than about the data.
+    #[tokio::test]
+    async fn a_choice_moves_the_progress_denominator_to_the_chosen_file() {
+        use crate::backend::TorrentHandle;
+        use crate::engine::FileChoice;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        tokio::fs::create_dir_all(&src).await.unwrap();
+        write_payload(&src.join("Show.S01E01.mkv"), 32 * 1024).await;
+        write_payload(&src.join("Show.S01E02.mkv"), 48 * 1024).await;
+        let (bytes, hash) = make_torrent(&src).await;
+        let one = torrent_file_index(&bytes, "Show.S01E01.mkv");
+
+        let dl = tmp.path().join("dl");
+        let backend = LibrqbitBackend::new_for_tests(dl.clone())
+            .await
+            .expect("hermetic session");
+        // librqbit's own folder for a multi-file torrent; only the first
+        // episode is there, and there is no swarm to bring the other.
+        let folder = dl.join("src");
+        tokio::fs::create_dir_all(&folder).await.unwrap();
+        tokio::fs::copy(src.join("Show.S01E01.mkv"), folder.join("Show.S01E01.mkv"))
+            .await
+            .unwrap();
+
+        let choice = FileChoice {
+            must_include: vec!["S01E01".to_string()],
+            guess: None,
+        };
+        let handle = backend
+            .add_torrent_placed(
+                TorrentSource::Bytes(bytes.clone()),
+                vec![],
+                TorrentPlacement {
+                    only_files: None,
+                    choose: Some(choice),
+                },
+            )
+            .await
+            .expect("add with a choice");
+        assert_eq!(wait_for_selection(&handle).await, vec![one]);
+        let stats = handle.stats().await;
+        assert_eq!(
+            stats.phase,
+            crate::backend::StartupPhase::Ready,
+            "everything it wants is on the disk: {stats:?}"
+        );
+        backend.remove_torrent(&hash).await.unwrap();
+
+        let handle = backend
+            .add_torrent_placed(
+                TorrentSource::Bytes(bytes),
+                vec![],
+                TorrentPlacement::default(),
+            )
+            .await
+            .expect("add wanting everything");
+        handle.handle.wait_until_initialized().await.unwrap();
+        assert_eq!(handle.handle.only_files(), None);
+        let stats = handle.stats().await;
+        assert_eq!(
+            stats.phase,
+            crate::backend::StartupPhase::Buffering,
+            "wanting the pack, half of which is not there: {stats:?}"
+        );
+    }
+
+    /// The selection the add settled, once the deferred op has landed: a
+    /// fresh add is Initializing, and `want_the_chosen_file` parks its
+    /// update rather than blocking the add on the on-disk check.
+    async fn wait_for_selection(handle: &LibrqbitHandle) -> Vec<usize> {
+        handle.handle.wait_until_initialized().await.unwrap();
+        for _ in 0..200 {
+            if let Some(files) = handle.handle.only_files() {
+                return files;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the add never narrowed the want-set");
+    }
+
+    /// [`wait_for_selection`] for the cases that assert the add changed
+    /// *nothing*. Waiting for a value that is already there proves nothing,
+    /// so this waits out the window a parked op would have landed in --
+    /// initialization plus the applier's own turn -- and reads the
+    /// selection after it. Without the wait the assertion passes on timing
+    /// alone, whatever the add did.
+    async fn settled_selection(handle: &LibrqbitHandle) -> Option<Vec<usize>> {
+        handle.handle.wait_until_initialized().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        handle.handle.only_files()
     }
 
     /// `remove_torrent_and_files` takes the torrent's files and its (then

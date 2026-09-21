@@ -110,6 +110,116 @@ pub fn guess_file_index_in(
         .map(|(idx, _, _)| idx)
 }
 
+/// Which file a request means, before anything can name its index.
+///
+/// Both create routes say which file the caller is about to play --
+/// `fileMustInclude` names it outright, `guessFileIdx` asks for the
+/// season/episode guess -- and both say it about a torrent whose file list
+/// does not exist yet: for a magnet, the add is what resolves the metadata
+/// the names live in. So the question travels with the add
+/// ([`crate::backend::TorrentPlacement::choose`]) and is answered the moment
+/// the files are known.
+///
+/// The same value answers the `guessedFileIdx` the route reports, so the
+/// file the client is told to stream and the file the torrent wants cannot
+/// disagree: they are one call.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileChoice {
+    /// `fileMustInclude`: substrings, or `/pattern/flags` regexes, one of
+    /// which the file's name must match. Takes precedence over the guess --
+    /// the stream named its file.
+    pub must_include: Vec<String>,
+    /// `guessFileIdx`: the season/episode hints, or
+    /// `Some(SeriesInfo::default())` for a hint-less guess (a movie). `None`
+    /// means no guessing was asked for.
+    pub guess: Option<SeriesInfo>,
+}
+
+impl FileChoice {
+    /// The request named nothing: no `fileMustInclude`, no `guessFileIdx`.
+    /// Such a request picks no file, and the torrent goes on wanting
+    /// everything.
+    pub fn is_empty(&self) -> bool {
+        self.must_include.is_empty() && self.guess.is_none()
+    }
+
+    /// The index this request means, or `None` when it asked for nothing or
+    /// the torrent has no files. Mirrors what `/create` has always reported
+    /// as `guessedFileIdx`, in the same order.
+    pub fn resolve(&self, files: &[crate::backend::BackendFileInfo]) -> Option<usize> {
+        if self.is_empty() {
+            return None;
+        }
+        // `fileMustInclude` first: the stream explicitly named its file.
+        if let Some(idx) = files.iter().position(|file| {
+            self.must_include
+                .iter()
+                .any(|filter| file_matches_filter(&file.name, filter))
+        }) {
+            return Some(idx);
+        }
+        // Then the series-aware guess (SxxEyy / NxM episode tags, largest-media
+        // fallback) -- this is what picks the right episode out of a season pack.
+        if self.guess.is_some()
+            && let Some(idx) = guess_file_index_in(files, self.guess.as_ref())
+        {
+            return Some(idx);
+        }
+        // Last resort (e.g. no media-extension file at all): largest video
+        // file, then largest file of any kind. Ties go to the last of them,
+        // which is how `routes::compat::resolve_file_idx` has always resolved
+        // them and what this step used to call.
+        largest_file(files, true).or_else(|| largest_file(files, false))
+    }
+}
+
+/// The largest file, by index, among the video-named ones (`video_only`) or
+/// among all of them. `max_by_key` keeps the last of equal keys, which is the
+/// tie-break `resolve_file_idx` has always had.
+fn largest_file(files: &[crate::backend::BackendFileInfo], video_only: bool) -> Option<usize> {
+    files
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| !video_only || is_video_name(&file.name))
+        .max_by_key(|(_, file)| file.length)
+        .map(|(idx, _)| idx)
+}
+
+/// Whether a file name is one of the container extensions the routes treat as
+/// playable video. Narrower than [`GUESS_MEDIA_EXTENSIONS`], which also counts
+/// audio: this one answers "what would a player be sent".
+pub fn is_video_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.rsplit('.').next(),
+        Some("mkv" | "mp4" | "avi" | "webm" | "mov" | "wmv" | "m4v" | "ts")
+    )
+}
+
+/// server.js-compatible `fileMustInclude` matching: `/pattern/flags` is a
+/// regex (`i` for case-insensitive), anything else a case-insensitive
+/// substring. A regex that does not compile matches nothing.
+pub fn file_matches_filter(name: &str, filter: &str) -> bool {
+    if let Some((pattern, flags)) = parse_regex_filter(filter) {
+        return regex::RegexBuilder::new(pattern)
+            .case_insensitive(flags.contains('i'))
+            .build()
+            .map(|regex| regex.is_match(name))
+            .unwrap_or(false);
+    }
+
+    name.to_ascii_lowercase()
+        .contains(&filter.to_ascii_lowercase())
+}
+
+fn parse_regex_filter(filter: &str) -> Option<(&str, &str)> {
+    if !filter.starts_with('/') {
+        return None;
+    }
+    let last_slash = filter.rfind('/')?;
+    (last_slash > 0).then(|| (&filter[1..last_slash], &filter[last_slash + 1..]))
+}
+
 #[cfg(test)]
 mod guess_tests {
     use super::{SeriesInfo, guess_file_index_in};
@@ -222,6 +332,80 @@ mod guess_tests {
             None
         );
         assert_eq!(guess_file_index_in(&[], None), None);
+    }
+}
+
+#[cfg(test)]
+mod choice_tests {
+    use super::{FileChoice, SeriesInfo};
+    use crate::backend::BackendFileInfo;
+
+    fn f(name: &str, length: u64) -> BackendFileInfo {
+        BackendFileInfo {
+            name: name.to_string(),
+            length,
+        }
+    }
+
+    fn filters(names: &[&str]) -> FileChoice {
+        FileChoice {
+            must_include: names.iter().map(|n| n.to_string()).collect(),
+            guess: None,
+        }
+    }
+
+    /// The order the route has always reported `guessedFileIdx` in, now the
+    /// order the add's want-set is resolved in too: the stream's own name
+    /// for its file beats the guess, whatever the guess would have said.
+    #[test]
+    fn file_must_include_beats_the_guess() {
+        let files = [f("Show.S01E01.mkv", 100), f("Show.S02E05.mkv", 900)];
+        let choice = FileChoice {
+            must_include: vec!["S02E05".to_string()],
+            guess: Some(SeriesInfo {
+                season: Some(1),
+                episode: Some(1),
+            }),
+        };
+        assert_eq!(choice.resolve(&files), Some(1));
+        // A regex filter, and one that matches nothing falls through to the
+        // guess rather than picking the wrong file.
+        assert_eq!(filters(&["/s01e01/i"]).resolve(&files), Some(0));
+        let missed = FileChoice {
+            must_include: vec!["S09E09".to_string()],
+            guess: Some(SeriesInfo {
+                season: Some(1),
+                episode: Some(1),
+            }),
+        };
+        assert_eq!(missed.resolve(&files), Some(0));
+    }
+
+    /// A request that names nothing resolves to nothing, which is what
+    /// leaves the torrent wanting everything. The whole hazard of this
+    /// change is a want-set that ends up empty instead.
+    #[test]
+    fn a_choice_that_names_nothing_resolves_to_nothing() {
+        let files = [f("Show.S01E01.mkv", 100), f("Show.S01E02.mkv", 900)];
+        assert!(FileChoice::default().is_empty());
+        assert_eq!(FileChoice::default().resolve(&files), None);
+        // And an empty torrent answers nothing however much was asked.
+        assert_eq!(filters(&["Show"]).resolve(&[]), None);
+    }
+
+    /// The last resort, reached only once something *was* asked for: the
+    /// largest video file, then the largest file of any kind. Ties go to the
+    /// last of them, as `resolve_file_idx` has always resolved them.
+    #[test]
+    fn a_torrent_with_no_media_file_falls_back_to_the_largest() {
+        let with_video = [
+            f("readme.txt", 900),
+            f("clip.mp4", 100),
+            f("clip2.mp4", 100),
+        ];
+        assert_eq!(filters(&["nothing here"]).resolve(&with_video), Some(2));
+        let no_video = [f("readme.txt", 100), f("disk.iso", 900)];
+        assert_eq!(filters(&["nothing here"]).resolve(&no_video), Some(1));
     }
 }
 

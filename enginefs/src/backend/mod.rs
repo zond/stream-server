@@ -29,6 +29,33 @@ pub enum TorrentSource {
 pub struct TorrentPlacement {
     /// Initial want-set; `None` = everything.
     pub only_files: Option<Vec<usize>>,
+    /// The initial want-set for a caller that knows *which file* it means
+    /// but not its index, because the index is an index into a file list
+    /// this very add is what produces. Used only when `only_files` is
+    /// `None` -- a caller that can name indices has already answered the
+    /// question.
+    ///
+    /// Resolved and applied by the backend as part of the add, before the
+    /// handle reaches anyone: a create that names its file leaves the
+    /// torrent wanting that file, not the whole season pack, for the whole
+    /// stretch between `/create` and the first stream request. It is never
+    /// allowed to end in an empty want-set -- a choice that resolves to
+    /// nothing leaves the torrent wanting everything, because an empty
+    /// `only_files` makes librqbit's `is_finished()` true and parks the
+    /// torrent on the NotInterested path, which is the opposite of the
+    /// point.
+    ///
+    /// **This moves the progress denominator.** The backend's
+    /// `wanted_on_disk` sums the *selected* files, so narrowing here makes
+    /// a `stats.json` poller between create and stream read the chosen
+    /// file's completeness instead of the whole torrent's --
+    /// [`EngineStats::is_finished`] and the torrent-level half of
+    /// [`StartupPhase`]. That
+    /// is the answer it is asking for: it polls to find out whether the
+    /// stream it is about to open can play. It is also the same answer it
+    /// would get a moment later, since the stream request narrows to that
+    /// file anyway; all this changes is when it becomes true.
+    pub choose: Option<crate::engine::FileChoice>,
 }
 
 #[async_trait::async_trait]
