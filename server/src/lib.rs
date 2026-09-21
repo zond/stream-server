@@ -210,6 +210,22 @@ pub struct ServerConfig {
     /// together they are what "makes no outbound request of its own" means,
     /// and neither is enough alone. Defaults to `true`; tests set it false.
     pub use_public_trackers: bool,
+    /// Whether a torrent announces itself to the local network by BEP-14
+    /// multicast, or is found only by the ways a request named.
+    ///
+    /// The third of the same family, and the one nobody thought to switch
+    /// off: with the other two false a test still shouted every info hash
+    /// it held at the network it was running on, and -- because a fixture
+    /// built from deterministic bytes has a deterministic info hash --
+    /// **two concurrent test runs found each other and swapped pieces**.
+    /// The symptom was a store holding more than the test's own seeder had
+    /// ever uploaded, which is a measurement no assertion can save.
+    ///
+    /// This is the **default** for `btEnableLsd` rather than a veto over
+    /// it: a viewer who has asked for local discovery keeps it, and the
+    /// settings report goes on describing what the session actually does.
+    /// Defaults to `true`; tests set it false.
+    pub enable_local_service_discovery: bool,
 }
 
 /// The one configuration: a server inside a host process. There used to be a
@@ -230,6 +246,7 @@ impl Default for ServerConfig {
             lan_media_addr: None,
             resolve_dht_bootstrap_names: true,
             use_public_trackers: true,
+            enable_local_service_discovery: true,
         }
     }
 }
@@ -1118,6 +1135,12 @@ pub async fn run(
 
     let default_settings = routes::system::ServerSettings {
         cache_root: cache_dir.to_string_lossy().to_string(),
+        // The *default*, not an override: a viewer who has asked for local
+        // discovery keeps it, and what the settings report says is what
+        // the session does. An embedder that must not announce -- a test --
+        // starts on a config directory of its own, so the default is the
+        // whole story there.
+        bt_enable_lsd: cfg.enable_local_service_discovery,
         ..routes::system::ServerSettings::default()
     };
 

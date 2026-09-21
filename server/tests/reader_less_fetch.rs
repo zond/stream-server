@@ -70,6 +70,10 @@ fn offline_config() -> ServerConfig {
     ServerConfig {
         resolve_dht_bootstrap_names: false,
         use_public_trackers: false,
+        // The run's own nonce below already makes this torrent nobody
+        // else's; this makes sure of it from the other side, and keeps the
+        // measurement off the network the runner sits on.
+        enable_local_service_discovery: false,
         // An embedder that keeps a pin record and has named nothing in it:
         // xtremio's `downloads::pins()` over an empty registry. The `None`
         // arm below overrides exactly this field and nothing else.

@@ -52,6 +52,12 @@ fn offline_config() -> ServerConfig {
     ServerConfig {
         resolve_dht_bootstrap_names: false,
         use_public_trackers: false,
+        // And no multicast either. Two of these switches were not enough:
+        // local service discovery stayed on, every test announced its info
+        // hashes to the network the runner was on, and two concurrent runs
+        // of a fixture built from the same bytes -- the same info hash --
+        // found each other and fed each other pieces.
+        enable_local_service_discovery: false,
         // An embedder that keeps a pin record and has nothing in it yet.
         // `None` is not the same thing -- it is "nobody said", which keeps
         // every torrent's data and reports it all as pinned -- and it has a
@@ -75,6 +81,40 @@ fn seeded_fixture_config() -> ServerConfig {
     fixture_pins::keep_what_the_fixture_seeded(offline_config())
 }
 
+/// **A test announces nothing on the network it is running on**, local
+/// discovery included.
+///
+/// The other two switches ([`offline_config`]) stop the DNS, the DoH and
+/// the tracker traffic, and with both off a run still shouted every info
+/// hash it held over BEP-14 multicast. A fixture built from deterministic
+/// bytes has a deterministic info hash, so two concurrent runs of the same
+/// test found each other and swapped pieces -- a seeded store came out
+/// holding more than the test's own seeder had ever uploaded.
+///
+/// What is asserted is the *setting*, because the setting is what the
+/// session is built from and what the report describes: a config that says
+/// this process may not announce is the default `btEnableLsd` takes, not a
+/// veto applied somewhere the report cannot see.
+#[test]
+fn a_test_does_not_announce_itself_on_the_local_network() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_dir.path().join("cache")),
+        ..offline_config()
+    })?;
+
+    assert!(
+        !handle.settings()?.bt_enable_lsd,
+        "the offline config left local service discovery on"
+    );
+
+    handle.shutdown()?;
+    Ok(())
+}
+
 /// Resolving bootstrap names is on in the stock configuration -- the Android
 /// embed is the case it exists for -- and so are the public trackers, which
 /// are how a real torrent finds peers at all.
@@ -82,6 +122,10 @@ fn seeded_fixture_config() -> ServerConfig {
 fn the_stock_config_resolves_dht_bootstrap_names() {
     assert!(ServerConfig::default().resolve_dht_bootstrap_names);
     assert!(ServerConfig::default().use_public_trackers);
+    // A viewer on a home network is exactly who local discovery is for:
+    // the other device playing the same film is one multicast away, and no
+    // tracker or DHT round trip finds it faster.
+    assert!(ServerConfig::default().enable_local_service_discovery);
 }
 
 /// Every launch generates a per-launch token. There is no way to ask for an
@@ -158,6 +202,7 @@ fn two_embedded_servers_start_concurrently() -> anyhow::Result<()> {
 /// `catalog/{type}/{id}/{extra}.json` shape must answer an empty but valid
 /// catalog; `meta` stays a 404, and so does every other resource under the
 /// prefix.
+
 #[test]
 fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
