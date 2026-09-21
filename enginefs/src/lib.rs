@@ -2202,18 +2202,34 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         source: TorrentSource,
         extra_trackers: Option<Vec<String>>,
     ) -> Result<Arc<Engine<B::Handle>>> {
+        self.add_torrent_placed(source, extra_trackers, TorrentPlacement::default())
+            .await
+    }
+
+    /// [`Self::add_torrent`] with a [`TorrentPlacement`] -- the `.torrent`
+    /// half of what [`Self::get_or_add_magnet_placed`] does for a magnet.
+    /// Unlike that one there is nothing to join: a blob add has no registry
+    /// entry, so the placement always counts, including on the re-add the
+    /// [`RemovalGate`] may make.
+    pub async fn add_torrent_placed(
+        &self,
+        source: TorrentSource,
+        extra_trackers: Option<Vec<String>>,
+        placement: TorrentPlacement,
+    ) -> Result<Arc<Engine<B::Handle>>> {
         let trackers = self.merged_trackers(extra_trackers).await;
         debug!(count = trackers.len(), "Adding torrent with trackers");
-        let handle = self
-            .backend
-            .add_torrent(source.clone(), trackers.clone())
-            .await?;
+        let add = || {
+            self.backend
+                .add_torrent_placed(source.clone(), trackers.clone(), placement.clone())
+        };
+        let handle = add().await?;
         Self::publish_added(
             &*self.backend,
             &self.engines,
             handle,
             self.engine_parts(),
-            || self.backend.add_torrent(source.clone(), trackers.clone()),
+            add,
         )
         .await
     }
@@ -3739,6 +3755,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     ) -> Result<Arc<Engine<B::Handle>>, PinDownloadError> {
         let placement = TorrentPlacement {
             only_files: Some(vec![file_idx]),
+            ..Default::default()
         };
         let AddedMagnet {
             engine,
@@ -5531,7 +5548,7 @@ mod tests {
 
         async fn add_torrent_placed(
             &self,
-            _source: TorrentSource,
+            source: TorrentSource,
             _trackers: Vec<String>,
             placement: TorrentPlacement,
         ) -> Result<Self::Handle> {
@@ -5539,7 +5556,13 @@ mod tests {
             let handle = self.handles[0].clone();
             handle.counters.paused.store(false, Ordering::SeqCst);
             self.placements.lock().unwrap().push(placement);
-            if self.hold_add.load(Ordering::SeqCst) {
+            // Only a magnet waits: `hold_add` stands in for metadata still
+            // resolving, and a `.torrent` add has its metadata in hand. The
+            // distinction is not academic -- `EngineFS::add_torrent` goes
+            // through this same call now (it carries a want-set too), and
+            // held here it would park the very add that is meant to publish
+            // the torrent while a magnet add times out.
+            if matches!(source, TorrentSource::Url(_)) && self.hold_add.load(Ordering::SeqCst) {
                 self.add_hold.acquire().await.unwrap().forget();
             }
             Ok(handle)
@@ -7142,6 +7165,7 @@ mod tests {
 
         let placement = TorrentPlacement {
             only_files: Some(vec![0]),
+            ..Default::default()
         };
         let engine = enginefs
             .get_or_add_magnet_placed(TEST_HASH, None, placement.clone())
@@ -7152,7 +7176,7 @@ mod tests {
 
         // Already managed: no second add, whatever the placement.
         enginefs
-            .get_or_add_magnet_placed(TEST_HASH, None, TorrentPlacement { only_files: None })
+            .get_or_add_magnet_placed(TEST_HASH, None, TorrentPlacement::default())
             .await
             .expect("joined");
         assert_eq!(placements.lock().unwrap().len(), 1);
@@ -7207,6 +7231,7 @@ mod tests {
             enginefs.backend.placements.lock().unwrap().as_slice(),
             &[TorrentPlacement {
                 only_files: Some(vec![1]),
+                ..Default::default()
             }]
         );
         assert_eq!(engine.pinned_file_indices(), vec![1]);

@@ -5,8 +5,8 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use enginefs::backend::TorrentHandle;
-use enginefs::engine::SeriesInfo;
+use enginefs::backend::{TorrentHandle, TorrentPlacement};
+use enginefs::engine::{FileChoice, SeriesInfo};
 use hex;
 use serde::Deserialize;
 use serde_json::json;
@@ -131,8 +131,11 @@ pub async fn create_engine(
     };
 
     let mut trackers = merged_trackers(payload.announce, payload.peer_search);
-    let file_must_include = payload.file_must_include;
-    let guess = parse_guess_file_idx(payload.guess_file_idx.as_ref());
+    let choice = FileChoice {
+        must_include: payload.file_must_include,
+        guess: parse_guess_file_idx(payload.guess_file_idx.as_ref()),
+    };
+    let placement = placement_for(&choice);
 
     let engine = match source {
         CreateSource::Magnet {
@@ -144,7 +147,7 @@ pub async fn create_engine(
             );
             match state
                 .engine
-                .get_or_add_magnet(&info_hash, Some(trackers))
+                .get_or_add_magnet_placed(&info_hash, Some(trackers), placement)
                 .await
             {
                 Ok(engine) => engine,
@@ -152,7 +155,11 @@ pub async fn create_engine(
             }
         }
         CreateSource::TorrentFile(source) => {
-            match state.engine.add_torrent(source, Some(trackers)).await {
+            match state
+                .engine
+                .add_torrent_placed(source, Some(trackers), placement)
+                .await
+            {
                 Ok(engine) => engine,
                 // stremio-video's createTorrent.js checks resp.ok before
                 // reading the body (createTorrent.js:62); a 200 here on
@@ -182,7 +189,7 @@ pub async fn create_engine(
             }
         }
     };
-    let stats = stats_with_guess(&engine, &file_must_include, guess).await;
+    let stats = stats_with_guess(&engine, &choice).await;
     (StatusCode::OK, Json(stats))
 }
 
@@ -224,12 +231,18 @@ pub async fn create_magnet(
         .unwrap_or(&info_hash);
 
     let trackers = merged_trackers(None, payload.peer_search);
-    let file_must_include = payload.file_must_include;
-    let guess = parse_guess_file_idx(payload.guess_file_idx.as_ref());
+    let choice = FileChoice {
+        must_include: payload.file_must_include,
+        guess: parse_guess_file_idx(payload.guess_file_idx.as_ref()),
+    };
 
-    match state.engine.get_or_add_magnet(ih, Some(trackers)).await {
+    match state
+        .engine
+        .get_or_add_magnet_placed(ih, Some(trackers), placement_for(&choice))
+        .await
+    {
         Ok(engine) => {
-            let stats = stats_with_guess(&engine, &file_must_include, guess).await;
+            let stats = stats_with_guess(&engine, &choice).await;
             (StatusCode::OK, Json(stats))
         }
         // See the matching comment in create_engine: stremio-video's
@@ -282,10 +295,26 @@ fn parse_guess_file_idx(value: Option<&serde_json::Value>) -> Option<SeriesInfo>
     }
 }
 
+/// The add-time want-set a create request carries: the file it named, for
+/// the add this call may be the one to start.
+///
+/// A request that names nothing carries no choice, and the torrent wants
+/// everything as it always did. The choice is *not* turned into indices
+/// here -- for a magnet there is no file list yet to index into, and
+/// resolving it here would mean a second metadata resolve. The add resolves
+/// it once, against the files it has just learned, and the route asks the
+/// same [`FileChoice`] for the `guessedFileIdx` it reports, so the two
+/// answers are one answer.
+fn placement_for(choice: &FileChoice) -> TorrentPlacement {
+    TorrentPlacement {
+        only_files: None,
+        choose: (!choice.is_empty()).then(|| choice.clone()),
+    }
+}
+
 async fn stats_with_guess<H>(
     engine: &Arc<enginefs::engine::Engine<H>>,
-    filters: &[String],
-    guess: Option<SeriesInfo>,
+    choice: &FileChoice,
 ) -> serde_json::Value
 where
     H: TorrentHandle,
@@ -293,41 +322,12 @@ where
     let stats = engine.get_statistics().await;
     let mut value = serde_json::to_value(stats).unwrap_or_else(|_| json!({}));
 
-    if filters.is_empty() && guess.is_none() {
+    if choice.is_empty() {
         return value;
     }
 
     let files = engine.handle.get_files().await;
-
-    // fileMustInclude takes precedence: the stream explicitly names its file.
-    let mut guessed = files.iter().position(|file| {
-        filters
-            .iter()
-            .any(|filter| compat::file_matches_filter(&file.name, filter))
-    });
-
-    // Then the series-aware guess (SxxEyy / NxM episode tags, largest-media
-    // fallback) — this is what picks the right episode out of a season pack.
-    if guessed.is_none() && guess.is_some() {
-        guessed = enginefs::engine::guess_file_index_in(&files, guess.as_ref());
-    }
-
-    // Last resort (e.g. no media-extension file at all): largest video file,
-    // then largest file of any kind.
-    if guessed.is_none() {
-        let candidates = files
-            .iter()
-            .enumerate()
-            .map(|(index, file)| compat::FileCandidate {
-                index,
-                name: file.name.clone(),
-                length: file.length,
-            })
-            .collect::<Vec<_>>();
-        guessed = compat::resolve_file_idx("-1", &candidates, &[]).ok();
-    }
-
-    if let Some(idx) = guessed
+    if let Some(idx) = choice.resolve(&files)
         && let Some(obj) = value.as_object_mut()
     {
         obj.insert("guessedFileIdx".to_string(), json!(idx));
@@ -423,6 +423,36 @@ mod tests {
                 season: None,
                 episode: Some(5),
             })
+        );
+    }
+
+    /// A create that names its file carries that file as the add's want-set;
+    /// one that names nothing carries no want-set at all, which is what
+    /// leaves the torrent wanting everything. Never `only_files`: the
+    /// indices are indices into a file list the add is what produces.
+    #[test]
+    fn a_create_that_names_a_file_carries_it_as_the_adds_want_set() {
+        let named = FileChoice {
+            must_include: vec!["S01E01".to_string()],
+            guess: None,
+        };
+        assert_eq!(
+            placement_for(&named),
+            TorrentPlacement {
+                only_files: None,
+                choose: Some(named),
+            }
+        );
+        // `guessFileIdx: {}` (a movie) names a file too -- the largest one.
+        let movie = FileChoice {
+            must_include: Vec::new(),
+            guess: Some(SeriesInfo::default()),
+        };
+        assert_eq!(placement_for(&movie).choose, Some(movie));
+        assert_eq!(
+            placement_for(&FileChoice::default()),
+            TorrentPlacement::default(),
+            "nothing named, everything wanted"
         );
     }
 }

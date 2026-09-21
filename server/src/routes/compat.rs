@@ -2,7 +2,6 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use enginefs::backend::librqbit::LibrqbitHandle;
 use enginefs::engine::Engine;
 use enginefs::{EngineFS, MagnetAddError};
-use regex::RegexBuilder;
 use std::sync::Arc;
 
 pub const DLNA_TRANSFER_MODE: &str = "Streaming";
@@ -84,6 +83,12 @@ pub fn query_flag(query: Option<&str>, name: &str) -> bool {
 ///
 /// Waits at most `enginefs::METADATA_RESOLVE_TIMEOUT` for metadata; map the
 /// error with [`engine_creation_failure`].
+///
+/// No want-set, unlike the create routes (`routes::engine::placement_for`).
+/// Its callers are the ones that either name no file at all -- a `stats.json`
+/// poll -- or name it and then narrow to it inside the same request, through
+/// `prepare_file_for_streaming`: there is no stretch of time here for an
+/// add-time want-set to shorten.
 pub async fn get_or_create_engine(
     engine_fs: &EngineFS,
     info_hash: &str,
@@ -224,34 +229,10 @@ pub fn resolve_file_idx(
         .ok_or_else(|| "No playable file found".to_string())
 }
 
-pub fn is_video_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    matches!(
-        lower.rsplit('.').next(),
-        Some("mkv" | "mp4" | "avi" | "webm" | "mov" | "wmv" | "m4v" | "ts")
-    )
-}
-
-pub fn file_matches_filter(name: &str, filter: &str) -> bool {
-    if let Some((pattern, flags)) = parse_regex_filter(filter) {
-        return RegexBuilder::new(pattern)
-            .case_insensitive(flags.contains('i'))
-            .build()
-            .map(|regex| regex.is_match(name))
-            .unwrap_or(false);
-    }
-
-    name.to_ascii_lowercase()
-        .contains(&filter.to_ascii_lowercase())
-}
-
-fn parse_regex_filter(filter: &str) -> Option<(&str, &str)> {
-    if !filter.starts_with('/') {
-        return None;
-    }
-    let last_slash = filter.rfind('/')?;
-    (last_slash > 0).then(|| (&filter[1..last_slash], &filter[last_slash + 1..]))
-}
+/// Both live in `enginefs::engine` now, next to `guess_file_index_in` and
+/// [`enginefs::engine::FileChoice`]: an add resolves which file a create
+/// request means, and it cannot call back up into the server to ask.
+pub use enginefs::engine::{file_matches_filter, is_video_name};
 
 #[cfg(test)]
 mod tests {
