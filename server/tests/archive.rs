@@ -21,6 +21,9 @@ fn offline_config() -> stream_server::ServerConfig {
         // reaches `merged_trackers` -- but the two halves of "offline"
         // belong together, and `embed.rs` paid for having only one of them.
         use_public_trackers: false,
+        // And no multicast: see `embed.rs`, where a test run announcing its
+        // info hashes found another test run and fed it pieces.
+        enable_local_service_discovery: false,
         // An embedder that keeps a pin record and has nothing in it yet.
         // `None` is not the same thing -- it is "nobody said", which keeps
         // every torrent's data and reports it all as pinned -- and it has a
