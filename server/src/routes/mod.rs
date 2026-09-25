@@ -3,6 +3,7 @@ pub mod cache;
 pub mod casting;
 pub mod compat;
 pub mod downloads;
+pub mod drive;
 pub mod engine;
 pub mod ftp;
 pub mod local_addon;

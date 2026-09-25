@@ -37,6 +37,22 @@ pub struct AppState {
     /// on.
     pub translated_archives:
         crate::translators::session::Sessions<crate::translators::session::TranslatedSession>,
+    /// Google Drive files a `POST /drive/create` has opened, keyed by the
+    /// random key their stream URL carries (see `crate::routes::drive`).
+    /// The same map type and the same lifetime rule as
+    /// [`Self::translated_archives`]: a session stays while its own file is
+    /// what is playing, a lease outranks that, and the switch task in
+    /// `crate::run` is what applies it.
+    ///
+    /// **This is where the refresh token lives while a file is open**, one
+    /// layer down inside each source's `DriveCredential`. Nothing but the
+    /// header supplier can reach it and nothing here can print it.
+    pub drive_files: crate::translators::session::Sessions<crate::routes::drive::DriveSession>,
+    /// Where a Drive file's two services are, or `None` for a server whose
+    /// embedder named no pairing service -- which is every server but the
+    /// app's, and which refuses a create rather than guessing
+    /// (`crate::routes::drive::DriveEndpoints`).
+    pub drive: Option<Arc<crate::routes::drive::DriveEndpoints>>,
     /// What `GET /casting` answers with. Always empty: the SSDP discovery
     /// loop that filled it went with the daemon, and nothing could be cast
     /// to an entry anyway (see `crate::devices`).
@@ -119,6 +135,10 @@ impl AppState {
             translated_archives: crate::translators::session::Sessions::new(
                 crate::translators::session::SESSION_CAP,
             ),
+            drive_files: crate::translators::session::Sessions::new(
+                crate::translators::session::SESSION_CAP,
+            ),
+            drive: None,
             devices: Arc::new(RwLock::new(Vec::new())),
             proxy_streams: Arc::new(crate::proxy_streams::ProxyStreams::new()),
             proxy_cache,

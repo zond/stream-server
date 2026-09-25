@@ -120,7 +120,10 @@ fn refusal_response(refusal: &Refusal) -> Response {
 /// declines to do the work: serving a member out of it would mean
 /// downloading the whole archive first, which is the thing the design
 /// exists to stop.
-fn source_error_response(error: &ProxySourceError) -> Response {
+///
+/// Shared with `routes::drive`, which opens a `ProxySource` of its own and
+/// owes a client the same four answers about one.
+pub(crate) fn source_error_response(error: &ProxySourceError) -> Response {
     // `noRanges` is a *refusal*, in the same shape as a translator's, and
     // not an `error`: it is a thing about this source that the viewer can
     // be told in the viewer's own words ("this link will not serve the
@@ -142,13 +145,17 @@ fn source_error_response(error: &ProxySourceError) -> Response {
             Json(serde_json::json!({ "error": error.to_string() })),
         )
             .into_response(),
-        // `Credentials` cannot arise on this route -- a `/{fmt}/create`
-        // relays the caller's own `h=`, which is a value and not a grant
-        // to renew -- and it is answered rather than `unreachable!()`d,
-        // because the arm that says "this cannot happen" is how a later
-        // source that mints its own header gets a panic instead of a
-        // status. A `502` is right for it either way: the far end would
-        // not authorise us.
+        // `Credentials` cannot arise on the archive routes -- a
+        // `/{fmt}/create` relays the caller's own `h=`, which is a value
+        // and not a grant to renew -- and it is answered rather than
+        // `unreachable!()`d, because the arm that says "this cannot
+        // happen" is how a later source that mints its own header gets a
+        // panic instead of a status. That source now exists: `/drive`
+        // shares this function, and its one terminal case -- a grant that
+        // is gone -- never reaches here, because `DriveError` lifts
+        // `pairAgain` out of a `Credentials` before answering
+        // (`sources::drive`). A `502` is right for what is left either
+        // way: the far end would not authorise us.
         ProxySourceError::Origin(_)
         | ProxySourceError::Fetch(_)
         | ProxySourceError::Credentials(_) => (

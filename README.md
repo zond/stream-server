@@ -217,6 +217,7 @@ The HTTP surface is deliberately small and split in two by `build_router()` (`se
 | GET | `/{rar\|zip\|7zip\|tar\|tgz}/stream`, `/{…}/stream/{key}`, `/{…}/stream/{key}/{*file}` | OPEN | players -- archive member bytes |
 | GET | `/ftp/{filename}?lz=…` | OPEN | players (FTP/FTPS passthrough through the pure-Rust `suppaftp` -- nothing to install; any other scheme is `400`, and an origin that refuses is `502`) |
 | GET, HEAD, OPTIONS | `/proxy/{*rest}`, `/proxy`, `/proxy/` | OPEN | players -- a remote stream fetched on their behalf, with the headers the addon asked for, and cached in whole chunks so a seek back into it is answered from disk. Any other method is `405` with `Allow`. See [Proxied remote streams](#proxied-remote-streams) |
+| GET | `/drive/stream/{key}` | OPEN | players -- the bytes of a file in a paired Google Drive, by range. The key is random and the URL carries **no credential**: the grant stays in the create's body and is spent inside the server for an hourly access token. A dead pairing is `401` `{"refused":"pairAgain"}`, never a generic `502`. See [Google Drive files](#google-drive-files) |
 | GET | `/local-addon/manifest.json` | OPEN | stremio-core default profile -- **stub**: a valid manifest (`org.stremio.local`, "Local Files") declaring no types, resources or catalogs |
 | GET | `/local-addon/stream/{type}/{id}`, `/local-addon/stream/{type}/{id}.json` | OPEN | stremio-core default profile -- **stub**: always `{"streams": []}` |
 | GET | `/local-addon/catalog/{type}/{id}`, `/local-addon/catalog/{type}/{id}/{extra}` (with or without `.json`) | OPEN | stremio-core profiles that carry the catalog-declaring descriptor -- **stub**: always `{"metas": []}` |
@@ -227,6 +228,7 @@ The HTTP surface is deliberately small and split in two by `build_router()` (`se
 | GET | `/{infoHash}/stats.json`, `/{infoHash}/{fileIdx}/stats.json` | TOKEN | stremio-core `Statistics`; accept `tr=`/`f=` like the stream route |
 | POST | `/create` | TOKEN | stremio-core `CreateTorrent` (torrent blob / URL) |
 | POST | `/{infoHash}/create` | TOKEN | stremio-core `CreateTorrent` (magnet) |
+| POST | `/drive/create` | TOKEN | open a file in a paired Google Drive: body `{"fileId", "refreshToken", "name"?}`, answer `{"key", "url", "name"?, "contentType", "length"}`. **Control, because the body carries the account's refresh token** -- a live credential that never goes in a path or a query. `401` `{"refused":"pairAgain"}` for a grant that is gone, `501` `{"refused":"noPairingService"}` for a build configured with none, `502` for anything that might pass. See [Google Drive files](#google-drive-files) |
 | GET, POST | `/settings` | TOKEN | stremio-core `StreamingServer` (`{ baseUrl, options, values }` / `{ success }`) |
 | GET | `/network-info`, `/device-info` | TOKEN | stremio-core `StreamingServer` |
 | GET | `/casting` | TOKEN | stremio-core playback devices: **`[]`, always.** The SSDP discovery loop that filled the list ran only in the deleted daemon and is gone with the `ssdp-client` dependency; nothing could be cast to an entry it found in any case (next row), and on Android M-SEARCH is multicast the app sandbox cannot send. An embedder that casts discovers receivers itself and feeds them from the [LAN media listener](#lan-media-listener). No trailing slash: `/casting/` is an unknown path (`404`) |
@@ -321,6 +323,7 @@ An embedder holds a `ServerHandle` (from `stream_server::start`) and never needs
 | `clean_cache_now() -> Result<EvictionReport>` | `POST /cache/clean` -- drop both owners' slack immediately and report what is left; a pin and the window of the stream being played are never touched. See [Cache usage and cleaning](#cache-usage-and-cleaning) |
 | `stream_numbers(url: &str) -> Result<Option<StreamNumbers>>` | `GET /stream-numbers.json?url=…` -- the cache around the playhead and, for a torrent, the committed set, this session's transfer totals (fetched, unverified, uploaded and their ratio) and the engine's refused reclaims (each absent where there is no such number, never zeroed). `None` is a stream this server does not hold, which is not an error. See [What a panel is told about a stream](#what-a-panel-is-told-about-a-stream) |
 | `close_proxy_streams(token: &str) -> usize` | `POST /proxy-streams/{token}/close` -- end every proxied stream the client marked with `token`, retire the token, and answer how many streams that was. See [Ending a proxied stream](#ending-a-proxied-stream) |
+| `open_drive_file(file_id, refresh_token, name) -> Result<Result<DriveFileOpened, DriveOpenError>>` | `POST /drive/create`, with `url` made absolute on this server. **How an embedder asks, and why the credential never becomes a request**: the grant is an argument to a function call in this process, not a query string, a path segment or a logged line. `DriveOpenError::is_pair_again()` is the one thing a caller must be able to tell without reading English -- its answer is a new pairing, and everything else's is to try again. See [Google Drive files](#google-drive-files) |
 | `dht_status() -> DhtStatus` | the `dht` key of `GET /stats.json` -- see [DHT health](#dht-health-the-dht-key-on-statsjson) |
 | `set_background(background: bool)` / `is_background() -> bool` | no route -- the app's lifecycle hook. `true` puts the torrent session on a lean footprint: every torrent keeps running, with `LEAN_PEER_LIMIT` (8) peers instead of the configured limit (the surplus hung up) and its peer table pruned; nothing is paused and nothing on disk is touched. `false` restores the configured limit |
 | `background_traffic() -> Result<BackgroundTraffic>` | no route -- the one signal a client's "working in the background" indicator reads: `{active, downloading, uploading, playing, bytes_downloaded, bytes_uploaded, window_secs}`. See [Background activity](#background-activity) |
@@ -521,6 +524,31 @@ That includes a request that is already in flight. `/proxy` checks the token bef
 **And what it does not end.** A demuxer wedged on something *other* than the read -- a texture handoff, an audio device -- is not waiting on this and is unaffected; a wedged player still costs its own teardown deadline. A player that has stopped reading altogether is not polling the body either, so it observes the close when it next reads, or when it goes away.
 
 `ServerHandle::proxy_streams_live()` is the same registry counted: how many players are attached through `/proxy` right now.
+
+### Google Drive files
+
+A file in somebody's Google Drive, played the way an archive member is: a
+create that opens it and a stream that serves its bytes. What makes it a
+layer of its own rather than a `/proxy` URL is the credential -- Drive
+serves `files/{id}?alt=media` under an access token that lasts about an
+hour, and films do not. `sources::drive::DriveSource` is the file as a
+`ByteSource` and renews that token for itself against the embedder's
+pairing service (`ServerConfig::drive_refresh_endpoint`, where the OAuth
+client secret lives -- never on the device); `routes::drive` is the two
+routes.
+
+| | |
+|---|---|
+| **The create** | `POST /drive/create`, **TOKEN**. The refresh token is a field of the JSON body -- not a query parameter and not a path segment, because the request line is the half of a request that gets logged, by the tracing layer here, by whatever an embedder puts in front, and by the diagnostics report a viewer can copy. `/proxy`'s `h=Authorization:…` overrides ride in the path, so they are not reused; they are also the wrong shape, since what a Drive file needs is a *grant* spent for a new header every hour rather than a header value relayed verbatim |
+| **The stream** | `GET /drive/stream/{key}`, **OPEN**. A random key and nothing else: a player cannot send headers, so the URL handed to mpv has to work as it stands -- and this one is meaningless to anyone who was not given it and unchanged by the token rotating under it. Ranges, `206`/`416` and `HEAD` are `routes::util::MediaRange`, the same framing the torrent and archive routes answer with |
+| **A dead pairing** | `401` with `{"refused":"pairAgain"}`, at the create and at the stream, distinct from the `502` that "Google is having a moment" is. The grant is gone and only a new pairing brings it back, so a client that could not tell the two apart would show a spinner for something that will never finish. The sentence beside the kind is written in `sources::drive` and never echoed from the service's body |
+| **Where the origin comes from** | The server, not the caller. A caller who could name Drive's origin would have this server fetch an arbitrary host under a credential it renews and cache the answer under the vouch `DriveSource` makes -- the open-relay shape `/proxy` has and this deliberately does not. `ServerConfig::drive_api_base` exists for the tests' loopback fake and for nothing else |
+| **Caching** | `DriveSource` passes `Vouch::UrlIdentifiesBytes`: the file id names one file's content for everyone entitled to fetch it, so the cache key is the URL with no token in it. A backward seek inside what the cache still holds is a disk read rather than a round trip to Google |
+| **Not on the LAN** | `/drive/stream` is absent from `lan_media_routes()`. The bytes are one account's private file fetched with this device's grant, and the listener's rule is that a group is added by name before it serves one |
+
+An embedder asks through `ServerHandle::open_drive_file`, which shares the
+route's own function: the grant is an argument to a call inside this
+process, and what comes back is a URL carrying a key.
 
 ### LAN media listener
 

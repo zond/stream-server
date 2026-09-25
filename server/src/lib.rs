@@ -14,9 +14,16 @@ pub use enginefs::pretend_volume_space;
 pub use enginefs::{PIN_FREE_SPACE_MARGIN, PinDownloadError, UnpinOutcome};
 use futures_util::future::BoxFuture;
 pub use routes::downloads::DownloadInfo;
+// What `ServerHandle::open_drive_file` answers. Named here because `routes`
+// is private, so a type only reachable through it is one an embedder can
+// call the method but not write down the result of -- and `DriveError`
+// with them, because `DriveOpenError::Drive` carries one and an embedder
+// that cannot name it cannot construct or match the case that matters.
+pub use routes::drive::{DriveFileOpened, DriveOpenError};
 #[doc(hidden)]
 pub use routes::stream::{pretend_available_space, pretend_available_space_readings};
 pub use routes::system::{FileNotFound, ServerSettings, resolved_path};
+pub use sources::drive::DriveError;
 pub use state::AppState;
 use std::{
     future::IntoFuture,
@@ -226,6 +233,26 @@ pub struct ServerConfig {
     /// settings report goes on describing what the session actually does.
     /// Defaults to `true`; tests set it false.
     pub enable_local_service_discovery: bool,
+    /// Where this embedder's Google Drive pairing service is: the `POST`
+    /// that turns a refresh token into an access token, because the OAuth
+    /// client secret lives there and never on the device (see
+    /// `routes::drive` and `sources::drive`).
+    ///
+    /// `None` -- the default -- means `POST /drive/create` refuses with
+    /// `noPairingService` and nothing else changes. This repository ships
+    /// no such service and must not invent one: a wrong endpoint is a
+    /// refresh token posted to somebody else's host.
+    pub drive_refresh_endpoint: Option<url::Url>,
+    /// Where Drive itself is, for the pairing service above. `None` is
+    /// Google (`sources::drive::GOOGLE_DRIVE_API`), which is every shipped
+    /// build; a test points it at a loopback fake.
+    ///
+    /// `#[doc(hidden)]`-in-spirit and deliberately not a per-request
+    /// parameter: a caller who could name this origin would have the
+    /// server fetch an arbitrary host under a credential it renews, and
+    /// cache the answer under the vouch `DriveSource` makes. See
+    /// `routes::drive::DriveEndpoints`.
+    pub drive_api_base: Option<url::Url>,
 }
 
 /// The one configuration: a server inside a host process. There used to be a
@@ -247,6 +274,8 @@ impl Default for ServerConfig {
             resolve_dht_bootstrap_names: true,
             use_public_trackers: true,
             enable_local_service_discovery: true,
+            drive_refresh_endpoint: None,
+            drive_api_base: None,
         }
     }
 }
@@ -588,6 +617,42 @@ impl ServerHandle {
         let info_hash = info_hash.to_string();
         self.block_on_server(async move {
             routes::downloads::download_path(&state, &info_hash, file_idx).await
+        })
+    }
+
+    /// Open a file in a paired Google Drive and hand back a URL a player
+    /// can fetch -- exactly what `POST /drive/create` answers (see
+    /// `routes::drive::open_file`, which the route shares), with the
+    /// stream path made absolute on this server.
+    ///
+    /// **This is how an embedder asks, and why the credential never
+    /// becomes a request.** The refresh token is an argument to a function
+    /// call inside this process: it is not a query string, not a path
+    /// segment, not a header, and not a line anything logs. What comes
+    /// back is a URL carrying a random key, which is the whole of what the
+    /// player is told.
+    ///
+    /// A dead pairing is [`routes::drive::DriveOpenError::is_pair_again`]
+    /// -- terminal, and the one thing a caller must be able to tell
+    /// without reading English, because the answer to it is a new QR and
+    /// the answer to everything else is to try again.
+    pub fn open_drive_file(
+        &self,
+        file_id: &str,
+        refresh_token: &str,
+        name: Option<String>,
+    ) -> anyhow::Result<Result<routes::drive::DriveFileOpened, routes::drive::DriveOpenError>> {
+        let state = self.state.clone();
+        let base = self.state.base_url.trim_end_matches('/').to_string();
+        let file_id = file_id.to_string();
+        let refresh_token = refresh_token.to_string();
+        self.block_on_server(async move {
+            routes::drive::open_file(&state, &file_id, &refresh_token, name)
+                .await
+                .map(|opened| routes::drive::DriveFileOpened {
+                    url: format!("{base}{}", opened.url),
+                    ..opened
+                })
         })
     }
 
@@ -1272,6 +1337,16 @@ pub async fn run(
     state.http_addr = public_http_addr;
     state.auth_token = Some(Arc::from(cfg.auth.resolve()?));
     state.lan_media = Arc::new(lan_media::LanMedia::new(cfg.lan_media_addr));
+    // Where a Drive file's two services are, fixed at the server rather
+    // than named per request -- see `routes::drive::DriveEndpoints`. A
+    // build whose embedder named no pairing service keeps `None` and
+    // refuses a create; nothing else about it changes.
+    state.drive = cfg.drive_refresh_endpoint.clone().map(|refresh| {
+        Arc::new(match cfg.drive_api_base.clone() {
+            Some(api_base) => routes::drive::DriveEndpoints::against(refresh, api_base),
+            None => routes::drive::DriveEndpoints::at(refresh),
+        })
+    });
     // The token is a secret and must never reach `tracing`: the log files
     // would keep it, and the kept launches' archives with them. An embedder
     // reads `ServerHandle::auth_token` instead. The deleted daemon printed it
@@ -1403,10 +1478,16 @@ pub async fn run(
         // sessions get the rule the map itself does not hold: a session
         // stays while its own container is what is playing, and a lease
         // out on one outranks that (`translators::session`).
+        // And the Drive files, which are the same kind of session over one
+        // file instead of a container and take the same rule: the file
+        // that is playing stays, a body reading one outranks the rule, and
+        // a session that goes takes its credential with it.
         let sessions = {
             let translated = state.translated_archives.clone();
+            let drive = state.drive_files.clone();
             move |reading: &enginefs::retention::live::Reading| {
                 translated.retain(|session| session.is_live(reading));
+                drive.retain(|session| session.is_live(reading));
             }
         };
         tokio::spawn(drop_slack_on_switch_and_bell(
@@ -1869,6 +1950,11 @@ fn media_router() -> Router<AppState> {
         .merge(archive_routes())
         .merge(routes::proxy::router())
         .nest("/ftp", routes::ftp::router())
+        // The byte-serving half of the Drive API, and only that half: the
+        // create is a control route because its body carries the account's
+        // grant (`routes::drive`). This URL carries a random key and no
+        // credential, which is what lets a player fetch it.
+        .merge(routes::drive::stream_routes())
         .merge(local_addon_routes())
 }
 
@@ -1935,6 +2021,13 @@ fn control_router() -> Router<AppState> {
                 // rather than one that judges the file.
                 .layer(axum::extract::DefaultBodyLimit::max(MAX_CREATE_BODY)),
         )
+        // The create half of the Drive API. **Control, and for the one
+        // reason**: its body carries the account's refresh token, which is
+        // a live credential to somebody's Drive -- so it wants the bearer
+        // like every other control route, and the token stays in a body
+        // that nothing logs rather than in a path that everything does.
+        // See `routes::drive`.
+        .merge(routes::drive::create_routes())
         .route("/{infoHash}/create", post(routes::engine::create_magnet))
         .route(
             "/{infoHash}/stats.json",
