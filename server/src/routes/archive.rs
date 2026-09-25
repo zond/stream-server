@@ -142,7 +142,16 @@ fn source_error_response(error: &ProxySourceError) -> Response {
             Json(serde_json::json!({ "error": error.to_string() })),
         )
             .into_response(),
-        ProxySourceError::Origin(_) | ProxySourceError::Fetch(_) => (
+        // `Credentials` cannot arise on this route -- a `/{fmt}/create`
+        // relays the caller's own `h=`, which is a value and not a grant
+        // to renew -- and it is answered rather than `unreachable!()`d,
+        // because the arm that says "this cannot happen" is how a later
+        // source that mints its own header gets a panic instead of a
+        // status. A `502` is right for it either way: the far end would
+        // not authorise us.
+        ProxySourceError::Origin(_)
+        | ProxySourceError::Fetch(_)
+        | ProxySourceError::Credentials(_) => (
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({ "error": error.to_string() })),
         )
@@ -480,7 +489,10 @@ async fn create_translated(
                     state.proxy_cache.clone(),
                     state.http_addr,
                     parsed,
-                    Default::default(),
+                    // No `h=` of any kind on this route yet; the caller's
+                    // headers are what would go here, which is what makes
+                    // these reads the relay the cache refuses to key on.
+                    std::collections::BTreeMap::new(),
                 )
                 .await
                 {

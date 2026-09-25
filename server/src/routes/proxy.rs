@@ -310,7 +310,17 @@ fn is_a_playlist(
             && !cannot_be_a_playlist(origin_content_type))
 }
 
-fn http_client() -> Option<&'static Client> {
+/// The process's one outbound HTTP client, on this workspace's own trust
+/// roots (`enginefs::http_client_builder`) and no platform verifier.
+///
+/// `pub(crate)` for a second caller: `crate::sources::drive`, whose token
+/// refresh is an ordinary HTTPS `POST` and has no business standing up a
+/// client of its own -- a second one would be a second answer to what this
+/// process trusts, which is the thing `http_client_builder`'s docs are
+/// about. It inherits `Policy::none()`, which is right for a refresh: the
+/// endpoint is a constant this server was handed, and a redirect away from
+/// it is not somewhere a refresh token follows.
+pub(crate) fn http_client() -> Option<&'static Client> {
     HTTP_CLIENT
         .get_or_init(|| {
             enginefs::http_client_builder()

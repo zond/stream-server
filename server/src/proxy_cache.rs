@@ -127,7 +127,12 @@
 //!   fetch the player had asked for regardless.
 //! * **No `Vary`.** The key is fixed (below); the header is not read.
 //! * **No credentialed responses at all.** Not "keyed carefully" -- refused,
-//!   in [`ProxyCache::entry`].
+//!   in [`ProxyCache::entry`]. The one exception is not a relaxation of that
+//!   rule but a different question asked somewhere else: a source whose
+//!   *constructor* vouches that its URL identifies the bytes is keyed on the
+//!   URL alone, with no credential anywhere in it
+//!   ([`ProxyCache::entry_for_vouched_url`], where what that costs is
+//!   written out). `/proxy` has nobody to vouch for it and is still refused.
 //! * **No coalescing.** Two players filling the same missing chunk both fetch
 //!   it.
 //! * **Nothing is kept of the chunk a fetch starts inside.** Only whole
@@ -535,6 +540,102 @@ impl ProxyCache {
                 field(value.as_bytes());
             }
         }
+        Some(Entry {
+            dir: self.root.join(hex::encode(hash.finalize())),
+            retention: self.retention.clone(),
+            work: self.work.clone(),
+            floor: self.floor.clone(),
+            target: url.as_str().into(),
+        })
+    }
+
+    /// The entry for a URL **somebody has vouched for**: a read whose
+    /// authorisation is a credential, kept anyway, because the thing that
+    /// built the source asserted that the URL identifies the bytes.
+    ///
+    /// # What this is not
+    ///
+    /// It does not relax [`Self::entry`], and nothing should. `/proxy`
+    /// still refuses a credentialed target outright, for the reason
+    /// written there: the route is handed a URL and a header by a caller
+    /// it cannot interpret, and keying on a credential it cannot read is a
+    /// guess. Refusing is structural where keying is careful. A bare
+    /// `/proxy` request has nobody to vouch for it and stays refused.
+    ///
+    /// # What it is
+    ///
+    /// The same question, moved somewhere that can answer it. `/proxy`
+    /// can only ask *"does this request carry a credential?"*, which is
+    /// the wrong question -- it is about the request, when what a key
+    /// needs to know is about the bytes. The constructor of a source can
+    /// ask the right one: *"does this URL identify the content I am about
+    /// to get back?"* For `crate::sources::DriveSource` the answer is yes
+    /// and it is checkable: `files/{id}?alt=media` is the same file for
+    /// everyone entitled to it, so the id names the content, and the
+    /// credential authorises the *fetch* without determining the *result*.
+    ///
+    /// **No token is in this key**, which is the whole reason the
+    /// exception is worth having: an access token rotates hourly, so a key
+    /// with one in it is never hit twice -- not a cache, an empty
+    /// directory tree with a sweep over it. Nor is a fingerprint of the
+    /// grant, which would be a per-account key and is not what was
+    /// decided; see below.
+    ///
+    /// The vouch is an assertion the *caller* makes (`sources::proxy::Vouch`),
+    /// deliberately, so no source acquires caching by accident: a source
+    /// that mints its own header and says nothing is read and never kept.
+    ///
+    /// # What the owner has accepted, knowingly
+    ///
+    /// The key has no credential in it, so **anything that can reach this
+    /// server and name the same URL reads these bytes out of the store
+    /// without being authorised for them.** That is a real consequence and
+    /// not an oversight. What bounds it is where this server listens: the
+    /// HTTP listener is loopback (`Ipv4Addr::LOCALHOST` at boot) and the
+    /// LAN listener is the cast receiver's narrow allow-list with no
+    /// `/create` on it, so "anything that can reach it" means another app
+    /// on this same device -- not the network, and not another household.
+    /// The owner has weighed that against a television re-fetching every
+    /// backward seek over domestic wifi and chosen this. A change that
+    /// widens what the loopback router serves is a change that has to
+    /// revisit this paragraph.
+    ///
+    /// # What is still guarded
+    ///
+    /// The file changing underneath is not this key's job and is not left
+    /// open: the entity directory *under* the key is named for the
+    /// origin's own validator, a fill that finds a different one drops
+    /// what was held of the old generation ([`remove_other_entities`]),
+    /// and an origin that names no validator at all is read and never kept
+    /// (`routes::proxy::cacheable_entity`). A vouch is about identity, and
+    /// the validator is about generation; the two are separate and both
+    /// are needed.
+    ///
+    /// `None` for this server's own listener, for the same budget reason
+    /// [`Self::entry`] refuses one: no key this cache mints may name bytes
+    /// the engine is already storing under the same cap. Nothing builds
+    /// such a URL today -- the API host is a constant -- which is exactly
+    /// why the check is cheap to keep.
+    pub(crate) fn entry_for_vouched_url(
+        &self,
+        url: &Url,
+        self_addr: std::net::SocketAddr,
+    ) -> Option<Entry> {
+        if names_this_server(url, self_addr) {
+            return None;
+        }
+        let mut hash = Sha256::new();
+        let mut field = |bytes: &[u8]| {
+            hash.update((bytes.len() as u64).to_le_bytes());
+            hash.update(bytes);
+        };
+        // A domain tag, first and always. No `h=` key begins with this
+        // field, so a vouched key can never collide with a relayed one
+        // however either is spelled -- which matters in the one direction
+        // that would hurt: a `/proxy` caller must not be able to name a
+        // URL that lands on a directory filled under somebody's grant.
+        field(b"vouched-url");
+        field(url.as_str().as_bytes());
         Some(Entry {
             dir: self.root.join(hex::encode(hash.finalize())),
             retention: self.retention.clone(),
@@ -1656,6 +1757,91 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **A vouched key is a different directory from every `/proxy` key for
+    /// the same URL**, and that is the whole of what the domain tag is for.
+    ///
+    /// The refusal above stays: `/proxy` cannot cache a credentialed
+    /// request. What the vouched door adds is a store filled under
+    /// somebody's grant, and the one thing that must not be possible is a
+    /// caller reaching it by naming the URL through the route -- so the two
+    /// namespaces are separated by a field no `h=` key begins with, rather
+    /// than by whatever the hash happens to do.
+    #[test]
+    fn a_vouched_key_is_not_a_key_any_proxy_request_can_name() {
+        let (_root, cache) = cache();
+        let target = url("https://www.googleapis.com/drive/v3/files/abc?alt=media");
+        let vouched = cache
+            .entry_for_vouched_url(&target, SELF_ADDR)
+            .expect("a target that is not this server");
+
+        // The plainest `/proxy` request for the same URL, and the same with
+        // every forwarded header a player can send: none of them lands on
+        // the vouched directory.
+        let mut relayed = vec![
+            cache
+                .entry(
+                    &Method::GET,
+                    &target,
+                    &BTreeMap::new(),
+                    &HeaderMap::new(),
+                    SELF_ADDR,
+                )
+                .expect("an uncredentialed relay"),
+        ];
+        for name in crate::routes::proxy::FORWARDED_REQUEST_HEADERS {
+            if let Some(entry) = cache.entry(
+                &Method::GET,
+                &target,
+                &BTreeMap::new(),
+                &header(name, "anything"),
+                SELF_ADDR,
+            ) {
+                relayed.push(entry);
+            }
+        }
+        for entry in &relayed {
+            assert_ne!(
+                key_of(&cache, entry),
+                key_of(&cache, &vouched),
+                "a /proxy request named the directory a grant filled"
+            );
+        }
+
+        // And the vouched key is the URL and nothing else: stable, so the
+        // hourly token rotation cannot move it, and shared, which is the
+        // consequence written out at `entry_for_vouched_url`.
+        assert_eq!(
+            key_of(&cache, &vouched),
+            key_of(
+                &cache,
+                &cache
+                    .entry_for_vouched_url(&target, SELF_ADDR)
+                    .expect("the same target again")
+            )
+        );
+        assert_ne!(
+            key_of(&cache, &vouched),
+            key_of(
+                &cache,
+                &cache
+                    .entry_for_vouched_url(
+                        &url("https://www.googleapis.com/drive/v3/files/xyz?alt=media"),
+                        SELF_ADDR
+                    )
+                    .expect("another file")
+            ),
+            "two file ids are one directory"
+        );
+
+        // This server's own listener is refused here too: no key this cache
+        // mints may name bytes the engine already stores under the same cap.
+        assert!(
+            cache
+                .entry_for_vouched_url(&url(&format!("http://{SELF_ADDR}/stream")), SELF_ADDR)
+                .is_none()
+        );
     }
 
     #[test]

@@ -15,11 +15,15 @@
 //! exists to prevent; the refusal has a sentence the player can show
 //! ([`ProxySourceError`]).
 //!
-//! Credentials travel as they already do: `h=` request headers, which the
-//! proxy cache refuses to key on at all (so a credentialed target is read
-//! without a cache rather than into a store another caller could name),
-//! and which reach no log -- [`ByteSource::describe`] is the target's
-//! origin and nothing else.
+//! Credentials travel one of two ways ([`Credentials`]): the caller's own
+//! `h=` request headers, relayed as `/proxy` relays them, or a header this
+//! server mints per request out of a grant only it holds -- which is what
+//! a credential that expires halfway through a film has to be. Whether
+//! either read is *kept* is a third thing and not a property of the
+//! header: the proxy cache refuses every credentialed request, and the one
+//! way past that is a [`Vouch`] from the source's own constructor that its
+//! URL identifies the bytes. Neither credential reaches a log --
+//! [`ByteSource::describe`] is the target's origin and nothing else.
 
 use super::{ByteSource, ReadHint, SeekableReader, read_filling};
 use crate::routes::proxy::{
@@ -46,6 +50,11 @@ pub enum ProxySourceError {
     Origin(StatusCode),
     /// It could not be reached at all.
     Fetch(String),
+    /// The headers this read was to go out with could not be minted at
+    /// all: the grant behind them ([`Credentials::Own`]) is not usable.
+    /// The error is the grant's own and carries its own typed reason --
+    /// `DriveError::in_read` is how a caller gets it back.
+    Credentials(io::Error),
 }
 
 impl std::fmt::Display for ProxySourceError {
@@ -58,6 +67,9 @@ impl std::fmt::Display for ProxySourceError {
             ),
             Self::Origin(status) => write!(f, "this link's host answered {status}"),
             Self::Fetch(error) => write!(f, "this link's host could not be reached: {error}"),
+            Self::Credentials(error) => {
+                write!(f, "this link could not be authorised: {error}")
+            }
         }
     }
 }
@@ -68,6 +80,106 @@ impl From<FetchFailure> for ProxySourceError {
     fn from(failure: FetchFailure) -> Self {
         Self::Fetch(failure.into_io_error().to_string())
     }
+}
+
+/// **Where a source's request headers come from.**
+///
+/// A source built before this existed took a `BTreeMap` and nothing else,
+/// which is [`Self::Caller`] -- and which cannot hold a credential that
+/// expires, since the map is fixed at construction and a film is longer
+/// than an access token. [`Self::Own`] is the other half the design asked
+/// for (`docs/translated-sources.md`: "a `ProxySource` with a header
+/// supplier that refreshes").
+pub(crate) enum Credentials {
+    /// The `h=` overrides **the caller named**, relayed to the origin
+    /// exactly as `/proxy` relays them. Keyed by
+    /// [`crate::proxy_cache::ProxyCache::entry`], which refuses outright
+    /// when one of them is a credential. The route is handed a URL and a
+    /// header by a caller it cannot interpret, and there is nobody to say
+    /// what the bytes behind them are.
+    Caller(BTreeMap<String, String>),
+    /// Headers this server **mints itself**, per request, out of a grant
+    /// only it holds.
+    Own {
+        grant: Arc<dyn OwnGrant>,
+        /// What the source's constructor is willing to say about its URL,
+        /// which is the only thing that can make one of these reads a
+        /// cached one. See [`Vouch`].
+        vouch: Vouch,
+    },
+}
+
+/// **Whether whoever built this source vouches that its URL identifies the
+/// bytes**, which is what decides whether a credentialed read may be kept.
+///
+/// The proxy cache refuses every credentialed request because the question
+/// it is in a position to ask -- *"does this request carry a
+/// credential?"* -- is the wrong one: it is about the request, and a key
+/// needs to know about the bytes. The constructor of a source can ask the
+/// right one, *"does this URL identify the content I am about to get
+/// back?"*, and this type is where it answers. [`super::DriveSource`]
+/// answers [`Self::UrlIdentifiesBytes`] because `files/{id}?alt=media` is
+/// the same file for everyone entitled to it: the credential authorises
+/// the fetch and does not determine the result.
+///
+/// **A value that has to be passed, not a trait method that could be
+/// defaulted**, so that a source added later gets caching only by saying
+/// so in as many words. Saying nothing is [`Self::Unvouched`] and the
+/// reads are never kept -- the safe direction, and the one a mistake falls
+/// in.
+///
+/// What a vouch costs is written where the key is minted
+/// ([`crate::proxy_cache::ProxyCache::entry_for_vouched_url`]), and it is
+/// not nothing: the key holds no credential, so anything that reaches this
+/// server and names the same URL reads those bytes without being
+/// authorised for them. Bounded by this server being loopback-only, and
+/// knowingly accepted. Do not vouch for a URL without reading that.
+#[derive(Clone, Copy)]
+pub(crate) enum Vouch {
+    /// Nobody said anything. Read, never kept.
+    ///
+    /// `allow(dead_code)` and not a deletion: **no shipped source is
+    /// unvouched today**, and this variant is the reason a later one has to
+    /// think about it. Without it `Credentials::Own` would be
+    /// self-vouching, which is precisely the accident this type exists to
+    /// prevent -- a source that mints a header would get a cache directory
+    /// by existing. It is constructed in the tests, where the claim that
+    /// an unvouched grant is not cached is made.
+    #[allow(dead_code)]
+    Unvouched,
+    /// The URL names the content, whoever is entitled to fetch it.
+    /// `vouched_by` is the source that said so. It is deliberately **not**
+    /// in the key -- two vouchers for one URL mean one set of bytes, and
+    /// keying on the name would fragment the store for nothing -- and is
+    /// carried so that a fill under a credentialed read can say in a trace
+    /// who licensed the keeping.
+    UrlIdentifiesBytes { vouched_by: &'static str },
+}
+
+impl From<BTreeMap<String, String>> for Credentials {
+    fn from(request_headers: BTreeMap<String, String>) -> Self {
+        Self::Caller(request_headers)
+    }
+}
+
+/// An authority this server holds and renews, asked for headers once per
+/// request.
+///
+/// **Once per request is the whole point.** A token that expires halfway
+/// through a film cannot be a value captured at construction, and the
+/// renewal has to happen on this side of the FFI boundary -- a device
+/// whose frame budget is already tight must not go into Dart to find out
+/// what its next `Authorization` is.
+#[async_trait::async_trait]
+pub(crate) trait OwnGrant: Send + Sync {
+    /// The headers one read goes out with, valid now. An implementation
+    /// renews *before* returning a token that is about to bite, so a read
+    /// never carries one the origin is going to reject.
+    ///
+    /// The error is typed underneath: `io::Error::other(..)` over the
+    /// grant's own error, so a caller can downcast the terminal case out
+    /// of a failed read rather than matching on a sentence.
+    async fn headers(&self) -> io::Result<BTreeMap<String, String>>;
 }
 
 /// One HTTP entity, read by range through the proxy cache.
@@ -89,10 +201,12 @@ struct Entity {
     /// machine is not us. See `ProxyCache::entry`.
     self_addr: SocketAddr,
     url: Url,
-    /// The `h=` overrides, as the proxy carries them. Never logged, and
-    /// never keyed on: a credential among them is what makes
-    /// [`Self::entry`] `None`, so a credentialed read is an uncached one.
-    request_headers: BTreeMap<String, String>,
+    /// Where each read's request headers come from, and never logged
+    /// whichever it is. A credential among a caller's `h=` is what makes
+    /// [`Self::entry`] `None` -- so a *relayed* credentialed read is an
+    /// uncached one -- while a grant of this server's own is keyed by its
+    /// scope. See [`Credentials`].
+    credentials: Credentials,
     total: u64,
     content_type: String,
     /// How the origin identified the entity, as the store files it.
@@ -126,8 +240,13 @@ impl ProxySource {
         cache: Arc<crate::proxy_cache::ProxyCache>,
         self_addr: SocketAddr,
         url: Url,
-        request_headers: BTreeMap<String, String>,
+        credentials: impl Into<Credentials>,
     ) -> Result<Self, ProxySourceError> {
+        let credentials = credentials.into();
+        let request_headers = credentials
+            .headers()
+            .await
+            .map_err(ProxySourceError::Credentials)?;
         let mut probe = HeaderMap::new();
         probe.insert(header::RANGE, HeaderValue::from_static("bytes=0-0"));
         let answer =
@@ -154,13 +273,28 @@ impl ProxySource {
                 ProxySourceError::Origin(status)
             });
         };
+        if let Credentials::Own {
+            vouch: Vouch::UrlIdentifiesBytes { vouched_by },
+            ..
+        } = &credentials
+        {
+            // The one line that says a credentialed read is being kept and
+            // who licensed it. The origin and the voucher's name, which is
+            // all there is here that is not a secret.
+            tracing::debug!(
+                origin = %crate::routes::util::log_origin(url.as_str()),
+                vouched_by,
+                validator = entity.validator.is_some(),
+                "an authorised read is cached under its URL"
+            );
+        }
         Ok(Self {
             entity: Arc::new(Entity {
                 cache,
                 self_addr,
                 describe: crate::routes::util::log_origin(url.as_str()),
                 url,
-                request_headers,
+                credentials,
                 total: entity.total,
                 content_type: entity.content_type,
                 validator: entity.validator,
@@ -181,11 +315,25 @@ impl ProxySource {
     }
 }
 
+impl Credentials {
+    /// The headers this read goes out with. A caller's `h=` is a value
+    /// and answers at once; a grant of our own is asked, which is where a
+    /// renewal happens.
+    async fn headers(&self) -> io::Result<BTreeMap<String, String>> {
+        match self {
+            Self::Caller(headers) => Ok(headers.clone()),
+            Self::Own { grant, .. } => grant.headers().await,
+        }
+    }
+}
+
 impl Entity {
-    /// The cache entry these reads go through: **the very same one
-    /// `/proxy` would use for this URL and these `h=` headers**, because it
-    /// is the same call. `None` for a target the cache will not touch --
-    /// a credentialed one, or this server's own listener.
+    /// The cache entry these reads go through.
+    ///
+    /// For a caller's `h=`: **the very same entry `/proxy` would use for
+    /// this URL and these headers**, because it is the same call. `None`
+    /// for a target the cache will not touch -- a credentialed relay, or
+    /// this server's own listener.
     ///
     /// The player headers are empty, and that is the whole of the
     /// difference from a request a player makes: `accept`,
@@ -193,14 +341,32 @@ impl Entity {
     /// keyed on, so a source reading with none of them reads the entity a
     /// request with none of them would. `Range` is not keyed on either
     /// way.
+    ///
+    /// For a grant of our own: an entry on the URL alone, and only when
+    /// the source's constructor vouched that the URL identifies the bytes
+    /// ([`Vouch`]). The minted header is not in that key and could not
+    /// usefully be -- it changes every hour, so a key with the token in it
+    /// is a key that is never hit twice, which is not a cache but an empty
+    /// directory tree with a sweep over it. An unvouched grant is `None`:
+    /// the reads go out, and nothing of them is kept.
     fn entry(&self) -> Option<crate::proxy_cache::Entry> {
-        self.cache.entry(
-            &Method::GET,
-            &self.url,
-            &self.request_headers,
-            &HeaderMap::new(),
-            self.self_addr,
-        )
+        match &self.credentials {
+            Credentials::Caller(request_headers) => self.cache.entry(
+                &Method::GET,
+                &self.url,
+                request_headers,
+                &HeaderMap::new(),
+                self.self_addr,
+            ),
+            Credentials::Own {
+                vouch: Vouch::UrlIdentifiesBytes { .. },
+                ..
+            } => self.cache.entry_for_vouched_url(&self.url, self.self_addr),
+            Credentials::Own {
+                vouch: Vouch::Unvouched,
+                ..
+            } => None,
+        }
     }
 
     /// The bytes `first..=last` of the entity: the cache's where it holds
@@ -213,12 +379,19 @@ impl Entity {
             HeaderValue::from_str(&format!("bytes={first}-{last}"))
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?,
         );
+        // Minted here, immediately before the request, and *not* held on
+        // the source: this is the instant a grant that is about to expire
+        // renews, so that no request carries a token the origin will
+        // refuse. A read already streaming carries the token it left with
+        // and is untouched -- a response Google has begun framing is not
+        // re-authorised mid-body.
+        let request_headers = self.credentials.headers().await?;
         let answer = cache_assisted_range(
             self.entry(),
             &Method::GET,
             &self.url,
             &headers,
-            &self.request_headers,
+            &request_headers,
             None,
         )
         .await
@@ -270,7 +443,7 @@ impl ByteSource for ProxySource {
     /// entity is one generation of the resource, and a container indexed
     /// from a link is still the same container after the origin has
     /// revalidated it (`Reading::proxy_under`). A target the cache will
-    /// not touch -- a credentialed one, this server's own listener -- has
+    /// not touch -- a credentialed relay, this server's own listener -- has
     /// no key, and nothing the cell can name; it reads every time as
     /// "not playing", which is correct, since nothing here retains a byte
     /// of it either.
