@@ -79,12 +79,15 @@ fn spawn_stream_progress_log(
                 phase = ?stats.phase,
                 download_speed = stats.download_speed,
                 peers = stats.peers,
-                // Addresses known and dials made: a slow start with few
-                // peers is either nothing found or nothing answering, and
-                // these two say which.
+                // Addresses queued, being dialled, seen and known against
+                // the peers connected: a slow start with few peers is
+                // either nothing found or nothing answering, and these say
+                // which. (`connection_tries` used to be here; the backend
+                // never counted it, so it read 0 on every line.)
                 queued = stats.queued,
+                connecting = stats.peer_discovery.connecting,
                 unique = stats.unique,
-                connection_tries = stats.connection_tries,
+                known = stats.peer_discovery.known,
                 connected_seeders = stats.connected_seeders,
                 swarm_seeders = stats.swarm_seeders,
                 initial_window_ready_bytes = stats.initial_window_ready_bytes,

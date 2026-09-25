@@ -13,7 +13,9 @@ use axum::{
 use enginefs::backend::{EngineStats, StartupPhase, TorrentHandle};
 use enginefs::{PinDownloadError, UnpinOutcome};
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 /// One pinned download as the routes and `ServerHandle` report it.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -86,6 +88,13 @@ pub async fn pin_download(
             file_idx,
             file_count: stats.files.len(),
         })?;
+    if !file.complete {
+        spawn_download_progress_log(
+            Arc::clone(&state.engine),
+            engine.info_hash.clone(),
+            file_idx,
+        );
+    }
     Ok(DownloadInfo {
         info_hash: engine.info_hash.clone(),
         file_idx,
@@ -97,6 +106,168 @@ pub async fn pin_download(
         phase: stats.phase,
         error: stats.error.clone(),
     })
+}
+
+/// How often a pinned download that is not finished says where it stands.
+///
+/// A stream logs `stream progress` every five seconds while a player is
+/// reading; a pin had no line at all after `download_pinned`, so a download
+/// that had stopped moving looked exactly like one nobody had asked to move
+/// -- a file that sat at 54 % for ten minutes with no peer connected was
+/// diagnosed from `/proc/net/tcp`. Ten seconds rather than five: nothing is
+/// waiting on this line, and a download runs for the length of a film.
+const DOWNLOAD_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The files with a progress logger running, so that a second pin of the
+/// same file -- a retry, the boot's re-pin of an unfinished download -- adds
+/// no second line every ten seconds. A slot is taken before the task is
+/// spawned and given back when the task ends ([`LoggerSlot`]).
+fn progress_loggers() -> &'static Mutex<HashSet<(String, usize)>> {
+    static LOGGERS: OnceLock<Mutex<HashSet<(String, usize)>>> = OnceLock::new();
+    LOGGERS.get_or_init(Default::default)
+}
+
+/// Takes `key`'s slot in [`progress_loggers`], or answers `None` when a
+/// logger already holds it. The slot is released when the value drops.
+fn claim_progress_logger(key: (String, usize)) -> Option<LoggerSlot> {
+    // The guard is dropped before any `LoggerSlot` exists: a slot's drop
+    // takes the same lock, and an eager `then_some` here built one for a
+    // refused claim too -- dropped under the guard (a deadlock) and
+    // removing the holder's key with it.
+    let claimed = progress_loggers()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key.clone());
+    claimed.then(|| LoggerSlot(key))
+}
+
+struct LoggerSlot((String, usize));
+
+impl Drop for LoggerSlot {
+    fn drop(&mut self) {
+        progress_loggers()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.0);
+    }
+}
+
+/// Bytes moved since the previous reading, and how many readings in a row
+/// moved nothing: the two numbers that tell a download that is slow from
+/// one that has stopped.
+#[derive(Debug, Default)]
+struct ProgressTrack {
+    last: Option<u64>,
+    still: u32,
+}
+
+impl ProgressTrack {
+    /// Answers `(moved, still)`: bytes since the previous reading -- 0 on
+    /// the first, which measures nothing -- and the consecutive readings,
+    /// this one included, that moved nothing. A count that went *down* (a
+    /// piece dropped, a re-check) is not movement either.
+    fn observe(&mut self, downloaded: u64) -> (u64, u32) {
+        let moved = self.last.map_or(0, |last| downloaded.saturating_sub(last));
+        self.still = match self.last {
+            Some(_) if moved == 0 => self.still + 1,
+            _ => 0,
+        };
+        self.last = Some(downloaded);
+        (moved, self.still)
+    }
+}
+
+/// One `download progress` line every [`DOWNLOAD_PROGRESS_LOG_INTERVAL`]
+/// for `file_idx` of `info_hash`, until the file is complete, the pin is
+/// gone or the torrent has left the session -- each of which is said in a
+/// last line. Every field the stream line carries and the ones a stall is
+/// argued from: bytes moved since the last line, how long nothing has
+/// moved, the peers connected against the addresses queued, dialling and
+/// known, and the torrent's run state, so "stopped" and "nobody answers"
+/// read differently.
+fn spawn_download_progress_log(
+    engine: Arc<enginefs::EngineFS>,
+    info_hash: String,
+    file_idx: usize,
+) {
+    let Some(slot) = claim_progress_logger((info_hash.clone(), file_idx)) else {
+        return;
+    };
+    tokio::spawn(async move {
+        let _slot = slot;
+        let mut ticker = tokio::time::interval(DOWNLOAD_PROGRESS_LOG_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick is immediate, and `download_pinned` has just said
+        // everything there is to say.
+        ticker.tick().await;
+        let mut track = ProgressTrack::default();
+        loop {
+            ticker.tick().await;
+            let Some(engine) = engine.peek_engine(&info_hash).await else {
+                tracing::info!(
+                    info_hash = %info_hash,
+                    file_idx,
+                    stage = "download_progress",
+                    "download progress: the torrent has left the session"
+                );
+                return;
+            };
+            if !engine.pinned_file_indices().contains(&file_idx) {
+                tracing::info!(
+                    info_hash = %info_hash,
+                    file_idx,
+                    stage = "download_progress",
+                    "download progress: the file is no longer pinned"
+                );
+                return;
+            }
+            let stats = engine.get_statistics().await;
+            let Some(file) = stats.files.get(file_idx) else {
+                // No file list right now (a hash check in progress, a
+                // torrent the session has not brought back): nothing to
+                // measure, and the next tick asks again.
+                tracing::debug!(
+                    info_hash = %info_hash,
+                    file_idx,
+                    phase = ?stats.phase,
+                    "download progress: no file list to read"
+                );
+                continue;
+            };
+            let (moved, still) = track.observe(file.downloaded);
+            tracing::info!(
+                info_hash = %info_hash,
+                file_idx,
+                run_state = ?engine.handle.run_state(),
+                phase = ?stats.phase,
+                downloaded = file.downloaded,
+                length = file.length,
+                moved,
+                still_secs = u64::from(still) * DOWNLOAD_PROGRESS_LOG_INTERVAL.as_secs(),
+                download_speed = stats.download_speed,
+                peers = stats.peers,
+                connected_seeders = stats.connected_seeders,
+                queued = stats.queued,
+                connecting = stats.peer_discovery.connecting,
+                unique = stats.unique,
+                known = stats.peer_discovery.known,
+                swarm_seeders = stats.swarm_seeders,
+                error = stats.error.as_deref().unwrap_or(""),
+                stage = "download_progress",
+                "download progress"
+            );
+            if file.complete {
+                tracing::info!(
+                    info_hash = %info_hash,
+                    file_idx,
+                    length = file.length,
+                    stage = "download_progress",
+                    "download complete"
+                );
+                return;
+            }
+        }
+    });
 }
 
 /// Drop the pin on `file_idx` of `info_hash`, exactly what
@@ -318,9 +489,51 @@ pub async fn get_downloads(State(state): State<AppState>) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{PinRequest, download_failure};
+    use super::{PinRequest, ProgressTrack, claim_progress_logger, download_failure};
     use axum::http::StatusCode;
     use enginefs::PinDownloadError;
+
+    /// The line's two stall fields: a first reading measures nothing,
+    /// movement resets the count, and a count that fell is not movement.
+    #[test]
+    fn progress_track_tells_slow_from_stopped() {
+        let mut track = ProgressTrack::default();
+        assert_eq!(
+            track.observe(100),
+            (0, 0),
+            "a first reading measures nothing"
+        );
+        assert_eq!(track.observe(100), (0, 1));
+        assert_eq!(track.observe(100), (0, 2));
+        assert_eq!(track.observe(160), (60, 0), "movement resets the count");
+        assert_eq!(
+            track.observe(150),
+            (0, 1),
+            "a count that fell is not movement"
+        );
+        assert_eq!(track.observe(151), (1, 0));
+    }
+
+    /// A retry or the boot's re-pin of a file already being logged adds no
+    /// second logger; once the first ends the slot is free again.
+    #[test]
+    fn one_progress_logger_per_file() {
+        let key = ("one_progress_logger_per_file".to_owned(), 3);
+        let first = claim_progress_logger(key.clone()).expect("a free slot is claimed");
+        assert!(
+            claim_progress_logger(key.clone()).is_none(),
+            "the same file is not logged twice over"
+        );
+        assert!(
+            claim_progress_logger((key.0.clone(), 4)).is_some(),
+            "another file of the torrent is its own logger"
+        );
+        drop(first);
+        assert!(
+            claim_progress_logger(key).is_some(),
+            "the slot is given back"
+        );
+    }
 
     /// A full disk is a 507 the client can act on, a bad index a 404, and a
     /// backend refusal a 500 whose body never carries the librqbit error
