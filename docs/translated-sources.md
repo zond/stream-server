@@ -156,6 +156,34 @@ with the addon's OAuth header, which is a `ProxySource` with a header
 supplier that refreshes), `SmbSource`, `NfsSource`. That they are the same
 seam is the point of having it.
 
+**`DriveSource` is built** (2026-09-25, `server/src/sources/drive.rs`), and
+it is that shape exactly: a `ProxySource` whose headers come from a
+`Credentials::Own` supplier rather than a fixed map. Two things it settled
+that the sentence above did not anticipate, both of which the next cloud
+source inherits:
+
+* **The refresh is in Rust and it is serialised.** An access token lasts
+  about an hour and a film does not, so the header is minted per request,
+  renewed a minute before it expires rather than after a `401`, and renewed
+  once however many reads meet the expiry together. A dead pairing
+  (`invalid_grant` -> `pairAgain`) is a typed terminal error and is never
+  retried, so the app shows a QR rather than a spinner. Nothing crosses FFI
+  to do any of it.
+* **A credentialed read can be cached, but only on a vouch.** The proxy
+  cache still refuses every credentialed request -- `ProxyCache::entry` is
+  unchanged -- because the question it can ask ("does this carry a
+  credential?") is about the request when a key needs to know about the
+  bytes. The question a *source's constructor* can ask is the right one
+  ("does this URL identify the content?"), and `sources::proxy::Vouch` is
+  where it answers: a Drive file id names one file for everyone entitled to
+  it, so the credential authorises the fetch without determining the
+  result, and the key is the URL with no token in it and nothing that
+  churns hourly. The consequence -- an entry made with authorisation can be
+  read without it, by anything on this device that names the same URL -- is
+  bounded by the server being loopback-only and was accepted knowingly; it
+  is written out at `ProxyCache::entry_for_vouched_url`, which is where a
+  later source has to read it before vouching for anything.
+
 ### 2.2 `Translator`: what a container says about the bytes inside it
 
 ```rust

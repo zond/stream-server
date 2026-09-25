@@ -20,8 +20,11 @@
 //! * [`MemberView`] -- several extents of several sources as one file, which
 //!   is what a member of a container is. It is a `ByteSource` too, so a
 //!   translator can sit on another translator's member;
-//! * [`torrent::TorrentFileSource`] over a torrent's file and
-//!   [`proxy::ProxySource`] over an HTTP entity through `/proxy`'s cache;
+//! * [`torrent::TorrentFileSource`] over a torrent's file,
+//!   [`proxy::ProxySource`] over an HTTP entity through `/proxy`'s cache,
+//!   and [`drive::DriveSource`] over a file in a paired Google Drive --
+//!   which is the second of those with a header supplier that renews its
+//!   own access token, since a film outlives one;
 //! * [`testing`] -- a source over a `Vec<u8>` and a wrapper that counts what
 //!   was asked of the one underneath, which is how a test proves that
 //!   reading an index read no more than the index.
@@ -31,11 +34,13 @@ use std::io;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek};
 
+pub mod drive;
 pub mod proxy;
 pub mod testing;
 pub mod torrent;
 pub mod view;
 
+pub use drive::{DriveError, DrivePairing, DriveSource};
 pub use proxy::ProxySource;
 pub use torrent::TorrentFileSource;
 pub use view::{MemberReader, MemberView};
