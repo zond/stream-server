@@ -493,6 +493,11 @@ pub struct PendingMagnetAdd<H: TorrentHandle> {
     /// refused pin removes the torrent it added, and must not when a
     /// stream request is holding the same engine.
     joiners: Arc<AtomicUsize>,
+    /// The file this add is a pin of, read off the placement a pin makes
+    /// (`only_files` of exactly that file); `None` for a stream's add. What
+    /// lets [`BackendEngineFS::unpin_download`] tell an add it may abort
+    /// from one it must queue behind.
+    pinned_file: Option<usize>,
 }
 
 /// Registry-wide id source for [`PendingMagnetAdd::id`].
@@ -2469,6 +2474,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     ) -> PendingMagnetAdd<B::Handle> {
         let id = NEXT_ADD_ID.fetch_add(1, Ordering::Relaxed);
         let trackers: Arc<[String]> = trackers.into();
+        let pinned_file = match placement.only_files.as_deref() {
+            Some([file_idx]) => Some(*file_idx),
+            _ => None,
+        };
 
         let add = {
             let hash = info_hash.clone();
@@ -2548,6 +2557,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             id,
             abort,
             joiners: Arc::new(AtomicUsize::new(0)),
+            pinned_file,
         }
     }
 
@@ -3913,12 +3923,23 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// "delete the whole torrent".
     ///
     /// Takes the same per-hash lock as [`Self::pin_download`]: an unpin
-    /// issued while a pin of that hash is still resolving metadata queues
-    /// behind it and applies to the finished pin. Unlocked it would find no
-    /// engine (the hash is parked in the magnet registry for the length of
-    /// the add), report that nothing was pinned, delete the pieces as a
-    /// dormant pin's, and leave the pin to land and be persisted behind
-    /// it.
+    /// issued while a pin of that hash is still in flight queues behind it
+    /// and applies to the finished pin. Unlocked it would find no engine
+    /// (the hash is parked in the magnet registry for the length of the
+    /// add), report that nothing was pinned, delete the pieces as a
+    /// dormant pin's, and leave the pin to land and be persisted behind it.
+    ///
+    /// **Unless the pin in flight is this file's own, and nobody else is
+    /// waiting on its add: then the add is aborted first.** A magnet takes
+    /// up to [`METADATA_RESOLVE_TIMEOUT`] to resolve, and a user who cancels
+    /// a download while it does was queued behind that whole wait -- the
+    /// button did nothing for ninety seconds, then everything went at
+    /// once. Aborted, the pin returns [`MagnetAddError::Cancelled`] to its
+    /// caller straight away, releases the lock, and this call finds no
+    /// engine and no pin -- which is the truth. An add a *stream* started
+    /// (its placement names no pinned file) or one a stream has joined
+    /// (`joiners > 0`) is not this pin's to abort: that viewer's torrent
+    /// must still arrive, so the unpin queues as before.
     pub async fn unpin_download(
         &self,
         info_hash: &str,
@@ -3926,10 +3947,41 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         delete_files: bool,
     ) -> Result<UnpinOutcome, PinDownloadError> {
         let info_hash = info_hash.to_lowercase();
+        self.abort_unjoined_pin_add(&info_hash, file_idx).await;
         let lock = self.pin_lock(&info_hash);
         let _guard = lock.mutex().lock().await;
         self.unpin_download_locked(&info_hash, file_idx, delete_files)
             .await
+    }
+
+    /// The abort [`Self::unpin_download`] makes: the add in flight for
+    /// `info_hash`, when it is a pin of `file_idx` that nothing else has
+    /// joined. Decided and done under the registry's read lock, so a lookup
+    /// cannot join the add between the two; whether the abort was made is
+    /// logged, since it is the difference between an unpin that returned at
+    /// once and one that waited out a magnet.
+    async fn abort_unjoined_pin_add(&self, info_hash: &str, file_idx: usize) {
+        let adds = self.magnet_adds.read().await;
+        let Some(MagnetAddState::Adding(pending)) = adds.get(info_hash).map(|entry| &entry.state)
+        else {
+            return;
+        };
+        if pending.pinned_file != Some(file_idx) || pending.joiners() > 0 {
+            debug!(
+                info_hash,
+                file_idx,
+                pinned_file = ?pending.pinned_file,
+                joiners = pending.joiners(),
+                "an add is in flight for the hash; the unpin queues behind it"
+            );
+            return;
+        }
+        pending.abort.abort();
+        tracing::info!(
+            info_hash,
+            file_idx,
+            "aborted the in-flight pin the unpin was asked about"
+        );
     }
 
     /// [`Self::unpin_download`] with the per-hash lock held.
@@ -16688,13 +16740,15 @@ mod tests {
 
     /// An unpin issued while a pin of the same hash is still in flight --
     /// a magnet add resolving metadata, or a relocation moving files --
-    /// must queue behind it and apply to the finished pin. It takes the
-    /// same per-hash lock: without one it would find no engine (the hash
-    /// is parked in the magnet registry for the length of the add), fall
-    /// into the dormant branch, do nothing, and leave the pin to land and
-    /// be persisted behind it.
+    /// must queue behind it and apply to the finished pin, **when the add
+    /// is not the pin's alone**: here a stream has joined it, and that
+    /// viewer's torrent must still arrive. It takes the same per-hash
+    /// lock: without one it would find no engine (the hash is parked in
+    /// the magnet registry for the length of the add), fall into the
+    /// dormant branch, do nothing, and leave the pin to land and be
+    /// persisted behind it. The add nobody joined is the next test's.
     #[tokio::test]
-    async fn unpin_download_queues_behind_an_in_flight_pin() {
+    async fn unpin_download_queues_behind_an_in_flight_pin_a_stream_joined() {
         let root = tempfile::tempdir().unwrap();
         let counters = Arc::new(FakeCounters::default());
         let handle = FakeHandle {
@@ -16732,6 +16786,16 @@ mod tests {
                 "the pin reached the held backend add"
             );
             assert!(enginefs.get_engine(TEST_HASH).await.is_none());
+            // A viewer opens the same hash while the pin's add is in
+            // flight: the lookup joins the add, and from here on the add
+            // is not the pin's to abort.
+            assert!(
+                matches!(
+                    enginefs.get_or_begin_add_magnet(TEST_HASH, None).await,
+                    crate::EngineLookup::Adding(_)
+                ),
+                "the stream joined the pin's add"
+            );
             enginefs
                 .unpin_download(TEST_HASH, 0, true)
                 .await
@@ -16762,6 +16826,70 @@ mod tests {
         assert!(
             enginefs.pinned_downloads().await.is_empty(),
             "the unpin applies to the pin it queued behind"
+        );
+    }
+
+    /// The pin's add that nobody joined is aborted by the unpin instead of
+    /// waited out: a user who cancels a download while its magnet resolves
+    /// was queued behind the whole resolution (ninety seconds at the
+    /// timeout), and the button did nothing until then. Here the hold is
+    /// never released, so an unpin that queued would never return; it
+    /// returns, the pin comes back `Cancelled`, and nothing is pinned.
+    #[tokio::test]
+    async fn unpin_download_aborts_an_in_flight_pin_nobody_joined() {
+        let root = tempfile::tempdir().unwrap();
+        let counters = Arc::new(FakeCounters::default());
+        let handle = FakeHandle {
+            info_hash: TEST_HASH.to_string(),
+            counters: counters.clone(),
+            files: (0..2)
+                .map(|idx| BackendFileInfo {
+                    name: format!("video-{idx}.mkv"),
+                    length: 100,
+                })
+                .collect(),
+            init: FakeInit::new(true, Duration::from_secs(60)),
+        };
+        let enginefs = BackendEngineFS::new_with_backend(
+            FakeBackend::new(vec![handle]),
+            HashMap::new(),
+            root.path().join("cache"),
+            root.path().join("downloads"),
+        );
+        std::fs::create_dir_all(root.path().join("downloads")).unwrap();
+        enginefs.backend.hold_add.store(true, Ordering::SeqCst);
+
+        let unpin = async {
+            assert!(
+                wait_until(TEST_WAIT_BOUND, || {
+                    !enginefs.backend.placements.lock().unwrap().is_empty()
+                })
+                .await,
+                "the pin reached the held backend add"
+            );
+            let outcome =
+                tokio::time::timeout(TEST_WAIT_BOUND, enginefs.unpin_download(TEST_HASH, 0, true))
+                    .await
+                    .expect("the unpin returned without the add ever being released")
+                    .unwrap();
+            assert!(!outcome.unpinned, "there was no pin to drop yet");
+            assert!(!outcome.deleted_files, "and nothing on disk to delete");
+        };
+        let (pinned, ()) = tokio::join!(enginefs.pin_download(TEST_HASH, 0, None), unpin);
+        let refusal = pinned.as_ref().err().map(ToString::to_string);
+        assert!(
+            matches!(
+                pinned,
+                Err(crate::PinDownloadError::MagnetAdd(
+                    crate::MagnetAddError::Cancelled { .. }
+                ))
+            ),
+            "the pin was told it was cancelled: {refusal:?}"
+        );
+        assert!(enginefs.pinned_downloads().await.is_empty());
+        assert!(
+            enginefs.get_engine(TEST_HASH).await.is_none(),
+            "no engine was published for the aborted add"
         );
     }
 
