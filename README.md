@@ -9,50 +9,33 @@ A headless, pure-Rust torrent-streaming library with no system dependencies, for
 
 ## About
 
-Stream Server is zond's hard fork of [stremio-native/stream-server](https://github.com/stremio-native/stream-server) (formerly `perpetus/stream-server`, itself an open-source alternative to Stremio's closed-source `server.js`), rewritten around a fork of `librqbit`. It has **no ambition to merge back upstream**: the API, the engine and the licensing have all diverged, and it is shaped by one client. That client is [xtremio](https://github.com/zond/xtremio), a Flutter Stremio client that embeds this server in-process as a Rust library (`stream_server::start`, see [Library API](#library-api)). **This crate is a library and nothing else**: there is no standalone daemon any more, so no other Stremio client can run it.
+Stream Server is the torrent-streaming half of [xtremio](https://github.com/zond/xtremio), a Flutter Stremio client, and it is a **Rust library** that the app links and starts in-process (`stream_server::start`, see [Library API](#library-api)). It began as a hard fork of [stremio-native/stream-server](https://github.com/stremio-native/stream-server), an open-source alternative to Stremio's closed-source `server.js`, and has no ambition to merge back: the API, the engine and the licensing have all diverged, and it is shaped by that one client. There is no standalone daemon, so no other Stremio client can run it.
 
-Its goal is narrower than upstream's: a **headless torrent-streaming server with no system-library requirements**. `cargo build` on a machine with a Rust toolchain and a C compiler -- no libtorrent, no libclang, no FFmpeg, no GUI toolkits -- is enough to compile it, with the default features or with `--no-default-features`. The server itself is Rust; the C compiler is for the C one dependency bundles and builds from source (`aws-lc-sys`, under rustls and librqbit's SHA-1). **At run time it spawns no external program at all**: `/ftp` was a spawned `curl` and is now the pure-Rust `suppaftp`, so nothing has to be on `PATH` for any route to work. (The one `Command` left in the tree is `build.rs` asking `git` for the commit it is building, which is a build-time convenience and absent from the library.)
+Its goal is narrower than a `server.js` replacement's: a **headless torrent-streaming server with no system-library requirements**. A Rust toolchain and a C compiler build it (the C is what `aws-lc-sys` bundles, under rustls and librqbit's SHA-1); at run time it spawns no external program. It deliberately does not transcode -- the client plays containers and codecs directly through libmpv -- so the server's only job is getting torrent, archive, remote and Drive bytes onto an HTTP connection efficiently, and keeping what it fetched inside a bounded cache.
 
-To get there, this fork **deliberately drops Stremio server.js API compatibility**: there is no HLS transcoding, no FFmpeg/FFprobe integration, and no video-probing endpoints. Those existed to reformat video for Stremio's web-based player. This server instead sits behind a native client (xtremio: Flutter, with `media_kit`/`libmpv` for playback) that does direct play and handles codecs and subtitles itself -- so the server's only job is getting torrent and archive bytes onto an HTTP connection efficiently, not transcoding them.
-
-The torrent engine is [`librqbit`](https://github.com/ikatson/rqbit) -- the **sole** torrent backend, in Rust, no system libraries -- consumed via a fork ([`zond/rqbit`](https://github.com/zond/rqbit), pinned to one git rev, the same in `enginefs/Cargo.toml` and `server/Cargo.toml`) that follows upstream and adds what a bounded streaming cache needs from the engine: a configurable per-stream lookahead window; piece reclaim (the engine forgets a piece so its storage may delete it, and the storage decides the have-set at startup); holding pieces back from what a torrent announces; a runtime per-torrent peer cap; a session-wide upload switch; per-piece chunk progress and a count of the connected peers that are seeders (what `inFlightPiece` and `connectedSeeders` below are read from); Mozilla's compiled-in TLS roots; and the fixes found on the way (a write past 2 GiB on a 32-bit `off_t` among them). There used to be an optional C++ `libtorrent` backend; it has been removed entirely, along with its vcpkg build apparatus, so no C++ is left in the build; the torrent path's only C is aws-lc, behind librqbit's SHA-1 piece hasher.
+The torrent engine is [`librqbit`](https://github.com/ikatson/rqbit), the sole backend, through a fork ([`zond/rqbit`](https://github.com/zond/rqbit), pinned to one git rev in both crates) that follows upstream and adds what a bounded streaming cache needs from the engine: a per-stream lookahead window, piece reclaim (the engine forgets a piece so its storage may delete it), holding pieces back from what a torrent announces, a runtime per-torrent peer cap, a session-wide upload switch, per-piece chunk progress and a count of connected seeders, a flat re-dial schedule for a thin swarm's proven peers, and Mozilla's compiled-in TLS roots.
 
 ---
 
-## Why this fork?
+## What it does that `server.js` does not
 
-| | Stream Server (this fork) | Upstream stream-server |
+Stremio's own server, and the upstream fork, exist to serve a web-based player: transcoding, subtitle conversion and a wide HTTP API. This one serves a native player it shares a process with, and the differences are the point.
+
+| | This server | Stremio `server.js` / upstream fork |
 |---|---|---|
-| **Build deps** | ✅ The Rust toolchain and a C compiler; no system libraries | FFmpeg/FFprobe at run time, for HLS transcoding |
-| **Transcoding** | ❌ Not the server's job -- client plays containers/codecs directly | ✅ HLS transcoding via FFmpeg |
-| **Torrent backend** | Pure-Rust `librqbit`, the only backend | `libtorrent` (C++) or `librqbit` |
-| **Open Source** | ✅ Source is MIT; default binary is GPL-3.0 (see [License](#license)) | ✅ (it replaces the closed-source `server.js`) |
-| **Archive Streaming** | ✅ ZIP/7Z/TAR/TGZ/RAR and ISO 9660/UDF disc images built in (pure Rust) | ✅ |
-| **Headless** | ✅ No tray, no desktop GUI in this repo | Varies |
+| **Build and run** | Rust toolchain + C compiler; no system libraries; nothing spawned at run time | FFmpeg/FFprobe at run time; upstream: `libtorrent` (C++) or `librqbit` |
+| **Transcoding** | None -- direct play; codecs and subtitles are the client's | HLS transcoding, probing, hwaccel profiles |
+| **Control surface** | The embed API (`ServerHandle`, over FFI); HTTP only for players and the handful of routes stremio-core calls, behind a per-launch bearer token -- see [API](#api) | Dozens of HTTP routes, open |
+| **Cache** | One torrent-data root, bounded by `cacheSize` and the volume's free space; one retention owner per entity, windowed round the playhead; nothing is ever pre-allocated -- see [What bounds the cache](#what-bounds-the-cache) | Files written whole; a periodic cache cleaner |
+| **Offline downloads** | A pin on the same cache, for a torrent file, an addon link or a Google Drive file; one file per piece, played back through the media routes -- see [Offline downloads](#offline-downloads) | -- |
+| **Remote streams** | `/proxy` caches in 256 KiB chunks, is bounded by the same retention, and reads ahead of a player exactly as a torrent stream is -- see [Proxied remote streams](#proxied-remote-streams) | Relayed, nothing kept |
+| **Google Drive** | A paired account's files as byte sources, the grant spent inside the server, downloadable and playable offline -- see [Google Drive files](#google-drive-files) | -- |
+| **Archives** | ZIP, 7Z, TAR, RAR and ISO 9660/UDF read as byte ranges of wherever the archive lives -- nothing downloaded, nothing extracted; a member that would have to be decoded is refused with a sentence | Extracted through native readers |
+| **Casting** | A second, media-only listener a cast session turns on and off -- see [LAN media listener](#lan-media-listener) | SSDP discovery and a casting API |
+| **Startup honesty** | `phase`, the in-flight piece, tracker scrapes of the swarm, DHT health -- see [Startup phases](#startup-phases-in-statsjson) | Progress percentages |
+| **Thin swarms** | A proven peer of a starving torrent is re-dialled on a flat 60 s (`docs/thin-swarm-redial.md`) | -- |
 
-This is not a drop-in replacement for `server.js` -- the API surface it exposes is intentionally smaller. It's built to be the backend of one specific client, not a generic Stremio-compatible service.
-
----
-
-## Features
-
-### Core Streaming
-- **No system libraries**: a Rust toolchain and a C compiler build it, and at run time it spawns no external program. See [About](#about) and [Building](#building)
-- **Single backend**: `librqbit` (Rust, via the `zond/rqbit` fork -- see [About](#about)) is the only torrent engine -- there is no C++ alternative to opt into
-- **HTTP Range Requests**: torrent pieces are streamed straight to HTTP range requests for instant seeking -- direct play, no transcoding step in between
-
-### Media & Archives
-- **Archive Streaming**: direct playback from ZIP, 7Z, TAR and RAR archives and from ISO 9660/UDF disc images out of the box (all pure Rust). A member that is *stored* -- which is what a film in one normally is -- is served as byte ranges of the archive itself, wherever the archive lives: nothing is downloaded, nothing is extracted, nothing is written, in any of the five. A member that would have to be decoded to be seeked in is **refused**, with a sentence to show the viewer, rather than unpacked into a second copy of the film (`415`; a `.tar.gz` is refused whole, since gzip has no way in at the middle). RAR is **on by default** via `unrar-rs`, which is GPL-3.0-or-later, so a program that links this library with RAR on is GPL-3.0-or-later -- see [License](#license); build `--no-default-features` to link no GPL code and have no RAR
-- Subtitles are the client's job: there is no subtitle conversion, track discovery or OpenSubtitles hashing in the server (see [Removed routes](#removed-routes))
-
-### Control
-- **The embed API is the control surface**: the app links the crate and calls `ServerHandle` methods over FFI -- downloads, cache, stream numbers, Drive, the LAN listener, all of it. No HTTP client anywhere in the app. See [Library API](#library-api)
-- **HTTP exists for two callers only**: players, which fetch media by URL (open routes), and stremio-core's `StreamingServer` model, which speaks Stremio's streaming-server protocol (a handful of token-protected routes, kept exactly as the core calls them because our fork of the core is changed as little as possible). **Do not add control routes.** See [API](#api)
-- **Per-launch bearer token** on those core-protocol routes; media routes stay open for players
-- **Stats**: `ServerHandle::engine_stats` / `file_stats` for torrent progress, and `/{infoHash}/{fileIdx}/stats.json` for the core
-- **Settings**: runtime-configurable via `ServerHandle::update_settings` and the core's `/settings`, with the stremio-core-compatible shape
-- **BitTorrent Privacy Controls**: DHT, PeX, LSD, encryption, interface binding, ports, and proxy settings. All accepted and persisted, but each has a fixed effect against `librqbit` -- applied live, applied on the next start, or not honoured (no backend knob) -- listed per setting in `bt_settings_support()`; a `POST /settings` response reports which bucket each one you sent fell into. See [BitTorrent Settings](docs/bittorrent-settings.md).
-- **LAN media listener**: an optional second listener that serves *media bytes only* to the local network, so a Chromecast can fetch a stream while the control API stays on loopback. Off by default and session-scoped. See [LAN media listener](#lan-media-listener)
+**Deliberately not here:** HLS/FFmpeg transcoding and probing, subtitle conversion and OpenSubtitles hashing (the client fetches addon subtitles and picks tracks), an HTTPS listener, a daemon or command line, SSDP casting, NZB and YouTube routes. Every one of them existed upstream and was removed for lack of a consumer; [Removed routes](#removed-routes) lists them.
 
 ---
 
@@ -80,15 +63,9 @@ let base_url = handle.base_url().to_string();   // http://127.0.0.1:<port>
 let token = handle.auth_token().map(str::to_string); // control-route bearer
 ```
 
-`ServerConfig::default()` is the only configuration: **loopback only** -- `127.0.0.1:11470`, no logging, a freshly generated per-launch bearer token the embedder reads off the handle, and an ephemeral BitTorrent listen port (`TorrentListenPort::Ephemeral`) so several servers (and the tests) coexist. `TorrentListenPort::Fixed(42000..42010)` -- the first free port of that range, stable and forwardable, and the only shape a UPnP mapping is worth taking for -- is there for an embedder that sets the field.
+`ServerConfig::default()` is the only configuration: **loopback only** -- `127.0.0.1:11470`, no logging, a freshly generated per-launch bearer token the embedder reads off the handle, and an ephemeral BitTorrent listen port (`TorrentListenPort::Ephemeral`) so several servers (and the tests) coexist. `TorrentListenPort::Fixed(42000..42010)` -- the first free port of that range, stable and forwardable, and the only shape a UPnP mapping is worth taking for -- is there for an embedder that sets the field. There is no HTTPS listener: a server embedded in a host process binds loopback, and the remote address a certificate would be for belongs to the host. An embedder that wants the open media routes reachable from the local network (`/proxy` and `/ftp` among them, which fetch whatever URL they are handed) has to bind them there field by field, which is the point; the [LAN media listener](#lan-media-listener) is the supported way to give a cast receiver what it needs and nothing else.
 
-**Prefer `http_addr`'s port `0`** and read the one the OS picked from `ServerHandle::bound_http_addr()`. 11470 is the default because it is what stremio-core's default profile points `streaming_server_url` at, so a client that has never been told otherwise looks there -- but an embedder that retargets core at the address it read back (xtremio does, and so does this repository's own example and every test) gains nothing from the number and can only lose the bind to a desktop Stremio, to a second instance of itself, or to whatever else holds the port. `DEFAULT_HTTP_PORT` is a contract with the *client*, not a port anything here needs.
-
-There used to be a second, `binary_default()` -- all interfaces, HTTPS on 12470, SSDP discovery, a Ctrl+C handler, a startup banner on stdout, a memory sampler, and a `std::process::exit` if shutdown ran long. It existed for the deleted daemon and nothing here ever ran it; every field that only it set is gone with it. An embedder that wants the open media routes (`/proxy` and `/ftp` among them, which fetch whatever URL they are handed) reachable from the local network now has to say so field by field, which is the point.
-
-**There is no HTTPS listener.** `ServerConfig::https_addr`, `server/src/https.rs` and the certificate machinery went with the daemon: a server embedded in a host process binds loopback, and the remote address a certificate would be for belongs to the host, not to this library. `/get-https` stays as a `501` -- see the route table.
-
-Control routes require that token on every request (`Authorization: Bearer <token>`); media routes are open so a player can fetch bytes without one. `ServerHandle` calls the same functions the routes do, so an embedder needs no HTTP client for control at all -- see [Library API](#library-api) and [Authentication](#authentication).
+**Prefer `http_addr`'s port `0`** and read the one the OS picked from `ServerHandle::bound_http_addr()`. 11470 is the default because it is what stremio-core's default profile points `streaming_server_url` at, so a client that has never been told otherwise looks there -- but an embedder that retargets core at the address it read back (xtremio does, and so does every test) gains nothing from the number and can only lose the bind to a desktop Stremio, to a second instance of itself, or to whatever else holds the port.
 
 ### Startup phases in `stats.json`
 
@@ -202,13 +179,13 @@ Both stats routes accept the same query parameters as `/{infoHash}/{fileIdx}` an
 - **Players fetch media by URL** -- mpv, or a Chromecast receiver through the [LAN media listener](#lan-media-listener). They cannot attach a header, so **media routes are OPEN**, and a route that hands a player bytes belongs there (`media_router()`).
 - **stremio-core's `StreamingServer` model speaks Stremio's streaming-server protocol** over HTTP, through the app's `Env::fetch`, which attaches the bearer. Our fork of stremio-core is changed as little as possible -- by policy, so it keeps following upstream -- so the routes it calls stay exactly as it calls them. That is `control_router()`, and it is **all** of `control_router()`: `/settings`, `/create`, `/{infoHash}/create`, `/{infoHash}/{fileIdx}/stats.json`, `/network-info`, `/device-info`, `/get-https`, `/casting`, `/casting/{devID}/player`, plus the archive `/create`s the core builds as media URLs. Every one requires `Authorization: Bearer <token>`, header only -- a token in the query string is never accepted, so it does not end up in access logs or in URLs handed to third parties. A missing or wrong token gets `401` with the fixed body `unauthorized` and `WWW-Authenticate: Bearer`; the compare is constant-time.
 
-**There is no third caller and none is planned.** The control routes that once mirrored the embed API for "the app" (`/heartbeat`, `/stats.json`, `/{infoHash}/stats.json`, `/downloads.json`, `POST`/`DELETE /downloads…`, `/{infoHash}/{fileIdx}/download`, `/cache.json`, `/cache/clean`, `/stream-numbers.json`, `/proxy-streams/{token}/close`, `/drive/create`) were a leftover of the standalone daemon this fork started as; nothing but the tests ever called them, and they were removed on 2026-09-26 (see [Removed routes](#removed-routes)). The tests call the handle. **Do not add a control route**: a new capability is a `ServerHandle` method, a new byte-serving URL for a player is a media route, and a route appears in `control_router()` only when the core fork starts calling a path it did not call before -- which is a change to the core fork first.
+**There is no third caller and none is planned.** The control routes that once mirrored the embed API for the app were a leftover of the standalone daemon this fork started as; nothing but the tests ever called them, and they went on 2026-09-26 ([Removed routes](#removed-routes)). **Do not add a control route**: a new capability is a `ServerHandle` method, a new byte-serving URL for a player is a media route, and a route appears in `control_router()` only when the core fork starts calling a path it did not call before -- which is a change to the core fork first.
 
 ### Authentication
 
 `ServerConfig.auth: ServerAuth` has one variant, `Generated`: 32 random bytes, hex-encoded, fresh per launch. The embedder reads it off `ServerHandle::auth_token()`; it is never passed to `tracing`, so it is in no log file, and it never reaches stdout.
 
-`Token(String)` (a secret the host picks) and `Disabled` (every route open) went with the daemon whose command line they were for -- `--token` and `--no-auth`. An embedder has no command line: it reads the generated token off the handle, so choosing one buys nothing, and an open control API on a machine that also runs a browser is a hole nothing here asked for. **There is no way to start this server without a token.**
+**There is no way to start this server without a token**, and no way to choose one: an embedder reads the generated token off the handle, so a chosen secret would buy nothing, and an open control API on a machine that also runs a browser is a hole nothing here asked for.
 
 ### Routes
 
@@ -289,7 +266,7 @@ That number is librqbit's per-stream lookahead (`FileStreamOptions::lookahead_by
 
 **The startup window is the same under every profile, deliberately.** It is that same 4 MiB: the narrow first-frame want-set is what makes playback start quickly, and widening it would spend that latency to buy read-ahead the very next request -- by which time a duration has usually been stated -- already asks for. Choosing a bigger profile never slows a play down; it changes what happens after the first frame. (`maximum` converts the same way, from a day of film, which for any film is the whole file: what bounds it is the cache budget.)
 
-**What it costs.** A larger window downloads further ahead of what is being watched, which means more of the file on disk at once and more **bandwidth** spent on bytes the viewer may seek past or never reach -- worth saying out loud on mobile data. `maximum` asks for the whole film where the cache budget covers it. Where the budget is smaller than the file, the retention window caps the read-ahead, so a bigger profile buys nothing past the window there. If the connection is bad enough that even `maximum` stutters, the honest answer is not a bigger window but an offline download: pin the file (`POST /{infoHash}/{fileIdx}/download`, see [Offline downloads](#offline-downloads)) and watch it once it is there.
+**What it costs.** A larger window downloads further ahead of what is being watched, which means more of the file on disk at once and more **bandwidth** spent on bytes the viewer may seek past or never reach -- worth saying out loud on mobile data. `maximum` asks for the whole film where the cache budget covers it. Where the budget is smaller than the file, the retention window caps the read-ahead, so a bigger profile buys nothing past the window there. If the connection is bad enough that even `maximum` stutters, the honest answer is not a bigger window but an offline download: pin the file (`ServerHandle::pin_download`, see [Offline downloads](#offline-downloads)) and watch it once it is there.
 
 **Validation is lenient by design.** The value is matched case-insensitively with surrounding whitespace ignored. Anything else -- a profile a future build added, a typo, an empty value -- is *not* an error: on `?buffer=` it falls back to `settings.bufferProfile`, and on `POST /settings` it leaves the setting as it was, like every other unrecognised value in that payload. A player must never lose a playback because it guessed a name wrong. The wire is additive throughout: a client that sends neither gets exactly today's behaviour.
 
@@ -395,7 +372,7 @@ A **pinned** file stays wanted no matter which file of the torrent is being play
 
 **A cap is a statement about one volume, and there is one root, so there is one cap.** `overLimit` stays as a field of its own -- how far over the cap the cache still is -- because it is what a client should read before telling a user that cleaning helped.
 
-**What keeps a byte, and what takes it**: a **pin** is kept until it is unpinned, whatever else is happening; the **one stream being played** keeps the window round its playhead and the half it has committed for sharing (and any file an open reader is still delivering); **everything else is slack** -- the moment a viewer opens something else, what they left is disposable, and it goes at the reconciler's next two-second tick, at the switch itself, when the volume runs low, on `POST /cache/clean`, or at the next boot. So stopping playback changes nothing on disk and resuming inside the window plays from the cache, while starting something else really does throw the previous stream away. At boot, before the session opens, the launch sweep deletes every piece directory the embedder's pin set does not name, and a previous release's data beside the store (below); the proxy cache and the archive scratch directory are emptied after it, before the router serves a request. A boot handed no pin set sweeps no torrent data at all (see *Restarts* under [Offline downloads](#offline-downloads)).
+**What keeps a byte, and what takes it**: a **pin** is kept until it is unpinned, whatever else is happening; the **one stream being played** keeps the window round its playhead and the half it has committed for sharing (and any file an open reader is still delivering); **everything else is slack** -- the moment a viewer opens something else, what they left is disposable, and it goes at the reconciler's next two-second tick, at the switch itself, when the volume runs low, on `clean_cache_now`, or at the next boot. So stopping playback changes nothing on disk and resuming inside the window plays from the cache, while starting something else really does throw the previous stream away. At boot, before the session opens, the launch sweep deletes every piece directory the embedder's pin set does not name, and a previous release's data beside the store (below); the proxy cache and the archive scratch directory are emptied after it, before the router serves a request. A boot handed no pin set sweeps no torrent data at all (see *Restarts* under [Offline downloads](#offline-downloads)).
 
 **A stream that would not fit is refused rather than served by evicting something**: the `507` path drops every disposable byte, re-reads the volume and tries again, and if pins plus the live window still do not fit, the answer is `507` -- never a pin or a playing stream taken to make room.
 
@@ -415,7 +392,7 @@ A torrent the free-space arm stopped says `phase: "error"` in its `stats.json`, 
 
 **Only what is committed is announced to a peer**, so while a file is being played this server advertises no piece it is about to throw away (once the viewer moves on, the file is slack and its committed pieces go too).
 
-**The budget is published on its own timer**: `server/src/cache_budget.rs` states it from one `statvfs` and what the owners of the cache say they hold (a sum over the bits each piece store keeps, plus the proxy cache's running count -- no walk, no syscall), on a minute timer, at startup before the router serves a request, and whenever a client changes `cacheSize`. `GET /cache.json` and `POST /cache/clean` are how a client reads the cache's state and asks for its slack back on demand. See [Cache usage and cleaning](#cache-usage-and-cleaning).
+**The budget is published on its own timer**: `server/src/cache_budget.rs` states it from one `statvfs` and what the owners of the cache say they hold (a sum over the bits each piece store keeps, plus the proxy cache's running count -- no walk, no syscall), on a minute timer, at startup before the router serves a request, and whenever a client changes `cacheSize`. `ServerHandle::cache_usage` and `clean_cache_now` are how a client reads the cache's state and asks for its slack back on demand. See [Cache usage and cleaning](#cache-usage-and-cleaning).
 
 ### Cache usage and cleaning
 
@@ -687,7 +664,7 @@ Everything below existed for server.js compatibility and had no consumer in stre
 - All subtitles routes (`/subtitles.vtt`, `/subtitles.{ext}`, `/{infoHash}/{fileIdx}/subtitles.vtt`, `/opensubHash`, `/opensubHash/{infoHash}/{fileIdx}`, `/subtitlesTracks`) and the engine code behind them -- the client fetches addon subtitles and selects tracks itself.
 - `/update/*` and the self-update manager plus the `stream-server-updater` helper binary -- desktop baggage.
 - `/{ipc_key}/downloader/*` -- stubs for an HTTP downloader that was never implemented.
-- `/local-addon/*` -- the local-files Stremio addon (scanned `localFiles/` directory, catalogs, `bt:`/`local:` metas). **A stub remains** (see the table above), because stremio-core's `OFFICIAL_ADDONS` carries a *protected* descriptor for `http://127.0.0.1:11470/local-addon/manifest.json` with a `stream` resource for `tt` movies/series: a stock profile requests `/local-addon/stream/{type}/{id}.json` on every details page, and a `404` there shows up as an error group in the client and an ERROR-level unhandled-request log line each time. A profile synced from a Stremio account carries an older descriptor for the same addon that *also* declares an `other`/`local` catalog, so core requests `/local-addon/catalog/other/local.json` (and `/local-addon/catalog/other/local/{extra}.json` once the board pages or a filter is applied -- the two shapes `AddonHTTPTransport::resource` builds); a `404` there broke the catalog row and logged an ERROR on every refresh. The stub answers an empty manifest, `{"streams": []}` and `{"metas": []}` instead and serves no local files; `meta` (only ever asked for `local:`/`bt:` ids) is a quiet `404`, and so is every other path under the prefix -- the stub has its own fallback so a 404 it *intends* is logged at debug, not through the ERROR-level unhandled-request path. The served manifest still declares no catalogs, so a profile that does not already carry one gains no empty row.
+- `/local-addon/*` -- the local-files Stremio addon (scanned `localFiles/` directory, catalogs, `bt:`/`local:` metas). **A stub remains** (the `/local-addon` rows of the table above), because stremio-core's default and account-synced profiles carry a protected descriptor for it and request its `stream` and `catalog` resources on every details page and board refresh; a `404` there shows up as an error group in the client and an ERROR-level log line each time. The stub answers an empty manifest, `{"streams": []}` and `{"metas": []}`, serves no local files, and logs its own intended 404s at debug.
 - `/casting/transcode`, `/casting/convert`, `GET /casting/{devID}` and the `501` stubs for `/ftp/create*` and `/ftp/stream*`.
 
 **Usenet (NZB)**: `/nzb/create*` and `/nzb/stream*` are gone, with the NNTP client and yEnc decoder behind them. stremio-core still builds `/nzb/create` for an addon's `nzbUrl` streams; no route here serves it, and as a two-segment path ending in `create` it matches the control route `POST /{infoHash}/create`, so it is refused and never serves media. The feature never worked end to end: article bodies were read as UTF-8 text, so binary data did not survive, and the connection pool was never refilled. Its routes were also open, fetching a caller-named URL and opening connections to caller-named news servers.
@@ -739,15 +716,13 @@ stream-server/
 │   ├── src/sources/  # ByteSource: a file somebody else fetches, read by range
 │   ├── src/images/   # ISO 9660 + UDF: which byte ranges of a disc image are each file
 │   └── src/translators/ # What a container says about the bytes inside it (ZIP, TAR, RAR, 7Z, ISO)
-├── enginefs/         # Torrent engine abstraction
-│   └── src/backend/
-│       └── librqbit.rs   # The sole torrent backend (pure Rust)
-└── docs/             # BitTorrent settings, retention design, known issues, review notes
+├── enginefs/         # Torrent engine abstraction: the librqbit backend, the piece store,
+│                     # the retention owner, the reconciler
+└── docs/             # Designs and measurements: retention, downloads, thin swarms,
+                      # translated sources, BitTorrent settings, known issues, reviews
 ```
 
-Two crates, and neither builds a binary: `server` is the library an embedder links, `enginefs` is what it is built on.
-
-There is no `bindings/` directory and no vcpkg apparatus: the optional C++ `libtorrent` backend and everything it needed to build (the `libtorrent-sys` FFI crate, `triplets/`, `vcpkg-overlays/`, `vcpkg.json`) have been removed. RAR is handled by the pure-Rust `unrar-rs` crate -- a direct `server` dependency behind the default-on `rar` feature -- so there is no separate RAR binding crate either.
+Two crates, and neither builds a binary: `server` is the library an embedder links, `enginefs` is what it is built on. RAR is the pure-Rust `unrar-rs`, a direct `server` dependency behind the default-on `rar` feature. [AGENTS.md](AGENTS.md) is the map of the modules and the rules a change has to keep.
 
 ---
 
