@@ -63,14 +63,6 @@ pub fn query_value_is_true(value: &str) -> bool {
     value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
 }
 
-/// Whether the boolean query flag `name` is set truthily in `query`
-/// (`?deleteFiles=1`), by [`query_value_is_true`].
-pub fn query_flag(query: Option<&str>, name: &str) -> bool {
-    query_values(query, name)
-        .iter()
-        .any(|value| query_value_is_true(value))
-}
-
 /// Look `info_hash` up in `engine_fs`, or create it from a bare magnet with
 /// the request's `tr=` trackers merged in, waiting for metadata. Every route
 /// that may be the first to touch a torrent (stream, HEAD, both `stats.json`
@@ -247,25 +239,6 @@ mod tests {
         assert!(value.contains(r#"filename="Movie Final.mkv""#));
         assert!(value.contains("filename*=UTF-8''Movie%20Final.mkv"));
         assert!(!value.contains(".."));
-    }
-
-    /// `?deleteFiles=1` and its spellings; anything else is off, including
-    /// a flag that is simply absent.
-    #[test]
-    fn query_flag_reads_server_js_truthiness() {
-        for query in ["deleteFiles=1", "tr=x&deleteFiles=true", "deleteFiles=YES"] {
-            assert!(super::query_flag(Some(query), "deleteFiles"), "{query}");
-        }
-        for query in [
-            "deleteFiles=0",
-            "deleteFiles=",
-            "deleteFiles",
-            "other=1",
-            "",
-        ] {
-            assert!(!super::query_flag(Some(query), "deleteFiles"), "{query}");
-        }
-        assert!(!super::query_flag(None, "deleteFiles"));
     }
 
     #[test]

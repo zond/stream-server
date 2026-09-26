@@ -15,15 +15,14 @@
 //! walk of what is there.
 //!
 //! What is left is therefore the wire types ([`CacheUsage`],
-//! [`EvictionReport`]) and the two functions behind `GET /cache.json` and
-//! `POST /cache/clean`.
+//! [`EvictionReport`]) and the two functions behind
+//! `ServerHandle::{cache_usage, clean_cache_now}`.
 
 use crate::cache_budget::CacheLimit;
 use crate::state::AppState;
 
 /// Give back everything nobody is playing and nobody is reading, now, and
-/// report what is left -- what `POST /cache/clean` and
-/// `ServerHandle::clean_cache_now` answer.
+/// report what is left -- what `ServerHandle::clean_cache_now` answers.
 ///
 /// **"Clean" is no longer a choice of victims.** It used to be a walk of
 /// the root that sorted what it found by age and size and evicted until it
@@ -39,8 +38,8 @@ use crate::state::AppState;
 /// one film playing and one pinned, and [`EvictionReport::over_limit`] is
 /// what says the cache is still over its cap. The cap is restated first
 /// ([`crate::cache_budget::publish_now`]), so the owners are sized against
-/// the volume as the clean left it. The `limit` reported is the one `GET
-/// /cache.json` answers, which is the same rule applied to a different
+/// the volume as the clean left it. The `limit` reported is the one [`usage`]
+/// answers, which is the same rule applied to a different
 /// figure: [`usage`]'s total also counts the bytes no owner's count prices
 /// -- a torrent held in Error, a directory a previous process left, the
 /// staged copies of pieces being written -- and the published cap does
@@ -97,8 +96,7 @@ pub(crate) async fn drop_slack(state: &AppState) -> EvictionReport {
 /// adding a category of byte with no deleter is how the disk becomes
 /// unbounded again.
 ///
-/// Shared by `routes::cache::cache_usage` (`ServerHandle::cache_usage` and
-/// `GET /cache.json`).
+/// Behind `ServerHandle::cache_usage`.
 pub(crate) async fn usage(state: &AppState) -> CacheUsage {
     let configured = {
         let settings = state.settings.read().await;
@@ -170,8 +168,8 @@ fn cache_usage(
 /// What the cache currently occupies against its configured limit
 /// ([`usage`]), in the one occupancy accounting this repository has
 /// ([`enginefs::chunk_store::occupied_bytes`] -- allocated blocks, never
-/// apparent length). `serde`-serializable so it crosses the `GET
-/// /cache.json` / `ServerHandle::cache_usage` boundary as is.
+/// apparent length). `serde`-serializable so it crosses the
+/// `ServerHandle::cache_usage` boundary (FFI, as JSON) as is.
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheUsage {
@@ -202,8 +200,8 @@ pub struct CacheUsage {
 
 /// What one [`drop_slack`] call left behind, in occupancy bytes
 /// ([`enginefs::chunk_store::occupied_bytes`]) throughout.
-/// `serde`-serializable so it crosses the `POST /cache/clean` /
-/// `ServerHandle::clean_cache_now` boundary as is.
+/// `serde`-serializable so it crosses the `ServerHandle::clean_cache_now`
+/// boundary (FFI, as JSON) as is.
 ///
 /// The name is the wire's and stays: nothing is evicted here any more --
 /// the owners are asked for their slack and report what is left -- but the
@@ -489,8 +487,8 @@ mod tests {
         assert!(piece.is_file());
         assert!(debris.is_file());
 
-        // A `CacheUsage` crosses `GET /cache.json` and `ServerHandle::cache_usage`
-        // as JSON, camelCase like every other response type.
+        // A `CacheUsage` crosses `ServerHandle::cache_usage` as JSON over
+        // FFI, camelCase like every other type on that boundary.
         let json = serde_json::to_value(&usage).unwrap();
         assert_eq!(json["totalBytes"], 4096 + debris_bytes + CHUNK);
         assert_eq!(json["protectedBytes"], 4096 + CHUNK);
@@ -595,7 +593,7 @@ mod tests {
         );
     }
 
-    /// The shape the two sentinels cross the wire in. `POST /cache/clean`,
+    /// The shape the two sentinels cross the wire in.
     /// `ServerHandle::clean_cache_now` and the FFI call behind the app's
     /// storage screen all read this JSON, and the app distinguishes "no cap"
     /// from "a cap of nothing" by exactly this difference -- so it is pinned

@@ -109,7 +109,7 @@ mod tests {
 
     fn request_with_authorization(value: &str) -> Request {
         Request::builder()
-            .uri("/heartbeat")
+            .uri("/settings")
             .header(header::AUTHORIZATION, value)
             .body(axum::body::Body::empty())
             .unwrap()
@@ -141,7 +141,7 @@ mod tests {
         let req = request_with_authorization("abc");
         assert_eq!(bearer_token(&req), None);
         let req = Request::builder()
-            .uri("/heartbeat")
+            .uri("/settings")
             .body(axum::body::Body::empty())
             .unwrap();
         assert_eq!(bearer_token(&req), None);

@@ -188,11 +188,7 @@ impl Server {
             .error_for_status()?;
         let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
         loop {
-            let stats: serde_json::Value = client
-                .get(format!("{}/{info_hash}/stats.json", self.base))
-                .send()?
-                .error_for_status()?
-                .json()?;
+            let stats = serde_json::to_value(self.handle.engine_stats(&info_hash, &[])?)?;
             match stats["phase"].as_str() {
                 Some("checking") | Some("resolvingMetadata") => {
                     anyhow::ensure!(

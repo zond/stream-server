@@ -37,7 +37,7 @@ pub struct AppState {
     /// on.
     pub translated_archives:
         crate::translators::session::Sessions<crate::translators::session::TranslatedSession>,
-    /// Google Drive files a `POST /drive/create` has opened, keyed by the
+    /// Google Drive files `ServerHandle::open_drive_file` has opened, keyed by the
     /// random key their stream URL carries (see `crate::routes::drive`).
     /// The same map type and the same lifetime rule as
     /// [`Self::translated_archives`]: a session stays while its own file is

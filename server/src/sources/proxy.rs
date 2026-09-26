@@ -6,7 +6,7 @@
 //! serves what the cache holds and fetches exactly the rest under
 //! `If-Range`, filling the cache on the way past. The cache stays the
 //! owner of those bytes: its retention pass keeps reclaiming them and
-//! `/stream-numbers.json` keeps answering for them, exactly as if the
+//! `ServerHandle::stream_numbers` keeps answering for them, exactly as if the
 //! player had fetched the file through `/proxy` itself.
 //!
 //! **An origin that will not range is refused here**, at construction,

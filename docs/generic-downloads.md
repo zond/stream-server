@@ -7,8 +7,11 @@ Design, 2026-09-26. Written against stream-server `9334c93`, xtremio
 server -- the proxy pin set through `ServerConfig::proxy_pins`, the
 keeping sweep with the occupancy seeded from what it kept,
 `ProxyBacking::keeps_everything`, quiet readers, the filler, and the
-routes (`POST /downloads`, `DELETE /downloads/{key}`, rows in
-`downloads.json` with `source` and `playUrl`, and the embed calls). One
+embed calls (`ServerHandle::{pin_proxy_download, unpin_proxy_download,
+proxy_download_key}`, rows in `downloads()` with `source` and `playUrl`;
+the HTTP routes §3.4 sketched were built and then removed the same day
+with every other app-facing control route -- the app speaks FFI, see the
+README's "API"). One
 thing the design did not foresee: a finished download does **not** play
 from the stream's `/proxy` URL, because that route keys the cache on the
 player's own negotiation headers, so a player's request lands on a key the
@@ -19,7 +22,7 @@ loopback origin, played back with the origin asked for nothing, kept
 across a restart that names it, swept by one that does not, deleted on
 request). Not built: §3.5 (a complete Drive download played offline:
 the media route serves any complete pinned entry, Drive included, but the
-app still opens Drive files through `/drive/create`, whose probe goes to
+app still opens Drive files through `open_drive_file`, whose probe goes to
 the origin), §4 (read-ahead), and §5 (the app) -- the app side is next.
 
 **The ask (zond):** every source should download, not only torrents -- and
@@ -52,7 +55,7 @@ HTTP streams, which they lack today.
 | Pin | `Engine::pinned_files`; `keeps_everything` answers from it | `keeps_everything` is hard-wired `false` ("the proxy has no pins") |
 | Claim that outlives the run | `PinSet` handed in by the embedder at boot; the launch sweep keeps what it names | **none** -- the launch sweep removes the whole cache ("no claim that outlives the run") |
 | Occupancy at boot | seeded from the held set the sweep left | "what this process wrote", true because the sweep emptied the disk |
-| Progress | `downloads.json`, `download progress` line | -- |
+| Progress | `downloads()`, `download progress` line | -- |
 | Playback of a finished download | a `url` stream naming the server's media route, served off the pieces | would be the `/proxy` or `/drive/stream` URL itself: a complete entry answers without opening the origin (`Cached::complete`) |
 
 Drive specifically: `DriveSource` **is** a `ProxySource` (`sources/drive.rs`)
@@ -188,6 +191,9 @@ connection while you are not watching"), through the same
 `BackgroundTraffic` reading, by direction.
 
 ### 3.4 Routes and the embed API
+
+*(As designed. What was kept is the embed API only; the routes went with
+the rest of the app-facing control routes on 2026-09-26.)*
 
 ```
 POST   /downloads            {"url": ..., "headers": [[name, value], ...]}   -> DownloadInfo

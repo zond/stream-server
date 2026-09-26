@@ -1,12 +1,14 @@
-//! Offline downloads: the control routes `POST /{infoHash}/{fileIdx}/download`,
-//! `DELETE /{infoHash}/{fileIdx}/download` and `GET /downloads.json`, and the
-//! functions they share with the matching `ServerHandle` methods
-//! (`pin_download`, `unpin_download`, `downloads`, `download_path`).
+//! Offline downloads, behind the `ServerHandle` methods `pin_download`,
+//! `unpin_download`, `pin_proxy_download`, `unpin_proxy_download`,
+//! `downloads` and `download_path`. No HTTP route pins or lists anything:
+//! the app reaches this over FFI and nothing else speaks to it (see
+//! `control_router` in `lib.rs`). The one route in this module is the
+//! media route `GET /downloads/{key}/stream`, which a player fetches.
 
 use crate::routes::compat;
 use crate::state::AppState;
 use axum::{
-    extract::{Json, Path, RawQuery, State},
+    extract::{Json, Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -502,96 +504,7 @@ pub async fn download_path(state: &AppState, info_hash: &str, file_idx: usize) -
     engine.handle.get_file_path(file_idx).await
 }
 
-/// Body of `POST /{infoHash}/{fileIdx}/download`. Every field is optional:
-/// an empty body pins with no extra trackers. `trackers` takes a stream's
-/// `sources`/`announce` values as they are -- `pin_download` normalises
-/// them like the stats routes' `tr=` values -- and, as everywhere else,
-/// they only matter when this request is the one that creates the engine.
-#[derive(Debug, Default, serde::Deserialize)]
-pub struct PinRequest {
-    #[serde(default, alias = "sources", alias = "announce")]
-    pub trackers: Vec<String>,
-}
-
-/// Status and body for a refused pin or unpin: a bad file index is a 404,
-/// a full disk a 507 (the client can free space and retry), a failed magnet
-/// add whatever `compat::engine_creation_failure` says, a backend refusal a
-/// 500. The body is [`PinDownloadError::client_message`], which does not
-/// leak the absolute cache/downloads paths the backend errors carry -- the
-/// full error goes to the log at the call site.
-fn download_failure(error: &PinDownloadError) -> (StatusCode, String) {
-    let status = match error {
-        PinDownloadError::MagnetAdd(error) => compat::engine_creation_failure(error).0,
-        PinDownloadError::FileNotFound { .. } => StatusCode::NOT_FOUND,
-        PinDownloadError::InsufficientSpace { .. } => StatusCode::INSUFFICIENT_STORAGE,
-        PinDownloadError::Backend(_) => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    (status, error.client_message())
-}
-
-/// The 404 for a route `{fileIdx}` that is not a number at all -- the same
-/// answer as for a file the torrent does not have, not a 400: the path
-/// shape is the one the stats routes answer 404 for.
-fn file_idx_not_found(raw: &str) -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({ "error": format!("file index {raw:?} is not a file index") })),
-    )
-        .into_response()
-}
-
-pub async fn post_download(
-    State(state): State<AppState>,
-    Path((info_hash, file_idx)): Path<(String, String)>,
-    body: Option<Json<PinRequest>>,
-) -> Response {
-    let Ok(file_idx) = file_idx.parse::<usize>() else {
-        return file_idx_not_found(&file_idx);
-    };
-    let trackers = body.map(|Json(body)| body.trackers).unwrap_or_default();
-    match pin_download(&state, &info_hash, file_idx, trackers).await {
-        Ok(info) => Json(info).into_response(),
-        Err(error) => {
-            tracing::warn!(info_hash, file_idx, error = %format!("{error:#}"), "pin_download_failed");
-            let (status, message) = download_failure(&error);
-            (status, Json(json!({ "error": message }))).into_response()
-        }
-    }
-}
-
-pub async fn delete_download(
-    State(state): State<AppState>,
-    Path((info_hash, file_idx)): Path<(String, String)>,
-    RawQuery(query): RawQuery,
-) -> Response {
-    let Ok(file_idx) = file_idx.parse::<usize>() else {
-        return file_idx_not_found(&file_idx);
-    };
-    let delete_files = compat::query_flag(query.as_deref(), "deleteFiles");
-    match unpin_download(&state, &info_hash, file_idx, delete_files).await {
-        // `deletedFiles` is what happened, not what was asked: a dormant
-        // pin whose torrent lived in the cache root has nothing this layer
-        // can name to delete, and a failed delete is logged, not raised.
-        Ok(outcome) => Json(json!({
-            "infoHash": info_hash.to_lowercase(),
-            "fileIdx": file_idx,
-            "unpinned": outcome.unpinned,
-            "deletedFiles": outcome.deleted_files,
-        }))
-        .into_response(),
-        Err(error) => {
-            tracing::warn!(info_hash, file_idx, error = %format!("{error:#}"), "unpin_download_failed");
-            let (status, message) = download_failure(&error);
-            (status, Json(json!({ "error": message }))).into_response()
-        }
-    }
-}
-
-pub async fn get_downloads(State(state): State<AppState>) -> Response {
-    Json(downloads(&state).await).into_response()
-}
-
-/// The body of `POST /downloads`: one of the two proxy download kinds.
+/// What a proxy download is of: one of the two kinds, and only one.
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxyDownloadRequest {
@@ -611,8 +524,8 @@ pub struct ProxyDownloadRequest {
     pub name: Option<String>,
 }
 
-/// Pins a proxy download and answers its row, or why not. What
-/// `ServerHandle::pin_proxy_download` and `POST /downloads` share.
+/// Pins a proxy download and answers its row, or why not
+/// (`ServerHandle::pin_proxy_download`).
 pub async fn pin_proxy_download(
     state: &AppState,
     request: ProxyDownloadRequest,
@@ -669,8 +582,7 @@ pub fn proxy_download_key(
 }
 
 /// Drops a proxy download's pin by its key (the row's `infoHash`), with
-/// `delete_files` its bytes too. What `ServerHandle::unpin_proxy_download`
-/// and `DELETE /downloads/{key}` share.
+/// `delete_files` its bytes too (`ServerHandle::unpin_proxy_download`).
 pub async fn unpin_proxy_download(state: &AppState, key: &str, delete_files: bool) -> UnpinOutcome {
     let dir = state.proxy_cache.root().join(key);
     if dir.parent() != Some(state.proxy_cache.root()) || key.is_empty() {
@@ -693,41 +605,6 @@ pub async fn unpin_proxy_download(state: &AppState, key: &str, delete_files: boo
         unpinned: false,
         deleted_files: false,
     })
-}
-
-fn proxy_pin_failure(error: &crate::proxy_downloads::ProxyPinError) -> (StatusCode, String) {
-    use crate::proxy_downloads::ProxyPinError;
-    use crate::sources::proxy::ProxySourceError;
-    let status = match error {
-        ProxyPinError::Source(ProxySourceError::WillNotRange) => StatusCode::NOT_IMPLEMENTED,
-        ProxyPinError::Source(ProxySourceError::Origin(StatusCode::NOT_FOUND)) => {
-            StatusCode::NOT_FOUND
-        }
-        ProxyPinError::Source(_) => StatusCode::BAD_GATEWAY,
-        ProxyPinError::Drive(crate::routes::drive::DriveOpenError::NoPairingService) => {
-            StatusCode::NOT_IMPLEMENTED
-        }
-        ProxyPinError::Drive(crate::routes::drive::DriveOpenError::Drive(
-            crate::sources::drive::DriveError::PairAgain,
-        )) => StatusCode::UNAUTHORIZED,
-        ProxyPinError::Drive(_) => StatusCode::BAD_GATEWAY,
-        ProxyPinError::Unkeyable(_) => StatusCode::BAD_REQUEST,
-    };
-    (status, error.to_string())
-}
-
-pub async fn post_proxy_download(
-    State(state): State<AppState>,
-    Json(request): Json<ProxyDownloadRequest>,
-) -> Response {
-    match pin_proxy_download(&state, request).await {
-        Ok(info) => Json(info).into_response(),
-        Err(error) => {
-            tracing::warn!(error = %error, "proxy_download_pin_failed");
-            let (status, message) = proxy_pin_failure(&error);
-            (status, Json(json!({ "error": message }))).into_response()
-        }
-    }
 }
 
 /// `GET /downloads/{key}/stream`: a proxy download by range, served off the
@@ -848,26 +725,9 @@ pub async fn stream_proxy_download(
     (framing.status(), res_headers, body).into_response()
 }
 
-pub async fn delete_proxy_download(
-    State(state): State<AppState>,
-    Path(key): Path<String>,
-    RawQuery(query): RawQuery,
-) -> Response {
-    let delete_files = compat::query_flag(query.as_deref(), "deleteFiles");
-    let outcome = unpin_proxy_download(&state, &key, delete_files).await;
-    Json(json!({
-        "key": key,
-        "unpinned": outcome.unpinned,
-        "deletedFiles": outcome.deleted_files,
-    }))
-    .into_response()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{PinRequest, ProgressTrack, claim_progress_logger, download_failure};
-    use axum::http::StatusCode;
-    use enginefs::PinDownloadError;
+    use super::{ProgressTrack, claim_progress_logger};
 
     /// The line's two stall fields: a first reading measures nothing,
     /// movement resets the count, and a count that fell is not movement.
@@ -909,43 +769,5 @@ mod tests {
             claim_progress_logger(key).is_some(),
             "the slot is given back"
         );
-    }
-
-    /// A full disk is a 507 the client can act on, a bad index a 404, and a
-    /// backend refusal a 500 whose body never carries the librqbit error
-    /// (it names absolute cache and downloads paths).
-    #[test]
-    fn pin_failures_map_to_actionable_statuses() {
-        let (status, message) = download_failure(&PinDownloadError::InsufficientSpace {
-            required: 5,
-            available: 3,
-            margin: 2,
-        });
-        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
-        assert!(message.contains("free space"), "{message}");
-
-        let (status, message) = download_failure(&PinDownloadError::FileNotFound {
-            file_idx: 9,
-            file_count: 2,
-        });
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert!(message.contains("out of range"), "{message}");
-
-        let (status, message) = download_failure(&PinDownloadError::Backend(anyhow::anyhow!(
-            "error opening /home/someone/cache/rqbit-downloads/Show/e1.bin"
-        )));
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(!message.contains("/home/someone"), "{message}");
-    }
-
-    /// The body is optional and so is every field in it; a stream's
-    /// `sources`/`announce` array is accepted under its own name.
-    #[test]
-    fn pin_request_accepts_the_streams_own_tracker_field_names() {
-        let parse = |json: &str| serde_json::from_str::<PinRequest>(json).unwrap().trackers;
-        assert!(parse("{}").is_empty());
-        assert_eq!(parse(r#"{"trackers":["udp://a"]}"#), vec!["udp://a"]);
-        assert_eq!(parse(r#"{"sources":["udp://b"]}"#), vec!["udp://b"]);
-        assert_eq!(parse(r#"{"announce":["udp://c"]}"#), vec!["udp://c"]);
     }
 }

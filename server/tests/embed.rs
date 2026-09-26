@@ -173,11 +173,14 @@ fn two_embedded_servers_start_concurrently() -> anyhow::Result<()> {
     assert_ne!(handles[0].http_addr(), handles[1].http_addr());
     for handle in &handles {
         let heartbeat: serde_json::Value = bearer_client(handle)?
-            .get(format!("http://{}/heartbeat", handle.http_addr()))
+            .get(format!("http://{}/device-info", handle.http_addr()))
             .send()?
             .error_for_status()?
             .json()?;
-        assert_eq!(heartbeat["success"], true);
+        assert_eq!(
+            heartbeat["availableHardwareAccelerations"],
+            serde_json::json!([])
+        );
     }
     for handle in handles {
         handle.shutdown()?;
@@ -223,7 +226,7 @@ fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
     assert!(token.bytes().all(|c| c.is_ascii_hexdigit()));
 
     let anonymous = reqwest::blocking::Client::new();
-    let response = anonymous.get(format!("{base}/heartbeat")).send()?;
+    let response = anonymous.get(format!("{base}/device-info")).send()?;
     assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
     assert_eq!(
         response
@@ -235,7 +238,7 @@ fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
     assert_eq!(response.text()?, "unauthorized");
 
     let response = anonymous
-        .get(format!("{base}/heartbeat"))
+        .get(format!("{base}/device-info"))
         .bearer_auth(format!("{}0", &token[1..]))
         .send()?;
     assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
@@ -243,7 +246,7 @@ fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
 
     // Token in the query string is not accepted: header only.
     let response = anonymous
-        .get(format!("{base}/heartbeat?token={token}"))
+        .get(format!("{base}/device-info?token={token}"))
         .send()?;
     assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
 
@@ -257,11 +260,14 @@ fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
 
     let response = bearer_client(&handle)?
-        .get(format!("{base}/heartbeat"))
+        .get(format!("{base}/device-info"))
         .send()?
         .error_for_status()?;
     let body: serde_json::Value = response.json()?;
-    assert_eq!(body["success"], true);
+    assert_eq!(
+        body["availableHardwareAccelerations"],
+        serde_json::json!([])
+    );
 
     let response = anonymous.get(format!("{base}/ftp/movie.mkv")).send()?;
     assert_eq!(
@@ -365,7 +371,7 @@ fn loopback_grants_no_cross_origin_read() -> anyhow::Result<()> {
         .header("access-control-request-headers", "range")
         .send()?;
     let get = anonymous
-        .get(format!("{base}/heartbeat"))
+        .get(format!("{base}/device-info"))
         .header(reqwest::header::ORIGIN, "https://example.org")
         .send()?;
     let ftp = anonymous
@@ -408,11 +414,11 @@ fn header_value(response: &reqwest::blocking::Response, name: &str) -> String {
 /// exist (200, not 404) or every client boot logs an ERROR-level 404 in
 /// diagnostics::logging.
 ///
-/// `GET /stats.json?sys=1` is polled roughly once a second by players.
-/// Confirms the response still carries the `sys.loadavg`/`sys.cpus` shape
-/// after moving the sysinfo sweep to a cached spawn_blocking call.
+/// And the DHT state a client needs to say "DHT unavailable, using
+/// trackers only" instead of pretending peer discovery is healthy is
+/// `ServerHandle::dht_status`, crossing FFI as JSON in these names.
 #[test]
-fn device_info_and_stats_json_sys_probes_keep_their_shapes() -> anyhow::Result<()> {
+fn device_info_keeps_its_shape_and_the_dht_status_is_reported() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
 
@@ -434,32 +440,7 @@ fn device_info_and_stats_json_sys_probes_keep_their_shapes() -> anyhow::Result<(
         Some(&serde_json::json!([]))
     );
 
-    let response = client
-        .get(format!("http://{}/stats.json?sys=1", handle.http_addr()))
-        .send()?
-        .error_for_status()?;
-    let body: serde_json::Value = response.json()?;
-    let loadavg = body["sys"]["loadavg"]
-        .as_array()
-        .expect("sys.loadavg array");
-    assert_eq!(loadavg.len(), 3);
-    assert!(
-        body["sys"]["cpus"]
-            .as_array()
-            .is_some_and(|c| !c.is_empty()),
-        "expected at least one reported CPU"
-    );
-
-    // The DHT state a client needs to say "DHT unavailable, using trackers
-    // only" instead of pretending peer discovery is healthy. Always present,
-    // `sys=1` or not: a missing `dht` key means an older server, which is a
-    // different thing from a DHT that never came up.
-    let response = client
-        .get(format!("http://{}/stats.json", handle.http_addr()))
-        .send()?
-        .error_for_status()?;
-    let body: serde_json::Value = response.json()?;
-    let dht = &body["dht"];
+    let dht = serde_json::to_value(handle.dht_status())?;
     assert!(dht["enabled"].is_boolean(), "dht.enabled: {dht}");
     assert!(dht["nodes"].is_u64(), "dht.nodes: {dht}");
     assert!(dht["nodesV6"].is_u64(), "dht.nodesV6: {dht}");
@@ -467,9 +448,6 @@ fn device_info_and_stats_json_sys_probes_keep_their_shapes() -> anyhow::Result<(
         dht["everBootstrapped"].is_boolean(),
         "dht.everBootstrapped: {dht}"
     );
-    // The library API is the same call (`routes::system::dht_status`).
-    let status = handle.dht_status();
-    assert_eq!(dht["enabled"], serde_json::json!(status.enabled));
 
     handle.shutdown()?;
     handle.join()?;
@@ -507,18 +485,11 @@ fn background_traffic_is_dark_on_an_idle_server() -> anyhow::Result<()> {
     assert_eq!(json["bytes_downloaded"], serde_json::json!(0));
     assert_eq!(json["bytes_uploaded"], serde_json::json!(0));
 
-    // And it created nothing on the way: `/stats.json` still knows no torrent
-    // (its non-torrent keys are `dht`, and `sys` only when asked for).
-    let response = bearer_client(&handle)?
-        .get(format!("http://{}/stats.json", handle.http_addr()))
-        .send()?
-        .error_for_status()?;
-    let body: serde_json::Value = response.json()?;
-    let torrents: Vec<&String> = body
-        .as_object()
-        .expect("object")
-        .keys()
-        .filter(|key| key.len() == 40)
+    // And it created nothing on the way: the engine still knows no torrent.
+    let (engine, runtime) = handle.engine_for_tests();
+    let torrents: Vec<String> = runtime
+        .block_on(engine.get_all_statistics())
+        .into_keys()
         .collect();
     assert!(torrents.is_empty(), "asking lit an engine: {torrents:?}");
 
@@ -554,11 +525,14 @@ fn casting_lists_no_devices_and_refuses_to_play_on_one() -> anyhow::Result<()> {
 
     let client = bearer_client(&handle)?;
     let heartbeat: serde_json::Value = client
-        .get(format!("http://{}/heartbeat", handle.http_addr()))
+        .get(format!("http://{}/device-info", handle.http_addr()))
         .send()?
         .error_for_status()?
         .json()?;
-    assert_eq!(heartbeat["success"], true);
+    assert_eq!(
+        heartbeat["availableHardwareAccelerations"],
+        serde_json::json!([])
+    );
 
     let devices: serde_json::Value = client
         .get(format!("http://{}/casting", handle.http_addr()))
@@ -656,7 +630,6 @@ fn create_from_a_magnet_joins_the_shared_registry_add() -> anyhow::Result<()> {
         ..offline_config()
     })?;
     let base = format!("http://{}", handle.http_addr());
-    let client = bearer_client(&handle)?;
     let impatient = bearer_client_builder(&handle)
         .timeout(std::time::Duration::from_secs(2))
         .build()?;
@@ -693,11 +666,7 @@ fn create_from_a_magnet_joins_the_shared_registry_add() -> anyhow::Result<()> {
             created.is_err(),
             "create must wait for metadata, got {created:?}"
         );
-        let stats: serde_json::Value = client
-            .get(format!("{base}/{hash}/stats.json"))
-            .send()?
-            .error_for_status()?
-            .json()?;
+        let stats: serde_json::Value = serde_json::to_value(handle.engine_stats(hash, &[])?)?;
         assert_eq!(stats["phase"], "resolvingMetadata", "{stats}");
         let sources: Vec<&str> = stats["sources"]
             .as_array()
@@ -904,14 +873,14 @@ fn the_diagnostics_trace_setting_changes_the_installed_log_filter() -> anyhow::R
 }
 
 /// The library API on `ServerHandle` is the same code the control routes
-/// run, so an embedder (FFI, no HTTP client) sees exactly what a client
-/// polling over HTTP would: `settings()` is `GET /settings`' `values`,
+/// stremio-core calls run, so the app (FFI, no HTTP client) and the core
+/// (HTTP) see one server: `settings()` is `GET /settings`' `values`,
 /// `update_settings` is `POST /settings` (same merge/validation, visible to
-/// the next GET), `engine_stats` is `/{infoHash}/stats.json` -- including
-/// creating the engine with the given trackers on first sight -- normalised
-/// like the route's `tr=` values: `tracker:` stripped, `dht:` dropped -- and
-/// answering `resolvingMetadata` at once -- and `file_stats` is
-/// `/{infoHash}/{fileIdx}/stats.json`, with the route's 404 as `FileNotFound`.
+/// the next GET), `engine_stats` creates the engine with the given trackers
+/// on first sight -- normalised like the routes' `tr=` values: `tracker:`
+/// stripped, `dht:` dropped -- and answers `resolvingMetadata` at once, and
+/// `file_stats` is `/{infoHash}/{fileIdx}/stats.json`, with the route's 404
+/// as `FileNotFound`.
 #[test]
 fn library_api_matches_the_http_control_routes() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -967,8 +936,8 @@ fn library_api_matches_the_http_control_routes() -> anyhow::Result<()> {
     assert_eq!(handle.settings()?.bt_max_connections, 55);
 
     // engine_stats() creates the engine with the trackers on first sight and
-    // answers resolvingMetadata at once, exactly like the route; a later poll
-    // over HTTP sees that very engine.
+    // answers resolvingMetadata at once, exactly like the stats route; a
+    // later per-file poll over HTTP sees that very engine.
     let unresolved = "8899aabbccddeeff00112233445566778899aabb";
     let tracker = "udp://library-first.invalid:6969/announce";
     // The sources exactly as a stream's `sources` array carries them: the
@@ -994,11 +963,12 @@ fn library_api_matches_the_http_control_routes() -> anyhow::Result<()> {
         "raw sources must not reach the engine: {sources:?}"
     );
     let http: serde_json::Value = client
-        .get(format!("{base}/{unresolved}/stats.json"))
+        .get(format!("{base}/{unresolved}/-1/stats.json"))
         .send()?
         .error_for_status()?
         .json()?;
-    assert_eq!(api_json, http);
+    assert_eq!(api_json["sources"], http["sources"]);
+    assert_eq!(http["phase"], "resolvingMetadata", "{http}");
 
     // file_stats() == /{infoHash}/{fileIdx}/stats.json for a known torrent.
     let created: serde_json::Value = client
@@ -1010,7 +980,7 @@ fn library_api_matches_the_http_control_routes() -> anyhow::Result<()> {
     let info_hash = created["infoHash"].as_str().expect("infoHash").to_string();
     // Let the hash check finish first: the per-file initial-window fields
     // only exist once it has, and the two calls below must see one state.
-    stats_after_check(&client, &base, &info_hash)?;
+    stats_after_check(&handle, &info_hash)?;
     let api = handle.file_stats(&info_hash, 1, &[])?;
     let http: serde_json::Value = client
         .get(format!("{base}/{info_hash}/1/stats.json"))
@@ -1198,11 +1168,14 @@ fn starts_without_home_env() -> anyhow::Result<()> {
     })?;
 
     let response = bearer_client(&handle)?
-        .get(format!("http://{}/heartbeat", handle.http_addr()))
+        .get(format!("http://{}/device-info", handle.http_addr()))
         .send()?
         .error_for_status()?;
     let body: serde_json::Value = response.json()?;
-    assert_eq!(body["success"], true);
+    assert_eq!(
+        body["availableHardwareAccelerations"],
+        serde_json::json!([])
+    );
     assert!(
         config_dir.path().join("config").join("cache").is_dir(),
         "cache dir must be created inside config_dir when unset"
@@ -1213,10 +1186,11 @@ fn starts_without_home_env() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `/{infoHash}/stats.json` contract for the startup-phase fields: they are
-/// additive (every server.js-compatible key stremio-core's `Statistics`
-/// parses is still there), camelCase, and describe the guessed stream file;
-/// `/{infoHash}/{fileIdx}/stats.json` describes the requested file instead.
+/// The stats contract for the startup-phase fields: they are additive
+/// (every server.js-compatible key stremio-core's `Statistics` parses is
+/// still there), camelCase, and `engine_stats` describes the guessed stream
+/// file while `/{infoHash}/{fileIdx}/stats.json` describes the requested
+/// file instead.
 /// The torrent has a dummy piece hash and no peers, so after the (instant)
 /// hash check it must sit in `buffering` with nothing of the window on disk.
 #[test]
@@ -1247,11 +1221,7 @@ fn stats_json_exposes_startup_phase_fields_additively() -> anyhow::Result<()> {
     // Poll past the hash check (bounded); `checking` is legal in between.
     let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
     let stats = loop {
-        let stats: serde_json::Value = client
-            .get(format!("{base}/{info_hash}/stats.json"))
-            .send()?
-            .error_for_status()?
-            .json()?;
+        let stats: serde_json::Value = serde_json::to_value(handle.engine_stats(&info_hash, &[])?)?;
         match stats["phase"].as_str() {
             Some("checking") if std::time::Instant::now() < deadline => {
                 // **Both or neither, and never a number that is really a
@@ -1408,9 +1378,8 @@ fn stats_json_reports_resolving_metadata_with_the_requests_trackers() -> anyhow:
     for path in [
         format!("{unresolved}/0/stats.json?{tr}"),
         format!("{unresolved}/-1/stats.json?{tr}"),
-        format!("{unresolved}/stats.json?{tr}"),
         // Later polls without trackers still see the tracker set used.
-        format!("{unresolved}/stats.json"),
+        format!("{unresolved}/-1/stats.json"),
     ] {
         let response = client.get(format!("{base}/{path}")).send()?;
         assert_eq!(response.status(), reqwest::StatusCode::OK, "{path}");
@@ -1451,11 +1420,7 @@ fn stats_json_reports_resolving_metadata_with_the_requests_trackers() -> anyhow:
         created.is_err(),
         "create must wait for metadata, got {created:?}"
     );
-    let stats: serde_json::Value = client
-        .get(format!("{base}/{create_first}/stats.json"))
-        .send()?
-        .error_for_status()?
-        .json()?;
+    let stats: serde_json::Value = serde_json::to_value(handle.engine_stats(create_first, &[])?)?;
     assert_eq!(stats["phase"], "resolvingMetadata", "{stats}");
     let sources: Vec<&str> = stats["sources"]
         .as_array()
@@ -1562,7 +1527,7 @@ fn a_zero_length_torrent_file_is_an_empty_body_not_a_416() -> anyhow::Result<()>
         .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
         .send()?
         .error_for_status()?;
-    let stats = stats_after_check(&client, &base, &info_hash)?;
+    let stats = stats_after_check(&handle, &info_hash)?;
     let idx = file_index(&stats, "notes.nfo");
 
     let anonymous = reqwest::blocking::Client::new();
@@ -1858,14 +1823,27 @@ fn free_space_stop() -> enginefs::reconcile::Verdict {
     }
 }
 
-/// Poll `/{infoHash}/stats.json` until the torrent is out of `checking`
+/// Poll `engine_stats` until the torrent is out of `checking`
 /// (bounded), returning the last stats.
 fn stats_after_check(
-    client: &reqwest::blocking::Client,
-    base: &str,
+    handle: &stream_server::ServerHandle,
     info_hash: &str,
 ) -> anyhow::Result<serde_json::Value> {
-    poll_stats(client, &format!("{base}/{info_hash}/stats.json"))
+    let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
+    loop {
+        let stats = serde_json::to_value(handle.engine_stats(info_hash, &[])?)?;
+        match stats["phase"].as_str() {
+            Some("checking") | Some("resolvingMetadata") => {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "{info_hash} was still {} after {CHECK_WAIT_BOUND:?}: {stats}",
+                    stats["phase"]
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            _ => return Ok(stats),
+        }
+    }
 }
 
 /// The same for `/{infoHash}/{fileIdx}/stats.json`.
@@ -2269,7 +2247,7 @@ fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
         .error_for_status()?
         .json()?;
     assert_eq!(created["infoHash"], info_hash);
-    let stats = stats_after_check(&client, &base, &info_hash)?;
+    let stats = stats_after_check(&handle, &info_hash)?;
     assert_eq!(stats["files"][0]["complete"], true, "{stats}");
     assert_eq!(stats["files"][1]["complete"], true, "{stats}");
     assert_eq!(stats["pinnedFiles"], serde_json::json!([]));
@@ -2307,7 +2285,7 @@ fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
         e2_pieces.iter().all(|piece| held.contains(piece)),
         "the pin kept every piece of the pinned file: {held:?}"
     );
-    let stats = stats_after_check(&client, &base, &info_hash)?;
+    let stats = stats_after_check(&handle, &info_hash)?;
     assert_eq!(
         stats["files"][idx]["complete"], true,
         "and the data it had is still complete: {stats}"
@@ -2337,8 +2315,6 @@ fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
         info_hash.clone(),
         vec![idx],
     )])))?;
-    let base = format!("http://{}", handle.http_addr());
-    let client = bearer_client(&handle)?;
     let stats = handle.engine_stats(&info_hash, &[])?;
     assert_ne!(
         stats.phase,
@@ -2346,7 +2322,7 @@ fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
         "restored from the session, not re-added"
     );
     assert_eq!(stats.pinned_files, vec![idx], "pin restored");
-    let stats = stats_after_check(&client, &base, &info_hash)?;
+    let stats = stats_after_check(&handle, &info_hash)?;
     assert_eq!(stats["files"][idx]["complete"], true, "{stats}");
     assert_eq!(stats["files"][idx]["pinned"], true, "{stats}");
     assert_eq!(stats["pinnedFiles"], serde_json::json!([idx]));
@@ -2369,7 +2345,7 @@ fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
 /// The launch sweep deletes every piece directory the set does not name, so
 /// a boot told nothing is one keystroke away from deleting every offline
 /// download the user has. It does not: nothing is swept, the disk keeps what
-/// it held, and `GET /downloads.json` lists every file of every restored
+/// it held, and `downloads()` lists every file of every restored
 /// torrent, because that is what is being kept -- reporting the empty
 /// in-memory pin set instead would tell the caller their downloads are gone
 /// while the bytes are still on the disk.
@@ -2410,7 +2386,7 @@ fn an_unnamed_pin_set_keeps_every_download_and_lists_it() -> anyhow::Result<()> 
         .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
         .send()?
         .error_for_status()?;
-    let stats = stats_after_check(&client, &base, &info_hash)?;
+    let stats = stats_after_check(&handle, &info_hash)?;
     let pinned_idx = file_index(&stats, "e2.bin");
     handle.pin_download(&info_hash, pinned_idx, &[])?;
     handle.shutdown()?;
@@ -2418,25 +2394,20 @@ fn an_unnamed_pin_set_keeps_every_download_and_lists_it() -> anyhow::Result<()> 
 
     // What an embedder whose own record would not read hands in: nothing.
     let handle = stream_server::start(config(None))?;
-    let base = format!("http://{}", handle.http_addr());
-    let client = bearer_client(&handle)?;
     assert_eq!(
         pieces_held(&cache_root, &info_hash),
         seeded_pieces,
         "nothing was swept on a boot nobody named a pin set to"
     );
 
-    let listed: Vec<serde_json::Value> = client
-        .get(format!("{base}/downloads.json"))
-        .send()?
-        .error_for_status()?
-        .json()?;
+    let listed = serde_json::to_value(handle.downloads()?)?;
+    let listed = listed.as_array().expect("a list");
     assert_eq!(
         listed.len(),
         2,
         "every file of the restored torrent: {listed:?}"
     );
-    for entry in &listed {
+    for entry in listed {
         assert_eq!(entry["infoHash"], info_hash);
     }
 
@@ -2519,7 +2490,7 @@ fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Res
         .json(&serde_json::json!({ "torrent": hex::encode(&streamed_torrent) }))
         .send()?
         .error_for_status()?;
-    let stats = stats_after_check(&client, &base, &streamed_hash)?;
+    let stats = stats_after_check(&handle, &streamed_hash)?;
     assert_eq!(stats["files"][0]["complete"], true, "{stats}");
     assert_eq!(stats["files"][1]["complete"], true, "{stats}");
     // Every file of it, so the whole torrent is kept: see the note above.
@@ -2535,7 +2506,7 @@ fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Res
         .json(&serde_json::json!({ "torrent": hex::encode(&pinned_torrent) }))
         .send()?
         .error_for_status()?;
-    let stats = stats_after_check(&client, &base, &pinned_hash)?;
+    let stats = stats_after_check(&handle, &pinned_hash)?;
     let p2 = file_index(&stats, "p2.bin");
     let info = handle.pin_download(&pinned_hash, p2, &[])?;
     assert_eq!(
@@ -2543,7 +2514,7 @@ fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Res
         Some(session_dir.join("Pinned").join("p2.bin").to_str().unwrap()),
         "librqbit's own folder for the torrent, pinned or not"
     );
-    let stats = stats_after_check(&client, &base, &pinned_hash)?;
+    let stats = stats_after_check(&handle, &pinned_hash)?;
     assert_eq!(stats["files"][p2]["complete"], true, "{stats}");
     assert_eq!(stats["files"][1 - p2]["complete"], false, "{stats}");
 
@@ -2571,7 +2542,7 @@ fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Res
     ])))?;
     let base = format!("http://{}", handle.http_addr());
     let client = bearer_client(&handle)?;
-    let stats = stats_after_check(&client, &base, &streamed_hash)?;
+    let stats = stats_after_check(&handle, &streamed_hash)?;
     assert_eq!(stats["phase"], "ready", "{stats}");
     assert_eq!(stats["files"][0]["complete"], true, "{stats}");
     assert_eq!(stats["files"][1]["complete"], true, "{stats}");
@@ -2600,14 +2571,14 @@ fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Res
     Ok(())
 }
 
-/// The download control routes and the `ServerHandle` methods behind them
-/// are one implementation: `POST /{infoHash}/{fileIdx}/download` (optional
-/// `{"trackers":[..]}` body), `DELETE` of the same path (`?deleteFiles=1`)
-/// and `GET /downloads.json` answer exactly what `pin_download`,
-/// `unpin_download`, `downloads` and `download_path` return. They are
-/// control routes, so they need the bearer token.
+/// The download API -- `pin_download`, `unpin_download`, `downloads`,
+/// `download_path` -- pins a file where its data already is and answers
+/// exactly what it did: a `DownloadInfo` for the pin, `unpinned` and
+/// `deleted_files` for the unpin as what happened rather than the request
+/// echoed, and `FileNotFound` for an index the torrent does not have -- on a
+/// destructive unpin too, which is never read as "the whole torrent".
 #[test]
-fn download_routes_match_the_library_api() -> anyhow::Result<()> {
+fn downloads_pin_in_place_and_delete_only_what_they_say() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
     let src = tempfile::tempdir()?;
@@ -2639,7 +2610,7 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
         .error_for_status()?
         .json()?;
     assert_eq!(created["infoHash"], info_hash);
-    let stats = stats_after_check(&client, &base, &info_hash)?;
+    let stats = stats_after_check(&handle, &info_hash)?;
     let first = file_index(&stats, "e1.bin");
     let second = file_index(&stats, "e2.bin");
 
@@ -2647,42 +2618,22 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
     // change: `<cacheRoot>/rqbit-downloads/<torrent name>`.
     let named = cache_root.join("rqbit-downloads").join("Show Season 2");
 
-    // The routes are token-protected, like every other control route.
-    let anonymous = reqwest::blocking::Client::new();
-    for response in [
-        anonymous
-            .post(format!("{base}/{info_hash}/{first}/download"))
-            .json(&serde_json::json!({ "trackers": [] }))
-            .send()?,
-        anonymous
-            .delete(format!("{base}/{info_hash}/{first}/download"))
-            .send()?,
-        anonymous.get(format!("{base}/downloads.json")).send()?,
-    ] {
-        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
-    }
-    assert!(
-        handle.downloads()?.is_empty(),
-        "nothing pinned by an unauthorized call"
-    );
-
-    // POST == pin_download: the file is pinned where it already is, and the
-    // answer is a DownloadInfo.
-    let pinned: serde_json::Value = client
-        .post(format!("{base}/{info_hash}/{first}/download"))
-        .json(&serde_json::json!({ "trackers": ["udp://pin.invalid:6969/announce"] }))
-        .send()?
-        .error_for_status()?
-        .json()?;
-    assert_eq!(pinned["infoHash"], info_hash);
-    assert_eq!(pinned["fileIdx"], first);
-    assert_eq!(pinned["name"], "e1.bin");
-    assert_eq!(pinned["length"], 40 * 1024);
-    assert_eq!(pinned["error"], serde_json::Value::Null);
+    // The pin: the file is pinned where it already is, and the answer is a
+    // DownloadInfo.
+    let pinned = handle.pin_download(
+        &info_hash,
+        first,
+        &["udp://pin.invalid:6969/announce".to_string()],
+    )?;
+    assert_eq!(pinned.info_hash, info_hash);
+    assert_eq!(pinned.file_idx, first);
+    assert_eq!(pinned.name, "e1.bin");
+    assert_eq!(pinned.length, 40 * 1024);
+    assert_eq!(pinned.error, None);
     assert_eq!(
-        pinned["path"],
-        named.join("e1.bin").to_str().unwrap(),
-        "{pinned}"
+        pinned.path.as_deref(),
+        named.join("e1.bin").to_str(),
+        "{pinned:?}"
     );
     // `path` is where the file *would* be, and no longer where any byte is:
     // a pinned download is piece files like everything else, and the folder
@@ -2694,42 +2645,41 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
         "the pin did not move, lose or duplicate the data"
     );
 
-    // An empty body is a pin with no extra trackers, not a 400.
-    let again = client
-        .post(format!("{base}/{info_hash}/{first}/download"))
-        .send()?;
-    assert!(again.status().is_success(), "{:?}", again.status());
-    let again: serde_json::Value = again.json()?;
-    for key in ["infoHash", "fileIdx", "name", "length", "path", "error"] {
-        assert_eq!(again[key], pinned[key], "{key}");
-    }
+    // No trackers is a pin with no extra trackers, and pinning twice is the
+    // same pin.
+    let again = handle.pin_download(&info_hash, first, &[])?;
+    assert_eq!(
+        (
+            &again.info_hash,
+            again.file_idx,
+            &again.name,
+            again.length,
+            &again.path,
+            &again.error
+        ),
+        (
+            &pinned.info_hash,
+            pinned.file_idx,
+            &pinned.name,
+            pinned.length,
+            &pinned.path,
+            &pinned.error
+        )
+    );
 
-    // The library pins the second file; both are listed, by HTTP and API
-    // alike.
+    // The second file too; both are listed.
     let api = handle.pin_download(&info_hash, second, &[])?;
     assert_eq!(api.name, "e2.bin");
-    stats_after_check(&client, &base, &info_hash)?;
-    let listed: serde_json::Value = client
-        .get(format!("{base}/downloads.json"))
-        .send()?
-        .error_for_status()?
-        .json()?;
-    assert_eq!(listed, serde_json::to_value(handle.downloads()?)?);
-    let indices: Vec<u64> = listed
-        .as_array()
-        .expect("array")
-        .iter()
-        .map(|item| item["fileIdx"].as_u64().expect("fileIdx"))
-        .collect();
-    assert_eq!(indices.len(), 2, "{listed}");
-    assert!(indices.contains(&(first as u64)) && indices.contains(&(second as u64)));
+    stats_after_check(&handle, &info_hash)?;
+    let listed = handle.downloads()?;
+    let indices: Vec<usize> = listed.iter().map(|item| item.file_idx).collect();
+    assert_eq!(indices.len(), 2, "{listed:?}");
+    assert!(indices.contains(&first) && indices.contains(&second));
     assert!(
         listed
-            .as_array()
-            .unwrap()
             .iter()
-            .all(|item| item["infoHash"] == info_hash.as_str() && item["complete"] == true),
-        "{listed}"
+            .all(|item| item.info_hash == info_hash && item.complete),
+        "{listed:?}"
     );
 
     // download_path is the same path the listing reports.
@@ -2740,37 +2690,35 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
     assert_eq!(handle.download_path(&info_hash, 99)?, None);
     assert_eq!(handle.download_path(&"a".repeat(40), 0)?, None);
 
-    // A file the torrent does not have is a 404 on both sides.
-    let missing = client
-        .post(format!("{base}/{info_hash}/9/download"))
-        .send()?;
-    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
-    let body: serde_json::Value = missing.json()?;
+    // A file the torrent does not have is `FileNotFound`, with a message
+    // that says so and names no path.
+    let missing = handle
+        .pin_download(&info_hash, 9, &[])
+        .expect_err("index 9 does not exist");
+    let not_found = missing
+        .downcast_ref::<stream_server::PinDownloadError>()
+        .expect("a typed refusal");
     assert!(
-        body["error"].as_str().unwrap_or_default().contains("range"),
-        "{body}"
+        matches!(
+            not_found,
+            stream_server::PinDownloadError::FileNotFound { .. }
+        ),
+        "{missing:#}"
     );
-    assert_eq!(
-        client
-            .post(format!("{base}/{info_hash}/nope/download"))
-            .send()?
-            .status(),
-        reqwest::StatusCode::NOT_FOUND
-    );
-    assert!(handle.pin_download(&info_hash, 9, &[]).is_err());
+    assert!(not_found.client_message().contains("range"), "{missing:#}");
 
-    // And a *destructive* DELETE for an index the torrent does not have is
-    // the same 404, not a request to delete every file of it.
-    let missing = client
-        .delete(format!("{base}/{info_hash}/9/download?deleteFiles=1"))
-        .send()?;
-    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
-    let body: serde_json::Value = missing.json()?;
+    // And a *destructive* unpin for an index the torrent does not have is
+    // the same refusal, not a request to delete every file of it.
+    let missing = handle
+        .unpin_download(&info_hash, 9, true)
+        .expect_err("index 9 does not exist");
     assert!(
-        body["error"].as_str().unwrap_or_default().contains("range"),
-        "{body}"
+        matches!(
+            missing.downcast_ref::<stream_server::PinDownloadError>(),
+            Some(stream_server::PinDownloadError::FileNotFound { .. })
+        ),
+        "{missing:#}"
     );
-    assert!(handle.unpin_download(&info_hash, 9, true).is_err());
     assert_eq!(
         pieces_held(&cache_root, &info_hash),
         seeded_pieces,
@@ -2778,43 +2726,23 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
     );
     assert_eq!(handle.downloads()?.len(), 2, "and both pins stand");
 
-    // DELETE without deleteFiles: the pin goes, the data stays.
-    let removed: serde_json::Value = client
-        .delete(format!("{base}/{info_hash}/{first}/download"))
-        .send()?
-        .error_for_status()?
-        .json()?;
+    // Unpin without the files: the pin goes, the data stays.
     assert_eq!(
-        removed,
-        serde_json::json!({
-            "infoHash": info_hash,
-            "fileIdx": first,
-            "unpinned": true,
-            "deletedFiles": false,
-        })
+        handle.unpin_download(&info_hash, first, false)?,
+        stream_server::UnpinOutcome {
+            unpinned: true,
+            deleted_files: false,
+        }
     );
     assert_eq!(
         pieces_held(&cache_root, &info_hash),
         seeded_pieces,
         "the bytes stay"
     );
-    let listed: serde_json::Value = client
-        .get(format!("{base}/downloads.json"))
-        .send()?
-        .error_for_status()?
-        .json()?;
-    assert_eq!(listed, serde_json::to_value(handle.downloads()?)?);
-    assert_eq!(listed.as_array().expect("array").len(), 1, "{listed}");
-    assert_eq!(listed[0]["fileIdx"], second);
-    // Nothing to unpin twice, over either surface.
-    assert_eq!(
-        client
-            .delete(format!("{base}/{info_hash}/{first}/download"))
-            .send()?
-            .error_for_status()?
-            .json::<serde_json::Value>()?["unpinned"],
-        false
-    );
+    let listed = handle.downloads()?;
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].file_idx, second);
+    // Nothing to unpin twice.
     assert!(!handle.unpin_download(&info_hash, first, false)?.unpinned);
 
     // The last pin, with the files: the torrent goes with it, and the
@@ -2834,35 +2762,14 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
     );
     assert!(handle.downloads()?.is_empty());
     assert_eq!(handle.download_path(&info_hash, second)?, None);
-    let listed: serde_json::Value = client
-        .get(format!("{base}/downloads.json"))
-        .send()?
-        .error_for_status()?
-        .json()?;
-    assert_eq!(listed, serde_json::json!([]));
 
-    // `deletedFiles` reports what happened, not what was asked for: an
+    // `deleted_files` reports what happened, not what was asked for: an
     // unmanaged hash nothing ever downloaded has no pieces in the store, so
-    // the answer says nothing was deleted instead of echoing the query flag
-    // back. ("Nothing there" is not "freed", and under this storage it is
-    // the ordinary answer.)
-    let unmanaged = "b".repeat(40);
-    let nothing: serde_json::Value = client
-        .delete(format!("{base}/{unmanaged}/0/download?deleteFiles=1"))
-        .send()?
-        .error_for_status()?
-        .json()?;
+    // the answer says nothing was deleted instead of echoing the flag back.
+    // ("Nothing there" is not "freed", and under this storage it is the
+    // ordinary answer.)
     assert_eq!(
-        nothing,
-        serde_json::json!({
-            "infoHash": unmanaged,
-            "fileIdx": 0,
-            "unpinned": false,
-            "deletedFiles": false,
-        })
-    );
-    assert_eq!(
-        handle.unpin_download(&unmanaged, 0, true)?,
+        handle.unpin_download(&"b".repeat(40), 0, true)?,
         stream_server::UnpinOutcome {
             unpinned: false,
             deleted_files: false,
@@ -2874,16 +2781,16 @@ fn download_routes_match_the_library_api() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `GET /stream-numbers.json?url=...` is `ServerHandle::stream_numbers`, and
-/// **a URL this server is not holding is `200 null`, not a `404`.**
+/// `ServerHandle::stream_numbers` for **a URL this server is not holding is
+/// `None`, not an error.**
 ///
 /// The client is not asking whether a resource exists here; it is asking
 /// what we hold of the stream its player is on, and "nothing" is a complete
 /// answer to that -- the ordinary case for every stream this server neither
-/// torrents nor proxies. A `404` would have a panel showing an error for a
-/// film that is playing perfectly.
+/// torrents nor proxies. An error would have a panel showing one for a film
+/// that is playing perfectly.
 #[test]
-fn the_stream_numbers_route_matches_the_library_api() -> anyhow::Result<()> {
+fn stream_numbers_for_a_stream_this_server_does_not_hold_are_none() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
 
@@ -2893,41 +2800,11 @@ fn the_stream_numbers_route_matches_the_library_api() -> anyhow::Result<()> {
         cache_dir: Some(cache_dir.path().join("cache")),
         ..offline_config()
     })?;
-    let base = format!("http://{}", handle.http_addr());
-    let client = bearer_client(&handle)?;
 
-    // A control route, so it takes the token like every other one.
-    assert_eq!(
-        reqwest::blocking::Client::new()
-            .get(format!("{base}/stream-numbers.json?url=/x/0"))
-            .send()?
-            .status(),
-        reqwest::StatusCode::UNAUTHORIZED
-    );
-
-    // A stream this server does not hold: `null`, and the library says the
-    // same.
     let url = format!("http://127.0.0.1:11470/{}/0", "f".repeat(40));
-    // The URL carries no `&` or `=`, so it needs no escaping to survive one
-    // query parameter.
-    let response = client
-        .get(format!("{base}/stream-numbers.json?url={url}"))
-        .send()?;
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        response.json::<serde_json::Value>()?,
-        serde_json::Value::Null
-    );
     assert_eq!(handle.stream_numbers(&url)?, None);
-
-    // And a request that names no stream at all is the client's mistake.
-    assert_eq!(
-        client
-            .get(format!("{base}/stream-numbers.json"))
-            .send()?
-            .status(),
-        reqwest::StatusCode::BAD_REQUEST
-    );
+    // And a URL that is not a stream of this server's at all.
+    assert_eq!(handle.stream_numbers("http://example.org/film.mkv")?, None);
 
     handle.shutdown()?;
     handle.join()?;
@@ -3010,7 +2887,7 @@ fn a_panels_numbers_are_about_the_file_the_url_resolved_to() -> anyhow::Result<(
         .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
         .send()?
         .error_for_status()?;
-    let stats = stats_after_check(&client, &base, &info_hash)?;
+    let stats = stats_after_check(&handle, &info_hash)?;
     let picked_idx = file_index(&stats, "Show.S01E01.mkv");
     let filtered_idx = file_index(&stats, "Show.S01E02.mkv");
     let picked_pieces = file_pieces(&stats, picked_idx, PIECE);
@@ -3217,7 +3094,7 @@ fn a_panel_asking_about_a_torrent_stream_is_told_what_is_on_the_disk() -> anyhow
         .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
         .send()?
         .error_for_status()?;
-    let stats = stats_after_check(&client, &base, &info_hash)?;
+    let stats = stats_after_check(&handle, &info_hash)?;
     let idx = file_index(&stats, "film.bin");
     complete_file_stats(&client, &base, &info_hash, idx, &cache_root)?;
 
@@ -3291,26 +3168,6 @@ fn a_panel_asking_about_a_torrent_stream_is_told_what_is_on_the_disk() -> anyhow
     assert!(
         numbers.sharing.is_some(),
         "a torrent stream's bytes are seeded, so there is a sharing row: {numbers:?}"
-    );
-
-    // And the route a client asks with answers the same stream: the window
-    // is a number there too, not a `null` a panel draws no row for.
-    let answered: serde_json::Value = client
-        .get(format!(
-            "{base}/stream-numbers.json?url={}",
-            urlencoding::encode(&player_url)
-        ))
-        .send()?
-        .error_for_status()?
-        .json()?;
-    assert!(
-        answered["window"]["behindBytes"]
-            .as_u64()
-            .is_some_and(|behind| behind >= PIECE)
-            && answered["window"]["aheadBytes"]
-                .as_u64()
-                .is_some_and(|ahead| ahead >= PIECE),
-        "the window reaches the route a panel really asks with: {answered}"
     );
 
     handle.shutdown()?;
@@ -3413,7 +3270,7 @@ fn the_minute_publishers_cap_follows_the_owners_occupancy() -> anyhow::Result<()
         .error_for_status()?
         .json()?;
     assert_eq!(created["infoHash"], info_hash);
-    let stats = stats_after_check(&client, &base, &info_hash)?;
+    let stats = stats_after_check(&handle, &info_hash)?;
     // Pinned, so nothing is playing it and nothing takes it either: the
     // count under test stays still while the two publications straddle it.
     handle.pin_download(&info_hash, file_index(&stats, "film.mkv"), &[])?;
@@ -3529,7 +3386,7 @@ fn a_clean_restates_the_cap_before_it_reports_it() -> anyhow::Result<()> {
         .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
         .send()?
         .error_for_status()?;
-    let stats = stats_after_check(&client, &base, &info_hash)?;
+    let stats = stats_after_check(&handle, &info_hash)?;
     handle.pin_download(&info_hash, file_index(&stats, "film.mkv"), &[])?;
 
     let report = handle.clean_cache_now()?;
@@ -3550,10 +3407,8 @@ fn a_clean_restates_the_cap_before_it_reports_it() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `GET /cache.json` and `POST /cache/clean` share their functions with
-/// `ServerHandle::{cache_usage, clean_cache_now}`, and the two surfaces
-/// answer the same bytes: the report the route returns is the report the
-/// library call returns, field for field.
+/// `ServerHandle::cache_usage` reads the cache without touching it, and
+/// `ServerHandle::clean_cache_now` answers in the same figures.
 ///
 /// What a clean does is give back both owners' slack, so on this fixture it
 /// gives back **nothing**, and that is the claim. Both of the torrent's
@@ -3568,7 +3423,7 @@ fn a_clean_restates_the_cap_before_it_reports_it() -> anyhow::Result<()> {
 /// So the honest answer to "clean now" here is `overLimit`, and a client
 /// that wants those bytes back unpins something.
 #[test]
-fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
+fn a_clean_takes_no_pinned_and_no_ownerless_byte() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
     let src = tempfile::tempdir()?;
@@ -3623,16 +3478,6 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
     let seeded_pieces = pieces_held(&cache_root, &info_hash);
     let base = format!("http://{}", handle.http_addr());
     let client = bearer_client(&handle)?;
-    let anonymous = reqwest::blocking::Client::new();
-
-    // Both routes are token-protected, like every other control route.
-    for response in [
-        anonymous.get(format!("{base}/cache.json")).send()?,
-        anonymous.post(format!("{base}/cache/clean")).send()?,
-    ] {
-        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
-    }
-    assert!(idle.is_file(), "an unauthorized call cleans nothing");
 
     let created: serde_json::Value = client
         .post(format!("{base}/create"))
@@ -3641,11 +3486,11 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
         .error_for_status()?
         .json()?;
     assert_eq!(created["infoHash"], info_hash);
-    let stats = stats_after_check(&client, &base, &info_hash)?;
+    let stats = stats_after_check(&handle, &info_hash)?;
     for name in ["movie.mkv", "subtitle.srt"] {
         handle.pin_download(&info_hash, file_index(&stats, name), &[])?;
     }
-    stats_after_check(&client, &base, &info_hash)?;
+    stats_after_check(&handle, &info_hash)?;
 
     // Read usage() before touching the limit, to learn how many bytes the
     // pinned files occupy. The limit below sits one byte under that, so the
@@ -3661,14 +3506,9 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
     let limit = baseline.protected_bytes - 1;
     handle.update_settings(serde_json::json!({ "cacheSize": limit as f64 }))?;
 
-    // cache_usage() == GET /cache.json, and reading it evicts nothing.
-    let api_usage = handle.cache_usage()?;
-    let http_usage: serde_json::Value = client
-        .get(format!("{base}/cache.json"))
-        .send()?
-        .error_for_status()?
-        .json()?;
-    assert_eq!(serde_json::to_value(&api_usage)?, http_usage);
+    // Reading the usage evicts nothing. (As JSON: that is how it crosses
+    // FFI, and these are the names the app reads.)
+    let http_usage = serde_json::to_value(handle.cache_usage()?)?;
     assert!(idle.is_file(), "usage() must not touch the filesystem");
     assert!(root_folder.join("movie.mkv").is_file());
     assert_eq!(http_usage["limitBytes"], limit, "{http_usage}");
@@ -3687,16 +3527,11 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
         "{http_usage}"
     );
 
-    // POST /cache/clean over HTTP: both owners give back their slack, and
-    // there is none to give. The pin is kept, and the whole-file copies an
-    // earlier version left behind are nobody's -- in no count and in no
-    // pass -- so every byte this test put on the disk is still there
-    // afterwards.
-    let report: serde_json::Value = client
-        .post(format!("{base}/cache/clean"))
-        .send()?
-        .error_for_status()?
-        .json()?;
+    // The clean: both owners give back their slack, and there is none to
+    // give. The pin is kept, and the whole-file copies an earlier version
+    // left behind are nobody's -- in no count and in no pass -- so every
+    // byte this test put on the disk is still there afterwards.
+    let report = serde_json::to_value(handle.clean_cache_now()?)?;
     assert!(
         idle.is_file(),
         "a byte no owner ever booked is no clean's to take: {report}"
@@ -3713,8 +3548,8 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
     assert_eq!(report["deleted"], 0, "{report}");
     assert_eq!(report["freed"], 0, "{report}");
     // The figures are the owners' own, which is what makes them the same
-    // figures `GET /cache.json` answers: the pinned files, counted as
-    // files, and the cap the process has just restated.
+    // figures `cache_usage` answers: the pinned files, counted as files,
+    // and the cap the process has just restated.
     assert_eq!(report["protectedFiles"], 2, "{report}");
     assert_eq!(report["protected"], baseline.protected_bytes, "{report}");
     assert_eq!(report["limit"], limit, "{report}");
@@ -3728,11 +3563,10 @@ fn cache_routes_match_the_library_api() -> anyhow::Result<()> {
         "the clean's total is the figure the usage route answers: {report}"
     );
 
-    // clean_cache_now() == POST /cache/clean, run right after over the
-    // library instead -- the same function underneath both surfaces, so the
-    // two can never disagree about a field.
-    let api_report = handle.clean_cache_now()?;
-    assert_eq!(serde_json::to_value(&api_report)?, report);
+    // And a second clean right after finds the same nothing.
+    let again = serde_json::to_value(handle.clean_cache_now()?)?;
+    assert_eq!(again["deleted"], 0, "{again}");
+    assert_eq!(again["protectedFiles"], 2, "{again}");
     assert_eq!(pieces_held(&cache_root, &info_hash), seeded_pieces);
 
     handle.shutdown()?;
@@ -3789,7 +3623,7 @@ fn lan_media_server(
         .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
         .send()?
         .error_for_status()?;
-    let stats = stats_after_check(&client, &base, &info_hash)?;
+    let stats = stats_after_check(&handle, &info_hash)?;
     let idx = file_index(&stats, "movie.bin");
     complete_file_stats(&client, &base, &info_hash, idx, &cache_root)?;
 
@@ -3910,28 +3744,24 @@ fn the_servers_own_reconciler_stops_a_torrent_under_the_floor_and_starts_it_agai
         .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
         .send()?
         .error_for_status()?;
-    let stats = stats_after_check(&client, &base, &info_hash)?;
+    let stats = stats_after_check(&handle, &info_hash)?;
     let idx = file_index(&stats, "wanted.bin");
 
     // Nothing of the file is on disk, so it wants every byte it has.
     let stopped_message =
         "the torrent is stopped for want of disk space; free some space and it will resume";
-    let error_of = |client: &reqwest::blocking::Client| -> anyhow::Result<Option<String>> {
-        let stats: serde_json::Value = client
-            .get(format!("{base}/{info_hash}/stats.json"))
-            .send()?
-            .error_for_status()?
-            .json()?;
+    let error_of = |handle: &stream_server::ServerHandle| -> anyhow::Result<Option<String>> {
+        let stats: serde_json::Value = serde_json::to_value(handle.engine_stats(&info_hash, &[])?)?;
         Ok(stats["error"].as_str().map(str::to_owned))
     };
-    assert_eq!(error_of(&client)?, None, "nothing is wrong with it yet");
+    assert_eq!(error_of(&handle)?, None, "nothing is wrong with it yet");
 
     // The volume fills. Bounded poll on what the client can see, never a
     // sleep: the loop runs on its own two-second interval.
     stream_server::pretend_volume_space(&cache_root, 0);
     let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
     loop {
-        if error_of(&client)?.as_deref() == Some(stopped_message) {
+        if error_of(&handle)?.as_deref() == Some(stopped_message) {
             break;
         }
         anyhow::ensure!(
@@ -3964,7 +3794,7 @@ fn the_servers_own_reconciler_stops_a_torrent_under_the_floor_and_starts_it_agai
     }
     let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
     loop {
-        if error_of(&client)? != Some(stopped_message.to_string()) {
+        if error_of(&handle)? != Some(stopped_message.to_string()) {
             break;
         }
         anyhow::ensure!(
@@ -4040,16 +3870,13 @@ fn a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it() -> anyhow
             .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
             .send()?
             .error_for_status()?;
-        stats_after_check(&client, &base, &info_hash)?;
+        stats_after_check(&handle, &info_hash)?;
 
         stream_server::pretend_volume_space(&cache_root, 0);
         let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
         loop {
-            let stats: serde_json::Value = client
-                .get(format!("{base}/{info_hash}/stats.json"))
-                .send()?
-                .error_for_status()?
-                .json()?;
+            let stats: serde_json::Value =
+                serde_json::to_value(handle.engine_stats(&info_hash, &[])?)?;
             // Both, in one reading, rather than breaking on the message and
             // asserting the flag after it: they are two fields of one
             // snapshot and nothing makes them move together, so on a slow
@@ -4077,13 +3904,8 @@ fn a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it() -> anyhow
     stream_server::pretend_available_space(&cache_root, FLOOR + MARGIN - 1);
     let handle = start()?;
     let base = format!("http://{}", handle.http_addr());
-    let client = bearer_client(&handle)?;
-    let swarm_paused = |client: &reqwest::blocking::Client| -> anyhow::Result<bool> {
-        let stats: serde_json::Value = client
-            .get(format!("{base}/{info_hash}/stats.json"))
-            .send()?
-            .error_for_status()?
-            .json()?;
+    let swarm_paused = |handle: &stream_server::ServerHandle| -> anyhow::Result<bool> {
+        let stats: serde_json::Value = serde_json::to_value(handle.engine_stats(&info_hash, &[])?)?;
         Ok(stats["swarmPaused"] == serde_json::json!(true))
     };
     // The initial check has to finish before the state machine can say
@@ -4091,9 +3913,9 @@ fn a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it() -> anyhow
     // `checking` is not that moment, so this is a bounded poll on the
     // reading the rest of the test depends on rather than one assertion
     // taken the instant `phase` moves.
-    stats_after_check(&client, &base, &info_hash)?;
+    stats_after_check(&handle, &info_hash)?;
     let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
-    while !swarm_paused(&client)? {
+    while !swarm_paused(&handle)? {
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
             "the torrent did not come back stopped, as the last process left it"
@@ -4118,7 +3940,7 @@ fn a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it() -> anyhow
         "the timer must not start a torrent into a volume inside the resume margin"
     );
     assert!(
-        swarm_paused(&client)?,
+        swarm_paused(&handle)?,
         "and having decided that, it must have left the torrent stopped"
     );
 
@@ -4140,7 +3962,7 @@ fn a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it() -> anyhow
         (64 * 1024).to_string()
     );
     assert!(
-        swarm_paused(&client)?,
+        swarm_paused(&handle)?,
         "a HEAD reads the file list and opens no stream, so it starts nothing"
     );
 
@@ -4163,7 +3985,7 @@ fn a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it() -> anyhow
         Err(error) => assert!(error.is_timeout(), "{error}"),
     }
     assert!(
-        !swarm_paused(&client)?,
+        !swarm_paused(&handle)?,
         "the request that opened a stream started the torrent it reads from"
     );
 
@@ -4229,21 +4051,17 @@ fn an_archive_member_request_starts_the_torrent_it_reads_from() -> anyhow::Resul
         .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
         .send()?
         .error_for_status()?;
-    stats_after_check(&client, &base, &info_hash)?;
+    stats_after_check(&handle, &info_hash)?;
 
-    let swarm_paused = |client: &reqwest::blocking::Client| -> anyhow::Result<bool> {
-        let stats: serde_json::Value = client
-            .get(format!("{base}/{info_hash}/stats.json"))
-            .send()?
-            .error_for_status()?
-            .json()?;
+    let swarm_paused = |handle: &stream_server::ServerHandle| -> anyhow::Result<bool> {
+        let stats: serde_json::Value = serde_json::to_value(handle.engine_stats(&info_hash, &[])?)?;
         Ok(stats["swarmPaused"] == serde_json::json!(true))
     };
 
     // The volume fills and the server's own reconciler stops the torrent.
     stream_server::pretend_volume_space(&cache_root, 0);
     let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
-    while !swarm_paused(&client)? {
+    while !swarm_paused(&handle)? {
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
             "the reconciler never stopped the torrent"
@@ -4269,7 +4087,7 @@ fn an_archive_member_request_starts_the_torrent_it_reads_from() -> anyhow::Resul
         "the timer must not start a torrent into a volume inside the resume margin"
     );
     assert!(
-        swarm_paused(&client)?,
+        swarm_paused(&handle)?,
         "and having decided that, it must have left the torrent stopped"
     );
 
@@ -4296,7 +4114,7 @@ fn an_archive_member_request_starts_the_torrent_it_reads_from() -> anyhow::Resul
         Err(error) => assert!(error.is_timeout(), "{error}"),
     }
     assert!(
-        !swarm_paused(&client)?,
+        !swarm_paused(&handle)?,
         "the archive request started the torrent it was about to read from"
     );
 
@@ -4414,7 +4232,7 @@ fn archive_member_server_with(
         .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
         .send()?
         .error_for_status()?;
-    stats_after_check(&client, &base, &info_hash)?;
+    stats_after_check(&handle, &info_hash)?;
     Ok((handle, base, info_hash))
 }
 
@@ -4428,16 +4246,8 @@ fn archive_member_url(base: &str, info_hash: &str, member: &str) -> String {
 /// Whether the reconciler has this torrent stopped, as the server reports it:
 /// `swarmPaused` is `run_state() == Paused` read off librqbit, not anything
 /// the route under test writes.
-fn swarm_paused(
-    client: &reqwest::blocking::Client,
-    base: &str,
-    info_hash: &str,
-) -> anyhow::Result<bool> {
-    let stats: serde_json::Value = client
-        .get(format!("{base}/{info_hash}/stats.json"))
-        .send()?
-        .error_for_status()?
-        .json()?;
+fn swarm_paused(handle: &stream_server::ServerHandle, info_hash: &str) -> anyhow::Result<bool> {
+    let stats: serde_json::Value = serde_json::to_value(handle.engine_stats(info_hash, &[])?)?;
     Ok(stats["swarmPaused"] == serde_json::json!(true))
 }
 
@@ -4652,7 +4462,7 @@ fn rar_set_server(
         .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
         .send()?
         .error_for_status()?;
-    stats_after_check(&client, &base, &info_hash)?;
+    stats_after_check(&handle, &info_hash)?;
     Ok((handle, base, info_hash))
 }
 
@@ -4854,7 +4664,7 @@ fn an_archive_body_keeps_its_torrent_running_while_it_is_open() -> anyhow::Resul
         .json(&serde_json::json!({ "torrent": hex::encode(&idle_torrent) }))
         .send()?
         .error_for_status()?;
-    stats_after_check(&client, &base, &idle_hash)?;
+    stats_after_check(&handle, &idle_hash)?;
 
     // The read. The response arrives -- there are bytes to send before the
     // hole -- and the body is then left open, unread, for the rest of the
@@ -4877,9 +4687,7 @@ fn an_archive_body_keeps_its_torrent_running_while_it_is_open() -> anyhow::Resul
     let would_have_stopped = opened + 3 * enginefs::FREE_SPACE_WATCH_INTERVAL;
     let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
     loop {
-        if swarm_paused(&client, &base, &idle_hash)?
-            && std::time::Instant::now() >= would_have_stopped
-        {
+        if swarm_paused(&handle, &idle_hash)? && std::time::Instant::now() >= would_have_stopped {
             break;
         }
         anyhow::ensure!(
@@ -4889,7 +4697,7 @@ fn an_archive_body_keeps_its_torrent_running_while_it_is_open() -> anyhow::Resul
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     assert!(
-        !swarm_paused(&client, &base, &info_hash)?,
+        !swarm_paused(&handle, &info_hash)?,
         "the torrent an archive body is still reading from was stopped under it"
     );
 
@@ -4956,7 +4764,7 @@ fn an_archive_member_read_lets_the_torrent_be_stopped_again_when_it_is_done() ->
         .json(&serde_json::json!({ "torrent": hex::encode(&other_torrent) }))
         .send()?
         .error_for_status()?;
-    let other_stats = stats_after_check(&client, &base, &other_hash)?;
+    let other_stats = stats_after_check(&handle, &other_hash)?;
     let other_idx = file_index(&other_stats, "other.bin");
 
     // The member, read to its end out of the torrent.
@@ -4999,7 +4807,7 @@ fn an_archive_member_read_lets_the_torrent_be_stopped_again_when_it_is_done() ->
          playing something else"
     );
     assert!(
-        !swarm_paused(&client, &base, &info_hash)?,
+        !swarm_paused(&handle, &info_hash)?,
         "and having decided that, the timer must have left it running"
     );
 
@@ -5009,7 +4817,7 @@ fn an_archive_member_read_lets_the_torrent_be_stopped_again_when_it_is_done() ->
         .send()?
         .error_for_status()?;
     let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
-    while !swarm_paused(&client, &base, &info_hash)? {
+    while !swarm_paused(&handle, &info_hash)? {
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
             "the torrent the viewer left is still running"
@@ -5094,7 +4902,7 @@ fn head_on_the_torrent_left(budget: std::time::Duration) -> anyhow::Result<Optio
         .json(&serde_json::json!({ "torrent": hex::encode(&other_torrent) }))
         .send()?
         .error_for_status()?;
-    let other_stats = stats_after_check(&client, &base, &other_hash)?;
+    let other_stats = stats_after_check(&handle, &other_hash)?;
     let other_idx = file_index(&other_stats, "other.bin");
 
     // The tick: nothing is playing, so the timer stops the torrent just
@@ -5103,7 +4911,7 @@ fn head_on_the_torrent_left(budget: std::time::Duration) -> anyhow::Result<Optio
     let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
     loop {
         let asked = std::time::Instant::now();
-        if swarm_paused(&client, &base, &other_hash)? {
+        if swarm_paused(&handle, &other_hash)? {
             break;
         }
         running_at = Some(asked);
@@ -5146,7 +4954,7 @@ fn head_on_the_torrent_left(budget: std::time::Duration) -> anyhow::Result<Optio
         .head(format!("{base}/{left_hash}/{left_idx}"))
         .send()?
         .error_for_status()?;
-    let stopped = swarm_paused(&client, &base, &left_hash)?;
+    let stopped = swarm_paused(&handle, &left_hash)?;
     let conclusive = !stopped || running_at.is_some_and(|at| at.elapsed() < budget);
 
     drop(watching);
@@ -5205,7 +5013,7 @@ fn a_television_above_its_own_floor_streams() -> anyhow::Result<()> {
         .json(&serde_json::json!({ "torrent": hex::encode(&wanting_torrent) }))
         .send()?
         .error_for_status()?;
-    let wanting_stats = stats_after_check(&client, &base, &wanting_hash)?;
+    let wanting_stats = stats_after_check(&handle, &wanting_hash)?;
     let wanting_idx = file_index(&wanting_stats, "wanted.bin");
     enginefs::pretend_volume_total(&cache_root, 4 * 1024 * MIB);
     enginefs::pretend_volume_space(&cache_root, 300 * MIB);
@@ -5268,7 +5076,7 @@ fn a_stream_below_the_free_space_floor_is_refused_not_degraded() -> anyhow::Resu
         .json(&serde_json::json!({ "torrent": hex::encode(&wanting_torrent) }))
         .send()?
         .error_for_status()?;
-    let wanting_stats = stats_after_check(&client, &base, &wanting_hash)?;
+    let wanting_stats = stats_after_check(&handle, &wanting_hash)?;
     let wanting_idx = file_index(&wanting_stats, "wanted.bin");
     let wanting_url = format!("{base}/{wanting_hash}/{wanting_idx}");
 
@@ -5391,7 +5199,7 @@ fn a_stream_refused_for_space_frees_the_slack_and_asks_again() -> anyhow::Result
         .json(&serde_json::json!({ "torrent": hex::encode(&wanting_torrent) }))
         .send()?
         .error_for_status()?;
-    let wanting_stats = stats_after_check(&client, &base, &wanting_hash)?;
+    let wanting_stats = stats_after_check(&handle, &wanting_hash)?;
     let wanting_idx = file_index(&wanting_stats, "wanted.bin");
     let wanting_url = format!("{base}/{wanting_hash}/{wanting_idx}");
 
@@ -5503,7 +5311,7 @@ fn stats_json_reports_the_piece_the_open_reader_waits_for() -> anyhow::Result<()
         .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
         .send()?
         .error_for_status()?;
-    let stats = stats_after_check(&client, &base, &info_hash)?;
+    let stats = stats_after_check(&handle, &info_hash)?;
     let idx = file_index(&stats, "movie.bin");
 
     // Polling stats is not opening a stream: nothing is in flight yet.
@@ -5608,14 +5416,9 @@ fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> 
     let anonymous = reqwest::blocking::Client::new();
     let with_token = bearer_client(&handle)?;
     for path in [
-        "/heartbeat",
-        "/stats.json",
         "/settings",
         "/network-info",
         "/device-info",
-        "/downloads.json",
-        "/cache.json",
-        "/stream-numbers.json?url=/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/0",
         "/get-https?ipAddress=127.0.0.1",
         "/casting",
     ] {
@@ -5652,31 +5455,6 @@ fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> 
         anonymous
             .post(format!("{lan}/settings"))
             .json(&serde_json::json!({ "cacheSize": 1.0 }))
-            .send()?
-            .status(),
-        reqwest::StatusCode::NOT_FOUND
-    );
-    // `POST /cache/clean` is not a route on the LAN listener either -- but
-    // its two segments match the stream route's `/{infoHash}/{fileIdx}`
-    // pattern (`"cache"`/`"clean"` parse as neither, so it would 404 on
-    // content, but routing happens on shape first), and that route only
-    // answers GET/HEAD, so this is the same collision as
-    // `/{infoHash}/create` below: `405`, not `404`, with the control
-    // handler still never reached.
-    assert_eq!(
-        anonymous
-            .post(format!("{lan}/cache/clean"))
-            .send()?
-            .status(),
-        reqwest::StatusCode::METHOD_NOT_ALLOWED
-    );
-    // `POST /proxy-streams/{token}/close` ends a player's proxied stream.
-    // The LAN listener serves no `/proxy` and no control route, so there is
-    // nothing there to close and no route to ask: cutting another device's
-    // playback is not something to hand the network.
-    assert_eq!(
-        anonymous
-            .post(format!("{lan}/proxy-streams/player-one/close"))
             .send()?
             .status(),
         reqwest::StatusCode::NOT_FOUND
@@ -5836,11 +5614,7 @@ fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> 
         ))
         .send()?;
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
-    let stats: serde_json::Value = with_token
-        .get(format!("{base}/{unknown}/stats.json"))
-        .send()?
-        .error_for_status()?
-        .json()?;
+    let stats: serde_json::Value = serde_json::to_value(handle.engine_stats(unknown, &[])?)?;
     let sources = stats["sources"].to_string();
     assert!(
         !sources.contains("attacker.invalid"),
@@ -6057,11 +5831,14 @@ fn set_lan_media_toggles_the_listener_and_the_setting_can_forbid_it() -> anyhow:
 
     // And the loopback listener still serves control routes too.
     let heartbeat: serde_json::Value = bearer_client(&handle)?
-        .get(format!("{base}/heartbeat"))
+        .get(format!("{base}/device-info"))
         .send()?
         .error_for_status()?
         .json()?;
-    assert_eq!(heartbeat["success"], true);
+    assert_eq!(
+        heartbeat["availableHardwareAccelerations"],
+        serde_json::json!([])
+    );
 
     handle.shutdown()?;
     handle.join()?;
@@ -6155,11 +5932,14 @@ fn a_configured_lan_media_address_binds_nothing_until_a_cast_asks() -> anyhow::R
     assert!(!handle.lan_media_running());
     assert_eq!(handle.lan_media_addr(), None);
     let heartbeat: serde_json::Value = bearer_client(&handle)?
-        .get(format!("{base}/heartbeat"))
+        .get(format!("{base}/device-info"))
         .send()?
         .error_for_status()?
         .json()?;
-    assert_eq!(heartbeat["success"], true);
+    assert_eq!(
+        heartbeat["availableHardwareAccelerations"],
+        serde_json::json!([])
+    );
 
     // Asking for the listener while the port is taken fails the ask, and
     // only the ask.
@@ -6172,11 +5952,14 @@ fn a_configured_lan_media_address_binds_nothing_until_a_cast_asks() -> anyhow::R
     );
     assert!(!handle.lan_media_running());
     let heartbeat: serde_json::Value = bearer_client(&handle)?
-        .get(format!("{base}/heartbeat"))
+        .get(format!("{base}/device-info"))
         .send()?
         .error_for_status()?
         .json()?;
-    assert_eq!(heartbeat["success"], true);
+    assert_eq!(
+        heartbeat["availableHardwareAccelerations"],
+        serde_json::json!([])
+    );
 
     // Port released: the same server binds it on the next ask.
     drop(taken);
@@ -6509,7 +6292,7 @@ fn a_torrent_source_registers_its_stream_and_seeks_past_what_it_does_not_need() 
         .json(&serde_json::json!({ "torrent": hex::encode(&idle_torrent) }))
         .send()?
         .error_for_status()?;
-    stats_after_check(&client, &base, &idle_hash)?;
+    stats_after_check(&handle, &idle_hash)?;
 
     // The source, opened on the torrent's one file and held for the rest of
     // the test -- which is what a translated session does with it.
@@ -6579,9 +6362,7 @@ fn a_torrent_source_registers_its_stream_and_seeks_past_what_it_does_not_need() 
     let would_have_stopped = opened + 3 * enginefs::FREE_SPACE_WATCH_INTERVAL;
     let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
     loop {
-        if swarm_paused(&client, &base, &idle_hash)?
-            && std::time::Instant::now() >= would_have_stopped
-        {
+        if swarm_paused(&handle, &idle_hash)? && std::time::Instant::now() >= would_have_stopped {
             break;
         }
         anyhow::ensure!(
@@ -6591,7 +6372,7 @@ fn a_torrent_source_registers_its_stream_and_seeks_past_what_it_does_not_need() 
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     assert!(
-        !swarm_paused(&client, &base, &info_hash)?,
+        !swarm_paused(&handle, &info_hash)?,
         "the torrent a source is open on was stopped under it"
     );
 
@@ -6681,7 +6462,7 @@ fn an_embedder_that_has_pinned_nothing_keeps_no_torrent_nobody_plays() -> anyhow
         .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
         .send()?
         .error_for_status()?;
-    stats_after_check(&client, &base, &info_hash)?;
+    stats_after_check(&handle, &info_hash)?;
 
     let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
     loop {
@@ -6753,7 +6534,7 @@ fn a_seeded_fixture_is_still_read_after_the_pass_that_would_have_taken_it() -> a
         .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
         .send()?
         .error_for_status()?;
-    let stats = stats_after_check(&client, &base, &info_hash)?;
+    let stats = stats_after_check(&handle, &info_hash)?;
     let idx = file_index(&stats, "film.bin");
 
     std::thread::sleep(WAITED);

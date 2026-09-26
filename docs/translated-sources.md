@@ -141,7 +141,7 @@ Implementations, in order of need:
   This is the one piece of new plumbing of any size, and it is a
   refactor of code the proxy route already has, into a function both can
   call. The cache stays the owner of the bytes; the retention owner keeps
-  reclaiming them; `/stream-numbers.json` keeps answering for them.
+  reclaiming them; `ServerHandle::stream_numbers` keeps answering for them.
   Credentials travel as the proxy already carries them (`h=` request
   headers, kept out of the cache key's credential set and out of logs).
 * **`MemberView`** (below) is a `ByteSource` too, so a translator can sit on
@@ -457,7 +457,7 @@ it and why.
 exist, and it does -- for a fresh install. For an **upgraded** one it is
 already there, holding about twice the size of every archive played since
 that build's last clean exit, and nothing else would ever take it: no
-retention owner speaks for those bytes, `GET /cache.json` does not count
+retention owner speaks for those bytes, `ServerHandle::cache_usage` does not count
 them, and the piece store's legacy sweep walks
 `<cacheRoot>/rqbit-downloads`, one level *below* where `.archives` sits.
 (Which is also why removing it from `NOT_OURS` frees nothing by itself:

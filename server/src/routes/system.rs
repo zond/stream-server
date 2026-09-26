@@ -2,7 +2,7 @@ use crate::routes::compat;
 use crate::state::AppState;
 use axum::{
     Json,
-    extract::{Query, RawQuery, State},
+    extract::{RawQuery, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -14,7 +14,6 @@ use enginefs::backend::{
 };
 use enginefs::{EngineLookup, FailedMagnetAdd, PendingMagnetAdd};
 use serde_json::{Value, json};
-use std::time::{Duration, Instant};
 
 /// Whether this server is using the connection while nothing is playing,
 /// in each direction -- what a client's "working in the background" light
@@ -50,97 +49,11 @@ pub async fn background_traffic(state: &AppState) -> enginefs::traffic::Backgrou
     state.traffic_window.sample(totals, playing)
 }
 
-#[derive(serde::Deserialize)]
-pub struct StatsParams {
-    pub sys: Option<String>, // "1"
-}
-
-// stats.json?sys=1 is polled by players roughly once a second. A full
-// `System::new_all()` + `refresh_all()` sweeps processes, memory, and every
-// disk on top of CPU info — 50-300ms of synchronous /proc scanning that,
-// run inline in an async handler, blocks a tokio worker thread on every
-// poll. Refresh only the CPU specifics the response actually reads (brand,
-// frequency) off the blocking thread pool, and cache the short-lived result
-// the same way DISK_SPACE_CACHE caches disk space (routes/stream.rs).
-type SysInfoCache = std::sync::Mutex<Option<(Instant, Value)>>;
-static SYS_INFO_CACHE: std::sync::OnceLock<SysInfoCache> = std::sync::OnceLock::new();
-const SYS_INFO_CACHE_TTL: Duration = Duration::from_secs(1);
-
-async fn cached_sys_info() -> Value {
-    let cache = SYS_INFO_CACHE.get_or_init(|| std::sync::Mutex::new(None));
-
-    if let Ok(guard) = cache.lock()
-        && let Some((at, value)) = guard.as_ref()
-        && at.elapsed() < SYS_INFO_CACHE_TTL
-    {
-        return value.clone();
-    }
-
-    let value = tokio::task::spawn_blocking(sys_info_uncached)
-        .await
-        .unwrap_or_else(|_| json!({ "loadavg": [0.0, 0.0, 0.0], "cpus": [] }));
-
-    if let Ok(mut guard) = cache.lock() {
-        *guard = Some((Instant::now(), value.clone()));
-    }
-    value
-}
-
-fn sys_info_uncached() -> Value {
-    let refresh = sysinfo::RefreshKind::nothing().with_cpu(sysinfo::CpuRefreshKind::everything());
-    let system = sysinfo::System::new_with_specifics(refresh);
-    let loadavg = sysinfo::System::load_average();
-    json!({
-        "loadavg": [loadavg.one, loadavg.five, loadavg.fifteen],
-        "cpus": system.cpus().iter().map(|cpu| {
-            json!({
-                "model": cpu.brand(),
-                "speed": cpu.frequency(),
-            })
-        }).collect::<Vec<_>>()
-    })
-}
-
 /// Whether the mainline DHT works on this host -- see
 /// [`enginefs::backend::DhtStatus`] and `crate::diagnostics::dht_health`.
-/// Shared by `GET /stats.json`'s `dht` key and
-/// [`crate::ServerHandle::dht_status`], per the library-parity rule.
+/// Behind [`crate::ServerHandle::dht_status`]; no route reports it.
 pub fn dht_status(state: &AppState) -> enginefs::backend::DhtStatus {
     state.engine.clone().dht_status()
-}
-
-pub async fn get_stats(
-    State(state): State<AppState>,
-    Query(params): Query<StatsParams>,
-) -> impl IntoResponse {
-    let engines = state.engine.get_all_statistics().await;
-
-    // Convert engines HashMap to Value
-    let mut root: serde_json::Map<String, Value> = serde_json::Map::new();
-
-    for (hash, stats) in engines {
-        root.insert(hash, serde_json::to_value(stats).unwrap_or(Value::Null));
-    }
-
-    // Alongside the per-torrent entries (keyed by 40-hex info hash) and the
-    // optional `sys` probe, so a client can say "DHT unavailable, using
-    // trackers only" without a route of its own. Always present: a client
-    // that finds no `dht` key is talking to an older server, which is a
-    // different thing from a DHT that never came up.
-    root.insert(
-        "dht".to_string(),
-        serde_json::to_value(dht_status(&state)).unwrap_or(Value::Null),
-    );
-
-    if params.sys.as_deref() == Some("1") {
-        root.insert("sys".to_string(), cached_sys_info().await);
-    }
-
-    Json(Value::Object(root))
-}
-
-pub async fn heartbeat() -> impl IntoResponse {
-    Json(json!({ "success": true }))
 }
 
 // stremio-core probes this at startup (models/streaming_server.rs) expecting
@@ -1203,15 +1116,16 @@ fn magnet_add_failed_stats(info_hash: &str, failed: &FailedMagnetAdd) -> EngineS
     EngineStats::magnet_add_failed(info_hash, &failed.trackers, &failed.error.client_message())
 }
 
-/// Torrent-level stats for `info_hash`, exactly what `GET /{infoHash}/stats.json`
-/// answers: the statistics of an existing engine, else -- this being the first
-/// request for the hash -- the engine is created in the stream engine with
-/// `trackers` and `resolvingMetadata` stats come back at once; a failed add
-/// reports `phase: error`. `trackers` are the raw tracker sources (the
-/// request's `tr=` values, or whatever the library caller passes) and are
-/// normalised here (`compat::normalize_tracker_sources`: `tracker:` prefixes
-/// stripped, `dht:` entries dropped, whitespace trimmed) so the HTTP route and
-/// `ServerHandle::engine_stats` cannot disagree. Shared by both.
+/// Torrent-level stats for `info_hash` (`ServerHandle::engine_stats`; the
+/// `GET /{infoHash}/stats.json` route that answered the same went with the
+/// other control routes nothing called): the statistics of an existing
+/// engine, else -- this being the first request for the hash -- the engine
+/// is created in the stream engine with `trackers` and `resolvingMetadata`
+/// stats come back at once; a failed add reports `phase: error`. `trackers`
+/// are raw tracker sources (a stream's `sources` as the caller has them) and
+/// are normalised here (`compat::normalize_tracker_sources`: `tracker:`
+/// prefixes stripped, `dht:` entries dropped, whitespace trimmed), the same
+/// way [`file_stats`] normalises the route's `tr=` values.
 pub async fn engine_stats(state: &AppState, info_hash: &str, trackers: Vec<String>) -> EngineStats {
     let info_hash = info_hash.to_lowercase();
     let trackers = compat::normalize_tracker_sources(trackers);
@@ -1301,16 +1215,6 @@ pub async fn file_stats(
     // Startup phase / initial-window readiness for this exact file too.
     stats.focus_stream_file(idx);
     Ok(stats)
-}
-
-pub async fn get_engine_stats(
-    State(state): State<AppState>,
-    axum::extract::Path(info_hash): axum::extract::Path<String>,
-    RawQuery(query_str): RawQuery,
-) -> Response {
-    // Raw `tr=` values: `engine_stats` normalises them.
-    let trackers = compat::query_values(query_str.as_deref(), "tr");
-    Json(engine_stats(&state, &info_hash, trackers).await).into_response()
 }
 
 pub async fn get_file_stats(
@@ -1495,42 +1399,6 @@ mod tests {
         let error = json["error"].as_str().expect("error string");
         assert!(!error.is_empty());
         assert!(!error.contains("/home/user"), "{error}");
-    }
-
-    #[test]
-    fn sys_info_uncached_has_the_shape_stats_json_needs() {
-        let value = sys_info_uncached();
-        let loadavg = value["loadavg"].as_array().expect("loadavg array");
-        assert_eq!(loadavg.len(), 3);
-
-        let cpus = value["cpus"].as_array().expect("cpus array");
-        assert!(!cpus.is_empty(), "expected at least one reported CPU");
-        for cpu in cpus {
-            assert!(cpu["model"].is_string());
-            assert!(cpu["speed"].is_number());
-        }
-    }
-
-    /// stats.json?sys=1 is polled ~1Hz by players; a fresh call after the
-    /// TTL and a repeat call within it must both return the same shape, and
-    /// the cached path must not re-run the sysinfo sweep (asserted here by
-    /// checking the second call is effectively instantaneous, unlike the
-    /// 50-300ms a real /proc sweep takes).
-    #[tokio::test]
-    async fn cached_sys_info_serves_repeat_calls_from_cache() {
-        let first = cached_sys_info().await;
-        assert!(first["cpus"].is_array());
-
-        let start = Instant::now();
-        let second = cached_sys_info().await;
-        let elapsed = start.elapsed();
-
-        assert_eq!(first, second);
-        assert!(
-            elapsed < Duration::from_millis(20),
-            "expected a cache hit to be near-instant, took {:?}",
-            elapsed
-        );
     }
 
     #[test]

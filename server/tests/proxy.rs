@@ -1625,7 +1625,7 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// **What `POST /cache/clean` takes is the slack, and only the slack.**
+/// **What `clean_cache_now` takes is the slack, and only the slack.**
 ///
 /// Cached proxy bytes are ordinary cache and a proxied stream the viewer
 /// has left is the first thing that should go -- a clean is one of the four
@@ -1706,7 +1706,7 @@ fn cleaning_now_takes_the_proxied_stream_the_viewer_left_and_not_the_one_playing
     Ok(())
 }
 
-/// **`GET /cache.json` counts the proxy's chunks as the fill books them,
+/// **`cache_usage` counts the proxy's chunks as the fill books them,
 /// and names what the stream being played keeps -- with nothing having
 /// walked the tree.**
 ///
@@ -1945,7 +1945,7 @@ const RETENTION_BUDGET: u64 = 8 * 1024 * 1024;
 /// and the next pass, which is a minute after the last write at best --
 /// would be bounded by nothing at all.
 ///
-/// The reading is `GET /cache.json`'s, which is the same arithmetic
+/// The reading is `cache_usage`'s, which is the same arithmetic
 /// (`CacheLimit::effective`) and evicts nothing: it says the volume this
 /// test runs on is roomy enough that `cacheSize` is the smaller of the two,
 /// so a volume too full to give the configured cap fails the test loudly
@@ -6116,17 +6116,9 @@ fn closing_one_player_token_ends_that_stream_and_leaves_the_other_playing() -> a
         "GET /other.mkv HTTP/1.1"
     );
 
-    // Close the first player's stream over the control API, with the bearer
-    // token that API requires.
-    let control = reqwest::blocking::Client::new()
-        .post(format!("{}/proxy-streams/player-one/close", fixture.base))
-        .bearer_auth(fixture.handle.auth_token().expect("a generated token"))
-        .send()?;
-    assert_eq!(control.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        control.json::<serde_json::Value>()?,
-        serde_json::json!({ "closed": 1 })
-    );
+    // Close the first player's stream through the embed API, which is how
+    // the app asks.
+    assert_eq!(fixture.handle.close_proxy_streams("player-one"), 1);
 
     // The closed player's read fails now rather than in a minute's time...
     std::io::copy(&mut watching, &mut std::io::sink())
@@ -6449,19 +6441,6 @@ fn closing_during_the_cached_head_of_a_stitched_response_breaks_the_read() -> an
          of a {head_len}-byte head"
     );
     assert_eq!(fixture.handle.proxy_streams_live(), 0);
-
-    drop(fixture.handle);
-    Ok(())
-}
-
-/// The control route is a control route: no token, no close.
-#[test]
-fn closing_a_stream_needs_the_control_token() -> anyhow::Result<()> {
-    let fixture = fixture()?;
-    let response = reqwest::blocking::Client::new()
-        .post(format!("{}/proxy-streams/player-one/close", fixture.base))
-        .send()?;
-    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
 
     drop(fixture.handle);
     Ok(())

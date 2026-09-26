@@ -47,7 +47,7 @@
 //! held in Error, a directory a previous run left, the strays, and the
 //! staged copies of the pieces being written. Reading those costs a
 //! `read_dir` and a `stat` each, so they are read on demand for
-//! `GET /cache.json` (`enginefs::EngineFS::cache_holdings`) and not on the
+//! `ServerHandle::cache_usage` (`enginefs::EngineFS::cache_holdings`) and not on the
 //! minute timer. The cap is therefore stated over the complete pieces this
 //! session holds, which understates the volume by whatever an earlier one
 //! left and by the pieces in flight -- the safe
@@ -278,7 +278,7 @@ pub(crate) fn publish(
 /// is still a publication.
 ///
 /// **`occupied` is what the owners hold, and deliberately not the whole
-/// figure `GET /cache.json` reports.** That one adds
+/// figure `ServerHandle::cache_usage` reports.** That one adds
 /// `StoreRegistry::unregistered_bytes` -- a torrent the session is holding
 /// in Error, a directory a previous process left, and the staged copies of
 /// the pieces a live store is writing -- which costs a `read_dir` and a

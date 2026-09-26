@@ -1542,7 +1542,7 @@ impl ProxyRetention {
     }
 
     /// What a live proxied entity keeps, in bytes, and how many entities
-    /// that is: the proxy's half of `GET /cache.json`'s protection.
+    /// that is: the proxy's half of `ServerHandle::cache_usage`'s protection.
     ///
     /// Live is the same question [`Self::drop_slack`] asks and the same
     /// answer: the entity the cell names, and any entity an open body is
@@ -1607,7 +1607,7 @@ impl ProxyRetention {
     /// moment the viewer opened something else, which is exactly when this
     /// is called (the switch task on `Live::changed`), the moment the
     /// volume runs low (the same task, on the running-low bell), and
-    /// `POST /cache/clean`.
+    /// `ServerHandle::clean_cache_now`.
     ///
     /// One reading of the cell for the whole sweep, and every entity it
     /// does not name with no read open on it is slack. The reading is not
@@ -2109,7 +2109,7 @@ mod tests {
 
     /// **And the two readings a client sees come off the same set.**
     ///
-    /// `GET /cache.json`'s protection figure and the panel's window were
+    /// `cache_usage`'s protection figure and the panel's window were
     /// the other two callers of the listing, and they are the reason
     /// `ChunkDir::held` was on a hot path three times over rather than
     /// once. They read the owner's set now, which is not merely cheaper: a

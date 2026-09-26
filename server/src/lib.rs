@@ -247,8 +247,8 @@ pub struct ServerConfig {
     /// client secret lives there and never on the device (see
     /// `routes::drive` and `sources::drive`).
     ///
-    /// `None` -- the default -- means `POST /drive/create` refuses with
-    /// `noPairingService` and nothing else changes. This repository ships
+    /// `None` -- the default -- means [`ServerHandle::open_drive_file`]
+    /// refuses with `noPairingService` and nothing else changes. This repository ships
     /// no such service and must not invent one: a wrong endpoint is a
     /// refresh token posted to somebody else's host.
     pub drive_refresh_endpoint: Option<url::Url>,
@@ -383,8 +383,8 @@ impl ServerHandle {
         self.block_on_server(async move { routes::system::update_settings(&state, &patch).await })?
     }
 
-    /// Whether the mainline DHT works on this host, exactly what the `dht`
-    /// key of `GET /stats.json` answers (see `routes::system::dht_status`).
+    /// Whether the mainline DHT works on this host (see
+    /// `routes::system::dht_status`).
     ///
     /// The DHT is a peer *source*, not a requirement: a torrent with working
     /// trackers downloads fine without one. A network that drops the DHT's
@@ -479,8 +479,7 @@ impl ServerHandle {
         self.block_on_server(async move { routes::system::background_traffic(&state).await })
     }
 
-    /// What this server holds of the stream a player is playing, exactly
-    /// what `GET /stream-numbers.json?url=...` answers (see
+    /// What this server holds of the stream a player is playing (see
     /// `crate::stream_numbers`): the cache around the playhead, and for a
     /// torrent the set committed for sharing and what the session has
     /// moved.
@@ -503,16 +502,14 @@ impl ServerHandle {
     ) -> anyhow::Result<Option<stream_numbers::StreamNumbers>> {
         let state = self.state.clone();
         let url = url.to_string();
-        self.block_on_server(
-            async move { routes::stream_numbers::stream_numbers(&state, &url).await },
-        )
+        self.block_on_server(async move { stream_numbers::stream_numbers(&state, &url).await })
     }
 
-    /// Torrent-level stats, exactly what `GET /{infoHash}/stats.json?tr=...`
-    /// answers (see `routes::system::engine_stats`): `trackers` are the
-    /// `tr=` values -- normalised exactly as the route normalises them
-    /// (`tracker:` prefixes stripped, `dht:` entries dropped, trimmed), so a
-    /// stream's `sources` list can be passed as is -- and are only used when
+    /// Torrent-level stats (see `routes::system::engine_stats`): `trackers`
+    /// are a stream's tracker sources -- normalised exactly as the stream and
+    /// stats routes normalise their `tr=` values (`tracker:` prefixes
+    /// stripped, `dht:` entries dropped, trimmed), so a stream's `sources`
+    /// list can be passed as is -- and are only used when
     /// this call is the one that creates the engine; a magnet still resolving
     /// reports `phase: resolvingMetadata` immediately, a failed add
     /// `phase: error`.
@@ -575,7 +572,7 @@ impl ServerHandle {
 
     /// Drop the pin on `file_idx` of `info_hash` (see
     /// `routes::downloads::unpin_download`, which
-    /// `DELETE /{infoHash}/{fileIdx}/download?deleteFiles=1` shares).
+    /// is the whole of it).
     /// [`UnpinOutcome::unpinned`] says whether a pin was cleared -- false
     /// for an unknown torrent or an unpinned file -- and
     /// [`UnpinOutcome::deleted_files`] whether data actually went, which is
@@ -601,9 +598,8 @@ impl ServerHandle {
         Ok(outcome?)
     }
 
-    /// Pins an addon URL or a Drive file as an offline download -- exactly
-    /// what `POST /downloads` answers (see `routes::downloads::pin_proxy_download`
-    /// and `crate::proxy_downloads`). The row's `info_hash` is the key to
+    /// Pins an addon URL or a Drive file as an offline download (see
+    /// `routes::downloads::pin_proxy_download` and `crate::proxy_downloads`). The row's `info_hash` is the key to
     /// drop it by ([`Self::unpin_proxy_download`]).
     pub fn pin_proxy_download(
         &self,
@@ -623,7 +619,7 @@ impl ServerHandle {
     }
 
     /// Drops a proxy download's pin by its key, with `delete_files` its
-    /// bytes -- exactly what `DELETE /downloads/{key}` answers.
+    /// bytes.
     pub fn unpin_proxy_download(
         &self,
         key: &str,
@@ -636,8 +632,7 @@ impl ServerHandle {
         })
     }
 
-    /// Every pinned download, exactly what `GET /downloads.json` answers
-    /// (see `routes::downloads::downloads`).
+    /// Every pinned download (see `routes::downloads::downloads`).
     pub fn downloads(&self) -> anyhow::Result<Vec<DownloadInfo>> {
         let state = self.state.clone();
         self.block_on_server(async move { routes::downloads::downloads(&state).await })
@@ -666,9 +661,8 @@ impl ServerHandle {
     }
 
     /// Open a file in a paired Google Drive and hand back a URL a player
-    /// can fetch -- exactly what `POST /drive/create` answers (see
-    /// `routes::drive::open_file`, which the route shares), with the
-    /// stream path made absolute on this server.
+    /// can fetch (see `routes::drive::open_file`), with the stream path made
+    /// absolute on this server.
     ///
     /// **This is how an embedder asks, and why the credential never
     /// becomes a request.** The refresh token is an argument to a function
@@ -704,8 +698,8 @@ impl ServerHandle {
     /// What the cache currently occupies against its configured limit, in
     /// the one occupancy accounting this repository has
     /// (`enginefs::chunk_store::occupied_bytes` -- allocated blocks, not
-    /// apparent length), exactly what `GET /cache.json` answers (see
-    /// `routes::cache::cache_usage`). [`CacheUsage::protected_bytes`] and
+    /// apparent length); see `cache_cleaner::usage`.
+    /// [`CacheUsage::protected_bytes`] and
     /// `protected_files` are what a pin or the stream being played is
     /// holding right now, so a caller can tell "over the limit but nothing
     /// is disposable" apart from "a clean would help" without running one.
@@ -718,12 +712,12 @@ impl ServerHandle {
     /// do not poll it on a sub-second timer.
     pub fn cache_usage(&self) -> anyhow::Result<CacheUsage> {
         let state = self.state.clone();
-        self.block_on_server(async move { routes::cache::cache_usage(&state).await })
+        self.block_on_server(async move { cache_cleaner::usage(&state).await })
     }
 
     /// Give back everything nobody is playing and nobody is reading, now,
-    /// and report what is left -- exactly what `POST /cache/clean` answers
-    /// (see `routes::cache::clean_cache_now`). A pinned download's files
+    /// and report what is left (see `cache_cleaner::drop_slack`, which the
+    /// reconciler's tick and a viewer's switch run too). A pinned download's files
     /// and the window of the stream being played are never touched, however
     /// far over the limit the cache is; [`EvictionReport::shortfall_message`]
     /// is the line to show the user when that leaves it still over: nothing
@@ -731,7 +725,7 @@ impl ServerHandle {
     /// the stream or unpin the download, not to run the clean again.
     pub fn clean_cache_now(&self) -> anyhow::Result<EvictionReport> {
         let state = self.state.clone();
-        self.block_on_server(async move { routes::cache::clean_cache_now(&state).await })?
+        self.block_on_server(async move { cache_cleaner::drop_slack(&state).await })
     }
 
     /// The cap the budget publisher last stated, as the owners of the cache
@@ -812,8 +806,7 @@ impl ServerHandle {
     }
 
     /// End every proxied stream the client marked with `token`, and answer
-    /// how many that was -- exactly what
-    /// `POST /proxy-streams/{token}/close` does, through the same function.
+    /// how many that was.
     ///
     /// The token is the client's own: it mints one per player and puts it in
     /// the `/proxy` URL that player is given (`p=`). Closing it here makes
@@ -1862,7 +1855,7 @@ fn lan_cors_layer() -> CorsLayer {
 /// downloads, stats or the torrent session with a guessed or leaked token.
 ///
 /// Two-segment paths that are not media -- `/{infoHash}/create`,
-/// `/cache/clean`, `/proxy/x`, `/ftp/x`, `/rar/create` -- collide with the
+/// `/proxy/x`, `/ftp/x`, `/rar/create` -- collide with the
 /// `/{infoHash}/{fileIdx}` pattern and are answered by that route: `405`
 /// for a method it does not take, and for a `GET` or `HEAD` the LAN stream
 /// handler's `404`, because it looks the first segment up as an info hash
@@ -2007,10 +2000,11 @@ fn media_router() -> Router<AppState> {
         .merge(archive_routes())
         .merge(routes::proxy::router())
         .nest("/ftp", routes::ftp::router())
-        // The byte-serving half of the Drive API, and only that half: the
-        // create is a control route because its body carries the account's
-        // grant (`routes::drive`). This URL carries a random key and no
-        // credential, which is what lets a player fetch it.
+        // The byte-serving half of the Drive API, and the only half that is
+        // a route: the open is `ServerHandle::open_drive_file`, because its
+        // argument is the account's grant (`routes::drive`). This URL
+        // carries a random key and no credential, which is what lets a
+        // player fetch it.
         .merge(routes::drive::stream_routes())
         .merge(local_addon_routes())
 }
@@ -2050,14 +2044,48 @@ fn lan_media_routes() -> Router<AppState> {
 /// envelope, so about half of this is the file.
 const MAX_CREATE_BODY: usize = 32 * 1024 * 1024;
 
-/// Everything that is not media bytes: what stremio-core's StreamingServer
-/// model calls through `Env::fetch`, plus the app/test status routes. Every
-/// route here requires `Authorization: Bearer <token>` (see `auth`); a new
-/// route goes here unless it serves media bytes to a player.
+/// **Why this server speaks HTTP at all, and to whom.** Two callers, and
+/// only two:
+///
+/// 1. **Players**, which fetch media by URL and cannot attach a header.
+///    That is [`media_router`], open, and it is where a route that hands a
+///    player bytes belongs.
+/// 2. **stremio-core's `StreamingServer` model**, which speaks Stremio's
+///    streaming-server protocol over HTTP through the app's `Env::fetch`
+///    (which attaches the bearer). Our fork of stremio-core is changed as
+///    little as possible -- by policy, so that it keeps following upstream
+///    -- and so the routes it calls stay exactly as it calls them. That is
+///    this router, and it is **all** of this router: `/settings`,
+///    `/create`, `/{infoHash}/create`, `/{infoHash}/{fileIdx}/stats.json`,
+///    `/network-info`, `/device-info`, `/get-https`, `/casting` and
+///    `/casting/{devID}/player` (`src/models/streaming_server.rs`,
+///    `src/models/streaming_server/casting.rs` and
+///    `src/types/streaming_server/request.rs` in the core fork name them),
+///    plus the archive `/create`s under [`media_router`] that
+///    `types/resource/stream.rs` builds.
+///
+/// **The app itself speaks no HTTP to this server.** It links the crate
+/// and calls [`ServerHandle`] over FFI -- downloads, cache usage and
+/// cleaning, stream numbers, closing a proxied stream, opening a Drive
+/// file, DHT status, background traffic, the LAN listener: every one is a
+/// method, and none has a route. The control routes that once mirrored
+/// them (`/heartbeat`, `/stats.json`, `/{infoHash}/stats.json`,
+/// `/downloads.json`, `POST`/`DELETE /downloads…`,
+/// `/{infoHash}/{fileIdx}/download`, `/cache.json`, `/cache/clean`,
+/// `/stream-numbers.json`, `/proxy-streams/{token}/close`,
+/// `/drive/create`) were a leftover of the standalone daemon this fork
+/// started as, had no caller but the tests, and were removed; the tests
+/// call the handle. There is no other client and none is planned.
+///
+/// So: **do not add a control route.** A new capability is a
+/// `ServerHandle` method; a new byte-serving URL for a player is a media
+/// route. A route appears here only if the core fork starts calling a
+/// path it did not call before, which is a change to the core fork first.
+/// Every route here requires `Authorization: Bearer <token>` (see `auth`),
+/// header only, and none is mounted on the LAN listener
+/// ([`lan_media_routes`]).
 fn control_router() -> Router<AppState> {
     Router::new()
-        .route("/heartbeat", get(routes::system::heartbeat))
-        .route("/stats.json", get(routes::system::get_stats))
         .route("/network-info", get(routes::system::network_info))
         .route("/device-info", get(routes::system::device_info))
         .route(
@@ -2078,43 +2106,12 @@ fn control_router() -> Router<AppState> {
                 // rather than one that judges the file.
                 .layer(axum::extract::DefaultBodyLimit::max(MAX_CREATE_BODY)),
         )
-        // The create half of the Drive API. **Control, and for the one
-        // reason**: its body carries the account's refresh token, which is
-        // a live credential to somebody's Drive -- so it wants the bearer
-        // like every other control route, and the token stays in a body
-        // that nothing logs rather than in a path that everything does.
-        // See `routes::drive`.
-        .merge(routes::drive::create_routes())
         .route("/{infoHash}/create", post(routes::engine::create_magnet))
-        .route(
-            "/{infoHash}/stats.json",
-            get(routes::system::get_engine_stats),
-        )
         .route(
             "/{infoHash}/{idx}/stats.json",
             get(routes::system::get_file_stats),
         )
         .route("/get-https", get(routes::system::get_https))
-        .route("/downloads.json", get(routes::downloads::get_downloads))
-        .route("/downloads", post(routes::downloads::post_proxy_download))
-        .route(
-            "/downloads/{key}",
-            axum::routing::delete(routes::downloads::delete_proxy_download),
-        )
-        .route(
-            "/{infoHash}/{fileIdx}/download",
-            post(routes::downloads::post_download).delete(routes::downloads::delete_download),
-        )
-        .route(
-            "/proxy-streams/{token}/close",
-            post(routes::proxy::close_proxy_streams),
-        )
-        .route(
-            "/stream-numbers.json",
-            get(routes::stream_numbers::get_stream_numbers),
-        )
-        .route("/cache.json", get(routes::cache::get_cache_usage))
-        .route("/cache/clean", post(routes::cache::post_clean_cache))
         .nest("/casting", routes::casting::router())
 }
 

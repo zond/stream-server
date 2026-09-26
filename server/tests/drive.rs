@@ -1,5 +1,5 @@
-// The Google Drive routes end to end: a `POST /drive/create` that opens a
-// file in somebody's Drive under a refresh token, a
+// The Google Drive layer end to end: `ServerHandle::open_drive_file`,
+// which opens a file in somebody's Drive under a refresh token, the
 // `GET /drive/stream/{key}` that serves its bytes by range, and what each
 // of them says when the pairing is dead.
 //
@@ -226,7 +226,6 @@ fn respond(stream: &mut TcpStream, status: &str, body: &[u8]) {
 struct Fixture {
     handle: stream_server::ServerHandle,
     base: String,
-    token: String,
     _cache: tempfile::TempDir,
     _config: tempfile::TempDir,
 }
@@ -246,13 +245,8 @@ fn fixture(fake: &Fake) -> anyhow::Result<Fixture> {
         drive_api_base: Some(fake.api_base()),
         ..stream_server::ServerConfig::default()
     })?;
-    let token = handle
-        .auth_token()
-        .ok_or_else(|| anyhow::anyhow!("a started server always has a token"))?
-        .to_string();
     Ok(Fixture {
         base: format!("http://{}", handle.http_addr()),
-        token,
         handle,
         _cache: cache,
         _config: config,
@@ -260,22 +254,33 @@ fn fixture(fake: &Fake) -> anyhow::Result<Fixture> {
 }
 
 impl Fixture {
-    /// `POST /drive/create`, with the grant in the body and the bearer on
-    /// the request -- the two halves of the module's rule.
-    fn create(&self, refresh_token: &str) -> anyhow::Result<reqwest::blocking::Response> {
-        Ok(reqwest::blocking::Client::new()
-            .post(format!("{}/drive/create", self.base))
-            .bearer_auth(&self.token)
-            .json(&serde_json::json!({
-                "fileId": FILE_ID,
-                "refreshToken": refresh_token,
-                "name": "A Film.mkv",
-            }))
-            .send()?)
+    /// The open, as the app asks for it: the grant is an argument to a call
+    /// in this process, which is the whole of the module's rule.
+    fn open(
+        &self,
+        refresh_token: &str,
+    ) -> anyhow::Result<Result<stream_server::DriveFileOpened, stream_server::DriveOpenError>> {
+        self.handle
+            .open_drive_file(FILE_ID, refresh_token, Some("A Film.mkv".to_string()))
     }
 
-    fn get(&self, path: &str, range: Option<&str>) -> anyhow::Result<reqwest::blocking::Response> {
-        let mut request = reqwest::blocking::Client::new().get(format!("{}{}", self.base, path));
+    /// An open that is expected to pass, as the JSON it crosses FFI as.
+    fn create(&self, refresh_token: &str) -> anyhow::Result<serde_json::Value> {
+        let opened = self
+            .open(refresh_token)?
+            .map_err(|error| anyhow::anyhow!("the open was refused: {error}"))?;
+        Ok(serde_json::to_value(opened)?)
+    }
+
+    /// A player's fetch: `url` as the open answered it (absolute, on this
+    /// server) or a path of this server's.
+    fn get(&self, url: &str, range: Option<&str>) -> anyhow::Result<reqwest::blocking::Response> {
+        let url = if url.starts_with("http") {
+            url.to_string()
+        } else {
+            format!("{}{}", self.base, url)
+        };
+        let mut request = reqwest::blocking::Client::new().get(url);
         if let Some(range) = range {
             request = request.header(reqwest::header::RANGE, range);
         }
@@ -290,13 +295,11 @@ fn a_create_answers_a_stream_path_the_player_can_fetch() -> anyhow::Result<()> {
     let fake = Fake::start(Refreshes::Yes)?;
     let fixture = fixture(&fake)?;
 
-    let response = fixture.create(REFRESH_TOKEN)?;
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    let body: serde_json::Value = response.json()?;
+    let body = fixture.create(REFRESH_TOKEN)?;
 
     let key = body["key"].as_str().expect("a session key").to_string();
     assert!(!key.is_empty());
-    assert_eq!(body["url"], format!("/drive/stream/{key}"));
+    assert_eq!(body["url"], format!("{}/drive/stream/{key}", fixture.base));
     assert_eq!(body["length"], FILE_LENGTH as u64);
     assert_eq!(body["contentType"], "video/x-matroska");
     assert_eq!(body["name"], "A Film.mkv");
@@ -323,7 +326,7 @@ fn a_create_answers_a_stream_path_the_player_can_fetch() -> anyhow::Result<()> {
 fn a_stream_path_serves_exact_ranges() -> anyhow::Result<()> {
     let fake = Fake::start(Refreshes::Yes)?;
     let fixture = fixture(&fake)?;
-    let body: serde_json::Value = fixture.create(REFRESH_TOKEN)?.json()?;
+    let body = fixture.create(REFRESH_TOKEN)?;
     let path = body["url"].as_str().expect("the url").to_string();
 
     // A mid-file span, which is what a seek is.
@@ -357,39 +360,24 @@ fn a_stream_path_serves_exact_ranges() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A dead pairing arrives as itself: a status and a kind the app switches
-/// on, and **not** the `502` that "Google is down" would be.
+/// A dead pairing arrives as itself: a kind the app switches on without
+/// reading English, and **not** the plain failure that "Google is down"
+/// would be.
 #[test]
 fn a_dead_pairing_answers_as_itself_and_not_as_a_gateway_failure() -> anyhow::Result<()> {
     let fake = Fake::start(Refreshes::PairAgain)?;
     let fixture = fixture(&fake)?;
 
-    let response = fixture.create(REFRESH_TOKEN)?;
-    assert_eq!(
-        response.status(),
-        reqwest::StatusCode::UNAUTHORIZED,
-        "a grant that is gone is not a bad gateway"
-    );
-    let body: serde_json::Value = response.json()?;
-    assert_eq!(body["refused"], "pairAgain");
-    assert!(
-        body.get("error").is_none(),
-        "a refusal carries a kind, not a bare error: {body}"
-    );
+    let error = fixture
+        .open(REFRESH_TOKEN)?
+        .expect_err("a grant that is gone refuses the open");
+    assert!(error.is_pair_again(), "{error}");
+    assert_eq!(error.refused(), Some("pairAgain"));
     // The sentence is written in `sources::drive`, so it says what the
     // viewer has to do and carries nothing from the service's own body.
-    let message = body["message"].as_str().expect("a sentence");
+    let message = error.to_string();
     assert!(message.contains("scan the code again"), "{message}");
     assert!(!message.contains(REFRESH_TOKEN));
-
-    // And the same question asked through the library API a host process
-    // uses, which is how the app asks it.
-    let outcome = fixture
-        .handle
-        .open_drive_file(FILE_ID, REFRESH_TOKEN, None)?;
-    let error = outcome.expect_err("a dead pairing refuses");
-    assert!(error.is_pair_again());
-    assert_eq!(error.refused(), Some("pairAgain"));
     Ok(())
 }
 
@@ -405,7 +393,7 @@ fn a_dead_pairing_answers_as_itself_and_not_as_a_gateway_failure() -> anyhow::Re
 fn a_pairing_that_dies_mid_film_answers_the_next_request_as_itself() -> anyhow::Result<()> {
     let fake = Fake::start(Refreshes::ShortThenGone)?;
     let fixture = fixture(&fake)?;
-    let body: serde_json::Value = fixture.create(REFRESH_TOKEN)?.json()?;
+    let body = fixture.create(REFRESH_TOKEN)?;
     let path = body["url"].as_str().expect("the url").to_string();
 
     // The one token this pairing ever got outlives the create by about a
@@ -446,34 +434,24 @@ fn a_build_with_no_pairing_service_refuses_by_name() -> anyhow::Result<()> {
         enable_local_service_discovery: false,
         ..stream_server::ServerConfig::default()
     })?;
-    let response = reqwest::blocking::Client::new()
-        .post(format!("http://{}/drive/create", handle.http_addr()))
-        .bearer_auth(handle.auth_token().expect("a token"))
-        .json(&serde_json::json!({ "fileId": FILE_ID, "refreshToken": REFRESH_TOKEN }))
-        .send()?;
-    assert_eq!(response.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
-    let body: serde_json::Value = response.json()?;
-    assert_eq!(body["refused"], "noPairingService");
-    assert!(!body.to_string().contains(REFRESH_TOKEN));
+    let error = handle
+        .open_drive_file(FILE_ID, REFRESH_TOKEN, None)?
+        .expect_err("a build with no pairing service opens nothing");
+    assert_eq!(error.refused(), Some("noPairingService"));
+    assert!(!error.is_pair_again(), "the account is not what is wrong");
+    assert!(!error.to_string().contains(REFRESH_TOKEN));
     Ok(())
 }
 
-/// The create wants the bearer, and the stream does not -- which is the
-/// whole arrangement: the half that carries a credential is behind the
-/// token, and the half a player fetches is open and carries a key.
+/// The stream is open and the key is the whole of what it takes -- which
+/// is the arrangement: the half that carries a credential is a call inside
+/// the process, and the half a player fetches is open and carries a key.
 #[test]
-fn the_create_is_behind_the_token_and_the_stream_is_not() -> anyhow::Result<()> {
+fn the_stream_is_open_and_a_key_nobody_was_given_is_a_404() -> anyhow::Result<()> {
     let fake = Fake::start(Refreshes::Yes)?;
     let fixture = fixture(&fake)?;
 
-    let unauthorised = reqwest::blocking::Client::new()
-        .post(format!("{}/drive/create", fixture.base))
-        .json(&serde_json::json!({ "fileId": FILE_ID, "refreshToken": REFRESH_TOKEN }))
-        .send()?;
-    assert_eq!(unauthorised.status(), reqwest::StatusCode::UNAUTHORIZED);
-    assert_eq!(fake.refreshes(), 0, "an unauthorised create opened nothing");
-
-    let body: serde_json::Value = fixture.create(REFRESH_TOKEN)?.json()?;
+    let body = fixture.create(REFRESH_TOKEN)?;
     // No bearer on this one, because mpv cannot send one.
     let response = fixture.get(body["url"].as_str().expect("the url"), None)?;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
@@ -485,18 +463,18 @@ fn the_create_is_behind_the_token_and_the_stream_is_not() -> anyhow::Result<()> 
 }
 
 /// **No token in any URL, and none in anything a caller is handed.** The
-/// create's answer, the stream URL and every error body are searched for
-/// the grant; the log files are the other half of this and live in
-/// `drive_secrecy.rs`, which needs a logging subscriber of its own.
+/// open's answer and the stream URL are searched for the grant; the log
+/// files are the other half of this and live in `drive_secrecy.rs`, which
+/// needs a logging subscriber of its own.
 #[test]
 fn no_url_or_answer_carries_the_refresh_token() -> anyhow::Result<()> {
     let fake = Fake::start(Refreshes::Yes)?;
     let fixture = fixture(&fake)?;
 
-    let created = fixture.create(REFRESH_TOKEN)?.text()?;
+    let created = fixture.create(REFRESH_TOKEN)?.to_string();
     assert!(
         !created.contains(REFRESH_TOKEN),
-        "the create's answer carried the grant: {created}"
+        "the open's answer carried the grant: {created}"
     );
     let body: serde_json::Value = serde_json::from_str(&created)?;
     let url = body["url"].as_str().expect("the url");
@@ -506,8 +484,7 @@ fn no_url_or_answer_carries_the_refresh_token() -> anyhow::Result<()> {
         "the stream URL names the file: {url}"
     );
 
-    // And the absolute URL the app is handed over the library API, which
-    // is the string that reaches mpv.
+    // And the URL as a typed answer, which is the string that reaches mpv.
     let opened = fixture
         .handle
         .open_drive_file(FILE_ID, REFRESH_TOKEN, Some("A Film.mkv".to_string()))?
@@ -520,14 +497,5 @@ fn no_url_or_answer_carries_the_refresh_token() -> anyhow::Result<()> {
             .url
             .ends_with(&format!("/drive/stream/{}", opened.key))
     );
-
-    // A 400 for a request with no grant in it says nothing about grants.
-    let refused = reqwest::blocking::Client::new()
-        .post(format!("{}/drive/create", fixture.base))
-        .bearer_auth(&fixture.token)
-        .json(&serde_json::json!({ "fileId": "", "refreshToken": REFRESH_TOKEN }))
-        .send()?
-        .text()?;
-    assert!(!refused.contains(REFRESH_TOKEN), "{refused}");
     Ok(())
 }

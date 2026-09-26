@@ -1,5 +1,5 @@
 //! **A download of what is not a torrent**, end to end: an addon URL pinned
-//! through `POST /downloads`, filled from a loopback origin into the proxy
+//! through `ServerHandle::pin_proxy_download`, filled from a loopback origin into the proxy
 //! cache, played back from the disk with the origin asked for nothing, kept
 //! across a restart that names it and swept by one that does not, and
 //! deleted on request. What `docs/generic-downloads.md` describes, measured.
@@ -9,7 +9,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use stream_server::{ProxyPinKey, ServerConfig, ServerHandle};
+use stream_server::{ProxyDownloadRequest, ProxyPinKey, ServerConfig, ServerHandle};
 
 fn byte_at(offset: usize) -> u8 {
     (offset % 251) as u8
@@ -148,7 +148,6 @@ fn offline_config() -> ServerConfig {
 
 struct Fixture {
     handle: ServerHandle,
-    base: String,
     cache_root: tempfile::TempDir,
     _config_dir: tempfile::TempDir,
 }
@@ -157,9 +156,7 @@ impl Fixture {
     fn start(proxy_pins: Option<Vec<ProxyPinKey>>) -> anyhow::Result<Self> {
         let config_dir = tempfile::tempdir()?;
         let cache_root = tempfile::tempdir()?;
-        let mut fixture = Self::start_in(config_dir, cache_root, proxy_pins)?;
-        fixture.base = format!("http://{}", fixture.handle.http_addr());
-        Ok(fixture)
+        Self::start_in(config_dir, cache_root, proxy_pins)
     }
 
     fn start_in(
@@ -174,10 +171,8 @@ impl Fixture {
             proxy_pins,
             ..offline_config()
         })?;
-        let base = format!("http://{}", handle.http_addr());
         Ok(Self {
             handle,
-            base,
             cache_root,
             _config_dir: config_dir,
         })
@@ -190,21 +185,6 @@ impl Fixture {
         Ok((self._config_dir, self.cache_root))
     }
 
-    fn control(&self) -> anyhow::Result<reqwest::blocking::Client> {
-        let token = self
-            .handle
-            .auth_token()
-            .expect("every launch generates a token");
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {token}").parse()?,
-        );
-        Ok(reqwest::blocking::Client::builder()
-            .default_headers(headers)
-            .build()?)
-    }
-
     fn proxy_root(&self) -> PathBuf {
         self.cache_root
             .path()
@@ -213,27 +193,19 @@ impl Fixture {
             .join(".proxy")
     }
 
+    /// A pin of `url`, as the app asks for one; the row as JSON, which is
+    /// how it crosses FFI.
     fn pin_url(&self, url: &str) -> anyhow::Result<serde_json::Value> {
-        let response = self
-            .control()?
-            .post(format!("{}/downloads", self.base))
-            .json(&serde_json::json!({ "url": url, "name": "the film" }))
-            .send()?;
-        anyhow::ensure!(
-            response.status().is_success(),
-            "pin refused: {} {}",
-            response.status(),
-            response.text().unwrap_or_default()
-        );
-        Ok(response.json()?)
+        let row = self
+            .handle
+            .pin_proxy_download(url_request(url, Some("the film")))
+            .map_err(|error| anyhow::anyhow!("pin refused: {error:#}"))?;
+        Ok(serde_json::to_value(row)?)
     }
 
     fn downloads(&self) -> anyhow::Result<Vec<serde_json::Value>> {
-        Ok(self
-            .control()?
-            .get(format!("{}/downloads.json", self.base))
-            .send()?
-            .json()?)
+        let rows = serde_json::to_value(self.handle.downloads()?)?;
+        Ok(rows.as_array().cloned().unwrap_or_default())
     }
 
     /// Polls the listing until the row for `key` is complete.
@@ -253,6 +225,17 @@ impl Fixture {
             );
             std::thread::sleep(Duration::from_millis(100));
         }
+    }
+}
+
+/// What the app sends for an addon link: the URL, no headers, a name.
+fn url_request(url: &str, name: Option<&str>) -> ProxyDownloadRequest {
+    ProxyDownloadRequest {
+        url: Some(url.to_string()),
+        headers: BTreeMap::new(),
+        drive_file_id: None,
+        refresh_token: None,
+        name: name.map(str::to_string),
     }
 }
 
@@ -322,14 +305,9 @@ fn a_url_download_is_filled_played_from_disk_and_deleted() -> anyhow::Result<()>
     assert!(key_dir_exists(&fixture, &key));
 
     // Deleted on request: the pin goes and so do the bytes.
-    let response = fixture
-        .control()?
-        .delete(format!("{}/downloads/{key}?deleteFiles=1", fixture.base))
-        .send()?;
-    assert!(response.status().is_success());
-    let outcome: serde_json::Value = response.json()?;
-    assert_eq!(outcome["unpinned"], true);
-    assert_eq!(outcome["deletedFiles"], true);
+    let outcome = fixture.handle.unpin_proxy_download(&key, true)?;
+    assert!(outcome.unpinned);
+    assert!(outcome.deleted_files);
     assert!(!key_dir_exists(&fixture, &key), "the key directory is gone");
     assert!(
         fixture
@@ -446,14 +424,18 @@ fn a_boot_that_names_no_record_sweeps_nothing() -> anyhow::Result<()> {
 fn an_origin_that_will_not_range_is_refused() -> anyhow::Result<()> {
     let origin = Origin::start(false)?;
     let fixture = Fixture::start(Some(Vec::new()))?;
-    let response = fixture
-        .control()?
-        .post(format!("{}/downloads", fixture.base))
-        .json(&serde_json::json!({ "url": origin.url("/whole.mp4") }))
-        .send()?;
-    assert_eq!(response.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
-    let body: serde_json::Value = response.json()?;
-    assert!(body["error"].as_str().is_some_and(|m| !m.is_empty()));
+    let refused = fixture
+        .handle
+        .pin_proxy_download(url_request(&origin.url("/whole.mp4"), None))
+        .expect_err("an origin that answers a range whole is refused");
+    assert!(
+        matches!(
+            refused.downcast_ref::<stream_server::ProxyPinError>(),
+            Some(stream_server::ProxyPinError::Source(_))
+        ),
+        "{refused:#}"
+    );
+    assert!(!refused.to_string().is_empty());
     assert!(fixture.downloads()?.is_empty(), "nothing was pinned");
     assert_eq!(
         origin.asked().len(),
@@ -494,26 +476,36 @@ fn the_key_is_known_before_the_pin() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A request that names neither a URL nor a Drive file is a bad request,
-/// and one that names both is too.
+/// A request that names neither a URL nor a Drive file is refused as
+/// unkeyable, and one that names both is too.
 #[test]
-fn a_request_that_names_no_source_is_a_bad_request() -> anyhow::Result<()> {
+fn a_request_that_names_no_source_is_refused() -> anyhow::Result<()> {
     let fixture = Fixture::start(Some(Vec::new()))?;
-    for body in [
-        serde_json::json!({ "name": "nothing" }),
-        serde_json::json!({ "url": "http://127.0.0.1:1/x", "driveFileId": "abc" }),
-    ] {
-        let response = fixture
-            .control()?
-            .post(format!("{}/downloads", fixture.base))
-            .json(&body)
-            .send()?;
-        assert_eq!(
-            response.status(),
-            reqwest::StatusCode::BAD_REQUEST,
-            "{body}"
+    let neither = ProxyDownloadRequest {
+        url: None,
+        headers: BTreeMap::new(),
+        drive_file_id: None,
+        refresh_token: None,
+        name: Some("nothing".into()),
+    };
+    let both = ProxyDownloadRequest {
+        drive_file_id: Some("abc".into()),
+        ..url_request("http://127.0.0.1:1/x", None)
+    };
+    for request in [neither, both] {
+        let refused = fixture
+            .handle
+            .pin_proxy_download(request)
+            .expect_err("a source that is not one thing is refused");
+        assert!(
+            matches!(
+                refused.downcast_ref::<stream_server::ProxyPinError>(),
+                Some(stream_server::ProxyPinError::Unkeyable(_))
+            ),
+            "{refused:#}"
         );
     }
+    assert!(fixture.downloads()?.is_empty(), "nothing was pinned");
     fixture.stop()?;
     Ok(())
 }

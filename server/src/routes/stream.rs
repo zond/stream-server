@@ -597,7 +597,7 @@ fn ensure_download_disk_ready(root: &FsPath) -> Result<(), String> {
 /// is registered before this gate, so the film the viewer left is slack by
 /// now -- and those bytes are ours to take back. So a failed check drops
 /// every owner's slack ([`EngineFS::drop_slack`] and the proxy cache's,
-/// the same passes `POST /cache/clean` runs), re-reads the volume and asks
+/// the same passes `ServerHandle::clean_cache_now` runs), re-reads the volume and asks
 /// both questions again; only a disk still short after that is answered
 /// `507 Insufficient Storage` -- the status the pin route already uses for
 /// a full disk -- with a fixed body, because the check's own message names

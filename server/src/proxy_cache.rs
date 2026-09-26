@@ -419,7 +419,7 @@ impl ProxyCache {
 
     /// The playheads and windows of what is being read right now: this
     /// cache's retention owner, which is what reclaims its chunks and what
-    /// `GET /cache.json` asks for the protected half of the figure.
+    /// `ServerHandle::cache_usage` asks for the protected half of the figure.
     pub fn retention(&self) -> &Arc<ProxyRetention> {
         &self.retention
     }

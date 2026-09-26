@@ -404,7 +404,7 @@ mod log_redaction_tests {
             log_path("/ftp/ftp%3A%2F%2Fuser%3Apass%40host%2Ffilm.mkv"),
             "/ftp"
         );
-        assert_eq!(log_path("/heartbeat"), "/heartbeat");
+        assert_eq!(log_path("/settings"), "/settings");
         assert_eq!(log_path("/proxying/x"), "/proxying/x");
     }
 }

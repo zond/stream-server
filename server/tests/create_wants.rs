@@ -173,22 +173,14 @@ fn config(cache: &Path, config_dir: &Path) -> stream_server::ServerConfig {
     })
 }
 
-/// `stats.json`, polled until the torrent is past the states it is only ever
+/// The torrent's stats, polled until it is past the states it is only ever
 /// passing through (no metadata yet, hash check running). Every fixture here
 /// is a blob add with its data already on the disk, so both settle in
 /// milliseconds; the budget is for a loaded runner.
-fn settled_stats(
-    client: &reqwest::blocking::Client,
-    base: &str,
-    info_hash: &str,
-) -> serde_json::Value {
+fn settled_stats(handle: &stream_server::ServerHandle, info_hash: &str) -> serde_json::Value {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let stats: serde_json::Value = client
-            .get(format!("{base}/{info_hash}/stats.json"))
-            .send()
-            .expect("stats")
-            .json()
+        let stats = serde_json::to_value(handle.engine_stats(info_hash, &[]).expect("stats"))
             .expect("stats json");
         let phase = stats["phase"].as_str().unwrap_or_default();
         if !matches!(phase, "" | "resolvingMetadata" | "checking") {
@@ -203,10 +195,10 @@ fn settled_stats(
 /// short of. The add narrows the want-set from a task parked on the on-disk
 /// check rather than blocking the add on it, so this is a wait and not a
 /// single read.
-fn wait_until_finished(client: &reqwest::blocking::Client, base: &str, info_hash: &str) {
+fn wait_until_finished(handle: &stream_server::ServerHandle, info_hash: &str) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let stats = settled_stats(client, base, info_hash);
+        let stats = settled_stats(handle, info_hash);
         if stats["isFinished"] == serde_json::Value::Bool(true) {
             return;
         }
@@ -270,8 +262,8 @@ fn a_create_that_names_its_episode_wants_that_episode_and_not_the_pack() -> anyh
         Some(wanted as u64),
         "the route still reports the file it picked: {created}"
     );
-    wait_until_finished(&client, &base, &info_hash);
-    let stats = settled_stats(&client, &base, &info_hash);
+    wait_until_finished(&handle, &info_hash);
+    let stats = settled_stats(&handle, &info_hash);
     assert_eq!(
         stats["files"][wanted]["complete"],
         serde_json::Value::Bool(true),
@@ -303,7 +295,7 @@ fn a_create_that_names_its_episode_wants_that_episode_and_not_the_pack() -> anyh
         control_created["guessedFileIdx"].is_null(),
         "a create that names nothing picks nothing: {control_created}"
     );
-    let control_stats = settled_stats(&control_client, &control_base, &info_hash);
+    let control_stats = settled_stats(&control_handle, &info_hash);
     assert_eq!(
         control_stats["isFinished"],
         serde_json::Value::Bool(false),

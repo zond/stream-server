@@ -1,5 +1,4 @@
 pub mod archive;
-pub mod cache;
 pub mod casting;
 pub mod compat;
 pub mod downloads;
@@ -9,6 +8,5 @@ pub mod ftp;
 pub mod local_addon;
 pub mod proxy;
 pub mod stream;
-pub mod stream_numbers;
 pub mod system;
 pub(crate) mod util;

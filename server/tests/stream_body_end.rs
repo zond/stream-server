@@ -152,11 +152,7 @@ fn seeded_stream_url(
 
     let deadline = Instant::now() + CHECK_WAIT_BOUND;
     let stats = loop {
-        let stats: serde_json::Value = client
-            .get(format!("{base}/{info_hash}/stats.json"))
-            .send()?
-            .error_for_status()?
-            .json()?;
+        let stats: serde_json::Value = serde_json::to_value(handle.engine_stats(&info_hash, &[])?)?;
         match stats["phase"].as_str() {
             Some("checking") | Some("resolvingMetadata") => {
                 anyhow::ensure!(

@@ -1,8 +1,8 @@
 use crate::routes::util;
 use crate::state::AppState;
 use axum::{
-    Json, Router,
-    extract::{Path, State},
+    Router,
+    extract::State,
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header, response::Builder},
     response::{IntoResponse, Response},
     routing::any,
@@ -1561,7 +1561,7 @@ async fn proxy(
     };
     // The client's name for the player this stream is for, if it minted one
     // (`p=`). It is ours, not the target's: it never travels to the origin,
-    // and it is what `POST /proxy-streams/{token}/close` addresses. See
+    // and it is what `ServerHandle::close_proxy_streams` addresses. See
     // [`crate::proxy_streams`].
     let player_token = params.player_token.clone();
 
@@ -1884,29 +1884,6 @@ async fn proxy(
         ),
         log,
     )
-}
-
-/// `POST /proxy-streams/{token}/close`: end every proxied stream the client
-/// marked with `token`, and say how many that was.
-///
-/// It also retires the token, which is the half that makes it stick: the
-/// closed reads break, and any later `/proxy` request bearing the same `p=`
-/// is answered `410 Gone` instead of being given a fresh stream. Without
-/// that, ffmpeg's `reconnect=1` re-fetches through the URL it already has
-/// and playback carries on.
-///
-/// A **control** route -- bearer token, loopback listener, and never on the
-/// LAN media listener, which serves no control route at all: the ability to
-/// cut another device's playback is not something to hand the network. The
-/// same operation is [`crate::ServerHandle::close_proxy_streams`], through
-/// this same function, so an embedder needs no HTTP client for it.
-pub async fn close_proxy_streams(
-    State(state): State<AppState>,
-    Path(token): Path<String>,
-) -> impl IntoResponse {
-    let closed = state.proxy_streams.close(&token);
-    tracing::debug!(closed, "closing proxied streams by player token");
-    Json(serde_json::json!({ "closed": closed }))
 }
 
 /// One line of a rewritten playlist, or the line unchanged when there is

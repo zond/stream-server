@@ -75,7 +75,7 @@ fn answer(mut stream: TcpStream) {
     let _ = stream.flush();
 }
 
-/// The grant reaches no log line -- not from the create's request, not
+/// The grant reaches no log line -- not from the open, not
 /// from the refresh that failed, and not from the service's own body.
 #[test]
 fn a_drive_grant_never_reaches_the_log() -> anyhow::Result<()> {
@@ -96,21 +96,14 @@ fn a_drive_grant_never_reaches_the_log() -> anyhow::Result<()> {
     })?;
     let base = format!("http://{}", handle.http_addr());
     let client = reqwest::blocking::Client::new();
-    let token = handle.auth_token().expect("a token").to_string();
 
-    // The create, which fails at the refresh -- the loudest path there is,
+    // The open, which fails at the refresh -- the loudest path there is,
     // because it logs and it answers.
-    let response = client
-        .post(format!("{base}/drive/create"))
-        .bearer_auth(&token)
-        .json(&serde_json::json!({
-            "fileId": FILE_ID,
-            "refreshToken": REFRESH_TOKEN,
-            "name": "A Film.mkv",
-        }))
-        .send()?;
-    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
-    let answered = response.text()?;
+    let error = handle
+        .open_drive_file(FILE_ID, REFRESH_TOKEN, Some("A Film.mkv".to_string()))?
+        .expect_err("the service refuses the grant");
+    assert!(error.is_pair_again(), "{error}");
+    let answered = format!("{error} / {error:?}");
     assert!(!answered.contains(REFRESH_TOKEN), "{answered}");
 
     // And a request for a route nothing serves, whose whole path and query
