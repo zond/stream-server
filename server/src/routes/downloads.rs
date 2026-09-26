@@ -654,6 +654,20 @@ pub async fn pin_proxy_download(
     )
 }
 
+/// The key a proxy download of `pin` would have -- the row's `infoHash`
+/// -- derived without pinning anything or touching the network: the cache
+/// key directory's name for that source. `None` when the source cannot be
+/// keyed (a URL that does not parse or names this server; a Drive pin with
+/// no Drive endpoint). What lets an embedder write a download's row under
+/// its final coordinates before it asks for the pin, as it does for a
+/// torrent with the info hash.
+pub fn proxy_download_key(
+    state: &AppState,
+    pin: &crate::proxy_downloads::ProxyPinKey,
+) -> Option<String> {
+    pin.entry(state).map(|entry| entry.key_name())
+}
+
 /// Drops a proxy download's pin by its key (the row's `infoHash`), with
 /// `delete_files` its bytes too. What `ServerHandle::unpin_proxy_download`
 /// and `DELETE /downloads/{key}` share.

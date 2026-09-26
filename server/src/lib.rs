@@ -616,6 +616,12 @@ impl ServerHandle {
         Ok(info?)
     }
 
+    /// The key a proxy download of `pin` has or would have (see
+    /// `routes::downloads::proxy_download_key`): pure, no network.
+    pub fn proxy_download_key(&self, pin: &ProxyPinKey) -> Option<String> {
+        routes::downloads::proxy_download_key(&self.state, pin)
+    }
+
     /// Drops a proxy download's pin by its key, with `delete_files` its
     /// bytes -- exactly what `DELETE /downloads/{key}` answers.
     pub fn unpin_proxy_download(

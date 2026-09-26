@@ -465,6 +465,35 @@ fn an_origin_that_will_not_range_is_refused() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The key an embedder is told before it pins is the key the pin then has.
+#[test]
+fn the_key_is_known_before_the_pin() -> anyhow::Result<()> {
+    let origin = Origin::start(true)?;
+    let fixture = Fixture::start(Some(Vec::new()))?;
+    let url = origin.url("/keyed.mp4");
+    let foretold = fixture
+        .handle
+        .proxy_download_key(&ProxyPinKey::Url {
+            target: url.clone(),
+            headers: BTreeMap::new(),
+        })
+        .expect("a plain URL is keyable");
+    let row = fixture.pin_url(&url)?;
+    assert_eq!(row["infoHash"], foretold);
+    assert!(
+        fixture
+            .handle
+            .proxy_download_key(&ProxyPinKey::Url {
+                target: "not a url".into(),
+                headers: BTreeMap::new(),
+            })
+            .is_none(),
+        "what cannot be keyed says so"
+    );
+    fixture.stop()?;
+    Ok(())
+}
+
 /// A request that names neither a URL nor a Drive file is a bad request,
 /// and one that names both is too.
 #[test]
