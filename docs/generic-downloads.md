@@ -20,10 +20,17 @@ filler never filled. It plays from the download's own media route,
 the disk (`server/tests/proxy_downloads.rs` measures it: filled from a
 loopback origin, played back with the origin asked for nothing, kept
 across a restart that names it, swept by one that does not, deleted on
-request). Not built: §3.5 (a complete Drive download played offline:
-the media route serves any complete pinned entry, Drive included, but the
-app still opens Drive files through `open_drive_file`, whose probe goes to
-the origin), §4 (read-ahead), and §5 (the app) -- the app side is next.
+request). **§3.5 built later the same day**, and not where the design put
+it: rather than teaching `DriveSource::open`'s probe to accept the cache,
+`ServerHandle::open_drive_file` answers a complete pinned Drive download
+from the disk before it probes anything -- the download's own media route,
+the length and content type the disk holds, no token spent -- and a pin
+over an entry that is already whole (`pin_url`, `pin_drive`) opens no
+source at all, so the app's launch-time re-pin works offline too
+(`server/tests/drive.rs`, `a_drive_download_plays_from_the_disk_with_no_network`:
+filled through the fake Drive, opened with the pairing service counting no
+renewal, relaunched against a dead pairing service and played). Not built:
+§4 (read-ahead).
 
 **The ask (zond):** every source should download, not only torrents -- and
 "maybe a new set of functions on the byte owner that handles download

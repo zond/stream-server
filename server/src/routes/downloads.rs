@@ -463,10 +463,18 @@ async fn proxy_downloads(state: &AppState) -> Vec<DownloadInfo> {
 /// the wrong answer for a download, and no answer at all offline.
 fn proxy_play_url(state: &AppState, key_name: &str) -> String {
     format!(
-        "{}/downloads/{}/stream",
+        "{}{}",
         state.base_url.trim_end_matches('/'),
-        urlencoding::encode(key_name)
+        proxy_stream_path(key_name)
     )
+}
+
+/// The media route a proxy download plays from, as this server's own path:
+/// what [`proxy_play_url`] makes absolute for a `DownloadInfo`, and what a
+/// complete Drive download is opened at
+/// (`proxy_downloads::complete_drive_download`).
+pub(crate) fn proxy_stream_path(key_name: &str) -> String {
+    format!("/downloads/{}/stream", urlencoding::encode(key_name))
 }
 
 /// One pinned file of a live torrent. A torrent still resolving its

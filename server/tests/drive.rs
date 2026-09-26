@@ -231,18 +231,35 @@ struct Fixture {
 }
 
 fn fixture(fake: &Fake) -> anyhow::Result<Fixture> {
-    let cache = tempfile::tempdir()?;
-    let config = tempfile::tempdir()?;
+    fixture_on(
+        tempfile::tempdir()?,
+        tempfile::tempdir()?,
+        (fake.refresh_endpoint(), fake.api_base()),
+        Some(Vec::new()),
+    )
+}
+
+/// A server over the given directories, against the given pairing service
+/// and Drive origin, told `proxy_pins` -- which is how a second launch
+/// over a first one's cache is made, and how one is pointed at a Drive
+/// that is not there.
+fn fixture_on(
+    cache: tempfile::TempDir,
+    config: tempfile::TempDir,
+    (refresh, api_base): (url::Url, url::Url),
+    proxy_pins: Option<Vec<stream_server::ProxyPinKey>>,
+) -> anyhow::Result<Fixture> {
     let handle = stream_server::start(stream_server::ServerConfig {
         http_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config.path().join("config")),
         cache_dir: Some(cache.path().join("cache")),
         pins: Some(Default::default()),
+        proxy_pins,
         resolve_dht_bootstrap_names: false,
         use_public_trackers: false,
         enable_local_service_discovery: false,
-        drive_refresh_endpoint: Some(fake.refresh_endpoint()),
-        drive_api_base: Some(fake.api_base()),
+        drive_refresh_endpoint: Some(refresh),
+        drive_api_base: Some(api_base),
         ..stream_server::ServerConfig::default()
     })?;
     Ok(Fixture {
@@ -253,7 +270,62 @@ fn fixture(fake: &Fake) -> anyhow::Result<Fixture> {
     })
 }
 
+/// A pairing service at an address nothing listens on: a port the OS just
+/// handed out and gave back. What a device with no network sees, near
+/// enough -- the connection is refused rather than timing out, which keeps
+/// the test quick and the claim the same. It is the *refresh* endpoint
+/// that is dead and not the Drive origin, because the origin's address is
+/// half of the cache key (`ProxyPinKey::Drive` keys the file's media URL,
+/// which in a shipped build is Google's fixed one) and a second launch
+/// against a different origin would be asking about a different file.
+/// Every Drive read renews its token before its first byte, so a dead
+/// pairing service is enough to make the origin unreachable.
+fn dead_refresh_endpoint() -> anyhow::Result<url::Url> {
+    let taken = TcpListener::bind(("127.0.0.1", 0))?;
+    let addr = taken.local_addr()?;
+    drop(taken);
+    Ok(url::Url::parse(&format!("http://{addr}/refresh"))?)
+}
+
 impl Fixture {
+    /// Stops the server and hands back its directories, for a second
+    /// launch over them.
+    fn stop(self) -> anyhow::Result<(tempfile::TempDir, tempfile::TempDir)> {
+        self.handle.shutdown()?;
+        self.handle.join()?;
+        Ok((self._cache, self._config))
+    }
+
+    /// Pins the fake's film as an offline download, as the app asks for it
+    /// (`ServerHandle::pin_proxy_download` with a Drive file and the
+    /// grant), and answers the row.
+    fn download(&self, refresh_token: &str) -> anyhow::Result<stream_server::DownloadInfo> {
+        self.handle
+            .pin_proxy_download(stream_server::ProxyDownloadRequest {
+                url: None,
+                headers: Default::default(),
+                drive_file_id: Some(FILE_ID.to_string()),
+                refresh_token: Some(refresh_token.to_string()),
+                name: Some("A Film.mkv".to_string()),
+            })
+    }
+
+    /// Polls the listing until the download of `key` is complete.
+    fn wait_complete(&self, key: &str) -> anyhow::Result<stream_server::DownloadInfo> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let rows = self.handle.downloads()?;
+            if let Some(row) = rows.iter().find(|row| row.info_hash == key && row.complete) {
+                return Ok(row.clone());
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "the Drive download did not complete: {rows:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
     /// The open, as the app asks for it: the grant is an argument to a call
     /// in this process, which is the whole of the module's rule.
     fn open(
@@ -497,5 +569,126 @@ fn no_url_or_answer_carries_the_refresh_token() -> anyhow::Result<()> {
             .url
             .ends_with(&format!("/drive/stream/{}", opened.key))
     );
+    Ok(())
+}
+
+/// **A Drive file downloads, and once it is whole it opens off the disk.**
+///
+/// The download is the proxy cache's pin and filler (`proxy_downloads`),
+/// fed by the same `DriveSource` a stream is read through. What this pins
+/// down is the other half: a finished download is what the app plays when
+/// there is no network, so opening the file must then cost **no request
+/// at all** -- not the probe `DriveSource::open` makes, and not the token
+/// renewal before it. The open answers the download's own media route,
+/// and a second launch that is told the pin -- against a pairing service
+/// and a Drive that are not there -- lists it and plays it the same way.
+#[test]
+fn a_drive_download_plays_from_the_disk_with_no_network() -> anyhow::Result<()> {
+    let fake = Fake::start(Refreshes::Yes)?;
+    let fixture = fixture(&fake)?;
+
+    let row = fixture.download(REFRESH_TOKEN)?;
+    let key = row.info_hash.clone();
+    assert_eq!(key.len(), 64, "keyed like every proxy download: {row:?}");
+    assert_eq!(row.name, "A Film.mkv");
+    assert!(
+        matches!(&row.source, Some(stream_server::ProxyPinKey::Drive { file_id }) if file_id == FILE_ID),
+        "{row:?}"
+    );
+    let done = fixture.wait_complete(&key)?;
+    assert_eq!(done.length, FILE_LENGTH as u64);
+    assert_eq!(done.downloaded, FILE_LENGTH as u64);
+    let renewed = fake.refreshes();
+    assert!(renewed >= 1, "the fill renewed the token at least once");
+
+    // The open, now: the download's route, the disk's facts, and nothing
+    // asked of the pairing service.
+    let opened = fixture
+        .open(REFRESH_TOKEN)?
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    assert_eq!(opened.key, key);
+    assert!(
+        opened.url.ends_with(&format!("/downloads/{key}/stream")),
+        "{}",
+        opened.url
+    );
+    assert_eq!(opened.length, FILE_LENGTH as u64);
+    assert_eq!(opened.content_type, "video/x-matroska");
+    assert_eq!(opened.name.as_deref(), Some("A Film.mkv"));
+    assert_eq!(
+        fake.refreshes(),
+        renewed,
+        "a finished download opens without the grant"
+    );
+
+    // And pinning it again -- what the app does at every launch for what
+    // it kept -- opens nothing either.
+    let again = fixture.download(REFRESH_TOKEN)?;
+    assert_eq!(again.info_hash, key);
+    assert!(again.complete);
+    assert_eq!(
+        fake.refreshes(),
+        renewed,
+        "a re-pin of a whole download probes nothing"
+    );
+
+    let response = fixture.get(&opened.url, Some("bytes=100000-100255"))?;
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    let expected: Vec<u8> = (100_000..=100_255).map(byte_at).collect();
+    assert_eq!(response.bytes()?.as_ref(), expected.as_slice());
+
+    // A second launch over the same cache, told the pin, with the pairing
+    // service unreachable: the device is offline (see
+    // [`dead_refresh_endpoint`] for why the origin's address stays).
+    let (cache, config) = fixture.stop()?;
+    let offline = fixture_on(
+        cache,
+        config,
+        (dead_refresh_endpoint()?, fake.api_base()),
+        Some(vec![stream_server::ProxyPinKey::Drive {
+            file_id: FILE_ID.to_string(),
+        }]),
+    )?;
+    let before = fake.refreshes();
+    let listed = offline.handle.downloads()?;
+    let row = listed
+        .iter()
+        .find(|row| row.info_hash == key)
+        .expect("the kept download is listed");
+    assert!(row.complete, "{row:?}");
+    assert_eq!(row.downloaded, FILE_LENGTH as u64);
+
+    let opened = offline
+        .open(REFRESH_TOKEN)?
+        .map_err(|error| anyhow::anyhow!("offline, the download did not open: {error}"))?;
+    assert!(
+        opened.url.ends_with(&format!("/downloads/{key}/stream")),
+        "{}",
+        opened.url
+    );
+    assert_eq!(opened.length, FILE_LENGTH as u64);
+    let response = offline.get(&opened.url, Some(&format!("bytes={}-", FILE_LENGTH - 16)))?;
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    let tail: Vec<u8> = (FILE_LENGTH - 16..FILE_LENGTH).map(byte_at).collect();
+    assert_eq!(response.bytes()?.as_ref(), tail.as_slice());
+
+    // A re-pin offline is the same nothing.
+    let again = offline.download(REFRESH_TOKEN)?;
+    assert!(again.complete, "{again:?}");
+    assert_eq!(
+        fake.refreshes(),
+        before,
+        "nothing offline reached for the grant"
+    );
+
+    // And a file that is *not* downloaded is refused as unreachable, not
+    // answered from somewhere -- offline means offline for what is not
+    // on the disk.
+    let other = offline
+        .handle
+        .open_drive_file("not-downloaded", REFRESH_TOKEN, None)?
+        .expect_err("a file the disk does not hold needs Drive");
+    assert!(!other.is_pair_again(), "{other}");
+    offline.stop()?;
     Ok(())
 }

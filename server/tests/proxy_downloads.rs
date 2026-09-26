@@ -385,6 +385,17 @@ fn a_pinned_download_survives_a_restart_and_an_unpinned_one_is_swept() -> anyhow
         origin.asked().is_empty(),
         "played off the disk after the restart"
     );
+
+    // What the app does at every launch for what it kept: pin it again.
+    // A whole entry has nothing to fetch, so the origin is not even probed
+    // -- which is what makes the launch work with no network.
+    let again = fixture.pin_url(&origin.url("/kept.mp4"))?;
+    assert_eq!(again["infoHash"], kept);
+    assert_eq!(again["complete"], true, "{again}");
+    assert!(
+        origin.asked().is_empty(),
+        "a re-pin of a whole download asks the origin nothing"
+    );
     fixture.stop()?;
     Ok(())
 }

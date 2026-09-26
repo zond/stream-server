@@ -260,6 +260,16 @@ pub(crate) async fn open_file(
         .drive
         .as_ref()
         .ok_or(DriveOpenError::NoPairingService)?;
+    // A finished download first, and off the disk: it is opened without
+    // the origin and without spending the grant, which is what lets it
+    // play on a device that is offline (`crate::proxy_downloads`). The
+    // ordinary open below probes Drive, and would refuse exactly then.
+    if let Some(downloaded) =
+        crate::proxy_downloads::complete_drive_download(state, file_id, name.clone()).await
+    {
+        tracing::info!(file = %file_id, "a Google Drive file is open from its finished download");
+        return Ok(downloaded);
+    }
     let pairing = endpoints.pairing(file_id, refresh_token);
     Ok(open_pairing(state, pairing, name).await?)
 }

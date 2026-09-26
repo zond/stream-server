@@ -204,13 +204,19 @@ impl ProxyDownloads {
     /// Pins `key` and starts (or keeps) its filler over `source`. Answers the
     /// key directory. Idempotent: a second pin of a running download changes
     /// nothing but the name.
+    /// Records the pin and, given a `source`, starts (or keeps) the filler
+    /// that fetches what the entry does not hold yet. `None` is a pin over
+    /// an entry that is already whole ([`held_complete`]): nothing to fetch,
+    /// so nothing is opened and the origin is not asked -- which is what
+    /// lets a re-pin after a restart, or a pin of a file that was streamed
+    /// to the end, succeed on a device that is offline.
     fn pin(
         &self,
         state: &crate::AppState,
         key: ProxyPinKey,
         name: Option<String>,
         entry: Entry,
-        source: Arc<ProxySource>,
+        source: Option<Arc<ProxySource>>,
     ) -> PathBuf {
         let dir = entry.dir().to_path_buf();
         state.proxy_cache.retention().pin(dir.clone());
@@ -227,7 +233,7 @@ impl ProxyDownloads {
             .filler
             .as_ref()
             .is_some_and(|filler| !filler.is_finished());
-        if !running {
+        if let Some(source) = source.filter(|_| !running) {
             let filler = Filler {
                 entry: entry.quiet(),
                 source,
@@ -301,10 +307,79 @@ pub(crate) async fn pin_url(
     let entry = key.entry(state).ok_or(ProxyPinError::Unkeyable(
         "the URL names this server, or carries a credential the cache will not key",
     ))?;
+    if held_complete(state, &entry).await {
+        return Ok(state.proxy_downloads.pin(state, key, name, entry, None));
+    }
     let source =
         ProxySource::open(state.proxy_cache.clone(), state.http_addr, url, headers).await?;
     let source = Arc::new(source.for_filling());
-    Ok(state.proxy_downloads.pin(state, key, name, entry, source))
+    Ok(state
+        .proxy_downloads
+        .pin(state, key, name, entry, Some(source)))
+}
+
+/// Whether the cache already holds every byte of `entry`'s entity: the
+/// question a pin asks before it opens anything, because a whole entry
+/// has nothing left to fetch and the origin -- or the token a Drive fetch
+/// would spend -- is not needed to keep it.
+async fn held_complete(state: &crate::AppState, entry: &Entry) -> bool {
+    let Some(entry) = state
+        .proxy_cache
+        .entry_for_key_dir(entry.dir().to_path_buf(), Arc::from(""))
+    else {
+        return false;
+    };
+    let entry = entry.quiet();
+    tokio::task::spawn_blocking(move || entry.held_facts())
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|facts| facts.complete)
+}
+
+/// A complete, pinned Drive download of `file_id`, as something a player
+/// can open **without the origin**: the key, its media route
+/// (`/downloads/{key}/stream`, see `routes::downloads`), and the facts the
+/// disk holds about it. `None` when the file is not pinned or not whole
+/// yet -- then it is opened the ordinary way, through Drive.
+///
+/// This is what makes a finished Drive download play offline. Opening a
+/// Drive file otherwise probes the origin (`DriveSource::open`), and a
+/// device with no network would be told its own download is unreachable.
+pub(crate) async fn complete_drive_download(
+    state: &crate::AppState,
+    file_id: &str,
+    name: Option<String>,
+) -> Option<crate::routes::drive::DriveFileOpened> {
+    let key = ProxyPinKey::Drive {
+        file_id: file_id.to_string(),
+    };
+    let dir = key.entry(state)?.dir().to_path_buf();
+    if !state.proxy_cache.retention().is_pinned(&dir) {
+        return None;
+    }
+    let pinned_name = state
+        .proxy_downloads
+        .table()
+        .get(&dir)
+        .map(|pinned| pinned.name.clone());
+    let entry = state
+        .proxy_cache
+        .entry_for_key_dir(dir, Arc::from(""))?
+        .quiet();
+    let key_name = entry.key_name();
+    let facts = tokio::task::spawn_blocking(move || entry.held_facts())
+        .await
+        .ok()
+        .flatten()
+        .filter(|facts| facts.complete)?;
+    Some(crate::routes::drive::DriveFileOpened {
+        url: crate::routes::downloads::proxy_stream_path(&key_name),
+        key: key_name,
+        name: name.or(pinned_name),
+        content_type: facts.content_type,
+        length: facts.total,
+    })
 }
 
 /// Pins a Google Drive file as a download, under the pairing the app
@@ -327,12 +402,17 @@ pub(crate) async fn pin_drive(
     let entry = key.entry(state).ok_or(ProxyPinError::Unkeyable(
         "the Drive file's media URL names this server",
     ))?;
+    if held_complete(state, &entry).await {
+        return Ok(state.proxy_downloads.pin(state, key, name, entry, None));
+    }
     let source = crate::sources::drive::DriveSource::open(state, pairing)
         .await
         .map_err(crate::routes::drive::DriveOpenError::Drive)?;
     let name = name.or_else(|| source.name().map(str::to_string));
     let source = Arc::new(source.filling_source());
-    Ok(state.proxy_downloads.pin(state, key, name, entry, source))
+    Ok(state
+        .proxy_downloads
+        .pin(state, key, name, entry, Some(source)))
 }
 
 /// The task that fetches a pinned download's holes until it is whole.
