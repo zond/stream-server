@@ -2661,6 +2661,22 @@ impl TorrentHandle for LibrqbitHandle {
         }
     }
 
+    /// librqbit's own reading of its peer table, live torrents only: a
+    /// paused or initialising torrent has no peers and no retries, and the
+    /// default says exactly that.
+    fn retry_outlook(&self) -> crate::backend::RetryOutlook {
+        let Some(live) = self.handle.live() else {
+            return crate::backend::RetryOutlook::default();
+        };
+        let summary = live.retry_summary();
+        crate::backend::RetryOutlook {
+            starving: live.is_starving(),
+            dead: summary.dead,
+            proven_dead: summary.proven_dead,
+            next_retry: summary.next_retry,
+        }
+    }
+
     /// `Session::unpause` -> `ManagedTorrent::start`, whose `Error(_)` arm
     /// rebuilds the storage, re-checks what is on disk and goes live again
     /// (librqbit e314d8b, `torrent_state/mod.rs`). The re-check is what makes

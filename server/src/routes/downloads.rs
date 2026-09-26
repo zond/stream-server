@@ -235,10 +235,19 @@ fn spawn_download_progress_log(
                 continue;
             };
             let (moved, still) = track.observe(file.downloaded);
+            // The backend's own reading of why nothing is arriving: short of
+            // sources, and the peers it is waiting to dial again. A stall
+            // then reads as "waiting 40 s for the only peer that ever
+            // served us" rather than as silence.
+            let retries = engine.handle.retry_outlook();
             tracing::info!(
                 info_hash = %info_hash,
                 file_idx,
                 run_state = ?engine.handle.run_state(),
+                starving = retries.starving,
+                dead = retries.dead,
+                proven_dead = retries.proven_dead,
+                next_retry_secs = retries.next_retry.map(|d| d.as_secs()),
                 phase = ?stats.phase,
                 downloaded = file.downloaded,
                 length = file.length,

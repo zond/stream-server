@@ -1,7 +1,8 @@
 # Thin swarms: why a download goes quiet for minutes
 
-Design, 2026-09-26. Written against rqbit `d02b73a2` and stream-server
-`300673e`. Not built.
+Design, 2026-09-26, against rqbit `d02b73a2` and stream-server `300673e`.
+**Built the same day** in the rqbit fork (see the end of §4 for what was built
+as designed, what was tightened, and what was dropped).
 
 ## 1. What a thin swarm is
 
@@ -93,9 +94,10 @@ Add to a peer's stats whether it has ever delivered a verified piece
 (the reset site in point 3 already knows). Then:
 
 * **Proven peer, torrent starving** (live peers below a floor, say 4, and
-  pieces still wanted): retry on a flat, short schedule -- 15 s, capped at
-  60 s -- for as long as that holds. These are the only addresses we know
-  are real sources; a leecher that choked us now may unchoke us on its next
+  pieces still wanted): retry on a flat 60 s -- libtorrent's own
+  `min_reconnect_time`, which no tracker or peer treats as aggressive -- for
+  as long as that holds. These are the only addresses we know are real
+  sources; a leecher that choked us now may unchoke us on its next
   rotation, which is tens of seconds away, not an hour.
 * **Proven peer, torrent healthy:** the existing schedule.
 * **Never answered:** the existing schedule. Those are the NAT'd and the
@@ -108,8 +110,9 @@ peers, which in a thin swarm is small by definition.
 ### 4.2 A fresh sighting brings a dead peer forward
 
 When a tracker or DHT reply names an address that is `Dead` and waiting,
-and the torrent is starving, move its requeue to now instead of ignoring
-it. A peer that has just announced itself to a tracker or answered a DHT
+**proven**, and the torrent is starving, move its requeue to now instead of
+ignoring it -- at most four per torrent per minute, so a reply that names
+every dead peer at once is a few dials and not a burst. A peer that has just announced itself to a tracker or answered a DHT
 query is more likely to be alive than one we last heard from twenty minutes
 ago. This is a change to the `Occupied` arm of `add_if_not_seen` (or a new
 `add_or_refresh`) and needs the state check under the entry lock that
@@ -118,24 +121,21 @@ ago. This is a change to the `Occupied` arm of `add_if_not_seen` (or a new
 Not for `Live`/`Connecting`/`Queued` peers (nothing to do) and not for
 `NotNeeded` (we decided we don't need it).
 
-### 4.3 Starvation is a signal the torrent can act on
+### 4.3 Starvation is a signal the torrent can act on -- mostly not
 
-When a wanted torrent has had no live peer and an empty queue for, say,
-60 s:
+The first draft here had the torrent re-announce to its trackers when it
+starved. Reading `tracker_comms` closed that: the announce loop already
+sleeps the tracker's `min interval` when it states one and `interval`
+otherwise, which is the earliest a client may ask again. There is nothing
+to gain inside the rules, and asking outside them is what gets a client
+throttled or banned -- so no re-announce. The DHT already re-queries every
+60 s; with 4.2 in place what it finds is no longer discarded, which is most
+of the value.
 
-* **Tracker:** re-announce, but never sooner than the tracker's own
-  `min interval` since the last announce. Trackers state that number
-  precisely so clients can ask again when they need to; respecting it is
-  both correct and the only thing that keeps us welcome. Most trackers
-  set `min interval` well below `interval`, so this is usually minutes,
-  not half an hour.
-* **DHT:** already re-queries at 60 s. With 4.2 in place, what it finds is
-  no longer discarded, which is most of the value.
-
-And the progress line should say so: `starving_secs`, and the count of
-`dead` peers with the time until the soonest retry, so a stall reads as
-"waiting 5 min for the next retry of the only peer that ever served us"
-rather than as silence.
+What starvation *does* drive is the report: the progress line says
+`starving`, and the count of `dead` peers, how many of them are proven,
+and the time until the soonest retry -- so a stall reads as "waiting 40 s
+for the only peer that ever served us" rather than as silence.
 
 ### 4.4 Keep proven peers across going lean
 
@@ -143,7 +143,29 @@ rather than as silence.
 for the same reason the requeue path already puts proven peers first when
 the cap goes back up (`task_peer_adder`: "peers we have already talked to
 go first"). They are a few hundred bytes each and they are the most
-valuable addresses the torrent has.
+valuable addresses the torrent has. Parked (`NotNeeded`) peers still go:
+that is what the peer-limit tests pin, and a raise re-dials what it parked
+from the queue, not from the table.
+
+### What was built (rqbit fork, 2026-09-26)
+
+* `PeerStats::proven` (a verified piece delivered) and
+  `PeerStats::next_wait`: the flat retry while starving, the exponential
+  schedule otherwise, the schedule's position untouched by the flat phase.
+* `TorrentStateLive::is_starving`: fewer live peers than the floor and
+  pieces still wanted. `ManagedTorrent::set_starving_retry(floor, retry)`
+  sets both numbers; defaults 4 peers and 60 s.
+* `add_peer_if_not_seen` brings a proven dead peer forward while starving,
+  four per minute per torrent; a generation counter keeps the stale sleep
+  from re-queueing it a second time.
+* `forget_disconnected_peers` keeps proven dead peers.
+* `TorrentStateLive::retry_summary`: dead, proven dead, seconds to the
+  soonest retry.
+* Tests: the schedule choice as unit tests on `PeerStats`; the forget
+  predicate and the burst cap as unit tests; and two end-to-end tests with
+  a real seeder that hangs up (`e2e_thin_swarm.rs`) -- three deaths, each
+  followed by a re-dial within the flat retry, and a sighting that brings a
+  parked peer forward.
 
 ## 5. What this does not fix, stated
 

@@ -304,6 +304,21 @@ impl std::fmt::Debug for DroppedFilePieces {
 ///
 /// Nothing here is a claim about *why* a torrent is stopped -- that is the
 /// caller's policy to recompute, not the backend's to remember.
+/// See [`TorrentHandle::retry_outlook`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetryOutlook {
+    /// The torrent still wants pieces and has fewer live peers than its
+    /// floor (librqbit: `TorrentStateLive::is_starving`).
+    pub starving: bool,
+    /// Peers marked dead, waiting out a retry.
+    pub dead: u32,
+    /// Of those, the ones that have delivered a verified piece -- the
+    /// addresses known to be sources.
+    pub proven_dead: u32,
+    /// How long until the soonest of those retries; `None` with none waiting.
+    pub next_retry: Option<std::time::Duration>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
     /// Connected to peers, reading and writing: the only state in which a
@@ -482,6 +497,16 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     /// Must be cheap: it is polled on a timer for every torrent that exists,
     /// so it is a couple of lock reads and no I/O, never a `stats()` walk.
     fn run_state(&self) -> RunState;
+
+    /// The peers this torrent is waiting to dial again, and whether it is
+    /// short of sources -- what tells "nobody answers" from "waiting out a
+    /// retry" in a stall report (`download progress`). Walks the peer table,
+    /// so it is for a report every few seconds and not the per-second stats
+    /// poll. A backend with no such notion answers the default: nothing
+    /// waiting, not starving.
+    fn retry_outlook(&self) -> RetryOutlook {
+        RetryOutlook::default()
+    }
 
     /// Whether the backend stopped this torrent because the volume it writes
     /// to ran out of space -- the one torrent error that is a statement about
