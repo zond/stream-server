@@ -1656,6 +1656,52 @@ async fn proxy(
     // again by the end-of-body line below so the two read alike.
     let answered_by = fetched_url.origin().ascii_serialization();
 
+    // An entity a *player* is reading is one the passes read ahead of, and
+    // this is the one moment that knows how: the URL, the caller's request
+    // headers, and what the origin just said the entity is. Registered on
+    // every relayed answer, so a link whose credentials rotate is fetched
+    // with the latest (`proxy_retention::Prefetcher`).
+    //
+    // A player, and only a player: the request carries the client's own
+    // player token (`p=`, which the app puts on every URL it hands mpv --
+    // see `proxy_streams`). A request without one is a probe, an index
+    // read, a thumbnail or a test, and fetches exactly what it asked for:
+    // a single sizeable read is enough to give the detector a rate, so the
+    // rate cannot be the thing that tells a player from a one-off fetch.
+    if let (Some(entry), Some(cacheable), Some(_player)) = (
+        cache_entry.as_ref(),
+        cacheable.as_ref(),
+        player_token.as_ref(),
+    ) {
+        // The player's negotiation headers, which are half of the cache
+        // key: the source has to fetch into the entity the player reads.
+        let mut negotiation = HeaderMap::new();
+        for name in FORWARDED_REQUEST_HEADERS {
+            if matches!(name, "range" | "if-range") {
+                continue;
+            }
+            if let Some(value) = headers.get(name) {
+                negotiation.insert(name, value.clone());
+            }
+        }
+        let source = crate::sources::ProxySource::from_probe(
+            state.proxy_cache.clone(),
+            state.http_addr,
+            url.clone(),
+            params.request_headers.clone(),
+            negotiation,
+            ProbedEntity {
+                total: cacheable.total,
+                content_type: cacheable.content_type.clone(),
+                validator: Some(cacheable.validator.filed()),
+            },
+        );
+        state.proxy_cache.retention().note_source(
+            entry.dir().to_path_buf(),
+            std::sync::Arc::new(source.for_filling()),
+        );
+    }
+
     // A rewritten playlist is the whole resource however it was asked for,
     // so it is answered `200` even when the origin said `206` -- and a
     // `HEAD` for it says the same, since what it describes is that same

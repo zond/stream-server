@@ -155,7 +155,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(test)]
 use std::time::Duration;
 #[cfg(test)]
 use std::time::Instant;
@@ -205,6 +204,279 @@ const PASSES_PER_WINDOW: u64 = 20;
 /// by: two entities under one cache key index their chunks the same way and
 /// hold different bytes.
 type Detectors = Arc<Mutex<HashMap<PathBuf, enginefs::retention::streams::Streams>>>;
+
+/// **How a proxied entity is fetched when no player is asking**, by key
+/// directory: a quiet [`crate::sources::ProxySource`] over the same URL and
+/// credentials the entity was opened with, registered by the `/proxy` route
+/// when it relays an origin answer and by the Drive open
+/// ([`ProxyRetention::note_source`]), and read by [`ProxyBacking::want`] to
+/// fill the want-windows ahead of a player.
+///
+/// Why it is a registry and not something the pass derives: the cache key
+/// is a hash of the URL and the request headers, so the entity's directory
+/// cannot be turned back into a fetch, and the credentials -- a debrid
+/// link's headers, a Drive grant that renews itself -- are only ever in
+/// the hands of whatever opened it. A source lives here as long as the
+/// process does; it is a URL and a credential handle, not a connection.
+type Sources = Arc<Mutex<HashMap<PathBuf, Arc<crate::sources::ProxySource>>>>;
+
+/// The read-ahead task of each proxied entity, by key directory. See
+/// [`Prefetcher`].
+type Prefetchers = Arc<Mutex<HashMap<PathBuf, Prefetcher>>>;
+
+/// Read-ahead for one proxied entity: the chunks the last pass wanted and
+/// the disk did not hold, being fetched through the entity's quiet source.
+///
+/// **This is the proxy's half of what a torrent's picker does with the
+/// want set.** [`Backing::want`] hands every pass's windows to the
+/// backing; the torrent forwards them to librqbit, which fetches them; a
+/// proxied body used to be fetched only by the player's own `Range`, so a
+/// Drive or debrid stream had the window's *retention* -- the bytes were
+/// kept once fetched -- and none of its *lookahead*. The task below is
+/// the fetch: one per entity, fed by each pass, reading the wanted runs in
+/// order through a source whose readers are quiet, so it claims no live
+/// entity and leaves no playhead -- a filler is never mistaken for a
+/// viewer, and a stream nobody is reading gets no pass and so no fill.
+///
+/// Bounded three ways. The pass sizes the window (the stream's measured
+/// rate times the buffer profile's seconds, shared out of the budget and
+/// ramped a doubling per pass -- `enginefs::retention::streams`), and only
+/// an entity **a player opened** has a source to fetch with: the `/proxy`
+/// route registers one for a request carrying the client's player token
+/// and the Drive open for its session, while a probe, an archive's index
+/// read or a test fetches exactly what it asked for, as before
+/// ([`ProxyRetention::note_source`]). The chunks it lands are inside the
+/// pass's exempt set, so the same pass never reclaims what it just asked
+/// for. And when passes stop -- the player left -- the task finishes the
+/// runs it holds and exits after [`PREFETCH_IDLE`] with nothing new to do.
+struct Prefetcher {
+    /// What is wanted fetched now, replaced whole by whoever asks and
+    /// taken whole by the task; `None` between asks.
+    wanted: Arc<Mutex<Option<Wanted>>>,
+    /// Rung when `wanted` changes.
+    notify: Arc<tokio::sync::Notify>,
+    task: tokio::task::AbortHandle,
+}
+
+/// What a [`Prefetcher`] is asked to fetch.
+///
+/// Two askers, for the two shapes a retention policy has. **Bounded** --
+/// the budget does not cover the entity, so the owner installed a window
+/// and runs passes -- and each pass hands [`ProxyBacking::want`] its
+/// windows, which arrive here as the runs the disk does not hold.
+/// **Whole** -- the budget covers the entity, so the owner installs no
+/// policy, runs no pass and asks the backing nothing (an unbounded torrent
+/// is simply left to its picker, which fetches all of it) -- and the
+/// player's own delivered bytes drive it instead
+/// ([`ProxyRetention::read_ahead_from`]): the rest of the file from the
+/// head, which is what the torrent's picker would be doing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Wanted {
+    Runs(Vec<Range<u32>>),
+    Whole { from: u32 },
+}
+
+/// How long a prefetcher waits for another pass before it exits. A pass
+/// arrives every stride of playback, so a minute of silence is a player
+/// that has stopped or left, and the task is cheap to start again.
+const PREFETCH_IDLE: Duration = Duration::from_secs(60);
+
+/// How long a prefetcher waits after a read failed before its next run.
+/// An origin that refused a range is not asked again at once; the pass
+/// after next re-states what is still missing.
+const PREFETCH_RETRY: Duration = Duration::from_secs(5);
+
+/// How much a prefetcher reads between two looks at what is wanted now and
+/// at whether the entity is still the one being played: a seek re-targets
+/// it within this much, and a player that left stops it within this much.
+const PREFETCH_STRIDE: u64 = 32 * 1024 * 1024;
+
+impl Prefetcher {
+    /// Hands the entity in `entity` (under `key_dir`) what is wanted
+    /// fetched now, starting the task if it is not running.
+    fn want(
+        prefetchers: &Prefetchers,
+        key_dir: PathBuf,
+        entity: ChunkDir,
+        total: u64,
+        wanted: Wanted,
+        source: Arc<crate::sources::ProxySource>,
+        live: Arc<Live>,
+    ) {
+        let mut table = prefetchers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(running) = table
+            .get(&key_dir)
+            .filter(|running| !running.task.is_finished())
+        {
+            *running
+                .wanted
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(wanted);
+            running.notify.notify_one();
+            return;
+        }
+        let wanted = Arc::new(Mutex::new(Some(wanted)));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn(prefetch(
+            key_dir.clone(),
+            entity,
+            total,
+            source,
+            live,
+            wanted.clone(),
+            notify.clone(),
+        ))
+        .abort_handle();
+        table.insert(
+            key_dir,
+            Prefetcher {
+                wanted,
+                notify,
+                task,
+            },
+        );
+    }
+}
+
+/// The body of a [`Prefetcher`]: fetch what is wanted a stride at a time,
+/// looking between strides at what is wanted now and at whether the entity
+/// is still the one being played; wait for more; exit when nothing more
+/// comes.
+async fn prefetch(
+    key_dir: PathBuf,
+    entity: ChunkDir,
+    total: u64,
+    source: Arc<crate::sources::ProxySource>,
+    live: Arc<Live>,
+    wanted: Arc<Mutex<Option<Wanted>>>,
+    notify: Arc<tokio::sync::Notify>,
+) {
+    use crate::sources::ByteSource as _;
+    tracing::info!(
+        key = %key_dir.display(),
+        origin = %source.describe(),
+        "read-ahead: filling ahead of the player"
+    );
+    let take = || {
+        wanted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    };
+    let superseded = || {
+        wanted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    };
+    let mut sink = vec![0u8; 256 * 1024];
+    let chunks = u32::try_from(total.div_ceil(CHUNK_BYTES)).unwrap_or(u32::MAX);
+    loop {
+        let Some(target) = take() else {
+            if tokio::time::timeout(PREFETCH_IDLE, notify.notified())
+                .await
+                .is_err()
+            {
+                tracing::info!(
+                    key = %key_dir.display(),
+                    "read-ahead: nothing asked for a minute; stopping"
+                );
+                return;
+            }
+            continue;
+        };
+        let runs = match target {
+            Wanted::Runs(runs) => runs,
+            // The rest of the file from the head, less what the disk holds
+            // -- listed now, once per ask, on the blocking pool.
+            Wanted::Whole { from } => {
+                let dir = entity.clone();
+                let held = tokio::task::spawn_blocking(move || dir.held())
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or_default();
+                let missing: Vec<u32> = (from.min(chunks)..chunks)
+                    .filter(|chunk| !held.contains(&u64::from(*chunk)))
+                    .collect();
+                runs_of(&missing)
+            }
+        };
+        'runs: for run in runs {
+            let mut from = u64::from(run.start).saturating_mul(CHUNK_BYTES);
+            let end = u64::from(run.end).saturating_mul(CHUNK_BYTES).min(total);
+            while from < end {
+                // Between strides: a newer ask wins, and an entity that is
+                // no longer the one being played is left alone -- the
+                // viewer went elsewhere, and this is not a viewer.
+                if superseded() {
+                    break 'runs;
+                }
+                if !live.is_proxy(entity.path()) {
+                    tracing::info!(
+                        key = %key_dir.display(),
+                        "read-ahead: the entity is no longer being played; stopping"
+                    );
+                    return;
+                }
+                let until = (from + PREFETCH_STRIDE).min(end);
+                if let Err(error) = prefetch_run(&source, from, until, &mut sink).await {
+                    tracing::warn!(
+                        key = %key_dir.display(),
+                        origin = %source.describe(),
+                        from,
+                        until,
+                        %error,
+                        "read-ahead: a read failed; waiting before the next"
+                    );
+                    tokio::time::sleep(PREFETCH_RETRY).await;
+                    break 'runs;
+                }
+                tracing::debug!(key = %key_dir.display(), from, until, "read-ahead: stride landed");
+                from = until;
+            }
+        }
+    }
+}
+
+/// Reads `from..until` of `source` into `sink` and drops it: the read is
+/// the point, since a quiet source's reader files every chunk it passes
+/// in the cache on the way (`crate::routes::proxy::cache_assisted_range`).
+async fn prefetch_run(
+    source: &crate::sources::ProxySource,
+    from: u64,
+    until: u64,
+    sink: &mut [u8],
+) -> std::io::Result<()> {
+    use crate::sources::{ByteSource as _, ReadHint};
+    use tokio::io::AsyncReadExt as _;
+    let mut reader = source.open(from, ReadHint::of(until - from)).await?;
+    let mut read = 0u64;
+    while from + read < until {
+        let want = ((until - from - read) as usize).min(sink.len());
+        let n = reader.read(&mut sink[..want]).await?;
+        if n == 0 {
+            break;
+        }
+        read += n as u64;
+    }
+    Ok(())
+}
+
+/// The fewest ranges that cover `chunks`, which must be sorted and
+/// distinct.
+fn runs_of(chunks: &[u32]) -> Vec<Range<u32>> {
+    let mut runs: Vec<Range<u32>> = Vec::new();
+    for &chunk in chunks {
+        match runs.last_mut() {
+            Some(run) if run.end == chunk => run.end += 1,
+            _ => runs.push(chunk..chunk + 1),
+        }
+    }
+    runs
+}
 
 /// A proxied entity, as the owner sees it: a chunk directory, its length,
 /// and the URL it was relayed for.
@@ -274,6 +546,11 @@ struct ProxyBacking {
     /// [`ProxyBacking::reading`], which draws the want set, the exempt bits
     /// and the reclaim out of them. See [`Detectors`].
     detectors: Detectors,
+    /// How each entity is fetched when nobody is asking, and the task
+    /// doing it: [`Sources`] and [`Prefetchers`], shared with
+    /// [`ProxyRetention`], which is where the route registers a source.
+    sources: Sources,
+    prefetchers: Prefetchers,
     /// The threads the blocking halves of a pass really ran on.
     ///
     /// A `#[tokio::test]` drives its runtime on the test's own thread, so
@@ -487,6 +764,77 @@ impl Backing for ProxyBacking {
     /// `key` is the entity directory (`<key dir>/<total_type_validator>`),
     /// so the pin is looked up by its parent. A copy-out read of the set,
     /// as the contract asks: no owner lock is held here.
+    /// The proxy's fetch of the want set: see [`Prefetcher`].
+    ///
+    /// `windows` are the pass's want-windows in chunk indices (each open
+    /// stream's head to its head plus its granted window); what the disk
+    /// already holds is taken out and the rest handed to the entity's
+    /// prefetcher as runs. Nothing is done for an entity whose reads have
+    /// no measured rate yet -- the detector answers that from the same
+    /// reads that drew the windows -- nor for one nothing registered a
+    /// source for: no player opened it, or it has been served from the
+    /// cache alone since this process started and has nothing to fetch.
+    async fn want(
+        &self,
+        (): &(),
+        domain: &ProxyDomain,
+        windows: &[Range<u32>],
+        held: &BTreeSet<u32>,
+        _door: &Door<Self>,
+    ) {
+        let Some(key_dir) = domain.dir.path().parent().map(Path::to_path_buf) else {
+            return;
+        };
+        let rated = self
+            .detectors
+            .lock()
+            .ok()
+            .and_then(|detectors| {
+                detectors
+                    .get(domain.dir.path())
+                    .map(|streams| streams.rates(0).iter().any(Option::is_some))
+            })
+            .unwrap_or(false);
+        if !rated {
+            return;
+        }
+        let mut missing: Vec<u32> = windows
+            .iter()
+            .flat_map(|window| window.clone())
+            .filter(|chunk| !held.contains(chunk))
+            .collect();
+        missing.sort_unstable();
+        missing.dedup();
+        let runs = runs_of(&missing);
+        if runs.is_empty() {
+            return;
+        }
+        let source = self
+            .sources
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key_dir)
+            .cloned();
+        let Some(source) = source else {
+            tracing::debug!(
+                key = %key_dir.display(),
+                wanted = runs.len(),
+                "read-ahead: the pass wants chunks but nothing registered a source"
+            );
+            return;
+        };
+        tracing::debug!(key = %key_dir.display(), ?runs, "read-ahead: the pass wants");
+        Prefetcher::want(
+            &self.prefetchers,
+            key_dir,
+            domain.dir.clone(),
+            domain.total,
+            Wanted::Runs(runs),
+            source,
+            self.live.clone(),
+        );
+    }
+
     fn keeps_everything(&self, key: &PathBuf) -> bool {
         let pins = self
             .pins
@@ -665,6 +1013,8 @@ impl ProxyBacking {
             live: self.live.clone(),
             occupancy: self.occupancy.clone(),
             detectors: self.detectors.clone(),
+            sources: self.sources.clone(),
+            prefetchers: self.prefetchers.clone(),
             #[cfg(test)]
             disk_threads: self.disk_threads.clone(),
         }
@@ -977,6 +1327,17 @@ pub struct ProxyRetention {
     /// answers them and sizes every window it keeps from them. See
     /// [`Detectors`].
     detectors: Detectors,
+    /// How each opened entity can be fetched without a player, registered
+    /// through [`Self::note_source`]; and the read-ahead tasks driven with
+    /// it, by the backing's passes when the entity is bounded and by
+    /// [`Self::read_ahead_from`] when the budget covers it whole. See
+    /// [`Sources`] and [`Prefetcher`].
+    sources: Sources,
+    prefetchers: Prefetchers,
+    /// The budget the owner decides under, read by [`Self::read_ahead_from`]
+    /// to tell a bounded entity (the passes' business) from one the budget
+    /// covers whole (its own).
+    budget: Arc<RetentionBudget>,
     /// The key directories pinned as offline downloads (see
     /// [`crate::proxy_downloads`]), shared with the backing so that
     /// [`ProxyBacking::keeps_everything`] answers from it. `None` until the
@@ -1059,16 +1420,20 @@ impl ProxyRetention {
         let occupancy: Arc<Occupancy> = Arc::default();
         let detectors: Detectors = Arc::default();
         let pins: Arc<RwLock<Option<HashSet<PathBuf>>>> = Arc::default();
+        let sources: Sources = Arc::default();
+        let prefetchers: Prefetchers = Arc::default();
         let owner = Retention::new(
             Arc::new(ProxyBacking {
                 pins: pins.clone(),
                 live: live.clone(),
                 occupancy: occupancy.clone(),
                 detectors: detectors.clone(),
+                sources: sources.clone(),
+                prefetchers: prefetchers.clone(),
                 #[cfg(test)]
                 disk_threads: disk_threads.clone(),
             }),
-            budget,
+            budget.clone(),
         );
         #[cfg(test)]
         let interleave: Arc<Interleave> = Arc::default();
@@ -1093,6 +1458,9 @@ impl ProxyRetention {
             work,
             occupancy,
             detectors,
+            sources,
+            prefetchers,
+            budget,
             pins,
             next_reader: AtomicU64::new(1),
             #[cfg(test)]
@@ -1173,6 +1541,76 @@ impl ProxyRetention {
     /// Names the pinned key directories. `Some(set)` is the embedder's
     /// record, `None` its absence (see [`Self::pins`]). Called once at boot,
     /// before the sweep, and thereafter by [`Self::pin`]/[`Self::unpin`].
+    /// Registers how the entity under `key_dir` is fetched when no player
+    /// is asking -- a quiet source over its URL and credentials -- so the
+    /// passes can read ahead of a player ([`Prefetcher`]). Called by the
+    /// `/proxy` route on every origin answer it relays to a request that
+    /// carries a player token, and by the Drive open; the latest
+    /// registration wins, which for a debrid link whose credentials rotate
+    /// is the one to use. **Registering is what turns read-ahead on** for
+    /// an entity, so nothing that is not a player's stream calls this.
+    pub(crate) fn note_source(&self, key_dir: PathBuf, source: Arc<crate::sources::ProxySource>) {
+        self.sources
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key_dir, source);
+    }
+
+    /// Read-ahead for an entity the budget covers whole, driven by a
+    /// player's delivered byte (`Reader::note`): the rest of the file from
+    /// the head, through the source registered for it. See [`Wanted`].
+    ///
+    /// Nothing for an entity no player opened (no source), for one the
+    /// owner bounds (its passes hand the windows to [`ProxyBacking::want`]
+    /// instead), or while no budget has been published yet -- the passes
+    /// wait for that too, and so does this.
+    fn read_ahead_from(&self, entity: &Path, total: u64, delivered_to: u64) {
+        let Some(key_dir) = entity.parent() else {
+            return;
+        };
+        let source = self
+            .sources
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(key_dir)
+            .cloned();
+        let Some(source) = source else {
+            return;
+        };
+        let dir = ChunkDir::new(entity.to_path_buf());
+        let bounded = match self.budget.get() {
+            enginefs::retention::CacheBudget::Unknown => return,
+            enginefs::retention::CacheBudget::Unbounded => false,
+            enginefs::retention::CacheBudget::Bytes(bytes) => {
+                let domain = ProxyDomain {
+                    dir: dir.clone(),
+                    total,
+                    target: Arc::from(""),
+                };
+                <ProxyBacking as Backing>::policy(
+                    &domain,
+                    bytes,
+                    enginefs::piece_store::Buffering::default(),
+                )
+                .map(|policy| matches!(policy.shape(), enginefs::piece_store::Shape::Split { .. }))
+                .unwrap_or(false)
+            }
+        };
+        if bounded {
+            return;
+        }
+        let from = u32::try_from(delivered_to / CHUNK_BYTES + 1).unwrap_or(u32::MAX);
+        Prefetcher::want(
+            &self.prefetchers,
+            key_dir.to_path_buf(),
+            dir,
+            total,
+            Wanted::Whole { from },
+            source,
+            self.live.clone(),
+        );
+    }
+
     pub fn set_pins(&self, pins: Option<HashSet<PathBuf>>) {
         *self
             .pins
@@ -1735,6 +2173,8 @@ impl Reader {
         if let Some(claim) = self.inner.note(delivered_to) {
             self.retention.spawn_pass(self.key.clone(), claim);
         }
+        self.retention
+            .read_ahead_from(&self.key, self.total, delivered_to);
     }
 }
 
@@ -1836,6 +2276,8 @@ mod tests {
             live: Arc::new(Live::default()),
             occupancy: Arc::default(),
             detectors: Arc::default(),
+            sources: Arc::default(),
+            prefetchers: Arc::default(),
             #[cfg(test)]
             disk_threads: Arc::default(),
         };

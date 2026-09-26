@@ -603,6 +603,12 @@ impl DriveSource {
     pub(crate) fn filling_source(&self) -> ProxySource {
         self.inner.for_filling()
     }
+
+    /// The key directory the file is cached under: see
+    /// [`ProxySource::key_dir`].
+    pub(crate) fn key_dir(&self) -> Option<std::path::PathBuf> {
+        self.inner.key_dir()
+    }
 }
 
 #[async_trait::async_trait]

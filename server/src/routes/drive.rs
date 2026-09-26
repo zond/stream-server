@@ -289,6 +289,14 @@ pub(crate) async fn open_pairing(
         Some(name) => source.named(name.clone()),
         None => source,
     };
+    // The passes read ahead of the player through the same source, quiet
+    // (`proxy_retention::Prefetcher`); it renews the grant for itself.
+    if let Some(key_dir) = source.key_dir() {
+        state
+            .proxy_cache
+            .retention()
+            .note_source(key_dir, Arc::new(source.filling_source()));
+    }
     let opened = DriveFileOpened {
         key: Uuid::new_v4().to_string(),
         url: String::new(),

@@ -235,6 +235,20 @@ and it is the only piece of §3 that touches the sources.
 
 ## 4. Drive streaming, and read-ahead
 
+**Built 2026-09-26** (`server/src/proxy_retention.rs`, `Prefetcher`), with
+two departures from the sketch below. There is no `Fill` enum: the
+download filler and the read-ahead are separate tasks over the same quiet
+`ProxySource`, because the download is a pin's and the read-ahead is a
+player's. And the want set alone was not enough: where the budget covers
+the response whole the owner installs no policy and runs no pass -- an
+unbounded torrent is simply left to its picker -- so that case is driven
+from the player's delivered bytes and fetches the rest of the file, which
+is what the picker would do. Read-ahead is on for a player's stream only:
+a `/proxy` request carrying the app's player token, or a Drive session.
+Measured in `tests/proxy.rs`
+(`a_reader_with_a_rate_is_read_ahead_of_and_a_lone_range_is_not`) and
+`tests/drive.rs` (`a_playing_drive_file_is_read_ahead_of`).
+
 What zond asked: does Drive fit the caching/lookahead system? **Caching
 and retention, yes, today, unchanged.** Lookahead, no -- and not because
 Drive is special: *no* proxied stream reads ahead of its player, because

@@ -208,6 +208,14 @@ struct Entity {
     /// uncached one -- while a grant of this server's own is keyed by its
     /// scope. See [`Credentials`].
     credentials: Credentials,
+    /// The player's negotiation headers (`routes::proxy::FORWARDED_REQUEST_HEADERS`
+    /// less the range ones), when this source stands in for a player's own
+    /// reads: they are part of the cache key and are sent to the origin,
+    /// so a source built for read-ahead must carry the ones the player
+    /// sent or it fetches into -- and out of -- a different entity than
+    /// the one the player reads. Empty for a source that is its own
+    /// caller (an archive's index, a download's filler).
+    player_headers: HeaderMap,
     total: u64,
     content_type: String,
     /// How the origin identified the entity, as the store files it.
@@ -291,19 +299,51 @@ impl ProxySource {
                 "an authorised read is cached under its URL"
             );
         }
-        Ok(Self {
+        Ok(Self::from_probe(
+            cache,
+            self_addr,
+            url,
+            credentials,
+            HeaderMap::new(),
+            entity,
+        ))
+    }
+
+    /// A source over an entity the origin has already described -- what
+    /// [`Self::open`] builds after its own probe, and what the `/proxy`
+    /// route builds from the answer it is relaying, so that the entity a
+    /// player is reading can be read ahead of without a second probe
+    /// (`crate::proxy_retention::ProxyRetention::note_source`).
+    /// `player_headers` are that player's, see [`Entity::player_headers`];
+    /// a source that is its own caller passes none.
+    pub(crate) fn from_probe(
+        cache: Arc<crate::proxy_cache::ProxyCache>,
+        self_addr: SocketAddr,
+        url: Url,
+        credentials: impl Into<Credentials>,
+        player_headers: HeaderMap,
+        entity: crate::routes::proxy::ProbedEntity,
+    ) -> Self {
+        Self {
             entity: Arc::new(Entity {
                 cache,
                 self_addr,
                 describe: crate::routes::util::log_origin(url.as_str()),
                 url,
-                credentials,
+                credentials: credentials.into(),
+                player_headers,
                 total: entity.total,
                 content_type: entity.content_type,
                 validator: entity.validator,
                 quiet: false,
             }),
-        })
+        }
+    }
+
+    /// The key directory this source's entity is cached under, when the
+    /// cache keys it at all: what registers it for read-ahead.
+    pub(crate) fn key_dir(&self) -> Option<std::path::PathBuf> {
+        self.entity.entry().map(|entry| entry.dir().to_path_buf())
     }
 
     /// This source with every reader it opens **quiet**: a download's
@@ -320,6 +360,7 @@ impl ProxySource {
                 self_addr: entity.self_addr,
                 url: entity.url.clone(),
                 credentials: entity.credentials.clone(),
+                player_headers: entity.player_headers.clone(),
                 total: entity.total,
                 content_type: entity.content_type.clone(),
                 validator: entity.validator.clone(),
@@ -382,7 +423,7 @@ impl Entity {
                 &Method::GET,
                 &self.url,
                 request_headers,
-                &HeaderMap::new(),
+                &self.player_headers,
                 self.self_addr,
             ),
             Credentials::Own {
@@ -405,7 +446,7 @@ impl Entity {
     /// them, the origin's where it does not, filled back into the cache as
     /// they go past.
     async fn ranged(&self, first: u64, last: u64) -> io::Result<ProxiedBody> {
-        let mut headers = HeaderMap::new();
+        let mut headers = self.player_headers.clone();
         headers.insert(
             header::RANGE,
             HeaderValue::from_str(&format!("bytes={first}-{last}"))

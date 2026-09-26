@@ -20,7 +20,7 @@ const REFRESH_TOKEN: &str = "refresh-tok-8b21-never-log-me";
 /// Drive's id for the film. Not a secret -- it is the cache key.
 const FILE_ID: &str = "1AbCdEfGhIjKlMnOpQrStUvWxYz";
 
-const FILE_LENGTH: usize = 400 * 1024;
+const FILE_LENGTH: usize = 2 * 1024 * 1024;
 
 /// The film's bytes: a pattern, so a range can be checked to have come
 /// from the offset it claims rather than merely to be the right length.
@@ -51,6 +51,8 @@ enum Refreshes {
 struct Fake {
     addr: SocketAddr,
     refreshes: Arc<AtomicUsize>,
+    /// Every `Range` the film was asked for, in order.
+    ranges: Arc<Mutex<Vec<String>>>,
 }
 
 impl Fake {
@@ -59,18 +61,21 @@ impl Fake {
         let addr = listener.local_addr()?;
         let refreshes = Arc::new(AtomicUsize::new(0));
         let issued = Arc::new(Mutex::new(Vec::<String>::new()));
+        let ranges = Arc::new(Mutex::new(Vec::<String>::new()));
         let fake = Fake {
             addr,
             refreshes: refreshes.clone(),
+            ranges: ranges.clone(),
         };
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { break };
-                let (refreshes, issued) = (refreshes.clone(), issued.clone());
+                let (refreshes, issued, ranges) =
+                    (refreshes.clone(), issued.clone(), ranges.clone());
                 // A thread per connection: a player's opening is several
                 // reads at once and a serial fake would turn the test's
                 // question into a queue.
-                std::thread::spawn(move || serve(stream, mode, &refreshes, &issued));
+                std::thread::spawn(move || serve(stream, mode, &refreshes, &issued, &ranges));
             }
         });
         Ok(fake)
@@ -87,6 +92,11 @@ impl Fake {
     fn refreshes(&self) -> usize {
         self.refreshes.load(Ordering::SeqCst)
     }
+
+    /// The `Range` headers the film has been asked with so far.
+    fn ranges(&self) -> Vec<String> {
+        self.ranges.lock().expect("the ranges").clone()
+    }
 }
 
 fn serve(
@@ -94,6 +104,7 @@ fn serve(
     mode: Refreshes,
     refreshes: &AtomicUsize,
     issued: &Mutex<Vec<String>>,
+    ranges: &Mutex<Vec<String>>,
 ) {
     let Ok(second) = stream.try_clone() else {
         return;
@@ -181,6 +192,9 @@ fn serve(
             b"{\"error\":{\"code\":401}}",
         );
         return;
+    }
+    if let Some(header) = range.as_deref() {
+        ranges.lock().expect("the ranges").push(header.to_string());
     }
     let (first, last) = match range.as_deref() {
         Some(header) => {
@@ -690,5 +704,78 @@ fn a_drive_download_plays_from_the_disk_with_no_network() -> anyhow::Result<()> 
         .expect_err("a file the disk does not hold needs Drive");
     assert!(!other.is_pair_again(), "{other}");
     offline.stop()?;
+    Ok(())
+}
+
+/// **A Drive file is read ahead of while it plays**, through the same
+/// source the open made, renewing the same grant: the passes' want-window
+/// is fetched by the proxy backing (`proxy_retention::Prefetcher`), so a
+/// reader consuming the film finds later chunks already on the disk --
+/// the buffer a torrent stream has always had.
+///
+/// The reader takes the film's first three chunks one after another --
+/// a pass runs once a reader has moved a chunk, and a rate takes two
+/// timed reads -- and never asks past them; what follows is then fetched
+/// from Drive by something that is not the reader.
+#[test]
+fn a_playing_drive_file_is_read_ahead_of() -> anyhow::Result<()> {
+    const CHUNK: usize = stream_server::PROXY_CACHE_CHUNK_BYTES as usize;
+    let fake = Fake::start(Refreshes::Yes)?;
+    let fixture = fixture(&fake)?;
+    // A stated cache size publishes the budget now; the passes that size
+    // and fill the window run against a published budget, which a fresh
+    // server otherwise states on its own timer.
+    fixture
+        .handle
+        .update_settings(serde_json::json!({ "cacheSize": (64u64 * 1024 * 1024) as f64 }))?;
+    let body = fixture.create(REFRESH_TOKEN)?;
+    let path = body["url"].as_str().expect("the url").to_string();
+
+    let played = 3usize;
+    for chunk in 0..played {
+        let response = fixture.get(
+            &path,
+            Some(&format!(
+                "bytes={}-{}",
+                chunk * CHUNK,
+                (chunk + 1) * CHUNK - 1
+            )),
+        )?;
+        assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.bytes()?.len(), CHUNK);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    // What Drive was asked for reaches past everything the reader asked
+    // for: the read-ahead took the rest of the file from the head, so the
+    // reader's own later chunks were answered off the disk.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let ahead = loop {
+        let ranges = fake.ranges();
+        let ahead: Vec<String> = ranges
+            .iter()
+            .filter(|range| {
+                range
+                    .trim_start_matches("bytes=")
+                    .split_once('-')
+                    .and_then(|(_, last)| last.parse::<usize>().ok())
+                    .is_some_and(|last| last >= played * CHUNK)
+            })
+            .cloned()
+            .collect();
+        if !ahead.is_empty() {
+            break ahead;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "Drive was never asked past what the reader requested: {ranges:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert!(
+        ahead.iter().all(|range| range.starts_with("bytes=")
+            && range.ends_with(&format!("-{}", FILE_LENGTH - 1))),
+        "the rest of the file, to its end: {ahead:?}"
+    );
     Ok(())
 }

@@ -1215,6 +1215,13 @@ fn a_partly_held_range_is_classified_the_way_a_hit_and_a_miss_are() -> anyhow::R
 /// the other's key -- `p=` is the client's name for its own player and is
 /// never part of what the cache is filed under -- so what one of them fetched
 /// answers the other.
+///
+/// A player's token is also what turns read-ahead on for its stream
+/// (`proxy_retention::Prefetcher`), and this film fits the budget whole, so
+/// after the first player's first chunk the rest of the film is on its way
+/// to the disk on the players' behalf. That is more sharing, not less: the
+/// second player's range may already be there when it asks, and the third
+/// player's certainly is.
 #[test]
 fn two_players_reading_one_stream_share_what_either_fetched() -> anyhow::Result<()> {
     let fixture = fixture()?;
@@ -1242,8 +1249,18 @@ fn two_players_reading_one_stream_share_what_either_fetched() -> anyhow::Result<
         .header(reqwest::header::RANGE, &middle)
         .send()?;
     assert_eq!(two.bytes()?.len() as u64, CHUNK);
-    assert_eq!(fixture.origin.next_request().range(), Some(&*middle));
-    wait_for_chunks(&fixture, 2);
+    // Fetched by the second player, or read ahead of the first: either way
+    // the origin was asked for it once, by this server, on a player's
+    // behalf.
+    let second = fixture.origin.next_request();
+    assert!(
+        second
+            .range()
+            .is_some_and(|range| range == middle || range.starts_with(&format!("bytes={CHUNK}-"))),
+        "{second:?}"
+    );
+    wait_for_chunks(&fixture, 3);
+    fixture.origin.drain();
 
     // A third player, a third token, and neither range costs an origin
     // request.
@@ -6679,4 +6696,171 @@ fn walk(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
         found.push(path);
     }
     found
+}
+
+/// **A player is read ahead of; a lone range is not.**
+///
+/// The retention owner has always drawn a want-window ahead of every
+/// proxied stream's head; until now nothing fetched it, so a Drive or a
+/// debrid stream had the window's retention and none of its lookahead --
+/// the player's own `Range` was the only thing that ever pulled a byte.
+/// The proxy backing now hands each pass's windows to a prefetcher that
+/// reads them through the entity's own source, quietly
+/// (`proxy_retention::Prefetcher`). What this pins down:
+///
+/// 1. A request with no player token -- a probe, an archive's index read,
+///    every other test in this file -- is not a player's, and fetches
+///    exactly what it asked for; the origin hears nothing else however
+///    long we wait. (A rate alone could not tell the two apart: one
+///    256 KiB read is enough to measure one.) This half is what keeps
+///    every "asked for nothing more" claim above true.
+/// 2. A reader with the app's player token (`p=`) that consumes chunk
+///    after chunk has a rate, and chunks it has not asked for arrive from
+///    the origin and land on the disk; its next request for one of them
+///    is answered from the disk.
+#[test]
+fn a_reader_with_a_rate_is_read_ahead_of_and_a_lone_range_is_not() -> anyhow::Result<()> {
+    use std::io::Read;
+
+    let fixture = fixture_with(Origin::start_sized(RETENTION_ORIGIN)?)?;
+    published_budget(&fixture, RETENTION_BUDGET)?;
+    let origin = format!("http://{}", fixture.origin.addr);
+    let client = reqwest::blocking::Client::new();
+
+    // 1. One range of a file nothing else has touched: exactly one origin
+    //    request, and nothing after it however long we wait.
+    let lone = format!("{}/proxy/d={}/lone.mp4", fixture.base, encode(&origin));
+    for chunk in 0..2u64 {
+        let mut response = client
+            .get(&lone)
+            .header(
+                reqwest::header::RANGE,
+                format!("bytes={}-{}", chunk * CHUNK, (chunk + 1) * CHUNK - 1),
+            )
+            .send()?;
+        let mut played = Vec::new();
+        response.read_to_end(&mut played)?;
+        assert_eq!(played.len() as u64, CHUNK);
+        let asked = fixture.origin.next_request();
+        assert_eq!(asked.target(), "/lone.mp4");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert!(
+        fixture.origin.was_asked_for_nothing_more(),
+        "a request with no player token is not a player's and is not read ahead of"
+    );
+
+    // 2. A player -- the URL carries the app's token for it -- that plays:
+    //    chunk after chunk, each asked for after the last arrived.
+    let url = format!(
+        "{}/proxy/d={}&p=viewer-one/movie.mp4",
+        fixture.base,
+        encode(&origin)
+    );
+    let played_chunks = 4u64;
+    for chunk in 0..played_chunks {
+        let mut response = client
+            .get(&url)
+            .header(
+                reqwest::header::RANGE,
+                format!("bytes={}-{}", chunk * CHUNK, (chunk + 1) * CHUNK - 1),
+            )
+            .send()?;
+        let mut body = Vec::new();
+        response.read_to_end(&mut body)?;
+        assert_eq!(body.len() as u64, CHUNK);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    // Chunks beyond what the player asked for arrive on the disk, and the
+    // origin was asked for them by something that was not the player.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let ahead = loop {
+        let held = cached_chunk_indices(&fixture);
+        let ahead: Vec<u64> = held
+            .iter()
+            .copied()
+            .filter(|chunk| *chunk >= played_chunks)
+            .collect();
+        if !ahead.is_empty() {
+            break ahead;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "nothing was read ahead of the player: the cache holds {held:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let mut requests = Vec::new();
+    while let Ok(request) = fixture
+        .origin
+        .requests
+        .recv_timeout(std::time::Duration::from_millis(200))
+    {
+        requests.push(request);
+    }
+    let unasked: Vec<String> = requests
+        .iter()
+        .filter(|request| request.target() == "/movie.mp4")
+        .filter_map(|request| request.range().map(str::to_string))
+        .filter(|range| {
+            let first: u64 = range
+                .trim_start_matches("bytes=")
+                .split('-')
+                .next()
+                .and_then(|first| first.parse().ok())
+                .unwrap_or(0);
+            first >= played_chunks * CHUNK
+        })
+        .collect();
+    assert!(
+        !unasked.is_empty(),
+        "the origin was asked for ranges the player never requested: \
+         ahead on disk {ahead:?}, origin requests {:?}",
+        requests
+            .iter()
+            .map(|request| request.range())
+            .collect::<Vec<_>>()
+    );
+
+    // And the player's next request, for a chunk that was read ahead, is
+    // answered off the disk: the origin does not hear it.
+    let next = *ahead.first().expect("a chunk ahead");
+    fixture.origin.drain();
+    let mut response = client
+        .get(&url)
+        .header(
+            reqwest::header::RANGE,
+            format!("bytes={}-{}", next * CHUNK, (next + 1) * CHUNK - 1),
+        )
+        .send()?;
+    let mut body = Vec::new();
+    response.read_to_end(&mut body)?;
+    assert_eq!(body.len() as u64, CHUNK);
+    assert!(
+        body.iter()
+            .enumerate()
+            .all(|(i, byte)| *byte == byte_at((next * CHUNK) as usize + i)),
+        "the bytes read ahead are the origin's bytes"
+    );
+    let asked_for_next = std::iter::from_fn(|| {
+        fixture
+            .origin
+            .requests
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .ok()
+    })
+    .any(|request| {
+        request
+            .range()
+            .is_some_and(|range| range.starts_with(&format!("bytes={}-", next * CHUNK)))
+    });
+    assert!(
+        !asked_for_next,
+        "chunk {next} was on the disk; the origin must not be asked for it again"
+    );
+
+    drop(fixture.handle);
+    Ok(())
 }
