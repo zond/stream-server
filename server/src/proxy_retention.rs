@@ -148,11 +148,12 @@
 //! is *not* kept in either case is a stream nobody is reading, which is the
 //! first thing that should go.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::time::Duration;
@@ -251,6 +252,8 @@ impl ProxyDomain {
 /// deliberately, so nothing outside it can unlink a torrent piece behind
 /// librqbit's back, and there is no have-set here to disagree with.
 struct ProxyBacking {
+    /// See [`ProxyRetention::pins`].
+    pins: Arc<RwLock<Option<HashSet<PathBuf>>>>,
     /// Which entity the server is playing, the one cell the whole process
     /// reads ([`enginefs::retention::live`]). Asked at the top of every
     /// slack pass, and then once per candidate chunk at its [`Door`]: this
@@ -480,10 +483,19 @@ impl Backing for ProxyBacking {
         }
     }
 
-    /// The proxy has no pins. The nearest thing is the promise, and that is
-    /// per reader and the owner's own.
-    fn keeps_everything(&self, _key: &PathBuf) -> bool {
-        false
+    /// A pinned download: the entity's key directory is in the pin set.
+    /// `key` is the entity directory (`<key dir>/<total_type_validator>`),
+    /// so the pin is looked up by its parent. A copy-out read of the set,
+    /// as the contract asks: no owner lock is held here.
+    fn keeps_everything(&self, key: &PathBuf) -> bool {
+        let pins = self
+            .pins
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match (&*pins, key.parent()) {
+            (Some(pins), Some(key_dir)) => pins.contains(key_dir),
+            _ => false,
+        }
     }
 
     /// Whether this directory is the entity the server is playing. The
@@ -649,6 +661,7 @@ impl ProxyBacking {
     /// the probe, and in the shipped build nothing.
     fn probe(&self) -> ProxyBacking {
         ProxyBacking {
+            pins: self.pins.clone(),
             live: self.live.clone(),
             occupancy: self.occupancy.clone(),
             detectors: self.detectors.clone(),
@@ -909,6 +922,11 @@ impl Occupancy {
                 Some(held.saturating_sub(bytes))
             });
     }
+
+    /// The opposite of [`Self::take`]: bytes found on the disk at boot.
+    fn give(&self, bytes: u64) {
+        self.occupied.fetch_add(bytes, Ordering::Relaxed);
+    }
 }
 
 /// A chunk index in the policy's `u32` index space. An index a `u32` cannot
@@ -959,6 +977,14 @@ pub struct ProxyRetention {
     /// answers them and sizes every window it keeps from them. See
     /// [`Detectors`].
     detectors: Detectors,
+    /// The key directories pinned as offline downloads (see
+    /// [`crate::proxy_downloads`]), shared with the backing so that
+    /// [`ProxyBacking::keeps_everything`] answers from it. `None` until the
+    /// embedder has named the set ([`Self::set_pins`]): a boot that has not
+    /// been told keeps nothing exempt -- the budget still bounds the disk --
+    /// and sweeps nothing (`crate::proxy_cache::sweep`), the piece store's
+    /// "silence is not an empty set" rule.
+    pins: Arc<RwLock<Option<HashSet<PathBuf>>>>,
     /// How many bodies this process has opened, which is what tells one
     /// consumer's reads from another's in the detector. A reopen is a new
     /// number over the same stream, and the detector is meant to say so.
@@ -1012,6 +1038,9 @@ pub struct Reader {
     inner: enginefs::retention::owner::Reader<ProxyBacking>,
     key: PathBuf,
     total: u64,
+    /// Not a viewer: no playhead, no read record. See
+    /// [`ProxyRetention::reader_with`].
+    quiet: bool,
     /// Which body this is. A reopen is a new number over the same stream,
     /// which is the thing the detector has to get right: a player seeks by
     /// closing its connection and asking again, and a stream keyed to a
@@ -1029,8 +1058,10 @@ impl ProxyRetention {
         let disk_threads: Arc<Mutex<Vec<std::thread::ThreadId>>> = Arc::default();
         let occupancy: Arc<Occupancy> = Arc::default();
         let detectors: Detectors = Arc::default();
+        let pins: Arc<RwLock<Option<HashSet<PathBuf>>>> = Arc::default();
         let owner = Retention::new(
             Arc::new(ProxyBacking {
+                pins: pins.clone(),
                 live: live.clone(),
                 occupancy: occupancy.clone(),
                 detectors: detectors.clone(),
@@ -1062,6 +1093,7 @@ impl ProxyRetention {
             work,
             occupancy,
             detectors,
+            pins,
             next_reader: AtomicU64::new(1),
             #[cfg(test)]
             interleave,
@@ -1093,10 +1125,27 @@ impl ProxyRetention {
     /// through `/proxy` is the HLS case -- a switch, and the finished
     /// segment is disposable.
     pub fn reader(self: &Arc<Self>, dir: &ChunkDir, total: u64, target: Arc<str>) -> Reader {
+        self.reader_with(dir, total, target, false)
+    }
+
+    /// [`Self::reader`], or a **quiet** one: a reader that is not a viewer.
+    /// A download's filler reads an entity nobody is watching, and a reader
+    /// that claimed the live entity would tell the reconciler the viewer
+    /// had moved on -- stopping the torrent they are watching -- and its
+    /// playhead would draw a window round bytes nobody is going to read.
+    /// Quiet, it claims nothing and notes nothing; its promises still
+    /// stand, which is harmless (the entity is pinned) and cheap.
+    pub(crate) fn reader_with(
+        self: &Arc<Self>,
+        dir: &ChunkDir,
+        total: u64,
+        target: Arc<str>,
+        quiet: bool,
+    ) -> Reader {
         let key = dir.path().to_path_buf();
         if let Some(switch) = self
             .live
-            .open(LiveEntity::Proxy { dir: key.clone() }, false)
+            .open(LiveEntity::Proxy { dir: key.clone() }, quiet)
         {
             tracing::debug!(
                 dir = %dir.path().display(),
@@ -1117,7 +1166,64 @@ impl ProxyRetention {
             ),
             key,
             total,
+            quiet,
         }
+    }
+
+    /// Names the pinned key directories. `Some(set)` is the embedder's
+    /// record, `None` its absence (see [`Self::pins`]). Called once at boot,
+    /// before the sweep, and thereafter by [`Self::pin`]/[`Self::unpin`].
+    pub fn set_pins(&self, pins: Option<HashSet<PathBuf>>) {
+        *self
+            .pins
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = pins;
+    }
+
+    /// Pins `key_dir`. A set that was unknown becomes known by this: the
+    /// embedder is now naming pins, one at a time.
+    pub fn pin(&self, key_dir: PathBuf) {
+        self.pins
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_or_insert_with(HashSet::new)
+            .insert(key_dir);
+    }
+
+    /// Drops the pin on `key_dir`; answers whether it was pinned.
+    pub fn unpin(&self, key_dir: &Path) -> bool {
+        self.pins
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_mut()
+            .is_some_and(|pins| pins.remove(key_dir))
+    }
+
+    /// Whether `key_dir` is pinned.
+    pub fn is_pinned(&self, key_dir: &Path) -> bool {
+        self.pins
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|pins| pins.contains(key_dir))
+    }
+
+    /// The pinned key directories, for a listing.
+    pub fn pinned(&self) -> Vec<PathBuf> {
+        self.pins
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|pins| pins.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Bytes the launch sweep found on the disk and kept (pinned
+    /// downloads from an earlier run): counted in, so the occupancy figure
+    /// equals the disk from the first byte, as it did when the sweep
+    /// emptied the cache.
+    pub fn restored(&self, bytes: u64) {
+        self.occupancy.give(bytes);
     }
 
     /// Keep one served read until a pass can answer it.
@@ -1598,7 +1704,7 @@ impl Reader {
         arrived: std::time::Instant,
         returned: std::time::Instant,
     ) {
-        if self.total == 0 || end <= begin {
+        if self.quiet || self.total == 0 || end <= begin {
             return;
         }
         self.retention.record_read(
@@ -1622,7 +1728,7 @@ impl Reader {
     /// turn taken is remembered by the pass that holds it, which asks the
     /// same head again when it concludes.
     pub fn note(&self, delivered_to: u64) {
-        if self.total == 0 {
+        if self.quiet || self.total == 0 {
             return;
         }
         let delivered_to = delivered_to.min(self.total - 1);
@@ -1681,6 +1787,80 @@ mod tests {
     /// unreclaimable for as long as its entity lived, and a client shown
     /// `protected == total` over a cache above its limit is being told the
     /// shortfall has no remedy when the remedy is the pass already running.
+    /// A download's filler reads through a **quiet** reader: it claims no
+    /// live entity -- claiming one would tell the reconciler the viewer had
+    /// moved on -- and leaves no playhead. A player's reader does both.
+    #[tokio::test]
+    async fn a_quiet_reader_is_not_a_viewer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ChunkDir::new(tmp.path().join("entity"));
+        write_chunks(&dir, 0..16);
+        let live = Arc::new(Live::default());
+        let retention = Arc::new(ProxyRetention::new(
+            Arc::new(RetentionBudget::default()),
+            Arc::default(),
+            live.clone(),
+        ));
+        let quiet = retention.reader_with(&dir, TOTAL, TARGET.into(), true);
+        quiet.note(CHUNK_BYTES);
+        quiet.note_read(CHUNK_BYTES, CHUNK_BYTES + 1, Instant::now(), Instant::now());
+        assert!(
+            !live.reading().is_proxy(dir.path()),
+            "a quiet reader did not make its entity the live one"
+        );
+        let loud = retention.reader(&dir, TOTAL, TARGET.into());
+        assert!(
+            live.reading().is_proxy(dir.path()),
+            "a player's reader is what claims the live entity"
+        );
+        drop(loud);
+        drop(quiet);
+    }
+
+    /// The pin set is what `keeps_everything` answers from: an entity under
+    /// a pinned key directory is kept whole, anything else -- and everything
+    /// while the set is unknown -- is the owner's to reclaim.
+    #[test]
+    fn keeps_everything_answers_from_the_pin_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_dir = tmp.path().join("key");
+        let entity = key_dir.join("entity");
+        let other = tmp.path().join("other").join("entity");
+        let live = Arc::new(Live::default());
+        let retention =
+            ProxyRetention::new(Arc::new(RetentionBudget::default()), Arc::default(), live);
+        // The backing the owner runs shares the retention's pin set; one
+        // built here over the same set answers exactly as it does.
+        let backing = ProxyBacking {
+            pins: retention.pins.clone(),
+            live: Arc::new(Live::default()),
+            occupancy: Arc::default(),
+            detectors: Arc::default(),
+            #[cfg(test)]
+            disk_threads: Arc::default(),
+        };
+        use enginefs::retention::owner::Backing as _;
+        assert!(
+            !backing.keeps_everything(&entity),
+            "unknown set: nothing exempt"
+        );
+        retention.set_pins(Some(HashSet::new()));
+        assert!(
+            !backing.keeps_everything(&entity),
+            "empty set: nothing exempt"
+        );
+        retention.pin(key_dir.clone());
+        assert!(
+            backing.keeps_everything(&entity),
+            "pinned by its key directory"
+        );
+        assert!(!backing.keeps_everything(&other));
+        assert!(retention.is_pinned(&key_dir));
+        assert!(retention.unpin(&key_dir));
+        assert!(!backing.keeps_everything(&entity));
+        assert!(!retention.unpin(&key_dir), "a second unpin finds nothing");
+    }
+
     #[tokio::test]
     async fn what_nobody_is_playing_and_nobody_is_reading_protects_nothing() {
         let tmp = tempfile::tempdir().unwrap();

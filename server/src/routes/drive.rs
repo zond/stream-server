@@ -140,7 +140,7 @@ impl DriveEndpoints {
     /// renews before its first request, which is not a special case -- it
     /// is the ordinary path `DriveCredential` takes a minute before every
     /// expiry, taken once at the start.
-    fn pairing(&self, file_id: &str, refresh_token: &str) -> DrivePairing {
+    pub(crate) fn pairing(&self, file_id: &str, refresh_token: &str) -> DrivePairing {
         DrivePairing {
             refresh_endpoint: self.refresh.clone(),
             refresh_token: refresh_token.to_string(),

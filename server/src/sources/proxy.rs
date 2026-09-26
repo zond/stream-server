@@ -90,6 +90,7 @@ impl From<FetchFailure> for ProxySourceError {
 /// than an access token. [`Self::Own`] is the other half the design asked
 /// for (`docs/translated-sources.md`: "a `ProxySource` with a header
 /// supplier that refreshes").
+#[derive(Clone)]
 pub(crate) enum Credentials {
     /// The `h=` overrides **the caller named**, relayed to the origin
     /// exactly as `/proxy` relays them. Keyed by
@@ -216,6 +217,8 @@ struct Entity {
     validator: Option<String>,
     /// What a log may say about this source: the origin and nothing else.
     describe: String,
+    /// Readers are quiet -- not viewers. See [`ProxySource::for_filling`].
+    quiet: bool,
 }
 
 impl ProxySource {
@@ -298,8 +301,32 @@ impl ProxySource {
                 total: entity.total,
                 content_type: entity.content_type,
                 validator: entity.validator,
+                quiet: false,
             }),
         })
+    }
+
+    /// This source with every reader it opens **quiet**: a download's
+    /// filler reads an entity nobody is watching, and must neither claim
+    /// the live entity nor leave a playhead
+    /// (`crate::proxy_retention::ProxyRetention::reader_with`). Same URL,
+    /// same credentials, same cache key -- the bytes it lands are the ones
+    /// a player later reads.
+    pub(crate) fn for_filling(&self) -> Self {
+        let entity = &*self.entity;
+        Self {
+            entity: Arc::new(Entity {
+                cache: entity.cache.clone(),
+                self_addr: entity.self_addr,
+                url: entity.url.clone(),
+                credentials: entity.credentials.clone(),
+                total: entity.total,
+                content_type: entity.content_type.clone(),
+                validator: entity.validator.clone(),
+                describe: entity.describe.clone(),
+                quiet: true,
+            }),
+        }
     }
 
     /// The type the origin labelled the entity with, for a caller that has
@@ -350,7 +377,7 @@ impl Entity {
     /// directory tree with a sweep over it. An unvouched grant is `None`:
     /// the reads go out, and nothing of them is kept.
     fn entry(&self) -> Option<crate::proxy_cache::Entry> {
-        match &self.credentials {
+        let entry = match &self.credentials {
             Credentials::Caller(request_headers) => self.cache.entry(
                 &Method::GET,
                 &self.url,
@@ -366,6 +393,11 @@ impl Entity {
                 vouch: Vouch::Unvouched,
                 ..
             } => None,
+        };
+        if self.quiet {
+            entry.map(crate::proxy_cache::Entry::quiet)
+        } else {
+            entry
         }
     }
 

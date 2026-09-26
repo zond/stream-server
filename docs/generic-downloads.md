@@ -1,7 +1,26 @@
 # Downloads for every source: a pin on the byte owner, and a filler
 
 Design, 2026-09-26. Written against stream-server `9334c93`, xtremio
-`be034e6`, rqbit `d02b73a2`. Not built.
+`be034e6`, rqbit `d02b73a2`.
+
+**Status (2026-09-26, later the same day):** §3.1–3.4 are built on the
+server -- the proxy pin set through `ServerConfig::proxy_pins`, the
+keeping sweep with the occupancy seeded from what it kept,
+`ProxyBacking::keeps_everything`, quiet readers, the filler, and the
+routes (`POST /downloads`, `DELETE /downloads/{key}`, rows in
+`downloads.json` with `source` and `playUrl`, and the embed calls). One
+thing the design did not foresee: a finished download does **not** play
+from the stream's `/proxy` URL, because that route keys the cache on the
+player's own negotiation headers, so a player's request lands on a key the
+filler never filled. It plays from the download's own media route,
+`GET /downloads/{key}/stream`, which serves the pinned entry by range off
+the disk (`server/tests/proxy_downloads.rs` measures it: filled from a
+loopback origin, played back with the origin asked for nothing, kept
+across a restart that names it, swept by one that does not, deleted on
+request). Not built: §3.5 (a complete Drive download played offline:
+the media route serves any complete pinned entry, Drive included, but the
+app still opens Drive files through `/drive/create`, whose probe goes to
+the origin), §4 (read-ahead), and §5 (the app) -- the app side is next.
 
 **The ask (zond):** every source should download, not only torrents -- and
 "maybe a new set of functions on the byte owner that handles download

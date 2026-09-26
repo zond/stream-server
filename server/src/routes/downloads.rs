@@ -21,8 +21,24 @@ use std::time::Duration;
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadInfo {
+    /// The download's coordinates. For a torrent, its info hash; for a
+    /// proxy download (see [`Self::source`]), the cache key directory's
+    /// name -- 64 hex characters, which no info hash is.
     pub info_hash: String,
+    /// The file within the torrent; `0` for a proxy download, which is one
+    /// file by construction.
     pub file_idx: usize,
+    /// What this is a download of when it is not a torrent: the addon URL
+    /// or the Drive file the pin names (`crate::proxy_downloads`). `None`
+    /// is a torrent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<crate::proxy_downloads::ProxyPinKey>,
+    /// Where a finished proxy download plays from: the `/proxy` URL of the
+    /// stream, which a complete entry answers off the disk. A torrent's is
+    /// its media route, which the client already knows; a Drive file's is
+    /// the session route the client opens, so both are `None` here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub play_url: Option<String>,
     /// What the torrent backend calls this file, when it knows.
     ///
     /// **A name, not a file.** Torrent data is stored one file per piece
@@ -98,6 +114,8 @@ pub async fn pin_download(
     Ok(DownloadInfo {
         info_hash: engine.info_hash.clone(),
         file_idx,
+        source: None,
+        play_url: None,
         path: engine.handle.get_file_path(file_idx).await,
         name: file.name.clone(),
         length: file.length,
@@ -362,6 +380,8 @@ pub async fn downloads(state: &AppState) -> Vec<DownloadInfo> {
             .map(|pin| DownloadInfo {
                 info_hash: pin.info_hash,
                 file_idx: pin.file_idx,
+                source: None,
+                play_url: None,
                 path: None,
                 name: String::new(),
                 length: 0,
@@ -371,7 +391,80 @@ pub async fn downloads(state: &AppState) -> Vec<DownloadInfo> {
                 error: Some(DORMANT_DOWNLOAD_ERROR.to_string()),
             }),
     );
+    downloads.extend(proxy_downloads(state).await);
     downloads
+}
+
+/// Every pinned proxy download (`crate::proxy_downloads`), read off the
+/// disk: what is held of the entity under the key, whether it is whole,
+/// and where it plays from. The disk is the truth for progress here as it
+/// is for a torrent -- nothing about a fill is remembered.
+async fn proxy_downloads(state: &AppState) -> Vec<DownloadInfo> {
+    let pinned = state.proxy_downloads.snapshot();
+    let mut rows = Vec::with_capacity(pinned.len());
+    for (dir, key, name, filling) in pinned {
+        let entry = state
+            .proxy_cache
+            .entry_for_key_dir(dir.clone(), Arc::from(""))
+            .map(crate::proxy_cache::Entry::quiet);
+        let facts = match entry.clone() {
+            Some(entry) => tokio::task::spawn_blocking(move || entry.held_facts())
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        };
+        let key_name = entry
+            .as_ref()
+            .map(|entry| entry.key_name())
+            .unwrap_or_else(|| {
+                dir.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            });
+        let play_url = Some(proxy_play_url(state, &key_name));
+        let (length, downloaded, complete) = facts
+            .as_ref()
+            .map(|facts| (facts.total, facts.held, facts.complete))
+            .unwrap_or((0, 0, false));
+        rows.push(DownloadInfo {
+            info_hash: key_name,
+            file_idx: 0,
+            source: Some(key),
+            play_url,
+            path: None,
+            name,
+            length,
+            downloaded,
+            complete,
+            phase: if complete {
+                StartupPhase::Ready
+            } else if filling {
+                StartupPhase::Buffering
+            } else {
+                // Pinned, nothing fetching: a Drive pin the app has not
+                // re-pinned with a pairing since boot, or a URL pin whose
+                // filler stopped. The bytes are kept.
+                StartupPhase::Checking
+            },
+            error: None,
+        });
+    }
+    rows
+}
+
+/// Where a proxy download plays from: its own media route,
+/// `GET /downloads/{key}/stream`, which serves the pinned entry by range
+/// off the disk. Not the `/proxy` URL of the stream: that route keys the
+/// cache on the player's own negotiation headers, so a player's request
+/// lands on a different key than the filler's and goes to the origin --
+/// the wrong answer for a download, and no answer at all offline.
+fn proxy_play_url(state: &AppState, key_name: &str) -> String {
+    format!(
+        "{}/downloads/{}/stream",
+        state.base_url.trim_end_matches('/'),
+        urlencoding::encode(key_name)
+    )
 }
 
 /// One pinned file of a live torrent. A torrent still resolving its
@@ -387,6 +480,8 @@ fn live_download(
     DownloadInfo {
         info_hash: info_hash.to_string(),
         file_idx,
+        source: None,
+        play_url: None,
         path,
         name: file.map(|file| file.name.clone()).unwrap_or_default(),
         length: file.map_or(0, |file| file.length),
@@ -494,6 +589,264 @@ pub async fn delete_download(
 
 pub async fn get_downloads(State(state): State<AppState>) -> Response {
     Json(downloads(&state).await).into_response()
+}
+
+/// The body of `POST /downloads`: one of the two proxy download kinds.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyDownloadRequest {
+    /// An addon link, with its `h=` request headers.
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// A Google Drive file, under the app's pairing.
+    #[serde(default)]
+    pub drive_file_id: Option<String>,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    /// What to call it in a list; the target's last path segment or the
+    /// Drive file's name when absent.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// Pins a proxy download and answers its row, or why not. What
+/// `ServerHandle::pin_proxy_download` and `POST /downloads` share.
+pub async fn pin_proxy_download(
+    state: &AppState,
+    request: ProxyDownloadRequest,
+) -> Result<DownloadInfo, crate::proxy_downloads::ProxyPinError> {
+    let dir = match (&request.url, &request.drive_file_id) {
+        (Some(url), None) => {
+            crate::proxy_downloads::pin_url(
+                state,
+                url,
+                request.headers.clone(),
+                request.name.clone(),
+            )
+            .await?
+        }
+        (None, Some(file_id)) => {
+            let token = request.refresh_token.as_deref().unwrap_or("");
+            if token.is_empty() {
+                return Err(crate::proxy_downloads::ProxyPinError::Unkeyable(
+                    "a Drive download wants a refreshToken",
+                ));
+            }
+            crate::proxy_downloads::pin_drive(state, file_id, token, request.name.clone()).await?
+        }
+        _ => {
+            return Err(crate::proxy_downloads::ProxyPinError::Unkeyable(
+                "a download wants a url or a driveFileId, and one of them",
+            ));
+        }
+    };
+    let rows = proxy_downloads(state).await;
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    rows.into_iter().find(|row| row.info_hash == name).ok_or(
+        crate::proxy_downloads::ProxyPinError::Unkeyable(
+            "the pin was taken but the download is not listed",
+        ),
+    )
+}
+
+/// Drops a proxy download's pin by its key (the row's `infoHash`), with
+/// `delete_files` its bytes too. What `ServerHandle::unpin_proxy_download`
+/// and `DELETE /downloads/{key}` share.
+pub async fn unpin_proxy_download(state: &AppState, key: &str, delete_files: bool) -> UnpinOutcome {
+    let dir = state.proxy_cache.root().join(key);
+    if dir.parent() != Some(state.proxy_cache.root()) || key.is_empty() {
+        return UnpinOutcome {
+            unpinned: false,
+            deleted_files: false,
+        };
+    }
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let (unpinned, freed) = state.proxy_downloads.unpin(&state, &dir, delete_files);
+        tracing::info!(key = %dir.display(), unpinned, freed, delete_files, "proxy_download_unpinned");
+        UnpinOutcome {
+            unpinned,
+            deleted_files: delete_files && freed > 0,
+        }
+    })
+    .await
+    .unwrap_or(UnpinOutcome {
+        unpinned: false,
+        deleted_files: false,
+    })
+}
+
+fn proxy_pin_failure(error: &crate::proxy_downloads::ProxyPinError) -> (StatusCode, String) {
+    use crate::proxy_downloads::ProxyPinError;
+    use crate::sources::proxy::ProxySourceError;
+    let status = match error {
+        ProxyPinError::Source(ProxySourceError::WillNotRange) => StatusCode::NOT_IMPLEMENTED,
+        ProxyPinError::Source(ProxySourceError::Origin(StatusCode::NOT_FOUND)) => {
+            StatusCode::NOT_FOUND
+        }
+        ProxyPinError::Source(_) => StatusCode::BAD_GATEWAY,
+        ProxyPinError::Drive(crate::routes::drive::DriveOpenError::NoPairingService) => {
+            StatusCode::NOT_IMPLEMENTED
+        }
+        ProxyPinError::Drive(crate::routes::drive::DriveOpenError::Drive(
+            crate::sources::drive::DriveError::PairAgain,
+        )) => StatusCode::UNAUTHORIZED,
+        ProxyPinError::Drive(_) => StatusCode::BAD_GATEWAY,
+        ProxyPinError::Unkeyable(_) => StatusCode::BAD_REQUEST,
+    };
+    (status, error.to_string())
+}
+
+pub async fn post_proxy_download(
+    State(state): State<AppState>,
+    Json(request): Json<ProxyDownloadRequest>,
+) -> Response {
+    match pin_proxy_download(&state, request).await {
+        Ok(info) => Json(info).into_response(),
+        Err(error) => {
+            tracing::warn!(error = %error, "proxy_download_pin_failed");
+            let (status, message) = proxy_pin_failure(&error);
+            (status, Json(json!({ "error": message }))).into_response()
+        }
+    }
+}
+
+/// `GET /downloads/{key}/stream`: a proxy download by range, served off the
+/// pinned entry. A range the disk holds is answered from the disk with the
+/// origin asked for nothing -- which is the whole download once it is
+/// complete, and is what plays it offline. A range it does not hold yet
+/// (a play mid-download) is read through the same source the filler
+/// fills from, so the bytes land in the cache on their way to the player.
+/// A media route: no bearer, like every URL a player fetches.
+pub async fn stream_proxy_download(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let dir = state.proxy_cache.root().join(&key);
+    if key.is_empty() || dir.parent() != Some(state.proxy_cache.root()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some((pin, name)) = state
+        .proxy_downloads
+        .snapshot()
+        .into_iter()
+        .find(|(pinned, ..)| *pinned == dir)
+        .map(|(_, key, name, _)| (key, name))
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    // A viewer's entry: its readers claim the live entity and note the
+    // playhead, as any player's do.
+    let Some(entry) = state
+        .proxy_cache
+        .entry_for_key_dir(dir, Arc::from(name.as_str()))
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let range = headers
+        .get(axum::http::header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let looked_up = entry.clone();
+    let asked = range.clone();
+    let cached = tokio::task::spawn_blocking(move || looked_up.look_up(asked.as_deref()))
+        .await
+        .ok()
+        .flatten();
+    if let Some(cached) = cached.filter(|cached| cached.complete()) {
+        // Served whole from the disk: the framing the lookup already made.
+        let total = cached.total();
+        let Some(framing) = crate::routes::util::MediaRange::of(range.as_deref(), total) else {
+            return crate::routes::util::range_not_satisfiable(total);
+        };
+        let mut res_headers = axum::http::HeaderMap::new();
+        res_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            cached.content_type().parse().unwrap_or_else(|_| {
+                axum::http::HeaderValue::from_static("application/octet-stream")
+            }),
+        );
+        framing.write_headers(total, &mut res_headers);
+        compat::add_dlna_headers(&mut res_headers);
+        let body = axum::body::Body::from_stream(cached.body());
+        return (framing.status(), res_headers, body).into_response();
+    }
+    // Not all on the disk: read through the source, filling as it goes.
+    let source: Arc<dyn crate::sources::ByteSource> = match &pin {
+        crate::proxy_downloads::ProxyPinKey::Url { target, headers } => {
+            let Ok(url) = url::Url::parse(target) else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            match crate::sources::ProxySource::open(
+                state.proxy_cache.clone(),
+                state.http_addr,
+                url,
+                headers.clone(),
+            )
+            .await
+            {
+                Ok(source) => Arc::new(source),
+                Err(error) => return crate::routes::archive::source_error_response(&error),
+            }
+        }
+        crate::proxy_downloads::ProxyPinKey::Drive { .. } => {
+            // A Drive download mid-fill is played through the Drive route
+            // the client already opens with its pairing; this route holds no
+            // credential to read the rest with.
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "this Drive download is not complete yet; play it through Drive" })),
+            )
+                .into_response();
+        }
+    };
+    let size = source.len();
+    let Some(framing) = crate::routes::util::MediaRange::of(range.as_deref(), size) else {
+        return crate::routes::util::range_not_satisfiable(size);
+    };
+    let wanted = framing.content_length(size);
+    let reader = match source
+        .open(framing.start, crate::sources::ReadHint::of(wanted))
+        .await
+    {
+        Ok(reader) => reader,
+        Err(error) => {
+            tracing::warn!(%error, "a proxy download could not be read");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    let mut res_headers = axum::http::HeaderMap::new();
+    res_headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/octet-stream"),
+    );
+    framing.write_headers(size, &mut res_headers);
+    compat::add_dlna_headers(&mut res_headers);
+    use tokio::io::AsyncReadExt as _;
+    let body =
+        axum::body::Body::from_stream(crate::routes::archive::media_body(reader.take(wanted)));
+    (framing.status(), res_headers, body).into_response()
+}
+
+pub async fn delete_proxy_download(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let delete_files = compat::query_flag(query.as_deref(), "deleteFiles");
+    let outcome = unpin_proxy_download(&state, &key, delete_files).await;
+    Json(json!({
+        "key": key,
+        "unpinned": outcome.unpinned,
+        "deletedFiles": outcome.deleted_files,
+    }))
+    .into_response()
 }
 
 #[cfg(test)]

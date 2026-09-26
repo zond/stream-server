@@ -13,7 +13,8 @@ pub use enginefs::piece_store::PinSet;
 pub use enginefs::pretend_volume_space;
 pub use enginefs::{PIN_FREE_SPACE_MARGIN, PinDownloadError, UnpinOutcome};
 use futures_util::future::BoxFuture;
-pub use routes::downloads::DownloadInfo;
+pub use proxy_downloads::{ProxyPinError, ProxyPinKey};
+pub use routes::downloads::{DownloadInfo, ProxyDownloadRequest};
 // What `ServerHandle::open_drive_file` answers. Named here because `routes`
 // is private, so a type only reachable through it is one an embedder can
 // call the method but not write down the result of -- and `DriveError`
@@ -114,6 +115,7 @@ pub mod images;
 pub use diagnostics::logging::{PROXY_TRACE_TARGET, RETENTION_TRACE_TARGET, log_filter};
 mod lan_media;
 mod proxy_cache;
+pub mod proxy_downloads;
 mod proxy_retention;
 mod proxy_streams;
 mod routes;
@@ -179,6 +181,13 @@ pub struct ServerConfig {
     /// map instead says "the user has pinned nothing", which deletes their
     /// downloads.
     pub pins: Option<enginefs::piece_store::PinSet>,
+    /// The proxy-cache downloads the embedder keeps -- addon URLs and Drive
+    /// files pinned offline (`crate::proxy_downloads`) -- under the same
+    /// rule as [`Self::pins`]: **`None` is "nobody told me"**, which sweeps
+    /// nothing and exempts nothing, and an empty list is "the user has
+    /// pinned nothing", which sweeps the proxy cache clean as every launch
+    /// did before pins existed.
+    pub proxy_pins: Option<Vec<proxy_downloads::ProxyPinKey>>,
     /// The port librqbit's incoming BitTorrent listener binds.
     /// [`TorrentListenPort::Ephemeral`] by default, so any number of
     /// embedded servers (and the tests) coexist; an embedder that needs a
@@ -263,6 +272,7 @@ impl Default for ServerConfig {
         Self {
             http_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_HTTP_PORT)),
             pins: None,
+            proxy_pins: None,
             config_dir: None,
             cache_dir: None,
             init_logging: false,
@@ -589,6 +599,35 @@ impl ServerHandle {
             routes::downloads::unpin_download(&state, &info_hash, file_idx, delete_files).await
         })?;
         Ok(outcome?)
+    }
+
+    /// Pins an addon URL or a Drive file as an offline download -- exactly
+    /// what `POST /downloads` answers (see `routes::downloads::pin_proxy_download`
+    /// and `crate::proxy_downloads`). The row's `info_hash` is the key to
+    /// drop it by ([`Self::unpin_proxy_download`]).
+    pub fn pin_proxy_download(
+        &self,
+        request: routes::downloads::ProxyDownloadRequest,
+    ) -> anyhow::Result<DownloadInfo> {
+        let state = self.state.clone();
+        let info = self.block_on_server(async move {
+            routes::downloads::pin_proxy_download(&state, request).await
+        })?;
+        Ok(info?)
+    }
+
+    /// Drops a proxy download's pin by its key, with `delete_files` its
+    /// bytes -- exactly what `DELETE /downloads/{key}` answers.
+    pub fn unpin_proxy_download(
+        &self,
+        key: &str,
+        delete_files: bool,
+    ) -> anyhow::Result<UnpinOutcome> {
+        let state = self.state.clone();
+        let key = key.to_string();
+        self.block_on_server(async move {
+            routes::downloads::unpin_proxy_download(&state, &key, delete_files).await
+        })
     }
 
     /// Every pinned download, exactly what `GET /downloads.json` answers
@@ -1398,9 +1437,15 @@ pub async fn run(
     // also what makes `ProxyRetention::occupancy` -- what *this* process
     // wrote -- equal to what is on the disk from the first byte.
     {
+        // The pinned proxy downloads first, so the sweep keeps them and the
+        // owner counts them: see `crate::proxy_downloads`.
+        let keep = state
+            .proxy_downloads
+            .install(&state, cfg.proxy_pins.as_deref());
         let root = state.proxy_cache.root().to_path_buf();
-        if let Err(error) = tokio::task::spawn_blocking(move || proxy_cache::sweep(&root)).await {
-            tracing::warn!(%error, "the proxy cache sweep did not finish");
+        match tokio::task::spawn_blocking(move || proxy_cache::sweep(&root, keep.as_ref())).await {
+            Ok(report) => state.proxy_cache.retention().restored(report.kept_bytes),
+            Err(error) => tracing::warn!(%error, "the proxy cache sweep did not finish"),
         }
     }
 
@@ -1873,6 +1918,12 @@ fn stream_routes() -> Router<AppState> {
             "/{infoHash}/{fileIdx}",
             get(routes::stream::stream_video).head(routes::stream::head_stream_video),
         )
+        // A proxy download's own media route (see
+        // `routes::downloads::stream_proxy_download`).
+        .route(
+            "/downloads/{key}/stream",
+            get(routes::downloads::stream_proxy_download),
+        )
 }
 
 /// [`stream_routes`] as the LAN media listener mounts them: the same two
@@ -2039,6 +2090,11 @@ fn control_router() -> Router<AppState> {
         )
         .route("/get-https", get(routes::system::get_https))
         .route("/downloads.json", get(routes::downloads::get_downloads))
+        .route("/downloads", post(routes::downloads::post_proxy_download))
+        .route(
+            "/downloads/{key}",
+            axum::routing::delete(routes::downloads::delete_proxy_download),
+        )
         .route(
             "/{infoHash}/{fileIdx}/download",
             post(routes::downloads::post_download).delete(routes::downloads::delete_download),

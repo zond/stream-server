@@ -546,6 +546,7 @@ impl ProxyCache {
             work: self.work.clone(),
             floor: self.floor.clone(),
             target: url.as_str().into(),
+            quiet: false,
         })
     }
 
@@ -642,6 +643,26 @@ impl ProxyCache {
             work: self.work.clone(),
             floor: self.floor.clone(),
             target: url.as_str().into(),
+            quiet: false,
+        })
+    }
+
+    /// The entry for a key directory a pin names, whoever made it: what
+    /// [`crate::proxy_downloads`] lists a pinned download from once the
+    /// process that made the key is gone. `dir` is a child of this cache's
+    /// root; a path elsewhere is refused. Quiet, since only a download's
+    /// bookkeeping ever asks for one.
+    pub(crate) fn entry_for_key_dir(&self, dir: PathBuf, target: Arc<str>) -> Option<Entry> {
+        if dir.parent() != Some(self.root.as_path()) {
+            return None;
+        }
+        Some(Entry {
+            dir,
+            retention: self.retention.clone(),
+            work: self.work.clone(),
+            floor: self.floor.clone(),
+            target,
+            quiet: false,
         })
     }
 }
@@ -694,6 +715,7 @@ fn names_this_server(url: &Url, self_addr: std::net::SocketAddr) -> bool {
 
 /// One cache key's directory: every entity ever stored for one request
 /// shape. Normally there is exactly one entity in it.
+#[derive(Clone)]
 pub struct Entry {
     dir: PathBuf,
     retention: Arc<ProxyRetention>,
@@ -708,6 +730,10 @@ pub struct Entry {
     /// opens so that a client holding a `/proxy` URL can ask what is held
     /// for the stream it is playing. See [`crate::proxy_retention`].
     target: Arc<str>,
+    /// Readers opened through this entry are quiet: see
+    /// [`crate::proxy_retention::ProxyRetention::reader_with`] and
+    /// [`Entry::quiet`].
+    quiet: bool,
 }
 
 impl Entry {
@@ -769,7 +795,9 @@ impl Entry {
         // `Content-Length`. Narrowed to what was found once the walk is
         // done; a lookup that finds nothing drops the reader, and the
         // promise with it.
-        let reader = self.retention.reader(&dir, total, self.target.clone());
+        let reader = self
+            .retention
+            .reader_with(&dir, total, self.target.clone(), self.quiet);
         reader.promises(first / CHUNK_BYTES..last / CHUNK_BYTES + 1);
         let mut held_to: Option<u64> = None;
         let mut index = first / CHUNK_BYTES;
@@ -871,7 +899,9 @@ impl Entry {
             }
         });
         let dir = ChunkDir::new(dir);
-        let reader = self.retention.reader(&dir, total, self.target.clone());
+        let reader = self
+            .retention
+            .reader_with(&dir, total, self.target.clone(), self.quiet);
         Filler {
             retention: reader.retention(),
             reader,
@@ -891,6 +921,79 @@ impl Entry {
     /// one leaves, and there is nothing here that can say which of them the
     /// origin would send now -- so the request goes to the origin, and the
     /// fill it comes back with removes the loser.
+    /// This entry, with every reader it opens quiet: a download's filler
+    /// is not a viewer (see
+    /// [`crate::proxy_retention::ProxyRetention::reader_with`]).
+    pub(crate) fn quiet(mut self) -> Self {
+        self.quiet = true;
+        self
+    }
+
+    /// The key directory's name: what a pin record names an entry by.
+    pub(crate) fn key_name(&self) -> String {
+        self.dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    /// What is held of the one entity under this key: its total length,
+    /// content type, and the bytes of it on the disk -- `None` when there
+    /// is no entity yet (nothing fetched) or more than one (a generation
+    /// change in progress). Blocking: lists the entity's bucket
+    /// directories.
+    pub(crate) fn held_facts(&self) -> Option<HeldFacts> {
+        let (dir, total, content_type, _validator) = self.sole_entity()?;
+        let dir = ChunkDir::new(dir);
+        let chunks = total.div_ceil(CHUNK_BYTES);
+        let buckets = chunks.div_ceil(enginefs::chunk_store::CHUNKS_PER_DIRECTORY);
+        let mut held = 0u64;
+        let mut held_chunks = 0u64;
+        for bucket in 0..buckets {
+            for index in dir.held_in_bucket(bucket).unwrap_or_default() {
+                if index < chunks {
+                    held_chunks += 1;
+                    held += chunk_len(index, total);
+                }
+            }
+        }
+        Some(HeldFacts {
+            total,
+            content_type,
+            held,
+            complete: total == 0 || held_chunks == chunks,
+        })
+    }
+
+    /// Removes everything under this key -- every generation, every chunk
+    /// -- and takes the bytes out of the occupancy figure. For a download
+    /// the user deleted. Blocking.
+    pub(crate) fn remove_all(&self) -> u64 {
+        let held: u64 = walkdir::WalkDir::new(&self.dir)
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry.file_type().is_file())
+            .filter_map(|entry| entry.metadata().ok())
+            .map(|metadata| enginefs::chunk_store::occupied_bytes(&metadata))
+            .sum();
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for entity in entries.flatten() {
+                self.retention.forget(&entity.path());
+            }
+        }
+        match std::fs::remove_dir_all(&self.dir) {
+            Ok(()) => {
+                self.retention.uncounted(held);
+                held
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+            Err(error) => {
+                tracing::warn!(dir = %self.dir.display(), %error, "could not delete a download's cache");
+                0
+            }
+        }
+    }
+
     fn sole_entity(&self) -> Option<(PathBuf, u64, String, String)> {
         let mut only: Option<(PathBuf, u64, String, String)> = None;
         for entry in std::fs::read_dir(&self.dir).ok()?.flatten() {
@@ -958,6 +1061,15 @@ const MAX_ENTITY_DIR_NAME: usize = 255;
 /// Whether an entity of this length, type and validator can be filed at all.
 /// Asked by `routes::proxy::cacheable_entity` before a response is kept,
 /// because the answer is a refusal and every refusal lives there.
+/// See [`Entry::held_facts`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HeldFacts {
+    pub total: u64,
+    pub content_type: String,
+    pub held: u64,
+    pub complete: bool,
+}
+
 pub fn can_be_filed(total: u64, content_type: &str, validator: &str) -> bool {
     entity_dir_name(total, content_type, validator).len() <= MAX_ENTITY_DIR_NAME
 }
@@ -1128,6 +1240,16 @@ pub struct Cached {
 impl Cached {
     /// Whether the whole of what was asked for is here, so the origin need
     /// not be opened at all.
+    /// The entity's length.
+    pub fn total(&self) -> u64 {
+        self.total
+    }
+
+    /// What the origin labelled the entity.
+    pub fn content_type(&self) -> &str {
+        &self.content_type
+    }
+
     pub fn complete(&self) -> bool {
         self.held_to >= self.last
     }
@@ -1429,6 +1551,9 @@ where
 /// What one sweep did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SweepReport {
+    /// Pinned key directories left in place, and their bytes.
+    pub kept: usize,
+    pub kept_bytes: u64,
     /// Cached resources removed -- one per key directory under the root.
     pub removed: usize,
     /// What they occupied, in bytes as the volume counts them.
@@ -1469,8 +1594,16 @@ pub struct SweepReport {
 /// entity under it -- because an empty tree of directories is debris too.
 /// The chunk a kill was writing to its temporary name goes with the rest;
 /// it needed naming when committed chunks stayed.
-pub fn sweep(root: &Path) -> SweepReport {
+pub fn sweep(root: &Path, keep: Option<&std::collections::HashSet<PathBuf>>) -> SweepReport {
     let mut report = SweepReport::default();
+    // Nobody has named the pins: nothing is swept, the piece store's rule
+    // for the same silence. Every byte stays on the disk, counted by the
+    // owner once an entity is asked about and bounded by the budget like
+    // any other slack; what it is not is deleted for want of a claim.
+    let Some(keep) = keep else {
+        tracing::info!("proxy cache: no pin record named; sweeping nothing");
+        return report;
+    };
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         // No cache root yet is the ordinary first-launch state.
@@ -1501,6 +1634,11 @@ pub fn sweep(root: &Path) -> SweepReport {
             .filter_map(|entry| entry.metadata().ok())
             .map(|metadata| enginefs::chunk_store::occupied_bytes(&metadata))
             .sum();
+        if keep.contains(&path) {
+            report.kept += 1;
+            report.kept_bytes += held;
+            continue;
+        }
         let removed = if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             std::fs::remove_dir_all(&path)
         } else {
@@ -1517,11 +1655,13 @@ pub fn sweep(root: &Path) -> SweepReport {
             }
         }
     }
-    if report.removed > 0 {
+    if report.removed > 0 || report.kept > 0 {
         tracing::info!(
             removed = report.removed,
             freed = report.freed_bytes,
-            "emptied the proxy cache: nothing cached by a previous run is being played by this one"
+            kept = report.kept,
+            kept_bytes = report.kept_bytes,
+            "swept the proxy cache: what a previous run cached goes, what it pinned stays"
         );
     }
     report
@@ -2375,7 +2515,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a scratch root");
         // The launch sweep, before anything is relayed: what it leaves is
         // what this process has counted, which is nothing.
-        assert_eq!(super::sweep(dir.path()).removed, 0);
+        assert_eq!(super::sweep(dir.path(), Some(&HashSet::new())).removed, 0);
         let live = Arc::new(Live::default());
         let cache = ProxyCache::new(dir.path(), Arc::default(), live.clone());
         assert_eq!(cache.retention().occupancy(), 0, "a fill has written none");
@@ -3099,7 +3239,7 @@ mod tests {
         let killed = chunk_path(&dir, 0).parent().unwrap().join("0.999-0.part");
         std::fs::write(&killed, [3u8; 64]).unwrap();
 
-        let report = sweep(cache.root());
+        let report = sweep(cache.root(), Some(&HashSet::new()));
         assert_eq!(report.removed, 1, "the one resource that was cached");
         assert_eq!(report.errors, 0);
         assert!(report.freed_bytes >= CHUNK_BYTES, "{report:?}");
@@ -3110,7 +3250,7 @@ mod tests {
         );
         assert!(!entry.dir.exists(), "the key directory goes whole");
         assert_eq!(
-            sweep(cache.root()),
+            sweep(cache.root(), Some(&HashSet::new())),
             SweepReport::default(),
             "idempotent: a second pass finds nothing to do"
         );
@@ -3133,7 +3273,7 @@ mod tests {
         let stray = cache.root().join("left-behind.tmp");
         std::fs::write(&stray, [1u8; 128]).unwrap();
 
-        let report = sweep(cache.root());
+        let report = sweep(cache.root(), Some(&HashSet::new()));
         assert_eq!(report.removed, 1);
         assert_eq!(report.errors, 0);
         assert!(report.freed_bytes >= 128, "{report:?}");
@@ -3145,7 +3285,7 @@ mod tests {
         let not_a_dir = tmp.path().join("proxy");
         std::fs::write(&not_a_dir, b"x").unwrap();
         assert_eq!(
-            sweep(&not_a_dir),
+            sweep(&not_a_dir, Some(&HashSet::new())),
             SweepReport {
                 errors: 1,
                 ..SweepReport::default()
@@ -3245,9 +3385,12 @@ mod tests {
     #[test]
     fn a_cache_that_has_never_been_written_is_not_a_problem() {
         let (root, cache) = cache();
-        assert_eq!(sweep(cache.root()), SweepReport::default());
         assert_eq!(
-            sweep(&root.path().join("never")),
+            sweep(cache.root(), Some(&HashSet::new())),
+            SweepReport::default()
+        );
+        assert_eq!(
+            sweep(&root.path().join("never"), Some(&HashSet::new())),
             SweepReport::default(),
             "and neither is one whose root does not exist"
         );

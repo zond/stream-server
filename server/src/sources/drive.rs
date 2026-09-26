@@ -233,7 +233,7 @@ impl DrivePairing {
     }
 
     /// Where this file's bytes are asked for.
-    fn media_url(&self) -> Result<Url, DriveError> {
+    pub(crate) fn media_url(&self) -> Result<Url, DriveError> {
         let mut url = self.api_base.clone();
         url.path_segments_mut()
             .map_err(|()| DriveError::Unreachable("the Drive API base cannot be a base".into()))?
@@ -593,6 +593,15 @@ impl DriveSource {
     /// of the source instead of an error.
     pub fn needs_pairing_again(&self) -> bool {
         self.credential.is_dead()
+    }
+}
+
+impl DriveSource {
+    /// The proxy source underneath, quiet, for a download's filler
+    /// ([`crate::proxy_downloads`]): the same media URL, the same renewing
+    /// credential, the same vouched cache key.
+    pub(crate) fn filling_source(&self) -> ProxySource {
+        self.inner.for_filling()
     }
 }
 

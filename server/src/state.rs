@@ -69,6 +69,9 @@ pub struct AppState {
     /// body has been framed to deliver and has not yet
     /// (`crate::proxy_retention`).
     pub proxy_cache: Arc<crate::proxy_cache::ProxyCache>,
+    /// The pinned proxy downloads and their fillers (see
+    /// `crate::proxy_downloads`).
+    pub proxy_downloads: Arc<crate::proxy_downloads::ProxyDownloads>,
     /// The optional LAN media listener shared by `run` and `ServerHandle`
     /// (see `crate::lan_media`). Constructed disabled; `run` replaces it with
     /// one carrying `ServerConfig::lan_media_addr`.
@@ -142,6 +145,7 @@ impl AppState {
             devices: Arc::new(RwLock::new(Vec::new())),
             proxy_streams: Arc::new(crate::proxy_streams::ProxyStreams::new()),
             proxy_cache,
+            proxy_downloads: Arc::default(),
             lan_media: Arc::new(crate::lan_media::LanMedia::new(None)),
             traffic_window: Arc::new(enginefs::traffic::TrafficWindow::new()),
             budget_publication: Arc::default(),

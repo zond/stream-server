@@ -38,6 +38,11 @@ fn offline_config() -> stream_server::ServerConfig {
         // idle-pause test in the file into one about a cache that may not be
         // touched.
         pins: Some(Default::default()),
+        // And the same for the proxy cache's own pins: an embedder that
+        // keeps a record and has pinned nothing, under which a restart
+        // sweeps the cache clean. `None` would keep everything
+        // (`proxy_downloads.rs` has that case).
+        proxy_pins: Some(Vec::new()),
         ..stream_server::ServerConfig::default()
     }
 }
