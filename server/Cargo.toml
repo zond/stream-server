@@ -152,7 +152,7 @@ reqwest = { version = "0.13", features = ["blocking"] }
 tokio = { version = "1.42", features = ["test-util"] }
 # Real .torrent fixtures for the embed tests (`librqbit::create_torrent`);
 # the same git pin as enginefs, so nothing extra is compiled.
-librqbit = { git = "https://github.com/zond/rqbit", rev = "fafb33ed36745558da155dd52f620b7042283054", default-features = false, features = [
+librqbit = { git = "https://github.com/zond/rqbit", rev = "e142006b1ae1b104c63105abd60dc8d75faf808e", default-features = false, features = [
     "rust-tls",
     "http-api-client",
 ] }
