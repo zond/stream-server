@@ -25,6 +25,14 @@ carried in below.
   `a_restart_out_of_error_has_its_hold_back_issued_again_by_the_next_pass`,
   `shape_for` gives the whole budget to the lookahead, so nothing is
   committed for sharing. A question about the policy, not a defect.
+- **`an_unknown_pin_set_never_stops_a_torrent_nobody_reads` flakes**
+  (server/tests/reader_less_fetch.rs, only under the full
+  `cargo test -p server --no-default-features` run; it has not failed
+  alone). Three failures: 2026-09-26 and 2026-09-27 "let a pass take
+  pieces it fetched" (a slack pass reclaiming a reader-less torrent's
+  pieces while the pin set is unknown), and 2026-09-27 "stopped a torrent
+  nobody reads" (nothing fetched in the last 4 s). Not hunted yet; the
+  first failure predates the rqbit changes it has been seen beside.
 - **The piece-commit failure paths are unmeasured on a device** -- see
   *Readable before durable* below.
 - **A stale-looking name, kept on purpose**:
