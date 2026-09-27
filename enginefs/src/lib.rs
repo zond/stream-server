@@ -744,6 +744,252 @@ impl Drop for PinLock<'_> {
 /// add is one torrent's removal, and removals are rare.
 type RemovalGate = Arc<tokio::sync::Mutex<()>>;
 
+/// The maps a request registers its activity in, beside an engine's own
+/// reader count: what [`BackendEngineFS::torrent_activity_registers`] and
+/// the housekeeping sweep both ask, the one way.
+#[derive(Clone)]
+struct Registers {
+    active_streams: Arc<RwLock<HashMap<String, usize>>>,
+    active_file_streams: Arc<RwLock<HashMap<(String, usize), usize>>>,
+    active_multifile_files: Arc<RwLock<HashMap<String, MultiFileActiveSelection>>>,
+}
+
+impl Registers {
+    /// Which register says a request is using `info_hash` -- `engine`'s own
+    /// count first, then each map -- or `None` when none does. Each map is
+    /// read under its own lock and let go before the next.
+    async fn holding<H: TorrentHandle>(
+        &self,
+        info_hash: &str,
+        engine: &Engine<H>,
+    ) -> Option<&'static str> {
+        if engine.active_streams.load(Ordering::SeqCst) > 0 {
+            return Some("engine_active_streams");
+        }
+        if self
+            .active_streams
+            .read()
+            .await
+            .get(info_hash)
+            .is_some_and(|count| *count > 0)
+        {
+            return Some("active_streams");
+        }
+        if self
+            .active_file_streams
+            .read()
+            .await
+            .iter()
+            .any(|((hash, _), count)| hash == info_hash && *count > 0)
+        {
+            return Some("active_file_streams");
+        }
+        if self
+            .active_multifile_files
+            .read()
+            .await
+            .contains_key(info_hash)
+        {
+            return Some("active_multifile_file");
+        }
+        None
+    }
+}
+
+/// The housekeeping sweep: every fifteen seconds, prune the magnet adds
+/// nobody has asked about and remove the torrents nothing has used for
+/// [`INACTIVE_TORRENT_REMOVE_TIMEOUT`]. Started by the constructor and
+/// handed over by [`BackendEngineFS::take_sweep_task`]. Pausing is not
+/// here -- that is the reconciler's, on its own two-second tick.
+struct Housekeeping<B: TorrentBackend> {
+    engines: EngineRegistry<B::Handle>,
+    backend: Arc<B>,
+    registers: Registers,
+    live: Arc<crate::retention::live::Live>,
+    magnet_adds: MagnetAddRegistry<B::Handle>,
+    gate: RemovalGate,
+    clock: Clock,
+}
+
+impl<B: TorrentBackend + 'static> Housekeeping<B> {
+    async fn run(self) {
+        loop {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            let now = self.clock.now_secs();
+            self.prune_magnet_adds(now).await;
+            for engine in self.idle_engines(now).await {
+                self.remove_if_still_idle(engine, now).await;
+            }
+        }
+    }
+
+    /// Magnet adds nobody has asked about for the inactivity window: a
+    /// failure record that was never retried, or (should the add somehow
+    /// outlive its own timeout) an add still in flight, whose task is
+    /// aborted. Bounds the registry the way the engine sweep bounds
+    /// `engines`.
+    async fn prune_magnet_adds(&self, now: u64) {
+        let mut adds = self.magnet_adds.write().await;
+        adds.retain(|info_hash, entry| {
+            let idle = entry.idle_for(now);
+            if idle <= INACTIVE_TORRENT_REMOVE_TIMEOUT {
+                return true;
+            }
+            match &entry.state {
+                MagnetAddState::Adding(pending) => {
+                    pending.abort.abort();
+                    tracing::info!(
+                        info_hash = %info_hash,
+                        idle_secs = idle.as_secs(),
+                        "Aborted idle magnet add"
+                    );
+                }
+                MagnetAddState::Failed(failed) => {
+                    debug!(
+                        info_hash = %info_hash,
+                        idle_secs = idle.as_secs(),
+                        error = %failed.error,
+                        "Dropped idle magnet add failure record"
+                    );
+                }
+            }
+            false
+        });
+    }
+
+    /// The engines nothing has used for the inactivity window, by every
+    /// register there is.
+    async fn idle_engines(&self, now: u64) -> Vec<Arc<Engine<B::Handle>>> {
+        // Cloned out and the guard dropped before the first `.await`: the
+        // registry is a write-preferring `RwLock`, and a read guard held
+        // across the activity maps' locks parks every writer -- an add, a
+        // removal -- and every reader queued behind it, for as long as any
+        // of those maps is held.
+        let engines: Vec<(String, Arc<Engine<B::Handle>>)> = self
+            .engines
+            .read()
+            .await
+            .iter()
+            .map(|(hash, engine)| (hash.clone(), engine.clone()))
+            .collect();
+        let mut idle = Vec::new();
+        for (hash, engine) in engines {
+            let age_secs = now.saturating_sub(engine.last_accessed.load(Ordering::SeqCst));
+            if age_secs <= INACTIVE_TORRENT_REMOVE_TIMEOUT.as_secs() {
+                continue;
+            }
+            // An offline download is idle by nature (nothing reads it until
+            // it is complete); removing the torrent from the session would
+            // stop it. And the torrent being played is never removed, asked
+            // of the same cell the reconciler and the passes read rather
+            // than of a register a request happened to leave behind:
+            // removing the live torrent's engine takes the entity its window
+            // is drawn round out of the map with it.
+            let skip_reason = if engine.is_pinned() {
+                Some("pinned_files")
+            } else if let Some(register) = self.registers.holding(&hash, &engine).await {
+                Some(register)
+            } else if self.live.is_torrent(&hash) {
+                Some("playing")
+            } else {
+                None
+            };
+            tracing::debug!(
+                info_hash = %hash,
+                age_secs,
+                removed = skip_reason.is_none(),
+                skip_reason,
+                "inactive-engine cleanup"
+            );
+            if skip_reason.is_none() {
+                idle.push(engine);
+            }
+        }
+        idle
+    }
+
+    /// Remove `engine` and its torrent, if it is still the registered one
+    /// and still idle.
+    ///
+    /// Decided in [`Self::idle_engines`] across several awaits; removed
+    /// here under the write lock, which is a later instant. What can happen
+    /// in between is a stream opening on the very engine that was found
+    /// idle: `on_stream_start` writes the cell, finds the engine (a
+    /// `get_engine`, which touches it) and counts its stream, all of it
+    /// after the reading and before this guard. An unconditional `remove`
+    /// here then took the torrent out from under that stream -- its reads
+    /// failed against a torrent the session no longer had, and the bytes it
+    /// had just started reading went with the directory.
+    ///
+    /// So the removal is decided again, from the facts as they stand under
+    /// the guard. The engine must still be the one that was read (a re-add
+    /// meanwhile publishes another, which this pass knows nothing about),
+    /// and still idle by the readings that need no other lock: the clock
+    /// every lookup stamps, the engine's own reader count, the liveness
+    /// cell and the pin set. Every writer of the activity maps looks the
+    /// engine up first, so a touch is the earliest trace any of them
+    /// leaves, and a stamp at or after this sweep's `now` reads as an age
+    /// of zero.
+    ///
+    /// **And the two halves of a removal are one step under the
+    /// [`RemovalGate`].** The registry entry going and the session's
+    /// torrent going are two instants with an await between them, and an
+    /// add in that gap -- a `.torrent` `/create`, a pin, a stream coming
+    /// back to the torrent -- was handed the torrent about to go
+    /// (`AlreadyManaged`), found no engine, and published one around it:
+    /// the torrent and its files then went, under a stream, or under a pin
+    /// answered `Ok`. Every add publishes under the gate and checks the
+    /// session first, so it waits here and then adds again.
+    async fn remove_if_still_idle(&self, engine: Arc<Engine<B::Handle>>, now: u64) {
+        let held = self.gate.lock().await;
+        let mut write = self.engines.write().await;
+        let hash = engine.info_hash.clone();
+        let current = write
+            .get(&hash)
+            .is_some_and(|current| Arc::ptr_eq(current, &engine));
+        let age_secs = now.saturating_sub(engine.last_accessed.load(Ordering::SeqCst));
+        let still_idle = current
+            && !engine.is_pinned()
+            && engine.active_streams.load(Ordering::SeqCst) == 0
+            && age_secs > INACTIVE_TORRENT_REMOVE_TIMEOUT.as_secs()
+            && !self.live.is_torrent(&hash);
+        if !still_idle {
+            tracing::debug!(
+                info_hash = %hash,
+                current,
+                age_secs,
+                removed = false,
+                "an engine found idle was used before it could be removed; keeping it"
+            );
+            return;
+        }
+        debug!(info_hash = %hash, "Auto-removing inactive engine");
+        write.remove(&hash);
+        drop(write);
+
+        // Actually stop the torrent in the backend session, and take its
+        // bytes with it: an engine nothing has asked about for five minutes
+        // is one whose entities the slack passes have already emptied, and
+        // what it leaves behind is a directory nothing in this process has
+        // a deleter for once its store is gone.
+        if let Err(e) = self.backend.remove_torrent_and_files(&hash).await {
+            tracing::warn!(
+                info_hash = %hash,
+                error = %e,
+                removed = false,
+                "Failed to remove inactive torrent from backend"
+            );
+        } else {
+            tracing::info!(
+                info_hash = %hash,
+                removed = true,
+                "Removed inactive torrent from backend"
+            );
+        }
+        drop(held);
+    }
+}
+
 /// The pins waiting for their torrent to come back: see
 /// `BackendEngineFS::dormant_pins`.
 type DormantPins = Arc<parking_lot::Mutex<BTreeMap<String, std::collections::BTreeSet<usize>>>>;
@@ -1110,252 +1356,18 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             pins_unknown,
         };
 
-        let engines_clone = engines.clone();
-        let backend_clone = efs.backend.clone();
-        let active_streams_clone = efs.active_streams.clone();
-        let active_file_streams_clone = efs.active_file_streams.clone();
-        let live_clone = efs.live.clone();
-        let active_multifile_files_clone = efs.active_multifile_files.clone();
-        let magnet_adds_clone = efs.magnet_adds.clone();
-        let gate_clone = efs.removal_gate.clone();
-        let clock = efs.clock;
-        let sweep = tokio::spawn(async move {
-            loop {
-                // Magnet-registry pruning; torrent removal is gated by
-                // the much longer inactivity timeout below. Pausing is not
-                // here any more -- that is the reconciler's, on its own
-                // two-second tick.
-                tokio::time::sleep(Duration::from_secs(15)).await;
-                let mut to_remove = Vec::new();
-                let now = clock.now_secs();
-
-                // Magnet adds nobody has asked about for the inactivity window:
-                // a failure record that was never retried, or (should the add
-                // somehow outlive its own timeout) an add still in flight,
-                // whose task is aborted. Bounds the registry the way the
-                // engine sweep below bounds `engines`.
-                {
-                    let mut adds = magnet_adds_clone.write().await;
-                    adds.retain(|info_hash, entry| {
-                        let idle = entry.idle_for(now);
-                        if idle <= INACTIVE_TORRENT_REMOVE_TIMEOUT {
-                            return true;
-                        }
-                        match &entry.state {
-                            MagnetAddState::Adding(pending) => {
-                                pending.abort.abort();
-                                tracing::info!(
-                                    info_hash = %info_hash,
-                                    idle_secs = idle.as_secs(),
-                                    "Aborted idle magnet add"
-                                );
-                            }
-                            MagnetAddState::Failed(failed) => {
-                                debug!(
-                                    info_hash = %info_hash,
-                                    idle_secs = idle.as_secs(),
-                                    error = %failed.error,
-                                    "Dropped idle magnet add failure record"
-                                );
-                            }
-                        }
-                        false
-                    });
-                }
-
-                {
-                    // Cloned out and the guard dropped before the first
-                    // `.await`: the registry is a write-preferring `RwLock`,
-                    // and a read guard held across the three activity maps'
-                    // locks below parks every writer -- an add, a removal --
-                    // and every reader queued behind it, for as long as any
-                    // of those maps is held.
-                    let engines: Vec<(String, Arc<Engine<B::Handle>>)> = engines_clone
-                        .read()
-                        .await
-                        .iter()
-                        .map(|(hash, engine)| (hash.clone(), engine.clone()))
-                        .collect();
-                    for (hash, engine) in &engines {
-                        let engine_active_streams = engine
-                            .active_streams
-                            .load(std::sync::atomic::Ordering::SeqCst);
-                        let last = engine
-                            .last_accessed
-                            .load(std::sync::atomic::Ordering::SeqCst);
-                        let age_secs = now.saturating_sub(last);
-                        if age_secs <= INACTIVE_TORRENT_REMOVE_TIMEOUT.as_secs() {
-                            continue;
-                        }
-
-                        let active_stream_count = {
-                            let streams = active_streams_clone.read().await;
-                            streams.get(hash).copied().unwrap_or(0)
-                        };
-                        let active_file_stream_count = {
-                            let streams = active_file_streams_clone.read().await;
-                            streams
-                                .iter()
-                                .filter(|((stream_hash, _), _)| stream_hash == hash)
-                                .map(|(_, count)| *count)
-                                .sum::<usize>()
-                        };
-                        // The torrent being played is never removed, and
-                        // this is asked of the same cell the reconciler and
-                        // the passes read rather than of a register a
-                        // request happened to leave behind: removing the
-                        // live torrent's engine takes the entity its window
-                        // is drawn round out of the map with it.
-                        let live_here = live_clone.is_torrent(hash);
-                        let active_multifile_matches = {
-                            let selections = active_multifile_files_clone.read().await;
-                            selections.contains_key(hash)
-                        };
-                        // An offline download is idle by nature (nothing
-                        // reads it until it is complete); removing the
-                        // torrent from the session would stop it.
-                        let pinned = engine.is_pinned();
-
-                        let skip_reason = if pinned {
-                            Some("pinned_files")
-                        } else if engine_active_streams > 0 {
-                            Some("engine_active_streams")
-                        } else if active_stream_count > 0 {
-                            Some("active_streams")
-                        } else if active_file_stream_count > 0 {
-                            Some("active_file_streams")
-                        } else if live_here {
-                            Some("playing")
-                        } else if active_multifile_matches {
-                            Some("active_multifile_file")
-                        } else {
-                            None
-                        };
-
-                        if let Some(skip_reason) = skip_reason {
-                            tracing::debug!(
-                                info_hash = %hash,
-                                age_secs,
-                                engine_active_streams,
-                                active_stream_count,
-                                active_file_stream_count,
-                                active_multifile_matches,
-                                removed = false,
-                                skip_reason,
-                                "Skipping inactive-engine cleanup"
-                            );
-                        } else {
-                            tracing::debug!(
-                                info_hash = %hash,
-                                age_secs,
-                                engine_active_streams,
-                                active_stream_count,
-                                active_file_stream_count,
-                                active_multifile_matches,
-                                removed = true,
-                                "Scheduling inactive-engine cleanup"
-                            );
-                            to_remove.push(engine.clone());
-                        }
-                    }
-                }
-
-                if !to_remove.is_empty() {
-                    // Decided above under the read lock, across several
-                    // awaits; removed here under the write lock, which is
-                    // a later instant. What can happen in between is a
-                    // stream opening on the very engine that was found
-                    // idle: `on_stream_start` writes the cell, finds the
-                    // engine (a `get_engine`, which touches it) and counts
-                    // its stream, all of it after the reading above and
-                    // before this guard. An unconditional `remove` here
-                    // then took the torrent out from under that stream --
-                    // its reads failed against a torrent the session no
-                    // longer had, and the bytes it had just started reading
-                    // went with the directory.
-                    //
-                    // So the removal is decided again, from the facts as
-                    // they stand under the guard. The engine must still be
-                    // the one that was read (a re-add meanwhile publishes
-                    // another, which this pass knows nothing about), and
-                    // still idle by the readings that need no other lock:
-                    // the clock every lookup stamps, the engine's own reader
-                    // count, the liveness cell and the pin set. Every writer
-                    // of the three activity maps read above looks the engine
-                    // up first, so a touch is the earliest trace any of them
-                    // leaves, and a stamp at or after this sweep's `now`
-                    // reads as an age of zero.
-                    //
-                    // **And the two halves of a removal are one step under
-                    // the [`RemovalGate`].** The registry entry going and
-                    // the session's torrent going are two instants with an
-                    // await between them, and an add in that gap -- a
-                    // `.torrent` `/create`, a pin, a stream coming back to
-                    // the torrent -- was handed the torrent about to go
-                    // (`AlreadyManaged`), found no engine, and published
-                    // one around it: the torrent and its files then went,
-                    // under a stream, or under a pin answered `Ok`. Every
-                    // add publishes under the gate and checks the session
-                    // first, so it waits here and then adds again.
-                    for engine in to_remove {
-                        let held = gate_clone.lock().await;
-                        let mut write = engines_clone.write().await;
-                        let hash = engine.info_hash.clone();
-                        let current = write
-                            .get(&hash)
-                            .is_some_and(|current| Arc::ptr_eq(current, &engine));
-                        let age_secs = now.saturating_sub(
-                            engine
-                                .last_accessed
-                                .load(std::sync::atomic::Ordering::SeqCst),
-                        );
-                        let still_idle = current
-                            && !engine.is_pinned()
-                            && engine
-                                .active_streams
-                                .load(std::sync::atomic::Ordering::SeqCst)
-                                == 0
-                            && age_secs > INACTIVE_TORRENT_REMOVE_TIMEOUT.as_secs()
-                            && !live_clone.is_torrent(&hash);
-                        if !still_idle {
-                            tracing::debug!(
-                                info_hash = %hash,
-                                current,
-                                age_secs,
-                                removed = false,
-                                "an engine found idle was used before it could be removed; keeping it"
-                            );
-                            continue;
-                        }
-                        debug!(info_hash = %hash, "Auto-removing inactive engine");
-                        write.remove(&hash);
-                        drop(write);
-
-                        // Actually stop the torrent in the backend session,
-                        // and take its bytes with it: an engine nothing has
-                        // asked about for five minutes is one whose entities
-                        // the slack passes have already emptied, and what it
-                        // leaves behind is a directory nothing in this process
-                        // has a deleter for once its store is gone.
-                        if let Err(e) = backend_clone.remove_torrent_and_files(&hash).await {
-                            tracing::warn!(
-                                info_hash = %hash,
-                                error = %e,
-                                removed = false,
-                                "Failed to remove inactive torrent from backend"
-                            );
-                        } else {
-                            tracing::info!(
-                                info_hash = %hash,
-                                removed = true,
-                                "Removed inactive torrent from backend"
-                            );
-                        }
-                        drop(held);
-                    }
-                }
+        let sweep = tokio::spawn(
+            Housekeeping {
+                engines: efs.engines.clone(),
+                backend: efs.backend.clone(),
+                registers: efs.registers(),
+                live: efs.live.clone(),
+                magnet_adds: efs.magnet_adds.clone(),
+                gate: efs.removal_gate.clone(),
+                clock: efs.clock,
             }
-        });
+            .run(),
+        );
         *efs.sweep_task.lock() = Some(sweep);
 
         efs
@@ -2035,33 +2047,16 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         info_hash: &str,
         engine: &Engine<B::Handle>,
     ) -> bool {
-        if engine.active_streams.load(Ordering::SeqCst) > 0 {
-            return true;
+        self.registers().holding(info_hash, engine).await.is_some()
+    }
+
+    /// The activity registers, shared: see [`Registers`].
+    fn registers(&self) -> Registers {
+        Registers {
+            active_streams: self.active_streams.clone(),
+            active_file_streams: self.active_file_streams.clone(),
+            active_multifile_files: self.active_multifile_files.clone(),
         }
-        if self
-            .active_streams
-            .read()
-            .await
-            .get(info_hash)
-            .copied()
-            .unwrap_or(0)
-            > 0
-        {
-            return true;
-        }
-        if self
-            .active_file_streams
-            .read()
-            .await
-            .iter()
-            .any(|((hash, _), count)| hash == info_hash && *count > 0)
-        {
-            return true;
-        }
-        self.active_multifile_files
-            .read()
-            .await
-            .contains_key(info_hash)
     }
 
     /// The tracker list a torrent is added with: the built-in defaults, the
@@ -4126,11 +4121,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // `await` ago: a torrent added, restored or restarted since is one
         // whose store registered at `init`, and deleting its directory
         // would take the pieces of a live have-set out from under it. The
-        // same guard `crate::retention::unlink` makes before a claimless
-        // delete, for the same reason and at the same instant -- and, like
-        // that one, the safe direction is to refuse: a directory left
-        // behind is swept at the next launch, where bytes deleted under a
-        // running check are gone.
+        // safe direction is to refuse: a directory left behind is swept at
+        // the next launch, where bytes deleted under a running check are
+        // gone.
         //
         // **And the directory leaves the hash's name before a byte goes.**
         // The door is one instant and `remove_dir_all` is a walk of the
@@ -17029,8 +17022,7 @@ mod tests {
     /// advertise-then-serve-a-hole this design exists to prevent, reached
     /// from the one door that never went through the backend.
     ///
-    /// So the registry is asked at the door, as `retention::unlink` asks it
-    /// before a claimless delete. Refusing is the safe direction: a
+    /// So the registry is asked at the door. Refusing is the safe direction: a
     /// directory left behind is swept at the next launch, where bytes taken
     /// from under a running check are gone.
     #[tokio::test]

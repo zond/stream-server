@@ -559,6 +559,11 @@ pub trait Backing: Sized + Send + Sync + 'static {
     fn is_live(&self, _key: &Self::Key) -> bool {
         false
     }
+    /// The owner has just forgotten `key` ([`Retention::forget_empty`]):
+    /// whatever the backing keeps per entity beside the owner's map goes
+    /// with it, or it outlives the entity for the life of the process.
+    /// Called with no owner lock held. The default keeps nothing.
+    fn forgotten(&self, _key: &Self::Key) {}
     /// What the disk holds of the entity: the torrent's registered store's
     /// held set, read in memory; the proxy's directory, listed off the
     /// reactor. `None` is a set we do not have -- no store is registered
@@ -1641,12 +1646,17 @@ impl<B: Backing> Retention<B> {
     /// the time it asks, so an entity a later reader has opened in the gap
     /// keeps itself.
     pub fn forget_empty(&self, key: &B::Key) {
-        let mut entities = self.entities.lock();
-        let Some(entity) = entities.get(key) else {
-            return;
+        let forgotten = {
+            let mut entities = self.entities.lock();
+            let Some(entity) = entities.get(key) else {
+                return;
+            };
+            Arc::strong_count(entity) == 1
+                && entity.state.lock().readers.is_empty()
+                && entities.remove(key).is_some()
         };
-        if Arc::strong_count(entity) == 1 && entity.state.lock().readers.is_empty() {
-            entities.remove(key);
+        if forgotten {
+            self.backing.forgotten(key);
         }
     }
 

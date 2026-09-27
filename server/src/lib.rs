@@ -738,7 +738,8 @@ impl ServerHandle {
     /// so a publisher that stopped reading what the cache holds would size
     /// every window on a volume's free space alone and nothing a client
     /// asked would say so. Here for the tests that pin it, and cheap: a
-    /// read of one cell.
+    /// read of one cell. Doc-hidden: an embedder reads `cache_usage`.
+    #[doc(hidden)]
     pub fn published_cache_budget(&self) -> Option<u64> {
         match self.state.engine.cache_budget().get() {
             enginefs::retention::CacheBudget::Bytes(bytes) => Some(bytes),
@@ -758,6 +759,7 @@ impl ServerHandle {
     /// gap is nanoseconds on an idle machine and milliseconds on a loaded
     /// one, which makes it exactly the kind of thing a test has to be able
     /// to wait for rather than hope past.
+    #[doc(hidden)]
     pub fn proxy_cache_reads(&self) -> usize {
         self.state.proxy_cache.retention().reads()
     }
@@ -774,6 +776,7 @@ impl ServerHandle {
     /// premise is that a stream ran past its budget has to assert the
     /// second one: the first is true on a roomy volume whether or not
     /// anything ever reached the owner.
+    #[doc(hidden)]
     pub fn proxy_cache_cap(&self) -> Option<u64> {
         self.state.proxy_cache.retention().cap()
     }
@@ -796,6 +799,7 @@ impl ServerHandle {
     /// read to its end, nothing can start work this count has not already
     /// seen, so a count of nothing is a disk that has stopped. `within`
     /// bounds it so a regression fails instead of hanging.
+    #[doc(hidden)]
     pub fn proxy_cache_settled(&self, within: std::time::Duration) -> anyhow::Result<()> {
         let state = self.state.clone();
         self.block_on_server(async move {

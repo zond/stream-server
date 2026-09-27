@@ -354,6 +354,23 @@ impl ProxySource {
         self.entity.entry().map(|entry| entry.dir().to_path_buf())
     }
 
+    /// Whether the entity directory `entity` is the one this source's reads
+    /// are filed under: its name is this source's length, type and
+    /// validator. A source with no validator files nothing, so fills none.
+    pub(crate) fn fills(&self, entity: &std::path::Path) -> bool {
+        let entity_name = entity.file_name().and_then(|name| name.to_str());
+        match (&self.entity.validator, entity_name) {
+            (Some(validator), Some(name)) => {
+                name == crate::proxy_cache::entity_dir_name(
+                    self.entity.total,
+                    &self.entity.content_type,
+                    validator,
+                )
+            }
+            _ => false,
+        }
+    }
+
     /// This source with every reader it opens **quiet**: a download's
     /// filler reads an entity nobody is watching, and must neither claim
     /// the live entity nor leave a playhead

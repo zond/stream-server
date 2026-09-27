@@ -3352,7 +3352,15 @@ mod tests {
                 fresh.held().unwrap().contains(2)
             })
         };
-        std::thread::sleep(Duration::from_millis(200));
+        // Until each is parked waiting out the rename -- or has answered,
+        // which is the bug these assert.
+        let deadline = Instant::now() + PATIENCE;
+        while !((asked.is_finished() || PENDING.is_waiting(&store.staging_path(2)))
+            && (walked.is_finished() || PENDING.is_waiting(store.dir())))
+        {
+            assert!(Instant::now() < deadline, "neither answered nor waited");
+            std::thread::yield_now();
+        }
         assert!(
             !asked.is_finished(),
             "librqbit's has_piece answered with the rename still to come"
@@ -3541,7 +3549,8 @@ mod tests {
         let flush = hold_flushes(&store);
 
         // The delete, run from inside the completion at the moment before
-        // the bit is set, and given a while to get through.
+        // the bit is set, and waited for until it has either got through
+        // (the bug) or is standing at the lock the completion holds.
         let (go, went) = std::sync::mpsc::channel::<()>();
         let (done, deleted) = std::sync::mpsc::channel::<()>();
         let deleter = {
@@ -3552,10 +3561,18 @@ mod tests {
                 let _ = done.send(());
             })
         };
+        let staged = store.staging_path(2);
         let (go, deleted) = (Mutex::new(go), Mutex::new(deleted));
         *store.inner.before_held_set.lock() = Some(Arc::new(move |_| {
             let _ = go.lock().send(());
-            let _ = deleted.lock().recv_timeout(Duration::from_millis(300));
+            let deadline = Instant::now() + PATIENCE;
+            while deleted.lock().try_recv().is_err() && !PENDING.cancel_is_blocked(&staged) {
+                assert!(
+                    Instant::now() < deadline,
+                    "the delete neither got through nor reached the lock"
+                );
+                std::thread::yield_now();
+            }
         }));
         store.complete_piece(2).unwrap();
         *store.inner.before_held_set.lock() = None;

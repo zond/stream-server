@@ -642,6 +642,17 @@ impl FileStreams {
             return None;
         }
 
+        if self.streams.len() >= STREAMS_PER_FILE
+            && let Some(oldest) = self
+                .streams
+                .iter()
+                .enumerate()
+                .filter(|(_, stream)| stream.dormant(read.returned))
+                .min_by_key(|(_, stream)| stream.seen)
+                .map(|(index, _)| index)
+        {
+            self.streams.remove(oldest);
+        }
         self.streams.push(Stream {
             reader,
             end: read.end,
@@ -728,6 +739,21 @@ const WAITING_READS: usize = 256;
 /// allowance and is nobody's head. Thirty seconds is longer than any gap
 /// the field's slow second track left between its own reads.
 const STREAM_DORMANT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How many streams one file keeps before a new one displaces the dormant
+/// stream read longest ago.
+///
+/// "Never expired on a timer" ([`STREAM_DORMANT`]) is about a stream's
+/// life, not the list's length: every seek is a stream, and a file scrubbed
+/// through for an evening kept every one of them -- walked by every read
+/// and every pass, for the life of the entity. A dormant stream holds no
+/// window and is nobody's head, and the one read longest ago is the one a
+/// resumed read is least likely to rejoin. Live streams are never
+/// displaced, so a file read by more than this many consumers at once
+/// keeps them all; sixteen is several times any reading the field has
+/// shown (a viewer, a crawler beside it, and the streams its last seeks
+/// left).
+const STREAMS_PER_FILE: usize = 16;
 
 /// How many bytes of reading move a stream's position halfway to a read's
 /// end ([`Stream::place`]), as a share of the piece: an eighth. On the
@@ -1197,6 +1223,105 @@ impl Streams {
     pub fn last_sample(&self, file: usize) -> Option<(u64, std::time::Duration)> {
         self.by_file.get(&file)?.streams.last()?.sampled
     }
+
+    /// **The body of every `Backing::reading`**: answer the reads served
+    /// since the last pass against `held`, the pass's reading of the disk,
+    /// and say what `at`'s consumers are asking of it. The torrent, the
+    /// proxy and the scenarios' fake all run this, each over its own unit
+    /// (a piece, a chunk) and its own lock; what differs between them --
+    /// the torrent's split depth, the fake's hooks -- stays in the backing.
+    ///
+    /// `trace_as` names the entity in the periodic `streams_seen` report,
+    /// or `None` for a caller that reports nothing.
+    pub fn consumers(
+        &mut self,
+        at: &FileAt,
+        held: &BTreeSet<u32>,
+        asking: &super::owner::Asking,
+        trace_as: Option<&str>,
+    ) -> super::owner::Consumers {
+        let now = asking.now;
+        // **What this entity may hold**: [`Asking::allowance`] has the
+        // argument.
+        //
+        // [`Asking::allowance`]: super::owner::Asking::allowance
+        let available = asking.allowance(at.piece, held.len());
+        // Where this file lies, first: a read carries an offset inside its
+        // own file, and every question the detector answers is about
+        // pieces of the entity. Stated every pass, even for the proxy's
+        // trivial geometry, because every offset is converted through it.
+        self.domain(at.file, at.offset, at.extent.clone(), asking.ceiling);
+        let rejected = self.observe(at.file, held, at.piece, now);
+        // **What the consumers are asking for, which is what this pass
+        // orders.** Every pass, and not only the ones that report: a
+        // window grows towards what its rate asks for by doubling, one step
+        // per grant, so grants that happened only when a log line was due
+        // would tie how fast a consumer is fetched for to how often this
+        // server talks about it.
+        let want = self.want(at.file, asking.seconds, available, at.piece, now);
+        let exempt = self.exempt(at.file, at.extent.end);
+        // **What may not be unlinked is published here**, where the want
+        // set is decided: the pass's own holdings -- every promise and
+        // every open stream's lookahead -- with what the consumers are
+        // asking for, and the committed set, which is on the disk whatever
+        // is asked for. The same set is what the coldest are chosen
+        // against, because a reclaim chosen against a smaller one frees
+        // nothing: the door refuses what this publishes.
+        let mut kept = want.clone();
+        kept.extend(asking.holding.iter().cloned());
+        kept.extend(asking.committed.iter().cloned());
+        exempt.publish(&kept);
+        // **What must go, and no more.** The disk that nothing else needs
+        // is scrub-back: giving it up before something asks for the room
+        // buys nothing and costs a re-fetch. So the reclaim is the overhang
+        // over what the disk may hold, taken coldest first -- over the
+        // disk's line, not the windows' allowance, which has the committed
+        // set taken off already ([`Asking::overhang`]).
+        //
+        // [`Asking::overhang`]: super::owner::Asking::overhang
+        let over = asking.overhang(at.piece, held.len());
+        let how_many = usize::try_from(over.div_ceil(at.piece.max(1))).unwrap_or(0);
+        let (tracked, reclaim) = self.coldest_of(at.file, now, &kept, how_many);
+        // Who, among this file's readers, the viewer is; see
+        // [`super::owner::Consumers::at`].
+        let viewer = self.busiest(at.file, at.piece, now);
+        if let Some(entity) = trace_as
+            && self.report_due(now)
+        {
+            let coldest: Vec<u32> = reclaim.iter().copied().take(COLDEST_REPORTED).collect();
+            super::trace::streams_seen(super::trace::StreamsSeen {
+                info_hash: entity,
+                file_idx: at.file,
+                counts: &self.counts(),
+                heads: &self.heads(at.file),
+                sample: self.last_sample(at.file),
+                rates: &self.rates(at.file),
+                want: &want,
+                allowed: available,
+                exempt: self.held_by_streams(at.file),
+                tracked,
+                coldest: &coldest,
+                why: rejected,
+            });
+        }
+        super::owner::Consumers {
+            want,
+            exempt,
+            reclaim,
+            at: viewer,
+        }
+    }
+}
+
+/// Where one file lies in its entity, for [`Streams::consumers`]: its
+/// index, the entity offset of its first byte, the pieces it spans, and
+/// how long a piece is.
+#[derive(Debug, Clone)]
+pub struct FileAt {
+    pub file: usize,
+    pub offset: u64,
+    pub extent: Range<u32>,
+    pub piece: u64,
 }
 
 #[cfg(test)]
@@ -1278,6 +1403,40 @@ mod tests {
             "and the reopen behind it is the same consumer: the disk is whole between them"
         );
         assert_eq!(streams.streams.len(), 1);
+    }
+
+    /// **A file keeps [`STREAMS_PER_FILE`] streams**: a new one displaces
+    /// the dormant stream read longest ago, and never a live one.
+    #[test]
+    fn a_new_stream_displaces_the_dormant_one_read_longest_ago() {
+        let t0 = Instant::now();
+        let held = BTreeSet::new();
+        let mut streams = file_at(0);
+        // Seeks a piece apart, a second apart: a stream each.
+        let seek = |streams: &mut FileStreams, n: u64, secs: u64| {
+            let begin = n * 2 * PIECE;
+            streams.observe(n, read(begin, begin + 262_144, t0, secs), &held, PIECE)
+        };
+        for n in 0..STREAMS_PER_FILE as u64 {
+            assert_eq!(seek(&mut streams, n, n), Some(Rejected::Outside));
+        }
+        assert_eq!(streams.streams.len(), STREAMS_PER_FILE);
+
+        // Every one of them still live: nothing is displaced.
+        let live = STREAMS_PER_FILE as u64;
+        assert_eq!(seek(&mut streams, live, live), Some(Rejected::Outside));
+        assert_eq!(streams.streams.len(), STREAMS_PER_FILE + 1);
+
+        // Long enough later that all are dormant: the oldest goes, and only
+        // it.
+        let later = live + STREAM_DORMANT.as_secs() + 1;
+        assert_eq!(seek(&mut streams, 100, later), Some(Rejected::Outside));
+        assert_eq!(streams.streams.len(), STREAMS_PER_FILE + 1);
+        assert!(
+            !streams.streams.iter().any(|stream| stream.reader == 0),
+            "the stream read longest ago is the one displaced"
+        );
+        assert!(streams.streams.iter().any(|stream| stream.reader == 1));
     }
 
     /// **One response reading on past what the disk holds is one

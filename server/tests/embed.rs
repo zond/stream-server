@@ -96,17 +96,15 @@ fn the_stock_config_generates_a_token() {
 
 /// A server takes an OS-assigned BitTorrent listen port, so any number of
 /// them coexist. The fixed, forwardable range is still reachable, but only
-/// for an embedder that names it.
+/// for an embedder that names it: the type's own `Default` is `Ephemeral`
+/// too, so `..Default::default()` on any config holding one cannot bind it.
 #[test]
 fn the_stock_config_uses_an_ephemeral_torrent_port() {
     assert_eq!(
         ServerConfig::default().torrent_listen_port,
         TorrentListenPort::Ephemeral
     );
-    assert_eq!(
-        TorrentListenPort::default(),
-        TorrentListenPort::Fixed(42000..42010)
-    );
+    assert_eq!(TorrentListenPort::default(), TorrentListenPort::Ephemeral);
 }
 
 /// Two embedded servers started at the same time both come up: neither the

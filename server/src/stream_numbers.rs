@@ -66,8 +66,9 @@
 //!   paused, still checking, stopped for space, in error. A torrent that
 //!   has moved gigabytes and then paused has not moved nothing, so the
 //!   three numbers go absent together rather than reading as a session
-//!   that has shared nothing. A [`Sharing`] with neither half is no
-//!   sharing row at all.
+//!   that has shared nothing. A torrent still has its sharing row then,
+//!   because [`Sharing::refused_reclaims`] is always there: a count, which
+//!   is `0` and not absent when nothing has been refused.
 
 use enginefs::EngineFS;
 use enginefs::backend::TorrentHandle;
@@ -110,8 +111,9 @@ pub struct Sharing {
     /// fetching 1.6 GB to play a hundred megabytes legible, and they stay
     /// for that reason.
     ///
-    /// `None` for a proxied response, which has no engine and no passes.
-    pub refused_reclaims: Option<usize>,
+    /// Never absent: every torrent stream has an engine, and a proxied
+    /// response, which has none, has no sharing row at all.
+    pub refused_reclaims: usize,
 }
 
 /// What a torrent has moved over the connection **in this session**, and
@@ -157,16 +159,14 @@ pub struct Transfer {
 
 impl Sharing {
     /// The sharing row for a torrent whose policy has committed
-    /// `committed_bytes` and whose backend reports `transfer`, or `None`
-    /// when it can say neither: a row with nothing in it is a row a client
-    /// should not draw, and this server saying "no sharing numbers for this
-    /// stream" is exactly as true of that torrent as it is of a proxied
-    /// response.
+    /// `committed_bytes`, whose backend reports `transfer` and whose
+    /// engine has had `refused_reclaims` refused. Always a row: the count
+    /// is always known, so a torrent always has something to draw.
     fn of(
         committed_bytes: Option<u64>,
         transfer: Option<enginefs::backend::TransferTotals>,
-        refused_reclaims: Option<usize>,
-    ) -> Option<Self> {
+        refused_reclaims: usize,
+    ) -> Self {
         let transfer = transfer.map(|transfer| Transfer {
             downloaded_bytes: transfer.fetched,
             unverified_bytes: transfer.unverified(),
@@ -174,13 +174,11 @@ impl Sharing {
             ratio: (transfer.fetched > 0)
                 .then(|| transfer.uploaded as f64 / transfer.fetched as f64),
         });
-        (committed_bytes.is_some() || transfer.is_some() || refused_reclaims.is_some()).then_some(
-            Self {
-                committed_bytes,
-                transfer,
-                refused_reclaims,
-            },
-        )
+        Self {
+            committed_bytes,
+            transfer,
+            refused_reclaims,
+        }
     }
 }
 
@@ -245,11 +243,11 @@ impl StreamStore for EngineFS {
         let numbers = self.torrent_stream_numbers(&info_hash, file_idx).await?;
         Some(StreamNumbers {
             window: numbers.window,
-            sharing: Sharing::of(
+            sharing: Some(Sharing::of(
                 numbers.committed_bytes,
                 numbers.transfer,
-                Some(numbers.refused_reclaims),
-            ),
+                numbers.refused_reclaims,
+            )),
         })
     }
 }
@@ -518,15 +516,15 @@ mod tests {
                 behind_seconds: Some(412.5),
                 ahead_seconds: None,
             }),
-            sharing: Sharing::of(
+            sharing: Some(Sharing::of(
                 Some(859_832_320),
                 Some(enginefs::backend::TransferTotals {
                     fetched: 4_800,
                     verified: 4_400,
                     uploaded: 2_100,
                 }),
-                Some(3),
-            ),
+                3,
+            )),
         };
         assert_eq!(
             serde_json::to_value(numbers).expect("it serializes"),
@@ -577,9 +575,8 @@ mod tests {
                 verified: 0,
                 uploaded: 2_100,
             }),
-            Some(0),
-        )
-        .expect("a torrent that has moved bytes has a sharing row");
+            0,
+        );
         let seeding = seeding.transfer.expect("its counters were readable");
         assert_eq!(seeding.ratio, None);
         assert_eq!(seeding.uploaded_bytes, 2_100);
@@ -591,9 +588,8 @@ mod tests {
                 verified: 4_400,
                 uploaded: 2_100,
             }),
-            Some(0),
-        )
-        .expect("a sharing row");
+            0,
+        );
         assert_eq!(both.committed_bytes, Some(820));
         assert_eq!(
             both.transfer.expect("its counters were readable").ratio,
@@ -612,7 +608,7 @@ mod tests {
     /// would tell a viewer their session has shared nothing.
     #[test]
     fn a_torrent_whose_counters_cannot_be_read_reports_no_transfer_at_all() {
-        let paused = Sharing::of(Some(820), None, None).expect("its policy still committed bytes");
+        let paused = Sharing::of(Some(820), None, 0);
         assert_eq!(paused.committed_bytes, Some(820));
         assert_eq!(
             paused.transfer, None,
@@ -624,14 +620,8 @@ mod tests {
             serde_json::json!({
                 "committedBytes": 820,
                 "transfer": null,
-                "refusedReclaims": null
+                "refusedReclaims": 0
             })
-        );
-
-        assert_eq!(
-            Sharing::of(None, None, None),
-            None,
-            "and with no committed set either there is no sharing row to draw"
         );
     }
 

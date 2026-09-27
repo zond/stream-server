@@ -463,43 +463,23 @@ impl<S: Side> Backing for FakeBacking<S> {
         asking: crate::retention::owner::Asking,
     ) -> crate::retention::owner::Consumers {
         let extent = Self::extent(domain);
-        let now = asking.now;
-        let available = asking.allowance(domain.piece, held.len());
         let mut streams = self.detector.lock();
-        streams.domain(
-            domain.file,
-            u64::from(extent.start) * domain.piece,
-            extent.clone(),
-            asking.ceiling,
-        );
-        streams.observe(domain.file, held, domain.piece, now);
         // Where a test puts a read that parks while the backing is inside
         // its reading, after the pass took its snapshot of the promises.
         if let Some(hook) = self.on_reading.lock().as_ref() {
             hook();
         }
-        let want = streams.want(domain.file, asking.seconds, available, domain.piece, now);
-        let exempt = streams.exempt(domain.file, extent.end);
-        // **What may not be unlinked is published here**, where the want
-        // set is decided: the pass's own holdings -- every promise and
-        // every open stream's lookahead -- with what the consumers are
-        // asking for. The same set is what the coldest are chosen against,
-        // because a reclaim chosen against a smaller one frees nothing: the
-        // door refuses what this publishes.
-        let mut kept = want.clone();
-        kept.extend(asking.holding.iter().cloned());
-        kept.extend(asking.committed.iter().cloned());
-        exempt.publish(&kept);
-        let over = asking.overhang(domain.piece, held.len());
-        let how_many = usize::try_from(over.div_ceil(domain.piece.max(1))).unwrap_or(0);
-        let (_, reclaim) = streams.coldest_of(domain.file, now, &kept, how_many);
-        let at = streams.busiest(domain.file, domain.piece, now);
-        crate::retention::owner::Consumers {
-            want,
-            exempt,
-            reclaim,
-            at,
-        }
+        streams.consumers(
+            &crate::retention::streams::FileAt {
+                file: domain.file,
+                offset: u64::from(extent.start) * domain.piece,
+                extent,
+                piece: domain.piece,
+            },
+            held,
+            &asking,
+            None,
+        )
     }
 
     fn keeps_everything(&self, _key: &usize) -> bool {

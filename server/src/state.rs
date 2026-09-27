@@ -50,10 +50,6 @@ pub struct AppState {
     /// app's, and which refuses a create rather than guessing
     /// (`crate::routes::drive::DriveEndpoints`).
     pub drive: Option<Arc<crate::routes::drive::DriveEndpoints>>,
-    /// What `GET /casting` answers with. Always empty: the SSDP discovery
-    /// loop that filled it went with the daemon, and nothing could be cast
-    /// to an entry anyway (see `crate::devices`).
-    pub devices: Arc<RwLock<Vec<crate::devices::Device>>>,
     /// The proxied streams players are reading right now, so a client can
     /// end its own player's (see `crate::proxy_streams`).
     pub proxy_streams: Arc<crate::proxy_streams::ProxyStreams>,
@@ -124,7 +120,6 @@ impl AppState {
                 crate::translators::session::SESSION_CAP,
             ),
             drive: None,
-            devices: Arc::new(RwLock::new(Vec::new())),
             proxy_streams: Arc::new(crate::proxy_streams::ProxyStreams::new()),
             proxy_cache,
             proxy_downloads: Arc::default(),

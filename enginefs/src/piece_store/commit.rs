@@ -57,6 +57,17 @@ pub(super) struct Pending {
     by_path: Mutex<HashMap<PathBuf, State>>,
     changed: Condvar,
     next_id: AtomicU64,
+    /// The paths a [`Self::cancel`] is on its way into the lock for: what a
+    /// test holding the lock polls to know a delete has reached it, rather
+    /// than sleeping while every other test's commit waits behind it.
+    #[cfg(test)]
+    cancelling: Mutex<Vec<PathBuf>>,
+    /// The paths (or directories) a [`Self::wait_for`] or
+    /// [`Self::wait_under`] is parked on the condvar for: what a test polls
+    /// to know a reader is waiting out a rename, rather than sleeping and
+    /// hoping it got there.
+    #[cfg(test)]
+    waiting: Mutex<Vec<PathBuf>>,
 }
 
 /// The one instance.
@@ -64,6 +75,10 @@ pub(super) static PENDING: LazyLock<Pending> = LazyLock::new(|| Pending {
     by_path: Mutex::new(HashMap::new()),
     changed: Condvar::new(),
     next_id: AtomicU64::new(1),
+    #[cfg(test)]
+    cancelling: Mutex::new(Vec::new()),
+    #[cfg(test)]
+    waiting: Mutex::new(Vec::new()),
 });
 
 impl Pending {
@@ -93,7 +108,11 @@ impl Pending {
     /// progress is waited for -- its result is the file the delete then
     /// removes. Returns whether a queued commit was cancelled.
     pub(super) fn cancel(&self, path: &Path) -> bool {
+        #[cfg(test)]
+        noted(&self.cancelling, path);
         let mut map = self.by_path.lock();
+        #[cfg(test)]
+        unnoted(&self.cancelling, path);
         loop {
             match map.get(path) {
                 Some(State::Renaming(_)) => self.changed.wait(&mut map),
@@ -105,6 +124,15 @@ impl Pending {
                 None => return false,
             }
         }
+    }
+
+    /// Whether a [`Self::cancel`] of `path` is standing at the lock while
+    /// something holds it: for a caller that holds it, "the cancel is
+    /// blocked behind me". A cancel passing through an unheld lock is not
+    /// this, however it is timed. See [`Self::cancelling`].
+    #[cfg(test)]
+    pub(super) fn cancel_is_blocked(&self, path: &Path) -> bool {
+        self.by_path.is_locked() && self.cancelling.lock().iter().any(|waiting| waiting == path)
     }
 
     /// The committer's claim on the rename: false when the commit was
@@ -139,7 +167,11 @@ impl Pending {
     pub(super) fn wait_for(&self, path: &Path) {
         let mut map = self.by_path.lock();
         while map.contains_key(path) {
+            #[cfg(test)]
+            noted(&self.waiting, path);
             self.changed.wait(&mut map);
+            #[cfg(test)]
+            unnoted(&self.waiting, path);
         }
     }
 
@@ -148,8 +180,34 @@ impl Pending {
     pub(super) fn wait_under(&self, dir: &Path) {
         let mut map = self.by_path.lock();
         while map.keys().any(|path| path.starts_with(dir)) {
+            #[cfg(test)]
+            noted(&self.waiting, dir);
             self.changed.wait(&mut map);
+            #[cfg(test)]
+            unnoted(&self.waiting, dir);
         }
+    }
+
+    /// Whether a [`Self::wait_for`] of `path`, or a [`Self::wait_under`]
+    /// of it as a directory, is parked waiting for a commit to finish.
+    #[cfg(test)]
+    pub(super) fn is_waiting(&self, path: &Path) -> bool {
+        self.waiting.lock().iter().any(|waiting| waiting == path)
+    }
+}
+
+/// Mark `path` in a test's list of what is parked where.
+#[cfg(test)]
+fn noted(list: &Mutex<Vec<PathBuf>>, path: &Path) {
+    list.lock().push(path.to_path_buf());
+}
+
+/// Take one mark of `path` off the list again.
+#[cfg(test)]
+fn unnoted(list: &Mutex<Vec<PathBuf>>, path: &Path) {
+    let mut list = list.lock();
+    if let Some(at) = list.iter().position(|noted| noted == path) {
+        list.remove(at);
     }
 }
 
@@ -162,6 +220,8 @@ mod tests {
             by_path: Mutex::new(HashMap::new()),
             changed: Condvar::new(),
             next_id: AtomicU64::new(1),
+            cancelling: Mutex::new(Vec::new()),
+            waiting: Mutex::new(Vec::new()),
         }
     }
 

@@ -209,7 +209,7 @@ type Detectors = Arc<Mutex<HashMap<PathBuf, enginefs::retention::streams::Stream
 /// **How a proxied entity is fetched when no player is asking**, by key
 /// directory: a quiet [`crate::sources::ProxySource`] over the same URL and
 /// credentials the entity was opened with, registered by the `/proxy` route
-/// when it relays an origin answer and by the Drive open
+/// when it relays an origin answer and by every Drive stream request
 /// ([`ProxyRetention::note_source`]), and read by [`ProxyBacking::want`] to
 /// fill the want-windows ahead of a player.
 ///
@@ -217,8 +217,9 @@ type Detectors = Arc<Mutex<HashMap<PathBuf, enginefs::retention::streams::Stream
 /// is a hash of the URL and the request headers, so the entity's directory
 /// cannot be turned back into a fetch, and the credentials -- a debrid
 /// link's headers, a Drive grant that renews itself -- are only ever in
-/// the hands of whatever opened it. A source lives here as long as the
-/// process does; it is a URL and a credential handle, not a connection.
+/// the hands of whatever opened it. A source lives here until its entity is
+/// forgotten ([`prune_entity`]); it is a URL and a credential handle, not
+/// a connection.
 type Sources = Arc<Mutex<HashMap<PathBuf, Arc<crate::sources::ProxySource>>>>;
 
 /// The read-ahead task of each proxied entity, by key directory. See
@@ -244,19 +245,27 @@ type Prefetchers = Arc<Mutex<HashMap<PathBuf, Prefetcher>>>;
 /// ramped a doubling per pass -- `enginefs::retention::streams`), and only
 /// an entity **a player opened** has a source to fetch with: the `/proxy`
 /// route registers one for a request carrying the client's player token
-/// and the Drive open for its session, while a probe, an archive's index
+/// and the Drive stream route for its session, while a probe, an archive's index
 /// read or a test fetches exactly what it asked for, as before
 /// ([`ProxyRetention::note_source`]). The chunks it lands are inside the
 /// pass's exempt set, so the same pass never reclaims what it just asked
 /// for. And when passes stop -- the player left -- the task finishes the
 /// runs it holds and exits after [`PREFETCH_IDLE`] with nothing new to do.
 struct Prefetcher {
+    /// The entity directory it fills, so forgetting that entity can stop
+    /// it ([`prune_entity`]) without stopping a newer generation's.
+    entity: PathBuf,
     /// What is wanted fetched now, replaced whole by whoever asks and
     /// taken whole by the task; `None` between asks.
     wanted: Arc<Mutex<Option<Wanted>>>,
     /// Rung when `wanted` changes.
     notify: Arc<tokio::sync::Notify>,
     task: tokio::task::AbortHandle,
+    /// How many times this task has been asked, the first ask included:
+    /// what a test reads to see that a body poll which did not move the
+    /// head asked nothing.
+    #[cfg(test)]
+    asks: usize,
 }
 
 /// What a [`Prefetcher`] is asked to fetch.
@@ -295,6 +304,7 @@ const PREFETCH_STRIDE: u64 = 32 * 1024 * 1024;
 impl Prefetcher {
     /// Hands the entity in `entity` (under `key_dir`) what is wanted
     /// fetched now, starting the task if it is not running.
+    #[allow(clippy::too_many_arguments)]
     fn want(
         prefetchers: &Prefetchers,
         key_dir: PathBuf,
@@ -303,12 +313,13 @@ impl Prefetcher {
         wanted: Wanted,
         source: Arc<crate::sources::ProxySource>,
         live: Arc<Live>,
+        occupancy: Arc<Occupancy>,
     ) {
         let mut table = prefetchers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(running) = table
-            .get(&key_dir)
+            .get_mut(&key_dir)
             .filter(|running| !running.task.is_finished())
         {
             *running
@@ -316,16 +327,22 @@ impl Prefetcher {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(wanted);
             running.notify.notify_one();
+            #[cfg(test)]
+            {
+                running.asks += 1;
+            }
             return;
         }
         let wanted = Arc::new(Mutex::new(Some(wanted)));
         let notify = Arc::new(tokio::sync::Notify::new());
+        let path = entity.path().to_path_buf();
         let task = tokio::spawn(prefetch(
             key_dir.clone(),
             entity,
             total,
             source,
             live,
+            occupancy,
             wanted.clone(),
             notify.clone(),
         ))
@@ -333,9 +350,12 @@ impl Prefetcher {
         table.insert(
             key_dir,
             Prefetcher {
+                entity: path,
                 wanted,
                 notify,
                 task,
+                #[cfg(test)]
+                asks: 1,
             },
         );
     }
@@ -345,12 +365,14 @@ impl Prefetcher {
 /// looking between strides at what is wanted now and at whether the entity
 /// is still the one being played; wait for more; exit when nothing more
 /// comes.
+#[allow(clippy::too_many_arguments)]
 async fn prefetch(
     key_dir: PathBuf,
     entity: ChunkDir,
     total: u64,
     source: Arc<crate::sources::ProxySource>,
     live: Arc<Live>,
+    occupancy: Arc<Occupancy>,
     wanted: Arc<Mutex<Option<Wanted>>>,
     notify: Arc<tokio::sync::Notify>,
 ) {
@@ -390,19 +412,12 @@ async fn prefetch(
         };
         let runs = match target {
             Wanted::Runs(runs) => runs,
-            // The rest of the file from the head, less what the disk holds
-            // -- listed now, once per ask, on the blocking pool.
+            // The rest of the file from the head, less what the disk holds.
             Wanted::Whole { from } => {
-                let dir = entity.clone();
-                let held = tokio::task::spawn_blocking(move || dir.held())
+                let (dir, occupancy) = (entity.clone(), occupancy.clone());
+                tokio::task::spawn_blocking(move || missing_from(&occupancy, &dir, from, chunks))
                     .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .unwrap_or_default();
-                let missing: Vec<u32> = (from.min(chunks)..chunks)
-                    .filter(|chunk| !held.contains(&u64::from(*chunk)))
-                    .collect();
-                runs_of(&missing)
+                    .unwrap_or_default()
             }
         };
         'runs: for run in runs {
@@ -440,6 +455,71 @@ async fn prefetch(
             }
         }
     }
+}
+
+/// Drop what the read-ahead and the detector keep about `entity` beside the
+/// owner's map: its detector, the prefetcher filling it (stopped), and the
+/// source registered for its key when that source fetches this entity and
+/// not a newer generation of it. Called when the entity is forgotten --
+/// taken whole by a slack pass ([`Backing::forgotten`]) or its directory
+/// removed ([`ProxyRetention::forget`]). Without it all three kept one entry
+/// per entity ever played for the life of the process, and an HLS stream
+/// is an entity per segment.
+///
+/// A source pruned here is registered again by the next request that
+/// relays the entity to a player (the `/proxy` route, the Drive stream
+/// route), so a viewer who comes back to it is read ahead of again.
+fn prune_entity(
+    detectors: &Detectors,
+    sources: &Sources,
+    prefetchers: &Prefetchers,
+    entity: &Path,
+) {
+    detectors
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(entity);
+    let Some(key_dir) = entity.parent() else {
+        return;
+    };
+    {
+        let mut table = prefetchers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if table
+            .get(key_dir)
+            .is_some_and(|running| running.entity == entity || running.task.is_finished())
+            && let Some(running) = table.remove(key_dir)
+        {
+            running.task.abort();
+        }
+    }
+    let mut table = sources
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if table
+        .get(key_dir)
+        .is_some_and(|source| source.fills(entity))
+    {
+        table.remove(key_dir);
+    }
+}
+
+/// The runs of chunks `from..chunks` of `dir` the disk does not hold, by
+/// the owner's held set ([`Occupancy::chunks`]) -- a lock and a clone once
+/// something has listed the entity, never a `read_dir` per ask: a whole
+/// entity is asked about every chunk a player is delivered.
+///
+/// Blocking only on the one seed a never-listed entity takes; a seed that
+/// fails is nothing missing, and the next ask seeds again.
+fn missing_from(occupancy: &Occupancy, dir: &ChunkDir, from: u32, chunks: u32) -> Vec<Range<u32>> {
+    let Ok(held) = occupancy.chunks(dir) else {
+        return Vec::new();
+    };
+    let missing: Vec<u32> = (from.min(chunks)..chunks)
+        .filter(|chunk| !held.contains(&u64::from(*chunk)))
+        .collect();
+    runs_of(&missing)
 }
 
 /// Reads `from..until` of `source` into `sink` and drops it: the read is
@@ -670,12 +750,7 @@ impl Backing for ProxyBacking {
         held: &BTreeSet<u32>,
         asking: enginefs::retention::owner::Asking,
     ) -> enginefs::retention::owner::Consumers {
-        let ceiling = asking.ceiling;
         let extent = Self::extent(domain);
-        let now = asking.now;
-        // What this entity may hold: `Asking::allowance` has the argument,
-        // and the torrent's half of this reads the same.
-        let available = asking.allowance(CHUNK_BYTES, held.len());
         let Ok(mut detectors) = self.detectors.lock() else {
             // A poisoned detector asks for nothing and gives up nothing:
             // this pass concludes, and refuses every unlink, rather than
@@ -689,80 +764,27 @@ impl Backing for ProxyBacking {
                 at: None,
             };
         };
-        let streams = detectors
-            .entry(domain.dir.path().to_path_buf())
-            .or_default();
         // The proxy's entity is one file starting at its own beginning, so
-        // its geometry is the trivial one -- and it is still stated, because
-        // the detector converts every offset through it.
-        // A proxied URL states no duration, so there is usually no
-        // ceiling here and the delivery rate is all there is -- the same
-        // choice the policy this replaces makes when nothing has stated a
-        // length. Passed through rather than dropped, because an entity
-        // whose duration the app *has* stated is the same arithmetic.
-        streams.domain(0, 0, extent.clone(), ceiling);
-        let rejected = streams.observe(0, held, CHUNK_BYTES, now);
-        let want = streams.want(0, asking.seconds, available, CHUNK_BYTES, now);
-        let exempt = streams.exempt(0, extent.end);
-        // **What may not be unlinked is published here**, where the want
-        // set is decided: the pass's own holdings -- every promise and
-        // every open stream's lookahead -- with what the consumers are
-        // asking for. The same set is what the coldest are chosen against,
-        // because a reclaim chosen against a smaller one frees nothing: the
-        // door refuses what this publishes.
-        let mut kept = want.clone();
-        kept.extend(asking.holding.iter().cloned());
-        kept.extend(asking.committed.iter().cloned());
-        exempt.publish(&kept);
-        // What must go, and no more: the overhang over what the entity may
-        // hold, taken coldest first. What nothing else needs is scrub-back,
-        // and giving it up early buys nothing and costs the origin a second
-        // fetch. `Asking::overhang`, the one computation the torrent's half
-        // and the scenarios run too -- measured against the whole disk
-        // allowance and not the windows' `available`, which would take a
-        // committed set off twice.
-        let over = asking.overhang(CHUNK_BYTES, held.len());
-        let how_many = usize::try_from(over.div_ceil(CHUNK_BYTES.max(1))).unwrap_or(0);
-        let (tracked, reclaim) = streams.coldest_of(0, now, &kept, how_many);
-        // One body is one reader here, but a proxied entity can still be
-        // read by two of them; see
-        // [`enginefs::retention::owner::Consumers::at`].
-        let at = streams.busiest(0, CHUNK_BYTES, now);
-        if !streams.report_due(now) {
-            return enginefs::retention::owner::Consumers {
-                want,
-                exempt,
-                reclaim,
-                at,
-            };
-        }
-        let coldest: Vec<u32> = reclaim
-            .iter()
-            .copied()
-            .take(enginefs::retention::streams::COLDEST_REPORTED)
-            .collect();
-        enginefs::retention::trace::streams_seen(enginefs::retention::trace::StreamsSeen {
-            // The entity's directory, which is what the proxy is keyed by
-            // and the only name it has: there is no info hash here.
-            info_hash: &domain.dir.path().display().to_string(),
-            file_idx: 0,
-            counts: &streams.counts(),
-            heads: &streams.heads(0),
-            sample: streams.last_sample(0),
-            rates: &streams.rates(0),
-            want: &want,
-            allowed: available,
-            exempt: streams.held_by_streams(0),
-            tracked,
-            coldest: &coldest,
-            why: rejected,
-        });
-        enginefs::retention::owner::Consumers {
-            want,
-            exempt,
-            reclaim,
-            at,
-        }
+        // its geometry is the trivial one. A proxied URL states no
+        // duration, so there is usually no ceiling in `asking` and the
+        // delivery rate is all there is; an entity whose duration the app
+        // *has* stated is the same arithmetic. The name in the report is
+        // the entity's directory, which is what the proxy is keyed by: there
+        // is no info hash here.
+        detectors
+            .entry(domain.dir.path().to_path_buf())
+            .or_default()
+            .consumers(
+                &enginefs::retention::streams::FileAt {
+                    file: 0,
+                    offset: 0,
+                    extent,
+                    piece: CHUNK_BYTES,
+                },
+                held,
+                &asking,
+                Some(&domain.dir.path().display().to_string()),
+            )
     }
 
     /// The proxy's fetch of the want set: see [`Prefetcher`].
@@ -833,6 +855,7 @@ impl Backing for ProxyBacking {
             Wanted::Runs(runs),
             source,
             self.live.clone(),
+            self.occupancy.clone(),
         );
     }
 
@@ -856,6 +879,12 @@ impl Backing for ProxyBacking {
     /// slack.
     fn is_live(&self, key: &PathBuf) -> bool {
         self.live.is_proxy(key)
+    }
+
+    /// A slack pass took the entity whole and nobody is reading it: see
+    /// [`prune_entity`].
+    fn forgotten(&self, key: &PathBuf) {
+        prune_entity(&self.detectors, &self.sources, &self.prefetchers, key);
     }
 
     /// **The held set, out of memory** ([`Held`]), and a `read_dir` only on
@@ -1412,6 +1441,13 @@ pub struct Reader {
     /// closing its connection and asking again, and a stream keyed to a
     /// connection would be one per seek.
     id: u64,
+    /// The chunk this body last asked the read-ahead to fill from
+    /// ([`ProxyRetention::read_ahead_from`]), or `u32::MAX` before it has
+    /// asked. A body is polled every few kilobytes and the answer changes
+    /// once a chunk: asking on every poll was a lock, a table lookup and a
+    /// policy's arithmetic per poll, and a ring of the prefetcher that sent
+    /// it round its listing again for nothing.
+    asked_from: std::sync::atomic::AtomicU32,
 }
 
 impl ProxyRetention {
@@ -1540,6 +1576,7 @@ impl ProxyRetention {
             key,
             total,
             quiet,
+            asked_from: std::sync::atomic::AtomicU32::new(u32::MAX),
         }
     }
 
@@ -1547,7 +1584,7 @@ impl ProxyRetention {
     /// is asking -- a quiet source over its URL and credentials -- so the
     /// passes can read ahead of a player ([`Prefetcher`]). Called by the
     /// `/proxy` route on every origin answer it relays to a request that
-    /// carries a player token, and by the Drive open; the latest
+    /// carries a player token, and by every Drive stream request; the latest
     /// registration wins, which for a debrid link whose credentials rotate
     /// is the one to use. **Registering is what turns read-ahead on** for
     /// an entity, so nothing that is not a player's stream calls this.
@@ -1560,13 +1597,14 @@ impl ProxyRetention {
 
     /// Read-ahead for an entity the budget covers whole, driven by a
     /// player's delivered byte (`Reader::note`): the rest of the file from
-    /// the head, through the source registered for it. See [`Wanted`].
+    /// chunk `from`, the one after the head's, through the source
+    /// registered for it. See [`Wanted`]. Asked only when `from` moves.
     ///
     /// Nothing for an entity no player opened (no source), for one the
     /// owner bounds (its passes hand the windows to [`ProxyBacking::want`]
     /// instead), or while no budget has been published yet -- the passes
     /// wait for that too, and so does this.
-    fn read_ahead_from(&self, entity: &Path, total: u64, delivered_to: u64) {
+    fn read_ahead_from(&self, entity: &Path, total: u64, from: u32) {
         let Some(key_dir) = entity.parent() else {
             return;
         };
@@ -1601,7 +1639,6 @@ impl ProxyRetention {
         if bounded {
             return;
         }
-        let from = u32::try_from(delivered_to / CHUNK_BYTES + 1).unwrap_or(u32::MAX);
         Prefetcher::want(
             &self.prefetchers,
             key_dir.to_path_buf(),
@@ -1610,6 +1647,7 @@ impl ProxyRetention {
             Wanted::Whole { from },
             source,
             self.live.clone(),
+            self.occupancy.clone(),
         );
     }
 
@@ -1969,6 +2007,7 @@ impl ProxyRetention {
     /// said about it. See [`Occupancy::forget`].
     pub(crate) fn forget(&self, entity: &std::path::Path) {
         self.occupancy.forget(entity);
+        prune_entity(&self.detectors, &self.sources, &self.prefetchers, entity);
     }
 
     /// Take `bytes` this cache no longer holds off the count.
@@ -2170,8 +2209,10 @@ impl Reader {
         if let Some(claim) = self.inner.note(delivered_to) {
             self.retention.spawn_pass(self.key.clone(), claim);
         }
-        self.retention
-            .read_ahead_from(&self.key, self.total, delivered_to);
+        let from = u32::try_from(delivered_to / CHUNK_BYTES + 1).unwrap_or(u32::MAX);
+        if self.asked_from.swap(from, Ordering::Relaxed) != from {
+            self.retention.read_ahead_from(&self.key, self.total, from);
+        }
     }
 }
 
@@ -2252,6 +2293,184 @@ mod tests {
         );
         drop(loud);
         drop(quiet);
+    }
+
+    /// **A body poll that did not move the head asks the read-ahead
+    /// nothing.** A body is polled every few kilobytes and the chunk the
+    /// read-ahead fills from moves once a chunk; each ask replaced the
+    /// prefetcher's target and woke it, and it listed the entity again.
+    ///
+    /// A current-thread runtime and no `await` between the notes, so the
+    /// prefetcher the first note starts has not run and cannot have
+    /// finished: every ask after the first lands on the same task.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_body_poll_that_does_not_move_the_head_asks_the_read_ahead_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let budget = Arc::new(RetentionBudget::default());
+        budget.set(None, None);
+        let cache = Arc::new(crate::proxy_cache::ProxyCache::new(
+            tmp.path(),
+            budget,
+            Arc::default(),
+        ));
+        let retention = cache.retention().clone();
+        let key_dir = tmp.path().join("key");
+        let dir = ChunkDir::new(key_dir.join("entity"));
+        let total = 8 * CHUNK_BYTES;
+        let source = crate::sources::ProxySource::from_probe(
+            cache.clone(),
+            "127.0.0.1:9".parse().unwrap(),
+            url::Url::parse("http://127.0.0.1:9/film.mkv").unwrap(),
+            std::collections::BTreeMap::new(),
+            axum::http::HeaderMap::new(),
+            crate::routes::proxy::ProbedEntity {
+                total,
+                content_type: "video/mp4".to_string(),
+                validator: None,
+            },
+        );
+        retention.note_source(key_dir.clone(), Arc::new(source.for_filling()));
+        let asks = || {
+            retention
+                .prefetchers
+                .lock()
+                .unwrap()
+                .get(&key_dir)
+                .map_or(0, |prefetcher| prefetcher.asks)
+        };
+
+        let reader = retention.reader(&dir, total, Arc::from("http://127.0.0.1:9/film.mkv"));
+        reader.note(0);
+        assert_eq!(asks(), 1, "the first delivered byte starts the read-ahead");
+        reader.note(4096);
+        reader.note(CHUNK_BYTES - 1);
+        assert_eq!(
+            asks(),
+            1,
+            "the head is still in chunk 0: nothing new to ask"
+        );
+        reader.note(CHUNK_BYTES);
+        assert_eq!(asks(), 2, "the head moved a chunk, and so did the ask");
+    }
+
+    /// **What the read-ahead and the detector keep about an entity goes
+    /// when the entity is forgotten** -- by either door: its directory
+    /// removed whole (a newer generation replaced it, or a download was
+    /// deleted), or the owner forgetting it once a slack pass took it all.
+    /// Each kept one entry per entity ever played, and an HLS stream is an
+    /// entity per segment. A newer generation's source under the same key
+    /// is not the forgotten entity's, and stays.
+    #[tokio::test(flavor = "current_thread")]
+    async fn forgetting_an_entity_forgets_its_detector_source_and_prefetcher() {
+        let tmp = tempfile::tempdir().unwrap();
+        let budget = Arc::new(RetentionBudget::default());
+        budget.set(None, None);
+        let cache = Arc::new(crate::proxy_cache::ProxyCache::new(
+            tmp.path(),
+            budget,
+            Arc::default(),
+        ));
+        let retention = cache.retention().clone();
+        let total = 8 * CHUNK_BYTES;
+        let key_dir = tmp.path().join("key");
+        let entity_of = |validator: &str| {
+            key_dir.join(crate::proxy_cache::entity_dir_name(
+                total,
+                "video/mp4",
+                validator,
+            ))
+        };
+        let source_for = |validator: &str| {
+            let source = crate::sources::ProxySource::from_probe(
+                cache.clone(),
+                "127.0.0.1:9".parse().unwrap(),
+                url::Url::parse("http://127.0.0.1:9/film.mkv").unwrap(),
+                std::collections::BTreeMap::new(),
+                axum::http::HeaderMap::new(),
+                crate::routes::proxy::ProbedEntity {
+                    total,
+                    content_type: "video/mp4".to_string(),
+                    validator: Some(validator.to_string()),
+                },
+            );
+            Arc::new(source.for_filling())
+        };
+        let kept = |entity: &Path| {
+            (
+                retention.detectors.lock().unwrap().contains_key(entity),
+                retention.sources.lock().unwrap().contains_key(&key_dir),
+                retention.prefetchers.lock().unwrap().contains_key(&key_dir),
+            )
+        };
+        let play = |entity: &Path, validator: &str| {
+            retention.note_source(key_dir.clone(), source_for(validator));
+            retention
+                .detectors
+                .lock()
+                .unwrap()
+                .insert(entity.to_path_buf(), Default::default());
+            let reader = retention.reader(
+                &ChunkDir::new(entity.to_path_buf()),
+                total,
+                Arc::from("http://127.0.0.1:9/film.mkv"),
+            );
+            reader.note(0);
+        };
+
+        // Its directory removed whole.
+        let old = entity_of("v1");
+        play(&old, "v1");
+        assert_eq!(kept(&old), (true, true, true));
+        retention.forget(&old);
+        assert_eq!(kept(&old), (false, false, false));
+
+        // A newer generation's source is not the forgotten entity's.
+        let new = entity_of("v2");
+        play(&old, "v1");
+        retention.note_source(key_dir.clone(), source_for("v2"));
+        retention.forget(&old);
+        assert_eq!(
+            kept(&old),
+            (false, true, false),
+            "the source fetches {new:?}, which nobody forgot"
+        );
+
+        // The owner forgetting it: a slack pass took it all, nobody reads.
+        play(&new, "v2");
+        assert_eq!(kept(&new), (true, true, true));
+        retention.owner.forget_empty(&new);
+        assert_eq!(kept(&new), (false, false, false));
+    }
+
+    /// **The whole-entity read-ahead asks the held set what is missing,
+    /// not the directory.** It is asked once a chunk of playback, and a
+    /// listing per ask was a `read_dir` of every bucket of the entity each
+    /// time. The set is short-never-long ([`Held`]): a chunk put on the
+    /// disk behind the owner's back is not in it, and is fetched again
+    /// rather than listed.
+    #[test]
+    fn the_whole_read_ahead_reads_what_is_missing_off_the_held_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ChunkDir::new(tmp.path().join("key").join("entity"));
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let occupancy = Occupancy::default();
+        assert_eq!(
+            missing_from(&occupancy, &dir, 1, 4),
+            vec![1..4],
+            "seeded empty"
+        );
+        // Booked: the set says so.
+        occupancy.gained(dir.path(), 2, || (0, OnDisk::Held, ()));
+        assert_eq!(missing_from(&occupancy, &dir, 1, 4), vec![1..2, 3..4]);
+        // On the disk and never booked: a listing would see it, the set
+        // does not.
+        let whole = vec![7u8; CHUNK_BYTES as usize];
+        dir.write_whole(3, &whole, None).expect("write");
+        assert_eq!(
+            missing_from(&occupancy, &dir, 1, 4),
+            vec![1..2, 3..4],
+            "read off the set, which nothing booked chunk 3 into"
+        );
     }
 
     /// The pin set is what `keeps_everything` answers from: an entity under

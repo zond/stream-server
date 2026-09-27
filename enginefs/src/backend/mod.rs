@@ -1313,7 +1313,7 @@ pub struct BtSettingsReport {
 pub const DEFAULT_LISTEN_PORT_RANGE: std::ops::Range<u16> = 42000..42010;
 
 /// Which port librqbit's incoming BitTorrent (TCP) listener binds.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TorrentListenPort {
     /// Try each port of the range in order and keep the first that binds;
     /// fail if none does. A stable, forwardable port, which is what a
@@ -1321,15 +1321,12 @@ pub enum TorrentListenPort {
     /// asks for this explicitly.
     Fixed(std::ops::Range<u16>),
     /// Port 0: the OS picks a free port (librqbit reads the bound address
-    /// back and announces that port). The `ServerConfig` default, so any
-    /// number of embedded servers and tests coexist on one machine.
+    /// back and announces that port). The default -- here, in
+    /// `BackendConfig` and in `ServerConfig` -- so any number of embedded
+    /// servers and tests coexist on one machine, and nothing binds a fixed
+    /// port it was not asked to.
+    #[default]
     Ephemeral,
-}
-
-impl Default for TorrentListenPort {
-    fn default() -> Self {
-        Self::Fixed(DEFAULT_LISTEN_PORT_RANGE)
-    }
 }
 
 impl TorrentListenPort {

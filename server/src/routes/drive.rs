@@ -289,14 +289,6 @@ pub(crate) async fn open_pairing(
         Some(name) => source.named(name.clone()),
         None => source,
     };
-    // The passes read ahead of the player through the same source, quiet
-    // (`proxy_retention::Prefetcher`); it renews the grant for itself.
-    if let Some(key_dir) = source.key_dir() {
-        state
-            .proxy_cache
-            .retention()
-            .note_source(key_dir, Arc::new(source.filling_source()));
-    }
     let opened = DriveFileOpened {
         key: Uuid::new_v4().to_string(),
         url: String::new(),
@@ -369,6 +361,17 @@ async fn stream_drive_file(
     // is to open again -- so what it opens into has to be the reason.
     if session.source.needs_pairing_again() {
         return pair_again_response();
+    }
+    // The passes read ahead of the player through the same source, quiet
+    // (`proxy_retention::Prefetcher`); it renews the grant for itself.
+    // Registered by every request, as `/proxy` registers on every origin
+    // answer: a slack pass that took the entity whole forgets its source
+    // with it, and the viewer coming back is read ahead of again.
+    if let Some(key_dir) = session.source.key_dir() {
+        state
+            .proxy_cache
+            .retention()
+            .note_source(key_dir, Arc::new(session.source.filling_source()));
     }
     let size = session.source.len();
     let range = headers

@@ -578,10 +578,10 @@ pub(crate) async fn release<H: TorrentHandle>(
         .await
     {
         Ok(Some(dropped)) => take_claimed(store, info_hash, dropped).await,
-        // A backend with no have-set of its own for the deletion to
-        // disagree with: there is nothing to interlock against, so there is
-        // no claim to hold -- and the same unlink, done the same way.
-        Ok(None) => unlink(store, info_hash, pieces.collect(), None).await,
+        // No claim, so no list of pieces the backend forgot and no right to
+        // take any: every unlink goes under a claim, and a backend that
+        // hands none back (a test double) frees nothing here.
+        Ok(None) => 0,
         // It still believes it has them, so they are not ours to take:
         // unlinking here is exactly the advertise-then-serve-a-hole this
         // whole path exists to prevent.
@@ -628,11 +628,11 @@ pub(crate) async fn take_claimed(
     dropped: crate::backend::DroppedFilePieces,
 ) -> usize {
     let pieces = dropped.pieces().to_vec();
-    unlink(store, info_hash, pieces, Some(dropped)).await
+    unlink(store, info_hash, pieces, dropped).await
 }
 
-/// The unlink itself, off the reactor, with the claim -- where there is one
-/// -- held across it and released on the far side.
+/// The unlink itself, off the reactor, with the claim held across it and
+/// released on the far side.
 ///
 /// **Off the reactor** because this is one `unlink` per piece on the flash
 /// of a television, which is a syscall loop of no bounded length: run on
@@ -653,10 +653,11 @@ pub(crate) async fn take_claimed(
 /// does not disturb that: a blocking task already started is not cancelled,
 /// so the deletion finishes and the claim goes with it.
 ///
-/// Both doors come through here so that the move off the reactor is written
-/// once. The claimed one is the door every reclaim takes; the claimless one
-/// is for a backend that keeps no have-set for a deletion to disagree with,
-/// which nothing in this workspace is.
+/// **There is one door and it takes a claim.** `pieces` must be a subset
+/// of what the claim dropped: the pass's late-arrival unlink narrows the
+/// claim's list to what the window no longer covers, [`take_claimed`] hands
+/// it whole. An unlink with no claim -- by path, or for a backend that
+/// keeps no have-set -- has no way in.
 ///
 /// **Through the registered store, and there is no other way in now.** The
 /// live store of a running torrent keeps the held set the pass reads and a
@@ -674,49 +675,33 @@ pub(crate) async fn take_claimed(
 /// piece taken from under the check is a have-bit over nothing. Refused
 /// pieces stay on the disk and in the held set, and the next pass offers
 /// them again.
-///
-/// **The claimless door never goes through a registered store.** Its caller
-/// read the torrent as one with no have-set, and that reading is older than
-/// this unlink by a `spawn_blocking` at least. A store registered now is a
-/// torrent librqbit holds now, with a have-set over these pieces that
-/// nobody has edited, so the pieces are not this door's to take and it
-/// takes nothing.
 pub(crate) async fn unlink(
     store: &Arc<StoreRegistry>,
     info_hash: &str,
     pieces: Vec<u32>,
-    claim: Option<crate::backend::DroppedFilePieces>,
+    claim: crate::backend::DroppedFilePieces,
 ) -> usize {
     let store = Arc::clone(store);
     let hash = info_hash.to_string();
     tokio::task::spawn_blocking(move || {
-        let freed = if claim.is_none() && store.is_registered(&hash) {
-            tracing::warn!(
-                info_hash = %hash,
-                pieces = pieces.len(),
-                "a store is registered for a torrent read as holding none; not deleting without a claim"
-            );
-            0
-        } else {
-            match store.delete(&hash, &pieces) {
-                DeleteOutcome::Registered { unlinked } => unlinked,
-                DeleteOutcome::Refused => {
-                    tracing::warn!(
-                        info_hash = %hash,
-                        pieces = pieces.len(),
-                        "not deleting under a running hash check; the pieces stay held"
-                    );
-                    0
-                }
-                DeleteOutcome::Unregistered => {
-                    tracing::warn!(
-                        info_hash = %hash,
-                        pieces = pieces.len(),
-                        "no store is registered for a torrent whose pieces were just dropped; \
-                         leaving its files to the next launch's sweep"
-                    );
-                    0
-                }
+        let freed = match store.delete(&hash, &pieces) {
+            DeleteOutcome::Registered { unlinked } => unlinked,
+            DeleteOutcome::Refused => {
+                tracing::warn!(
+                    info_hash = %hash,
+                    pieces = pieces.len(),
+                    "not deleting under a running hash check; the pieces stay held"
+                );
+                0
+            }
+            DeleteOutcome::Unregistered => {
+                tracing::warn!(
+                    info_hash = %hash,
+                    pieces = pieces.len(),
+                    "no store is registered for a torrent whose pieces were just dropped; \
+                     leaving its files to the next launch's sweep"
+                );
+                0
             }
         };
         // Released only now that the bytes are gone.
@@ -824,61 +809,6 @@ mod tests {
             Vec::<Range<u32>>::new(),
             "a run the window has covered entirely is not the pass's to take"
         );
-    }
-
-    /// **The claimless door never goes through a registered store.**
-    ///
-    /// Its caller read the torrent as one with no have-set for the deletion
-    /// to disagree with, and that reading is older than the unlink by a
-    /// `spawn_blocking` at least. A store registered by the time the pool
-    /// picks the work up is a torrent librqbit holds *now*, with a have-set
-    /// over these pieces that nobody has edited and, if `init` is still
-    /// running, a check reading them: the pieces are not this door's to
-    /// take, so it takes none of them and says so. Only the claimed door
-    /// may edit a registered store's files.
-    #[tokio::test]
-    async fn a_claimless_unlink_takes_nothing_from_a_registered_store() {
-        use crate::piece_store::layout::{FileSpec, PieceLayout};
-        use crate::piece_store::{PieceStore, StoreRoot};
-        use librqbit::storage::TorrentStorage;
-
-        const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
-        let tmp = tempfile::tempdir().unwrap();
-        let registry = Arc::new(StoreRegistry::new(StoreRoot::new(
-            tmp.path().join(".pieces"),
-        )));
-        let layout = Arc::new(PieceLayout::new(8, 24, [FileSpec::payload(24)]).expect("layout"));
-        let store = PieceStore::under(Arc::clone(&registry), HASH, Arc::clone(&layout));
-        std::fs::create_dir_all(store.dir()).unwrap();
-        store.pwrite_all(0, 8, &[7u8; 8]).expect("write");
-        store.complete_piece_and_wait(1).expect("complete");
-        store.init_for_tests().expect("seed and register");
-        let piece = store.piece_path(1);
-        assert!(piece.is_file() && registry.is_registered(HASH));
-
-        assert_eq!(
-            unlink(&registry, HASH, vec![1], None).await,
-            0,
-            "a store is registered, so the claimless door frees nothing"
-        );
-        assert!(piece.is_file(), "and the file is still there");
-        assert!(
-            registry
-                .held(HASH)
-                .expect("registered")
-                .in_range(0..3)
-                .contains(&1),
-            "with the bit that says so"
-        );
-
-        // The storage really gone -- what a torrent in Error is once
-        // librqbit's handles have dropped -- and the door still frees
-        // nothing, because there is no store left to unlink through: the
-        // directory is the next launch's sweep.
-        drop(store);
-        assert!(!registry.is_registered(HASH));
-        assert_eq!(unlink(&registry, HASH, vec![1], None).await, 0);
-        assert!(piece.is_file());
     }
 }
 

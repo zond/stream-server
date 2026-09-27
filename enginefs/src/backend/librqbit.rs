@@ -855,7 +855,6 @@ pub struct LibrqbitBackend {
     /// network" is exactly what a client needs to say "DHT unavailable,
     /// using trackers only".
     dht_ever_bootstrapped: AtomicBool,
-    download_dir: PathBuf,
     deferred_selections: DeferredSelections,
     pinned_files: PinnedFiles,
     reported_errors: ReportedErrors,
@@ -1068,7 +1067,6 @@ impl LibrqbitBackend {
             session,
             started_with,
             dht_ever_bootstrapped: AtomicBool::new(false),
-            download_dir,
             deferred_selections,
             pinned_files,
             reported_errors,
@@ -1309,7 +1307,6 @@ impl LibrqbitBackend {
             session,
             started_with: SessionTuning::default(),
             dht_ever_bootstrapped: AtomicBool::new(false),
-            download_dir,
             deferred_selections,
             pinned_files,
             stream_positions,
@@ -1931,10 +1928,6 @@ impl LibrqbitBackend {
     async fn delete_torrent(&self, info_hash: &str, delete_files: bool) -> Result<()> {
         let id = librqbit::api::TorrentIdOrHash::parse(info_hash)
             .with_context(|| format!("invalid info hash {info_hash}"))?;
-        let output_folder = self
-            .session
-            .get(id)
-            .map(|handle| handle.output_folder().to_path_buf());
         self.session
             .delete(id, delete_files)
             .await
@@ -1942,22 +1935,9 @@ impl LibrqbitBackend {
         self.deferred_selections.lock().remove(info_hash);
         self.pinned_files.lock().remove(info_hash);
         self.reported_errors.lock().remove(info_hash);
-        // `Session::delete(_, false)` only removes empty directories on the
-        // delete_files=true branch, so a torrent that never wrote anything
-        // (or whose files were cleaned out) would leave its output folder
-        // behind on every idle sweep. `remove_dir` fails on a non-empty
-        // directory, so this can only ever drop an empty folder -- and never
-        // the session root, which single-file torrents write straight into.
-        if let Some(folder) = output_folder
-            && folder != self.download_dir
-            && let Err(e) = tokio::fs::remove_dir(&folder).await
-            && !matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
-            )
-        {
-            debug!(error = %e, path = ?folder, "Left the torrent's output folder in place");
-        }
+        // No output folder to tidy: the piece store writes under
+        // `.pieces/<hash>/` and nothing creates the folder librqbit records
+        // (see `session_storage_factory`, and the test that pins it).
         Ok(())
     }
 }
@@ -3176,6 +3156,15 @@ impl LibrqbitHandle {
             .cloned()
     }
 
+    /// Whether nothing is parked for this torrent's selection and no waiter
+    /// is applying one: what a test polls instead of sleeping past the
+    /// window a parked op would land in.
+    #[cfg(test)]
+    fn selection_idle(&self) -> bool {
+        self.deferred_selection_if_present()
+            .is_none_or(|slot| !slot.has_pending() && !slot.waiter_running.load(Ordering::Acquire))
+    }
+
     /// Park `op` until the torrent initializes (see `DeferredSelection`).
     fn defer_selection(&self, op: SelectionOp, context: &'static str) {
         debug!(
@@ -3403,7 +3392,7 @@ mod tests {
     /// process for a port number that never comes back.
     #[test]
     fn only_a_fixed_listen_port_asks_the_router_to_forward() {
-        assert!(TorrentListenPort::default().wants_upnp_forwarding());
+        assert!(!TorrentListenPort::default().wants_upnp_forwarding());
         assert!(TorrentListenPort::Fixed(DEFAULT_LISTEN_PORT_RANGE).wants_upnp_forwarding());
         assert!(!TorrentListenPort::Ephemeral.wants_upnp_forwarding());
     }
@@ -7714,74 +7703,49 @@ mod tests {
         assert_eq!(handle.handle.only_files(), None);
     }
 
-    /// `Session::delete(_, false)` leaves the output folder behind even
-    /// when it is empty; `remove_torrent` cleans that up -- and only that:
-    /// a folder with data in it and the session root itself stay.
+    /// **Under the piece store nothing creates a torrent's output folder**,
+    /// so removing a torrent has no folder to tidy and `delete_torrent`
+    /// does not look for one. librqbit records the folder (a multi-file
+    /// torrent's is the session root joined with its name) and reports file
+    /// paths under it, but only its filesystem storage ever made it, and
+    /// that storage is not the session's.
     #[tokio::test]
-    async fn remove_torrent_removes_empty_output_folder_only() {
+    async fn the_piece_store_never_creates_an_output_folder() {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src");
         tokio::fs::create_dir_all(&src).await.unwrap();
         write_payload(&src.join("a.bin"), 32 * 1024).await;
         write_payload(&src.join("b.bin"), 32 * 1024).await;
         let (multi_bytes, multi_hash) = make_torrent(&src).await;
-        let single_payload = tmp.path().join("single.bin");
-        write_payload(&single_payload, 16 * 1024).await;
-        let (single_bytes, single_hash) = make_torrent(&single_payload).await;
 
         let dl = tmp.path().join("dl");
-        let backend = LibrqbitBackend::new_for_tests(dl.clone())
-            .await
-            .expect("hermetic session");
-        let multi = backend
-            .add_torrent(TorrentSource::Bytes(multi_bytes.clone()), vec![])
-            .await
-            .unwrap();
-        multi.handle.wait_until_initialized().await.unwrap();
-        let single = backend
-            .add_torrent(TorrentSource::Bytes(single_bytes), vec![])
-            .await
-            .unwrap();
-        single.handle.wait_until_initialized().await.unwrap();
-        assert_eq!(
-            single.handle.output_folder(),
-            dl,
-            "single-file torrents write into the root"
+        let factory = crate::piece_store::PieceStoreFactory::new(
+            crate::piece_store::StoreRoot::in_download_dir(&dl),
         );
-        let multi_dir = multi.handle.output_folder().to_path_buf();
-        assert_eq!(multi_dir, dl.join("src"));
-        assert!(multi_dir.is_dir());
-
-        // Nothing downloaded: the multi-file torrent's folder is empty
-        // (drop whatever librqbit pre-created) and goes with the torrent.
-        tokio::fs::remove_dir_all(&multi_dir).await.unwrap();
-        tokio::fs::create_dir_all(&multi_dir).await.unwrap();
-        backend.remove_torrent(&multi_hash).await.unwrap();
-        assert!(!multi_dir.exists(), "empty output folder must be removed");
-
-        // The root is never removed, however empty, and a single-file
-        // torrent's data survives in it.
-        for entry in std::fs::read_dir(&dl).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                std::fs::remove_dir_all(&path).unwrap();
-            } else {
-                std::fs::remove_file(&path).unwrap();
-            }
-        }
-        backend.remove_torrent(&single_hash).await.unwrap();
-        assert!(dl.is_dir(), "session root must survive");
-
-        // A folder that still holds data is left alone.
-        tokio::fs::create_dir_all(&dl.join("src")).await.unwrap();
-        write_payload(&dl.join("src").join("a.bin"), 32 * 1024).await;
+        let (backend, _restored) = LibrqbitBackend::new_for_tests_with(
+            dl.clone(),
+            TestSessionOptions {
+                store_registry: Some(factory.registry()),
+                default_storage: Some(librqbit::storage::StorageFactoryExt::boxed(factory)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("hermetic session");
         let multi = backend
             .add_torrent(TorrentSource::Bytes(multi_bytes), vec![])
             .await
             .unwrap();
         multi.handle.wait_until_initialized().await.unwrap();
+        let folder = multi.handle.output_folder().to_path_buf();
+        assert_eq!(folder, dl.join("src"));
+        assert!(
+            !folder.exists(),
+            "the piece store made the output folder: removing a torrent now leaves it behind"
+        );
         backend.remove_torrent(&multi_hash).await.unwrap();
-        assert!(dl.join("src").join("a.bin").is_file());
+        assert!(!folder.exists());
+        assert!(dl.is_dir(), "and the session root stays");
     }
 
     /// `file_path` is the torrent's output folder joined with the file's
@@ -8276,25 +8240,27 @@ mod tests {
     /// fresh add is Initializing, and `want_the_chosen_file` parks its
     /// update rather than blocking the add on the on-disk check.
     async fn wait_for_selection(handle: &LibrqbitHandle) -> Vec<usize> {
-        handle.handle.wait_until_initialized().await.unwrap();
-        for _ in 0..200 {
-            if let Some(files) = handle.handle.only_files() {
-                return files;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        panic!("the add never narrowed the want-set");
+        settled_selection(handle)
+            .await
+            .expect("the add never narrowed the want-set")
     }
 
-    /// [`wait_for_selection`] for the cases that assert the add changed
-    /// *nothing*. Waiting for a value that is already there proves nothing,
-    /// so this waits out the window a parked op would have landed in --
-    /// initialization plus the applier's own turn -- and reads the
-    /// selection after it. Without the wait the assertion passes on timing
-    /// alone, whatever the add did.
+    /// The selection once the add's choice has landed, whatever it was: the
+    /// torrent initialized, and nothing parked for it or being applied
+    /// ([`LibrqbitHandle::selection_idle`]). For the cases that assert the
+    /// add changed *nothing*, reading at once would pass on timing alone,
+    /// whatever the add did; this reads after the one place a parked op
+    /// lands has gone quiet. Bounded by `TEST_WAIT_BOUND`.
     async fn settled_selection(handle: &LibrqbitHandle) -> Option<Vec<usize>> {
         handle.handle.wait_until_initialized().await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let deadline = Instant::now() + TEST_WAIT_BOUND;
+        while !handle.selection_idle() {
+            assert!(
+                Instant::now() < deadline,
+                "a parked selection never landed in {TEST_WAIT_BOUND:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         handle.handle.only_files()
     }
 

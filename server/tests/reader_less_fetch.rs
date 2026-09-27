@@ -34,25 +34,32 @@ use torrent_fixtures::{offline_config, pieces_held};
 /// pieces rather than four thousand files in the store.
 const PIECE: u32 = 256 * 1024;
 
-/// The torrent. Sized so that a torrent that never stops cannot finish
-/// inside [`WATCHED`] -- at [`SEEDER_BPS`] the whole thing takes half a
-/// minute -- so "still arriving at the end of the window" is a reading and
-/// not an artefact of the fixture running out.
+/// The torrent. Sized so that a torrent that never stops is still arriving
+/// well past [`FETCH_BOUND`] -- at [`SEEDER_BPS`] the whole thing takes half
+/// a minute -- so "still arriving" is a reading and not an artefact of the
+/// fixture running out.
 const PAYLOAD: usize = 64 * 1024 * 1024;
 
 /// What the seeder is allowed to push. See the module: this is what makes
 /// the bound a number instead of a property of the runner's loopback.
 const SEEDER_BPS: u32 = 2 * 1024 * 1024;
 
-/// How long the measurement watches, with nothing reading the torrent.
-const WATCHED: std::time::Duration =
-    std::time::Duration::from_secs(6 * enginefs::reconcile::RECONCILE_INTERVAL.as_secs());
+/// The longest any wait below may take before it is a failure: the stop
+/// arriving, the seeder seeing the connection go, the fetch passing
+/// [`FETCH_BOUND`]. A bound on a poll, never a sleep -- a run that gets
+/// there sooner goes on at once.
+const WAIT_BOUND: std::time::Duration =
+    std::time::Duration::from_secs(12 * enginefs::reconcile::RECONCILE_INTERVAL.as_secs());
 
-/// The tail of [`WATCHED`] over which growth is read. Two whole reconcile
-/// intervals, so "it grew" and "it did not" are both statements about
-/// several passes and not about one.
-const TAIL: std::time::Duration =
-    std::time::Duration::from_secs(2 * enginefs::reconcile::RECONCILE_INTERVAL.as_secs());
+/// How often those polls look.
+const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The window the claim "nothing more arrives" is measured over, once the
+/// torrent has stopped and the seeder has seen the connection go. One
+/// whole reconcile interval, so a ladder that started the torrent again on
+/// its next tick is inside it. It is the assertion's window and not a wait
+/// for anything: nothing is expected to happen in it.
+const TAIL: std::time::Duration = enginefs::reconcile::RECONCILE_INTERVAL;
 
 /// The most a torrent nobody reads may fetch before the reconciler stops it.
 ///
@@ -69,16 +76,128 @@ const TAIL: std::time::Duration =
 /// being stopped fails it well before it could finish.
 const FETCH_BOUND: u64 = SEEDER_BPS as u64 * 4 * enginefs::reconcile::RECONCILE_INTERVAL.as_secs();
 
-/// What one run of [`watch_a_torrent_nobody_reads`] saw.
+/// A server with a torrent handed to it through `/create`, no stream open
+/// on it, and a seeder dialling it.
+///
+/// The order is deliberate: the payload and the metainfo are built before
+/// the server starts, so the add happens as early in the reconciler's first
+/// cycle as it can and the window being measured is a whole interval rather
+/// than whatever was left of one.
+struct Watch {
+    handle: stream_server::ServerHandle,
+    seeder: Seeder,
+    cache_root: std::path::PathBuf,
+    info_hash: String,
+    _dirs: [tempfile::TempDir; 3],
+}
+
+impl Watch {
+    fn start(pins: Option<enginefs::piece_store::PinSet>) -> anyhow::Result<Self> {
+        let config_dir = tempfile::tempdir()?;
+        let cache_dir = tempfile::tempdir()?;
+        let src = tempfile::tempdir()?;
+        let cache_root = stream_server::resolved_path(&cache_dir.path().join("cache"));
+        // Declared before the server starts: the free-space arm of the
+        // ladder stops a torrent for want of room, and a run that measured
+        // *that* would report the right number for the wrong reason.
+        stream_server::pretend_volume_space(&cache_root, u64::MAX);
+
+        let payload = src.path().join("payload.bin");
+        write_payload(&payload, PAYLOAD);
+        let (torrent, info_hash) = torrent_of(&payload)?;
+
+        let handle = stream_server::start(ServerConfig {
+            http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            config_dir: Some(config_dir.path().join("config")),
+            cache_dir: Some(cache_root.clone()),
+            pins,
+            ..offline_config()
+        })?;
+
+        let base = format!("http://{}", handle.http_addr());
+        let token = handle
+            .auth_token()
+            .ok_or_else(|| anyhow::anyhow!("every launch generates a token"))?
+            .to_owned();
+        let client = reqwest::blocking::Client::new();
+        client
+            .post(format!("{base}/create"))
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+            .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
+            .send()?
+            .error_for_status()?;
+
+        // After the add, never before: the seeder is told one address and
+        // dials it, and a dial that arrives before the torrent exists is a
+        // handshake the server refuses and does not retry.
+        let listen = handle
+            .torrent_listen_addr()
+            .ok_or_else(|| anyhow::anyhow!("the session listens for peers"))?;
+        let seeder = Seeder::dialling(
+            src.path(),
+            &torrent,
+            (std::net::Ipv4Addr::LOCALHOST, listen.port()).into(),
+        )?;
+
+        // No stream is opened here, and that is the whole fixture: nothing
+        // calls `/{infoHash}/{fileIdx}`, so nothing registers a reader and
+        // the ladder's last arm has only the pin set to go on.
+        Ok(Self {
+            handle,
+            seeder,
+            cache_root,
+            info_hash,
+            _dirs: [config_dir, cache_dir, src],
+        })
+    }
+
+    /// Whether the server's torrent is stopped, by its run state
+    /// (`EngineStats::swarm_paused`). A peek: it touches no idle clock.
+    fn stopped(&self) -> anyhow::Result<bool> {
+        Ok(self.handle.engine_stats(&self.info_hash, &[])?.swarm_paused)
+    }
+
+    /// Poll `done` until it holds, or fail after [`WAIT_BOUND`] saying
+    /// what was being waited for.
+    fn until(
+        &self,
+        what: &str,
+        mut done: impl FnMut(&Self) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<()> {
+        let deadline = std::time::Instant::now() + WAIT_BOUND;
+        while !done(self)? {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "waited {WAIT_BOUND:?} for {what}: {}",
+                self.reading()
+            );
+            std::thread::sleep(POLL);
+        }
+        Ok(())
+    }
+
+    fn reading(&self) -> Reading {
+        Reading {
+            fetched: self.seeder.uploaded(),
+            held: pieces_held(&self.cache_root, &self.info_hash),
+        }
+    }
+
+    fn finish(self) -> anyhow::Result<()> {
+        self.handle.shutdown()?;
+        self.handle.join()?;
+        Ok(())
+    }
+}
+
+/// What the seeder and the store say at one instant.
 struct Reading {
-    /// Bytes the seeder pushed over the whole window -- the number, taken
-    /// from the side that cannot stop. The downloader's own counters live
-    /// in its *running* state and read as absent once the reconciler has
-    /// stopped the torrent, which is the very moment being measured.
+    /// Bytes the seeder has pushed -- the number, taken from the side that
+    /// cannot stop. The downloader's own counters live in its *running*
+    /// state and read as absent once the reconciler has stopped the
+    /// torrent, which is the very moment being measured.
     fetched: u64,
-    /// Bytes the seeder pushed during [`TAIL`]. Zero is "it stopped".
-    fetched_in_the_tail: u64,
-    /// Pieces the store still holds at the end.
+    /// Pieces the store holds.
     held: usize,
 }
 
@@ -86,85 +205,10 @@ impl std::fmt::Display for Reading {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} of {PAYLOAD} bytes fetched in {WATCHED:?} ({} of them in the last {TAIL:?}), \
-             {} pieces still held",
-            self.fetched, self.fetched_in_the_tail, self.held
+            "{} of {PAYLOAD} bytes fetched, {} pieces held",
+            self.fetched, self.held
         )
     }
-}
-
-/// Stand up a server with `pins`, hand it a torrent through `/create`, open
-/// no stream at all, and watch what a seeder manages to push into it.
-///
-/// The order is deliberate: the payload and the metainfo are built before
-/// the server starts, so the add happens as early in the reconciler's first
-/// cycle as it can and the window being measured is a whole interval rather
-/// than whatever was left of one.
-fn watch_a_torrent_nobody_reads(
-    pins: Option<enginefs::piece_store::PinSet>,
-) -> anyhow::Result<Reading> {
-    let config_dir = tempfile::tempdir()?;
-    let cache_dir = tempfile::tempdir()?;
-    let src = tempfile::tempdir()?;
-    let cache_root = stream_server::resolved_path(&cache_dir.path().join("cache"));
-    // Declared before the server starts: the free-space arm of the ladder
-    // stops a torrent for want of room, and a run that measured *that*
-    // would report the right number for the wrong reason.
-    stream_server::pretend_volume_space(&cache_root, u64::MAX);
-
-    let payload = src.path().join("payload.bin");
-    write_payload(&payload, PAYLOAD);
-    let (torrent, info_hash) = torrent_of(&payload)?;
-
-    let handle = stream_server::start(ServerConfig {
-        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-        config_dir: Some(config_dir.path().join("config")),
-        cache_dir: Some(cache_root.clone()),
-        pins,
-        ..offline_config()
-    })?;
-
-    let base = format!("http://{}", handle.http_addr());
-    let token = handle
-        .auth_token()
-        .ok_or_else(|| anyhow::anyhow!("every launch generates a token"))?
-        .to_owned();
-    let client = reqwest::blocking::Client::new();
-    client
-        .post(format!("{base}/create"))
-        .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
-        .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
-        .send()?
-        .error_for_status()?;
-
-    // After the add, never before: the seeder is told one address and
-    // dials it, and a dial that arrives before the torrent exists is a
-    // handshake the server refuses and does not retry.
-    let listen = handle
-        .torrent_listen_addr()
-        .ok_or_else(|| anyhow::anyhow!("the session listens for peers"))?;
-    let seeder = Seeder::dialling(
-        src.path(),
-        &torrent,
-        (std::net::Ipv4Addr::LOCALHOST, listen.port()).into(),
-    )?;
-
-    // No stream is opened here, and that is the whole fixture: nothing
-    // calls `/{infoHash}/{fileIdx}`, so nothing registers a reader and the
-    // ladder's last arm has only the pin set to go on.
-    std::thread::sleep(WATCHED - TAIL);
-    let before_the_tail = seeder.uploaded();
-    std::thread::sleep(TAIL);
-    let fetched = seeder.uploaded();
-
-    let reading = Reading {
-        fetched,
-        fetched_in_the_tail: fetched - before_the_tail,
-        held: pieces_held(&cache_root, &info_hash),
-    };
-    handle.shutdown()?;
-    handle.join()?;
-    Ok(reading)
 }
 
 /// **A torrent nobody reads stops fetching, and what it fetched first is
@@ -187,28 +231,38 @@ fn watch_a_torrent_nobody_reads(
 /// seeder's pinned rate; see its comment for why the extra three.
 ///
 /// **The bound is the smaller half of this test.** The assertion that
-/// carries it is the tail: two whole reconcile intervals in which not one
-/// byte arrives. A regression that made the ladder keep running reader-less
-/// torrents would fail that line whatever the runner's speed, and
+/// carries it is the tail: a whole reconcile interval after the stop in
+/// which not one byte arrives. A regression that made the ladder keep
+/// running reader-less torrents never stops (the wait fails), or starts it
+/// again (the tail fails), whatever the runner's speed; and
 /// `an_unknown_pin_set_never_stops_a_torrent_nobody_reads` is the proof
 /// that the seeder in this file can in fact feed a torrent that is allowed
 /// to run -- without it, a broken dial would pass here by fetching nothing.
 #[test]
 fn a_torrent_nobody_reads_stops_fetching_within_a_few_reconcile_intervals() -> anyhow::Result<()> {
-    let reading = watch_a_torrent_nobody_reads(offline_config().pins)?;
-    println!("empty pin record: {reading}");
+    let watch = Watch::start(offline_config().pins)?;
+    watch.until("the reconciler to stop the torrent", Watch::stopped)?;
+    // The stop is a state; what the seeder has pushed is only final once
+    // it has seen the connection go.
+    watch.until("the seeder to see the connection go", |watch| {
+        Ok(watch.seeder.live_peers() == 0)
+    })?;
+    let at_the_stop = watch.reading();
+    std::thread::sleep(TAIL);
+    let reading = watch.reading();
+    println!("empty pin record: {reading}, {at_the_stop} at the stop");
 
     anyhow::ensure!(
-        reading.fetched_in_the_tail == 0,
-        "a torrent nobody reads was still being fed {TAIL:?} before the end of the window, \
-         so the reconciler never stopped it: {reading}"
+        reading.fetched == at_the_stop.fetched,
+        "a torrent nobody reads was fed again in the {TAIL:?} after it stopped: \
+         {at_the_stop} at the stop, {reading} after"
     );
     anyhow::ensure!(
         reading.fetched <= FETCH_BOUND,
         "a torrent nobody reads fetched more than {FETCH_BOUND} bytes before it was stopped: \
          {reading}"
     );
-    Ok(())
+    watch.finish()
 }
 
 /// **An unknown pin set never stops it, and that is the documented
@@ -219,8 +273,9 @@ fn a_torrent_nobody_reads_stops_fetching_within_a_few_reconcile_intervals() -> a
 /// last arm then reads `pinned` and runs the torrent for ever, and
 /// `Engine::reclaim_rest` breaks before it takes a piece -- so a torrent
 /// nobody has ever read fetches the whole thing and keeps it. Measured
-/// here: **still arriving at 2 MiB/s at the end of the window**, and with
-/// the limiter off a 256 MiB torrent completed in 2.6 s on this machine.
+/// here: **still arriving at 2 MiB/s long after the empty record's torrent
+/// has stopped**, and with the limiter off a 256 MiB torrent completed in
+/// 2.6 s on this machine.
 ///
 /// This is the reading `docs/known-issues.md` had recorded as "an engine
 /// with no reader downloads the whole torrent". It is real, and it is what
@@ -234,30 +289,36 @@ fn a_torrent_nobody_reads_stops_fetching_within_a_few_reconcile_intervals() -> a
 /// so none of the rest of that warning applies.
 #[test]
 fn an_unknown_pin_set_never_stops_a_torrent_nobody_reads() -> anyhow::Result<()> {
-    let reading = watch_a_torrent_nobody_reads(
-        fixture_pins::keep_what_the_fixture_seeded(offline_config()).pins,
-    )?;
-    println!("unknown pin set: {reading}");
-
+    let watch = Watch::start(fixture_pins::keep_what_the_fixture_seeded(offline_config()).pins)?;
+    // Past what the empty record's torrent may fetch in all, and then
+    // further still: a torrent the ladder had stopped would fail one wait
+    // or the other.
+    watch.until("the fetch to pass the empty record's bound", |watch| {
+        Ok(watch.seeder.uploaded() > FETCH_BOUND)
+    })?;
+    let past_the_bound = watch.reading();
+    watch.until("the fetch to go on past it", |watch| {
+        Ok(watch.seeder.uploaded() > past_the_bound.fetched)
+    })?;
     anyhow::ensure!(
-        reading.fetched_in_the_tail > 0,
+        !watch.stopped()?,
         "an unknown pin set stopped a torrent nobody reads; if that is now the design, \
-         this test and the note in docs/known-issues.md are what has to change: {reading}"
-    );
-    anyhow::ensure!(
-        reading.fetched > FETCH_BOUND,
-        "an unknown pin set fetched no more than the empty record's bound ({FETCH_BOUND} bytes), \
-         so this run measured nothing: {reading}"
+         this test and the note in docs/known-issues.md are what has to change: {}",
+        watch.reading()
     );
     // The other half of what `PinsUnknown` does: `reclaim_rest` breaks
     // before it takes anything, so every piece that arrived is still on the
-    // disk. The slack is bytes the seeder has counted out that no completed
-    // piece has been made of yet -- a megabyte of it, generously.
+    // disk. Fetched is read first, so the store has had at least as long to
+    // land it; the slack is bytes the seeder has counted out that no
+    // completed piece has been made of yet -- a megabyte of it, generously.
+    let fetched = watch.seeder.uploaded();
+    let held = pieces_held(&watch.cache_root, &watch.info_hash);
+    println!("unknown pin set: {fetched} bytes fetched, {held} pieces held");
     anyhow::ensure!(
-        reading.held as u64 + 4 >= reading.fetched / PIECE as u64,
-        "an unknown pin set let a pass take pieces it fetched: {reading}"
+        held as u64 + 4 >= fetched / PIECE as u64,
+        "an unknown pin set let a pass take pieces it fetched: {fetched} fetched, {held} held"
     );
-    Ok(())
+    watch.finish()
 }
 
 /// A second librqbit session with the whole torrent, listening, dialling
@@ -331,6 +392,14 @@ impl Seeder {
     /// Payload bytes this seeder has pushed to peers, cumulative.
     fn uploaded(&self) -> u64 {
         self.handle.stats().uploaded_bytes
+    }
+
+    /// Peers this seeder is connected to right now: the server, or nobody.
+    fn live_peers(&self) -> u32 {
+        self.handle
+            .stats()
+            .live
+            .map_or(0, |live| live.snapshot.peer_stats.live)
     }
 }
 

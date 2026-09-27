@@ -16,11 +16,12 @@
 //! server actually runs on, M-SEARCH is multicast the app sandbox is not
 //! permitted to send at all.
 //!
-//! **The type and the list stay.** `AppState::devices` is what `/casting`
-//! reads and it is now always empty, which is the right answer from a server
-//! that cannot cast: the embedder discovers receivers itself (xtremio does,
-//! and uses the LAN media listener to feed them) and never asks this route.
-//! A `404` instead would be a route stremio-core does not recognise.
+//! **The type and the route stay; the list does not.** `/casting` answers an
+//! empty list of this type, which is the right answer from a server that
+//! cannot cast: the embedder discovers receivers itself (xtremio does, and
+//! uses the LAN media listener to feed them) and never asks this route. A
+//! `404` instead would be a route stremio-core does not recognise. There is
+//! no state behind the answer: nothing could ever fill it.
 
 /// One playback device, in the shape stremio-core's `StreamingServer` model
 /// parses out of `GET /casting`. Nothing constructs one any more.

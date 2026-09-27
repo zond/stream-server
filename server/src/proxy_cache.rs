@@ -1053,7 +1053,7 @@ impl Entry {
 /// separator ambiguous the first time an origin used one. Escaped, the name
 /// splits into exactly three fields however an origin spells a type or a
 /// tag.
-fn entity_dir_name(total: u64, content_type: &str, validator: &str) -> String {
+pub(crate) fn entity_dir_name(total: u64, content_type: &str, validator: &str) -> String {
     format!(
         "{total}_{}_{}",
         encode_field(content_type),

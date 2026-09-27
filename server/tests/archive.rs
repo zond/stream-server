@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// The hand-built RAR archives (see the module), shared with the
@@ -175,6 +176,10 @@ fn fixture_tar() -> Vec<u8> {
 struct Origin {
     addr: SocketAddr,
     requests: Arc<Mutex<HashMap<String, usize>>>,
+    /// Body bytes written to whoever asked, over every request.
+    served: Arc<AtomicU64>,
+    /// What it serves, by path: the archives a download would copy.
+    bodies: Arc<HashMap<String, Vec<u8>>>,
 }
 
 impl Origin {
@@ -182,17 +187,26 @@ impl Origin {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let requests = Arc::new(Mutex::new(HashMap::new()));
+        let served = Arc::new(AtomicU64::new(0));
         let bodies = Arc::new(bodies);
         let seen = requests.clone();
+        let counted = served.clone();
+        let kept = bodies.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { break };
                 let bodies = bodies.clone();
                 let seen = seen.clone();
-                std::thread::spawn(move || serve_one(stream, &bodies, &seen));
+                let counted = counted.clone();
+                std::thread::spawn(move || serve_one(stream, &bodies, &seen, &counted));
             }
         });
-        Ok(Self { addr, requests })
+        Ok(Self {
+            addr,
+            requests,
+            served,
+            bodies: kept,
+        })
     }
 
     fn url(&self, path: &str) -> String {
@@ -218,6 +232,7 @@ fn serve_one(
     mut stream: TcpStream,
     bodies: &HashMap<String, Vec<u8>>,
     seen: &Mutex<HashMap<String, usize>>,
+    served: &AtomicU64,
 ) {
     let mut reader = BufReader::new(stream.try_clone().expect("clone socket"));
     let mut line = String::new();
@@ -265,7 +280,9 @@ fn serve_one(
                 slice.len()
             );
             let _ = stream.write_all(head.as_bytes());
-            let _ = stream.write_all(slice);
+            if stream.write_all(slice).is_ok() {
+                served.fetch_add(slice.len() as u64, Ordering::Relaxed);
+            }
             let _ = stream.flush();
             return;
         }
@@ -276,7 +293,9 @@ fn serve_one(
         ),
     };
     let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(body);
+    if stream.write_all(body).is_ok() {
+        served.fetch_add(body.len() as u64, Ordering::Relaxed);
+    }
     let _ = stream.flush();
 }
 
@@ -296,10 +315,8 @@ struct Fixture {
     handle: stream_server::ServerHandle,
     base: String,
     origin: Origin,
-    /// `<cache root>/.archives`, where the archive routes used to put a
-    /// downloaded archive and a member extracted from it. **Nothing writes
-    /// it now**, and the tests here assert it is not so much as created.
-    scratch_dir: PathBuf,
+    /// The server's cache root: see [`Fixture::assert_nothing_kept`].
+    cache_dir: PathBuf,
     _cache_root: tempfile::TempDir,
     _config_dir: tempfile::TempDir,
 }
@@ -347,7 +364,7 @@ fn fixture() -> anyhow::Result<Fixture> {
         handle,
         base,
         origin,
-        scratch_dir: cache_dir.join(".archives"),
+        cache_dir,
         _cache_root: cache_root,
         _config_dir: config_dir,
     })
@@ -480,16 +497,61 @@ impl Fixture {
         Ok(body["key"].as_str().expect("a key").to_string())
     }
 
-    /// The files under the scratch directory, by name.
-    fn scratch_files(&self) -> Vec<String> {
-        let Ok(entries) = std::fs::read_dir(&self.scratch_dir) else {
-            return Vec::new();
-        };
-        let mut names: Vec<String> = entries
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        names
+    /// Every file under the cache root, with its length.
+    fn cache_files(&self) -> Vec<(PathBuf, u64)> {
+        fn walk(dir: &std::path::Path, into: &mut Vec<(PathBuf, u64)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                match entry.metadata() {
+                    Ok(metadata) if metadata.is_dir() => walk(&path, into),
+                    Ok(metadata) => into.push((path, metadata.len())),
+                    Err(_) => {}
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&self.cache_dir, &mut files);
+        files.sort();
+        files
+    }
+
+    /// **Nothing a translation read was kept but the reads themselves.**
+    ///
+    /// The archive routes used to download an archive whole and extract the
+    /// member beside it, two copies of the film under the cache root. Now
+    /// a member is byte ranges of the link: what lands on the disk is the
+    /// proxy cache's chunks of what the origin sent, and nothing else. So
+    /// the whole root is walked, not one directory an old version wrote:
+    /// the bytes under it are no more than the origin has served, and no
+    /// file is a whole archive the origin serves (a download) or a member
+    /// of one (an extraction).
+    fn assert_nothing_kept(&self) {
+        self.handle
+            .proxy_cache_settled(std::time::Duration::from_secs(30))
+            .expect("the proxy cache settles");
+        let files = self.cache_files();
+        let served = self.origin.served.load(Ordering::Relaxed);
+        let held: u64 = files.iter().map(|(_, len)| len).sum();
+        assert!(
+            held <= served,
+            "{held} bytes under the cache root, more than the {served} the origin served: {files:?}"
+        );
+        let mut members = vec![FIRST_CONTENT.to_vec(), second_content()];
+        #[cfg(feature = "rar")]
+        members.push(signposted_film());
+        members.extend(self.origin.bodies.values().cloned());
+        for (path, len) in &files {
+            if members.iter().any(|member| member.len() as u64 == *len) {
+                let bytes = std::fs::read(path).unwrap_or_default();
+                assert!(
+                    !members.contains(&bytes),
+                    "{path:?} is an archive or a member of one, whole: {files:?}"
+                );
+            }
+        }
     }
 
     fn finish(self) -> anyhow::Result<()> {
@@ -570,7 +632,7 @@ fn an_archive_on_this_machines_disk_is_not_opened() -> anyhow::Result<()> {
             response.text()?
         );
     }
-    assert!(fixture.scratch_files().is_empty());
+    fixture.assert_nothing_kept();
     fixture.finish()
 }
 
@@ -592,16 +654,12 @@ fn a_failed_create_leaves_nothing_behind() -> anyhow::Result<()> {
         );
         let body: serde_json::Value = response.json()?;
         assert_eq!(body["refused"], "malformed", "{url}: {body}");
-        assert!(
-            fixture.scratch_files().is_empty(),
-            "{:?}",
-            fixture.scratch_files()
-        );
+        fixture.assert_nothing_kept();
     }
 
     let response = fixture.create(&fixture.origin.url("/missing.7z"))?;
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
-    assert!(fixture.scratch_files().is_empty());
+    fixture.assert_nothing_kept();
 
     fixture.finish()
 }
@@ -609,10 +667,10 @@ fn a_failed_create_leaves_nothing_behind() -> anyhow::Result<()> {
 /// **A stored member behind a web link is served as byte ranges of the
 /// link**, in every container this server reads, whole and by range and
 /// backwards -- and nothing is written anywhere: the archive is never
-/// downloaded, the member is never extracted, and `<cacheRoot>/.archives`
-/// -- which every archive this server played used to put two copies of the
-/// film in -- is not so much as created. (An ISO image is the same claim
-/// over the same assertion in `server/tests/iso.rs`.)
+/// downloaded and the member is never extracted, where every archive this
+/// server played used to leave two copies of the film under the cache root
+/// ([`Fixture::assert_nothing_kept`] walks all of it). (An ISO image is the
+/// same claim in `server/tests/iso.rs`.)
 ///
 /// The seek backwards is the case the old shape could not do at all
 /// without paying for the member again: a player opens, reads the head,
@@ -693,11 +751,7 @@ fn a_stored_member_behind_a_link_is_served_by_range_and_nothing_is_written() -> 
         assert!(head.bytes()?.is_empty());
     }
 
-    assert!(
-        !fixture.scratch_dir.exists(),
-        "the translated path wrote under the cache root: {:?}",
-        fixture.scratch_files()
-    );
+    fixture.assert_nothing_kept();
     fixture.finish()
 }
 
@@ -739,7 +793,7 @@ fn a_compressed_member_is_refused_with_a_sentence() -> anyhow::Result<()> {
         serde_json::json!("compressed")
     );
 
-    assert!(!fixture.scratch_dir.exists(), "nothing was extracted");
+    fixture.assert_nothing_kept();
     fixture.finish()
 }
 
@@ -765,7 +819,7 @@ fn a_tar_gz_is_refused_because_it_has_no_way_in() -> anyhow::Result<()> {
             .is_some_and(|message| message.contains("tar.gz")),
         "{body}"
     );
-    assert!(!fixture.scratch_dir.exists(), "nothing was extracted");
+    fixture.assert_nothing_kept();
     fixture.finish()
 }
 
@@ -794,7 +848,7 @@ fn an_origin_that_will_not_range_is_refused() -> anyhow::Result<()> {
             .is_some_and(|message| message.contains("byte ranges")),
         "{body}"
     );
-    assert!(!fixture.scratch_dir.exists());
+    fixture.assert_nothing_kept();
     fixture.finish()
 }
 
@@ -865,7 +919,7 @@ fn a_second_create_of_the_same_archive_reuses_its_index() -> anyhow::Result<()> 
         asked,
         "the second create read the index again instead of reusing it"
     );
-    assert!(!fixture.scratch_dir.exists());
+    fixture.assert_nothing_kept();
     fixture.finish()
 }
 
@@ -909,7 +963,7 @@ fn a_packed_7z_is_refused_with_a_sentence_naming_its_method() -> anyhow::Result<
         .send()?;
     assert_eq!(refused.status(), reqwest::StatusCode::OK, "the stored one");
 
-    assert!(!fixture.scratch_dir.exists(), "nothing was extracted");
+    fixture.assert_nothing_kept();
     fixture.finish()
 }
 
@@ -939,7 +993,7 @@ fn a_multi_part_7z_is_refused_as_one_file_cut_up() -> anyhow::Result<()> {
             .is_some_and(|message| message.contains(".7z.001")),
         "{body}"
     );
-    assert!(!fixture.scratch_dir.exists());
+    fixture.assert_nothing_kept();
     fixture.finish()
 }
 
@@ -1006,8 +1060,7 @@ fn assert_served_by_range(
 }
 
 /// **A stored RAR member behind a link is byte ranges of the archive**,
-/// like a zip's: nothing downloaded, nothing extracted, nothing under
-/// `.archives`. Until this step `/rar/create` fetched the whole archive
+/// like a zip's: nothing downloaded, nothing extracted. Until this step `/rar/create` fetched the whole archive
 /// into the cache root before it could name a member.
 #[cfg(feature = "rar")]
 #[test]
@@ -1018,11 +1071,7 @@ fn a_stored_rar_member_behind_a_link_is_served_by_range_and_nothing_is_written()
     let key = fixture.create_key_for("rar", &fixture.origin.url("/film.rar"))?;
     let member = format!("{}/rar/stream/{key}/videos/second.bin", fixture.base);
     assert_served_by_range(&client, &member, &second_content())?;
-    assert!(
-        !fixture.scratch_dir.exists(),
-        "the translated path wrote under the cache root: {:?}",
-        fixture.scratch_files()
-    );
+    fixture.assert_nothing_kept();
     fixture.finish()
 }
 
@@ -1119,11 +1168,7 @@ fn a_stored_film_across_three_rar_volumes_behind_links_is_served_by_range() -> a
         "a range inside the third volume"
     );
 
-    assert!(
-        !fixture.scratch_dir.exists(),
-        "the translated path wrote under the cache root: {:?}",
-        fixture.scratch_files()
-    );
+    fixture.assert_nothing_kept();
     fixture.finish()
 }
 
@@ -1149,11 +1194,7 @@ fn a_rar_set_missing_its_middle_volume_is_refused_as_malformed() -> anyhow::Resu
         message.contains("volume 3") && message.contains("volume 2"),
         "the sentence does not name the volume that is missing: {body}"
     );
-    assert!(
-        !fixture.scratch_dir.exists(),
-        "the refusal wrote under the cache root: {:?}",
-        fixture.scratch_files()
-    );
+    fixture.assert_nothing_kept();
     fixture.finish()
 }
 
@@ -1225,7 +1266,7 @@ fn a_local_path_anywhere_in_a_volume_list_is_refused() -> anyhow::Result<()> {
 /// **A RAR that cannot be served by range is refused with a sentence**, at
 /// the create: a compressed member (`rar`'s default), an archive whose
 /// headers are encrypted, a solid archive. Each is `415` with the kind the
-/// client switches on, and none of them puts a byte under `.archives`.
+/// client switches on, and none of them keeps a byte of the archive.
 #[cfg(feature = "rar")]
 #[test]
 fn a_rar_that_cannot_be_served_by_range_is_refused_with_a_sentence() -> anyhow::Result<()> {
@@ -1254,11 +1295,7 @@ fn a_rar_that_cannot_be_served_by_range_is_refused_with_a_sentence() -> anyhow::
             "{archive}: {body}"
         );
     }
-    assert!(
-        !fixture.scratch_dir.exists(),
-        "{:?}",
-        fixture.scratch_files()
-    );
+    fixture.assert_nothing_kept();
     fixture.finish()
 }
 

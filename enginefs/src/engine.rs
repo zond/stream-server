@@ -659,8 +659,7 @@ impl<H: TorrentHandle> TorrentBacking<H> {
                             pieces = arrived.len(),
                             "pieces outside the window arrived under the pass; unlinking what the backend forgot"
                         );
-                        crate::retention::unlink(store, &self.info_hash, arrived, Some(claim))
-                            .await;
+                        crate::retention::unlink(store, &self.info_hash, arrived, claim).await;
                     }
                 }
                 Ok(None) => {}
@@ -856,35 +855,20 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         held: &BTreeSet<u32>,
         asking: crate::retention::owner::Asking,
     ) -> crate::retention::owner::Consumers {
-        let ceiling = asking.ceiling;
-        let extent = Self::extent(domain);
         let now = asking.now;
-        // **What this entity may hold**: [`Asking::allowance`] has the
-        // argument.
-        let available = asking.allowance(domain.piece_length, held.len());
         let mut streams = self.streams.lock();
-        // Where this file lies, first: a read carries an offset inside its
-        // own file, and every question the detector answers is about
-        // torrent pieces.
-        streams.domain(domain.file_idx, domain.span.offset, extent.clone(), ceiling);
-        let rejected = streams.observe(domain.file_idx, held, domain.piece_length, now);
-        // **What the consumers are asking for, which is what this pass
-        // orders.** The detector's answer is the want set, the exempt set
-        // and the reclaim below; nothing here classifies a read any more.
-        //
-        // Every pass, and not only the ones that report: a window grows
-        // towards what its rate asks for by doubling, one step per grant,
-        // so grants that happened only when a log line was due would tie
-        // how fast a consumer is fetched for to how often this server talks
-        // about it.
-        let want = streams.want(
-            domain.file_idx,
-            asking.seconds,
-            available,
-            domain.piece_length,
-            now,
+        let consumers = streams.consumers(
+            &crate::retention::streams::FileAt {
+                file: domain.file_idx,
+                offset: domain.span.offset,
+                extent: Self::extent(domain),
+                piece: domain.piece_length,
+            },
+            held,
+            &asking,
+            Some(&self.info_hash),
         );
-        // **How deep the backend splits the head of that window**, sized
+        // **How deep the backend splits the head of the window**, sized
         // from what only this side knows -- the film's rate and the
         // player's stalls -- against what only the backend knows, how long
         // its pieces take; see [`crate::retention::deadline`]. Every
@@ -907,66 +891,7 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
                 streams.deadline.stalls(),
             );
         }
-        let exempt = streams.exempt(domain.file_idx, extent.end);
-        // **What may not be unlinked is published here**, where the want
-        // set is decided: the pass's own holdings -- every promise and
-        // every open stream's lookahead -- with what the consumers are
-        // asking for. The same set is what the coldest are chosen against,
-        // because a reclaim chosen against a smaller one frees nothing: the
-        // door refuses what this publishes.
-        let mut kept = want.clone();
-        kept.extend(asking.holding.iter().cloned());
-        // And the committed set: on the disk whatever is asked for, so the
-        // coldest quota is not spent on pieces the policy then vetoes.
-        kept.extend(asking.committed.iter().cloned());
-        exempt.publish(&kept);
-        // **What must go, and no more.** The disk that nothing else needs
-        // is scrub-back: giving it up before something asks for the room
-        // buys nothing and costs a re-fetch. So the reclaim is the overhang
-        // over what the disk may hold and nothing else, taken coldest
-        // first -- over the disk's line, not the windows' allowance, which
-        // has the committed set taken off already ([`Asking::overhang`]).
-        //
-        // [`Asking::overhang`]: crate::retention::owner::Asking::overhang
-        let over = asking.overhang(domain.piece_length, held.len());
-        let how_many = usize::try_from(over.div_ceil(domain.piece_length.max(1))).unwrap_or(0);
-        let (tracked, reclaim) = streams.coldest_of(domain.file_idx, now, &kept, how_many);
-        // Who, among this file's readers, the viewer is; see
-        // [`crate::retention::owner::Consumers::at`].
-        let at = streams.busiest(domain.file_idx, domain.piece_length, now);
-        if !streams.report_due(now) {
-            return crate::retention::owner::Consumers {
-                want,
-                exempt,
-                reclaim,
-                at,
-            };
-        }
-        let coldest: Vec<u32> = reclaim
-            .iter()
-            .copied()
-            .take(crate::retention::streams::COLDEST_REPORTED)
-            .collect();
-        crate::retention::trace::streams_seen(crate::retention::trace::StreamsSeen {
-            info_hash: &self.info_hash,
-            file_idx: domain.file_idx,
-            counts: &streams.counts(),
-            heads: &streams.heads(domain.file_idx),
-            sample: streams.last_sample(domain.file_idx),
-            rates: &streams.rates(domain.file_idx),
-            want: &want,
-            allowed: available,
-            exempt: streams.held_by_streams(domain.file_idx),
-            tracked,
-            coldest: &coldest,
-            why: rejected,
-        });
-        crate::retention::owner::Consumers {
-            want,
-            exempt,
-            reclaim,
-            at,
-        }
+        consumers
     }
 
     fn trace(

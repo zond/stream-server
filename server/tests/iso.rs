@@ -238,13 +238,52 @@ impl Server {
         Ok(format!("{}/iso/stream/{key}/{member}", self.base))
     }
 
-    /// **Nothing under the cache root but the fetchers' own stores**: not
-    /// an extraction, not the directory extractions used to land in.
-    fn assert_nothing_extracted(&self) {
-        assert!(
-            !self.cache_root.join(".archives").exists(),
-            "something wrote under the cache root"
-        );
+    /// **Nothing under the cache root but the fetchers' own stores**: the
+    /// torrent's pieces (`.pieces/`), the proxy cache's chunks (`.proxy/`)
+    /// and librqbit's record of the session beside them. The whole root is
+    /// walked, not the one directory an old version extracted into: an
+    /// extraction anywhere is a file outside those, and one inside them is
+    /// a file that is a served member whole -- `members` are those.
+    fn assert_nothing_extracted(&self, members: &[&[u8]]) {
+        fn walk(dir: &Path, into: &mut Vec<(PathBuf, u64)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                match entry.metadata() {
+                    Ok(metadata) if metadata.is_dir() => walk(&path, into),
+                    Ok(metadata) => into.push((path, metadata.len())),
+                    Err(_) => {}
+                }
+            }
+        }
+        self.handle
+            .proxy_cache_settled(std::time::Duration::from_secs(30))
+            .expect("the proxy cache settles");
+        let mut files = Vec::new();
+        walk(&self.cache_root, &mut files);
+        for (path, len) in &files {
+            let relative = path.strip_prefix(&self.cache_root).unwrap_or(path);
+            let in_a_store = relative
+                .components()
+                .any(|part| part.as_os_str() == ".pieces" || part.as_os_str() == ".proxy");
+            let session_record = path.file_name().is_some_and(|name| name == "session.json")
+                || path
+                    .extension()
+                    .is_some_and(|extension| extension == "torrent" || extension == "bitv");
+            assert!(
+                in_a_store || session_record,
+                "{relative:?} is in no store: {files:?}"
+            );
+            if members.iter().any(|member| member.len() as u64 == *len) {
+                let bytes = std::fs::read(path).unwrap_or_default();
+                assert!(
+                    !members.contains(&bytes.as_slice()),
+                    "{relative:?} is a served member, whole: {files:?}"
+                );
+            }
+        }
     }
 
     fn finish(self) -> anyhow::Result<()> {
@@ -323,7 +362,7 @@ fn a_9660_image_inside_a_torrent_is_served_by_range() -> anyhow::Result<()> {
         &server.torrent_member_url(&info_hash, "HELLO.TXT"),
         &file_bytes(&image, iso::data_range(&image)),
     )?;
-    server.assert_nothing_extracted();
+    server.assert_nothing_extracted(&[&file_bytes(&image, iso::data_range(&image))]);
     server.finish()
 }
 
@@ -371,7 +410,7 @@ fn a_container_in_a_torrent_is_told_which_member_to_ask_for() -> anyhow::Result<
         .join(&location)?
         .to_string();
     assert_member_served(&member, &file_bytes(&image, iso::data_range(&image)))?;
-    server.assert_nothing_extracted();
+    server.assert_nothing_extracted(&[&file_bytes(&image, iso::data_range(&image))]);
     server.finish()
 }
 
@@ -387,7 +426,7 @@ fn a_9660_image_behind_a_link_is_served_by_range() -> anyhow::Result<()> {
 
     let url = server.create_member_url(&origin.url("/disc.iso"), "HELLO.TXT")?;
     assert_member_served(&url, &file_bytes(&image, iso::data_range(&image)))?;
-    server.assert_nothing_extracted();
+    server.assert_nothing_extracted(&[&file_bytes(&image, iso::data_range(&image))]);
     server.finish()
 }
 
@@ -405,7 +444,7 @@ fn a_udf_image_inside_a_torrent_is_served_by_range() -> anyhow::Result<()> {
         &server.torrent_member_url(&info_hash, "MOVIE.BIN"),
         &file_bytes(&image, udf::data_range(&image)),
     )?;
-    server.assert_nothing_extracted();
+    server.assert_nothing_extracted(&[&file_bytes(&image, udf::data_range(&image))]);
     server.finish()
 }
 
@@ -439,7 +478,7 @@ fn a_udf_image_behind_a_link_is_served_by_range() -> anyhow::Result<()> {
     };
     let url = server.create_member_url(&origin.url("/bd.iso"), "BDMV/STREAM/00000.m2ts")?;
     assert_member_served(&url, &expected)?;
-    server.assert_nothing_extracted();
+    server.assert_nothing_extracted(&[&expected]);
     server.finish()
 }
 
@@ -499,7 +538,7 @@ fn an_image_the_parser_refuses_answers_the_status_and_the_sentence() -> anyhow::
     let body: serde_json::Value = refused.json()?;
     assert_eq!(body["refused"], serde_json::json!("unsupported"));
 
-    server.assert_nothing_extracted();
+    server.assert_nothing_extracted(&[]);
     server.finish()
 }
 
@@ -581,6 +620,6 @@ fn a_real_image_inside_a_torrent_is_served_by_range() -> anyhow::Result<()> {
         &server.torrent_member_url(&info_hash, "README.TXT"),
         b"a real image\n",
     )?;
-    server.assert_nothing_extracted();
+    server.assert_nothing_extracted(&[&vob, b"a real image\n"]);
     server.finish()
 }

@@ -233,14 +233,14 @@ impl StoreRegistry {
     }
 
     /// Whether a live store is registered for `info_hash` at all -- the
-    /// question a delete **with no claim** asks before it touches anything.
-    /// A registered store is one `init` seeded for a torrent librqbit
-    /// holds, and that torrent keeps a have-set over the same pieces; an
-    /// unlink nobody had the backend forget first leaves that have-set
-    /// standing over nothing. So the claimless door goes by path only where
-    /// this is false, and steps back where it is true -- whatever state the
-    /// caller read the torrent in earlier, because the read and the unlink
-    /// are two instants and a restart fits between them.
+    /// question a dormant download's delete asks before it takes the
+    /// directory. A registered store is one `init` seeded for a torrent
+    /// librqbit holds, and that torrent keeps a have-set over the same
+    /// pieces; a delete nobody had the backend forget first leaves that
+    /// have-set standing over nothing. So the delete by path goes only
+    /// where this is false, and steps back where it is true -- whatever
+    /// state the caller read the torrent in earlier, because the read and
+    /// the delete are two instants and a restart fits between them.
     pub fn is_registered(&self, info_hash: &str) -> bool {
         self.live(info_hash).is_some()
     }
