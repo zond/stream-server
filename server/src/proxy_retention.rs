@@ -1088,7 +1088,7 @@ pub(crate) enum OnDisk {
 /// pass on a 27 GB torrent. The proxy never got one, so
 /// [`ProxyBacking::held`] ran a real `read_dir` of every bucket directory
 /// of the entity on *every* pass, and the design that follows this one
-/// (`docs/read-pattern-retention.md`, section 8, step 0) needs the same
+/// (`docs/design/read-pattern-retention.md`, section 10, step 0) needs the same
 /// question answered on the **read** path, where a directory listing is not
 /// available at any price.
 ///

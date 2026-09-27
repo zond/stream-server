@@ -190,7 +190,7 @@ fn names_a_playlist(url: &Url) -> bool {
 ///
 /// Folded because the spelling that matters most is not lower case: Apple
 /// writes `application/x-mpegURL`, that is what stremio-core sends and what
-/// this repo's README uses, and a case-sensitive `contains("mpegurl")` sees
+/// this repo's `docs/proxy.md` uses, and a case-sensitive `contains("mpegurl")` sees
 /// none of it.
 fn forced_content_type(response_header_overrides: &BTreeMap<String, String>) -> Option<String> {
     response_header_overrides

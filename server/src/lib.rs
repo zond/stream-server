@@ -122,7 +122,7 @@ mod routes;
 /// **The seam every translated container reads through**: a file whose
 /// bytes something else fetched and keeps -- a torrent's piece store, the
 /// proxy cache -- asked for by byte range and never copied anywhere. See
-/// the module's own documentation and `docs/translated-sources.md`.
+/// the module's own documentation and `docs/design/translated-sources.md`.
 ///
 /// Public, and `doc(hidden)`, so the integration tests can build the
 /// sources and the counting wrapper the index bounds are stated in. It is
@@ -132,7 +132,7 @@ pub mod sources;
 mod state;
 pub mod stream_numbers;
 /// What a container says about the bytes inside it: the translators (see
-/// the module's own documentation and `docs/translated-sources.md`).
+/// the module's own documentation and `docs/design/translated-sources.md`).
 ///
 /// Public, and `doc(hidden)`, for the same reason [`sources`] is: the
 /// integration tests state what indexing a real archive may read, and say

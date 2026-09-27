@@ -25,7 +25,7 @@
 //! Every descriptor carries a tag with a checksum over the tag itself and a
 //! CRC over the descriptor's body. Both are checked: they are small, they
 //! are the format's own, and they are exactly the "header checksum" case
-//! `docs/translated-sources.md` §2.2.4 keeps.
+//! `docs/design/translated-sources.md` §2.2.4 keeps.
 //!
 //! What is refused rather than guessed at, each naming itself:
 //!

@@ -61,7 +61,7 @@ pub mod owner;
 /// The scenario harness and the fake backing every retention test is built
 /// over. **Test-only**, and a sibling of [`owner`] rather than a part of it
 /// on purpose: the policy in `owner` is being replaced whole
-/// (`docs/read-pattern-retention.md`), the replacement has to be proved
+/// (`docs/design/read-pattern-retention.md`), the replacement has to be proved
 /// against the same scenarios, and a fixture that lived inside the module
 /// being replaced would have to move -- taking its scenarios with it -- at
 /// the moment the comparison matters most.
@@ -103,7 +103,7 @@ pub enum CacheBudget {
 ///
 /// **Two numbers, one publication.** The cap is what the whole cache may
 /// occupy; the headroom is what the volume will still give before the
-/// margin -- the `free_disk - margin` of `docs/read-pattern-retention.md`
+/// margin -- the `free_disk - margin` of `docs/design/read-pattern-retention.md`
 /// section 4. They are written together, under this lock, by the one
 /// publisher, because they are two readings of one `statvfs` and a pass
 /// that mixed a fresh cap with a stale headroom would be sizing a lookahead

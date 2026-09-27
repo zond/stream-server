@@ -1,11 +1,11 @@
 //! **Offline downloads of what is not a torrent**: an addon URL, a Google
 //! Drive file -- anything that reads through the proxy cache.
 //!
-//! The principle is `docs/translated-sources.md`'s: only the thing that
+//! The principle is `docs/design/translated-sources.md`'s: only the thing that
 //! downloads a file may store it, and for everything that is not a torrent
 //! that is the proxy cache. A download of one of them is therefore not a new
 //! store but two things the torrent side has and the proxy side did not
-//! (`docs/generic-downloads.md`):
+//! (`docs/design/generic-downloads.md`):
 //!
 //! * **A pin** -- a claim on a key directory that outlives the process. The
 //!   embedder names the set at boot ([`crate::ServerConfig::proxy_pins`],

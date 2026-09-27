@@ -348,7 +348,7 @@ where
     // the cap because it is the other half of the same `statvfs` and the
     // two must not be read from different moments: an entity's own
     // allowance is this plus what it already holds
-    // (`docs/read-pattern-retention.md` section 4), so a fresh cap over a
+    // (`docs/design/read-pattern-retention.md` section 4), so a fresh cap over a
     // stale headroom sizes a lookahead against a disk that never existed.
     let headroom = available.map(|available| available.saturating_sub(floor));
     // Part of the retention trace (`enginefs::retention::trace`, under the
@@ -548,7 +548,7 @@ mod tests {
     ///
     /// It is the other half of one `statvfs` -- what the volume will still
     /// give before the margin -- and what an entity is allowed is that plus
-    /// what it already holds (`docs/read-pattern-retention.md` section 4).
+    /// what it already holds (`docs/design/read-pattern-retention.md` section 4).
     /// A publication that stated one and not the other would leave a pass
     /// sizing a lookahead against a disk that never existed.
     #[tokio::test]

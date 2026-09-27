@@ -2,7 +2,7 @@
 //! behind a [`ByteSource`].
 //!
 //! The parsers are the images module's own and nothing here adds to them.
-//! What this file is, is the seam `docs/translated-sources.md` §5 step 6
+//! What this file is, is the seam `docs/design/translated-sources.md` §5 step 6
 //! asked for: a [`ByteSource`] read as an [`ImageReader`] (the same two
 //! calls, `len` and `read_at`, under other names), each [`ImageFile`] --
 //! a path, a length and the image's own byte ranges that hold it --

@@ -1489,7 +1489,7 @@ pub struct Engine<H: TorrentHandle> {
     /// reads themselves and obeyed by every pass over its files: what is
     /// fetched, what may not be unlinked and what is given back are all
     /// answered from here. See [`crate::retention::streams`] and
-    /// `docs/read-pattern-retention.md`.
+    /// `docs/design/read-pattern-retention.md`.
     /// Here rather than on a `FileHandle` or a `Reader` because both of
     /// those die with the HTTP response, and the thing being detected
     /// survives a reopen -- one that did not would report a new stream per

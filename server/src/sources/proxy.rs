@@ -88,7 +88,7 @@ impl From<FetchFailure> for ProxySourceError {
 /// which is [`Self::Caller`] -- and which cannot hold a credential that
 /// expires, since the map is fixed at construction and a film is longer
 /// than an access token. [`Self::Own`] is the other half the design asked
-/// for (`docs/translated-sources.md`: "a `ProxySource` with a header
+/// for (`docs/design/translated-sources.md`: "a `ProxySource` with a header
 /// supplier that refreshes").
 #[derive(Clone)]
 pub(crate) enum Credentials {

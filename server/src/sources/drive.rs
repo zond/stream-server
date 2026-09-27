@@ -1,7 +1,7 @@
 //! **A file in somebody's Google Drive as a [`ByteSource`]**, read by
 //! range under an access token this server renews for itself.
 //!
-//! The shape the design named (`docs/translated-sources.md`): "`DriveSource`
+//! The shape the design named (`docs/design/translated-sources.md`): "`DriveSource`
 //! (Google Drive; ranged `GET` with the addon's OAuth header, which is a
 //! `ProxySource` with a header supplier that refreshes)". That is what this
 //! is. Drive serves `files/{id}?alt=media` with a `206` for a `Range`, so

@@ -2,7 +2,7 @@
 //! record of what the policy did to them.**
 //!
 //! It exists because the retention policy is about to be replaced whole
-//! (`docs/read-pattern-retention.md`). The old one cannot be left running
+//! (`docs/design/read-pattern-retention.md`). The old one cannot be left running
 //! beside the new one -- it would have to be the one deciding, which is the
 //! thing being replaced -- so the new one is built standalone and proved
 //! against scaffolded scenarios before anything is swapped. A harness that

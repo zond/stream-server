@@ -407,7 +407,7 @@ fn set_origin(urls: &[String]) -> String {
 /// The list is the volume list. For RAR that is the ordinary case: from an
 /// addon, `rarUrls` *is* `.part1.rar`, `.part2.rar`, ... in order, and the
 /// extents a member is made of name the volume each part is in
-/// (`docs/translated-sources.md` §2.2). A format that does not come in
+/// (`docs/design/translated-sources.md` §2.2). A format that does not come in
 /// sets reads `sources[0]` and says so about the rest, which is what every
 /// translator but RAR does.
 async fn create_translated(

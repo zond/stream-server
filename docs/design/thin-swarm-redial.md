@@ -180,38 +180,14 @@ from the queue, not from the table.
   situation decides that, not this design, and it is worth measuring on
   its own (does anything ever dial in on wifi?).
 
-## 6. Where it goes
+## 6. Where it went
 
 rqbit, as patches shaped for upstream (the fork follows upstream monthly):
-4.1, 4.2 and 4.4 are all inside `torrent_state/live` and are useful to any
-rqbit user, not only a streaming client. The "starving" predicate needs a
-floor that is policy; make it a torrent option with a default, so
-stream-server can set it without rqbit knowing why. 4.3's tracker half is a
-`tracker_comms` change -- a "please announce now if allowed" channel
-alongside the existing sleep.
-
-stream-server: set the floor, and extend the `download progress` line
-(`routes/downloads.rs`) with `starving_secs`, `dead`, and `next_retry_secs`.
-
-## 7. Tests
-
-rqbit has the pieces for all of these without a network (fake peers, the
-backoff under `start_paused`):
-
-1. **Proven + starving -> short retry.** One peer delivers a piece and
-   dies; no other peers; the requeue lands within 60 s of paused time, not
-   ~6 min on the third death.
-2. **Unproven + starving -> unchanged schedule.** Same, with a peer that
-   never delivered: the waits are the existing ones.
-3. **Healthy torrent -> unchanged schedule** even for a proven peer.
-4. **Re-sighting brings forward.** A `Dead` peer waiting 6 min is named by
-   a (fake) DHT reply while starving -> dialled now; while healthy -> not.
-5. **Lean keeps proven.** `forget_disconnected_peers` drops unproven dead
-   entries and keeps proven ones.
-6. **Tracker re-announce respects `min interval`.** Starving at t=10 s
-   after an announce with `min interval = 120` -> the next announce is at
-   120 s, not 10 s and not 30 min.
-
-And one field check to call it done: the 54 % torrent (or any thin one) on
-the phone, where the progress line shows `peers=0` for no longer than the
-short retry schedule while a proven peer is still online.
+4.1, 4.2 and 4.4 are inside `torrent_state/live` and useful to any rqbit
+user. The "starving" floor is policy, so it is a torrent option with a
+default (`ManagedTorrent::set_starving_retry`). 4.3's re-announce was
+dropped (above). stream-server's `download progress` line
+(`routes/downloads.rs`) carries `starving`, `dead` and `next_retry_secs`.
+The field check still owed: a thin torrent on the phone, where the progress
+line should show `peers=0` for no longer than the short retry while a
+proven peer is still online.

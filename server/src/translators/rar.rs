@@ -19,7 +19,7 @@
 //! is ciphertext to the player. And what is served here that the crate
 //! would not: a member whose only checksum is BLAKE2sp, or none, which the
 //! crate marks ineligible because *it* cannot verify such a member out of
-//! order. Verification is the fetcher's (`docs/translated-sources.md`
+//! order. Verification is the fetcher's (`docs/design/translated-sources.md`
 //! §2.2.4): the bytes are piece-checked or they are what the origin served,
 //! and a checksum over a member is a read of the whole member.
 //!
@@ -299,7 +299,7 @@ fn chain_sentence(name: &str, reason: MalformedReason) -> String {
 }
 
 /// The volumes of the set `named` belongs to, among `siblings`, in order --
-/// by the two naming rules and nothing else (`docs/translated-sources.md`
+/// by the two naming rules and nothing else (`docs/design/translated-sources.md`
 /// §6):
 ///
 /// * `name.partN.rar`, ascending `N`, which may be zero-padded;

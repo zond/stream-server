@@ -31,7 +31,7 @@
 //! workspace-wide) does not call a finished, tested parser dead code while
 //! the route that will use it is still a step away. The step that follows
 //! adapts [`ImageReader`] to the repository's `ByteSource` and maps
-//! [`Refusal`] onto the HTTP answers in `docs/translated-sources.md` §3.
+//! [`Refusal`] onto the HTTP answers in `docs/design/translated-sources.md` §3.
 
 use async_trait::async_trait;
 use std::fmt;
@@ -459,7 +459,7 @@ mod tests {
     #[tokio::test]
     async fn a_bridge_image_is_indexed_through_its_9660_tree() {
         // Both descriptor sets present: the 9660 answer is the one taken,
-        // which is what `docs/translated-sources.md` §2.2 says a bridge
+        // which is what `docs/design/translated-sources.md` §2.2 says a bridge
         // disc should cost.
         let image = MemoryImage::new(udf_fx::bridge_image());
         let idx = index(&image).await.expect("indexed");

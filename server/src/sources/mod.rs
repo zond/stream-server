@@ -9,7 +9,7 @@
 //! answers out of whatever store already holds them and fetches exactly the
 //! rest. A format that cannot say which bytes of the underlying file a
 //! member is made of is refused rather than extracted; see
-//! `docs/translated-sources.md`.
+//! `docs/design/translated-sources.md`.
 //!
 //! What is here is the seam itself and the two sources a fetcher exists
 //! for:

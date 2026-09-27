@@ -2,7 +2,7 @@
 //! through `ServerHandle::pin_proxy_download`, filled from a loopback origin into the proxy
 //! cache, played back from the disk with the origin asked for nothing, kept
 //! across a restart that names it and swept by one that does not, and
-//! deleted on request. What `docs/generic-downloads.md` describes, measured.
+//! deleted on request. What `docs/design/generic-downloads.md` describes, measured.
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};

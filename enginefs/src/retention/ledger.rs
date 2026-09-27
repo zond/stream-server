@@ -11,7 +11,7 @@
 //! consumer is asking for is what a pass reclaims
 //! ([`super::streams::Streams::coldest_of`]), and the same order is traced
 //! so a field log can be read against what a pass took; see
-//! `docs/read-pattern-retention.md`.
+//! `docs/design/read-pattern-retention.md`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};

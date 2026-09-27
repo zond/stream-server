@@ -280,7 +280,7 @@ pub enum Mode {
 /// Every one of them is a *published* number rather than a measured one:
 /// the cap the operator configured, what the volume will still give, the
 /// file's size over its duration, and how many seconds of stream the
-/// viewer's buffer profile buys. See `docs/read-pattern-retention.md`.
+/// viewer's buffer profile buys. See `docs/design/read-pattern-retention.md`.
 #[derive(Debug, Clone)]
 pub struct Asking {
     /// What the whole cache may hold.
@@ -322,7 +322,7 @@ pub struct Asking {
     /// a stride *over* it for as long as anything is downloading -- and the
     /// budget's own job is to keep the volume off the free-space floor, so
     /// being over it is the one thing it may not be. See
-    /// `docs/read-pattern-retention.md` section 4 on why the margin is
+    /// `docs/design/read-pattern-retention.md` section 4 on why the margin is
     /// load-bearing: eviction has to trigger on approaching the line, not
     /// on crossing it.
     pub margin: u64,
@@ -340,7 +340,7 @@ impl Asking {
     /// margin, under the configured cap -- less the room the fill needs
     /// between two passes.
     ///
-    /// `docs/read-pattern-retention.md` section 4. Its own usage has to be
+    /// `docs/design/read-pattern-retention.md` section 4. Its own usage has to be
     /// in there or the allowance shrinks as the cache fills and never
     /// converges -- a stream would stop well short of the disk with nothing
     /// to explain why. The cap is over the whole cache and is what an
@@ -6407,7 +6407,8 @@ mod tests {
         // The field's disk: the viewer's run at the head of the file and
         // the tail piece the crawler reads, nothing between. (A fully
         // cached film joins the two reads into one stream by the
-        // detector's same-run rule; see `docs/known-issues.md`.)
+        // detector's same-run rule; see "What a stream is" in
+        // `docs/design/read-pattern-retention.md`.)
         *backing.held.lock() = [0u32, 1, 2, 3, 7].into_iter().chain(8..16).collect();
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         // The viewer, three pieces into the file and eating.

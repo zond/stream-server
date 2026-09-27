@@ -4274,7 +4274,7 @@ fn archive_extractions(cache_root: &std::path::Path) -> Vec<std::path::PathBuf> 
 /// request was the bug, and one copy was the fix. There is no extraction
 /// now: reaching the end of a deflated film means inflating all of it, so
 /// the member is refused instead, by decision
-/// (`docs/translated-sources.md` §2.2). What the disk is asked here is
+/// (`docs/design/translated-sources.md` §2.2). What the disk is asked here is
 /// what it was asked then, and the answer is stronger: not one copy, none.
 #[test]
 fn a_compressed_member_in_a_torrent_is_refused_rather_than_extracted() -> anyhow::Result<()> {
@@ -6238,7 +6238,7 @@ fn buffer_profile_is_a_setting_and_a_stream_query_override() -> anyhow::Result<(
 /// is held, and a read of it seeks in the piece store** rather than reading
 /// its way to the byte it wants.
 ///
-/// The two claims step 1 of `docs/translated-sources.md` makes about the
+/// The two claims step 1 of `docs/design/translated-sources.md` makes about the
 /// torrent half of the seam, and both are observable from outside the
 /// source:
 ///

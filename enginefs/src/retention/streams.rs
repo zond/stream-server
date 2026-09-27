@@ -18,7 +18,7 @@
 //! readers is the viewer ([`Streams::busiest`]) are all answered from here,
 //! through `Backing::reading` on both backings. The only thing [`Fetching`]
 //! is still asked is how far a stream reads ahead before a duration has
-//! been stated. See `docs/read-pattern-retention.md`, which this
+//! been stated. See `docs/design/read-pattern-retention.md`, which this
 //! implements.
 //!
 //! [`Fetching`]: crate::backend::priorities::Fetching
@@ -534,7 +534,7 @@ impl FileStreams {
     /// connection ran long enough to span them. Sixteen megabytes from the
     /// last read is four and a half seconds of one film and thirty-two of
     /// another. What a single connection had served grows without bound on
-    /// a connection nobody closes. See `docs/read-pattern-retention.md`.
+    /// a connection nobody closes. See `docs/design/read-pattern-retention.md`.
     ///
     /// The read's **begin** is what is looked up, not its end. A consumer
     /// blocked on a missing piece serves up to the hole and stops, so its

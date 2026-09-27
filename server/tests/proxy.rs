@@ -2048,7 +2048,7 @@ fn nothing_is_reading(fixture: &Fixture) {
 /// has been promised; both of those sit over the line while the body is
 /// open, and what the fill wrote since the last pass sits over it too. The
 /// allowance keeps a margin back for that, which bounds the steady state
-/// rather than the instant -- see `docs/read-pattern-retention.md` section
+/// rather than the instant -- see `docs/design/read-pattern-retention.md` section
 /// 4, and `stream_past_the_cache_budget` in `enginefs`, which measures the
 /// same shape against a swarm.
 ///
@@ -2868,8 +2868,8 @@ fn a_clean_leaves_the_chunks_a_proxied_player_is_inside() -> anyhow::Result<()> 
     // window; it used to be a two-chunk floor apiece for every phantom
     // stream the detector had made of one body, and thirty-two of those
     // covered more than the whole allowance, so a clean here could never
-    // reach the cap whatever it took (`docs/known-issues.md`, closed
-    // 2026-09-20). It can now, and a run that leaves the disk at exactly
+    // reach the cap whatever it took (`docs/design/read-pattern-retention.md`,
+    // "What a stream is"). It can now, and a run that leaves the disk at exactly
     // one chunk reports nothing over the cap -- correctly. What still has
     // to hold is that the report describes the disk it left rather than
     // the cap it was handed.
@@ -3272,7 +3272,7 @@ fn playlist_origin_typed(content_type: &'static str) -> anyhow::Result<Origin> {
 }
 
 /// The content type that says "playlist" is matched with its case folded
-/// away. Apple writes `application/x-mpegURL`; so does this repo's README,
+/// away. Apple writes `application/x-mpegURL`; so does this repo's `docs/proxy.md`,
 /// and so does the `r=` stremio-core sends for an HLS stream. A
 /// case-sensitive `contains("mpegurl")` saw none of them, and the URL here
 /// has no `.m3u8` to fall back on -- which is exactly the shape a playlist
@@ -6616,8 +6616,9 @@ fn cached_chunk_indices(fixture: &Fixture) -> Vec<u64> {
 /// What is left over after that -- the cache is over its cap, every pass
 /// has run, and not one chunk came back -- is a statement about the policy,
 /// and the panic says so in those words. It is a real state and not a
-/// timing accident: see the open entry in `docs/known-issues.md` for the
-/// detector rule that gets the cache there and what it was measured at.
+/// timing accident: see "What a stream is" in
+/// `docs/design/read-pattern-retention.md` for the detector rule that got
+/// the cache there and what it was measured at.
 fn reclaimed_chunk_below(fixture: &Fixture, played: u64) -> u64 {
     let cap = fixture
         .handle

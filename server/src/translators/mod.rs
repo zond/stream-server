@@ -14,7 +14,7 @@
 //! rests on -- only the thing that downloads a file may store it -- and it
 //! is why `.archives`, the extraction cache under the cache root, ceases
 //! to exist for the formats that have come through here. See
-//! `docs/translated-sources.md`.
+//! `docs/design/translated-sources.md`.
 //!
 //! Verification is the fetcher's: a torrent's bytes are piece-verified by
 //! librqbit and a proxied entity is what the origin served, so nothing

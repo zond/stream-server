@@ -8771,7 +8771,7 @@ mod tests {
                 // peaks in the high seventies of 64 and stays there. The
                 // budget is not the volume's edge -- a free-space floor
                 // sits under it, which is what tolerates the difference;
-                // see `docs/read-pattern-retention.md` section 4. What this
+                // see `docs/design/read-pattern-retention.md` section 4. What this
                 // still catches is the failure it was written for: a disk
                 // at twice the budget and climbing.
                 assert!(
@@ -9063,7 +9063,7 @@ mod tests {
             // on the disk whatever the cap says -- here that is 4 MiB of a
             // 16 MiB budget, a quarter of the cache. What the fill wrote
             // since the last pass is on top. See
-            // `docs/read-pattern-retention.md` section 4.
+            // `docs/design/read-pattern-retention.md` section 4.
             assert!(
                 held <= self.budget_pieces + 16,
                 "{held} pieces on disk after reading {read_so_far} bytes, budget is {}",

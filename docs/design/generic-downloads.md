@@ -3,34 +3,13 @@
 Design, 2026-09-26. Written against stream-server `9334c93`, xtremio
 `be034e6`, rqbit `d02b73a2`.
 
-**Status (2026-09-26, later the same day):** §3.1–3.4 are built on the
-server -- the proxy pin set through `ServerConfig::proxy_pins`, the
-keeping sweep with the occupancy seeded from what it kept,
-`ProxyBacking::keeps_everything`, quiet readers, the filler, and the
-embed calls (`ServerHandle::{pin_proxy_download, unpin_proxy_download,
-proxy_download_key}`, rows in `downloads()` with `source` and `playUrl`;
-the HTTP routes §3.4 sketched were built and then removed the same day
-with every other app-facing control route -- the app speaks FFI, see the
-README's "API"). One
-thing the design did not foresee: a finished download does **not** play
-from the stream's `/proxy` URL, because that route keys the cache on the
-player's own negotiation headers, so a player's request lands on a key the
-filler never filled. It plays from the download's own media route,
-`GET /downloads/{key}/stream`, which serves the pinned entry by range off
-the disk (`server/tests/proxy_downloads.rs` measures it: filled from a
-loopback origin, played back with the origin asked for nothing, kept
-across a restart that names it, swept by one that does not, deleted on
-request). **§3.5 built later the same day**, and not where the design put
-it: rather than teaching `DriveSource::open`'s probe to accept the cache,
-`ServerHandle::open_drive_file` answers a complete pinned Drive download
-from the disk before it probes anything -- the download's own media route,
-the length and content type the disk holds, no token spent -- and a pin
-over an entry that is already whole (`pin_url`, `pin_drive`) opens no
-source at all, so the app's launch-time re-pin works offline too
-(`server/tests/drive.rs`, `a_drive_download_plays_from_the_disk_with_no_network`:
-filled through the fake Drive, opened with the pairing service counting no
-renewal, relaunched against a dead pairing service and played). Not built:
-§4 (read-ahead).
+**Status: built, all of it** (2026-09-26): the proxy pin set
+(`ServerConfig::proxy_pins`), `ProxyBacking::keeps_everything`, the filler,
+the embed calls (`ServerHandle::{pin_proxy_download, unpin_proxy_download,
+proxy_download_key}`, rows in `downloads()` with `source` and `playUrl`),
+offline Drive playback, and read-ahead (§4). Where the build departed from
+the design, the section says so. `server/tests/proxy_downloads.rs` and
+`server/tests/drive.rs` measure it.
 
 **The ask (zond):** every source should download, not only torrents -- and
 "maybe a new set of functions on the byte owner that handles download
@@ -49,29 +28,20 @@ entity from reclaim) and a **filler** (something that fetches the bytes when
 no player is asking for them). Both belong to the proxy's retention owner,
 which is the byte owner zond named. And once a filler exists, pointing it at
 the owner's *want set* instead of "everything" is read-ahead for Drive and
-HTTP streams, which they lack today.
+HTTP streams, which they lacked.
 
-## 1. Where the code is, and what is missing
+## 1. What the two sides share
 
-| | Torrent (enginefs + librqbit) | Proxy / Drive (`proxy_cache`, `proxy_retention`, `sources::*`) |
-|---|---|---|
-| Store | one file per piece under `.pieces/<hash>/` | one file per 256 KiB chunk under `<key-sha256>/<validator>/` |
-| Owner | `enginefs::retention::owner` via `TorrentBacking` | the same owner via `ProxyBacking` -- same budget, same 90/10 window, same pass |
-| Holes | any set of pieces | any set of chunks (`Entry::look_up` walks from `first` to the first missing) |
-| Fetcher when nobody reads | librqbit, driven by the want set | **none** -- the owner computes `want`, nothing fills it |
-| Pin | `Engine::pinned_files`; `keeps_everything` answers from it | `keeps_everything` is hard-wired `false` ("the proxy has no pins") |
-| Claim that outlives the run | `PinSet` handed in by the embedder at boot; the launch sweep keeps what it names | **none** -- the launch sweep removes the whole cache ("no claim that outlives the run") |
-| Occupancy at boot | seeded from the held set the sweep left | "what this process wrote", true because the sweep emptied the disk |
-| Progress | `downloads()`, `download progress` line | -- |
-| Playback of a finished download | a `url` stream naming the server's media route, served off the pieces | would be the `/proxy` or `/drive/stream` URL itself: a complete entry answers without opening the origin (`Cached::complete`) |
-
-Drive specifically: `DriveSource` **is** a `ProxySource` (`sources/drive.rs`)
-with a header supplier that renews the token in Rust, and its entry is a
-vouched key (`ProxyCache::entry_for_vouched_url`: the file's URL with no
-token, in a namespace no `/proxy` key can reach). So a Drive stream today is
-cached, windowed and reclaimed exactly as an addon URL is. What it does
-not get is read-ahead, for the reason in the table: the proxy owner's
-`want` has no filler.
+The proxy cache (`proxy_cache`, `proxy_retention`, `sources::*`) keeps one
+file per 256 KiB chunk under `<key-sha256>/<validator>/`, and the same
+retention owner that runs torrents runs it through `ProxyBacking`: same
+budget, same window, same pass. What the torrent side had and the proxy
+side lacked was a fetcher when nobody reads, a pin, and a claim that
+outlives the run -- which is what this design adds. A Drive file **is** a
+`ProxySource` (`sources/drive.rs`) with a header supplier that renews the
+token in Rust, under a vouched key (`ProxyCache::entry_for_vouched_url`: the
+file's URL with no token, in a namespace no `/proxy` key can reach), so
+everything here applies to it unchanged.
 
 ## 2. The identity of a non-torrent download
 
@@ -120,7 +90,7 @@ not "nothing is pinned"**.
 ```rust
 pub struct ServerConfig {
     pub pins: Option<enginefs::piece_store::PinSet>,     // torrents, as today
-    pub proxy_pins: Option<BTreeSet<ProxyPinKey>>,        // new
+    pub proxy_pins: Option<Vec<ProxyPinKey>>,             // new
 }
 /// What the embedder can name: the identity, not the hash. The server
 /// derives the key directory from it the way `ProxyCache::entry` does,
@@ -197,46 +167,36 @@ as background traffic for the sharing light (it *is* "using your
 connection while you are not watching"), through the same
 `BackgroundTraffic` reading, by direction.
 
-### 3.4 Routes and the embed API
+### 3.4 The embed API
 
-*(As designed. What was kept is the embed API only; the routes went with
-the rest of the app-facing control routes on 2026-09-26.)*
-
-```
-POST   /downloads            {"url": ..., "headers": [[name, value], ...]}   -> DownloadInfo
-POST   /downloads            {"driveFileId": ..., "pairing": {...}}          -> DownloadInfo
-DELETE /downloads/{key}?deleteFiles=1                                        -> UnpinOutcome
-GET    /downloads.json                                                       (torrent and proxy rows, `source` on each)
-```
-
-`DownloadInfo` gains `source: Source` and keeps `length`, `downloaded`,
-`complete`, `error`. `downloaded` for a proxy entity is *held chunks x
-CHUNK_BYTES*, off the held set -- exact, and free. `ServerHandle` gets the
-same three calls the torrent has (`pin_url_download`, `pin_drive_download`,
-`unpin_proxy_download`) so xtremio's FFI layer changes in one place.
-
-The `download progress` line (`9334c93`) gets its proxy twin: `moved`,
-`still_secs`, bytes held / total, the hole being fetched, and `origin` as
-the source describes itself (`ByteSource::describe`: never a URL, never a
-credential).
+The HTTP routes sketched here were built and removed the same day with every
+other app-facing control route; the app speaks FFI. `DownloadInfo` gains
+`source` and `playUrl` and keeps `length`, `downloaded`, `complete`,
+`error`; `downloaded` for a proxy entity is *held chunks x CHUNK_BYTES*, off
+the held set -- exact, and free. The `download progress` line gets its proxy
+twin: `moved`, `still_secs`, bytes held / total, the hole being fetched, and
+`origin` as the source describes itself (`ByteSource::describe`: never a
+URL, never a credential).
 
 ### 3.5 Playing a finished download
 
-Today's contract (`offline_play.dart`): a finished download is not a file;
-the player is handed a `url` stream naming the server's own route, served
-off what is on the device. For a URL download that route is the `/proxy`
-URL the stream already had -- a complete entry answers from disk and the
-origin is never opened. For Drive it is `/drive/stream/{key}`, with one
-change: `DriveSource::open` probes the origin with `bytes=0-0` and treats
-an answer from the cache as an error ("the probe was answered from the
-cache"). For a pinned, complete entity the probe must accept the cache's
-answer, or an offline device cannot play the download it holds. Small,
-and it is the only piece of §3 that touches the sources.
+A finished download is not a file: the player is handed a `url` stream
+naming the server's own route, served off what is on the device. **It is
+not the stream's `/proxy` URL**, as designed: that route keys the cache on
+the player's own negotiation headers, so a player's request lands on a key
+the filler never filled. It is the download's own media route,
+`GET /downloads/{key}/stream`, which serves the pinned entry by range. For
+Drive, `ServerHandle::open_drive_file` answers a complete pinned download
+from the disk before it probes anything -- that route, the length and type
+the disk holds, no token spent -- and a pin over an entry that is already
+whole opens no source at all, so the app's launch-time re-pin works offline
+too (`a_drive_download_plays_from_the_disk_with_no_network`).
 
 ## 4. Drive streaming, and read-ahead
 
 **Built 2026-09-26** (`server/src/proxy_retention.rs`, `Prefetcher`), with
-two departures from the sketch below. There is no `Fill` enum: the
+two departures from the design, which had one filler driven either by
+"everything" (a pin) or by the owner's want set. There is no such `Fill` enum: the
 download filler and the read-ahead are separate tasks over the same quiet
 `ProxySource`, because the download is a pin's and the read-ahead is a
 player's. And the want set alone was not enough: where the budget covers
@@ -248,27 +208,6 @@ a `/proxy` request carrying the app's player token, or a Drive session.
 Measured in `tests/proxy.rs`
 (`a_reader_with_a_rate_is_read_ahead_of_and_a_lone_range_is_not`) and
 `tests/drive.rs` (`a_playing_drive_file_is_read_ahead_of`).
-
-What zond asked: does Drive fit the caching/lookahead system? **Caching
-and retention, yes, today, unchanged.** Lookahead, no -- and not because
-Drive is special: *no* proxied stream reads ahead of its player, because
-nothing fills the owner's `want`. The player's own `Range` is the only
-thing that ever fetches.
-
-The filler above is the missing half, and driving it from `want` instead
-of "everything" is the same object:
-
-```rust
-enum Fill { Everything /* a pin */, Wanted /* the owner's want set, refreshed each pass */ }
-```
-
-Under `Wanted` the filler fetches the chunks the pass published as wanted
-for the entity's live readers -- the film's bitrate times the buffer
-profile's seconds, the same arithmetic the torrent's want set is made of
--- and nothing else. That gives Drive and addon streams what a torrent
-stream has: a buffer ahead of the playhead, and a seek that lands inside
-the window served locally. Bounded by the same budget, reclaimed by the
-same pass, exempt while promised.
 
 Two cautions, both stated rather than hidden. Read-ahead is origin
 traffic: on Drive it counts against the file's daily download quota, on a
@@ -293,42 +232,6 @@ reconciler, and a proxied entity nobody is playing has no window to fill.
 * The replace and cancel logic, the notification and the library's
   Downloaded pill are source-agnostic already: they read `Entry::state`
   and `wants_pin`, never `info_hash`.
-
-## 6. Tests that prove it, in the order it is built
-
-1. **Sweep keeps a pinned key and only it** (`proxy_cache` tests): two
-   entities on disk, one named by the set -> one survives; `None` ->
-   both; an empty set -> neither. Occupancy equals what survived.
-2. **`keeps_everything` exempts** (`proxy_retention` tests, scaffolded
-   scenarios as the retention work was): a pinned entity over budget is
-   never planned; a stream opening beside it is refused (507) rather than
-   the pin reclaimed.
-3. **The filler completes and resumes** (a loopback origin, as
-   `tests/proxy.rs` has): pin -> `complete()`; kill mid-fill (drop the
-   filler) -> restart with the pin set -> resumes from the holes and no
-   chunk is fetched twice (count the origin's requests); validator change
-   -> one restart, reported.
-4. **Unpin aborts** (the `9334c93` shape): the origin never answers the
-   second range; the unpin returns before it would have; the directory is
-   gone with `deleteFiles`.
-5. **A stream shares the download's chunks**: fill half, open a `/proxy`
-   read inside it -> served from disk, origin not opened.
-6. **Drive offline**: a complete pinned Drive entity plays with the
-   pairing service unreachable.
-7. **Read-ahead** (`Wanted`): with a reader at offset X and a stated
-   duration, the filler fetches exactly the wanted chunks and stops at the
-   window's edge; the sharing light stays dark while the player reads.
-
-## 7. Staging
-
-1. §3.1 + §3.2 + occupancy seed. Pins exist; nothing fills them yet, but a
-   *streamed* film that was pinned survives a restart, which is already a
-   feature.
-2. §3.3 + §3.4. Downloads of URLs and Drive files, end to end, on the
-   server.
-3. §5. The app admits them.
-4. §3.5. Offline Drive playback.
-5. §4. Read-ahead for streams, behind the buffer profile.
 
 Related: `translated-sources.md` (the principle and `ByteSource`),
 `read-pattern-retention.md` (the owner both backings run).

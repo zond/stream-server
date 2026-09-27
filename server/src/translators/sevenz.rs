@@ -164,7 +164,7 @@ async fn read_archive(source: Arc<dyn ByteSource>) -> Result<Archive, Refusal> {
     parsed.map_err(|error| match error {
         // The index itself is AES: the crate asks for a password at the
         // first coder, before a file is named. There is no password UX,
-        // so this is where it stops (`docs/translated-sources.md` §6).
+        // so this is where it stops (`docs/design/translated-sources.md` §6).
         SevenZError::PasswordRequired | SevenZError::MaybeBadPassword(_) => Refusal::Encrypted,
         SevenZError::Io(io, _) if IndexReader::is_over_budget(&io) => {
             Refusal::Malformed(format!("{FORMAT}: {described}: {io}"))

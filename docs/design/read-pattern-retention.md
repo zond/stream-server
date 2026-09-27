@@ -9,35 +9,18 @@ The staging at the end is the order it was built in.
 
 ## Why the design that was there had to go
 
-The retention owner decided what to keep and what to fetch from a *reading*:
-`Reading::{Playback, Probe}`, derived from a `PlaybackIntent`, derived in turn
-by `playback_intent_for_request` from a priority header, two download flags and
-the geometry of a byte range. A player states none of that. It sends a range.
-
-Every field failure of the week before this was written is that derivation
-being wrong, and each one was diagnosed as something else first:
-
-- `is_container_metadata_request` recognises "the container index" from two
-  invented constants -- a window of `max(16 MiB, file_size / 512)` and a start
-  offset scaled the same way. A reader that sat at `file_size - 25,961,713`
-  once a second for a whole session was read as an index crawl. It is 15.2 MB
-  *before* that file's `moov`, so it is inside `mdat`: media data. The
-  `/512`, `container_metadata_window` and `STRUCTURAL_PIECES` were all built
-  on that misreading.
-- That same reader is a second live track -- subtitles or a second audio
-  stream, muxed near the end of `mdat`. Labelled `ContainerMetadata`, it never
-  got a playback want-set, and a read blocked on its next piece for twenty
-  seconds while seventeen seeders were connected. Every retry served exactly
-  up to the missing piece's boundary and gave up: 40,898 bytes, then 40,851,
-  then 40,804, each one the distance from where it resumed to piece 5560.
-- Placing the window from reads put it at the end of a 23 GB file while the
-  viewer was sixteen minutes in, which is what the told playhead was added to
-  fix -- and the told playhead then needed `read_near` to decide which read to
-  believe, because a reader's position cannot say whether it is the viewer.
-
-The common shape is that we ask what a read *means* and answer from its
-geometry. We never have to: `files.rs::poll_read` hands us a file offset for
-every read, so we can measure what a read *does* instead.
+The retention owner used to decide what to keep and fetch from a *reading*
+-- `Reading::{Playback, Probe}`, derived from a `PlaybackIntent`, derived in
+turn from a priority header, two download flags and the geometry of a byte
+range. A player states none of that; it sends a range. Every field failure
+of the week before this was written was that derivation being wrong: a
+second live track muxed near the end of `mdat` read as a container-index
+crawl and starved for twenty seconds beside seventeen seeders, and a window
+placed from reads sat at the end of a 23 GB file while the viewer was
+sixteen minutes in. The common shape is asking what a read *means* and
+answering from its geometry. We never have to: `files.rs::poll_read` hands
+us a file offset for every read, so we can measure what a read *does*
+instead.
 
 ## 1. Detection
 
@@ -305,8 +288,8 @@ disk cannot cover them all, which is what makes the shares equal in seconds
 rather than equal in bytes. The field log settled it, as expected.
 
 What was left open was about the swarm rather than about this policy, and
-was closed on 2026-09-15 as a cost of streaming a torrent; see "Closed
-2026-09-15" in `docs/known-issues.md`.
+was closed on 2026-09-15 as a cost of streaming a torrent; see the closed
+list at the end of `docs/known-issues.md`.
 
 ## 7. What a stream is
 
@@ -498,7 +481,7 @@ set is made of: `window_at` and `ahead_of` are gone with it.
 stands in its place is `Fetching`, two variants and one question --
 `Streaming` or `Download` -- and it decides exactly one number, how far a
 stream reads ahead *before a duration has been stated*
-(`STREAMING_LOOKAHEAD_BYTES`, 4 MiB; `DOWNLOAD_LOOKAHEAD_BYTES`, 256 MiB for
+(`STREAMING_LOOKAHEAD_BYTES`, 32 MiB since review 2026-09-19 #15; `DOWNLOAD_LOOKAHEAD_BYTES`, 256 MiB for
 a fetch no player will ever state one for). That is the first open of a
 session and any file a player can put no length on: there is no
 seconds-to-bytes conversion without a duration, and a constant is the only

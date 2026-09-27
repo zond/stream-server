@@ -452,7 +452,7 @@ impl HeldSnapshot {
     /// lands inside the run and joins; a small one keeps less, so the same
     /// scrub lands outside it and is a new consumer. Three earlier rules
     /// each guessed that distance in bytes and each was wrong in the field
-    /// -- see `docs/read-pattern-retention.md`.
+    /// -- see `docs/design/read-pattern-retention.md`.
     ///
     /// `bound` is the entity's extent: a run never runs off the end of the
     /// file it belongs to.
