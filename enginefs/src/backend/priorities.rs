@@ -4,10 +4,10 @@ use serde::{Deserialize, Serialize};
 /// it, whatever the buffer profile.
 ///
 /// The committed set is what we offer a peer, drawn at random across the
-/// whole file, so this is a size and not a region of the film. Sized from
-/// the budget alone it was `cacheSize / 2` -- 151 MB on the field device,
-/// about fifty-one seconds of a 23 Mbps film -- so the forward buffer had
-/// the other half of a disk far too small to give half of away. Time is the
+/// whole file, so this is a size and not a region of the film. Sizing it
+/// from the budget alone (`cacheSize / 2`, about fifty-one seconds of a 23
+/// Mbps film at 151 MB on the field device) would leave the forward buffer
+/// the other half of a disk far too small to give half away. Time is the
 /// unit that says what it is for: what we offer is stated against the film,
 /// as the buffer is.
 pub const COMMITTED_SECONDS: u64 = 90;
@@ -24,9 +24,9 @@ pub const COMMITTED_SECONDS: u64 = 90;
 /// stream reads and how long the retention window may be
 /// ([`Self::window_seconds`]), because the two are the same question asked
 /// of the swarm and of the disk. The bytes it comes to are the film's own
-/// bitrate times these seconds. Sized from the disk instead, the forward
-/// reach was a fraction of `cacheSize`, so a viewer who gave the app a
-/// bigger cache silently bought a bigger mobile-data bill.
+/// bitrate times these seconds. Sizing the forward reach as a fraction of
+/// `cacheSize` instead would let a viewer who gives the app a bigger cache
+/// silently buy a bigger mobile-data bill.
 ///
 /// It does not scale the fallback a stream reads ahead at before a duration
 /// has been stated ([`STREAMING_LOOKAHEAD_BYTES`]): those first seconds are
@@ -67,11 +67,12 @@ pub enum BufferProfile {
 ///
 /// **A number and not "no cap"**, because the sharing is arithmetic over
 /// it: every stream's rate times the seconds, scaled by one factor so the
-/// total fits the allowance. `u64::MAX` stood here once and saturated --
-/// every stream's demand became `u64::MAX`, the factor became one, and
-/// each stream of an entity was granted the whole allowance on its own.
-/// A day of a 20 MB/s film is under two terabytes, which the arithmetic
-/// takes in its stride.
+/// total fits the allowance. `u64::MAX` here would saturate that
+/// arithmetic -- every stream's demand becomes `u64::MAX`, the factor
+/// becomes one, and each stream of an entity is granted the whole
+/// allowance on its own -- so the cap stays a real number: a day of a 20
+/// MB/s film is under two terabytes, which the arithmetic takes in its
+/// stride.
 pub const MAXIMUM_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 // A hundred megabytes a second for the maximum window must not saturate.
 const _: () = assert!(MAXIMUM_WINDOW_SECONDS < u64::MAX / (100 * 1024 * 1024));
@@ -128,15 +129,12 @@ impl BufferProfile {
 /// (`Engine::try_get_file_with_intent`), and what is kept on the disk comes
 /// from the read-pattern detector; neither asks this.
 ///
-/// **It used to be eight variants classifying the geometry of the range
-/// header** -- a first read, a seek, a sequential read, a full download, a
-/// ranged download, a crawl over the container index at the tail, a probe,
-/// a background fetch -- each with a window of its own, and an arm telling
-/// the retention which reader was the viewer. Every one of those questions
-/// is now answered by watching what the reads do
-/// (`crate::retention::streams`): in the field log of 2026-09-14 mpv's
-/// index crawler measured 91 B/s beside the viewer's 1.2 MB/s, two reads a
-/// range header cannot tell apart.
+/// A read's shape alone -- first read, seek, sequential, full or ranged
+/// download, a crawl over the container index, a probe, a background fetch
+/// -- cannot tell a viewer from an index crawler; watching what the reads
+/// actually do can (`crate::retention::streams`): an index crawler measures
+/// at 91 B/s beside a viewer's 1.2 MB/s, two reads a range header alone
+/// cannot tell apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Fetching {
@@ -158,15 +156,14 @@ pub enum Fetching {
 /// What a playing stream reads ahead of itself before a duration has been
 /// stated; see [`Fetching::Streaming`].
 ///
-/// **Eight pieces of the field's 4 MiB, not one.** It was 4 MiB, and the
-/// reader's lookahead is fixed when the reader opens: the viewer's own
-/// connection is opened before mpv has said how long the film is, so that
-/// stream kept a one-piece reach for as long as it lasted. The split depth
-/// is handed to the backend in pieces of that reach (`retention::deadline`),
-/// so a depth of six or eight had nothing to split and the trace reported
-/// a depth that could not bite (review 2026-09-19 #15). At a film's own
-/// rate this is about nine seconds of video, well inside every profile's
-/// window, and what is kept is still the retention pass's to say.
+/// **Eight pieces of the field's 4 MiB, not one.** The reader's lookahead is
+/// fixed when the reader opens: the viewer's own connection is opened
+/// before mpv has said how long the film is, so the reach handed to the
+/// backend (`retention::deadline`) must already be split into enough
+/// pieces for the split depth to have something to split -- a depth of six
+/// or eight biting on a single piece is a no-op. At a film's own rate this
+/// is about nine seconds of video, well inside every profile's window, and
+/// what is kept is still the retention pass's to say.
 pub const STREAMING_LOOKAHEAD_BYTES: u64 = 32 * 1024 * 1024;
 
 /// What a download reads ahead of itself, for its whole life; see
@@ -202,16 +199,16 @@ pub const fn librqbit_stream_lookahead_bytes(fetching: Fetching) -> u64 {
 ///
 /// `read_from` is the offset **inside the file** the reader is positioned
 /// at, not always 0: the window follows the reader. Anchoring it at the
-/// file head meant that after a seek the number described bytes nobody was
-/// fetching and sat at 0% while the seek region streamed perfectly.
+/// file head instead would describe bytes nobody is fetching after a seek,
+/// sitting at 0% while the seek region streams perfectly.
 ///
 /// The window is then **expanded to whole pieces**, because a piece is the
 /// unit that becomes readable: none of an 8 MiB piece can be served until
-/// all 8 MiB of it verifies. Reporting a 4 MiB window inside a 16 MiB piece
-/// described a quantity that did not exist -- the client could only ever
+/// all 8 MiB of it verifies. Reporting a window narrower than a piece would
+/// describe a quantity that does not exist -- the client could only ever
 /// see 0% or 100% of it, and on a 7.5 GB torrent (16 MiB pieces) at
 /// 300 kB/s that is 55 seconds of literal "0%" while the download runs
-/// perfectly. The denominator is now what actually has to arrive, and
+/// perfectly. The denominator is what actually has to arrive, and
 /// `EngineStats::piece_length` says how big the steps are, so a client can
 /// say "waiting for the first piece (16 MiB)" instead of showing a stalled
 /// percentage. `ready == window` is unchanged either way: it still means
@@ -244,7 +241,7 @@ pub fn initial_window_progress(
     )
 }
 
-/// [`initial_window_progress`] with `landed_bytes(piece)` saying how many
+/// `initial_window_progress` (test-only) with `landed_bytes(piece)` saying how many
 /// bytes of a piece the window touches have arrived but not yet verified,
 /// for a piece `have_piece` answers `false` for. Clipped to the file's part
 /// of the piece, like a whole piece is.
@@ -290,7 +287,7 @@ pub fn initial_window_progress_with(
 /// progress is worth showing (see `backend::InFlightPiece`).
 ///
 /// `read_from` is the reader's offset **inside the file**, the same offset
-/// [`initial_window_progress`] measures its window from, and the result is a
+/// `initial_window_progress` measures its window from, and the result is a
 /// **torrent-wide** piece index. An offset at or past the end of the file is
 /// clamped to its last byte, so a reader parked on the end still names the
 /// piece it last needed rather than a neighbouring file's.
@@ -381,11 +378,9 @@ mod tests {
         );
     }
 
-    /// A window inside one piece described a quantity that could only read
-    /// 0% or 100%: on a 7.5 GB torrent at 300 kB/s that is 55 seconds of
-    /// "0%" while the download is perfectly healthy. The denominator has to
-    /// be what actually must arrive. The piece here is larger than
-    /// [`STREAMING_LOOKAHEAD_BYTES`], which is the case this is about.
+    /// A window narrower than a piece can only read 0% or 100% (see
+    /// [`initial_window_progress`]); this pins the piece-larger-than-window
+    /// case, where [`STREAMING_LOOKAHEAD_BYTES`] is smaller than the piece.
     #[test]
     fn initial_window_progress_reports_the_piece_that_must_arrive() {
         let piece = 64 * 1024 * 1024u64;
@@ -404,9 +399,9 @@ mod tests {
         );
     }
 
-    /// The window follows the reader. Anchored at the file head it
-    /// described bytes nobody was fetching after a seek, and read 0%
-    /// forever while the seek region streamed fine.
+    /// The window follows the reader rather than the file head (see
+    /// [`initial_window_progress`]): pins that a seek moves the window with
+    /// it instead of reporting 0% forever.
     #[test]
     fn initial_window_progress_follows_the_read_position() {
         let piece = 256u64;

@@ -5,17 +5,16 @@
 //! volume the torrent writes to is under its floor ([`Volumes::floor`],
 //! which is [`crate::free_space_floor`] of the volume's own size, and
 //! [`CACHE_FREE_SPACE_FLOOR`] only on a volume large enough for it). A
-//! starting playback must lift the first and must not lift the second, so
-//! every earlier round of this code kept an in-memory record of *why* a
-//! torrent was paused -- `Engine::idle_paused`,
-//! `Engine::stopped_for_space`, the backend's own set of the hashes it
-//! idle-paused -- and asked that record before acting.
+//! starting playback must lift the first and must not lift the second.
 //!
-//! Those records are claims about the past, held in memory that starts
-//! empty while the pause they describe is persisted and survives the
-//! restart. After a restart "empty" reads as "nobody paused it", so the
-//! call sites that consult them are dead code in exactly the situation they
-//! exist for, and a stored "stopped for space" would in any case be a claim
+//! Not an in-memory record of *why* a torrent was paused --
+//! `Engine::idle_paused`, `Engine::stopped_for_space`, the backend's own
+//! set of the hashes it idle-paused -- consulted before acting: such a
+//! record is a claim about the past, held in memory that starts empty
+//! while the pause it describes is persisted and survives the restart.
+//! After a restart "empty" reads as "nobody paused it", so the call sites
+//! that would consult it are dead code in exactly the situation they exist
+//! for, and a stored "stopped for space" would in any case be a claim
 //! about a disk that may have been emptied since.
 //!
 //! So nothing here remembers anything. [`desired`] is a pure function of
@@ -74,12 +73,9 @@ pub enum Decision {
 /// answering a person, while a decision taken by the timer is answering
 /// nobody.
 ///
-/// It changed a third thing until the idle arm went: whether that arm was
-/// walked at all, which was a correctness rule rather than a concession,
-/// because the arm read registers the asker was still writing. Nothing
-/// below the free-space arm reads the trigger now -- what is playing is a
-/// value written before anything asks ([`crate::retention::live`]) -- so
-/// the ladder answers the same question to everyone.
+/// Nothing below the free-space arm reads the trigger -- what is playing
+/// is a value written before anything asks ([`crate::retention::live`]) --
+/// so the ladder answers the same question to everyone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
     /// The reconciler's own tick, over every torrent.
@@ -324,13 +320,11 @@ pub fn verdict(conditions: &Conditions, trigger: Trigger) -> Verdict {
         });
     }
     // Nothing below reads the trigger. A `PlaybackStart` is a caller
-    // saying somebody is about to open a reader on this torrent, and it
-    // used to have to switch the idle arm off, because that arm read
-    // registers the caller was still in the middle of writing. The liveness
-    // cell is written by `on_stream_start` before it asks anything, so the
-    // answer is the same whoever is asking, and `focus_torrent` -- which
-    // registers nothing at all -- is safe on its own account rather than by
-    // running two lines after something else.
+    // saying somebody is about to open a reader on this torrent: the
+    // liveness cell is written by `on_stream_start` before it asks
+    // anything, so the answer is the same whoever is asking, and
+    // `focus_torrent` -- which registers nothing at all -- is safe on its
+    // own account rather than by running two lines after something else.
     arm(if conditions.playing || conditions.pinned {
         Decision::Run
     } else {
@@ -352,8 +346,8 @@ pub fn verdict(conditions: &Conditions, trigger: Trigger) -> Verdict {
 /// the same question of a torrent that is already stopped, for the
 /// statistics a client polls and for the stream route's disk gate.
 /// A second copy of the test in either place is a policy in two halves that
-/// drift, which is how the free-space watch came to skip the very torrents
-/// the stream route was answering `507` for.
+/// drift, which is how the free-space watch would come to skip the very
+/// torrents the stream route answers `507` for.
 ///
 /// **The line is the caller's, and the two callers do not want the same
 /// one.** The ladder asks "should I start this torrent?" and takes its line
@@ -424,9 +418,9 @@ pub(crate) fn line(trigger: Trigger, observed: RunState, floor: u64) -> u64 {
 /// **One reading for the whole session, not one per torrent.** It is a
 /// property of a device: torrents writing to it share it, and the stall
 /// bound counted per torrent would start its clock again for each of them
-/// (see `Self::short_for`). It used to be a map keyed by each torrent's
-/// output folder, and the folder to ask about was every caller's to work
-/// out -- which is how three of them came to ask about a card nothing
+/// (see `Self::short_for`). A map keyed by each torrent's output folder
+/// instead would leave the folder to ask about every caller's to work out
+/// -- which is how three of them would come to ask about a card nothing
 /// writes to.
 pub struct Volumes {
     /// The folder every torrent's payload is written to -- the piece
@@ -434,14 +428,12 @@ pub struct Volumes {
     /// session's default storage puts every byte of every torrent.
     ///
     /// One folder for all of them, and not the per-torrent output folder
-    /// the backend reports, because that folder is a *name* now: librqbit
-    /// records one and reports file paths under it, and no payload byte is
-    /// written there (see `backend::librqbit::session_storage_factory`).
-    /// Probing it answered about the wrong device in both directions --
-    /// loudest while a pinned download was placed under a settings key of
-    /// its own. There is one torrent-data root now (`settings.cacheRoot`)
-    /// and a pin is a retention property, so there is no second device for
-    /// a probe to miss.
+    /// the backend reports: that folder is a *name*, librqbit records one
+    /// and reports file paths under it, but no payload byte is written
+    /// there (see `backend::librqbit::session_storage_factory`). Probing it
+    /// would answer about the wrong device in both directions. There is one
+    /// torrent-data root (`settings.cacheRoot`) and a pin is a retention
+    /// property, so there is no second device for a probe to miss.
     data_folder: std::path::PathBuf,
     reading: parking_lot::Mutex<Reading>,
 }
@@ -560,11 +552,11 @@ pub(crate) fn resume_line(floor: u64) -> u64 {
 /// behind reconciling another.
 ///
 /// The obvious shape -- one `tokio::Mutex` around the whole policy -- is
-/// what this replaces, and it was not merely inelegant: the pause call it
-/// guarded is `Session::pause`, which flushes the session's persistence
-/// file before it returns, so every torrent's decision waited on every
-/// other torrent's disk write. A playback starting on one hash could sit
-/// behind a slow stop of an unrelated one.
+/// not merely inelegant: the pause call it would guard is `Session::pause`,
+/// which flushes the session's persistence file before it returns, so
+/// every torrent's decision would wait on every other torrent's disk
+/// write. A playback starting on one hash could sit behind a slow stop of
+/// an unrelated one.
 ///
 /// Entries live only while a caller holds or waits for one, exactly as
 /// `BackendEngineFS::pin_locks` does, so an engine that reconciles a
@@ -706,7 +698,7 @@ mod tests {
     /// The stall clock a volume keeps, which is what decides whether a
     /// stopped torrent's parked readers have anything coming.
     ///
-    /// Three of its rules had nothing behind them until this test. It runs
+    /// Three of its rules have nothing behind them but this test. It runs
     /// from the moment the volume goes short and is not restarted by later
     /// short readings, or a disk that stayed full would keep handing its
     /// readers fresh patience. It is judged against the **resume line** and
@@ -769,7 +761,7 @@ mod tests {
     /// on a roomy volume, with seeding on. Every test below changes the one
     /// condition it is about.
     ///
-    /// `playing` is part of "nothing wrong with it" now. A torrent nobody
+    /// `playing` is part of "nothing wrong with it". A torrent nobody
     /// is playing and nobody has pinned is one the ladder stops -- its
     /// bytes are the retention owner's to delete, so there is nothing for
     /// it to fetch and nothing to seed from.
@@ -789,9 +781,9 @@ mod tests {
 
     /// **The ladder measures against the volume's own floor, not the
     /// constant.** A 4 GB television with 422 MB free is under the 512 MB
-    /// the constant names and over the 128 MB its own size allows; for an
-    /// afternoon the stream route admitted such a request and the ladder,
-    /// still on the constant, stopped the torrent it had just started.
+    /// the constant names and over the 128 MB its own size allows -- on the
+    /// constant, the ladder would stop a torrent the stream route had just
+    /// started for such a device.
     #[test]
     fn the_ladder_measures_against_the_volumes_own_floor() {
         const MIB: u64 = 1024 * 1024;
@@ -819,16 +811,15 @@ mod tests {
         assert!(verdict(&phone, Trigger::Timer).for_space);
     }
 
-    /// The ladder's own bottom, and the arm that replaced the idle one: a
-    /// torrent nobody is playing and nobody has pinned is stopped, seeding
-    /// on or off, whoever is asking and however recently it was watched.
+    /// The ladder's own bottom: a torrent nobody is playing and nobody has
+    /// pinned is stopped, seeding on or off, whoever is asking and however
+    /// recently it was watched.
     ///
     /// There is no grace period and no clock. A viewer who pauses is still
     /// playing this torrent -- the liveness value says so until they open
-    /// something else -- so the wait the grace existed to cover cannot
-    /// happen: what used to look like "a player between two segment reads"
-    /// was a register going quiet, and the register is not what is read any
-    /// more.
+    /// something else -- so there is no wait for "a player between two
+    /// segment reads" to cover: that reading came from a register going
+    /// quiet, which this arm does not consult.
     #[test]
     fn a_torrent_nobody_plays_and_nobody_pinned_is_stopped() {
         let left = Conditions {

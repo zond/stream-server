@@ -495,14 +495,14 @@ impl ChunkDir {
     /// empty; a bucket the filesystem would not list -- `EIO`, an
     /// `EMFILE` on a television that has run out of descriptors, a
     /// permission it lost -- holds whatever it held, and the answer is that
-    /// there is no answer. Reported as empty, one such tick told the
-    /// retention policy that every committed piece of a file had left the
-    /// disk: it withdrew the lot from what we announce -- after peers had
-    /// been told, and there is no un-Have -- and, the next tick, with the
-    /// listing back and the pieces outside the window and no longer
-    /// committed, reclaimed them. One transient directory error, and the
-    /// promise the whole design rests on -- what we announce is what nothing
-    /// will ever reclaim -- was broken for every piece of the file.
+    /// there is no answer. Reporting it as empty would tell the retention
+    /// policy that every committed piece of a file had left the disk: it
+    /// would withdraw the lot from what we announce -- after peers have
+    /// already been told, and there is no un-Have -- and, the next tick,
+    /// with the listing back and the pieces outside the window and no
+    /// longer committed, reclaim them. One transient directory error would
+    /// then break, for every piece of the file, the promise the whole
+    /// design rests on: what we announce is what nothing will ever reclaim.
     pub fn held_in_bucket(&self, bucket: u64) -> io::Result<HashSet<u64>> {
         let mut held = HashSet::new();
         let entries = match self.read_dir(&self.dir.join(bucket.to_string())) {
@@ -519,11 +519,10 @@ impl ChunkDir {
             if index / CHUNKS_PER_DIRECTORY != bucket {
                 continue;
             }
-            // A *directory* named like a chunk is not a chunk. It was
-            // reported as one by the piece store's hot listing and by
-            // nothing else, and the delete that followed failed with
-            // `EISDIR` -- not `NotFound` -- which abandoned the whole run of
-            // chunks it was part of.
+            // A *directory* named like a chunk is not a chunk: offered as
+            // one, the delete that follows fails with `EISDIR` -- not
+            // `NotFound` -- which abandons the whole run of chunks it was
+            // part of.
             if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
                 continue;
             }
@@ -673,9 +672,8 @@ impl ChunkDir {
     /// The caller is seeding what it knows about the disk from this, and
     /// there is no later event that adds a chunk already complete: a bucket
     /// skipped here would be a set short of that bucket's every chunk for
-    /// the rest of the process. The earlier form of this walk skipped a
-    /// bucket it could not read, which was tolerable while it fed only the
-    /// advisory staged set.
+    /// the rest of the process -- tolerable only if this fed nothing but
+    /// the advisory staged set, which the held set below is not.
     pub fn walk(&self) -> io::Result<Vec<Entry>> {
         let mut found = Vec::new();
         let buckets = match self.read_dir(&self.dir) {
@@ -839,9 +837,9 @@ pub fn collect_strays(dir: &Path, out: &mut Vec<Metadata>) {
 }
 
 /// What a file occupies, never its apparent length. **The one copy of this
-/// arithmetic**: the cache cleaner, the piece sweep and the proxy cache each
-/// had their own, and three readings of "how much would deleting this give
-/// back" is three numbers that can disagree.
+/// arithmetic**: the piece sweep and the proxy cache share it rather than
+/// each keeping their own, because two readings of "how much would deleting
+/// this give back" are two numbers that can disagree.
 ///
 /// On Unix `st_blocks` is the allocated block count in 512-byte units *by
 /// definition* -- the unit is POSIX, not the filesystem's block size -- so
@@ -877,13 +875,13 @@ struct OpenHandle {
 
 /// The last few chunk files opened, most recently used last.
 ///
-/// The first version of the piece store opened and closed the chunk file for
-/// every 16 KiB write and every 8 KiB read -- and, for a read, probed the
-/// staging name first, so a complete chunk cost two opens per read. On ext4
-/// that is microseconds; on the FUSE-mediated external storage and exFAT
-/// cards a large offline download lands on, an open is 50-200 µs and the read
-/// path was a third of the wall time. With this, a chunk written or streamed
-/// end to end is one open.
+/// Without it, every 16 KiB write and every 8 KiB read opens and closes the
+/// chunk file, and a read also probes the staging name first, so a complete
+/// chunk costs two opens per read. On ext4 that is microseconds; on the
+/// FUSE-mediated external storage and exFAT cards a large offline download
+/// lands on, an open is 50-200 µs, putting a third of the read path in
+/// opens alone. With this, a chunk written or streamed end to end is one
+/// open.
 ///
 /// The cache changes nothing about what is on disk, and it must not change
 /// what a read sees either: a handle is forgotten before the file it names is
@@ -1019,8 +1017,8 @@ mod tests {
     }
 
     /// **A directory that is not there is empty; one that cannot be read is
-    /// unknown.** The two used to be one answer, and the second read as the
-    /// first cost every committed piece of a file its announcement -- see
+    /// unknown.** Conflating the two -- reading "cannot be read" as "empty"
+    /// -- costs every committed piece of a file its announcement; see
     /// `held_in_bucket`.
     #[test]
     fn a_directory_that_cannot_be_listed_is_not_an_empty_one() {

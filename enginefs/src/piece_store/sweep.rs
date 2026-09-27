@@ -188,13 +188,10 @@ const NOT_OURS: [&str; 2] = [".pieces", ".proxy"];
 /// Whether `name`, directly under the download root, is something the
 /// session writes and reads.
 ///
-/// Taken from the cache cleaner's `is_session_artifact`, which is what
-/// exempted these from its walk for as long as it had one.
-///
 /// librqbit keeps its resume data beside the data itself -- `session.json`,
 /// a `.torrent` and a `.bitv` per info hash -- and the DHT its bootstrap.
 /// `pinned-downloads.json` (and the `.tmp-<n>` an interrupted write of it
-/// left) is on the list although nothing writes one any more: an install
+/// left) is also on the list: nothing here writes one, but an install
 /// upgraded from a build that did still has the file, and it is a record,
 /// not a previous release's data.
 fn is_session_artifact(name: &str) -> bool {
@@ -220,18 +217,17 @@ fn is_session_artifact(name: &str) -> bool {
 /// whole-file downloads at `<download dir>/<torrent name>/<file>`.
 ///
 /// **This is the one category of byte with no owner.** Everything this
-/// server writes now goes through the piece store or the proxy cache, and
-/// both have an owner that bounds them and a launch sweep that reconciles
-/// them. A whole-file download predates all of it: no store speaks for it,
-/// no policy bounds it, no pass will ever look at it, and until the cache
-/// cleaner was deleted its walk was the only thing that ever took one.
-/// Left alone it is invisible disk usage that grows once and never shrinks
-/// -- the failure this design exists to stop producing, wearing the clothes
-/// of a previous release.
+/// server writes goes through the piece store or the proxy cache, and both
+/// have an owner that bounds them and a launch sweep that reconciles them.
+/// A whole-file download predates all of it: no store speaks for it, no
+/// policy bounds it, no pass will ever look at it, and this sweep is the
+/// only thing that ever takes one. Left alone it is invisible disk usage
+/// that grows once and never shrinks -- the failure this design exists to
+/// stop producing, wearing the clothes of a previous release.
 ///
-/// So it goes, once, at launch, and the rule is the cleaner's own: what is
-/// not another component's directory ([`NOT_OURS`]) and not a session
-/// artifact ([`is_session_artifact`]) is a previous release's data.
+/// So it goes, once, at launch: what is not another component's directory
+/// ([`NOT_OURS`]) and not a session artifact ([`is_session_artifact`]) is a
+/// previous release's data.
 ///
 /// **It runs where the session's own data lives**, so the exemptions are
 /// load-bearing rather than tidy: removing `session.json` would lose every
@@ -317,9 +313,8 @@ mod tests {
     ///
     /// A whole-file download from an older release lives beside the store,
     /// not under it: no store speaks for it, no policy bounds it, no pass
-    /// will ever look at it, and the cache cleaner's walk -- deleted with
-    /// the rest of the eviction machinery -- was the only thing that ever
-    /// took one. Left alone it is disk usage that grows once and never
+    /// will ever look at it, and this sweep is the only thing that ever
+    /// takes one. Left alone it is disk usage that grows once and never
     /// shrinks.
     ///
     /// What it must not take is anything the session needs: `session.json`
@@ -361,11 +356,10 @@ mod tests {
         for name in [".pieces", ".proxy"] {
             std::fs::create_dir_all(root.join(name).join("inside")).unwrap();
         }
-        // `.archives` was exempt too, for an archive layer that no longer
-        // exists. It is a previous release's data now like anything else
-        // here -- though nothing ever put one *here*: the extraction cache
-        // was `<cacheRoot>/.archives`, a level above this root, which is
-        // why the exemption never did anything. See `NOT_OURS`.
+        // `.archives` is not exempt (see `NOT_OURS`): it is swept like any
+        // other unrecognised name. Nothing puts one *here* though -- the
+        // extraction cache is `<cacheRoot>/.archives`, a level above this
+        // root -- so this only exercises the default deletion path.
         std::fs::create_dir_all(root.join(".archives")).unwrap();
         std::fs::write(root.join(".archives").join("archive_x.7z"), [3u8; 2048]).unwrap();
 

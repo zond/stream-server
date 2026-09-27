@@ -127,8 +127,8 @@ impl TrackerProber {
 mod tests {
     use super::*;
 
-    /// A tracker whose probe fails is left out, not ranked last (review
-    /// #47): the caller keeps the top of this list.
+    /// A tracker whose probe fails is left out, not ranked last: the caller
+    /// keeps the top of this list.
     #[tokio::test]
     async fn a_tracker_that_does_not_answer_is_not_ranked() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

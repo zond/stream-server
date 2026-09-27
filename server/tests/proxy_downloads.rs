@@ -559,11 +559,10 @@ fn a_request_that_names_no_source_is_refused() -> anyhow::Result<()> {
 }
 
 /// An unpin names a key, and only a key: 64 lowercase hex digits, the
-/// spelling the cache writes. `..` joins to a path whose parent is the
-/// proxy root, and deleting "its" files once took the whole torrent-data
-/// root with it; every other spelling is refused as well, and nothing
-/// outside the key directory -- nor the pinned download beside it -- is
-/// touched.
+/// spelling the cache writes. A key is validated before any delete, because
+/// `..` joins to a path whose parent is the proxy root; every other
+/// spelling is refused as well, and nothing outside the key directory --
+/// nor the pinned download beside it -- is touched.
 #[test]
 fn an_unpin_that_names_no_key_touches_nothing() -> anyhow::Result<()> {
     let origin = Origin::start(true)?;
@@ -618,9 +617,9 @@ fn an_unpin_that_names_no_key_touches_nothing() -> anyhow::Result<()> {
 }
 
 /// An origin that answers a fill with no bytes is asked again after the
-/// filler's retry wait, not at once: a stride that read nothing is a
-/// failure, and stepping `pos += 0` in a loop with no sleep spun one
-/// request after another at the origin for as long as the pin stood.
+/// filler's retry wait, not at once: a stride that reads nothing is a
+/// failure, and `pos += 0` in a loop with no sleep is a busy loop against
+/// the origin for as long as the pin stands.
 #[test]
 fn an_origin_that_answers_nothing_is_not_asked_in_a_loop() -> anyhow::Result<()> {
     let origin = Origin::start_stingy()?;

@@ -21,10 +21,8 @@ use crate::state::AppState;
 
 /// How the control routes authenticate. Media routes are always open.
 ///
-/// One variant, and every server has a token. There were two more --
-/// `Token(String)`, a token the caller chose, and `Disabled`, which opened
-/// every control route -- and both existed for the deleted daemon's command
-/// line (`--token`, `--no-auth`). An embedder has no command line: it reads
+/// One variant, and every server has a token: there is no way to choose one
+/// and no way to disable auth. An embedder has no command line: it reads
 /// the generated token off [`crate::ServerHandle::auth_token`] and attaches
 /// it, so a token it could pick itself buys nothing, and an open control API
 /// on a machine that also runs a browser is a hole no embedder asked for.
@@ -89,11 +87,10 @@ pub(crate) async fn require_bearer(
     req: Request,
     next: Next,
 ) -> Response {
-    // A state with no token used to mean "authentication is off, let
-    // everyone in" -- `ServerAuth::Disabled`, which is gone. `run` always
-    // sets one now, so this arm is only reachable from an `AppState` nobody
-    // filled in, and refusing is the safe way to be wrong about that: a bug
-    // in the wiring must not silently open the control API.
+    // `run` always sets a token, so this arm is only reachable from an
+    // `AppState` nobody filled in, and refusing is the safe way to be wrong
+    // about that: a bug in the wiring must not silently open the control
+    // API.
     let Some(expected) = state.auth_token.as_deref() else {
         return unauthorized();
     };

@@ -4,11 +4,11 @@
 //! ended and the only one that says how much of what was asked for actually
 //! left the server. It is read off real devices, so what its `reason` says
 //! is not a detail: a range delivered whole and a player that hung up
-//! part-way have to be told apart in a log nobody can reproduce. They were
-//! not -- every completed playback was filed as a `client-disconnect`,
-//! because hyper stops polling a body of declared length the moment that
-//! length is met and the body therefore never recorded an end (the same
-//! defect `/proxy` was born with; see `proxy_body_end.rs`).
+//! part-way have to be told apart in a log nobody can reproduce. Hyper
+//! stops polling a body of declared length the moment that length is met,
+//! so the body itself never signals an end, and the two cases need their
+//! own signal to stay apart (the same fact `/proxy` works around; see
+//! `proxy_body_end.rs`).
 //!
 //! So this asserts over the log file the field report is read from, with a
 //! real torrent fixture behind the route: a client that reads a whole file

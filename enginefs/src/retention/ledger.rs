@@ -21,9 +21,7 @@ use std::time::{Duration, Instant};
 /// Doubling how long something survives each time it is read again is what
 /// keeps a container index alive without anyone knowing where one is: an
 /// `mp4`'s `moov` is read at every seek, so it earns its place by being
-/// wanted rather than by being recognised. That is the whole of what
-/// replaces `STRUCTURAL_PIECES`, which reserved eight slots first-come and
-/// on the field's film gave one of them to ordinary `mdat`.
+/// wanted rather than by being recognised or reserved in advance.
 ///
 /// Bounded because the discount is exponential and a ceiling is the
 /// difference between "survives a long time" and "never leaves": ten
@@ -205,12 +203,9 @@ mod tests {
     /// **A piece read again survives longer, and nobody had to know what it
     /// was.**
     ///
-    /// This is what keeps an `mp4`'s `moov` alive: it is read at every seek,
-    /// so it earns its place by being wanted. What it replaces reserved
-    /// eight slots first-come, and on the field's film gave one of them to
-    /// ordinary media data in the middle of a second audio track, which
-    /// then survived every pass for the life of the entity while the real
-    /// index did not.
+    /// This is what keeps an `mp4`'s `moov` alive: read at every seek, it
+    /// earns its place by being wanted, without needing to be recognised or
+    /// reserved as a special piece.
     #[test]
     fn a_piece_read_again_and_again_outlives_one_read_once() {
         let t0 = Instant::now();

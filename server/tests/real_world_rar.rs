@@ -74,10 +74,9 @@ fn a_compressed_set_packed_by_somebody_else_is_refused_for_being_compressed() ->
     // Resolved here rather than by the server: archive.org answers
     // `/download/...` with a 302 to whichever storage node holds the item,
     // and what is under test is the reading of a RAR set, not our handling
-    // of somebody's redirect. (Worth knowing that it is not nothing: the
-    // first run of this test, handing the server the `/download/` URLs,
-    // came back `malformed` -- "archive.org answered 500 Internal Server
-    // Error to a ranged read".)
+    // of somebody's redirect. Worth doing regardless: the storage node can
+    // answer a ranged read with a 500, which the server reports as
+    // `malformed` and which says nothing about the reader.
     let following = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
@@ -101,11 +100,9 @@ fn a_compressed_set_packed_by_somebody_else_is_refused_for_being_compressed() ->
         .send()?;
 
     // The origin's own bad day is not a verdict on the reader. archive.org
-    // answers a burst of ranged reads with a 500 often enough that a test
-    // which called that `malformed` would be crying wolf: indexing four
-    // volumes is four bursts, and this test has had both answers from the
-    // same URL a minute apart. Said out loud and skipped, never passed
-    // quietly.
+    // answers a burst of ranged reads with a 500 often enough that calling
+    // that `malformed` would be crying wolf: indexing four volumes is four
+    // bursts. Said out loud and skipped, never passed quietly.
     let status = created.status();
     let body: serde_json::Value = created.json()?;
     if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY

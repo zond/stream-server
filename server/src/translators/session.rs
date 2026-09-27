@@ -2,13 +2,11 @@
 //! leaves behind and every response body reads from -- and the keyed map
 //! that hands them out and drops them when the viewer has moved on.
 //!
-//! **A session owns no file.** An archive session used to own a download
-//! under `<cacheRoot>/.archives` and one extraction per member beside it,
-//! and the sweep that took the session unlinked them. What is here instead
-//! is the container's [`Index`] and the [`ByteSource`]s it was read from,
-//! so what dropping one frees is memory. For a proxied URL it frees nothing
-//! at all: the bytes are the proxy cache's, under its own retention owner,
-//! exactly as if the player had fetched the file through `/proxy` itself.
+//! **A session owns no file.** What it holds is the container's [`Index`]
+//! and the [`ByteSource`]s it was read from, so dropping one frees only
+//! memory. For a proxied URL it frees nothing at all: the bytes are the
+//! proxy cache's, under its own retention owner, exactly as if the player
+//! had fetched the file through `/proxy` itself.
 //!
 //! A re-index after a drop is therefore a few small ranged reads, which
 //! the proxy cache answers from disk and a torrent from its piece store.
@@ -18,24 +16,20 @@
 //!
 //! A session is created by one request (`/create`) and read by others
 //! (`/stream/{key}/...`), so it has to outlive the request that made it,
-//! and nothing tells the server when the player is done with it. Until
-//! [`Sessions`] the answer was "never": the map was a plain `DashMap` with
-//! an `insert` and a `get` and no `remove` anywhere, so every play left
-//! behind whatever the session owned -- in those days a downloaded archive
-//! on disk -- for the life of the process.
+//! and nothing tells the server when the player is done with it:
+//! [`Sessions`] is what decides when one ends (below), rather than leaving
+//! every session for the life of the process.
 //!
 //! ## What ends a session: a *what*, not a *when*
 //!
-//! [`Sessions`] used to give a session a lifetime measured from its last
-//! use: ten idle minutes and it was swept. **That was a clock, and the
-//! retention design abolished clocks for exactly this question** -- see
-//! `enginefs::retention::live`, which says it plainly: "a stream that has
-//! stopped is not a stream that has been replaced. Pausing for an hour
-//! changes nothing on the disk; opening something else changes it at
-//! once." Torrent pieces and proxy ranges are kept while nothing else has
-//! become live and go the moment something has, bounded by the cache
-//! budget. A session is the index of the container those bytes are in, and
-//! it now has the same life:
+//! A session's lifetime is not a clock, for the same reason
+//! `enginefs::retention::live` gives none to a torrent piece or a proxy
+//! range: "a stream that has stopped is not a stream that has been
+//! replaced. Pausing for an hour changes nothing on the disk; opening
+//! something else changes it at once." Torrent pieces and proxy ranges are
+//! kept while nothing else has become live and go the moment something
+//! has, bounded by the cache budget. A session is the index of the
+//! container those bytes are in, and has the same life:
 //!
 //! * A session with a [`Lease`] out is in use and is never taken -- a route
 //!   keeps the lease inside the response body it is streaming, so a player
@@ -482,8 +476,9 @@ mod tests {
         Owned(dropped.clone())
     }
 
-    /// The old idle timeout, so the test that says time does not end a
-    /// session can say it in the units the clock was written in.
+    /// How long an idle-based sweep would wait before acting, so the test
+    /// below can advance the paused clock through many of these periods
+    /// and show nothing happens.
     const OLD_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
     /// **Time does not end a session.** Nothing reads this one, nothing
@@ -502,9 +497,10 @@ mod tests {
         let dropped = Arc::new(AtomicBool::new(false));
         drop(sessions.insert("paused".into(), session(&dropped)));
 
-        // Advanced in the janitor's old period, so a sweep on a timer
-        // would have run its ticks rather than been skipped over by one
-        // long jump of the paused clock.
+        // Advanced in ten-minute steps -- the period an idle-based sweep
+        // would tick on -- so such a sweep would have run repeatedly
+        // rather than being skipped over by one long jump of the paused
+        // clock.
         for _ in 0..(24 * 4) {
             tokio::time::sleep(OLD_IDLE_TIMEOUT).await;
         }

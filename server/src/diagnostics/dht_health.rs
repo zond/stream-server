@@ -2,9 +2,8 @@
 //!
 //! ## Why this exists
 //!
-//! On a real Android phone (motorola edge 60 pro, Android 16, mobile data)
-//! every DHT bootstrap host failed for a whole 28-minute session, and
-//! librqbit said so on every retry:
+//! A DHT-hostile network makes every bootstrap host fail for the whole of a
+//! session, and librqbit says so on every retry:
 //!
 //! ```text
 //! WARN librqbit_dht::dht: error in bootstrap: no successful lookups, 0 errors retry_in=1.7s addr="router.bittorrent.com:6881"
@@ -13,8 +12,9 @@
 //! That line comes from `bootstrap_hostname_with_backoff`
 //! (`crates/dht/src/dht.rs`), whose `backon` retry notifier logs at WARN on
 //! *every* attempt, with a delay that grows to ~120 s and a total budget of
-//! 24 hours -- so a DHT-hostile network produces hundreds of identical
-//! warnings and no conclusion. Worse, the message is misleading:
+//! 24 hours -- so a 28-minute session on such a network produces hundreds
+//! of identical warnings and no conclusion (measured on a real device on
+//! mobile data). Worse, the message is misleading:
 //! `bootstrap_hostname` runs the v4 and v6 lookups and returns `v4.or(v6)`,
 //! and `Result::or` *discards* the v4 error whenever v4 failed. The bootstrap
 //! hosts have no `AAAA` records, so the v6 branch starts with an empty
@@ -33,7 +33,7 @@
 //! within [`BOOTSTRAP_GRACE`], INFO if it recovers after that. Every other
 //! sample is a debug line. The per-retry librqbit warnings are turned down to
 //! their own level in `DEFAULT_LOG_FILTER` (`crate::DEFAULT_LOG_FILTER`),
-//! since this is now the thing that reports the state.
+//! since this is the thing that reports the state.
 //!
 //! The same state is served to clients as
 //! [`crate::ServerHandle::dht_status`], so a client can say "DHT unavailable,
@@ -217,8 +217,8 @@ mod tests {
     fn an_unreachable_dht_warns_once_not_every_sample() {
         let mut reporter = DhtHealthReporter::default();
         let mut reports = Vec::new();
-        // 28 minutes of samples at the real poll interval -- the length of
-        // the field session that prompted this.
+        // 28 minutes of samples at the real poll interval: long enough to
+        // prove a dead DHT stays a single warning, not one per retry.
         let samples = (28 * 60) / POLL_INTERVAL.as_secs();
         for tick in 0..samples {
             let since_start = POLL_INTERVAL * tick as u32;

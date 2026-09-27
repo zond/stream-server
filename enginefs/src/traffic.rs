@@ -13,12 +13,12 @@
 //!
 //! # Why the connection's own counters
 //!
-//! The first version of this counted bytes through the torrent storage, on
-//! the grounds that a peer's request and a download's write both cross it.
-//! So does librqbit's initial check: every restored torrent is read back off
-//! the local disk at every startup to be hashed, persistence is on, and the
-//! light came on in a session with no network at all. A reading of the disk
-//! cannot be a reading of the connection. What can is what librqbit already
+//! Not counted through the torrent storage, though a peer's request and a
+//! download's write both cross it: so does librqbit's initial check --
+//! every restored torrent is read back off the local disk at every startup
+//! to be hashed, persistence is on, and the light would come on in a
+//! session with no network at all. A reading of the disk cannot be a
+//! reading of the connection. What can is what librqbit already
 //! counts per torrent for exactly this purpose -- bytes received from peers
 //! and bytes sent to them, [`crate::backend::TransferTotals`] -- summed over
 //! the torrents that exist and compared against an earlier reading of the

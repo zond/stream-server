@@ -86,8 +86,8 @@ pub struct LocalIpv4Interface {
 /// never grows a second copy of it. [`network_info`] applies its own
 /// loopback filter on top: `GET /network-info` advertises the addresses a
 /// *remote* client could use, while a caller matching an interface against a
-/// peer's subnet needs the loopback entries too. An enumeration failure is an
-/// empty list, exactly as it was for `/network-info` before.
+/// peer's subnet needs the loopback entries too. An enumeration failure is
+/// an empty list.
 pub fn local_ipv4_interfaces() -> Vec<LocalIpv4Interface> {
     if_addrs::get_if_addrs()
         .unwrap_or_default()
@@ -144,10 +144,9 @@ pub struct ServerSettings {
     /// free-space ladder and the diagnostics all read the live root from
     /// the engine (`state.engine.download_dir`).
     ///
-    /// It replaces `downloadsDir`, which was a second location for pinned
-    /// downloads. There is no second location: a pin does not move a
-    /// torrent, so a root that only pinned data went to had nothing to
-    /// hold.
+    /// There is no second location for pinned downloads: a pin does not
+    /// move a torrent, so a root that only pinned data went to would have
+    /// nothing to hold.
     #[serde(rename = "cacheRoot")]
     pub cache_root: String,
     // Option<f64> matches stremio-core's Settings.cache_size
@@ -323,11 +322,9 @@ pub struct ServerSettings {
 ///
 /// This is the only root there is: the piece store, the session's records
 /// and the proxy cache all live under it, and it is the one volume the cap
-/// is a statement about. It used to have a companion, `downloadsDir`, which
-/// was refused at or above a cache root -- a free-space cap is a statement
-/// about *one* volume, and a second root above the first would have put a
-/// tree the engine does not own inside the figure. With one root there is
-/// nothing for it to be above.
+/// is a statement about. There is no second root: a free-space cap is a
+/// statement about *one* volume, and a second root above the first would
+/// put a tree the engine does not own inside the figure.
 ///
 /// Checked before it is created, so a refused setting leaves no directory
 /// behind; and resolved before it is returned, because the stored value is
@@ -1067,18 +1064,12 @@ pub async fn set_settings(
 /// recognise; `501` is the honest "this server, no". Keeping it also keeps
 /// our fork of core rebasable -- nothing there has to be patched out.
 ///
-/// What it used to do was fetch a certificate for the caller's `ipAddress`
-/// from Stremio's API with their `authKey`, write it to the config dir, and
-/// start an HTTPS listener to serve it on. An *embedded* server has no HTTPS
-/// endpoint to give: it binds loopback inside a host process, the remote
-/// address a certificate would be for belongs to the host, and the listener
-/// that served one is gone (`ServerConfig::https_addr` with it). This was
-/// already the only answer xtremio ever saw, since it configured no HTTPS
-/// address; now it is the only answer there is.
+/// An *embedded* server has no HTTPS endpoint to give: it binds loopback
+/// inside a host process, and the remote address a certificate would be for
+/// belongs to the host, not this server.
 ///
-/// No parameters are read, so nothing is validated and no network call is
-/// made -- and no private key is written for a listener that can never run,
-/// which is what an earlier version of this route did.
+/// No parameters are read, so nothing is validated, no network call is
+/// made, and no private key is written.
 pub async fn get_https() -> impl IntoResponse {
     (
         StatusCode::NOT_IMPLEMENTED,

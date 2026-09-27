@@ -38,8 +38,7 @@ const ANONYMOUS_USER: &str = "anonymous";
 const ANONYMOUS_PASSWORD: &str = "anonymous";
 
 /// The ports the two schemes mean when the URL names none: 21 for FTP, and
-/// 990 for the implicit TLS `ftps://` asks for -- the same pair `curl`
-/// applied, since this route used to be `curl`.
+/// 990 for the implicit TLS `ftps://` asks for.
 const DEFAULT_FTP_PORT: u16 = 21;
 const DEFAULT_FTPS_PORT: u16 = 990;
 
@@ -72,12 +71,9 @@ async fn stream_ftp(Path(filename): Path<String>, Query(params): Query<FtpQuery>
 
     // Only what the route is named for. This route is open to any loopback
     // caller -- on Android, every app on the device -- so the URL decides
-    // what this server will go and fetch on a stranger's behalf. Back when
-    // the fetch was a spawned `curl`, that meant every scheme curl has:
-    // `file:///<data dir>/settings.json` streamed the proxy password to
-    // whoever asked. The fetch speaks FTP and nothing else now, and the
-    // check stays anyway, because a URL of another scheme reaching an FTP
-    // client is a request nobody meant.
+    // what this server will fetch on a stranger's behalf. The fetch speaks
+    // FTP and nothing else, and the scheme check enforces that: a URL of
+    // another scheme reaching an FTP client is a request nobody meant.
     let target = match ftp_target(&body.ftp_url) {
         Ok(target) => target,
         Err(refusal) => return (StatusCode::BAD_REQUEST, refusal).into_response(),
@@ -85,11 +81,10 @@ async fn stream_ftp(Path(filename): Path<String>, Query(params): Query<FtpQuery>
 
     let data = match open_transfer(&target).await {
         Ok(data) => data,
-        // The origin's failure, which is the caller's to hear as one. `curl`
-        // could not report it: its exit code arrived long after the response
-        // head had gone out, so a dead host, a refused login and a missing
-        // file were all a `200` with nothing in it. The transfer is opened
-        // here before a single header is written, so the three are a status.
+        // The origin's failure, which the caller hears as one: the transfer
+        // is opened here before a single header is written, so a dead host,
+        // a refused login and a missing file are a status rather than a
+        // `200` with nothing in it.
         Err(e) => {
             // The origin only: an FTP URL carries its login as `user:password@`.
             tracing::debug!(
@@ -139,12 +134,10 @@ struct FtpTarget {
 
 /// The FTP fetch `url` describes, or why there is not one.
 ///
-/// **The scheme is matched by allow-list**, as it was when the fetch was a
-/// spawned `curl` and the list was the only thing between an unauthenticated
-/// caller and every scheme curl knows. It is not merely a leftover: it is
-/// what keeps the route to what it is named for, and it refuses HTTP(S) too
-/// -- a caller with an HTTP URL has `/proxy`, which is built to be handed
-/// one. The `://` is required rather than taken from the parser, so
+/// **The scheme is matched by allow-list**: it keeps the route to what it
+/// is named for, and it refuses HTTP(S) too -- a caller with an HTTP URL
+/// has `/proxy`, which is built to be handed one. The `://` is required
+/// rather than taken from the parser, so
 /// `ftp:host`, which has no host part, is refused here and not later.
 ///
 /// Everything after the scheme is `url`'s parse and not a split of our own:
@@ -214,8 +207,7 @@ fn decoded(component: &str) -> String {
 /// The control connection is not returned: the transfer stream holds a share
 /// of it, so it lives exactly as long as the body being read from it, and
 /// dropping the client here sends no `QUIT`. A body the player abandons
-/// mid-film therefore closes both sockets when the response is dropped,
-/// which is what the killed `curl` did.
+/// mid-film therefore closes both sockets when the response is dropped.
 async fn open_transfer(target: &FtpTarget) -> Result<Pin<Box<dyn AsyncRead + Send>>, FtpError> {
     open_transfer_with(target, tls_config()).await
 }
@@ -232,8 +224,8 @@ async fn open_transfer_with(
     if target.secure {
         let connector = AsyncRustlsConnector::from(tokio_rustls::TlsConnector::from(tls));
         // Implicit TLS from the first byte, on 990 unless the URL says
-        // otherwise, which is what `ftps://` means to every client that has
-        // the scheme -- `curl` included, which is what this replaced.
+        // otherwise -- what `ftps://` means to every client that has the
+        // scheme.
         let mut ftp =
             AsyncRustlsFtpStream::connect_secure_implicit(&addr, connector, &target.host).await?;
         ftp.login(&target.user, &target.password).await?;
@@ -258,9 +250,7 @@ async fn open_transfer_with(
 /// own store, and this does not, because those anchors are held there as
 /// opaque `reqwest::Certificate`s that a `rustls::RootCertStore` cannot be
 /// given. A device-installed CA is therefore trusted for HTTPS and not for
-/// FTPS; `curl` trusted the platform store for both, so that is the one
-/// thing this rewrite narrows, and it narrows towards the workspace's own
-/// stated policy rather than away from it.
+/// FTPS -- narrower than the rest of the workspace, and deliberate.
 ///
 /// Built once for the life of the process: parsing ~150 roots per request
 /// is what the laziness is for, and the config is immutable and shared.
@@ -289,11 +279,10 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
 
-    /// What the route is named for goes through; nothing else does. The
-    /// fetch is an FTP client now, so another scheme reaching it is a
-    /// request nobody meant -- and it was worse than that while the fetch
-    /// was a spawned `curl`: `file://` read the settings file, and the
-    /// proxy password in it, to any app on the device.
+    /// What the route is named for goes through; nothing else does -- a URL
+    /// of another scheme reaching the FTP client is a request nobody meant,
+    /// and `file://` would read the settings file, and the proxy password
+    /// in it, to any app on the device.
     #[test]
     fn only_ftp_and_ftps_are_fetched() {
         assert_eq!(
@@ -326,10 +315,9 @@ mod tests {
         );
     }
 
-    /// A URL that begins with `-` is refused by the scheme check, which is
-    /// the whole of what is needed now: nothing is spawned, so there is no
-    /// argument vector for a URL to be read as a flag in. (There used to be
-    /// a `--` terminator in front of it for exactly that.)
+    /// A URL that begins with `-` is refused by the scheme check: nothing is
+    /// spawned, so there is no argument vector for a URL to be read as a
+    /// flag in.
     #[test]
     fn the_url_can_no_longer_be_an_option() {
         assert!(ftp_target("-o/tmp/owned").is_err());
@@ -340,8 +328,8 @@ mod tests {
         );
     }
 
-    /// The parts of the URL that decide where the bytes come from, since
-    /// this is what the spawned `curl` used to work out for itself.
+    /// The parts of the URL that decide where the bytes come from: host,
+    /// port, login and path.
     #[test]
     fn a_url_says_the_port_the_login_and_the_path() {
         let explicit = ftp_target("ftp://user:pa%20ss@host:2121/dir/The%20Film.mkv").unwrap();
@@ -394,11 +382,10 @@ mod tests {
     /// A one-transfer FTP server: enough of the protocol for one `RETR`,
     /// and a switch for the two ways a real one refuses.
     ///
-    /// It exists because the transfer path had no test at all while it was
-    /// a spawned `curl` -- a test would have had to put a real `curl` and a
-    /// real FTP server on the machine running it. With the client in the
-    /// process, the server is forty lines of `TcpStream`, and what this
-    /// route does with a login it is refused, or a file that is not there,
+    /// It exists so the transfer path has a real server to test against
+    /// in-process, without depending on one already on the machine running
+    /// it: the server is forty lines of `TcpStream`, and what this route
+    /// does with a login it is refused, or a file that is not there,
     /// becomes something a test can state.
     #[derive(Clone, Copy)]
     enum Behaviour {
@@ -584,8 +571,7 @@ mod tests {
     }
 
     /// The bytes the server sends are the bytes the reader gets, in order
-    /// and whole -- the one thing this route exists to do, and the one
-    /// thing nothing could assert while it was a subprocess.
+    /// and whole -- the one thing this route exists to do.
     #[tokio::test]
     async fn a_transfer_delivers_the_file() {
         let addr = ftp_server(Behaviour::Serve(b"a film, in bytes")).await;
@@ -622,8 +608,7 @@ mod tests {
 
     /// The `ftps://` half, end to end: implicit TLS on the control channel
     /// from the first byte, the data connection wrapped in TLS as well, and
-    /// the same bytes out the other side. It is the one path `curl` used to
-    /// own that nothing here could see, and the client verifies the server's
+    /// the same bytes out the other side. The client verifies the server's
     /// chain -- `trusting` gives it that server's anchor and nothing else,
     /// so a handshake that skipped verification would fail this too.
     #[tokio::test]
@@ -651,7 +636,6 @@ mod tests {
         assert!(open_transfer(&target(missing, "/film.mkv")).await.is_err());
         // Both are the route's `502`, which
         // `an_origin_that_refuses_is_a_bad_gateway` states for the second.
-        // Together they are what `curl` could not tell anybody at all.
     }
 
     /// What the response head carries, which is what a player reads before
@@ -684,9 +668,9 @@ mod tests {
         );
     }
 
-    /// An origin that refuses reaches the caller as a `502`, where the
-    /// spawned `curl` could only ever have sent a `200` with an empty body:
-    /// its exit code arrived after the head had gone out.
+    /// An origin that refuses reaches the caller as a `502`, not a `200`
+    /// with an empty body: the transfer opens, and can fail, before any
+    /// header is written.
     #[tokio::test]
     async fn an_origin_that_refuses_is_a_bad_gateway() {
         let addr = ftp_server(Behaviour::NoSuchFile).await;

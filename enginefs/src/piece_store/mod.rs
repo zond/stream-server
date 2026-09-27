@@ -101,24 +101,21 @@
 //! order and, on the first read error in a file, marks the rest of that file
 //! not-have without reading it. A sparsely populated cache -- which is the
 //! normal state here -- would report the pieces before the first gap and
-//! nothing after it. The fork's answer is that the have-set no longer comes
-//! from a read-everything pass: it is the resume bitfield intersected with
-//! [`librqbit::storage::TorrentStorage::has_piece`], asked of the storage, and
-//! [`store::PieceStore`] answers it. A read of an absent piece still has to
-//! fail ([`store::MissingPiece`]) rather than return zeroes, or a hash check
-//! would call a hole a verified piece, and it does.
+//! nothing after it. The have-set instead is the resume bitfield intersected
+//! with [`librqbit::storage::TorrentStorage::has_piece`], asked of the
+//! storage, and [`store::PieceStore`] answers it. A read of an absent piece
+//! still has to fail ([`store::MissingPiece`]) rather than return zeroes, or
+//! a hash check would call a hole a verified piece, and it does.
 //!
 //! **Settled: persistence, and why "default" is the only place this can go.**
-//! `JsonSessionPersistenceStore::update_db` used to refuse a torrent whose
-//! storage factory was not `FilesystemStorageFactory`, and this session runs
-//! with persistence on (`LibrqbitBackend::new` hands it
-//! `SessionPersistenceConfig::Json`), so an add with this factory failed
-//! outright. What that refusal was really about is what the record omits: a
-//! `SerializedTorrent` names an output folder and a file selection and no
+//! A `SerializedTorrent` names an output folder and a file selection and no
 //! storage at all, so a restart replays it onto the session's *default*
-//! factory. At the rev this crate pins the type check is gone and in its
-//! place is a `StorageFactory::ensure_persistable` promise -- a restart finds
-//! this data again, and the have-bitfield will not outlive it.
+//! factory -- which is why this store can only work as the default. This
+//! session runs with persistence on (`LibrqbitBackend::new` hands it
+//! `SessionPersistenceConfig::Json`), and
+//! `JsonSessionPersistenceStore::update_db` requires the factory to make a
+//! `StorageFactory::ensure_persistable` promise: a restart finds this data
+//! again, and the have-bitfield will not outlive it.
 //!
 //! [`store::PieceStoreFactory`] makes that promise
 //! (its `StorageFactory` impl in [`store`]) and may only make it
@@ -156,27 +153,23 @@
 //! of byte with no owner and no deleter is how a disk becomes unbounded,
 //! and the launch is this one's deleter.
 //!
-//! Nothing else has a stake in the default factory. The client's activity
-//! signal briefly did -- its counters were a storage wrapper around the
-//! default, and this store would have had to go inside it -- until that
-//! wrapper counted the initial check's read-back of every restored torrent
-//! as traffic. The signal now reads librqbit's own peer counters
-//! ([`crate::traffic`]) and never sees the storage, so this factory is the
-//! bare default, and its own initial-check reads are nobody's traffic.
+//! Nothing else has a stake in the default factory: the client's activity
+//! signal reads librqbit's own peer counters ([`crate::traffic`]) and never
+//! sees the storage, so this factory is the bare default, and its own
+//! initial-check reads are nobody's traffic.
 //!
 //! **Settled: a have-bit that is not an announcement.** [`policy`] decides
 //! that only the committed set is advertised and that a window piece is held
-//! and readable and *not* announced. That used to be inexpressible: `have`
-//! implied announced on both paths -- the `have` broadcast and the handshake
-//! bitfield, which serialises `get_have_pieces()` whole -- and a window piece
-//! has to be `have` for the stream to read it, while `drop_pieces` gives
-//! *not* have, not wanted, not advertised. The fork's
-//! `ManagedTorrent::set_pieces_advertised` is the third state: a suppression
-//! set on the chunk tracker, independent of both the have-set and the reclaim
-//! want-set, and settable before a piece is downloaded, which is the only
-//! ordering under which no Have ever goes out for a window piece.
-//! [`crate::retention`] is the wiring, and it is why the policy is no longer
-//! a decision nothing performs.
+//! and readable and *not* announced. `ManagedTorrent::set_pieces_advertised`
+//! is the fork's third state, independent of both the have-set and the
+//! reclaim want-set: a suppression set on the chunk tracker, settable before
+//! a piece is downloaded, which is the only ordering under which no Have
+//! ever goes out for a window piece. Without it, `have` implies announced on
+//! both paths -- the `have` broadcast and the handshake bitfield, which
+//! serialises `get_have_pieces()` whole -- and a window piece has to be
+//! `have` for the stream to read it, while `drop_pieces` gives *not* have,
+//! not wanted, not advertised. [`crate::retention`] is the wiring that
+//! performs the policy.
 //!
 //! All three are exercised rather than assumed. The storage is driven through
 //! a real librqbit session's own initial check below, and through a real
@@ -221,8 +214,9 @@ pub(crate) const PIECE_STORE_DIR: &str = ".pieces";
 ///
 /// Crate-private, and reached from outside only through
 /// [`store::StoreRoot::in_download_dir`]: naming the store is the one thing
-/// a caller needs, and giving it the *path* is how the directory shape
-/// escaped into the `server` crate's cache cleaner in the first place.
+/// a caller needs, and handing out the *path* instead is how the directory
+/// shape leaks into a walker outside this module that has no business
+/// depending on it.
 pub(crate) fn root_in(download_dir: &std::path::Path) -> std::path::PathBuf {
     download_dir.join(PIECE_STORE_DIR)
 }

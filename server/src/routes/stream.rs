@@ -30,20 +30,15 @@ static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
 /// How often an open stream reports what the torrent is doing.
 ///
-/// Only while a body is open: the owner's capture of four stalling streams
-/// had nothing between "response ready" and silence, so there was no way to
-/// tell a dead swarm from a slow one, or either from a window waiting on a
-/// piece bigger than itself.
+/// Only while a body is open, so a dead swarm can be told from a slow one,
+/// and either from a window waiting on a piece bigger than itself.
 ///
-/// Five seconds, not the one it was. This is the loudest emitter in the
-/// process and it is per open response, so on a film with two tracks being
-/// read it alone is two lines a second -- and the diagnostics report a
-/// tester actually sends back is a 400-line ring, which at that rate holds
-/// between eighty seconds and two minutes. Every report of a stall arrived
-/// containing the two minutes *after* the interesting part, with the
-/// start-up it was opened to explain already evicted. A stall is not a
-/// second-by-second phenomenon and nothing here was ever read at that
-/// resolution.
+/// Five seconds: this is the loudest emitter in the process and it is per
+/// open response, so on a film with two tracks being read it alone is two
+/// lines a second, and the diagnostics report a tester sends back is a
+/// 400-line ring -- which at that rate holds between eighty seconds and two
+/// minutes. A stall is not a second-by-second phenomenon, and this keeps
+/// its start-up context from being evicted before anyone reads it.
 const STREAM_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Log what the torrent behind an open stream is doing, once every
@@ -82,8 +77,7 @@ fn spawn_stream_progress_log(
                 // Addresses queued, being dialled, seen and known against
                 // the peers connected: a slow start with few peers is
                 // either nothing found or nothing answering, and these say
-                // which. (`connection_tries` used to be here; the backend
-                // never counted it, so it read 0 on every line.)
+                // which.
                 queued = stats.queued,
                 connecting = stats.peer_discovery.connecting,
                 unique = stats.unique,
@@ -117,27 +111,22 @@ struct StreamLifecycleGuard {
 
 impl StreamLifecycleGuard {
     /// Register the stream and take ownership of ending it, with no await
-    /// in between.
+    /// in between: a cancel can only land at an await, so a gap here -- the
+    /// handler's future dropped after the stream is registered but before
+    /// anything owns ending it, which is how every one of these handlers
+    /// ends when a player closes the connection -- would leave
+    /// `active_streams` and `active_file_streams` up for the life of the
+    /// process, `playback_is_live` reading a player for ever, the session
+    /// uploading with sharing off, and the sweep never removing the engine.
     ///
-    /// These were two statements in the handler with two more awaits
-    /// between them, and the gap was a leak with no floor under it. A
-    /// registered stream is ended by exactly one thing -- this guard's
-    /// `on_stream_end` -- and until the guard exists there is nothing to
-    /// end it; drop the handler's future in the gap, which is how every
-    /// one of these handlers ends when a player closes the connection, and
-    /// `active_streams` and `active_file_streams` stay up for the life of
-    /// the process. `playback_is_live` then reads a player for ever, so
-    /// with sharing off the session uploads all the same, and the sweep
-    /// never removes the engine.
-    ///
-    /// The handover is what this function is: `on_stream_start_unreconciled`
+    /// A registered stream is ended by exactly one thing -- this guard's
+    /// `on_stream_end` -- and until the guard exists there is nothing to end
+    /// it. The handover is what this function is: `on_stream_start_unreconciled`
     /// undoes its own registration if it is dropped before it returns (see
     /// `BackendEngineFS::on_stream_start`), and from the instant it does
     /// return the guard owns it. Putting the two in one function with no
-    /// `.await` between them is what leaves no third state -- a cancel can
-    /// only land at an await, so there is no point at which a registration
-    /// exists that neither side is holding. Written out in the handler it
-    /// was a comment asking the next reader not to reorder them.
+    /// `.await` between them is what leaves no third state: a registration
+    /// neither side is holding.
     async fn start(
         engine: Arc<enginefs::EngineFS>,
         info_hash: String,
@@ -377,14 +366,10 @@ impl PlaybackQuery {
 /// What a read is for, from the one thing the request really says: whether
 /// it is a download.
 ///
-/// **The range is not read at all any more.** Its offset and length used to
-/// be classified into eight intents -- a first read, a seek, a sequential
-/// read, a crawl over the container index at the tail
-/// (`is_container_metadata_request`) -- each with a read-ahead window of
-/// its own, and one of them telling the retention which reader was the
-/// viewer. Every one of those questions is now answered by watching what
-/// the reads do, so this is down to the one bit a read cannot be watched
-/// into telling us: whether anybody is waiting for these bytes at a rate.
+/// **The range is not read at all.** What a read is for is answered by
+/// watching what the reads do, not by classifying the request; this is down
+/// to the one bit a read cannot be watched into telling us: whether anybody
+/// is waiting for these bytes at a rate.
 fn playback_intent_for_request(is_download: bool) -> Fetching {
     if is_download {
         Fetching::Download
@@ -478,12 +463,6 @@ pub fn pretend_available_space_readings(root: impl Into<std::path::PathBuf>, rea
 /// The free space of the volume under `path`: the cap's own reading
 /// ([`crate::cache_budget::available_space`], one `statvfs` of the path), or
 /// what a test declared for it.
-///
-/// It used to match the path against `sysinfo`'s list of every mounted
-/// volume, refreshed per request behind a 3-second cache -- a different
-/// syscall from the cap's, a sweep that cost enough to need the cache, and a
-/// cache the gate then had to forget after freeing space. One `statvfs`
-/// needs none of that.
 fn available_space_for_path(path: &FsPath) -> Option<u64> {
     if let Some(overrides) = DISK_SPACE_OVERRIDES.get()
         && let Ok(mut overrides) = overrides.lock()
@@ -511,26 +490,19 @@ fn available_space_for_path(path: &FsPath) -> Option<u64> {
 /// CACHE_FREE_SPACE_FLOOR` is the free-space arm of
 /// `enginefs::reconcile::desired` written out, so the route refuses exactly
 /// the request whose torrent the reconciler would stop -- and, just as
-/// importantly, refuses nothing else. It used to be two lines with one
-/// name: a partial request needed `min(requested, floor)` free and a whole
-/// download needed `remaining + floor`, so the check could pass a request
-/// the engine layer was about to stop, and fail one it would have been
-/// happy to run. A `?download=1` of a film larger than the volume is no
-/// longer refused up front by this; it starts, fills to the floor, and is
-/// stopped there like anything else, which is the same answer arrived at by
-/// the one policy instead of by a second one that only this route knew
-/// about. (The offline-download path keeps a whole-file check of its own,
-/// where it can refuse *before* anything is downloaded --
-/// `enginefs::free_space_allows` in `pin_download`.)
+/// importantly, refuses nothing else. A `?download=1` of a film larger than
+/// the volume is not refused up front: it starts, fills to the floor, and is
+/// stopped there like anything else, the one policy's answer rather than a
+/// second one only this route knew about. (The offline-download path keeps a
+/// whole-file check of its own, where it can refuse *before* anything is
+/// downloaded -- `enginefs::free_space_allows` in `pin_download`.)
 ///
 /// A volume that cannot be probed is an error here rather than a pass,
 /// unlike in the reconciler: this runs before a byte is written, and the
 /// caller retries once the volume has been probed again.
 ///
-/// It writes nothing. It used to write and unlink a `.write-test` file on
-/// every request and every seek, a create and a delete on the device the
-/// check is about, to ask whether the root was writable -- which librqbit's
-/// own first write answers anyway, and which is not what the floor is for.
+/// It writes nothing: librqbit's own first write is what tests whether the
+/// root is writable, which is not what the floor is for.
 fn ensure_download_disk_ready(root: &FsPath) -> Result<(), String> {
     std::fs::create_dir_all(root).map_err(|e| {
         format!(
@@ -570,15 +542,9 @@ fn ensure_download_disk_ready(root: &FsPath) -> Result<(), String> {
 /// slack, the volume is read again, and a `507` if it is still short. `Err`
 /// is the status and body to answer.
 ///
-/// This used to "degrade the request to memory-only" by re-selecting
-/// `state.engine` -- which was the engine it already had: there was a
-/// second field holding the same `Arc`, librqbit sessions always persist to
-/// disk, and there is no memory-only storage anywhere in this server (the
-/// second field is gone; see `run()`). So the fallback re-fetched
-/// the same torrent from the same engine, labelled the log
-/// `memoryOnlyLowDiskFallback`, and streamed to the disk the check had just
-/// refused; the floor degraded nothing and the torrent ran on until
-/// librqbit's ENOSPC fatal error, exactly as if the check did not exist.
+/// **There is no memory-only fallback.** librqbit sessions always persist to
+/// disk and this server has no memory-only storage anywhere, so a disk that
+/// is not ready must be refused, never relabelled and streamed to anyway.
 ///
 /// Refusing at once is not right either, on the device the floor is about.
 /// **This request has just made its predecessor disposable** -- the stream
@@ -691,8 +657,8 @@ async fn ensure_disk_ready_or_refuse(
 /// cheap question has already refused. A torrent the reconciler is holding
 /// stopped for want of space is answered from the reading it took, and a
 /// player retrying that stream four times a second is what the order is
-/// worth. Written as a `match` over a tuple, both were evaluated -- the
-/// ordering the comment claimed was not the ordering the code had.
+/// worth. Not a `match` over a tuple: that evaluates both arms and undoes
+/// the ordering.
 async fn first_complaint<P, F>(stopped_for_space: bool, probe: P) -> Option<String>
 where
     P: FnOnce() -> F,
@@ -1053,12 +1019,12 @@ async fn stream_video_with(
     // **Before the gate, and that is the point.** Registering the stream
     // is what makes the file the viewer just left slack, and a slack entity
     // is bytes this server is about to give back. Asking "is there room?"
-    // first asked it of a volume still holding the previous film, so a
-    // switch on a full disk answered `507` for space that was already
-    // ours -- and the refusal took the registration down with it, so the
-    // next attempt asked the same stale question. A refused request still
-    // moved the live entity, which is right: the viewer really has left the
-    // old one.
+    // first would ask it of a volume still holding the previous film, so a
+    // switch on a full disk would answer `507` for space that is already
+    // ours -- and refusing before registering would leave nothing
+    // registered, so the next attempt would ask the same stale question. A
+    // refused request still moves the live entity, which is right: the
+    // viewer really has left the old one.
     let lifecycle =
         StreamLifecycleGuard::start(engine_fs.clone(), info_hash.clone(), idx, stream_id).await;
     if let Err(refusal) = ensure_disk_ready_or_refuse(
@@ -1082,22 +1048,15 @@ async fn stream_video_with(
     let playback_intent = playback_intent_for_request(is_download);
     // **Always on, unlike the retention trace.** What the player actually
     // asked for, before anything here interprets it: two lines per range
-    // request, which is the order every field log so far has been read in
-    // -- the seeks, the tail crawl, the stall boundaries -- and the frame
-    // the retention trace's lines are placed into when that is on.
+    // request, which is the frame every field log is read against -- the
+    // seeks, the tail crawl, the stall boundaries -- and the frame the
+    // retention trace's lines are placed into when that is on.
     //
     // `intent` is *our* label -- `playback_intent_for_request` derives it
     // from the download flag. A player says nothing of the kind;
     // it sends a byte range. So the range itself is logged beside the label,
     // because a question about what a player is doing cannot be answered by
     // reading back our own guess about it.
-    //
-    // What this is here to identify: a reader that spent the whole of the
-    // 2026-09-12 20:49 session reopening once a second at
-    // `file_size - 25,961,713`, taking about 41 kB and advancing some sixty
-    // bytes. That offset is 15.2 MB *before* this file's `moov`, so it is
-    // inside `mdat` -- media data, not the container index this module has
-    // been calling it.
     tracing::info!(
         stream_id,
         info_hash = %info_hash,
@@ -1503,12 +1462,10 @@ mod tests {
         assert_eq!(active_readers.load(Ordering::SeqCst), 0);
     }
 
-    /// **The gate writes nothing.** It asks the volume for its free space
-    /// and nothing else: a root this process cannot create a file in passes
-    /// on its room, where the per-request `.write-test` it used to write
-    /// refused it (and cost a create and an unlink on the very device being
-    /// asked about, every request and every seek). A process that can write
-    /// anywhere -- root -- proves nothing here, and the test says so.
+    /// **The gate writes nothing.** It asks the volume for its free space and
+    /// nothing else, so a root this process cannot create a file in still
+    /// passes on its room. A process that can write anywhere -- root --
+    /// proves nothing here, and the test says so.
     #[cfg(unix)]
     #[test]
     fn the_floor_check_writes_nothing_to_the_root() {
@@ -1536,10 +1493,10 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_check_runs_off_the_async_worker_via_spawn_blocking() {
-        // stream_video now dispatches the blocking fs probes onto the blocking
-        // pool rather than running them inline on a runtime worker. Exercise that
-        // exact path: the closure must be Send + 'static and produce the same
-        // result it would when called directly.
+        // stream_video dispatches the blocking fs probes onto the blocking
+        // pool rather than running them inline on a runtime worker. Exercise
+        // that exact path: the closure must be Send + 'static and produce the
+        // same result it would when called directly.
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().to_path_buf();
         let readiness = tokio::task::spawn_blocking(move || ensure_download_disk_ready(&root))
@@ -1552,10 +1509,10 @@ mod tests {
     /// player's read is a player's read wherever in the file it lands.**
     ///
     /// mpv's index crawler and a viewer seeking into the last minutes of a
-    /// film both arrive as `Range: bytes=X-` over the same bytes; the
-    /// geometry that used to separate them separated them wrongly about as
-    /// often as rightly. The detector prices them apart by what they
-    /// consume -- 91 B/s against 1.2 MB/s in the field log of 2026-09-14.
+    /// film both arrive as `Range: bytes=X-` over the same bytes, and
+    /// geometry alone cannot tell them apart reliably. The detector prices
+    /// them apart by what they consume instead -- measured at 91 B/s against
+    /// 1.2 MB/s.
     #[test]
     fn what_a_read_is_for_is_who_asked_and_not_what_it_asked_for() {
         let file_size: u64 = 10 * 1024 * 1024 * 1024;

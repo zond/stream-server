@@ -248,8 +248,8 @@ mod tests {
         reader.read_exact(&mut read).await.unwrap();
         assert_eq!(read, [10, 11, 12, 13, 14, 15, 16, 17]);
 
-        // Backwards, which is what a format parser does and what the old
-        // forward-only reader could not answer at all.
+        // Backwards too: a format parser seeks freely, and a forward-only
+        // reader would fail here.
         reader.seek(io::SeekFrom::Start(2)).await.unwrap();
         reader.read_exact(&mut read).await.unwrap();
         assert_eq!(read, [2, 3, 4, 5, 6, 7, 8, 9]);

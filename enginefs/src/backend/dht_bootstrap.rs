@@ -5,16 +5,16 @@
 //!
 //! librqbit takes `bootstrap_addrs: Vec<String>` and resolves each one with
 //! `tokio::net::lookup_host` in `bootstrap_hostname`
-//! (`crates/dht/src/dht.rs`), retrying forever on failure. A real Android
-//! field log had that step failing for a whole 28-minute session with the
-//! system resolver returning `No address associated with hostname` for every
-//! bootstrap name -- the DHT never came up because **DNS** was broken, not
-//! because the bootstrap hosts were down.
+//! (`crates/dht/src/dht.rs`), retrying forever on failure: a system resolver
+//! that returns `No address associated with hostname` for every bootstrap
+//! name can leave the DHT down indefinitely even though the bootstrap hosts
+//! themselves are up -- one measured session stayed stuck this way for 28
+//! minutes, because **DNS** was broken, not the bootstrap hosts.
 //!
 //! `lookup_host` also accepts an address *literal* (`"67.215.246.10:6881"`
-//! parses straight to a `SocketAddr` without touching a resolver), so if we
-//! resolve the names ourselves and hand librqbit literals, a broken system
-//! resolver stops being fatal and no fork change is needed.
+//! parses straight to a `SocketAddr` without touching a resolver), so
+//! resolving the names ourselves and handing librqbit literals keeps a
+//! broken system resolver from being fatal, with no fork change needed.
 //!
 //! # What this does
 //!
@@ -58,12 +58,12 @@
 //! **This fixes the DNS half only.** If the network drops the DHT's UDP
 //! outright -- carrier-grade NAT, a firewalled mobile APN, a captive portal
 //! -- then perfectly correct bootstrap addresses change nothing, because the
-//! queries never leave. The same Android log that showed DNS failing also
-//! showed SSDP refused with `EPERM` and UPnP timing out, which is what a
-//! network that blocks this traffic wholesale looks like. Resolving names
-//! ourselves removes one specific, observed cause of bootstrap failure; it
-//! is not a fix for "the DHT does not work on this network", and
-//! `diagnostics::dht_health` still exists to say so once.
+//! queries never leave; SSDP refused with `EPERM` and UPnP timing out
+//! alongside a DNS failure is what a network that blocks this traffic
+//! wholesale looks like. Resolving names ourselves removes one specific,
+//! observed cause of bootstrap failure; it is not a fix for "the DHT does
+//! not work on this network", and `diagnostics::dht_health` still exists to
+//! say so once.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
@@ -124,10 +124,9 @@ pub const DOH_ENDPOINTS: &[&str] = &[
 /// touching the network.
 #[async_trait::async_trait]
 pub trait SystemDnsResolver: Send + Sync {
-    /// Addresses for `host:port`, or an empty vec for "no address" (which is
-    /// exactly what the broken Android resolver returned). Never errors:
-    /// every failure mode here is just "no address", and the caller's next
-    /// step is the same either way.
+    /// Addresses for `host:port`, or an empty vec for "no address". Never
+    /// errors: every failure mode here is just "no address", and the
+    /// caller's next step is the same either way.
     async fn lookup(&self, host: &str, port: u16) -> Vec<SocketAddr>;
 }
 
@@ -334,8 +333,8 @@ fn parse_doh_answer(body: &str) -> Vec<IpAddr> {
 }
 
 /// Which path produced an entry's addresses. Reported at INFO once per
-/// start-up so a field log says *how* bootstrap addresses were obtained,
-/// which is the thing that was invisible before.
+/// start-up so a log says *how* bootstrap addresses were obtained, instead
+/// of leaving that invisible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolvedVia {
     /// The entry was already an address literal; no DNS was attempted.
@@ -485,9 +484,9 @@ pub struct BootstrapResolvers {
 ///
 /// `Off` is not a performance knob: it exists so hermetic callers (tests,
 /// and any embed that must not make outbound requests at start-up) do no DNS
-/// and no HTTP. With it, names reach librqbit as names -- exactly the
-/// behaviour before this module existed -- and address literals reach it as
-/// literals either way.
+/// and no HTTP. With it, names reach librqbit as names, with no resolution
+/// step in front of them, and address literals reach it as literals either
+/// way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DhtBootstrapDns {
@@ -850,16 +849,15 @@ fn report_summary(resolved: &[ResolvedEntry]) -> String {
         .join(" ")
 }
 
-/// Whether every entry failed the whole DNS ladder -- the state the Android
-/// field log was in. A host that resolved and then lost its addresses to
-/// the IPv6 route filter is *not* this: DNS worked for it, so saying DNS
-/// failed would be a wrong diagnosis.
+/// Whether every entry failed the whole DNS ladder. A host that resolved
+/// and then lost its addresses to the IPv6 route filter is *not* this: DNS
+/// worked for it, so saying DNS failed would be a wrong diagnosis.
 fn nothing_resolved(resolved: &[ResolvedEntry]) -> bool {
     resolved.iter().all(|r| r.via == ResolvedVia::Unresolved)
 }
 
 /// One INFO line saying what resolved and by which path, and one WARN when
-/// every path failed for every host, which previously showed up only as
+/// every path failed for every host, instead of that surfacing only as
 /// librqbit's own retry spam.
 fn report(resolved: &[ResolvedEntry]) {
     if resolved.is_empty() {
@@ -1178,8 +1176,8 @@ mod tests {
         );
     }
 
-    /// The Android field-log case: the system resolver returns "no address
-    /// associated with hostname", DoH answers, and librqbit gets a literal.
+    /// The system-resolver-fails case: it returns "no address associated
+    /// with hostname", DoH answers, and librqbit gets a literal.
     #[tokio::test]
     async fn a_name_the_system_resolver_fails_is_retried_over_doh() {
         let system = Arc::new(FakeSystem::default());

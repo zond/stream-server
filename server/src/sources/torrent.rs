@@ -41,12 +41,8 @@ const PLAYBACK_PRIORITY: u8 = 1;
 /// lives: an archive response body (`routes::archive`'s `torrent:` form)
 /// or a [`TorrentFileSource`].
 ///
-/// The `torrent:` form of `routes::archive::stream_file` opens a file
-/// reader on a live torrent, and until this existed it registered nothing
-/// at all: no `on_stream_start`, no reconcile, no entry in any activity
-/// register. Two things follow from that, and both are the failure the
-/// `PlaybackStart` reconcile in `EngineFS::on_stream_start` was written to
-/// prevent.
+/// Without this registration the reconciler cannot tell a body is being
+/// served from the torrent, and two failures follow:
 ///
 /// * The reconciler's own tick reads `playing` from those registers, so
 ///   with seeding off and the grace elapsed it pauses the torrent this

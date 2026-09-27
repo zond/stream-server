@@ -1,20 +1,20 @@
 //! What a torrent wants between `POST /create` and the first stream request.
 //!
-//! Both create routes already work out which file the caller means --
+//! Both create routes work out which file the caller means --
 //! `fileMustInclude` names it, `guessFileIdx` asks for the season/episode
-//! guess -- and they used to spend that answer on one JSON field. The
-//! torrent went on wanting every file, which for a season pack is the whole
-//! pack: forty gigabytes fetched, and a `stats.json` poller watching the
-//! pack's progress rather than the episode's, for however long the client
-//! sits on the details page before it plays anything.
+//! guess -- and that answer becomes the add's want-set
+//! (`enginefs::backend::TorrentPlacement::choose`), not just a JSON field:
+//! otherwise a season pack wants every file, forty gigabytes fetched, and a
+//! `stats.json` poller watches the pack's progress rather than the
+//! episode's for however long the client sits on the details page before it
+//! plays anything.
 //!
-//! So the answer is now the add's want-set
-//! (`enginefs::backend::TorrentPlacement::choose`), and what that changes is
-//! observable from outside: `stats.json`'s `isFinished` is "nothing left to
-//! fetch of what this torrent wants", so with one episode of a two-episode
-//! pack on the disk, a create that names that episode is finished and a
-//! create that names nothing is not. The control half of the test is what
-//! makes that a statement about the want-set and not about the fixture.
+//! What that makes is observable from outside: `stats.json`'s `isFinished`
+//! is "nothing left to fetch of what this torrent wants", so with one
+//! episode of a two-episode pack on the disk, a create that names that
+//! episode is finished and a create that names nothing is not. The control
+//! half of the test is what makes that a statement about the want-set and
+//! not about the fixture.
 //!
 //! A binary of its own because the file this would otherwise belong in is
 //! being edited elsewhere; the shared scaffolding is
@@ -221,8 +221,8 @@ fn wait_until_finished(handle: &stream_server::ServerHandle, info_hash: &str) {
 ///
 /// `phase` is deliberately not the assertion: `Engine::get_statistics`
 /// focuses it on its own hint-less guess (the largest media file), so it
-/// answers about the pack's biggest episode whatever the torrent wants.
-/// That is older than this change and untouched by it.
+/// answers about the pack's biggest episode whatever the torrent wants,
+/// independent of the want-set.
 #[test]
 fn a_create_that_names_its_episode_wants_that_episode_and_not_the_pack() -> anyhow::Result<()> {
     let content = tempfile::tempdir()?;

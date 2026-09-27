@@ -166,9 +166,8 @@ impl FileChoice {
             return Some(idx);
         }
         // Last resort (e.g. no media-extension file at all): largest video
-        // file, then largest file of any kind. Ties go to the last of them,
-        // which is how `routes::compat::resolve_file_idx` has always resolved
-        // them and what this step used to call.
+        // file, then largest file of any kind, with the same tie-break
+        // `largest_file` documents.
         largest_file(files, true).or_else(|| largest_file(files, false))
     }
 }
@@ -461,12 +460,10 @@ pub const STOPPED_FOR_SPACE_MESSAGE: &str =
 /// What one torrent's policies say, as a value: the reading a test takes
 /// of cells the owner keeps under its own locks.
 ///
-/// **Test-only, and that is what is left of it.** It used to be the cache
-/// cleaner's gate -- what this torrent would let a walk of the disk take --
-/// asked once before the walk and again at each delete. Nothing walks the
-/// disk any more and nothing outside this crate deletes a piece, so what
-/// remains is the copy-out itself, which is how a test reads a policy
-/// without reaching into the owner's locks. See [`Engine::standing`].
+/// **Test-only.** Nothing walks the disk and nothing outside this crate
+/// deletes a piece, so this is only ever the copy-out itself -- how a test
+/// reads a policy without reaching into the owner's locks. See
+/// [`Engine::standing`].
 #[cfg(test)]
 pub(crate) struct Standing {
     /// Every policy standing on this torrent, in file order, from one
@@ -588,12 +585,11 @@ pub(crate) struct CommitOnCompletion<H: TorrentHandle> {
 
 impl<H: TorrentHandle> crate::piece_store::PieceCompleted for CommitOnCompletion<H> {
     fn piece_completed(self: Arc<Self>, piece: u32) {
-        // No runtime to spawn on is no announcement now; the next pass
-        // commits the piece out of its listing, as every pass did before
-        // this event existed. It is not a case a shipped build reaches --
-        // librqbit completes a piece inside a peer's `block_in_place`, on
-        // the reactor it was spawned from -- and a test store driven
-        // straight from a thread is.
+        // No runtime to spawn on is no announcement: the next pass commits
+        // the piece out of its listing anyway. Not a case a shipped build
+        // reaches -- librqbit completes a piece inside a peer's
+        // `block_in_place`, on the reactor it was spawned from -- and a
+        // test store driven straight from a thread is.
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
@@ -1095,16 +1091,16 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         let alone = self.alone(domain, &unwanted).await;
         for planned in crate::retention::runs(&alone) {
             // **The reading that decides is the one taken here, right
-            // before the act.** `alone` read the pin set once, for every
+            // before the act.** `alone` reads the pin set once, for every
             // run, and the drops are awaited one after another: a pin that
-            // lands under the first run's drop used to reach the last run
-            // as a plan made without it, and the pinned neighbour's boundary
-            // piece was dropped and then wanted back. So each run is asked
-            // against the pins as they stand when it is about to go, as the
-            // reclaim asks at every run; what the plan read is a filter on
-            // the work, not the decision. The window that is left is the
-            // act itself, which no reading closes: `rewant_pins_crossed_by`
-            // reconciles after it.
+            // lands under the first run's drop would otherwise reach the
+            // last run as a plan made without it, dropping the pinned
+            // neighbour's boundary piece and then wanting it back. So each
+            // run is asked against the pins as they stand when it is about
+            // to go, as the reclaim asks at every run; what the plan read
+            // is a filter on the work, not the decision. The window that is
+            // left is the act itself, which no reading closes:
+            // `rewant_pins_crossed_by` reconciles after it.
             let pinned = pinned_spans(&self.handle, &self.pinned, Some(domain.file_idx)).await;
             let unpinned: Vec<u32> = planned
                 .clone()
@@ -1343,12 +1339,12 @@ pub struct Engine<H: TorrentHandle> {
     /// `register_engine`) and every `Engine::get_statistics`, so a client
     /// polling `GET /{infoHash}/stats.json` -- which reaches its engine
     /// through `get_engine` and then calls `get_statistics` -- resets it
-    /// every few seconds. The reconciler's idle arm used to measure its
-    /// grace from here, which made "somebody is asking about this torrent"
-    /// mean "somebody is watching it" and kept a torrent nobody was
-    /// watching downloading all night with seeding off. What decides that
-    /// now is the liveness cell ([`crate::retention::live`]), which is
-    /// written where a stream really opens and nowhere else.
+    /// every few seconds. What decides whether a torrent is playing is the
+    /// liveness cell instead ([`crate::retention::live`]), written where a
+    /// stream really opens and nowhere else: reading this field there
+    /// would make "somebody is asking about this torrent" mean "somebody
+    /// is watching it", keeping a torrent nobody is watching downloading
+    /// all night with seeding off.
     ///
     /// It is also initialised to the clock rather than left unset, which
     /// for an engine made for a torrent the *previous* process left behind
@@ -1423,12 +1419,11 @@ pub struct Engine<H: TorrentHandle> {
     /// reopen, manufacturing the very symptom this is measuring.
     streams: Arc<parking_lot::Mutex<crate::retention::streams::Streams>>,
     /// The retention owner for this torrent's files, keyed by file index:
-    /// one policy per file, resident, with its turn beside it. What
-    /// `announce`, the policy slot, its mirror and the playhead used to be
-    /// -- see [`crate::retention::owner`] for the lock rule and the pass.
-    /// One active file per torrent is the owner's
-    /// [`Retention::install`], which clears every other file first and runs
-    /// one at a time over the torrent, as `announce` made it.
+    /// one policy per file, resident, with its turn beside it -- see
+    /// [`crate::retention::owner`] for the lock rule and the pass. One
+    /// active file per torrent is the owner's [`Retention::install`], which
+    /// clears every other file first and runs one at a time over the
+    /// torrent, as `announce` made it.
     pub(crate) retention: Arc<Retention<TorrentBacking<H>>>,
     /// What the piece store tells this torrent's completions to, held here
     /// because the registry keeps only a `Weak` of it: the watcher lives
@@ -1452,10 +1447,10 @@ pub struct Engine<H: TorrentHandle> {
     /// the decision and before the unlinks -- with the file's turn held and
     /// no owner lock, and nowhere in a shipped build. A test that instead
     /// queued a task and trusted an await in the pass to yield to it would
-    /// be betting on scheduling: the held reading is a memory read now and
-    /// suspends nowhere, and when it was a listing a blocking task that
-    /// finished before its handle was first polled yielded nothing either,
-    /// so the test measured the ordering it meant to break.
+    /// be betting on scheduling: the held reading is a memory read and
+    /// suspends nowhere, and a blocking task that finishes before its
+    /// handle is first polled yields nothing either, so the test would
+    /// measure the ordering it meant to break.
     /// The cell is the engine's, where the tests write it; the owner is
     /// handed a runner that reads it ([`Retention::hook`]).
     #[cfg(test)]
@@ -1467,10 +1462,10 @@ pub struct Engine<H: TorrentHandle> {
     /// **It is reported, not only tested.** A refusal is a piece inside an
     /// open stream's lookahead and outside the window that would keep it --
     /// the disk permanently over budget, plus a wasted `drop_pieces` per
-    /// tick for as long as the stream lives -- and while this was
-    /// `#[cfg(test)]` there was no way to see it happening on a device. It
-    /// and the unverified figure beside it are what made the 1.6 GB open
-    /// visible, so they stay.
+    /// tick for as long as the stream lives -- and `#[cfg(test)]` alone
+    /// would give no way to see it happening on a device. It and the
+    /// unverified figure beside it are what made the 1.6 GB open visible,
+    /// so they stay.
     pub(crate) refused_reclaims: Arc<AtomicUsize>,
 }
 
@@ -1617,8 +1612,8 @@ impl<H: TorrentHandle> Engine<H> {
 
     /// Whether the reconciler is holding this torrent stopped for want of
     /// disk -- which is a wider question than [`Self::is_stopped_for_space`]
-    /// and has to be, because they were being asked with two different
-    /// lines and the gap between them swallowed torrents whole.
+    /// and has to be, because asking both with two different lines lets the
+    /// gap between them swallow torrents whole.
     ///
     /// The ladder measures a `Paused` torrent on a timer at
     /// `crate::reconcile::line`, which is the floor plus
@@ -1629,11 +1624,12 @@ impl<H: TorrentHandle> Engine<H> {
     ///
     /// So for a volume between the two -- which is exactly where a volume
     /// that has just given its slack back sits, since `CacheLimit::effective`
-    /// stops the instant `available` reaches the floor -- the reconciler
-    /// stopped the torrent and failed its reads while every reader that asks
-    /// "is anything wrong?" was told no: `stats.json` reported buffering
-    /// with no error. A pinned download stalled at whatever percent it had
-    /// reached, in silence, for good.
+    /// stops the instant `available` reaches the floor -- treating
+    /// `is_stopped_for_space` as this answer would leave the reconciler
+    /// holding the torrent stopped and failing its reads while every reader
+    /// that asks "is anything wrong?" is told no: `stats.json` reports
+    /// buffering with no error. A pinned download would stall at whatever
+    /// percent it had reached, in silence, for good.
     ///
     /// Readers that report a condition or ask for room use this. Readers
     /// that decide whether *this request* can proceed keep the floor: a
@@ -1679,16 +1675,14 @@ impl<H: TorrentHandle> Engine<H> {
     /// that a volume the stream route is serving from happily is out of
     /// disk.
     ///
-    /// It used to be a bit set when the free-space watch stopped a torrent
-    /// and cleared when something started it again, and that bit was wrong
-    /// in two ways that both shipped. It said nothing about a pause that
-    /// had survived a restart, because the bit had not; and because the
-    /// watch skipped any torrent that claimed to be idle-paused, an
-    /// idle-paused torrent on a full volume never got the bit at all --
-    /// while the stream route's `507` was gated on the bit alone, so a
-    /// playback starting on that torrent was let through onto the full
-    /// volume. Neither is possible of a question that is asked of the
-    /// present.
+    /// Not a bit set when the free-space watch stops a torrent and cleared
+    /// when something starts it again: such a bit says nothing about a
+    /// pause that survived a restart, since the bit did not, and a watch
+    /// that skips any torrent claiming to be idle-paused would never set
+    /// the bit for an idle-paused torrent on a full volume -- so a `507`
+    /// gated on the bit alone would let a playback starting on that
+    /// torrent through onto the full volume. Neither is possible of a
+    /// question that is asked of the present.
     ///
     /// The reading is the reconciler's last probe of the volume rather than
     /// a fresh one: this is asked on every `stats.json` poll, and it is a
@@ -1861,9 +1855,9 @@ impl<H: TorrentHandle> Engine<H> {
     /// ([`crate::retention::streams::Streams::viewer_filling`]). In the
     /// seconds after an open or a seek the window is on its way to what
     /// the rate asks for, a doubling a pass, and a popup then is that ramp
-    /// and not the swarm falling short of a full window: the field log of
-    /// 2026-09-17 06:41 had one 1.4 s after the first frame, counted, on a
-    /// window of 8 MB that was 321 MB ten seconds later.
+    /// and not the swarm falling short of a full window: one measured case
+    /// counted a stall 1.4 s after the first frame, on a window of 8 MB
+    /// that reached 321 MB ten seconds later.
     pub fn player_stalled(&self, now: Instant) {
         let mut streams = self.streams.lock();
         let filling = streams.viewer_filling(now) == Some(true);
@@ -1900,9 +1894,10 @@ impl<H: TorrentHandle> Engine<H> {
     /// Every reader of the file goes in, placed to the byte, with the
     /// film's own rate beside them; which of them the window is about is
     /// [`crate::retention::CacheWindow::worst_of`]'s to decide, not this
-    /// method's. It used to pick "the" playhead here -- the detector's
-    /// head -- and a comment recorded the day mpv's read of the tail had
-    /// left that head at the end of the file with the player at 0:00.
+    /// method's. Picking a single "the" playhead here instead -- the
+    /// detector's head -- would let one reader's tail read move it: a crawl
+    /// to the end of the file leaves the head there, at odds with a player
+    /// still at 0:00.
     pub(crate) fn policy_reading(
         &self,
         file_idx: usize,
@@ -2356,14 +2351,9 @@ impl<H: TorrentHandle> Engine<H> {
         freed
     }
 
-    /// Every policy standing on this torrent, as a value -- **for the
-    /// tests, which is all that asks now.**
-    ///
-    /// It was the cache cleaner's question: what may be taken off this
-    /// torrent, asked before a walk of the disk and again at every delete.
-    /// The walk is gone and so is the second asking; what a caller outside
-    /// this crate can still learn about the cache it asks
-    /// [`Self::protects`], which is a reading of what is on the disk rather
+    /// Every policy standing on this torrent, as a value; see [`Standing`].
+    /// A caller outside this crate that wants to know about the cache asks
+    /// [`Self::protects`] instead, a reading of what is on the disk rather
     /// than of what is installed.
     ///
     /// One copy-out under the owner's locks and one reading of what is
@@ -2714,20 +2704,20 @@ mod pin_tests {
     /// **A window grows on every pass, not only on the ones that say so.**
     ///
     /// A stream is granted its lookahead by doubling, one step per grant,
-    /// and the grant happens where the want set is computed. Computing it
-    /// inside the report throttle tied how fast a consumer is fetched for
-    /// to how often this server writes a log line about it -- a tenth of a
-    /// grant a second, so the five doublings that reach a full window take
-    /// fifty seconds instead of the fraction of one the doubling was
-    /// designed around.
+    /// and the grant happens where the want set is computed, not inside
+    /// the report throttle: tying how fast a consumer is fetched for to
+    /// how often this server writes a log line about it would cap it at a
+    /// tenth of a grant a second, so the five doublings that reach a full
+    /// window would take fifty seconds instead of the fraction of one the
+    /// doubling is designed around.
     /// **The committed set is not offered for reclaim.**
     ///
     /// `RetentionPolicy::advance` vetoes a committed piece whatever the
-    /// coldest list says, so a list that named them spent its quota on
-    /// pieces that were never going to go: once the coldest few were all
-    /// committed, a pass over its allowance freed nothing while warmer
-    /// pieces stayed. The committed set is kept beside the want set, so the
-    /// quota lands on pieces a reclaim can take.
+    /// coldest list says: a list that named them would spend its quota on
+    /// pieces that are never going to go, so once the coldest few are all
+    /// committed, a pass over its allowance would free nothing while
+    /// warmer pieces stay. The committed set is kept beside the want set,
+    /// so the quota lands on pieces a reclaim can take.
     #[test]
     fn the_committed_set_is_not_offered_for_reclaim() {
         let streams: Arc<parking_lot::Mutex<crate::retention::streams::Streams>> = Arc::default();
@@ -2783,12 +2773,11 @@ mod pin_tests {
     /// **The disk settles at the cap, committed set and all.**
     ///
     /// The committed set is on the disk whatever is asked, so the windows'
-    /// allowance takes it off -- and the reclaim used to measure its
-    /// overhang against that same allowance, taking it off again: the disk
-    /// settled at the cap less the committed set, and scrub-back a viewer
-    /// could have gone back to was reclaimed early for room nothing
-    /// needed. Passes run here until one reclaims nothing, which is where
-    /// the disk settles.
+    /// allowance takes it off. Measuring the reclaim's overhang against
+    /// that same allowance would take it off again: the disk would settle
+    /// at the cap less the committed set, reclaiming early scrub-back a
+    /// viewer could have gone back to, for room nothing needed. Passes run
+    /// here until one reclaims nothing, which is where the disk settles.
     #[test]
     fn the_disk_settles_at_the_cap_with_the_committed_set_counted_once() {
         let backing = TorrentBacking {
@@ -3010,10 +2999,10 @@ mod pin_tests {
     /// **What the operator configured caps the allowance, whatever the
     /// volume has left.**
     ///
-    /// The field's phone had 382 GB free against a configured 10.7 GB, and
-    /// an allowance that took the disk's word alone reported
-    /// `allowed=381570437120` -- so nothing bounded the want set at all and
-    /// it grew to the whole film.
+    /// An allowance that takes the disk's word alone reports `allowed` as
+    /// whatever is free -- 381,570,437,120 bytes measured on a phone
+    /// configured for 10.7 GB with 382 GB free -- so nothing bounds the
+    /// want set and it grows to the whole film.
     #[test]
     fn the_allowance_is_bounded_by_the_configured_cap() {
         use crate::retention::streams::Read;

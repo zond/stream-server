@@ -30,9 +30,8 @@ pub fn router() -> Router<AppState> {
 
 /// The devices this server can cast to, which is none: `[]`, always.
 ///
-/// The list was filled by an SSDP discovery loop that ran only in the
-/// deleted daemon and is gone (see `crate::devices`), so there is no state
-/// behind it and the answer is a constant. That is the honest answer rather than
+/// There is no discovery loop behind it (see `crate::devices`), so there is
+/// no state and the answer is a constant. That is the honest answer rather than
 /// a regression: nothing could be cast to a discovered device in any case --
 /// [`player_control`] below answers `501` on purpose -- and on Android
 /// M-SEARCH is multicast the app sandbox cannot send. The route stays

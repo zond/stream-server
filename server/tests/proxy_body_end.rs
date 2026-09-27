@@ -381,8 +381,8 @@ fn every_proxied_body_says_what_left_the_server() -> anyhow::Result<()> {
         "what left the server is the rewritten body, not the origin's"
     );
 
-    // A range served whole off the cache, which used to leave no record at
-    // all that a player had been served anything.
+    // A range served whole off the cache still logs that a player was
+    // served something.
     let cached_url = format!(
         "{base}/proxy/?d={}",
         encode(&format!("{origin_base}/cached.mp4?token={SECRET}"))

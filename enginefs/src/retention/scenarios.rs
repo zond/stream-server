@@ -162,11 +162,11 @@ fn burst(script: &mut Vec<(Duration, Step)>, from: u64, the_swarm_keeps_up: bool
 /// The first response is opened and not yet polled when the pass runs,
 /// which is the instant the field's line describes: a response has a head
 /// from the moment it opens (`ReaderState::opened_at`) and has promised
-/// nothing. That is the harness's ordering, and not production's any more:
-/// since `6744894` a read promises the piece it was opened on the moment
-/// its reader exists (`Opening::reader_on`), while the harness's `opens`
-/// makes no promise until the first blocked read -- which is what keeps
-/// this scenario the state the field's line was written from.
+/// nothing. That is the harness's ordering, not production's: in
+/// production a read promises the piece it was opened on the moment its
+/// reader exists (`Opening::reader_on`), while the harness's `opens` makes
+/// no promise until the first blocked read -- which is what keeps this
+/// scenario in the state the field's line was written from.
 fn field_session() -> Log {
     field_session_under(BUDGET)
 }
@@ -421,9 +421,8 @@ fn the_second_track_never_blocks_on_a_piece_a_pass_took_in(log: &Log) {
 /// Same film, same disk, same reader -- one difference. Here the response
 /// is polled before the pass instead of after it, so it is parked, and a
 /// parked read promises the piece under its cursor (`files.rs::poll_read`'s
-/// `Poll::Pending` arm, added in `87e8c9b`). The pass sees that promise and
-/// makes it the whole want-set, the swarm delivers, and the next poll is
-/// served.
+/// `Poll::Pending` arm). The pass sees that promise and makes it the whole
+/// want-set, the swarm delivers, and the next poll is served.
 ///
 /// It is here because it is what makes the verdict on the field failure
 /// evidence rather than argument. The keep set and the want set are both

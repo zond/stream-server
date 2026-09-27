@@ -481,7 +481,7 @@ set is made of: `window_at` and `ahead_of` are gone with it.
 stands in its place is `Fetching`, two variants and one question --
 `Streaming` or `Download` -- and it decides exactly one number, how far a
 stream reads ahead *before a duration has been stated*
-(`STREAMING_LOOKAHEAD_BYTES`, 32 MiB since review 2026-09-19 #15; `DOWNLOAD_LOOKAHEAD_BYTES`, 256 MiB for
+(`STREAMING_LOOKAHEAD_BYTES`, 32 MiB; `DOWNLOAD_LOOKAHEAD_BYTES`, 256 MiB for
 a fetch no player will ever state one for). That is the first open of a
 session and any file a player can put no length on: there is no
 seconds-to-bytes conversion without a duration, and a constant is the only

@@ -260,7 +260,7 @@ impl TrackerManager {
         Ok(())
     }
 
-    /// Internal refresh without persistence (legacy behavior)
+    /// Refresh without persistence, for a manager with no storage backing.
     async fn refresh_trackers_internal(&self, url: &str) -> anyhow::Result<()> {
         let raw_trackers = self.fetch_trackers(url).await?;
         if !raw_trackers.is_empty() {
@@ -311,12 +311,12 @@ impl TrackerManager {
 /// Ask `storage` one question, on the blocking pool.
 ///
 /// The trait is synchronous and the server's implementation blocks (a
-/// `block_on` of its settings lock under `block_in_place`). Asked inside
-/// the refresh task's poll, that block held the poll open, and an abort
-/// cannot land inside a poll: on a server stopped as it started, the task
-/// was still in it when the runtime shut down, then went on to its
-/// interval and panicked on the dead driver ("A Tokio 1.x context was
-/// found, but it is being shutdown"). Awaited here, the task is parked on
+/// `block_on` of its settings lock under `block_in_place`). Asking it
+/// inside the refresh task's poll would hold the poll open, and an abort
+/// cannot land inside a poll: on a server stopped as it starts, the task
+/// would still be in it when the runtime shuts down, then go on to its
+/// interval and panic on the dead driver ("A Tokio 1.x context was found,
+/// but it is being shutdown"). Awaited here instead, the task is parked on
 /// a join handle while the storage answers, and an abort ends it there.
 /// `Err` when the question panicked or the runtime is going away.
 async fn ask_storage<T: Send + 'static>(
@@ -424,13 +424,14 @@ mod tests {
     /// An abort ends the refresh loop while the storage is still answering,
     /// whichever answer it is.
     ///
-    /// Asked inside the task's poll, a storage that blocks held the poll
-    /// open, and an abort only flags a task that is inside one: the loop ran
-    /// on until the storage let go. On a server stopped as it started, the
-    /// runtime shut down in that gap and the loop's next step armed its
-    /// interval on the dead driver -- the "A Tokio 1.x context was found,
-    /// but it is being shutdown" panic. A question asked without
-    /// `ask_storage` times out here.
+    /// Guards `ask_storage`: asked inside the task's poll instead, a
+    /// storage that blocks holds the poll open, and an abort only flags a
+    /// task that is inside one, so the loop would run on until the storage
+    /// lets go. On a server stopped as it starts, the runtime would shut
+    /// down in that gap and the loop's next step would arm its interval on
+    /// the dead driver -- the "A Tokio 1.x context was found, but it is
+    /// being shutdown" panic. A question asked without `ask_storage` times
+    /// out here.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_abort_lands_while_the_storage_is_still_answering() {
         for blocks in [
@@ -515,8 +516,8 @@ mod tests {
         format!("http://{addr}/trackers.txt")
     }
 
-    /// A tracker-list GET that never answers ends at the fetch's timeout
-    /// (review #46): the refresh task awaits it, and nothing else would.
+    /// A tracker-list GET that never answers ends at the fetch's timeout:
+    /// the refresh task awaits it, and nothing else would.
     #[tokio::test(start_paused = true)]
     async fn a_tracker_list_fetch_that_stalls_ends() {
         let url = origin(|socket| async move {
@@ -553,8 +554,8 @@ mod tests {
         assert!(format!("{error:#}").contains("too large"), "{error:#}");
     }
 
-    /// An error page is not a tracker list: its lines used to become
-    /// "trackers".
+    /// An error page is not a tracker list: its lines are not read as
+    /// trackers.
     #[tokio::test]
     async fn an_error_answer_is_not_a_tracker_list() {
         use tokio::io::AsyncWriteExt;
@@ -602,11 +603,10 @@ mod tests {
         }
     }
 
-    /// **A refresh on which no tracker answers keeps the cached list**
-    /// (review #47). Failed probes used to be ranked last rather than left
-    /// out, so the persisted top 20 filled with trackers nobody could reach
-    /// whenever fewer than 20 answered -- and with nothing but those when
-    /// none did.
+    /// **A refresh on which no tracker answers keeps the cached list.**
+    /// Ranking failed probes last rather than leaving them out would fill
+    /// the persisted top 20 with trackers nobody can reach whenever fewer
+    /// than 20 answer -- and with nothing but those when none do.
     #[tokio::test]
     async fn a_refresh_where_no_tracker_answers_keeps_the_cached_list() {
         use tokio::io::AsyncWriteExt;

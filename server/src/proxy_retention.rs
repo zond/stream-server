@@ -5,13 +5,11 @@
 //! retention owner both drivers run: the same budget, the same
 //! 90%-ahead-10%-behind window, the same rule about what may be reclaimed,
 //! and the same pass -- what is here is what makes a chunk directory an
-//! entity of it ([`ProxyBacking`]), and the wiring that was missing before
-//! any of it existed: **a proxied stream had no playhead at all**. It serves
-//! ranges, so the reads were always there and the route always knew the
-//! offset, but nothing recorded where playback *was*, so there was nothing
-//! for a window to follow and the cache was bounded by the cache cleaner's
-//! walk alone: a minute after the last write at best, while a stream at
-//! 20 MB/s writes a gigabyte in that minute.
+//! entity of it ([`ProxyBacking`]), and what gives a proxied stream a
+//! playhead. The route serves ranges and always knows the offset, but
+//! nothing else records where playback *is*, so without this the window
+//! would have nothing to follow: a stream at 20 MB/s writes a gigabyte a
+//! minute, more than a periodic sweep could bound tightly.
 //!
 //! # The playhead is an observation, and its absence is real
 //!
@@ -104,8 +102,8 @@
 //! window of playback, which bounds the overshoot to a twentieth of the
 //! budget and the unlinking to twenty walks per window. What a pass asks
 //! about the disk it asks of the owner's own held set ([`Held`]) and not of
-//! the filesystem: the listing that used to be the expensive half of a pass
-//! now happens once per entity, to seed that set. The owner does
+//! the filesystem: the listing happens once per entity, to seed that set,
+//! never on every pass. The owner does
 //! the throttling ([`Trigger::OnMove`]); what a delivered byte hands this
 //! module is a [`Claim`] on the entity's turn, and [`ProxyRetention::spawn_pass`]
 //! is the task that runs the pass under it, and every pass the first one
@@ -119,10 +117,10 @@
 //! one cell for the whole server ([`enginefs::retention::live`]) -- and
 //! from then on it is slack: every chunk of it goes at the next
 //! [`ProxyRetention::drop_slack`], which the switch itself calls. There is
-//! no clock in it. The 90-second grace this module used to keep an ended
-//! read's windows for was the same mistake the torrent's idle arm was: a
-//! player that has paused has not stopped playing, and a player that has
-//! opened something else has stopped playing whatever the clock says. What
+//! no clock in it: a grace period would keep a paused player's windows as
+//! if it had not stopped playing, and a player that opened something else
+//! as if it had not stopped, whatever the clock said -- the same mistake
+//! the torrent's idle arm avoids by carrying none either. What
 //! a slack pass will not take is what an open read was already promised --
 //! the body is served every byte of it -- and the entity stands until it
 //! holds nothing.
@@ -175,11 +173,9 @@ use crate::proxy_cache::CHUNK_BYTES;
 /// Tying the throttle to the window rather than to a fixed number of chunks
 /// makes the overshoot a fraction of the budget instead of a constant, and
 /// makes the pass rarer exactly where a pass is dearer -- a big window is
-/// many chunks to walk and, when it moves, many to unlink. It used to buy
-/// one more thing, and does not any more: a pass was a `read_dir` per bucket
-/// of the entity, so the throttle was also what kept the listing off the hot
-/// path. The owner's held set ([`Held`]) is what keeps it off now, and there
-/// is one listing per entity rather than one per pass.
+/// many chunks to walk and, when it moves, many to unlink. The owner's held
+/// set ([`Held`]) is what keeps a pass off the filesystem: there is one
+/// directory listing per entity, to seed that set, never one per pass.
 ///
 /// The number itself is the overshoot the bound tolerates, and nothing
 /// subtler than that: what is on the disk when a pass measures it is the
@@ -231,11 +227,11 @@ type Prefetchers = Arc<Mutex<HashMap<PathBuf, Prefetcher>>>;
 ///
 /// **This is the proxy's half of what a torrent's picker does with the
 /// want set.** [`Backing::want`] hands every pass's windows to the
-/// backing; the torrent forwards them to librqbit, which fetches them; a
-/// proxied body used to be fetched only by the player's own `Range`, so a
-/// Drive or debrid stream had the window's *retention* -- the bytes were
-/// kept once fetched -- and none of its *lookahead*. The task below is
-/// the fetch: one per entity, fed by each pass, reading the wanted runs in
+/// backing; the torrent forwards them to librqbit, which fetches them.
+/// Without this, a proxied body is fetched only by the player's own
+/// `Range`: a Drive or debrid stream would get the window's *retention* --
+/// the bytes kept once fetched -- but none of its *lookahead*. The task
+/// below is the fetch: one per entity, fed by each pass, reading the wanted runs in
 /// order through a source whose readers are quiet, so it claims no live
 /// entity and leaves no playhead -- a filler is never mistaken for a
 /// viewer, and a stream nobody is reading gets no pass and so no fill.
@@ -890,13 +886,13 @@ impl Backing for ProxyBacking {
     /// **The held set, out of memory** ([`Held`]), and a `read_dir` only on
     /// the pass that first asks about an entity.
     ///
-    /// This used to be a real listing of the entity's directory -- one
-    /// `read_dir` of it and one more per thousand chunks, on the flash of a
-    /// television -- on *every* pass, and the torrent side had already
-    /// measured what that costs and stopped doing it (`Engine::held`, an
-    /// in-memory `HeldBits`, against some 6,750 `statx` calls a pass on a
-    /// 27 GB torrent). Now the owner keeps the mirror as it writes and
-    /// unlinks, and the only listing left is the one that seeds it.
+    /// A per-pass directory listing does not scale -- one `read_dir` of it
+    /// and one more per thousand chunks, on the flash of a television, on
+    /// *every* pass -- and the torrent side measured the cost and moved to
+    /// an in-memory mirror instead (`Engine::held`'s `HeldBits`, some 6,750
+    /// `statx` calls a pass on a 27 GB torrent). Here the owner keeps the
+    /// same kind of mirror as it writes and unlinks, and the only listing
+    /// left is the one that seeds it.
     ///
     /// Still on the blocking pool, and not as ceremony: whether this ask is
     /// the seed is precisely what the caller cannot know, and the seed is a
@@ -905,12 +901,9 @@ impl Backing for ProxyBacking {
     /// A chunk index too big for the policy's index space is one the policy
     /// was never built over -- see [`Self::policy`], which refuses to build
     /// one at all in that case -- so the filter cannot narrow a window that
-    /// exists. A seed that would not list is an answer we do not have, and
-    /// the pass concludes nothing rather than advance over an empty reading
-    /// of a directory that is not empty -- which is what a listing error
-    /// used to arrive as, and what had the policy withdraw every committed
-    /// chunk on one tick and reclaim them on the next (see
-    /// `ChunkDir::held_in_bucket`).
+    /// exists. A seed that fails to list is an answer we do not have: see
+    /// [`Held`] for why the pass must conclude nothing rather than read the
+    /// failure as an empty directory.
     async fn held(&self, _store: &(), domain: &ProxyDomain) -> Option<BTreeSet<u32>> {
         let dir = domain.dir.clone();
         let backing = self.probe();
@@ -1175,18 +1168,17 @@ pub(crate) enum OnDisk {
 /// what this process has written since playback started, or a pinned
 /// download's own entity, and the first pass comes one stride into the film.
 ///
-/// A seed that **fails** installs nothing. A listing the filesystem refused
+/// A seed that **fails** installs nothing. A listing the filesystem refuses
 /// -- `EMFILE` on a television out of descriptors, a permission lost under
-/// us, and no longer "this volume is broken", which `routes::system`'s
-/// startup check has already refused a cache root for -- is not an empty
-/// directory, and an entry installed empty from one would be wrong about
-/// that entity for the rest of the process, which is the direction that
-/// breaks reads. `chunk_store.rs`'s `held_in_bucket` records what the same
-/// mistake cost the torrent side: one transient directory error read as
-/// "empty" withdrew every committed piece of a file from what we announce,
-/// after peers had been told, and there is no un-Have. So the error is the
-/// whole answer, the pass concludes nothing that tick exactly as it did
-/// when every pass listed, and the next one seeds again.
+/// us -- is not an empty directory (a cache root that will not list is
+/// refused at startup by `routes::system`'s check, before anything reaches
+/// here), and an entry installed empty from one would be wrong about that
+/// entity for the rest of the process, which is the direction that breaks
+/// reads: read as empty it would withdraw every committed chunk from what
+/// we announce on one tick, after peers had been told, with no un-Have
+/// (see `chunk_store::held_in_bucket`). So the error is the whole answer,
+/// the pass concludes nothing that tick exactly as it did when every pass
+/// listed, and the next one seeds again.
 ///
 /// # What it costs to keep
 ///
@@ -1919,8 +1911,9 @@ impl ProxyRetention {
     /// the proxy's bytes move**: a chunk renamed into place by a fill adds
     /// what it occupies, and a chunk the owner unlinks takes it off again.
     /// So the figure costs nothing to read and is right the moment it is
-    /// read, where the number it replaced was whatever an eviction pass had
-    /// last counted -- 0 until the first walk of the root finished.
+    /// read, unlike a walk of the root, which would read 0 until it
+    /// finished (see [`crate::proxy_cache::SweepReport::freed_bytes`] for
+    /// the cost of one).
     ///
     /// **Every deleter of a chunk is booked, including the two outside the
     /// owner.** The entity a fill replaces under a key comes off here, and
@@ -2874,21 +2867,10 @@ mod tests {
     }
 
     /// **A seed that could not list installs nothing, and the next ask
-    /// seeds again.**
-    ///
-    /// The failure is no longer "this volume is broken" -- `routes::system`
-    /// refuses a cache root that will not list, at startup, before anything
-    /// gets here -- so a listing that fails now is transient: `EMFILE` on a
-    /// television that has run out of descriptors, a permission lost under
-    /// us. Read as "the directory is empty" it would not cost a tick, it
-    /// would cost the entity: the set is installed once and believed for
-    /// the life of the process, so an empty one seeded from a refusal says
-    /// we hold nothing of a stream we hold all of, for ever.
-    ///
-    /// `chunk_store.rs`'s `held_in_bucket` is where the same mistake was
-    /// made and what it cost: one transient directory error withdrew every
-    /// committed piece of a file from what we announce, after peers had
-    /// been told, and there is no un-Have.
+    /// seeds again.** See [`Held`] for why a failed listing must not be
+    /// read as an empty directory: the set is installed once and believed
+    /// for the life of the process, so an empty one seeded from a refusal
+    /// would say we hold nothing of a stream we hold all of, for ever.
     ///
     /// A file where the entity's directory belongs is the portable stand-in
     /// for a listing that fails -- `ENOTDIR` rather than `EMFILE`, and the
@@ -3297,11 +3279,9 @@ mod tests {
         drop(reader);
     }
 
-    /// And once a byte has gone out, the window round it is refused to
+    /// Once a byte has gone out, the window round it is refused to
     /// whatever asks -- while the chunks the playhead has left behind are
-    /// not. The cache cleaner's gate is what used to ask; the owner's own
-    /// cells answer now ([`inside_something_live`]), and the name is from
-    /// then.
+    /// not. Checked through the owner's own cells ([`inside_something_live`]).
     #[tokio::test]
     async fn a_window_a_player_is_inside_is_not_the_cleaners_to_take() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4130,17 +4110,12 @@ mod tests {
     /// **A pass that dies before its unlinks leaves the policy where it was,
     /// and the next delivered byte's pass reclaims.**
     ///
-    /// The pass used to take the policy out of its slot for the length of
-    /// itself, so a pass that died at an await -- the blocking pool refusing
-    /// a task, a panic in the unlink closure, the runtime shutting down --
-    /// walked off with it: the entity was unbounded until the budget's
-    /// *value* changed, `running` stayed set so no later pass could start,
-    /// and the gate went on protecting the windows of a pass that would
-    /// never be superseded. That was documented as shutdown-only, with
-    /// nothing to write a test against. Now the policy never leaves its cell
-    /// and what a pass holds is a guard on the entity's turn, so this is the
-    /// test: a pass aborted while its listing is on the pool leaves a
-    /// bounded entity whose turn is free, and the next byte's pass runs.
+    /// The policy never leaves its cell while a pass runs; what a pass
+    /// holds instead is a guard on the entity's turn. So a pass that dies
+    /// at an await -- the blocking pool refusing a task, a panic in the
+    /// unlink closure, the runtime shutting down -- leaves a bounded entity
+    /// whose turn is free, and the next byte's pass runs, rather than an
+    /// entity left unbounded with its turn stuck taken.
     ///
     /// The runtime has one blocking thread and the test occupies it, so the
     /// listing cannot start until the test lets it: the pass is parked at
@@ -4421,14 +4396,12 @@ mod tests {
     /// **A stream opening on another URL is what makes the one it left
     /// disposable -- and a second body on the same one is not.**
     ///
-    /// The cache used to keep what a player had left until a clock ran out
-    /// on it: ninety seconds after the last delivered byte, an entity
-    /// nothing was reading was forgotten and its chunks became the
-    /// cleaner's. This is what replaced it, and it is a fact rather than an
-    /// age -- the moment a body opens on something else, everything the
-    /// player left is disposable and goes at the switch. A seek is a second
-    /// body on the entity that is already being played and moves nothing:
-    /// [`Live::open`] answers `None` for it, so no switch is even reported.
+    /// What makes an entity disposable is a fact rather than an age: no
+    /// clock is kept on it. The moment a body opens on something else,
+    /// everything the player left is disposable and goes at the switch. A
+    /// seek is a second body on the entity that is already being played and
+    /// moves nothing: [`Live::open`] answers `None` for it, so no switch is
+    /// even reported.
     ///
     /// One HLS playback is many URLs, so a finished segment is exactly this
     /// case -- which is the decision, not a casualty of it.

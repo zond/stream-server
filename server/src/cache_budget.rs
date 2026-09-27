@@ -1,18 +1,13 @@
 //! What the torrent-data volume may hold, and the one place the process
 //! says so.
 //!
-//! **Publishing a budget is not the same job as evicting.** It used to be
-//! the tail of one: the cache cleaner walked sixteen thousand files to
-//! decide what to delete, and on its way out told the engine what the cap
-//! was. Everything downstream of the number depends on that having
-//! happened -- `enginefs::retention::CacheBudget::Unknown` installs no
-//! policy at all, so a process that has never published one holds no window
-//! over a proxied stream and reclaims none of it -- and so the whole of the
-//! retention story hung off a walk whose only purpose was eviction.
-//!
-//! So the two are separated here. The number lives in this module, with a
-//! trigger of its own ([`start`]) that takes one `statvfs` and walks
-//! nothing.
+//! **Publishing a budget is not the same job as evicting.** The number
+//! lives in this module, with a trigger of its own ([`start`]) that takes
+//! one `statvfs` and walks nothing:
+//! `enginefs::retention::CacheBudget::Unknown` installs no policy at all,
+//! so a process that has never published one holds no window over a
+//! proxied stream and reclaims none of it -- and the whole retention story
+//! must not hang off a walk whose only purpose is eviction.
 //!
 //! # What supplies each input
 //!
@@ -28,20 +23,14 @@
 //! (`enginefs::EngineFS::cache_occupancy`); the proxy cache adds what each
 //! chunk occupied as it lands and takes it off again when the owner unlinks
 //! it (`crate::proxy_retention::ProxyRetention::occupancy`). Neither costs
-//! a syscall, so the cap can be restated on a timer against a reading of
-//! the cache that is current rather than against whatever a walk last
-//! found.
-//!
-//! That is what this module was waiting for. The figure it used to publish
-//! was the last eviction pass's count, which is right to within whatever
-//! the cache has done since -- and **0 before the first walk finished**,
-//! which is not a stale figure that is close but one wrong by the whole of
-//! the cache: a four-gigabyte television already holding four gigabytes
-//! with six hundred megabytes free stated a cap of eighty-eight megabytes,
-//! so every stream in the first minutes of the process ran under a window
-//! that size. On a device with sixteen thousand files on eMMC those minutes
-//! were the whole of a film. The owners' count has no such window: a
-//! process that has held a piece for a millisecond can say so.
+//! a syscall, so the cap is restated on a timer against a reading of the
+//! cache that is current rather than against a walk: a walk of sixteen
+//! thousand cache files on eMMC costs minutes, and a cap read as 0 until
+//! it finished would run every stream over that stretch under a window as
+//! small as whatever headroom happened to be free -- eighty-eight
+//! megabytes measured on a four-gigabyte television already near full. The
+//! owners' count has no such window: a process that has held a piece for a
+//! millisecond can say so.
 //!
 //! What it does not count is what the held bits do not price -- a torrent
 //! held in Error, a directory a previous run left, the strays, and the
@@ -51,12 +40,14 @@
 //! minute timer. The cap is therefore stated over the complete pieces this
 //! session holds, which understates the volume by whatever an earlier one
 //! left and by the pieces in flight -- the safe
-//! direction, since a smaller `occupied` is a tighter cap, and **the claim
-//! above is a claim about a cache this process filled**: on a warm cache the
-//! first minute is still the volume's headroom alone. The proxy cache is not
-//! part of that gap: its launch sweep (`crate::proxy_cache::sweep`) empties
-//! it before the router serves anything, so what its owner counts is all it
-//! holds.
+//! direction, since a smaller `occupied` is a tighter cap, and **this gap
+//! is a claim about a cache this process filled**: on a warm cache the
+//! first minute is still the volume's headroom alone. The proxy cache has
+//! this same gap only once a pin record is named: its launch sweep
+//! (`crate::proxy_cache::sweep`) then empties it before the router serves
+//! anything, so what its owner counts is all it holds; with no pin record
+//! named the sweep counts nothing, and a previous run's strays sit
+//! uncounted, same as the torrent side.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -85,10 +76,10 @@ use crate::state::AppState;
 /// is (`enginefs::reconcile::desired`), and it is what turns the target into
 /// something close to a guarantee. A cap only bounds what the owners keep;
 /// it cannot throttle a writer, and librqbit writes the file it wants
-/// straight through this line to ENOSPC -- on the device that prompted all
-/// this, Available went to nothing in 40 s rather than stopping at 512 MiB.
-/// The reconciler stops a writing torrent when the volume falls under the
-/// floor and rings the running-low bell, so what the owners are asked to
+/// straight through this line to ENOSPC -- measured going to nothing in
+/// 40 s rather than stopping at 512 MiB. The reconciler stops a writing
+/// torrent when the volume falls under the floor and rings the
+/// running-low bell, so what the owners are asked to
 /// give back is asked of a volume with a torrent paused a few MB under the
 /// line, not one dead at zero. Offline downloads keep a margin of their own
 /// (`enginefs::PIN_FREE_SPACE_MARGIN`, 500 MiB, checked once when a pin is
@@ -184,9 +175,9 @@ impl CacheLimit {
 /// Failure -- a filesystem that refuses the call, a path on no volume the OS
 /// can name -- is `None`, never 0: an unreadable volume must not be read as
 /// "no room" and evict a healthy cache. The configured `cacheSize` then
-/// stands alone, exactly as it did before any of this existed. Which paths
-/// fail is the platform's business, not this function's: `statvfs` wants
-/// the path to exist, so on Unix a root not yet created is unreadable, while
+/// stands alone. Which paths fail is the platform's business, not this
+/// function's: `statvfs` wants the path to exist, so on Unix a root not
+/// yet created is unreadable, while
 /// Windows resolves the volume from the drive letter (`GetVolumePathNameW`)
 /// and answers for a directory nothing has made yet. The test for what an
 /// unreadable volume does therefore writes the `None` straight into a
@@ -225,11 +216,9 @@ pub(crate) async fn available_space_off_the_reactor(path: std::path::PathBuf) ->
 /// One `statvfs` per tick and no walk, so the interval is set by how long
 /// the cap may be wrong for rather than by what it costs: the number it
 /// re-reads is what the *rest* of the device has done to the volume, and a
-/// player is inside a window for minutes at a time. A minute is the same
-/// order as the debounce the cache cleaner's walk used to run on, so a
-/// cache something is writing to is restated about as often as it was
-/// before this existed, and an idle one -- which used to wait out that
-/// walk's hourly fallback -- is now restated on the minute like any other.
+/// player is inside a window for minutes at a time. A minute keeps a busy
+/// cache and an idle one on the same schedule, with no separate fallback
+/// needed for the idle case.
 const BUDGET_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The cap a publication states, from the three readings behind it.
@@ -381,7 +370,7 @@ where
 /// `run` builds the router, so the first request of the process is served
 /// by a bounded cache rather than by one that will be bounded shortly.
 /// That is the whole point on a device with sixteen thousand cache files,
-/// where the first walk of the root used to be minutes away
+/// where a walk of the root would still be minutes away
 /// (`server/tests/proxy.rs`,
 /// `a_stream_relayed_before_anything_has_walked_the_cache_is_still_bounded`).
 pub async fn start(state: Arc<AppState>) -> JoinHandle<()> {
@@ -442,15 +431,11 @@ mod tests {
     /// **A process that has counted nothing still states a cap, and one
     /// held piece moves it by that piece's size.**
     ///
-    /// The budget used to be the tail of an eviction pass, so until the
-    /// first walk of the root finished the occupancy behind every cap was
-    /// nobody's count, read as 0 -- and on a device whose cache is most of
-    /// what is on the volume that is wrong by the whole of the cache. It is
-    /// still the right answer for a cache that really holds nothing, which
-    /// is the first half here. What the second half pins is that the figure
-    /// no longer waits for a walk: the store books a piece the instant it
-    /// lands, so the very next publication states a cap that piece's size
-    /// bigger.
+    /// A cache that really holds nothing is capped at the volume's
+    /// headroom, which is the first half here. The second half pins that
+    /// the figure never waits for a walk: the store books a piece the
+    /// instant it lands, so the very next publication states a cap that
+    /// piece's size bigger.
     #[test]
     fn a_cache_nothing_has_counted_is_capped_at_the_volumes_headroom() {
         let free = CACHE_FREE_SPACE_FLOOR + 8 * MIB;
@@ -775,11 +760,9 @@ mod tests {
     /// staged with a path the OS will not answer for, because there is no
     /// such path on every platform: `statvfs` fails on a directory not yet
     /// created, but Windows names the volume from the drive letter and
-    /// answers for it with the drive's real free space. (That is exactly how
-    /// this test used to fail there, with the real number where `None` was
-    /// expected -- the property held; the fixture did not.) What a cap made
-    /// from a probe that answered `None` is, is the property, and it is the
-    /// same on both.
+    /// answers for it with the drive's real free space. What a cap made
+    /// from a probe that answered `None` is, is the property under test,
+    /// and it is the same regardless of which path fails to produce one.
     #[test]
     fn an_unreadable_volume_leaves_the_configured_limit_alone() {
         assert_eq!(CacheLimit::configured(1024).effective(4096), Some(1024));

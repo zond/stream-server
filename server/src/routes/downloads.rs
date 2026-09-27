@@ -70,10 +70,9 @@ pub struct DownloadInfo {
 /// What a pin whose torrent the backend did not restore reports as its
 /// `error` (`enginefs::BackendEngineFS::dormant_pinned_downloads`): the pin
 /// is kept, nothing is downloading, and there is nothing for the client to
-/// do about it. It used to blame a folder that might be unavailable, from
-/// when a pinned download lived in one of its own; a dormant pin is a
-/// torrent the session did not bring back, and where its bytes are is not
-/// the question.
+/// do about it. A dormant pin is a torrent the session did not bring back,
+/// and where its bytes are is not the question, so the message names no
+/// folder.
 pub const DORMANT_DOWNLOAD_ERROR: &str = "the torrent is not managed right now; \
      the pin is kept and applies when it comes back";
 
@@ -128,14 +127,12 @@ pub async fn pin_download(
     })
 }
 
-/// How often a pinned download that is not finished says where it stands.
+/// How often a pinned download that is not finished says where it stands,
+/// so a download that has stopped moving is visible without diagnosing it
+/// from the peer connections by hand.
 ///
-/// A stream logs `stream progress` every five seconds while a player is
-/// reading; a pin had no line at all after `download_pinned`, so a download
-/// that had stopped moving looked exactly like one nobody had asked to move
-/// -- a file that sat at 54 % for ten minutes with no peer connected was
-/// diagnosed from `/proc/net/tcp`. Ten seconds rather than five: nothing is
-/// waiting on this line, and a download runs for the length of a film.
+/// Ten seconds, not the stream route's five: nothing is waiting on this
+/// line, and a download runs for the length of a film.
 const DOWNLOAD_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 /// The files with a progress logger running, so that a second pin of the

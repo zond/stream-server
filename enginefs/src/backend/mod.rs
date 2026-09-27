@@ -437,31 +437,21 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     /// backend's state machine, never from its `paused` flag.
     ///
     /// The flag is what `is_paused()` returns and what every "did we pause
-    /// this?" question used to be asked of. The flag and the state are two
-    /// writes, and across a torrent's initial check they have disagreed in
-    /// both directions. Read against upstream librqbit (`c280959`), by
-    /// function:
+    /// this?" question is tempted to ask. The flag and the state are two
+    /// separate writes, and across a torrent's initial check they can
+    /// disagree in both directions: an unpause racing the check's own
+    /// continuation can leave the flag saying "running" on a torrent that
+    /// is still stopped, and a pause during a fastresume check can leave the
+    /// flag saying "paused" on a torrent that has gone live -- measured as a
+    /// 3 MiB -> 12 MiB overshoot past the free-space floor.
     ///
-    /// * **A swallowed unpause.** `Session::unpause` is
-    ///   `ManagedTorrent::start`, which writes the intent *before* `_start`
-    ///   looks at the state; the `Initializing` arm then finds a check
-    ///   already running and returns success having started nothing, and
-    ///   that check's continuation landed on the `start_paused` captured when
-    ///   *it* began. Net: a stopped torrent whose flag says it is running.
-    /// * **A swallowed pause.** `TorrentStateInitializing::check` hands
-    ///   `pause_requested` to `FileOps::initial_check` and to nothing else,
-    ///   so a pause during a *fastresume* check went unseen, and the
-    ///   continuation applied the add-time `start_paused` -- `false` for a
-    ///   torrent restored unpaused -- and took it `Live`. Net: a downloading
-    ///   torrent whose flag says it is paused. This is the measured
-    ///   3 MiB -> 12 MiB overshoot past the free-space floor.
-    ///
-    /// The fork's `f21c3a3e` has the continuation read the intent under the
-    /// lock as it stands when the check finishes, which closes both; the
-    /// librqbit tests `an_unpause_during_the_initial_check_starts_the_torrent`
-    /// and `a_pause_during_a_fastresume_check_leaves_the_torrent_parked` are
-    /// this side's guard on it. The rule stays, because two writes are two
-    /// writes.
+    /// The fork has the continuation read the intent under the lock as it
+    /// stands when the check finishes, which closes both; the librqbit
+    /// tests `an_unpause_during_the_initial_check_starts_the_torrent` and
+    /// `a_pause_during_a_fastresume_check_leaves_the_torrent_parked` guard
+    /// that fix -- a rebase that loses it fails here. This reader still
+    /// prefers the state over the flag regardless, because two writes are
+    /// two writes.
     ///
     /// There is a third shape with no flag divergence but no settled state
     /// either: a pause during a *full* check does stop it (`FileOps::
@@ -523,17 +513,15 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     /// transition. Errs for a backend that cannot restart one, so a caller
     /// never mistakes silence for recovery.
     ///
-    /// It used to lift the free-space stop as well, and that is why it is
-    /// worth a paragraph: one method reached from two places that meant
-    /// different things ("the error was dealt with" and "the space came
-    /// back") could be made correct for neither, and the second of those
-    /// callers is now [`Self::start_torrent`]. What is left has exactly one
-    /// caller, the reconciler's ladder
-    /// (`crate::reconcile::Decision::RestartFromError`), which takes it
-    /// only for an error a full volume caused and only once the volume has
-    /// cleared the resume line: restarting means re-running a storage check
-    /// that would fail again on a device that has not actually gained
-    /// anything.
+    /// This has exactly one caller, the reconciler's ladder
+    /// (`crate::reconcile::Decision::RestartFromError`): one method reached
+    /// from two callers meaning different things ("the error was dealt
+    /// with" and "the space came back") cannot be made correct for both, so
+    /// the free-space case goes through [`Self::start_torrent`] instead. It
+    /// is taken only for an error a full volume caused and only once the
+    /// volume has cleared the resume line: restarting means re-running a
+    /// storage check that would fail again on a device that has not
+    /// actually gained anything.
     async fn restart_from_error(&self) -> Result<()> {
         anyhow::bail!("this backend cannot restart a stopped torrent")
     }
@@ -561,13 +549,12 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     /// the previous process included.
     ///
     /// The counterpart of [`Self::stop_torrent`] and the other half of the
-    /// reconciler's control. **Unconditional is the whole point.** This
-    /// used to sit beside a `resume_torrent` that lifted only the pauses
-    /// the backend itself had recorded as idle ones, and was therefore
-    /// silent for a pause that survived a restart -- which is exactly the
-    /// pause somebody has to be able to lift. Errs for a torrent that is
-    /// not stopped, so a caller cannot mistake "already running" for a
-    /// start it made.
+    /// reconciler's control. **Unconditional is the whole point**: a
+    /// `resume_torrent` that lifted only the pauses the backend itself had
+    /// recorded as idle ones would stay silent for a pause that survived a
+    /// restart -- exactly the pause somebody has to be able to lift. Errs
+    /// for a torrent that is not stopped, so a caller cannot mistake
+    /// "already running" for a start it made.
     async fn start_torrent(&self) -> Result<()> {
         anyhow::bail!("this backend cannot start a stopped torrent")
     }
@@ -1120,9 +1107,9 @@ pub struct TorrentSpeedProfile {
 ///
 /// **160, for the 40 peers per torrent it derives** through
 /// [`TorrentSpeedProfile::effective_connection_limits`] (`/4`, floored at
-/// 40). It was 800, which derived the ceiling of 200.
+/// 40).
 ///
-/// 200 peers is the wrong default for the device this server is aimed at.
+/// 200 peers (what 800 would derive) is the wrong default for the device this server is aimed at.
 /// A peer costs about 75 KiB once its protocol buffers, task, channel and
 /// table entry are counted, so 200 of them are ~15 MB per torrent -- on a
 /// 2 GB television whose low-memory killer fires at around 300 MB, which
@@ -1133,17 +1120,15 @@ pub struct TorrentSpeedProfile {
 /// from a fast handful with room for churn, and well past the four or
 /// five peers a client unchokes at a time.
 ///
-/// A user who wants the old behaviour still has it -- the setting is
-/// honoured up to [`MAX_EFFECTIVE_BT_CONNECTIONS`], and since it now
-/// applies live it costs no restart to try. Raising the *default* is what
-/// a small device cannot argue with.
+/// A user who wants more still has it -- the setting is honoured up to
+/// [`MAX_EFFECTIVE_BT_CONNECTIONS`], and it applies live, so it costs no
+/// restart to try. Raising the *default* is what a small device cannot
+/// argue with.
 ///
 /// **This reaches a fresh install, not an existing one.** The first run
-/// writes the default into `settings.json`, so an installation that has
-/// been up since the 800 default has 800 on disk and keeps it: nothing
-/// here can tell that from a user who typed it. Rewriting a persisted
-/// setting behind their back is the worse of the two, and the setting now
-/// applies live, so changing it is a request rather than a restart.
+/// writes the default into `settings.json`, so an install that persisted
+/// 800 keeps it: nothing here can tell that from a user who typed it, and
+/// rewriting a persisted setting behind their back is the worse of the two.
 pub const DEFAULT_BT_MAX_CONNECTIONS: u64 = 160;
 pub const LEGACY_UNLIMITED_BT_MAX_CONNECTIONS: u64 = 65535;
 pub const MAX_EFFECTIVE_BT_CONNECTIONS: u64 = 1200;

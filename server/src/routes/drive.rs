@@ -21,8 +21,8 @@
 //!   (by the tracing layer here, `routes::util::log_path`, by whatever an
 //!   embedder puts in front, and by the diagnostics report the app lets a
 //!   viewer copy), and a body is one copy more of the secret in flight.
-//!   The `POST /drive/create` that once took it in a JSON body went with
-//!   the other control routes the app never used (`control_router` in
+//!   There is no `POST /drive/create` route to take it in a JSON body:
+//!   a control route the app never calls is not kept (`control_router` in
 //!   `lib.rs` says which remain and why). `/proxy`'s `h=Authorization:...`
 //!   overrides are the existing way to put a credential on a relayed fetch
 //!   and they are **not** reused here: they ride in the path, and an `h=`

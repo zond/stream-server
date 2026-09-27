@@ -123,12 +123,11 @@ Not for `Live`/`Connecting`/`Queued` peers (nothing to do) and not for
 
 ### 4.3 Starvation is a signal the torrent can act on -- mostly not
 
-The first draft here had the torrent re-announce to its trackers when it
-starved. Reading `tracker_comms` closed that: the announce loop already
-sleeps the tracker's `min interval` when it states one and `interval`
-otherwise, which is the earliest a client may ask again. There is nothing
-to gain inside the rules, and asking outside them is what gets a client
-throttled or banned -- so no re-announce. The DHT already re-queries every
+Re-announcing to trackers when the torrent starves is not the fix: the
+announce loop already sleeps the tracker's `min interval` when it states
+one and `interval` otherwise, which is the earliest a client may ask
+again. There is nothing to gain inside the rules, and asking outside them
+is what gets a client throttled or banned -- so no re-announce. The DHT already re-queries every
 60 s; with 4.2 in place what it finds is no longer discarded, which is most
 of the value.
 

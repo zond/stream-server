@@ -61,8 +61,8 @@ mime_guess = "2.0.5"
 # code and have no RAR support (the librqbit backend is always compiled and
 # is not a feature).
 #
-# default-features=false + crypto-rust keeps RAR's decryption in Rust. It no
-# longer keeps a C toolchain out of the build: aws-lc-sys is compiled anyway,
+# default-features=false + crypto-rust keeps RAR's decryption in Rust. It
+# does not keep a C toolchain out of the build: aws-lc-sys is compiled anyway,
 # under rustls and under librqbit's SHA-1, so the crate's default
 # `crypto-aws-lc` would change RAR's crypto backend and not what the build
 # needs.
@@ -70,22 +70,20 @@ unrar-rs = { version = "0.10", default-features = false, features = [
     "crypto-rust",
 ], optional = true }
 lz-str = "0.2.1"
-# The FTP client behind `/ftp`, in place of a spawned `curl`. That was the
-# last external program this server ran, so with it gone the build and the
-# run both need nothing but the crates named here -- which is the whole of
-# what makes this library embeddable in an app store binary. Default
-# features are off: the crate's own default is the blocking client, and the
-# `tokio` feature is the one that fits the runtime everything else here is
-# on. `tokio-rustls-aws-lc-rs` is what `ftps://` needs, on the same rustls
-# and the same aws-lc-rs provider the rest of the workspace already
+# The FTP client behind `/ftp`. Nothing here spawns an external program, so
+# the build and the run both need nothing but the crates named here -- which
+# is the whole of what makes this library embeddable in an app store binary.
+# Default features are off: the crate's own default is the blocking client,
+# and the `tokio` feature is the one that fits the runtime everything else
+# here is on. `tokio-rustls-aws-lc-rs` is what `ftps://` needs, on the same
+# rustls and the same aws-lc-rs provider the rest of the workspace already
 # compiles, so it brings no second TLS stack into the graph.
 # `deprecated` is what `connect_secure_implicit` lives behind, and implicit
 # TLS is exactly what `ftps://` means: the scheme opens the control channel
 # inside TLS on 990 rather than negotiating `AUTH TLS` on 21. The crate
 # deprecates it because the RFC prefers explicit FTPS; the URL a caller
-# hands this route does not, and `curl` -- which this replaced -- read
-# `ftps://` the implicit way too. Dropping it would silently turn one
-# scheme into a different protocol.
+# hands this route does not, and `curl` reads `ftps://` the implicit way
+# too. Dropping it would silently turn one scheme into a different protocol.
 suppaftp = { version = "12.0.0", default-features = false, features = [
     "tokio",
     "tokio-rustls-aws-lc-rs",
@@ -128,9 +126,8 @@ tar = "0.4.44"
 flate2 = "1.1.5"
 tempfile = "3.23.0"
 # The TLS origin `server/tests/proxy.rs` stands up to test what `/proxy` does
-# with an HTTPS upstream. The crate used to be a real dependency: it served
-# the deleted HTTPS listener, and nothing in the library speaks TLS server-side
-# any more.
+# with an HTTPS upstream -- a test-only use: nothing in the library speaks
+# TLS server-side.
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 # Turns on the test-root registry in the same enginefs the tests link, so the
 # proxy's TLS fixture can present a chain that verifies, and the retention
@@ -142,9 +139,10 @@ enginefs = { path = "../enginefs", features = [
     "test-hooks",
     "test-seed",
 ] }
-# Generates that fixture's CA and leaf at run time. The old fixture shipped a
-# self-signed CA certificate used as an end entity, which rustls refuses
-# whatever it is trusted as, so it could only ever be the unverifiable case.
+# Generates that fixture's CA and leaf at run time: a self-signed CA
+# certificate used as an end entity is refused by rustls whatever it is
+# trusted as, so a fixture built that way could only ever be the
+# unverifiable case.
 rcgen = "0.14"
 # The integration tests' HTTP client. Only they block; the server never does.
 reqwest = { version = "0.13", features = ["blocking"] }

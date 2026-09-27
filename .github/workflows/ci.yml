@@ -57,8 +57,8 @@ jobs:
       # No lint flags here on purpose: the policy lives in
       # `[workspace.lints]` and is inherited by every crate, so a local
       # `cargo clippy` gates exactly as this does and a new crate cannot opt
-      # out by saying nothing. This used to deny only the correctness and
-      # suspicious groups, which left `unused` as output nobody had to read.
+      # out by saying nothing. Denying only the correctness and suspicious
+      # groups would leave `unused` as output nobody had to read.
       #
       # The bare invocation lints the workspace default-members, which is
       # exactly the pure-Rust set (identical to `members`). `--all-features`
@@ -75,15 +75,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # RAR is now pure-Rust (`unrar-rs`) and ON BY DEFAULT, so the default
+      # RAR is pure-Rust (`unrar-rs`) and ON BY DEFAULT, so the default
       # test job above already builds and tests it — no libclang, no separate
       # rar job. What still needs its own guard is the MIT escape hatch:
       # `--no-default-features` must keep building WITHOUT unrar-rs
       # (GPL-3.0-or-later), so an embedder can link an MIT-licensed library --
       # this repo builds no binary at all -- and that build must work: the
       # cfg(not(feature = "rar")) paths (RAR answered 501) are only compiled
-      # here, so only here can a test reach them. The librqbit backend is always compiled (it is no longer a
-      # feature), so no backend feature needs to be named. No apt installs.
+      # here, so only here can a test reach them. The librqbit backend is
+      # always compiled and is not a feature, so no backend feature needs to
+      # be named. No apt installs.
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@1.98.0
 

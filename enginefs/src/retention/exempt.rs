@@ -2,12 +2,11 @@
 //!
 //! The door is asked once per candidate piece on the torrent and once per
 //! candidate chunk on the proxy, from a blocking thread, at the instant of
-//! every unlink. Each of those asks used to take the entity's state lock
-//! and walk its readers. That was affordable while the answer was one piece
-//! of arithmetic over one window; it is not affordable as a walk of a
-//! stream table, and a lock taken per chunk on a blocking thread is a
-//! contention point on the path that is already the slowest thing a pass
-//! does.
+//! every unlink. Taking the entity's state lock and walking its readers for
+//! each ask is affordable only while the answer is one piece of arithmetic
+//! over one window, not as a walk of a stream table, and a lock taken per
+//! chunk on a blocking thread would be a contention point on the path that
+//! is already the slowest thing a pass does.
 //!
 //! So the answer is published instead: one bit per piece, written only by
 //! the owner and only under its own lock, read by the door with a load and
@@ -15,10 +14,9 @@
 //!
 //! **The door never writes it.** "A stream dies when its region is
 //! evicted" reads like a write from the reclaim, and the reclaim holds no
-//! turn; two unordered writers to one piece of state is the defect this
-//! module's own owner has spent four review rounds finding in other places.
-//! The door refuses or does not refuse, and the owner alone decides what
-//! the bits say.
+//! turn; two unordered writers to one piece of state is exactly the defect
+//! class this owner's design rules out everywhere else. The door refuses
+//! or does not refuse, and the owner alone decides what the bits say.
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};

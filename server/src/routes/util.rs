@@ -57,12 +57,8 @@ pub(crate) fn parse_range(header: &str, size: u64) -> Option<(u64, u64)> {
 /// go out, under which status, with which headers.
 ///
 /// **One definition, because a member of an archive has to behave exactly
-/// like a plain file over HTTP.** The torrent stream route and the archive
-/// routes each used to write this out for themselves, and the differences
-/// were not decisions: a `416` that named the resource's length in one
-/// place and not the other, an empty resource that was a `Content-Length:
-/// 1` here and a `0` there. A player reading a film out of a zip cannot be
-/// asked to know which of the two it is talking to.
+/// like a plain file over HTTP.** A player reading a film out of a zip
+/// cannot be asked to know which of the two it is talking to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MediaRange {
     pub start: u64,
@@ -95,9 +91,10 @@ impl MediaRange {
 
     /// How many bytes the body carries.
     ///
-    /// An empty resource is `(0, 0)` with no range, and an inclusive end
-    /// of 0 is a length of one: a `HEAD` used to promise a byte the `GET`
-    /// had not got, and a client reads that as a truncated response.
+    /// An empty resource is `(0, 0)` with no range: an inclusive end of 0
+    /// would otherwise read as a length of one, promising a `HEAD` a byte
+    /// the `GET` doesn't have, which a client reads as a truncated
+    /// response.
     pub(crate) fn content_length(&self, size: u64) -> u64 {
         if size == 0 {
             0
@@ -183,10 +180,10 @@ pub(crate) fn log_path(path: &str) -> &str {
 /// How a response body finished, for the line a route writes when one
 /// ends.
 ///
-/// A capture of four failing streams had nothing in it about why any of
-/// them stopped. The distinction that mattered was invisible: four bodies
-/// died after about ten seconds having delivered ~4 MiB of a multi-gigabyte
-/// range, i.e. the player hung up, not the server.
+/// A body that stops early with no error recorded is the player
+/// disconnecting, not the server failing -- the distinction a field report
+/// needs, since a body can deliver a few MiB of a multi-gigabyte range and
+/// simply stop.
 ///
 /// **One vocabulary, because two routes are asked the same question.** A
 /// torrent file and a proxied URL fail a player in the same ways, and a
@@ -336,9 +333,9 @@ mod tests {
 
     #[test]
     fn zero_size_is_always_none() {
-        // Regression: these previously underflowed u64 (`size - 1` with
-        // size == 0), panicking in debug and wrapping to a huge value in
-        // release. A zero-length entry has no satisfiable byte range.
+        // Guards against underflow: `size - 1` with `size == 0` would panic
+        // in debug and wrap to a huge value in release. A zero-length entry
+        // has no satisfiable byte range.
         assert_eq!(parse_range("bytes=-5", 0), None);
         assert_eq!(parse_range("bytes=0-", 0), None);
         assert_eq!(parse_range("bytes=0-0", 0), None);
@@ -376,8 +373,7 @@ mod tests {
 mod log_redaction_tests {
     use super::*;
 
-    /// A log may name the host and nothing else of a caller's URL (review
-    /// #17).
+    /// A log may name the host and nothing else of a caller's URL.
     #[test]
     fn log_origin_keeps_the_host_and_drops_everything_else() {
         assert_eq!(
@@ -413,11 +409,9 @@ mod log_redaction_tests {
 mod body_progress_tests {
     use super::*;
 
-    /// A capture of four failing streams said nothing about why any of them
-    /// stopped. What mattered was the distinction between a body that
-    /// delivered its range and one the player hung up on part-way -- so a
-    /// body that never ended by itself must read as a disconnect, and the
-    /// first error must survive whatever the stream says afterwards.
+    /// Proves that a body dropped mid-range reads as a disconnect, and that
+    /// a body that also errors keeps its first error over whatever it
+    /// reports afterward.
     #[test]
     fn body_progress_tells_a_hung_up_player_from_a_delivered_range() {
         let mut dropped = BodyProgress::default();

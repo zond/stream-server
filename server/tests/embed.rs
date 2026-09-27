@@ -293,11 +293,11 @@ fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// **Loopback answers no CORS** (review #16). Loopback is not "only this
+/// **Loopback answers no CORS.** Loopback is not "only this
 /// app": any page a browser on the device has open reaches it, and the open
 /// routes fetch what the caller names -- `/proxy?d=http://192.168.1.1/admin`
-/// under `Access-Control-Allow-Origin: *` was a page reading the LAN through
-/// this server. Nothing that reads loopback is a browser (mpv, the
+/// under `Access-Control-Allow-Origin: *` would be a page reading the LAN
+/// through this server. Nothing that reads loopback is a browser (mpv, the
 /// embedder's HTTP client, stremio-core), so no response there grants a
 /// cross-origin read: not a preflight, not a media `GET`, not a control
 /// route. The Cast receiver's CORS lives on the LAN listener, and
@@ -1026,10 +1026,9 @@ fn post_settings_reports_which_bt_settings_took_effect() -> anyhow::Result<()> {
         applied_live.contains(&"btDownloadSpeedHardLimit".to_string()),
         "{report}"
     );
-    // So is the peer limit: it used to be `pendingRestart`, because the cap
-    // was a session option, and it is now the same runtime lever the
-    // background footprint uses. A client that shows "restart to apply"
-    // from this list must stop showing it for this setting.
+    // So is the peer limit: it is the same runtime lever the background
+    // footprint uses, not a session option, so a client must not show
+    // "restart to apply" for this setting.
     assert!(
         applied_live.contains(&"btMaxConnections".to_string()),
         "{report}"
@@ -1406,10 +1405,10 @@ fn stats_json_reports_resolving_metadata_with_the_requests_trackers() -> anyhow:
     Ok(())
 }
 
-/// **A big `.torrent` is not a `413`** (review #65). The file arrives
-/// hex-encoded in a JSON body, so axum's default 2 MB limit refused every
-/// torrent over about a megabyte -- a 20,000-piece torrent -- with a status
-/// the client can only read as "the server would not take this file".
+/// **A big `.torrent` is not a `413`.** The file arrives hex-encoded in a
+/// JSON body, so it must not run into axum's default 2 MB body limit: a
+/// 20,000-piece torrent is about a megabyte hex-encoded, and a `413` there
+/// reads to the client as "the server would not take this file".
 #[test]
 fn a_large_torrent_file_is_not_refused_by_the_body_limit() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -1446,12 +1445,12 @@ fn a_large_torrent_file_is_not_refused_by_the_body_limit() -> anyhow::Result<()>
     Ok(())
 }
 
-/// **A torrent file with no bytes is a `200` with no body** (review #64).
-/// `HEAD` promised `Content-Length: 1` -- the inclusive end of an empty
-/// range saturated to 0 and was read as one byte -- and the `GET` the
-/// player made next answered `416`, which is what a client sees as a file
-/// it cannot read rather than an empty one. (The archive routes were fixed
-/// for the same case; the torrent routes were not.)
+/// **A torrent file with no bytes is a `200` with no body.** `HEAD` reports
+/// `Content-Length: 0`, and an unranged `GET` answers `200` with an empty
+/// body: the inclusive end of an empty range must not saturate to 0 and
+/// read as a one-byte range, which would answer `416` -- a file the client
+/// sees as unreadable rather than empty. The archive routes and the torrent
+/// routes share this rule.
 #[test]
 fn a_zero_length_torrent_file_is_an_empty_body_not_a_416() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -1532,11 +1531,10 @@ fn seed_piece_store_files(
 /// `<cacheRoot>/rqbit-downloads/.pieces/<info hash>/<bucket>/<piece>`, which
 /// is where the session's default storage keeps it.
 ///
-/// These fixtures used to copy whole files into
-/// `rqbit-downloads/<torrent name>/` and let librqbit's filesystem storage
-/// find them at the initial check. The session's default storage is
-/// `PieceStoreFactory` now, so a whole `.mkv` there is bytes nothing reads:
-/// the check would find every piece missing and report the torrent empty.
+/// A whole file under `rqbit-downloads/<torrent name>/` does not work: the
+/// session's default storage is `PieceStoreFactory`, so a whole `.mkv`
+/// there is bytes nothing reads, and the check finds every piece missing
+/// and reports the torrent empty.
 ///
 /// `content` is the directory `real_torrent` was pointed at, and each file is
 /// read back through the path the *metainfo* gives, in the order the metainfo
@@ -1822,15 +1820,13 @@ fn poll_stats(client: &reqwest::blocking::Client, url: &str) -> anyhow::Result<s
 /// re-dialling the parked ones on the way back. That needs a swarm and is
 /// enginefs's `lean_parks_the_surplus_and_full_re_dials_it`, which dials
 /// out to seeders whose addresses it was handed instead of waiting to be
-/// dialled. This test used to grow a swarm of its own -- a dozen loopback
-/// seeders dialling *in*, because the server cannot be told peer addresses
-/// over its API -- and on the Windows CI runner not one of them ever
-/// connected (`peers=0`), so its precondition, more live peers than the
-/// cap, could not be met there at all. The cap's arithmetic
-/// (`LEAN_PEER_LIMIT` on every torrent the session holds and on the next
-/// one added, the *configured* limit back on `Full`) is enginefs's
-/// `footprint_caps_every_torrent_and_the_next_one_added`, which needs no
-/// peers either.
+/// dialled: a test that needs live peers dialling *in* -- which is the only
+/// way this server's API lets a swarm form -- is a bet on the runner's own
+/// network stack, so this test reads the cap off data already on disk
+/// instead. The cap's arithmetic (`LEAN_PEER_LIMIT` on every torrent the
+/// session holds and on the next one added, the *configured* limit back on
+/// `Full`) is enginefs's `footprint_caps_every_torrent_and_the_next_one_added`,
+/// which needs no peers either.
 #[test]
 fn set_background_caps_the_torrent_and_still_streams() -> anyhow::Result<()> {
     const LEAN: usize = enginefs::backend::LEAN_PEER_LIMIT;
@@ -1938,7 +1934,7 @@ fn set_background_caps_the_torrent_and_still_streams() -> anyhow::Result<()> {
 /// archive downloaded whole and a member extracted beside it, about twice
 /// the film, unlinked only when the session holding them dropped -- and a
 /// killed process drops nothing, which on Android is the ordinary end.
-/// Nothing writes the directory now (`crate::translators`: a member is
+/// Nothing writes the directory (`crate::translators`: a member is
 /// ranges of the container), so on an upgraded install it is bytes no
 /// retention owner speaks for, no cache figure counts, and nothing else
 /// will ever take: the piece store's own legacy sweep walks
@@ -2556,7 +2552,7 @@ fn downloads_pin_in_place_and_delete_only_what_they_say() -> anyhow::Result<()> 
         named.join("e1.bin").to_str(),
         "{pinned:?}"
     );
-    // `path` is where the file *would* be, and no longer where any byte is:
+    // `path` is where the file *would* be, not where any byte actually is:
     // a pinned download is piece files like everything else, and the folder
     // in that name holds none of them.
     assert!(!named.join("e1.bin").exists(), "no whole file is produced");
@@ -3111,13 +3107,13 @@ fn content_range_total(response: &reqwest::blocking::Response) -> u64 {
 /// **The cap the publisher states follows what the owners hold.**
 ///
 /// The disk arm of the cap is `occupied + available - floor`, and
-/// `occupied` used to be whatever an eviction pass had last counted -- 0
-/// until the first walk of the root finished. That is not a stale figure
-/// that is close: a four-gigabyte television already holding four gigabytes
-/// with six hundred megabytes free stated a cap of eighty-eight megabytes,
-/// and every stream opened in the minutes a sixteen-thousand-file walk
-/// takes ran under a window that size. The publisher reads the owners now,
-/// and this is the moment that proves it: bytes that were on the volume
+/// `occupied` is what the owners count, never an eviction pass's last walk
+/// of the root. A stale count is not close: a four-gigabyte television
+/// already holding four gigabytes with six hundred megabytes free measured
+/// a cap of eighty-eight megabytes under a stale count, with every stream
+/// opened during a sixteen-thousand-file walk running under a window that
+/// size. The publisher reads the owners directly, and this is the moment
+/// that proves it: bytes that were on the volume
 /// before the process started -- so the free-space arm has already lost
 /// them -- become *counted* when the session registers the store over them,
 /// and the very next publication states a cap that much larger.
@@ -3132,7 +3128,7 @@ fn content_range_total(response: &reqwest::blocking::Response) -> u64 {
 /// disk arm is `occupied + available - floor`, and `available` is a reading
 /// of a real volume that the rest of this test binary is writing to while
 /// this runs: a plain `after > before` is a bet that the suite freed more
-/// than it wrote in between, and it lost that bet once. So the volume is
+/// than it wrote in between, a bet this suite can lose. So the volume is
 /// read beside each cap -- the same `statvfs` the publisher takes -- and
 /// the growth is measured in `cap - available`, which is the occupancy the
 /// publisher put in and nothing else.
@@ -3471,8 +3467,8 @@ fn a_clean_takes_no_pinned_and_no_ownerless_byte() -> anyhow::Result<()> {
         .join("old.mkv");
     std::fs::create_dir_all(idle.parent().unwrap())?;
     write_payload(&idle, 16 * 1024);
-    // And the legacy whole-file copy of *this* torrent, exactly where the
-    // filesystem storage used to put a directory torrent's data.
+    // And the legacy whole-file copy of *this* torrent, exactly where a
+    // whole-file (filesystem) storage puts a directory torrent's data.
     let root_folder = cache_root.join("rqbit-downloads").join("Movie");
     std::fs::create_dir_all(&root_folder)?;
     std::fs::copy(content.join("movie.mkv"), root_folder.join("movie.mkv"))?;
@@ -3646,11 +3642,10 @@ fn lan_media_server(
 /// not a timing assertion), never on a sleep of its own choosing.
 ///
 /// `cache_root` is the one the fixture seeded through, and it is here for the
-/// failure message alone. This wait expired once on the Windows runner
-/// (2026-09-13, run 34727326274) with the whole file unclaimed -- `downloaded`
-/// zero, every piece of a one-file torrent missing -- and the stats alone
-/// cannot say which of the two things happened, because a torrent reports the
-/// same numbers either way:
+/// failure message alone. If this wait expires, the stats alone cannot say
+/// which of two things happened -- a torrent reports the same numbers
+/// either way, `downloaded` zero and every piece of a one-file torrent
+/// missing:
 ///
 /// * the piece files were **not on the disk** when the check ran, so
 ///   `PieceStore::has_piece` said no to every piece and the check read
@@ -3718,8 +3713,8 @@ fn start_lan_media(handle: &ServerHandle) -> anyhow::Result<std::net::SocketAddr
 ///
 /// The last part is the window the hysteresis opens. Between the floor and
 /// the resume margin a timer leaves a stopped torrent alone -- but the
-/// stream route no longer has a refusal of its own keyed on "this torrent
-/// is stopped", so a request landing there must be what starts it, or the
+/// stream route has no refusal of its own keyed on "this torrent is
+/// stopped", so a request landing there must be what starts it, or the
 /// reader would park on a torrent nothing is fetching for.
 #[test]
 fn the_servers_own_reconciler_stops_a_torrent_under_the_floor_and_starts_it_again()
@@ -3889,8 +3884,6 @@ fn a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it() -> anyhow
             // asserting the flag after it: they are two fields of one
             // snapshot and nothing makes them move together, so on a slow
             // runner the message lands first and the flag a moment later.
-            // That is what failed the Windows job at 2eebbfb, and nowhere
-            // else.
             if stats["error"].as_str() == Some(stopped_message)
                 && stats["swarmPaused"] == serde_json::json!(true)
             {
@@ -4292,13 +4285,11 @@ fn archive_extractions(cache_root: &std::path::Path) -> Vec<std::path::PathBuf> 
 /// **A compressed member inside a torrent is refused**, with the sentence
 /// the player shows and nothing written anywhere.
 ///
-/// This test used to prove that two ranged reads of a deflated member were
-/// *one* extraction rather than two -- a second copy of the film per range
-/// request was the bug, and one copy was the fix. There is no extraction
-/// now: reaching the end of a deflated film means inflating all of it, so
-/// the member is refused instead, by decision
-/// (`docs/design/translated-sources.md` §2.2). What the disk is asked here is
-/// what it was asked then, and the answer is stronger: not one copy, none.
+/// A deflated member has no random access: reaching any offset means
+/// inflating everything before it, so a range read is refused by decision
+/// (`docs/design/translated-sources.md` §2.2) rather than serving a
+/// decompressed copy. A member is `Direct` extents or a `Refusal`, never a
+/// third state, so nothing is written under the cache root either.
 #[test]
 fn a_compressed_member_in_a_torrent_is_refused_rather_than_extracted() -> anyhow::Result<()> {
     const MEMBER: &str = "member.bin";
@@ -4428,8 +4419,8 @@ fn a_stored_member_in_a_torrent_is_served_without_an_extraction() -> anyhow::Res
         Some(MEMBER_LEN.to_string().as_str())
     );
 
-    // **Nothing under the cache root at all**: not an extraction, not the
-    // directory extractions used to land in.
+    // **Nothing under the cache root at all**: not an extraction, not
+    // `.archives`, the directory one would use.
     assert!(
         !cache_root.join(".archives").exists(),
         "the translated path wrote under the cache root: {:?}",
@@ -4516,8 +4507,9 @@ fn rar_set_server(
 /// mapping is a range that spans a volume boundary: its bytes have to be
 /// the film's on both sides of it. The film's every kibibyte states its
 /// own offset, so a part read out of the wrong volume is a wrong sentence.
-/// Nothing is extracted and nothing is written: until this step a RAR in a
-/// torrent was `501`, because the reader took a `std::fs::File`.
+/// Nothing is extracted and nothing is written: the reader takes a
+/// `ByteSource`, not a `std::fs::File`, so a RAR set stored in a torrent is
+/// served by range like any other member.
 #[cfg(feature = "rar")]
 #[test]
 fn a_stored_film_across_three_rar_volumes_in_a_torrent_is_served_by_range() -> anyhow::Result<()> {
@@ -4713,9 +4705,9 @@ fn an_archive_body_keeps_its_torrent_running_while_it_is_open() -> anyhow::Resul
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let opened = std::time::Instant::now();
 
-    // Seeding off, which used to be half of what armed the arm and is now
-    // neither here nor there: a torrent nobody is playing is stopped either
-    // way. Left in as the setting a viewer of this feature would have.
+    // Seeding off is neither here nor there for this arm: a torrent nobody
+    // is playing is stopped either way. Left in as the setting a viewer of
+    // this feature would have.
     handle.update_settings(serde_json::json!({ "seedingEnabled": false }))?;
 
     // Wait until both are true: the control torrent has been stopped, and
@@ -4760,7 +4752,7 @@ fn an_archive_body_keeps_its_torrent_running_while_it_is_open() -> anyhow::Resul
 /// still `TorrentMemberStream::drop`'s spawned `on_stream_end` -- a `Drop`
 /// cannot await the async locks itself -- and without it every archive
 /// member ever read leaves a stream registered for the life of the process.
-/// That no longer stops the reconciler from doing anything (what it reads
+/// That does not stop the reconciler from doing anything (what it reads
 /// is the cell), so the oracle for it is the register itself, on the wire
 /// the embedder reads it off: `background_traffic().playing` is
 /// `enginefs::EngineFS::playback_is_live`, which is the open file readers
@@ -4869,14 +4861,15 @@ fn an_archive_member_read_lets_the_torrent_be_stopped_again_when_it_is_done() ->
 
 /// A HEAD on a torrent the viewer has just left leaves it running.
 ///
-/// The stream route's metadata-resolution guard used to ask the reconciler
-/// about every torrent it was handed, before the stream open had written
-/// the liveness cell. For a torrent with its metadata that asks about one
-/// nobody has claimed: the viewer watched X, moved to Y, and comes back to
-/// X before the timer has stopped it -- X is running, neither playing nor
-/// pinned, so the ladder's last arm answers `Stop`, and the guard dropped
-/// its peers moments before the GET's own reconcile started it again. A
-/// HEAD never opens a stream, so its stop was not undone at all.
+/// The stream route's metadata-resolution guard must not ask the
+/// reconciler about every torrent it is handed before the stream open has
+/// written the liveness cell: for a torrent with its metadata, that asks
+/// about one nobody has claimed. The viewer watched X, moved to Y, and
+/// comes back to X before the timer has stopped it -- X is running,
+/// neither playing nor pinned, so the ladder's last arm answers `Stop`, and
+/// a guard that reconciled would drop its peers moments before the GET's
+/// own reconcile started it again. A HEAD never opens a stream, so that
+/// stop would never be undone.
 ///
 /// **The window is one tick.** A stop is not held back by the dwell, so
 /// the server's own reconciler stops X within `RECONCILE_INTERVAL` of Y

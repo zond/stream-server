@@ -31,7 +31,7 @@
 //!   from pieces we already hold -- nothing here ever asks for a byte no
 //!   consumer asked for -- and once a piece is in it, it stays.
 //!
-//! Where the split falls is not a half any more. Both parts are bounded in
+//! Where the split falls is not simply a half. Both parts are bounded in
 //! *time* first ([`Buffering`]) -- so many seconds of this stream at the rate
 //! bytes are really leaving the server at -- and the budget is only the
 //! ceiling. The committed part yields first, and it yields to a floor too:
@@ -46,19 +46,11 @@
 //! *not* announced, because it will go. On a small volume
 //! that means we honestly seed little; on a roomy one we seed everything.
 //!
-//! **That last part was a decision this module could state and not perform,
-//! and it performs it now.** At the rev this crate used to pin, `have`
-//! implied announced on both paths out of librqbit -- the `have` broadcast
-//! and the handshake bitfield, which serialises `get_have_pieces()` whole --
-//! and a window piece has to be `have` for the stream to read it, so wiring
-//! this policy up would have announced every window piece and withdrawn it
-//! again a few seconds later. The fork now has the third state,
-//! `ManagedTorrent::set_pieces_advertised`: a suppression set on the chunk
-//! tracker, independent of both the have-set and the reclaim want-set, and
-//! settable *before* a piece is downloaded so no Have ever goes out for it.
-//! [`crate::retention`] is what holds a window back with it and what puts a
-//! committed piece into what we announce, and [`RetentionPolicy::advertised`]
-//! is now what a peer really is shown.
+//! **That last part is a decision this module states but does not perform.**
+//! [`RetentionPolicy::advertised`] says which pieces to show a peer, and
+//! [`crate::retention`] is what turns it into what librqbit actually
+//! announces, through the fork's `ManagedTorrent::set_pieces_advertised`
+//! (see the `piece_store` module docs for why that third state exists).
 //!
 //! # Two choices worth stating, because they look arbitrary
 //!
@@ -73,41 +65,37 @@
 //! because a shared late bias only moves the hole: if every client kept the
 //! tail, the tail becomes the over-replicated part and the head goes scarce.
 //!
-//! It is the opposite of the rule that used to be here, which committed a
-//! piece when the window *released* it -- the playhead having walked past it
-//! -- and so settled the shared set out of the first minutes of the film. In a
-//! swarm of streaming clients everyone watches from the start, so the head is
-//! the most replicated part of a torrent and the tail is the scarce part: that
-//! rule kept exactly the pieces nobody needs. Measured on the field device --
-//! a cap of thirty-six pieces, about fifty seconds of a 23 Mbps film -- it
-//! shared the first fifty seconds of a 109-minute feature and nothing else for
-//! the rest of the process.
+//! It is not committed when the window *releases* a piece -- the playhead
+//! having walked past it -- because that would settle the shared set out of
+//! the first minutes of the film: in a swarm of streaming clients everyone
+//! watches from the start, so the head is the most replicated part of a
+//! torrent and the tail is the scarce part, and committing on release would
+//! keep exactly the pieces nobody needs. Measured on the field device -- a
+//! cap of thirty-six pieces, about fifty seconds of a 23 Mbps film -- that
+//! approach shares the first fifty seconds of a 109-minute feature and
+//! nothing else for the rest of the process.
 //!
-//! **A drawn piece is committed and announced the moment we hold it**, verified
-//! on the disk, rather than when something lets go of it. The old rule had to
-//! wait: with membership decided by playback there was always a piece we might
-//! still reclaim, and announcing one of those is the advertise-then-refuse this
-//! module exists to prevent. With the set fixed up front there is nothing to
-//! take back, so a piece can go out the moment it verifies -- which is what any
-//! BitTorrent client does with every piece it completes, and it means peers
-//! learn we have those bytes *while* the viewer is watching, which is when the
-//! upload switch lets us serve them.
+//! **A drawn piece is committed and announced the moment we hold it**,
+//! verified on the disk, rather than when something lets go of it: with the
+//! set fixed up front there is nothing to take back, so a piece can go out
+//! the moment it verifies -- which is what any BitTorrent client does with
+//! every piece it completes -- and it means peers learn we have those bytes
+//! *while* the viewer is watching, which is when the upload switch lets us
+//! serve them. Deciding membership by playback instead would always leave a
+//! piece we might still reclaim, and announcing one of those is the
+//! advertise-then-refuse this module exists to prevent.
 //!
-//! **And the moment is the completion, not the next pass.** It was the pass
-//! for as long as "found to hold it" was a listing sampled every couple of
-//! seconds: a drawn piece fetched and given back between two passes was
-//! never announced at all, and how much a session shared came out of how
-//! much the cache happened to be holding when a pass looked -- which is a
-//! property of the window and the tick and not of the draw.
-//! [`RetentionPolicy::commit_drawn`] is what the completion calls, and the
-//! pass still commits whatever it finds held that the event missed.
+//! **And the moment is the completion, not the next pass.**
+//! [`RetentionPolicy::commit_drawn`] is what the completion calls (see
+//! [`super::registry::PieceCompleted`]); the pass still commits whatever it
+//! finds held that the event missed, which is a property of the window and
+//! the tick and not of the draw.
 //!
-//! **Nothing once committed is ever un-announced or reclaimed**, and that is
-//! now a property of the design rather than a consequence of a capacity never
-//! being reached. There is no un-have in BitTorrent: hiding a piece changes
-//! only the bitfield a *new* peer is handed at its handshake, while a peer that
-//! already holds our Have can still ask for it and, the bytes being gone, be
-//! hung up on. So a capacity that shrinks under the set only stops it growing
+//! **Nothing once committed is ever un-announced or reclaimed.** There is no
+//! un-have in BitTorrent: hiding a piece changes only the bitfield a *new*
+//! peer is handed at its handshake, while a peer that already holds our Have
+//! can still ask for it and, the bytes being gone, be hung up on. So a
+//! capacity that shrinks under the set only stops it growing
 //! ([`RetentionPolicy::observe`]), and a smaller budget adopts the whole of
 //! what the bigger one announced, over its capacity and all
 //! ([`RetentionPolicy::carry_into`]).
@@ -137,10 +125,10 @@
 use std::collections::BTreeSet;
 use std::ops::Range;
 
-/// How much of the unshared part is counted as sitting behind a reader when
-/// it is sized from a forward reach ([`window_for_reach`]), in percent: what
-/// is left in the sizing of the rolling window this part used to be, 90%
-/// ahead of the playhead and 10% behind it.
+/// How much of a forward-reach window ([`window_for_reach`]) is treated as
+/// sitting behind the playhead rather than ahead of it, in percent: a cap
+/// stated in seconds is converted assuming 90% of the window reaches ahead
+/// and 10% behind.
 const BEHIND_PERCENT: u64 = 10;
 
 /// How much of the budget is committed for sharing rather than spent on the
@@ -188,8 +176,8 @@ impl Share {
 /// [`crate::retention::owner::Asking::holding`] so that no reclaim is
 /// chosen against it. The committed set is what `advance` never reclaims.
 /// Nothing here bounds what a stream fetches or what a pass takes back --
-/// that went with the read-pattern rewrite, see [`Shape::Split`] -- so
-/// what this number does is size the committed half. The budget is
+/// see [`Shape::Split`] -- so what this number does is size the committed
+/// half. The budget is
 /// republished every sixty seconds from the volume's free space and a
 /// shrink resizes the policy under readers that are already open; a
 /// committed set drawn at half of the new budget, beside a lookahead
@@ -224,9 +212,10 @@ pub struct Buffering {
     /// `None` for no cap.
     ///
     /// The committed set is what a peer may be offered and what a scan back
-    /// is served from; both want the recent past, not half the volume. Half
-    /// the budget is what it used to be, which on a small cache is the half
-    /// the forward buffer needed.
+    /// is served from; both want the recent past, not half the volume.
+    /// Sizing it as half the budget would, on a small cache, take exactly
+    /// the half the forward buffer needs, leaving nothing over for either
+    /// use.
     pub committed_seconds: Option<u64>,
     /// The film's average bitrate for this entity, or `None` until its
     /// length has been stated.
@@ -234,12 +223,12 @@ pub struct Buffering {
     /// **A bitrate and not an observation.** It is the entity's size over
     /// the duration the player reported (`Retention::note_duration`), which
     /// is exact at the first report and cannot be distorted by a read
-    /// pattern. It was an EWMA over delivered bytes, and that measured a
-    /// swarm and a player's own cache rather than a film: three bytes a
-    /// second across a gap in which nothing played, seventeen across two
-    /// seconds a player spent inside its buffer, each collapsing the window
-    /// onto its floor. Until there is a rate the two time caps do not apply
-    /// at all and the byte arithmetic below stands on its own.
+    /// pattern: an EWMA over delivered bytes instead would measure the
+    /// swarm and the player's own buffer rather than the film -- as little
+    /// as three bytes a second across a gap in which nothing played --
+    /// collapsing the window onto its floor. Until there is a rate the two
+    /// time caps do not apply at all and the byte arithmetic below stands
+    /// on its own.
     pub bytes_per_second: Option<u64>,
     /// The draw that decides which pieces of this entity this process
     /// offers to the swarm; see [`choose`].
@@ -275,12 +264,12 @@ const SMALLEST_TIME_CAP_BYTES: u64 = 64 * 1024 * 1024;
 /// and runs off the end of. Zero for no lookahead.
 ///
 /// This is the window's floor ([`RetentionPolicy::shape_for`]), and it is a
-/// count of pieces and nothing else. It used to be sized as a forward reach
-/// ([`window_for_reach`]), which assumed a tenth of the window sat behind a
-/// playhead -- but what the floor protects is the lookahead the backend
-/// refuses to forget, which has nothing behind it, so the floor came out a
-/// ninth over the lookahead and the committed set that much under what the
-/// rule leaves it.
+/// count of pieces and nothing else -- not a forward reach
+/// ([`window_for_reach`]), because that assumes a tenth of the window sits
+/// behind a playhead, and what the floor protects is the lookahead the
+/// backend refuses to forget, which has nothing behind it: sizing it as a
+/// reach would come out a ninth over the lookahead, leaving the committed
+/// set that much short of what the rule leaves it.
 fn pieces_touched_by(bytes: u64, piece_length: u64) -> u32 {
     debug_assert!(piece_length > 0, "a piece length of zero");
     if bytes == 0 {
@@ -383,15 +372,13 @@ pub enum Shape {
     Split {
         /// Pieces the sharing draw may **not** have.
         ///
-        /// **It was a rolling window and is not one now.** The forward
-        /// reach round a playhead went with the read-pattern rewrite: what
-        /// is fetched and kept is what the detector's consumers ask for
-        /// (`crate::retention::streams`), which no number here bounds. What
-        /// is left of it is this -- the part of the budget `committed` may
-        /// not take, which is what sizes `committed` at all -- and, on a
-        /// backing whose passes run off a moving byte rather than a tick,
-        /// how far that byte may move between two of them
-        /// (`stride_for`).
+        /// **Not a rolling window.** What is fetched and kept is what the
+        /// detector's consumers ask for (`crate::retention::streams`),
+        /// which no number here bounds. What this sizes is the part of the
+        /// budget `committed` may not take -- which is what sizes
+        /// `committed` at all -- and, on a backing whose passes run off a
+        /// moving byte rather than a tick, how far that byte may move
+        /// between two of them (`stride_for`).
         unshared: u32,
         /// Pieces the committed set may hold.
         committed: u32,
@@ -468,15 +455,13 @@ pub struct RetentionPolicy {
     /// The pieces this policy will share, drawn when it was built and
     /// never changed except to follow the capacity up or down.
     ///
-    /// **Membership is decided in advance, not sampled from playback.** A
-    /// chosen piece is committed the moment we hold it -- verified on the
-    /// disk -- announced from then on, and kept for the life of the policy;
-    /// nothing here ever takes one back. That is exactly what a BitTorrent
-    /// client with no retention at all does with every piece it completes,
-    /// and it is available here only because the set is fixed up front:
-    /// with membership decided by playback there was always a piece we
-    /// might still reclaim, so nothing could be announced until the window
-    /// had let go of it.
+    /// **Membership is decided in advance, not sampled from playback** (see
+    /// the module docs for why). A chosen piece is committed the moment we
+    /// hold it -- verified on the disk -- announced from then on, and kept
+    /// for the life of the policy; nothing here ever takes one back. That
+    /// is exactly what a BitTorrent client with no retention at all does
+    /// with every piece it completes, and it is available here only
+    /// because the set is fixed up front.
     ///
     /// It is never *fetched* for. We commit what we hold, and we hold what
     /// the viewer's window fetched, so a viewer who stops halfway fills
@@ -742,17 +727,15 @@ impl RetentionPolicy {
     ///
     /// The same rule [`Self::advance`] applies to a held piece, asked one
     /// piece at a time so that the answer does not depend on when a pass
-    /// happens to run. A pass samples the listing every couple of seconds,
-    /// so a drawn piece fetched and given back between two of them was
-    /// never announced at all, and how much a session shared came out of
-    /// how much the cache happened to be holding when a pass looked.
-    /// Completion is the event that says a piece is ours, and this is what
-    /// hears it; see [`crate::retention::owner::Retention::commit_completed`].
+    /// happens to run (see [`super::registry::PieceCompleted`] for why that
+    /// matters). Completion is the event that says a piece is ours, and
+    /// this is what hears it; see
+    /// [`crate::retention::owner::Retention::commit_completed`].
     ///
     /// The drawn set alone, so [`Shape::Whole`] is untouched: a budget that
     /// covers the file reclaims nothing, so there is no window for a piece
-    /// to be lost in and nothing for the sampling to miss -- the pass
-    /// commits the whole file as it arrives, as it always did.
+    /// to be lost in and nothing for a sampling pass to miss -- it commits
+    /// the whole file as it arrives.
     ///
     /// The capacity is respected by [`Self::chosen`] being sized from it,
     /// which is the same thing that bounds `advance`; nothing here can
@@ -822,7 +805,7 @@ impl RetentionPolicy {
 
         // Ascending, for a stable order in the decision and nothing else:
         // which pieces we share is not a function of the order they are
-        // offered in any more. It was settled when the policy was built.
+        // offered -- that was settled when the policy was built.
         for &piece in held {
             if !self.pieces.contains(&piece) || self.committed.contains(&piece) {
                 continue;
@@ -834,9 +817,9 @@ impl RetentionPolicy {
                 decision.committed.push(piece);
             }
         }
-        // **What to give up is not this module's to decide any more.** It
-        // is what the entity's consumers are not asking for, oldest by
-        // effective age, and only as much of it as the allowance needs --
+        // **What to give up is not this module's to decide.** It is what
+        // the entity's consumers are not asking for, oldest by effective
+        // age, and only as much of it as the allowance needs --
         // `crate::retention::streams`. What is still this module's is that
         // a committed piece is never one of them: a piece we have offered a
         // peer is out of reach of every reclaim, which is the whole of what
@@ -909,10 +892,10 @@ mod tests {
         for playhead in playheads {
             // What arrives is what a consumer at `playhead` is fetched, and
             // what is offered up is everything else -- neither of which the
-            // policy decides any more (`crate::retention::streams`). The
-            // walk states both, which is all these tests ever needed them
-            // for: what a policy commits is what it has held, and what it
-            // refuses to give back is what it has committed.
+            // policy decides (`crate::retention::streams`). The walk states
+            // both, which is all these tests ever needed them for: what a
+            // policy commits is what it has held, and what it refuses to
+            // give back is what it has committed.
             let width = match p.shape() {
                 Shape::Whole => p.pieces().end,
                 Shape::Split { unshared, .. } => unshared.max(1),
@@ -1121,15 +1104,15 @@ mod tests {
     ///
     /// What the floor is for is the *next* budget, republished sixty
     /// seconds later off a volume that has filled. That policy is built
-    /// without the reader in view, and used to be free to give half of it
-    /// to the committed set under a stream whose lookahead the backend
-    /// will not forget a piece of -- two pinned sets that between them
-    /// overfilled the budget, so the disk sat over it for the life of the
-    /// stream and paid a refused `drop_pieces` per tick. What is asserted
-    /// is the arithmetic itself, `committed <= budget - floor`, and not
-    /// `piece_budget`, which nothing in production reads; and the
-    /// lookahead varies, because a floor that only ever had one piece to
-    /// cover was only ever checked at a budget of one.
+    /// without the reader in view, so the floor must leave room for a
+    /// lookahead the backend will not forget a piece of: without it, two
+    /// pinned sets could between them overfill the budget, leaving the disk
+    /// over it for the life of the stream and paying a refused
+    /// `drop_pieces` per tick. What is asserted is the arithmetic itself,
+    /// `committed <= budget - floor`, and not `piece_budget`, which nothing
+    /// in production reads; and the lookahead varies, because a floor that
+    /// only ever had one piece to cover was only ever checked at a budget
+    /// of one.
     #[test]
     fn the_committed_half_leaves_room_for_every_granted_lookahead_at_every_budget() {
         const MIB: u64 = 1 << 20;
@@ -1508,15 +1491,8 @@ mod tests {
     /// beside it in the same window are not.**
     ///
     /// Committed and the window are two protections over the same piece and
-    /// both can apply at once. The old rule waited for the window to
-    /// release a piece before committing it, and it had to: with membership
-    /// decided by playback there was always a piece we might still reclaim,
-    /// and announcing one of those is the advertise-then-refuse this whole
-    /// module exists to avoid. With the set drawn up front there is nothing
-    /// to take back, so a piece can be announced the moment it verifies --
-    /// which is what an ordinary client does with every piece it completes,
-    /// and it means peers learn we have those bytes *while* the viewer is
-    /// watching, which is when the upload switch lets us serve them.
+    /// both can apply at once (see the module docs for why membership is
+    /// drawn up front rather than released by the window).
     #[test]
     fn a_drawn_piece_is_committed_as_soon_as_it_is_held() {
         let mut p = policy(20, 200);
@@ -1555,7 +1531,8 @@ mod tests {
     ///
     /// [`RetentionPolicy::observe`] runs at the top of every pass and
     /// re-draws whenever the capacity moves, which a stated bitrate and a
-    /// moving budget between them make often enough to matter. Lowest-rank-`count` is nested, so a shrink drops the
+    /// moving budget between them make often enough to matter.
+    /// Lowest-rank-`count` is nested in `count`, so a shrink drops the
     /// unchosen tail of the draw -- and a piece we have already announced is
     /// in that tail as easily as any other. `advance` would not reclaim it,
     /// because it tests the committed set first, but the moment the disk
@@ -1799,8 +1776,8 @@ mod tests {
 
             let mut disk: BTreeSet<u32> = BTreeSet::new();
             for playhead in (0..count).chain((0..count).rev()) {
-                // What a consumer at this playhead is fetched, which the
-                // policy no longer decides; and everything held offered up,
+                // What a consumer at this playhead is fetched -- not the
+                // policy's decision -- and everything held offered up,
                 // which is what the walk is measuring the ceiling of.
                 let width = match p.shape() {
                     Shape::Whole => count,

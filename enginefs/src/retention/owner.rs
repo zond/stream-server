@@ -57,7 +57,7 @@
 //!    and in the pass.
 //! 3. T is awaited (`lock().await`) only with NO owner lock held:
 //!    [`Retention::pass`]'s callers, [`Retention::install`] and
-//!    [`Retention::clear`] take it first. T → L2 briefly is allowed.
+//!    `Retention::clear` take it first. T → L2 briefly is allowed.
 //!    `try_lock` on T IS allowed under L2 -- deliberately:
 //!    "is a pass running" and "is this byte due" must be one reading, and
 //!    **every exit of the pass** must decide `again` and either hand the
@@ -424,11 +424,9 @@ pub struct Consumers {
     /// keeps a second reader crawling the container's index for as long as
     /// a film is open, reopening about once a second, so the newest read
     /// and the longest-lived read are both regularly that crawler rather
-    /// than the viewer. It used to be told from the geometry of the range
-    /// header (`is_container_metadata_request`), which is the thing this
-    /// replaces; the measured rates in the field log of 2026-09-14 were
-    /// 91 B/s for the crawler against 1.2 MB/s for the viewer, and the
-    /// two reads look identical from the wire.
+    /// than the viewer. Not told from the geometry of a range header: the
+    /// two reads look identical from the wire, measured at 91 B/s for the
+    /// crawler against 1.2 MB/s for the viewer.
     ///
     /// **It is a cadence and a reporting number, not a retention one.**
     /// What is kept, fetched and given back comes from [`Self::want`],
@@ -494,10 +492,9 @@ pub trait Backing: Sized + Send + Sync + 'static {
     ///
     /// Only [`State::buffering`] asks, and only to turn a player's stated
     /// duration into the film's bitrate -- which is what a window measured
-    /// in seconds needs, and what this module spent three field rounds
-    /// failing to *measure*. Size over duration is that number exactly, at
+    /// in seconds needs. Size over duration gives that number exactly, at
     /// the first report, with nothing to converge and no read pattern to be
-    /// fooled by.
+    /// fooled by; a rate measured from reads instead has neither property.
     fn bytes(domain: &Self::Domain) -> Option<u64> {
         let _ = domain;
         None
@@ -656,7 +653,7 @@ pub trait Backing: Sized + Send + Sync + 'static {
     /// detector answers it: what to fetch ahead of them, what no unlink may
     /// touch, and what to give back first if something must go.
     ///
-    /// The three replace what a playhead and a window used to decide. A
+    /// The three replace what a playhead and a window once decided. A
     /// consumer is the unbroken run of bytes it caused, so membership is a
     /// question about the disk and this is the first moment in a pass that
     /// has one -- and the backing owns the detector because the reads reach
@@ -821,13 +818,12 @@ struct State<B: Backing> {
     ///
     /// It ends the other way too: a **pin**, which makes the entity one no
     /// slack pass will ever walk again. [`Retention::clear_under`] is the
-    /// only thing that gives a range back, and with no policy to read the
-    /// range off it used to return at once -- leaving the pieces the user
-    /// had just asked us to keep held back from every peer while
-    /// `Engine::standing`, finding no policy, told the
-    /// cleaner the torrent announces them. Held back and protected at once
-    /// is the one combination that is never right, and there was no pass
-    /// left to undo it. So the fact is recorded, and `clear_under` reads it.
+    /// only thing that gives a range back, and with no policy of its own to
+    /// read the range from it cannot tell "nothing installed" from "nothing
+    /// to release" -- so it reads this recorded fact instead of returning at
+    /// once. Held back and protected at once is the one combination that is
+    /// never right, and once slack has stopped running there is no pass
+    /// left to undo it.
     ///
     /// **A fresh entity starts with it set** (under [`Share::Half`]). The
     /// mask is the backend's, and it outlives everything here that could
@@ -1345,16 +1341,11 @@ impl<B: Backing> Retention<B> {
     /// Install (or keep) the policy for `key` about to be streamed, and hold
     /// its pieces back from what we announce. [`Install::OnOpen`]'s path.
     ///
-    /// **It touches no other entity.** It used to clear every sibling first
-    /// -- one active file per torrent, and the old range given back before
-    /// the new one was held back -- under an install-ordering lock that
-    /// existed only to make that sweep atomic. Both are gone with the value
-    /// that replaced them: what is live is one cell
-    /// ([`crate::retention::live`]), the file a reader left is
+    /// **It touches no other entity.** What is live is one cell
+    /// ([`crate::retention::live`]); the file a reader left is
     /// [`Mode::Slack`] at the next pass, and a slack pass takes its bytes
     /// off the disk rather than putting its range back into what we
-    /// announce. Re-announcing a range we are about to delete was issue
-    /// (a): a Have per switch for pieces that went seconds later.
+    /// announce ([`Self::slack_pass`] says why that matters).
     ///
     /// Under this key's turn alone: a pin clears; a policy that already
     /// describes this domain under this budget is kept untouched (nothing
@@ -1571,7 +1562,7 @@ impl<B: Backing> Retention<B> {
         self.clear_under(&entity, &mut claim).await;
     }
 
-    /// [`Self::clear`] with the turn already held, saying what it did
+    /// `Self::clear` with the turn already held, saying what it did
     /// ([`Cleared`]): nothing is installed afterwards unless it was
     /// refused.
     ///
@@ -1721,13 +1712,13 @@ impl<B: Backing> Retention<B> {
     /// draw chose it, and announce it.** Says whether a peer was told.
     ///
     /// The committed set is a draw fixed when the policy is built, and a
-    /// drawn piece is committed the moment we are found to hold it. That
-    /// moment used to be a pass finding it in a listing taken every couple
-    /// of seconds, which made what we share a function of the window and
-    /// the tick: a drawn piece fetched and given back between two passes
-    /// was never announced, and the tighter the budget the less of the draw
-    /// ever filled. This is the same rule asked of the completion itself,
-    /// so what we share stops depending on when a pass happens to run.
+    /// drawn piece is committed the moment we are found to hold it -- at
+    /// the completion itself, not a pass's next listing. A listing taken
+    /// every couple of seconds would make what we share a function of the
+    /// window and the tick: a drawn piece fetched and given back between
+    /// two passes would never be announced, and the tighter the budget the
+    /// less of the draw would ever fill. Deciding it at the completion
+    /// means what we share does not depend on when a pass happens to run.
     ///
     /// **Off the path that told us.** The caller is librqbit's completion
     /// and may not block, so it hands this to a task; here the entity's
@@ -1867,10 +1858,9 @@ impl<B: Backing> Retention<B> {
     /// -- except under a pin, and except once the entity has become live
     /// again, either of which stops the run where it stands.
     ///
-    /// Nothing is put back into what we announce on the way out. That is
-    /// the whole of issue (a): the install that used to retire a sibling
-    /// re-announced the range it was about to delete, so every switch cost
-    /// a Have for pieces that went seconds later.
+    /// Nothing is put back into what we announce on the way out: a Have for
+    /// a range about to be deleted, followed seconds later by the delete
+    /// itself, is a peer told to ask for a piece that has already gone.
     ///
     /// An entity left holding nothing, with no read open on it, is
     /// forgotten ([`Self::forget_empty`]). Pieces a delete refused -- a
@@ -2278,21 +2268,20 @@ impl<B: Backing> Retention<B> {
             else {
                 return Self::nothing(&state, claim, about, None);
             };
-            // **One list per entity, not one window per playhead.** The
-            // policy used to answer for one playhead at a time and the
-            // pass unioned a window round each reader; what is kept and
-            // fetched is now the run of the file each detected consumer is
-            // moving through, and the policy sizes that rather than placing
-            // it. A pass is still one decision about what to give back.
+            // **One list per entity, not one window per playhead.** What is
+            // kept and fetched is the run of the file each detected
+            // consumer is moving through; the policy sizes that rather than
+            // placing it. A pass is one decision about what to give back
+            // for the whole entity.
             //
-            // **What to keep and what to fetch are one list now, and it is
-            // the detector's.** A window is a promise not to delete and an
+            // **What to keep and what to fetch are one list, and it is the
+            // detector's.** A window is a promise not to delete and an
             // order to the swarm to fill it, and both are about the same
-            // thing: the run of disk a consumer is moving through. Where
-            // the two used to differ was a probe -- a read of the container
-            // index owed a promise but not a fetch -- and a probe is not a
-            // classification any more, it is a consumer like any other,
-            // with its own short run and its own share of the seconds.
+            // thing: the run of disk a consumer is moving through. A probe
+            // -- a read of the container index -- is a consumer like any
+            // other, with its own short run and its own share of the
+            // seconds, not a separate classification owed a promise but no
+            // fetch.
             //
             // The promise is kept at the door through the published set
             // rather than through this list ([`crate::retention::exempt`]),
@@ -2865,18 +2854,14 @@ impl<B: Backing> State<B> {
     ///    no pass measures at all.
     ///
     /// **What a player says about itself is not asked, and neither is what
-    /// its range header looks like.** The first used to be the first
-    /// question -- where in the picture the viewer is, converted to a byte
-    /// offset at the film's average rate -- and cost a number that drifts
-    /// on a variable-bitrate encode, a staleness rule, a vicinity rule to
-    /// correct it against the reads, and a report a second from every
-    /// player. The second was `is_container_metadata_request`, which read a
-    /// range's offset and length for mpv's crawl over the container index
-    /// so that read would not be taken for the viewer, and got it wrong in
-    /// both directions: a viewer seeking into the last minutes of a film
-    /// looked like an index read, and a crawler further out than the
-    /// constant allowed looked like a seek. Both are answered by what the
-    /// reads *do* (`crate::retention::streams`).
+    /// its range header looks like.** Converting where a player claims to
+    /// be in the picture to a byte offset drifts on a variable-bitrate
+    /// encode; reading a range's offset and length to tell mpv's crawl over
+    /// the container index apart from a viewer's seek gets it wrong in both
+    /// directions -- a viewer seeking into the last minutes of a film looks
+    /// like an index read, and a crawler far enough out looks like a seek.
+    /// Both are answered instead by what the reads *do*
+    /// (`crate::retention::streams`).
     fn head(&self, about: Option<ReaderId>) -> Option<B::Position> {
         if let Some(head) = about
             .and_then(|id| self.readers.get(&id))
@@ -3331,17 +3316,14 @@ impl<B: Backing> Reader<B> {
     /// A byte at `at` of this entity has reached a player.
     ///
     /// **Every delivered byte moves the entity's `last_position`, and it is
-    /// the last resort under the detector.** It used to be written only by
-    /// a read declared to be playback, because mpv's read of the container
-    /// index at the tail would otherwise leave the entity's head at the end
-    /// of the file after that read had closed -- and the next tick pass
-    /// drew its window there, un-queued the head the player was parked on,
-    /// unlinked it, and watched the stream fetch it back. Nothing is
-    /// declared now: where the entity is being consumed is
-    /// [`Consumers::at`], from the bytes each detected stream has eaten,
-    /// and this value is only what a pass falls back to when no stream has
-    /// read the entity lately -- which is a film nobody is watching, whose
-    /// crawler has stopped too.
+    /// the last resort under the detector.** Where the entity is being
+    /// consumed is [`Consumers::at`], from the bytes each detected stream
+    /// has eaten; this value is only what a pass falls back to when no
+    /// stream has read the entity lately -- a film nobody is watching,
+    /// whose crawler has stopped too. Moving it on every delivered byte,
+    /// not only a byte some caller declares to be playback, keeps mpv's
+    /// read of the container index at the tail from stranding the head
+    /// there once that read has closed.
     ///
     /// The budget is read before L2 (a copy-out of a foreign lock, rule 2);
     /// under L2 the entity's `last_position`, an
@@ -4363,13 +4345,10 @@ mod tests {
     ///
     /// But a pin lands on that state, and a pinned entity is never slack:
     /// no further slack pass runs. [`Retention::clear_under`] is what puts a
-    /// range back, and it had nothing to put back from -- no policy, so it
-    /// returned at once. The pieces the user had just asked us to keep were
-    /// then held back from every peer while
-    /// [`crate::engine::Engine::standing`], finding no policy, told the
-    /// cleaner the torrent announces them: held back and protected at once,
-    /// which is the one combination that is never right, and with no pass
-    /// left to undo it.
+    /// range back; with no policy of its own to read it from it relies on
+    /// the recorded hold-back instead of assuming there is nothing to give
+    /// (see [`State::held_back`]) -- held back and protected at once is the
+    /// one combination that is never right, and no pass is left to undo it.
     ///
     /// So the range goes back, exactly as a policy's would. The whole
     /// extent, with nothing subtracted: `set_pieces_advertised(_, true)`
@@ -4525,13 +4504,13 @@ mod tests {
     /// The test above hands the pin's pass [`Mode::Live`], which is what the
     /// driver decides for a file being played or read. A pinned download
     /// nobody is watching is neither: the driver reads it as
-    /// [`Mode::Slack`] every tick, and the slack pass's pin exit used to
-    /// take nothing and give nothing back, on the assumption that the
-    /// pin's own install would clear the policy -- but the install runs
-    /// only when the file is opened, and an offline download is pinned to
-    /// be fetched *without* being opened. The extent stayed held back from
-    /// every peer, and the pieces the slack pass had dropped stayed
-    /// unwanted, so the download the user asked to keep stood still.
+    /// [`Mode::Slack`] every tick, so the slack pass's pin exit has to give
+    /// the extent and the wanted pieces back itself. The pin's own install
+    /// only clears the policy when the file is opened, and an offline
+    /// download is pinned to be fetched *without* being opened -- without
+    /// this, the extent would stay held back from every peer and the
+    /// pieces the slack pass dropped would stay unwanted, so a download
+    /// the user asked to keep would stand still.
     #[tokio::test]
     async fn a_pin_on_a_slack_entity_nobody_plays_gives_its_bytes_back_on_the_slack_pass() {
         let (backing, owner, _budget) = torrent();
@@ -5877,12 +5856,12 @@ mod tests {
     /// This is the other half of the same tick, and on a cold open it is
     /// the whole of it. The policy is installed before the reader opens
     /// ([`Install::OnOpen`]), so between the open and the first byte -- a
-    /// whole piece, tens of seconds on a slow swarm -- the entity had a
-    /// policy and no head, every pass over it concluded nothing, and
-    /// nothing trimmed the want-set: the swarm filled the disk with the
-    /// file in whatever order it liked while the player showed 0:00. A
-    /// television measured 180 MB fetched and 54 MB kept before the first
-    /// frame.
+    /// whole piece, tens of seconds on a slow swarm -- the entity has a
+    /// policy and no head: without a promise, every pass over it concludes
+    /// nothing and nothing trims the want-set, so the swarm fills the disk
+    /// with the file in whatever order it likes while the player shows
+    /// 0:00 (measured on a television: 180 MB fetched and 54 MB kept
+    /// before the first frame).
     ///
     /// What keeps it is the promise, which is what a parked read makes:
     /// `poll_read` returning `Pending` promises the piece it is waiting on,
@@ -6541,10 +6520,10 @@ mod tests {
     /// **A slack pass that finds the entity live hands no claim on.**
     ///
     /// Under [`Trigger::OnMove`] the ordinary release answers "again"
-    /// whenever a policy stands and a head is in the domain, and every
-    /// early exit of the slack pass used to take it: the claim came back
-    /// `Some` to a driver that reads nothing back, and a driver that looped
-    /// on it would have spun.
+    /// whenever a policy stands and a head is in the domain, but an early
+    /// exit of the slack pass must not: the driver never reads a slack
+    /// pass's claim back, so answering `Some` here would hand on a claim
+    /// nobody takes, and a driver that looped on it would spin.
     #[tokio::test]
     async fn a_slack_pass_that_finds_the_entity_live_hands_no_claim_on() {
         let (backing, owner, _budget) = proxy();

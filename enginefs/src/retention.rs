@@ -23,9 +23,8 @@
 //! [`crate::piece_store::policy::RetentionPolicy::advertised`] says, and no
 //! more: once nobody plays the file it is slack, and the pass takes the
 //! committed half too. It holds the whole file back from what we announce
-//! before it unlinks anything, so a piece is never deleted while announced.
-//! That was a decision the policy could state and not perform until the
-//! fork gained a have-bit that is not an announcement; it performs it now.
+//! before it unlinks anything, so a piece is never deleted while announced
+//! -- performable because the fork's have-bit is not itself an announcement.
 //!
 //! # What decides the budget, and what a missing one means
 //!

@@ -156,11 +156,10 @@ impl ReadCursor {
 /// length (no metadata, or a backend without pieces) or without the file's
 /// offset within the torrent, `file_start`.
 ///
-/// `None` rather than guessing zero. Every blocked-read line used to
-/// compute from zero, which is right for a single-file torrent and for the
-/// first file of any other, and named a piece thousands away for the
-/// second episode of a season pack -- and keyed the probe's one-line-per-
-/// piece throttle by it too.
+/// `None` rather than guessing zero: guessing zero is right for a
+/// single-file torrent and for the first file of any other, but names a
+/// piece thousands away for the second episode of a season pack -- and
+/// would key the probe's one-line-per-piece throttle by it too.
 fn torrent_piece(offset: u64, file_start: Option<u64>, piece_length: Option<u64>) -> Option<u64> {
     let len = piece_length.filter(|len| *len > 0)?;
     Some(file_start?.saturating_add(offset) / len)
@@ -198,9 +197,9 @@ pub struct FileHandle<H: TorrentHandle> {
     /// [`Self::arm_blocked_probe`]. Set to a fresh generation when the read
     /// parks, cleared when it is served, and read by the probe task before
     /// it logs: a task from an earlier park finds a different generation
-    /// and says nothing. A flag was not enough -- a read served within a
-    /// second and parked again on the next piece had the first park's task
-    /// log the old offset against the new wait.
+    /// and says nothing. A flag is not enough -- a read served within a
+    /// second and parked again on the next piece would have the first
+    /// park's task log the old offset against the new wait.
     probe: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -366,8 +365,8 @@ impl<H: TorrentHandle> FileHandle<H> {
     ///
     /// The blocked-read log fires on completion and says how long; it
     /// cannot say why, because by then the piece is done and its claims
-    /// are gone. The field's 24- and 30-second blocks on the latency claim
-    /// rules (2026-09-15) could only be guessed at. This asks the backend
+    /// are gone -- a measured 24- and 30-second block on the latency claim
+    /// rules could only be guessed at. This asks the backend
     /// while the read is parked: each holder, its chunks, how many are
     /// missing, how long since it last delivered and what its own last
     /// chunk took -- the two halves of the takeover rule, so the line says
@@ -491,11 +490,9 @@ impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
                 // A parked read is waiting for exactly one piece: the one
                 // under its cursor. Said here, it becomes a promise the pass
                 // may not unlink and -- more to the point -- the want-set
-                // the pass orders ahead of every window it holds. Nothing
-                // said it before: `promises` had one production caller in
-                // the whole workspace, the proxy's, so on the torrent side
-                // the pass knew what readers were *near* and never what any
-                // of them was actually stuck on.
+                // the pass orders ahead of every window it holds. On the
+                // torrent side this is the only caller that names what a
+                // reader is *stuck on*, rather than merely near.
                 if let Some(reader) = &self.reader {
                     reader.promises_at((self.file_idx, self.cursor.position));
                 }

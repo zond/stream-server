@@ -138,28 +138,18 @@ impl AppState {
 
 /// `settings.json` on disk, and the one way anything writes it.
 ///
-/// Two writers used to reach the file on their own: `AppState::save_settings`
+/// **Every write goes through one place** -- both `AppState::save_settings`
 /// (every `POST /settings` and `update_settings`) and the tracker
-/// refresher's `save_trackers`, each a plain `tokio::fs::write` -- an
-/// `open(O_TRUNC)` and a `write` -- with nothing between them. Two of those
-/// in flight at once (a settings change during the startup tracker
-/// refresh) left the file as one
-/// writer's bytes with the other's tail behind them, which does not parse;
-/// and a kill between the truncate and the write left it empty. Either way
-/// the next launch read nothing it could use, fell through to the defaults
-/// with an INFO line, and the next save overwrote the evidence -- every
-/// setting reset, including the proxy and anonymity ones, and nobody told.
-///
-/// So writes go through one place, and that place does two things. It
-/// writes to a uniquely named temporary file beside the target and renames
-/// it into place, so the file on disk is always a whole serialization --
-/// the old one or the new one, never a mixture and never empty. And it holds
-/// a
-/// mutex from serialization through rename, which the rename alone does
-/// not buy: two atomic writers racing can still land the *older*
-/// serialization last, and a user's change would be undone by a tracker
-/// refresh that had serialized a moment before it. Under the lock the
-/// order of serialization is the order on disk.
+/// refresher's `save_trackers` -- and that place does two things. It writes
+/// to a uniquely named temporary file beside the target and renames it into
+/// place, so the file on disk is always a whole serialization: the old one
+/// or the new one, never a mixture and never empty, whatever a concurrent
+/// writer or a kill mid-write does. And it holds a mutex from serialization
+/// through rename, which the rename alone does not buy: two writers racing
+/// without it can still land the *older* serialization last, undoing a
+/// user's settings change with a tracker refresh that had serialized a
+/// moment before it. Under the lock the order of serialization is the order
+/// on disk.
 pub struct SettingsFile {
     path: PathBuf,
     /// Serialises writers -- see the type doc for why the rename is not
@@ -399,9 +389,9 @@ mod tests {
     /// the end is the settings as they finally are, not an older state that
     /// happened to land last. Nothing of the writing is left beside it.
     ///
-    /// The tracker list is made large on purpose: a multi-megabyte write
-    /// through `open(O_TRUNC)` + `write` is open to a reader for as long as
-    /// it takes, which is what made the old shape observable here at all.
+    /// The tracker list is made large on purpose: only a multi-megabyte
+    /// write is open to a reader for long enough to make a torn read
+    /// observable here at all.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_writers_leave_a_whole_and_current_settings_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -495,8 +485,8 @@ mod tests {
         );
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 
-        // What a kill between truncate and write, or two interleaved
-        // writers, used to leave behind.
+        // The shape a kill between truncate and write, or two interleaved
+        // writers, leaves behind.
         let garbage = r#"{"cacheSize": 0, "btMaxCo"#;
         std::fs::write(file.path(), garbage).unwrap();
         let loaded = file.load(&defaults);

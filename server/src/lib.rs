@@ -185,8 +185,7 @@ pub struct ServerConfig {
     /// files pinned offline (`crate::proxy_downloads`) -- under the same
     /// rule as [`Self::pins`]: **`None` is "nobody told me"**, which sweeps
     /// nothing and exempts nothing, and an empty list is "the user has
-    /// pinned nothing", which sweeps the proxy cache clean as every launch
-    /// did before pins existed.
+    /// pinned nothing", which sweeps the proxy cache clean.
     pub proxy_pins: Option<Vec<proxy_downloads::ProxyPinKey>>,
     /// The port librqbit's incoming BitTorrent listener binds.
     /// [`TorrentListenPort::Ephemeral`] by default, so any number of
@@ -264,9 +263,7 @@ pub struct ServerConfig {
     pub drive_api_base: Option<url::Url>,
 }
 
-/// The one configuration: a server inside a host process. There used to be a
-/// second, `binary_default()`, for the standalone daemon -- all interfaces,
-/// HTTPS, SSDP, a Ctrl+C handler -- and it went with the daemon.
+/// The one configuration: a server inside a host process.
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -338,18 +335,15 @@ impl ServerHandle {
 
     /// The bearer token the control routes require this launch
     /// (`Authorization: Bearer <token>`). A started server always has one:
-    /// the `Option` is only what an `AppState` no `run` filled in carries,
-    /// and `ServerAuth::Disabled` -- which used to make it `None` and leave
-    /// the control routes open -- is gone.
+    /// the `Option` is only what an `AppState` no `run` filled in carries --
+    /// there is no way to leave the control routes open.
     pub fn auth_token(&self) -> Option<&str> {
         self.state.auth_token.as_deref()
     }
 
     /// The URL the server advertises (`settings.baseUrl`):
-    /// `http://<connectable bound address>`. There used to be a
-    /// `public_base_url` override for the daemon, which set it to the
-    /// address it was binding anyway; without it this cannot disagree with
-    /// the listener.
+    /// `http://<connectable bound address>`. There is no override, so this
+    /// cannot disagree with the listener.
     pub fn base_url(&self) -> &str {
         &self.state.base_url
     }
@@ -1334,10 +1328,9 @@ pub async fn run(
             None => routes::drive::DriveEndpoints::at(refresh),
         })
     });
-    // The token is a secret and must never reach `tracing`: the log files
-    // would keep it, and the kept launches' archives with them. An embedder
-    // reads `ServerHandle::auth_token` instead. The deleted daemon printed it
-    // to stdout; nothing in a host process reads stdout.
+    // The token is a secret and must never reach `tracing` or stdout: the
+    // log files would keep it, and the kept launches' archives with them.
+    // An embedder reads `ServerHandle::auth_token` instead.
     tracing::info!("control API requires `Authorization: Bearer <token>`");
 
     let (seeding_enabled, diagnostics_trace) = {
@@ -1398,9 +1391,9 @@ pub async fn run(
     }
 
     // And what an **older build** left under `<cacheRoot>/.archives`: the
-    // extraction cache the archive layer used to keep, which this server
-    // does not write any more (see `crate::translators` -- a member is
-    // ranges of the container, and nothing is extracted). On an install
+    // extraction cache the archive layer kept, which this server does not
+    // write (see `crate::translators` -- a member is ranges of the
+    // container, and nothing is extracted). On an install
     // upgraded into this build the directory can be gigabytes, about twice
     // the size of every archive played since that build's last clean exit
     // -- the download and the extraction -- and **nothing else will ever
@@ -1487,10 +1480,9 @@ pub async fn run(
             changed, bell, torrents, proxied, sessions,
         ))
     });
-    // And the cache budget, which the cache cleaner used to state on its
-    // way out of a walk. Unconditional like the DHT health check: a process
-    // that has published no budget holds no retention policy over a relayed
-    // stream at all. See `cache_budget`.
+    // And the cache budget (see `cache_budget`). Unconditional like the DHT
+    // health check: a process that has published no budget holds no
+    // retention policy over a relayed stream at all.
     // Awaited, not merely spawned: `start` states the budget before it
     // returns, so it exists before the router below can serve a request
     // into the proxy cache rather than a moment after.
@@ -1554,11 +1546,10 @@ pub async fn run(
                     result?;
                 }
                 Err(_) => {
-                    // Never `std::process::exit` here. The deleted daemon
-                    // did, and it stayed behind after the daemon went: this
-                    // server is one thread of a host process with its own
-                    // work and its own exit, and a slow shutdown must cost
-                    // that process a dropped future, not its life.
+                    // Never `std::process::exit` here: this server is one
+                    // thread of a host process with its own work and its own
+                    // exit, and a slow shutdown must cost that process a
+                    // dropped future, not its life.
                     tracing::warn!(
                         ?source,
                         timeout_secs = cfg.graceful_shutdown_timeout.as_secs(),
@@ -1602,8 +1593,8 @@ pub async fn run(
 /// **The sessions go on a switch and on nothing else.** A translated
 /// container's session is the index of bytes the two owners above have just
 /// been told are slack, and it has the same life for the same reason
-/// (`enginefs::retention::live`, and `translators::session` for what that
-/// means for a map that used to hold a ten-minute idle clock). It is handed
+/// (`enginefs::retention::live`, and `translators::session` for the map's
+/// own rule). It is handed
 /// the reading the switch landed on rather than asking the cell again:
 /// every consumer of one switch answers the same reading, as everywhere
 /// else. It is not called on the bell -- a volume running low is a reason
@@ -1764,8 +1755,7 @@ pub fn build_router(state: AppState) -> Router {
 ///   `Accept-Ranges` readable from script, so they are exposed by name too.
 ///
 /// Nothing on that listener takes a bearer header or relays a `Location`,
-/// so neither is named: those were for a browser-hosted client of the
-/// loopback listener, which no longer answers CORS at all (see
+/// so neither is named: the loopback listener answers no CORS at all (see
 /// [`build_router`]).
 ///
 /// Methods stay a wildcard: every method this server answers is one of the
@@ -2017,14 +2007,9 @@ const MAX_CREATE_BODY: usize = 32 * 1024 * 1024;
 /// and calls [`ServerHandle`] over FFI -- downloads, cache usage and
 /// cleaning, stream numbers, closing a proxied stream, opening a Drive
 /// file, DHT status, background traffic, the LAN listener: every one is a
-/// method, and none has a route. The control routes that once mirrored
-/// them (`/heartbeat`, `/stats.json`, `/{infoHash}/stats.json`,
-/// `/downloads.json`, `POST`/`DELETE /downloads…`,
-/// `/{infoHash}/{fileIdx}/download`, `/cache.json`, `/cache/clean`,
-/// `/stream-numbers.json`, `/proxy-streams/{token}/close`,
-/// `/drive/create`) were a leftover of the standalone daemon this fork
-/// started as, had no caller but the tests, and were removed; the tests
-/// call the handle. There is no other client and none is planned.
+/// method, and none has a route (`docs/api.md#removed-routes` lists the
+/// control routes that once mirrored them). There is no other client and
+/// none is planned.
 ///
 /// So: **do not add a control route.** A new capability is a
 /// `ServerHandle` method; a new byte-serving URL for a player is a media

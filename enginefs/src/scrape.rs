@@ -1173,9 +1173,9 @@ mod tests {
     }
 
     /// **An implausible count is warned about once per answer, not once per
-    /// stats poll** (review #48). The aggregate that leaves it out is
-    /// recomputed on every poll -- about once a second, for the hour the
-    /// answer stays fresh -- and warned each time, into logs that are kept.
+    /// stats poll.** The aggregate that leaves it out is recomputed on every
+    /// poll -- about once a second, for the hour the answer stays fresh --
+    /// and warned each time, into logs that are kept.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn an_implausible_count_is_warned_about_once() {
         let warns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1397,8 +1397,8 @@ mod tests {
     }
 
     /// A scrape body over the cap is refused as it arrives, not after it
-    /// has been buffered whole (review #45): one that never ends used to be
-    /// read until the request's timeout.
+    /// has been buffered whole: one that never ends would otherwise be read
+    /// until the request's timeout.
     #[tokio::test]
     async fn a_scrape_body_over_the_cap_is_refused_as_it_arrives() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

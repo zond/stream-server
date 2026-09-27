@@ -1,21 +1,22 @@
 //! The proxied streams players are holding open, and the one operation that
 //! ends one on purpose.
 //!
-//! A client that wants a player torn down has, until now, had to wait for
+//! Without this, a client that wants a player torn down has to wait for
 //! the read to time out -- and `network-timeout` is deliberately generous,
-//! because a slow swarm must not be mistaken for a dead connection. So the
-//! wait was tens of seconds of a player that is already unwanted, holding
-//! its packet memory, its socket and the engine that socket pins.
+//! because a slow swarm must not be mistaken for a dead connection, so
+//! that wait can be tens of seconds of a player that is already unwanted,
+//! holding its packet memory, its socket and the engine that socket pins.
 //!
-//! The missing piece was never the closing, it was the correlation: this
-//! server knows its streams by an id it minted, and the client has no way to
-//! say which one is *its* player's. So the client mints the name instead. It
+//! The hard part is not the closing, it is the correlation: this server
+//! knows its streams by an id it minted, and the client has no way to say
+//! which one is *its* player's. So the client mints the name instead. It
 //! puts a token of its own in the proxy URL it hands the player (`p=` --
 //! see [`crate::routes::proxy`]), every stream opened through such a URL is
 //! registered here under that token, and one call
-//! (`ServerHandle::close_proxy_streams`) closes every stream bearing it. A pleasant side effect: the count of live streams for
-//! a token is the count of players actually attached, which nothing outside
-//! this process could work out before.
+//! (`ServerHandle::close_proxy_streams`) closes every stream bearing it. A
+//! side effect: the count of live streams for a token is the count of
+//! players actually attached to it, which nothing outside this process
+//! can otherwise tell.
 //!
 //! **What this ends is the read *and the token*.** Closing makes the body
 //! yield an error, so hyper drops the connection and the player's demuxer

@@ -1,16 +1,8 @@
 //! **What is reading this file, worked out from the reads themselves.**
 //!
-//! The retention layer used to decide what to keep and what to fetch from a
-//! *classification*: a `Reading` of `Playback` or `Probe`, derived from a
-//! `PlaybackIntent`, derived in turn from a priority header, two download
-//! flags and the geometry of a `Range`. A player states none of that. It
-//! sends a byte range, and every field failure this module exists to end
-//! was that derivation guessing wrong -- a live second track labelled
-//! container metadata and starved for twenty seconds while seventeen
-//! seeders were connected, a read fifteen megabytes inside `mdat` taken for
-//! the container index.
-//!
-//! Nothing here asks what a read means. It watches where reads go.
+//! Nothing here asks what a read means. It watches where reads go: a
+//! player states no more than a byte range, and a classification derived
+//! from anything else guesses wrong.
 //!
 //! **This is what a pass obeys.** What an entity's consumers are fetched
 //! for ([`Streams::want`]), what no unlink may touch ([`Streams::exempt`]),
@@ -108,9 +100,9 @@ struct Stream {
     /// not measured one is priced at the film's own arithmetic -- so by
     /// rate a crawler that has just started outranks a viewer who has been
     /// measured slower than the film's average. Bytes asked for need no
-    /// such admission rule and separate the two by orders of magnitude:
-    /// in the field log of 2026-09-14 the viewer's reads ran to tens of
-    /// megabytes a body against the crawler's 39 kB.
+    /// such admission rule and separate the two by orders of magnitude: one
+    /// measured session had the viewer's reads run to tens of megabytes a
+    /// body against the crawler's 39 kB.
     eaten: u64,
     /// When the last one did.
     seen: Instant,
@@ -246,9 +238,9 @@ impl Stream {
         // **Seeded from the film's own arithmetic, not from the first
         // sample.** A stream nothing has measured is already fetched at the
         // ceiling -- that is what `demand` does with a `None` rate -- so
-        // taking the first admitted sample whole was a step out of it with
-        // no averaging behind it at all, and the first admitted sample is
-        // the one most likely to be wrong.
+        // taking the first admitted sample whole would be a step out of it
+        // with no averaging behind it at all, and the first admitted sample
+        // is the one most likely to be wrong.
         //
         // It is wrong in a particular direction, which is why this matters.
         // A starving player asks again the instant it is answered, so its
@@ -256,11 +248,11 @@ impl Stream {
         // the player had some buffer and idled, and a long idle over a
         // small read is a *low* sample. On a link that alternates stalling
         // and bursting, the admitted samples are systematically the low
-        // ones -- so one of them used to collapse the window to a tenth of
-        // the film's rate, on exactly the link where a buffer is worth
-        // most (field log 2026-09-14 18:21, a wifi-to-mobile switch:
+        // ones -- so unseeded, one of them can collapse the window to a
+        // tenth of the film's rate, on exactly the link where a buffer is
+        // worth most: measured on a wifi-to-mobile switch at
         // `rates=[Some(367710)]` against a 3,568,061 B/s film, a want set
-        // of eight pieces where the arithmetic allows seventy-seven).
+        // of eight pieces where the arithmetic allows seventy-seven.
         //
         // Seeded, the same sample moves the rate by an eighth -- one part
         // in `RATE_SMOOTHING` -- and the transition out of "no measurement"
@@ -359,17 +351,16 @@ pub enum Rejected {
 /// and the film's. A seventh of the old number and one of the new settles
 /// over roughly a dozen reads.
 ///
-/// **It was widened to a sixteenth and put back.** The argument for
-/// widening is real -- only *admitted* samples move this
-/// ([`Stream::sample`]), and admission is biased low on a bad link, so a
-/// short memory tracks a stalling link down and leaves the stream too thin
-/// to ride the next stall out. What the widening missed is that the seed
-/// it was paired with only exists where a duration does. A proxied stream
-/// states none, so its first admitted sample still sets the rate outright,
-/// and a longer memory only makes that one sample stickier: on Windows,
-/// where the first read of a test is slower and so the first sample is
-/// lower, the cache kept three chunks of a played run where the assertion
-/// wanted four.
+/// **Not a sixteenth.** Widening is tempting -- only *admitted* samples
+/// move this ([`Stream::sample`]), and admission is biased low on a bad
+/// link, so a short memory tracks a stalling link down and leaves the
+/// stream too thin to ride the next stall out. But the seed a wider
+/// window would need to remove the cliff only exists where a duration
+/// does: a proxied stream states none, so its first admitted sample still
+/// sets the rate outright, and a longer memory only makes that one sample
+/// stickier -- on Windows, where the first read of a test is slower and so
+/// the first sample is lower, a longer memory leaves the cache holding
+/// three chunks of a played run where the assertion wants four.
 ///
 /// So the width may only be widened for streams that are seeded, and that
 /// is a second constant for one idea. The seed is what removes the cliff
@@ -518,13 +509,9 @@ impl FileStreams {
     /// new consumer that has to be fetched for. Bigger disks behave better,
     /// with no number anywhere.
     ///
-    /// Three rules preceded it, each guessing that distance in bytes, each
-    /// wrong in a way the last one could not have predicted. The span of
-    /// everything a stream had served merged two tracks as soon as one
-    /// connection ran long enough to span them. Sixteen megabytes from the
-    /// last read is four and a half seconds of one film and thirty-two of
-    /// another. What a single connection had served grows without bound on
-    /// a connection nobody closes. See `docs/design/read-pattern-retention.md`.
+    /// Three rules were tried and rejected before this one, each guessing
+    /// that distance in bytes; see `docs/design/read-pattern-retention.md`
+    /// for what each got wrong.
     ///
     /// The read's **begin** is what is looked up, not its end. A consumer
     /// blocked on a missing piece serves up to the hole and stops, so its
@@ -542,7 +529,7 @@ impl FileStreams {
         self.observe_in(reader, read, &HeldRuns::of(held), piece)
     }
 
-    /// [`Self::observe`] against a listing already cut into its runs.
+    /// `Self::observe` against a listing already cut into its runs.
     fn observe_in(
         &mut self,
         reader: u64,
@@ -1525,8 +1512,8 @@ mod tests {
     /// player's.**
     ///
     /// mpv keeps a second reader crawling the container's index for as long
-    /// as a film is open, reopening about once a second; in the field log
-    /// of 2026-09-14 it took 39 kB an open against the viewer's tens of
+    /// as a film is open, reopening about once a second; one measured
+    /// session had it take 39 kB an open against the viewer's tens of
     /// megabytes, and both arrive as `Range: bytes=X-` over the same file.
     /// The crawler is the *newest* reader most of the time and the
     /// *longest-lived* stream some of the time, so neither recency nor age
@@ -2230,8 +2217,8 @@ mod tests {
     ///
     /// The set is what that file's door reads, and it holds the promises of
     /// that file's parked reads beside the windows its own pass published.
-    /// Reporting file 1's windows for file 0's pass used to republish them
-    /// into file 1's set alone, and the promise bit went with it.
+    /// Reporting file 1's windows for file 0's pass would republish them
+    /// into file 1's set alone, wiping the promise bit with it.
     #[test]
     fn a_pass_of_one_file_does_not_publish_into_anothers_exempt_set() {
         let t0 = Instant::now();
@@ -2464,12 +2451,12 @@ mod tests {
     }
 
     /// **After a seek, the stream the viewer left is nobody's reader.**
-    /// It stays in the file's list for [`STREAM_DORMANT`], and before this
-    /// it was handed to the cache window with the rest: the window had
-    /// moved with the new stream and taken what was ahead of the old one,
-    /// so the old one stood at the end of what is held with nothing in
-    /// front of it -- a stalled reader, reported as the film about to stop.
-    /// A crawler read again after the seek is still a reader.
+    /// It stays in the file's list for [`STREAM_DORMANT`]. Handed to the
+    /// cache window with the rest instead, it would stand at the end of
+    /// what is held with nothing in front of it once the window moves with
+    /// the new stream and takes what was ahead of the old one -- a stalled
+    /// reader, reported as the film about to stop. A crawler read again
+    /// after the seek is still a reader.
     #[test]
     fn after_a_seek_the_readers_are_the_streams_still_being_read() {
         let t0 = Instant::now();
@@ -2931,8 +2918,8 @@ mod tests {
     ///
     /// Two streams with a hole between them are two consumers. When the
     /// hole fills they are two positions in one run, and a read that could
-    /// belong to either used to join whichever was created first -- the one
-    /// the viewer left. The history then piled up on a dormant stream.
+    /// belong to either would join whichever was created first -- the one
+    /// the viewer left -- piling its history onto a dormant stream.
     #[test]
     fn a_read_joins_the_stream_it_is_being_read_on() {
         let t0 = Instant::now();

@@ -1,10 +1,10 @@
 //! Which staged pieces are waiting to be made durable, process-wide.
 //!
-//! [`super::store::PieceStore::complete_piece`] no longer flushes and renames
-//! on librqbit's completion path: it queues the piece for its store's
-//! committer thread and returns, and the piece is read from its staged copy
-//! until the rename lands. This is the bookkeeping that makes that safe to
-//! race against everything else that addresses the same file:
+//! [`super::store::PieceStore::complete_piece`] queues the piece for its
+//! store's committer thread on librqbit's completion path and returns; the
+//! piece is read from its staged copy until the rename lands. This is the
+//! bookkeeping that makes that safe to race against everything else that
+//! addresses the same file:
 //!
 //! * a delete of the piece (retention's reclaim, `remove_file`) must either
 //!   cancel the commit before its rename or wait for the rename to finish and

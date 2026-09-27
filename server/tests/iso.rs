@@ -241,9 +241,9 @@ impl Server {
     /// **Nothing under the cache root but the fetchers' own stores**: the
     /// torrent's pieces (`.pieces/`), the proxy cache's chunks (`.proxy/`)
     /// and librqbit's record of the session beside them. The whole root is
-    /// walked, not the one directory an old version extracted into: an
-    /// extraction anywhere is a file outside those, and one inside them is
-    /// a file that is a served member whole -- `members` are those.
+    /// walked, not one known directory: an extraction anywhere is a file
+    /// outside those, and one inside them is a file that is a served
+    /// member whole -- `members` are those.
     fn assert_nothing_extracted(&self, members: &[&[u8]]) {
         fn walk(dir: &Path, into: &mut Vec<(PathBuf, u64)>) {
             let Ok(entries) = std::fs::read_dir(dir) else {
@@ -372,10 +372,8 @@ fn a_9660_image_inside_a_torrent_is_served_by_range() -> anyhow::Result<()> {
 /// torrent has no member path to ask for. `GET /iso/stream/{key}` is where
 /// it is told: it indexes the container (the same `session_for` the member
 /// routes use) and redirects to the member the `/create` rule picks.
-///
-/// Before this, that route only *looked a session up*, so the redirect was
-/// a `404` for every torrent key -- and with it the whole torrent half of
-/// the archive layer was unreachable by any request a client could make.
+/// Without this redirect the torrent form has no member path a client can
+/// construct, so it is unreachable by any request.
 #[test]
 fn a_container_in_a_torrent_is_told_which_member_to_ask_for() -> anyhow::Result<()> {
     let src = tempfile::tempdir()?;

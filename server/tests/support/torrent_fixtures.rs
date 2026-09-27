@@ -19,21 +19,20 @@ use stream_server::{ServerConfig, ServerHandle};
 /// runner with no DNS at all the resolution ladder would otherwise spend its
 /// whole budget failing, once per server.
 ///
-/// The tracker half was missing until a Windows CI failure printed a
-/// torrent's `sources`: twenty-seven public trackers, one of them answering
-/// a scrape 59 seconds old. Every test in `embed.rs` was doing live tracker
-/// I/O. [`real_torrent`] passes `trackers: Vec::new()`, which looked like
-/// enough and never was -- `EngineFS::merged_trackers` prepends the built-in
-/// list and whatever the tracker manager has fetched, below the caller.
+/// The tracker half matters even though [`real_torrent`] passes
+/// `trackers: Vec::new()`: `EngineFS::merged_trackers` prepends the built-in
+/// list and whatever the tracker manager has fetched below the caller's, so
+/// an empty caller list alone does not stop announcing -- only
+/// `use_public_trackers: false` above does (measured: a torrent's `sources`
+/// otherwise carry twenty-seven public trackers).
 pub fn offline_config() -> ServerConfig {
     ServerConfig {
         resolve_dht_bootstrap_names: false,
         use_public_trackers: false,
-        // And no multicast either. Two of these switches were not enough:
-        // local service discovery stayed on, every test announced its info
-        // hashes to the network the runner was on, and two concurrent runs
-        // of a fixture built from the same bytes -- the same info hash --
-        // found each other and fed each other pieces.
+        // And no multicast either: local service discovery would announce
+        // every test's info hash to the runner's network, letting two
+        // concurrent runs of a fixture built from the same bytes (the same
+        // info hash) find each other and feed each other pieces.
         enable_local_service_discovery: false,
         // An embedder that keeps a pin record and has nothing in it yet.
         // `None` is not the same thing -- it is "nobody said", which keeps

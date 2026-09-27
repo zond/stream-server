@@ -729,16 +729,15 @@ pub(crate) const FIELD_FILM: Film = Film {
 };
 
 /// The lookahead the field's second-track reads were granted, and the
-/// number that trace line carries: `lookahead_bytes=16777216`. It was a
-/// constant of its own then (`MAX_CONTAINER_METADATA_WINDOW_BYTES`); what a
-/// read like it gets now is the film's bitrate times the viewer's seconds,
-/// like every other read. Kept at the field's number so the scenario stays
-/// the measurement it was taken from.
+/// number that trace line carries: `lookahead_bytes=16777216`. A read like
+/// it gets its lookahead today from the film's bitrate times the viewer's
+/// seconds, like every other read; this constant is kept at the field's
+/// number so the scenario stays the measurement it was taken from.
 pub(crate) const CONTAINER_METADATA_LOOKAHEAD: u64 = 16 * 1024 * 1024;
 
-/// The lookahead a playback read was granted at the `Normal` profile when
-/// the profile scaled a constant. Now it is the bitrate times the seconds;
-/// kept for the same reason.
+/// The lookahead a playback read gets at the `Normal` buffer profile: the
+/// film's bitrate times the profile's seconds. Kept for the same reason as
+/// [`CONTAINER_METADATA_LOOKAHEAD`].
 pub(crate) const PLAYBACK_LOOKAHEAD: u64 = 128 * 1024 * 1024;
 
 /// The seconds of stream the `Normal` buffer profile asks to hold

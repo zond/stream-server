@@ -296,14 +296,14 @@ type VolumeProbe = Box<dyn Fn(&Path) -> Option<u64> + Send + Sync>;
 /// floor`, and a proxy write moves `occupied` up and `available` down by
 /// the same bytes, so it never tightens under the fill that is using the
 /// volume up. The retention owner keeps a live entity whole when the cap
-/// can hold it, and the slack passes leave the live entity alone -- so a
-/// film proxied onto a volume that pins had taken to the margin filled it
-/// to zero, one chunk at a time, each `ENOSPC` logged at debug and the next
-/// chunk tried. The torrent half has the reconciler to stop a writer at
-/// the floor; the proxy had nothing.
+/// can hold it, and the slack passes leave the live entity alone, so
+/// nothing else stops a proxy fill at the free-space floor the way the
+/// torrent side's reconciler does: without this, a film proxied onto a
+/// volume that pins had taken to the margin fills it to zero, one chunk at
+/// a time, each `ENOSPC` logged at debug and the next chunk tried.
 ///
 /// This is that stop. A chunk the volume cannot take without going under
-/// [`crate::cache_budget::CACHE_FREE_SPACE_FLOOR`] is not written, and
+/// [`enginefs::CACHE_FREE_SPACE_FLOOR`] is not written, and
 /// nothing else changes: the body goes on reaching the player from the
 /// origin, so what the floor costs is a later seek back that has to fetch
 /// again.
@@ -720,9 +720,9 @@ fn is_key_name(name: &str) -> bool {
 /// `0.0.0.0` (and `::`), which a client resolves to this host; the
 /// IPv4-mapped form `[::ffff:127.0.0.1]`, which `Ipv6Addr::is_loopback`
 /// answers `false` for; and, when the listener is bound to *every* address,
-/// any address this host's interfaces carry. Each of them used to be cached
-/// as somebody else's bytes, against the same volume's cap that the engine
-/// was already filling.
+/// any address this host's interfaces carry. Missing any of these would
+/// cache the engine's own bytes as somebody else's, a second time against
+/// the same volume's cap it is already filling.
 pub(crate) fn names_this_server(url: &Url, self_addr: std::net::SocketAddr) -> bool {
     use std::net::IpAddr;
 
@@ -800,17 +800,16 @@ impl Entry {
     /// on the blocking pool -- it is a handful of `getdents` for a cached
     /// film, but a handful on a phone's flash is still not nothing.
     ///
-    /// It used to stat every chunk file instead, from the range's first
-    /// chunk to its last: `Range: bytes=0-` on a fully cached 2 GB film was
-    /// eight thousand `statx`, on every rewatch, all of it before the first
-    /// byte. The names in a bucket directory say which chunks are there; what
-    /// the stat added was each file's length, and that check has moved to
-    /// the one place the file is opened anyway ([`Cached::body`]). **What
-    /// this reads as held is therefore a chunk at its final name**, which is
-    /// the claim the store is built to make good: a chunk gets that name by
+    /// A `stat` of every chunk file instead, from the range's first chunk
+    /// to its last, would cost eight thousand `statx` calls on `Range:
+    /// bytes=0-` over a fully cached 2 GB film, on every rewatch, all of it
+    /// before the first byte. The names in a bucket directory say which
+    /// chunks are there; a file's length is checked instead at the one
+    /// place the file is opened anyway ([`Cached::body`]). **What this
+    /// reads as held is therefore a chunk at its final name**, which is the
+    /// claim the store is built to make good: a chunk gets that name by
     /// being renamed into it whole. A file of some other length under that
-    /// name is an accident's, and the read refuses it -- see `body` for why
-    /// that is now the better place to.
+    /// name is an accident's, and `body` is where that is refused.
     ///
     /// `range` is the request's `Range` header as it arrived. **A request
     /// with no `Range` is answered only from a complete entry**: it asks for
@@ -1300,13 +1299,14 @@ impl Cached {
     /// committed the rename and not the data is the realistic one -- and it
     /// is not served: the read ends in an error, as above. It is also
     /// *deleted*, which is what makes checking here rather than in the
-    /// lookup the better arrangement and not merely the cheaper one. The
-    /// lookup used to measure every chunk and read a wrong one as absent,
-    /// and the fill skips a chunk whose name is taken, so such a file was
-    /// skipped by every lookup and every fill for as long as it sat there,
-    /// and the origin was asked for those bytes at every play.
-    /// Taken here, it costs the player one broken read, the next lookup
-    /// finds the gap, and the next fill writes the chunk again.
+    /// lookup the better arrangement and not merely the cheaper one:
+    /// checked in the lookup instead, a wrong-length chunk would read as
+    /// absent there, and the fill skips a chunk whose name is already
+    /// taken, so such a file would be skipped by every lookup and every
+    /// fill for as long as it sat there, with the origin asked for those
+    /// bytes at every play. Checked here, it costs the player one broken
+    /// read, the next lookup finds the gap, and the next fill writes the
+    /// chunk again.
     pub fn body(&self) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
         let dir = self.dir.clone();
         let reader = self.reader.clone();
@@ -1600,13 +1600,12 @@ pub struct SweepReport {
     /// What they occupied, in bytes as the volume counts them.
     ///
     /// **Counted as it is written and as it goes, and nothing walks the
-    /// tree to learn it.** The budget's disk arm used to be sized from
-    /// whatever an eviction pass had last counted, which is 0 until the
-    /// first walk of the root finishes -- minutes, on a television with
-    /// sixteen thousand cache files, and the whole of a film. The two
-    /// places this cache's bytes move are a chunk landing and a chunk
-    /// being reclaimed, so both of them book what they did and the figure
-    /// is current without a syscall.
+    /// tree to learn it.** A walk of the root to size the budget's disk arm
+    /// would cost minutes on a television with sixteen thousand cache
+    /// files -- the whole of a film. Instead, the two places this cache's
+    /// bytes move are a chunk landing and a chunk being reclaimed, so both
+    /// of them book what they did and the figure is current without a
+    /// syscall.
     pub freed_bytes: u64,
     /// Entries that could not be read or removed. Logged, never fatal.
     pub errors: usize,
@@ -1615,7 +1614,15 @@ pub struct SweepReport {
 /// Empty the proxy cache, at launch, of everything the embedder's pin
 /// record does not name.
 ///
-/// **Nothing unpinned survives a restart.** A proxied entity is kept for
+/// **`keep` is `None` when the embedder named no pin record at all, and
+/// that means unknown, not empty**: nothing is swept and nothing is
+/// booked, the same rule the piece store keeps for the same silence
+/// (`ServerConfig::pins`). A restart with no pin record therefore keeps
+/// every stray the run before it left, uncounted, rather than guess which
+/// of them was wanted.
+///
+/// Once a pin record is named, **nothing unpinned survives a restart.**
+/// A proxied entity is kept for
 /// exactly as long as something is playing it: a window round the playhead
 /// while it is live, and nothing at all once a stream opens on anything
 /// else. A process that has served nothing is playing nothing, so every
@@ -1713,10 +1720,10 @@ mod tests {
     use enginefs::chunk_store::CHUNKS_PER_DIRECTORY;
     use std::collections::{BTreeSet, HashSet};
 
-    /// **Every spelling that reaches this listener is this server** (review
-    /// #66). Each of these used to be cached as an ordinary origin, so the
-    /// engine's own bytes were written a second time against the volume's
-    /// cap.
+    /// **Every spelling that reaches this listener is this server**, so
+    /// `/proxy` refuses to fetch it: caching any of these as an ordinary
+    /// origin would write the engine's own bytes a second time against the
+    /// volume's cap.
     #[test]
     fn names_this_server_knows_the_spellings_that_reach_it() {
         let loopback: std::net::SocketAddr = "127.0.0.1:11470".parse().unwrap();
@@ -2090,11 +2097,10 @@ mod tests {
     /// A chunk written whole and renamed into place is readable. A file at a
     /// chunk's name whose length disagrees with the entity is never served
     /// -- that would serve a hole as content -- but the place it is caught is
-    /// the read, not the lookup: the lookup goes by names, the read refuses
-    /// the file and removes it, and from then on the lookup sees the gap it
-    /// leaves and a fill can write the chunk again. (The lookup used to
-    /// measure every chunk and read a wrong one as absent, which left it in
-    /// place for ever: skipped by every lookup, skipped by every fill.)
+    /// the read, not the lookup (see [`Cached::body`] for why): the lookup
+    /// goes by names, the read refuses the file and removes it, and from
+    /// then on the lookup sees the gap it leaves and a fill can write the
+    /// chunk again.
     #[tokio::test]
     async fn a_chunk_of_the_wrong_length_is_refused_at_the_read_and_removed() {
         use futures_util::StreamExt as _;
@@ -3079,10 +3085,10 @@ mod tests {
     ///
     /// A range that starts inside a chunk and ends before the next boundary
     /// carries nothing the cache can keep -- a player probing the tail of
-    /// an MP4 for its index is the everyday one -- and the fill used to make
-    /// the entity's directory before any chunk arrived. Nothing reclaims an
-    /// entity with no chunks, so that directory, and the key above it,
-    /// stood until the next launch.
+    /// an MP4 for its index is the everyday one -- so the fill makes no
+    /// entity directory before a chunk has arrived: nothing reclaims an
+    /// entity with no chunks, so a directory made early, and the key above
+    /// it, would stand until the next launch.
     #[tokio::test]
     async fn a_fill_that_keeps_nothing_makes_no_directory() {
         let (_root, cache) = cache();

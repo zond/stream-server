@@ -277,10 +277,11 @@ fn a_torrent_nobody_reads_stops_fetching_within_a_few_reconcile_intervals() -> a
 /// has stopped**, and with the limiter off a 256 MiB torrent completed in
 /// 2.6 s on this machine.
 ///
-/// This is the reading `docs/known-issues.md` had recorded as "an engine
-/// with no reader downloads the whole torrent". It is real, and it is what
-/// `ServerConfig::default()` does -- `pins: None` is the default -- but it
-/// is not what the shipping client configures; its sibling above is.
+/// This is the reading `docs/known-issues.md` keeps open: an engine with no
+/// reader fetches the lot when nobody has told the server what is pinned.
+/// It is real, and it is what `ServerConfig::default()` does -- `pins: None`
+/// is the default -- but it is not what the shipping client configures; its
+/// sibling above is.
 ///
 /// [`fixture_pins`]'s module docs warn that a test about the reconciler
 /// must not run under `None`, because it would be asserting about a torrent

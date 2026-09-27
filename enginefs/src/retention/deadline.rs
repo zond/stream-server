@@ -3,15 +3,12 @@
 //!
 //! The backend (`librqbit`, the fork's `CLAIMS.md`) splits the first few
 //! pieces ahead of a reader into claims any faster peer may join, and asks
-//! for them before anything deeper. How many pieces that is used to be a
-//! constant, two, on the reasoning that every piece after those has a whole
-//! piece of playback to arrive in. That holds only while a piece arrives in
-//! less than a piece of playback. The field of 2026-09-17 -- a phone and a
-//! television on one wifi, one 20 GB film -- had 4 MiB pieces completing in
-//! two to twelve seconds against 1.2 s of playback each, and the reader
-//! walked into piece after piece still in flight, waiting each time on its
-//! slowest claim. Splitting had begun about a second before the reader
-//! arrived, on pieces that needed six.
+//! for them before anything deeper. A fixed depth of two holds only while a
+//! piece arrives in less than a piece of playback: on a slow swarm, 4 MiB
+//! pieces completing in two to twelve seconds against 1.2 s of playback
+//! each walk the reader into piece after piece still in flight, waiting
+//! each time on its slowest claim, with splitting only beginning about a
+//! second before the reader arrives, on pieces that needed six.
 //!
 //! The backend knows how long its pieces take (the median of the last
 //! sixty-four completed, whole and split alike) but not how fast the reader
@@ -45,9 +42,9 @@
 //!   falling one can wait: the depth the backend holds shrinks by one per
 //!   pass towards what the arithmetic asks, so a median that dips for a
 //!   few passes (the fast split pieces of a seek's burst filling the ring)
-//!   does not pull the split zone out from under pieces already cut. The
-//!   field of 2026-09-17 12:22 had the depth flap 7-3-4-5-6-8-5-4-3 in
-//!   forty seconds on the arithmetic alone.
+//!   does not pull the split zone out from under pieces already cut. On the
+//!   arithmetic alone the depth has been measured to flap
+//!   7-3-4-5-6-8-5-4-3 in forty seconds.
 //!
 //! Where no length has been stated there is no bitrate, so no median-derived
 //! depth and no ceiling: the floor plus the stalls stands, as the constant

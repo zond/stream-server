@@ -22,13 +22,11 @@
 //! server has seen the last one's connection close looks like a subtitle
 //! fetch at the moment it opens, and like a viewer moving on a moment later.
 //!
-//! **Nothing here remembers a time.** The previous design measured
-//! liveness with two clocks -- an idle grace on the torrent and a 90-second
-//! grace on the proxy -- and both were the same mistake: a stream that has
-//! stopped is not a stream that has been replaced. Pausing for an hour
-//! changes nothing on the disk; opening something else changes it at once.
-//! So the value is a *what*, not a *when*, and it is written only where a
-//! new what begins.
+//! **Nothing here remembers a time.** A stream that has stopped is not a
+//! stream that has been replaced: pausing for an hour changes nothing on
+//! the disk, while opening something else changes it at once. So the value
+//! is a *what*, not a *when*, and it is written only where a new what
+//! begins.
 //!
 //! # Reading it
 //!

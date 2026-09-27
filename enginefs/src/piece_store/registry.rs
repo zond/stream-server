@@ -4,15 +4,15 @@
 //!
 //! The live [`PieceStore`] of a running torrent is librqbit's: the factory
 //! builds it and hands it to a torrent state this crate holds no reference
-//! to. So the retention pass used to list the torrent's directory every
-//! couple of seconds to learn what the store already knew, and the reclaim
-//! unlinked by path behind the store's back -- which left the store's
-//! open-handle cache holding an unlinked inode's blocks, and would have left
-//! a held set it never told about the unlink standing over files that had
-//! gone. The registry is the way back in: a store registers itself when
-//! `init` has seeded it, the pass asks the registry for the set, and every
-//! unlink of a registered torrent's piece goes through the registered
-//! store's own delete.
+//! to. The registry is what lets the retention pass read the held set
+//! without listing the torrent's directory every couple of seconds, and lets
+//! a reclaim unlink through the store instead of by path behind its back --
+//! a path unlink would leave the store's open-handle cache holding an
+//! unlinked inode's blocks, and a held set that never learned of the unlink
+//! standing over files that had gone. A store registers itself when `init`
+//! has seeded it, the pass asks the registry for the set, and every unlink
+//! of a registered torrent's piece goes through the registered store's own
+//! delete.
 //!
 //! A registration is a `Weak`, and the live store is whichever `Inner` the
 //! entry points at. A torrent in Error holds no storage -- librqbit pauses
@@ -75,12 +75,11 @@ pub struct StoreRegistry {
 /// and held by the store from that instant.
 ///
 /// **The one event that says a drawn piece is ours.** What may be shared is
-/// drawn when the policy is built and committed as we are found to hold it
-/// (`crate::piece_store::policy`), and "found to hold it" used to mean a
-/// retention pass finding it in a listing it takes every couple of seconds
-/// -- so a drawn piece fetched and given back between two passes was never
-/// announced, and what a session shared came out of what the cache happened
-/// to be holding when a pass ran.
+/// drawn when the policy is built and committed the moment this fires
+/// (`crate::piece_store::policy`), not on a retention pass's next reading of
+/// a directory listing -- which would miss a piece fetched and given back
+/// between two passes, and make what a session shares depend on whatever the
+/// cache happened to be holding when a pass last ran.
 ///
 /// **Called on librqbit's own path**, inside a peer connection's
 /// `block_in_place` and concurrent across peers, so an implementation takes

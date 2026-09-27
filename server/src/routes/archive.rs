@@ -54,12 +54,8 @@ pub(crate) fn media_body<R: tokio::io::AsyncRead>(reader: R) -> ReaderStream<R> 
     ReaderStream::with_capacity(reader, MEDIA_BODY_CHUNK_BYTES)
 }
 
-/// Which container format a URL prefix names.
-///
-/// The prefix used to be decorative: one handler set served every format
-/// and worked out which it was from the file's suffix. It is the format
-/// now, because that is what says *which translator reads this*
-/// (`crate::translators`).
+/// Which container format a URL prefix names -- the prefix is what says
+/// *which translator reads this* (`crate::translators`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Rar,
@@ -76,7 +72,7 @@ pub enum Format {
 impl Format {
     /// The translator for this format -- `None` only for RAR in a build
     /// without the `rar` feature, which has no reader for it at all and
-    /// answers [`rar_disabled_response`] instead.
+    /// answers `rar_disabled_response` instead.
     fn translator(self) -> Option<Box<dyn Translator>> {
         match self {
             Self::Zip => Some(Box::new(crate::translators::zip::Zip)),
@@ -151,12 +147,12 @@ pub(crate) fn source_error_response(error: &ProxySourceError) -> Response {
         // and not a grant to renew -- and it is answered rather than
         // `unreachable!()`d, because the arm that says "this cannot
         // happen" is how a later source that mints its own header gets a
-        // panic instead of a status. That source now exists: `/drive`
-        // shares this function, and its one terminal case -- a grant that
-        // is gone -- never reaches here, because `DriveError` lifts
-        // `pairAgain` out of a `Credentials` before answering
-        // (`sources::drive`). A `502` is right for what is left either
-        // way: the far end would not authorise us.
+        // panic instead of a status -- and `/drive` is exactly that
+        // source: it shares this function, and its one terminal case --
+        // a grant that is gone -- never reaches here, because
+        // `DriveError` lifts `pairAgain` out of a `Credentials` before
+        // answering (`sources::drive`). A `502` is right for what is left
+        // either way: the far end would not authorise us.
         ProxySourceError::Origin(_)
         | ProxySourceError::Fetch(_)
         | ProxySourceError::Credentials(_) => (
@@ -637,12 +633,10 @@ async fn stream_redirection(
         return no_translator_response(format);
     };
     // **The session first, which for a `torrent:` key is what indexes it.**
-    // This only looked a session up, so a container inside a torrent -- which
-    // has no `/create` to be made at, and whose member names only its index
-    // knows -- was a `404` to every request a client could make: the one
-    // route that hands out a member name never reached the one function that
-    // creates the session. A client cannot ask for a member of a torrent's
-    // archive without being told its name first, so this is where it is told.
+    // A container inside a torrent has no `/create` to be made at, and its
+    // member names are known only to its index -- so indexing it here is
+    // what lets a client ask for a member of a torrent's archive without
+    // being told its name first.
     let session = match session_for(&state, translator.as_ref(), &key).await {
         Ok(session) => session,
         Err(response) => return *response,
@@ -802,11 +796,11 @@ async fn stream_translated(
 /// A `torrent:<info hash>/<path>` key names its torrent by a hash, and a
 /// hash is hex whatever its case: the engine folds it before it looks a
 /// torrent up (`TorrentFileSource`), so `torrent:ABC…/film.rar` and
-/// `torrent:abc…/film.rar` are one archive -- and filed as they were
-/// written they were two sessions over it, each indexing it and each
-/// holding a lease. Only the hash is folded; the path is the torrent's own
-/// and its case means something. Any other key is the registry's own name
-/// for a `/create`d session and is returned as it came.
+/// `torrent:abc…/film.rar` name one archive -- filed as written, they would
+/// be two sessions over it, each indexing it and each holding a lease. Only
+/// the hash is folded; the path is the torrent's own and its case means
+/// something. Any other key is the registry's own name for a `/create`d
+/// session and is returned as it came.
 fn canonical_key(key: &str) -> Cow<'_, str> {
     match key
         .strip_prefix("torrent:")
@@ -934,7 +928,7 @@ mod tests {
 
     /// **A `torrent:` key's hash is folded, and nothing else is.** The
     /// session registry is keyed by the string, so two spellings of one
-    /// hash were two sessions over one archive.
+    /// hash would otherwise be two sessions over one archive.
     #[test]
     fn a_torrent_key_is_filed_under_its_lowercase_hash() {
         const UPPER: &str = "torrent:0123456789ABCDEF0123456789ABCDEF01234567/Film.Part1.RAR";

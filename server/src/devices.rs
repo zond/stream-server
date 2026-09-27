@@ -1,30 +1,22 @@
 //! The playback devices `GET /casting` reports, which is always none.
 //!
 //! stremio-core's `StreamingServer` model asks the server for the devices it
-//! can cast to, and this is the shape it parses. The list behind it was
-//! filled by an SSDP discovery loop -- an M-SEARCH for `MediaRenderer`, the
-//! DIAL service and `ssdp:all` every thirty seconds -- that ran only where
-//! `ServerConfig::enable_ssdp_discovery` was set, which is to say only in
-//! the deleted daemon. It has been removed with the `ssdp-client` dependency
-//! behind it.
-//!
-//! Nothing could be cast to a device it found in any case: `POST
-//! /casting/{devID}/player` has always answered `501`, on purpose, because
+//! can cast to, and this is the shape it parses. Nothing here discovers
+//! devices, and nothing could be cast to one if it did: `POST
+//! /casting/{devID}/player` always answers `501`, on purpose, because
 //! stremio-core reads any `2xx` there as "playing on device" and a client
-//! would report playback that never started. Discovery therefore filled a
-//! list whose entries led nowhere -- and on Android, the one platform this
-//! server actually runs on, M-SEARCH is multicast the app sandbox is not
-//! permitted to send at all.
+//! would report playback that never started. On Android, the one platform
+//! this server actually runs on, M-SEARCH is also multicast the app sandbox
+//! is not permitted to send.
 //!
-//! **The type and the route stay; the list does not.** `/casting` answers an
-//! empty list of this type, which is the right answer from a server that
-//! cannot cast: the embedder discovers receivers itself (xtremio does, and
-//! uses the LAN media listener to feed them) and never asks this route. A
-//! `404` instead would be a route stremio-core does not recognise. There is
-//! no state behind the answer: nothing could ever fill it.
+//! **The type and the route stay; there is no list behind them.** `/casting`
+//! answers an empty list of this type, which is the right answer from a
+//! server that cannot cast: the embedder discovers receivers itself (xtremio
+//! does, and uses the LAN media listener to feed them) and never asks this
+//! route. A `404` instead would be a route stremio-core does not recognise.
 
 /// One playback device, in the shape stremio-core's `StreamingServer` model
-/// parses out of `GET /casting`. Nothing constructs one any more.
+/// parses out of `GET /casting`. Nothing constructs one.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Device {
     pub id: String,

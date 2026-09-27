@@ -520,14 +520,11 @@ impl Fixture {
 
     /// **Nothing a translation read was kept but the reads themselves.**
     ///
-    /// The archive routes used to download an archive whole and extract the
-    /// member beside it, two copies of the film under the cache root. Now
-    /// a member is byte ranges of the link: what lands on the disk is the
-    /// proxy cache's chunks of what the origin sent, and nothing else. So
-    /// the whole root is walked, not one directory an old version wrote:
-    /// the bytes under it are no more than the origin has served, and no
-    /// file is a whole archive the origin serves (a download) or a member
-    /// of one (an extraction).
+    /// A member is byte ranges of the link: what lands on the disk is the
+    /// proxy cache's chunks of what the origin sent, and nothing else. The
+    /// whole root is walked, not one directory: the bytes under it are no
+    /// more than the origin has served, and no file is a whole archive the
+    /// origin serves (a download) or a member of one (an extraction).
     fn assert_nothing_kept(&self) {
         self.handle
             .proxy_cache_settled(std::time::Duration::from_secs(30))
@@ -562,7 +559,7 @@ impl Fixture {
 }
 
 /// **A create under a key that is in use does not swap the archive out from
-/// under a player** (review #67). `/{fmt}/create/{key}` takes the key from
+/// under a player.** `/{fmt}/create/{key}` takes the key from
 /// the caller, and every `/{fmt}/stream/{key}/...` after it reads whatever
 /// that key now names -- so a second caller (on Android, any app on the
 /// device) could point a live session at an archive of its own. A repeat of
@@ -606,10 +603,10 @@ fn a_create_cannot_take_over_another_archives_session_key() -> anyhow::Result<()
 /// An archive is fetched from a web address and from nowhere else.
 ///
 /// The create routes are open to any loopback caller -- on Android, every
-/// app on the device, and any page in a browser on it -- and a `url` that
-/// was not http(s) was taken as a path on this machine: the members of any
-/// archive the server could read, its own private storage included, were
-/// served to whoever asked.
+/// app on the device, and any page in a browser on it -- so a `url` that is
+/// not http(s) must never be taken as a path on this machine: that would
+/// serve the members of any archive the server can read, its own private
+/// storage included, to whoever asked.
 #[test]
 fn an_archive_on_this_machines_disk_is_not_opened() -> anyhow::Result<()> {
     let fixture = fixture()?;
@@ -667,15 +664,13 @@ fn a_failed_create_leaves_nothing_behind() -> anyhow::Result<()> {
 /// **A stored member behind a web link is served as byte ranges of the
 /// link**, in every container this server reads, whole and by range and
 /// backwards -- and nothing is written anywhere: the archive is never
-/// downloaded and the member is never extracted, where every archive this
-/// server played used to leave two copies of the film under the cache root
+/// downloaded and the member is never extracted
 /// ([`Fixture::assert_nothing_kept`] walks all of it). (An ISO image is the
 /// same claim in `server/tests/iso.rs`.)
 ///
-/// The seek backwards is the case the old shape could not do at all
-/// without paying for the member again: a player opens, reads the head,
-/// jumps to the tail for the index, and comes back. Here each of those is
-/// one ranged read of the link.
+/// The seek backwards is the case that would otherwise pay for the member
+/// again: a player opens, reads the head, jumps to the tail for the index,
+/// and comes back. Here each of those is one ranged read of the link.
 #[test]
 fn a_stored_member_behind_a_link_is_served_by_range_and_nothing_is_written() -> anyhow::Result<()> {
     let fixture = fixture()?;
@@ -798,8 +793,7 @@ fn a_compressed_member_is_refused_with_a_sentence() -> anyhow::Result<()> {
 }
 
 /// **A `tar.gz` is refused whole**: gzip is one stream with no way in at
-/// the middle, so there is no member of it this server can point at. It
-/// used to be extracted, every time, in full.
+/// the middle, so there is no member of it this server can point at.
 #[test]
 fn a_tar_gz_is_refused_because_it_has_no_way_in() -> anyhow::Result<()> {
     let fixture = fixture()?;
@@ -852,15 +846,14 @@ fn an_origin_that_will_not_range_is_refused() -> anyhow::Result<()> {
     fixture.finish()
 }
 
-/// An empty member is an empty body with a length of 0 -- it was answered
-/// `Content-Length: 1` over a body that ended at once -- and a range past
+/// An empty member is an empty body with a length of 0 -- never
+/// `Content-Length: 1` over a body that ends at once -- and a range past
 /// the end of a member is a `416` naming its length, not the whole member
 /// under a `200`.
 ///
-/// Over a `.tar` where it used to be over a `.tar.gz`: the claim is about
-/// the framing every media response shares (`routes::util::MediaRange`),
-/// and the container it is made through is now one whose members can be
-/// pointed at.
+/// Made through a `.tar`: the claim is about the framing every media
+/// response shares (`routes::util::MediaRange`), and a `.tar`'s members
+/// can be pointed at directly.
 #[test]
 fn an_empty_member_is_empty_and_a_range_past_the_end_is_refused() -> anyhow::Result<()> {
     let fixture = fixture()?;
@@ -901,8 +894,7 @@ fn an_empty_member_is_empty_and_a_range_past_the_end_is_refused() -> anyhow::Res
 
 /// **A second create of the same archive reuses the index the first one
 /// read**: the origin is asked for nothing more. A re-play sends the same
-/// `/create` again, and before the translated path each send downloaded
-/// the whole archive a second time, beside the first copy.
+/// `/create` again.
 #[test]
 fn a_second_create_of_the_same_archive_reuses_its_index() -> anyhow::Result<()> {
     let fixture = fixture()?;
@@ -926,10 +918,8 @@ fn a_second_create_of_the_same_archive_reuses_its_index() -> anyhow::Result<()> 
 /// **A 7z of a film is LZMA2 in practice, and is refused with a sentence.**
 ///
 /// 7-Zip compresses by default: the archive this asks for is what `7z a`
-/// writes. It used to be *extracted whole* into `<cacheRoot>/.archives`,
-/// a second copy of the film that a seek to the end paid for in full.
-/// Now the create says so, before a byte of the member is fetched, with
-/// the method named.
+/// writes. The create says so, before a byte of the member is fetched,
+/// with the method named.
 #[test]
 fn a_packed_7z_is_refused_with_a_sentence_naming_its_method() -> anyhow::Result<()> {
     let fixture = fixture()?;
@@ -1060,8 +1050,7 @@ fn assert_served_by_range(
 }
 
 /// **A stored RAR member behind a link is byte ranges of the archive**,
-/// like a zip's: nothing downloaded, nothing extracted. Until this step `/rar/create` fetched the whole archive
-/// into the cache root before it could name a member.
+/// like a zip's: nothing downloaded, nothing extracted.
 #[cfg(feature = "rar")]
 #[test]
 fn a_stored_rar_member_behind_a_link_is_served_by_range_and_nothing_is_written()
@@ -1121,18 +1110,16 @@ fn volume_boundaries() -> [usize; 2] {
 
 /// **A stored film across three volumes behind three links is one file.**
 ///
-/// This is the ordinary RAR case and the one this server could not do at
-/// all until now: `rarUrls` is a list of volumes, and the film inside is a
-/// *part* of each of them. The member is three extents -- `(volume 0,
-/// ..)`, `(volume 1, ..)`, `(volume 2, ..)` -- and what proves the mapping
-/// is that a range spanning a volume boundary comes back as the film's own
-/// bytes on both sides of it. The content is signposted with its own
-/// offsets, so reading a part out of the wrong volume is a wrong sentence
-/// and not a subtle byte.
+/// This is the ordinary RAR case: `rarUrls` is a list of volumes, and the
+/// film inside is a *part* of each of them. The member is three extents --
+/// `(volume 0, ..)`, `(volume 1, ..)`, `(volume 2, ..)` -- and what proves
+/// the mapping is that a range spanning a volume boundary comes back as the
+/// film's own bytes on both sides of it. The content is signposted with its
+/// own offsets, so reading a part out of the wrong volume is a wrong
+/// sentence and not a subtle byte.
 ///
-/// Nothing is downloaded: until this step `/rar/create` with several URLs
-/// answered `501`, and with one it fetched the whole archive into
-/// `.archives` first.
+/// Nothing is downloaded: each volume is read only for the ranges its
+/// extents cover.
 #[cfg(feature = "rar")]
 #[test]
 fn a_stored_film_across_three_rar_volumes_behind_links_is_served_by_range() -> anyhow::Result<()> {

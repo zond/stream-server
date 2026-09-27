@@ -1084,9 +1084,7 @@ mod tests {
         // **The expiry has to come after the probe, not before it.** A
         // source opened on an already-expired token renews during the
         // probe and hands the reads an hour-old-nothing, so the reads meet
-        // no expiry at all and the test passes whatever the lock does --
-        // which is how this test first passed while holding the lock
-        // across the renewal and while dropping it.
+        // no expiry at all and the test passes whatever the lock does.
         assert_eq!(
             fake.refreshes(),
             0,

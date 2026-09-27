@@ -78,7 +78,7 @@ async fn stream(Path((r#type, id)): Path<(String, String)>) -> impl IntoResponse
 
 /// The catalog resource: an empty but *valid* catalog. Core's
 /// `ResourceResponse` accepts `{"metas": []}` as `Metas { metas: [] }`, so the
-/// row renders as empty instead of failing -- a 404 here used to break the row
+/// row renders as empty instead of failing -- a 404 here would break the row
 /// and log an ERROR on every board refresh.
 async fn catalog(Path((r#type, id)): Path<(String, String)>) -> impl IntoResponse {
     tracing::debug!(
@@ -108,8 +108,8 @@ pub fn empty_catalog_json() -> Value {
     json!({ "metas": [] })
 }
 
-/// `meta` is only ever asked for `local:`/`bt:` ids, which nothing produces
-/// any more; a quiet 404 rather than the ERROR-level unhandled-request log.
+/// `meta` is only ever asked for `local:`/`bt:` ids, which nothing produces;
+/// a quiet 404 rather than the ERROR-level unhandled-request log.
 async fn meta(Path((r#type, id)): Path<(String, String)>) -> impl IntoResponse {
     tracing::debug!(
         r#type,

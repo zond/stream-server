@@ -13,9 +13,9 @@ pub struct ProcessMemorySnapshot {
 /// This process's memory, and nothing else's. Read by the panic hook, so it
 /// runs while something is already going wrong.
 ///
-/// `System::new_all()` + `refresh_all()` enumerated every process on the
-/// machine through `/proc` -- CPU, memory, disks, networks, the lot -- to
-/// read one pid's RSS. Refreshing this pid alone, for memory alone, is a
+/// `System::new_all()` + `refresh_all()` would enumerate every process on
+/// the machine through `/proc` -- CPU, memory, disks, networks, the lot --
+/// to read one pid's RSS. Refreshing this pid alone, for memory alone, is a
 /// handful of reads of `/proc/self`.
 pub fn process_memory_snapshot() -> ProcessMemorySnapshot {
     let pid = Pid::from_u32(std::process::id());
@@ -45,8 +45,8 @@ mod tests {
     /// Both figures are asserted non-zero and nothing more. On Unix the
     /// virtual size is at least the resident set, but on Windows sysinfo's
     /// `virtual_memory()` is the pagefile commit, which a process whose pages
-    /// are mostly file-backed keeps *below* its working set -- CI's first
-    /// Windows run of this test failed on exactly that relation.
+    /// are mostly file-backed keeps *below* its working set -- so the two
+    /// are never compared against each other here, only against zero.
     #[test]
     fn the_process_snapshot_reads_this_process_s_memory() {
         let snapshot = process_memory_snapshot();

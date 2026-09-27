@@ -9,9 +9,9 @@
 //! `server::routes::ftp::tls_config`.)
 //! It lives in `enginefs` rather than `server` because `server` depends on
 //! `enginefs` and not the reverse; librqbit has its own copy of this policy
-//! (`librqbit::http_client_builder`) for the same reason. The two are no
-//! longer identical: librqbit's is written to be upstreamable and trusts the
-//! compiled-in roots alone, while this one also reads the platform's store.
+//! (`librqbit::http_client_builder`) for the same reason. The two differ:
+//! librqbit's is written to be upstreamable and trusts the compiled-in roots
+//! alone, while this one also reads the platform's store.
 //! Nothing librqbit fetches leaves the open internet, so the anchors it is
 //! missing are ones its traffic never needs.
 
@@ -166,11 +166,11 @@ fn mozilla_roots() -> impl Iterator<Item = reqwest::Certificate> {
 
 /// The platform's own trust anchors, read once for the life of the process.
 ///
-/// Empty is a valid answer and never an error: it means this build trusts the
-/// compiled-in roots alone, which is what every release before this one did.
-/// A store that cannot be read is logged and skipped rather than propagated,
-/// because the alternative -- refusing to build a client -- would take the
-/// whole server down over a directory the compiled-in roots make optional.
+/// Empty is a valid answer and never an error: it means this build trusts
+/// the compiled-in roots alone. A store that cannot be read is logged and
+/// skipped rather than propagated, because the alternative -- refusing to
+/// build a client -- would take the whole server down over a directory the
+/// compiled-in roots make optional.
 fn platform_roots() -> &'static [reqwest::Certificate] {
     static ROOTS: std::sync::LazyLock<Vec<reqwest::Certificate>> =
         std::sync::LazyLock::new(load_platform_roots);

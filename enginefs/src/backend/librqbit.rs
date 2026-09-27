@@ -349,9 +349,9 @@ pub const TORRENT_ERROR_MESSAGE: &str = "the torrent is in an error state (its d
 /// The text needle is for a chain that carries the cause as a message only:
 /// librqbit's own filesystem storage writes through `nix::sys::uio::pwritev`,
 /// whose `nix::errno::Errno` is no `std::io::Error` and renders as
-/// `"ENOSPC: No space left on device"` (a field log from before the piece
-/// store, reproduced at `/dev/full`), and anything else that turns an error
-/// into text before wrapping it would read the same.
+/// `"ENOSPC: No space left on device"` (reproduced at `/dev/full`), and
+/// anything else that turns an error into text before wrapping it would
+/// read the same.
 ///
 /// Anything else is a torrent problem, not a device problem, and must stay
 /// fatal: reclaiming space and restarting would be a loop.
@@ -386,46 +386,24 @@ enum InitPolicy {
 /// routing table when it starts cold (no persisted `dht.json`, or a
 /// deserialize failure).
 ///
-/// **This list is not "wider is safer".** An earlier revision padded it out
-/// with every conventional public bootstrap name mainstream clients ship, on
-/// the theory that more hosts hedge against an outage. Measurement said
-/// otherwise: of the five, only two answer a mainline DHT `ping` query at
-/// all. Three attempts each, from a working residential connection:
-///
-/// | host | resolves | answers a DHT ping |
-/// |---|---|---|
-/// | `dht.libtorrent.org:25401` | yes | 3/3, ~11 ms |
-/// | `dht.transmissionbt.com:6881` | yes | 3/3, ~31 ms |
-/// | `router.bittorrent.com:6881` | yes (`67.215.246.10`) | 0/3 |
-/// | `router.utorrent.com:6881` | yes (`82.221.103.244`) | 0/3 |
-/// | `dht.aelitis.com:6881` | yes (`34.203.221.232`) | 0/3 |
-///
-/// `router.utorrent.com` and `dht.aelitis.com` went first: a name that
-/// resolves but never replies is not resilience, it is one more address for
-/// `DhtWorker::bootstrap` to time out on and one more retry line in the log.
-///
-/// `router.bittorrent.com` survived one revision longer, on the argument
-/// that it is the most widely deployed bootstrap name in the ecosystem and
-/// that its address is anycast, so it might answer from some network that
-/// was not the one measured. It was re-probed in 2026-09 from two
-/// networks, twice each, with both `ping` and `find_node`: it still
-/// resolves to `67.215.246.10` and still answers nothing, on either
-/// network, while `dht.libtorrent.org` replied in 11 ms and
-/// `dht.transmissionbt.com` in 32 ms on those same runs and both returned
-/// nodes. Reputation is not a measurement, and the entry cost one
-/// forever-retrying backoff loop per launch, so it is gone too. Nothing
-/// else belongs here unless someone has actually pinged it.
+/// **This list is not "wider is safer".** Of the conventional public
+/// bootstrap names mainstream clients ship, only two are kept here because
+/// only two are measured to answer a mainline DHT `ping` at all
+/// (`dht.libtorrent.org`, `dht.transmissionbt.com`, both replying within
+/// tens of milliseconds); the rest resolve but never reply, which is not
+/// resilience -- it is one more address for `DhtWorker::bootstrap` to time
+/// out on and one more retry line in the log. Reputation or an anycast
+/// address is not a measurement: a host is added only with a `ping` behind
+/// it.
 ///
 /// What is left is exactly librqbit's own built-in fallback
 /// (`DHT_BOOTSTRAP` in the `zond/rqbit` fork's `crates/dht/src/lib.rs`),
 /// ordered fastest-first rather than in librqbit's order. Overriding that
-/// default therefore no longer changes *which* hosts are used at all. What
+/// default therefore does not change *which* hosts are used at all. What
 /// the override still buys is that these entries pass through
 /// [`dht_bootstrap::resolve_bootstrap_addrs`] first, which turns the names
 /// into address literals and drops the v6 ones on a host with no v6 route
-/// -- see that module for why (a field log had the system resolver itself
-/// returning nothing, and an IPv4-only device retrying AAAA records
-/// forever).
+/// -- see that module for why.
 ///
 /// Overridable via the `dhtBootstrapNodes` server setting
 /// (`server/src/routes/system.rs`) -- see [`resolve_dht_bootstrap_nodes`].
@@ -453,7 +431,7 @@ pub const DEFAULT_DHT_BOOTSTRAP_NODES: &[&str] =
 /// -- non-empty `host:port` strings only) if non-empty, REPLACING
 /// [`DEFAULT_DHT_BOOTSTRAP_NODES`] entirely; otherwise the default set.
 /// Mirrors `SessionOptions.dht.bootstrap_addrs`'s own `None` = built-in
-/// convention -- and since [`DEFAULT_DHT_BOOTSTRAP_NODES`] is now exactly
+/// convention -- and since [`DEFAULT_DHT_BOOTSTRAP_NODES`] is exactly
 /// librqbit's own two-host list, leaving it unconfigured and configuring
 /// that same list are the same thing. Configuring anything *else* is what
 /// changes which hosts are used. Both branches then go through
@@ -1195,9 +1173,7 @@ impl LibrqbitBackend {
     /// as such every time -- see [`bt_settings_support`] for why each is
     /// where it is.
     ///
-    /// `btMaxConnections` used to wait for a restart, because the cap was
-    /// `SessionOptions::peer_limit` and a session's options are fixed once
-    /// it is open. It does not have to any more: the fork's
+    /// `btMaxConnections` applies live, without a restart: the fork's
     /// `ManagedTorrent::set_peer_limit` is the same runtime lever
     /// [`Footprint`] uses, so lowering the setting hangs up on the surplus
     /// now and raising it re-queues the parked peers, with no restart and
@@ -2151,7 +2127,7 @@ impl TorrentHandle for LibrqbitHandle {
     /// Two counters off the live state, read through librqbit's
     /// `stats_snapshot()` -- which loads its handful of torrent-level
     /// atomics and the aggregate peer counters, because
-    /// `TorrentStateLive::stats` is private at the pinned rev; cheap and
+    /// `TorrentStateLive::stats` is private at this crate's librqbit rev; cheap and
     /// side-effect free, but a snapshot, not two loads. Not
     /// `progress_bytes`: while a torrent initializes that mirrors the hash
     /// check's `checked_bytes`, which is disk read back, not a peer.
@@ -3011,15 +2987,16 @@ impl LibrqbitHandle {
     /// retention pass makes it true of a torrent with only its window on the
     /// disk: it stops wanting every piece of the file outside the window
     /// through `drop_pieces`, and a piece we do not have and stop wanting is
-    /// one librqbit no longer needs. Read as "the torrent is complete", that
-    /// exempted such a torrent from the free-space stop as one that writes
-    /// nothing, let a seek outside the window past the disk-space gate onto a
-    /// full volume, and showed a client 100% of a file it had a sixteenth of
-    /// -- and it flapped: the head advancing re-wants a piece, `finished`
-    /// drops, the torrent is stopped for space, and its passes keep the piece
-    /// wanted. `have == total` is the question every one of those readers
-    /// asks, and it moves only when bytes do: down when a reclaim takes a
-    /// piece, which is right, because a seek back into that range writes.
+    /// one librqbit no longer needs. Reading that as "the torrent is
+    /// complete" would exempt such a torrent from the free-space stop as one
+    /// that writes nothing, let a seek outside the window past the
+    /// disk-space gate onto a full volume, and show a client 100% of a file
+    /// it has a sixteenth of -- and it would flap: the head advancing
+    /// re-wants a piece, `finished` drops, the torrent is stopped for space,
+    /// and its passes keep the piece wanted. `have == total` is the question
+    /// every one of those readers asks, and it moves only when bytes do:
+    /// down when a reclaim takes a piece, which is right, because a seek
+    /// back into that range writes.
     fn wanted_on_disk(&self, stats: &librqbit::TorrentStats) -> WantedOnDisk {
         use librqbit::TorrentStatsState as S;
         let Some(metadata) = self.handle.metadata.load_full() else {
@@ -4044,13 +4021,13 @@ mod tests {
 
         handle.stop_torrent().await.expect("a live torrent pauses");
         assert_eq!(wait_until_settled(&handle).await, RunState::Paused);
-        // **A second pause is accepted, and leaves it paused.** librqbit
-        // 193a5bd8 turned pause-on-an-already-paused-torrent from an error
-        // into a second release of its file handles, so the old assertion
-        // (an `Err`) was asserting a contract upstream no longer keeps. What
-        // this ever meant to say is that a redundant stop does not disturb
-        // the state, and the reconciler never issues one anyway: it stops
-        // only what it has just seen `Live` (`stop_if_running`).
+        // **A second pause is accepted, and leaves it paused.** The fork
+        // makes pausing an already-paused torrent a no-op (a second release
+        // of its file handles) rather than an error; a rebase that loses
+        // that fix fails here. The reconciler never issues a redundant stop
+        // anyway -- it stops only what it has just seen `Live`
+        // (`stop_if_running`) -- but a redundant stop must not disturb the
+        // state either way.
         handle
             .stop_torrent()
             .await
@@ -4084,8 +4061,8 @@ mod tests {
     /// `/stream` request for that torrent goes through
     /// `LibrqbitHandle::await_initialized`, and
     /// `ManagedTorrent::wait_until_initialized` refuses a waiter on that
-    /// pair -- it used to poll it for ever -- so the visible symptom is a
-    /// player that never gets its first byte.
+    /// pair rather than polling it forever; without that refusal the
+    /// visible symptom would be a player that never gets its first byte.
     ///
     /// The volume here is full, so the free-space arm wants this torrent
     /// stopped and would make the call on any settled reading. It is the
@@ -4182,11 +4159,9 @@ mod tests {
     /// that the previous process had stopped: the engine that comes out is
     /// what a fresh boot really holds.
     ///
-    /// This is the situation every deleted record was wrong about. The
-    /// pause is in `session.json` and survived; nothing in this process
-    /// knows it exists, let alone why, and on master the three call sites
-    /// that could have lifted it all read `if idle_paused.swap(false) &&
-    /// resume()` -- `false && ...` here, so none of them ever ran.
+    /// The pause is in `session.json` and survived; nothing in this process
+    /// knows it exists, let alone why, so a start gated on who stopped the
+    /// torrent would never lift it.
     ///
     /// The free-space probe is declared, so the decisions the tests below
     /// make are about their own inputs rather than about however much room
@@ -4370,26 +4345,10 @@ mod tests {
     /// An unpause that lands while the initial check runs starts the torrent,
     /// and `run_state` and librqbit's own flag agree about it.
     ///
-    /// **This used to be a divergence, and the fork fixed it.** `Session::
-    /// unpause` cleared `paused` and then found the check already running, so
-    /// it returned success having started nothing; the check that *was*
-    /// running had captured the add-time `start_paused = true` and parked the
-    /// torrent when it finished. The flag said running, the torrent was
-    /// stopped, and everything here that reads one of the two was reading a
-    /// coin flip. The fork's `f21c3a3e` makes the check land on the pause
-    /// intent as it stands when it finishes, so the unpause is honoured.
-    ///
-    /// Kept, with its assertions turned round, because it is this side's
-    /// guard on that fix: a rebase that lost it would fail here rather than
-    /// in a field log.
-    ///
-    /// At the pinned rev the shape is: `Session::unpause` reaches
-    /// `ManagedTorrent::start`, which writes the intent and then, in
-    /// `_start`'s `Initializing` arm, finds the initial check already
-    /// running and returns success having started nothing. What changed is
-    /// the continuation: it now reads the intent off the guard rather than
-    /// the `start_paused` captured a check ago, so the unpause is honoured
-    /// and this test asserts that it is.
+    /// Guards the fork's fix for this case: the check's continuation reads
+    /// the pause intent as it stands when the check finishes, rather than
+    /// the intent captured when the check began, so the unpause here is
+    /// honoured. A rebase that loses that fix fails here.
     ///
     /// The last assertion is librqbit's own opinion rather than either of
     /// the two readings: it refuses to pause a torrent it considers paused,
@@ -4479,25 +4438,18 @@ mod tests {
     /// The other direction: a pause landing during a *fastresume* check parks
     /// the torrent, and the flag agrees.
     ///
-    /// **Also a divergence the fork fixed.** `validate_fastresume` never read
-    /// `pause_requested`, so the check returned `Ok`, its continuation applied
-    /// the add-time `start_paused` -- `false` for a torrent restored unpaused
-    /// -- and took it `Live` while the flag said paused. That is the shape
-    /// behind the measured 3 MiB -> 12 MiB overshoot: the free-space watch
-    /// stopped the torrent, was told it was paused, and the torrent went on
-    /// writing.
+    /// Guards the fork's fix for the fastresume case: `validate_fastresume`
+    /// never reads `pause_requested`, so the check still returns `Ok` with
+    /// the pause unseen, but the continuation now applies the intent as it
+    /// stands rather than the add-time `start_paused`, so the torrent parks
+    /// instead of going live while the flag says paused -- the divergence
+    /// `crate::backend::TorrentHandle::run_state`'s docs measure as a 3 MiB
+    /// -> 12 MiB overshoot past the free-space floor. A rebase that loses
+    /// the fix fails here.
     ///
-    /// `TorrentStateInitializing::check` still hands `pause_requested` to
-    /// `FileOps::initial_check` and to nothing else, and
-    /// `validate_fastresume` still never reads it -- so the check returns
-    /// `Ok` with the pause unseen. What the fix changed is what happens
-    /// next: the check's continuation in `_start` applies the intent as it
-    /// stands instead of the add-time `start_paused`, and the torrent parks.
-    ///
-    /// A restart is not decoration here. Fastresume needs a have-bitfield
+    /// A restart is not decoration here: fastresume needs a have-bitfield
     /// from a previous run, so the first session is what makes the second
-    /// one take the fastresume path at all -- and a restart is exactly when
-    /// this happens in the field.
+    /// one take the fastresume path at all.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_pause_during_a_fastresume_check_leaves_the_torrent_parked() {
         use crate::backend::TorrentHandle;
@@ -4712,12 +4664,11 @@ mod tests {
     /// The reconciler's stop really stops the fetching, and its start gets
     /// the pieces back.
     ///
-    /// This is the half no fake backend can show. The idle pause was the
-    /// trait's no-op here, so with `seedingEnabled=false` the engine marked
-    /// itself paused and the torrent went on downloading at full rate --
-    /// measured at 3 MiB -> 12 MiB in three seconds -- while the free-space
-    /// watch, which skipped an engine that claimed to be paused, left it
-    /// alone all the way to `ENOSPC`.
+    /// This is the half no fake backend can show: a no-op idle pause would
+    /// let the engine mark itself paused under `seedingEnabled=false` while
+    /// the torrent keeps downloading at full rate -- measured at 3 MiB ->
+    /// 12 MiB in three seconds -- with the free-space watch, which skips an
+    /// engine that claims to be paused, never catching it before `ENOSPC`.
     ///
     /// A seeder with a fixed upload rate is what makes "did it stop?"
     /// answerable in a bounded time: the window is first shown to be long
@@ -5296,7 +5247,7 @@ mod tests {
     /// The classifier over both shapes a chain can carry the cause in: text
     /// only -- the chain librqbit's own filesystem storage builds, whose
     /// write goes through `nix::sys::uio::pwritev` and whose cause is a
-    /// `nix::errno::Errno`, matched verbatim to a field log -- and a
+    /// `nix::errno::Errno` (see [`is_out_of_space`]) -- and a
     /// `std::io::Error` of kind `StorageFull`, which is what the piece
     /// store's writes produce on every platform.
     #[test]
@@ -5999,9 +5950,8 @@ mod tests {
     /// only then performs the waiter's release. This is the one ordering
     /// `handle_gate_error`'s single, non-looping `take` can never itself
     /// reproduce (it only ever takes once, before it releases), which is
-    /// exactly why the fix is correct: unlike the old drain-and-recheck loop,
-    /// there is no code path left that could re-take and drop this op under
-    /// the stale verdict.
+    /// exactly why it is correct: a drain-and-recheck loop instead would
+    /// have a path that re-takes and drops this op under the stale verdict.
     #[tokio::test(start_paused = true)]
     async fn deferred_selection_defer_racing_gate_error_is_not_lost() {
         let slot: Arc<DeferredSelection<u32>> = DeferredSelection::new();
@@ -8381,9 +8331,9 @@ mod tests {
     }
 
     /// Which pieces of a torrent are complete **on the disk**: a listing of
-    /// its directory, names only, as the retention pass used to take one.
-    /// For the tests whose claim is about the disk rather than about what a
-    /// store knows -- what a peer received, what an unbounded stream left.
+    /// its directory, names only. For the tests whose claim is about the
+    /// disk rather than about what a store knows -- what a peer received,
+    /// what an unbounded stream left.
     fn on_disk(
         root: &crate::piece_store::StoreRoot,
         hash: &str,
@@ -8640,26 +8590,24 @@ mod tests {
     /// **The tail read is the third of those.** Part-way through the pause
     /// mpv reads the end of the file for the Cues
     /// ([`BoundWatch::probe_the_tail`]) and closes that response, exactly as
-    /// it does before the first frame of every MKV. That read used to leave
-    /// the *file's* head at the end of the file behind it, so every pass
-    /// after it measured from there; what that costs is bytes off the
-    /// swarm, and the occupancy -- one window, wherever it is -- says
-    /// nothing about it at all. Reverting the head's owner today fails this
-    /// test on the disk bound first, because the probe's window and the
-    /// player's are then two windows over a budget of one; the network
-    /// bound is what stays true when the churn is inside the budget, which
-    /// is where it was on the television.
+    /// it does before the first frame of every MKV. The probe stays its own
+    /// window rather than moving the *file's* read head to the end of the
+    /// file: folding it into the head would move every later pass's
+    /// measurement point there too, and the occupancy check (one window,
+    /// wherever it is) cannot see that cost -- reverting the head's owner
+    /// fails this test on the disk bound first, because the probe's window
+    /// and the player's are then two windows over a budget of one. The
+    /// network bound is what stays true while the churn is inside the
+    /// budget.
     ///
-    /// Before the reader's lookahead was cut to the window's reach this held
-    /// only for the 4 MiB startup intent, and by luck of the constants: the
-    /// window was wider than that one cap. Under a seek's cap the stream
-    /// asked librqbit for the whole rest of the file, librqbit refused to
-    /// drop what its stream was about to read, and the disk sat over the
-    /// budget by the lookahead for the stream's life while every pass asked
-    /// for the same refused pieces again (issue b). Now the lookahead is
-    /// `min(cap, reach)`, the want-set outside the window is trimmed, and
-    /// the refused count stays at zero: through a pause, through the whole
-    /// read and for thirty passes after it.
+    /// The lookahead is `min(cap, reach)`, not the raw cap alone: under a
+    /// seek's cap alone the stream would ask librqbit for the whole rest of
+    /// the file, librqbit refuses to drop what its stream is about to read,
+    /// and the disk would sit over the budget by the lookahead for the
+    /// stream's life while every pass asks for the same refused pieces
+    /// again. Capping to the window's reach keeps the want-set outside the
+    /// window trimmed and the refused count at zero: through a pause,
+    /// through the whole read and for thirty passes after it.
     ///
     /// The pause is what makes the lookahead observable at all. A reader
     /// that reads as fast as the one peer on the loopback delivers keeps
@@ -8744,9 +8692,9 @@ mod tests {
         // it lasts as long as it takes -- twice. First until the fill has
         // caught up with the window and the passes have stopped moving
         // pieces; then the player reads the container index at the end of
-        // the file ([`BoundWatch::probe_the_tail`]), which is the read that
-        // used to move the window off the player; then until the stream is
-        // at rest again after it. How long settling takes is the machine's
+        // the file ([`BoundWatch::probe_the_tail`]), a read the window must
+        // not move off the player for; then until the stream is at rest
+        // again after it. How long settling takes is the machine's
         // business: no pass is asked how much may land across it, since a
         // tick on a loaded machine is as long as the machine makes it, and
         // whatever was in flight lands when it lands, which only postpones
@@ -8919,18 +8867,17 @@ mod tests {
             }
         }
 
-        /// **mpv's read of the container index at the tail**, which is what
-        /// made the field measurement above what it was: a second reader on
-        /// the same file, opened near its end with the intent that names it
-        /// which delivers a few bytes and closes
-        /// before the next pass runs.
+        /// **mpv's read of the container index at the tail**: a second
+        /// reader on the same file, opened near its end with the intent
+        /// that names it, which delivers a few bytes and closes before the
+        /// next pass runs.
         ///
-        /// That read used to claim the file's head, and a head is not given
-        /// back when a read ends -- a paused film keeps its window. So
-        /// every pass after it drew the window round the end of the file,
-        /// stopped wanting the head the player was parked on and unlinked
-        /// it, and the playing stream's priority path fetched it back
-        /// again, once per tick. Nothing about the disk shows that: the
+        /// This read must not claim the file's head -- a head is not given
+        /// back when a read ends, so a paused film keeps its window --
+        /// or every pass after it would draw the window round the end of
+        /// the file, stop wanting the head the player is parked on and
+        /// unlink it, with the playing stream's priority path fetching it
+        /// back again once per tick. Nothing about the disk shows that: the
         /// occupancy is one window either way. The fetched count is the
         /// only place it appears.
         async fn probe_the_tail(&mut self) {
@@ -8953,10 +8900,10 @@ mod tests {
             // nowhere else: `LibrqbitBackend::get_file_reader` opens
             // librqbit's `FileStream` at zero whatever it is handed, and
             // `stream_video` seeks the handle before it serves a byte.
-            // Without the same seek here the probe delivered the *head* of
-            // the file -- already on the disk, off no peer, its playhead
-            // recorded at a tail it had never reached -- and the read this
-            // fixture exists to reproduce never happened.
+            // Without the same seek here the probe would deliver the *head*
+            // of the file -- already on the disk, off no peer, its playhead
+            // recorded at a tail it never reached -- and the read this
+            // fixture exists to reproduce would never happen.
             probe
                 .seek(std::io::SeekFrom::Start(tail))
                 .await
@@ -9011,8 +8958,8 @@ mod tests {
         }
     }
 
-    /// **The film paused with its response closed, and the tail read that
-    /// used to move the window off it.**
+    /// **A paused film with its response closed, and the tail read that
+    /// must not move the window off it.**
     ///
     /// `a_stream_wider_than_its_window_is_fetched_inside_it` probes the
     /// tail with the player's body still open, and that shape cannot show
@@ -9021,16 +8968,17 @@ mod tests {
     /// hold the window on the player without the other. Reverting either
     /// alone leaves that test green.
     ///
-    /// The field shape is the one where they come apart. A viewer pauses
-    /// and the client closes the response -- there is no live read at all,
-    /// and where playback got to is the only thing left that says where
-    /// the film is -- and then the player reads the container index at the
-    /// end of the file, as mpv does before every frame it decodes after a
-    /// seek. That read delivers bytes like any other, it used to write
-    /// `last_position`, and `Reader::drop` deliberately leaves that value
-    /// behind, so the window relocated to the end of the file and stayed
-    /// there with nobody watching it. What that costs is bytes off the
-    /// peers: the disk holds one window either way.
+    /// This is the shape where they come apart. A viewer pauses and the
+    /// client closes the response -- there is no live read at all, and
+    /// where playback got to is the only thing left that says where the
+    /// film is -- and then the player reads the container index at the end
+    /// of the file, as mpv does before every frame it decodes after a seek.
+    /// That read delivers bytes like any other; it must not write
+    /// `last_position`, because `Reader::drop` deliberately leaves that
+    /// value behind, and a read that did would relocate the window to the
+    /// end of the file and leave it there with nobody watching it. What
+    /// that would cost is bytes off the peers: the disk holds one window
+    /// either way.
     ///
     /// So: what comes off the swarm after the probe has closed, against
     /// what had come off it before the probe opened, with two pieces of
@@ -9649,11 +9597,9 @@ mod tests {
         // error is what stands under final names, and a piece is renamed
         // there by the store's committer thread, a flush after the
         // completion that made it readable -- so a `chmod` that beat the
-        // first of those left the bucket holding staged copies alone, every
-        // queued rename failing against a directory it could no longer
-        // write, and nothing on the disk for the restart to find. Run
-        // inside the full suite the first rename usually won, which is what
-        // made this a flake rather than a failure (review #91).
+        // first of those would leave the bucket holding staged copies
+        // alone, every queued rename failing against a directory it can no
+        // longer write, and nothing on the disk for the restart to find.
         //
         // Waiting is bounded to the first one on purpose: the bucket has to
         // be made unwritable while the download is still writing into it,

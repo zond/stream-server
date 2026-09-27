@@ -1,4 +1,4 @@
-//! What the log files may not contain (review #17).
+//! What the log files may not contain.
 //!
 //! `/proxy` takes the URL it fetches -- and the request headers it attaches
 //! -- from the caller, in the *path* as well as the query, and an addon's
@@ -102,7 +102,7 @@ fn a_caller_supplied_url_is_logged_as_its_origin_only() -> anyhow::Result<()> {
     assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
 
     // A request nothing serves, which is logged at ERROR with everything
-    // about it (review #93): the path and the query used to go in whole.
+    // about it: the query's key names, never its values.
     let response = client
         .get(format!(
             "{base}/no-such-route?d={encoded}&h={}",

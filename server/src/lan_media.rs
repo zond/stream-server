@@ -80,11 +80,9 @@ impl LanMedia {
     /// which is why the answer comes from the listener and not from the
     /// configuration.
     ///
-    /// Synchronous, and never behind the listener's lock: it used to wait
-    /// for that lock, which a start holds for the whole of its bind, and
-    /// `ServerHandle::lan_media_running` reached it through a hop onto the
-    /// server's runtime -- a question an embedder asks from a UI thread,
-    /// with no await of its own to give up.
+    /// Synchronous, and never behind the listener's lock, which a start
+    /// holds for the whole of its bind: `ServerHandle::lan_media_running` is
+    /// asked from a UI thread with no await of its own to give up.
     pub fn bound_addr(&self) -> Option<SocketAddr> {
         *self.bound.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -101,13 +99,12 @@ impl LanMedia {
     /// no address is configured, or when the bind fails.
     pub async fn start(&self, state: &AppState) -> anyhow::Result<SocketAddr> {
         let mut running = self.running.lock().await;
-        // The operator's veto, read under the lock that `stop` takes. It
-        // used to be read by the caller before this lock was waited for,
-        // and a settings update that revoked it in between found nothing
-        // running to stop -- then this bound the listener the setting had
-        // just forbidden. Read here, a revocation either lands first and is
-        // seen, or its `stop` queues behind this start and takes what it
-        // bound.
+        // The operator's veto, read under the lock that `stop` takes: read
+        // anywhere else, a settings update that revokes it while this waits
+        // for the lock could find nothing running to stop, and this would
+        // then bind the listener the setting just forbade. Read here, a
+        // revocation either lands first and is seen, or its `stop` queues
+        // behind this start and takes what it bound.
         anyhow::ensure!(
             state.settings.read().await.lan_media_enabled,
             "the lanMediaEnabled setting forbids the LAN media listener; \
@@ -309,8 +306,8 @@ fn host_for_peer(bound: SocketAddr, peer: IpAddr) -> Option<IpAddr> {
 ///
 /// Failing that -- `peer` is behind a router we cannot see, or there is no
 /// real peer at all, which is what every platform that does not report a
-/// receiver's address gives us -- the answer is a guess, and it used to be
-/// whichever non-loopback address `getifaddrs` listed first. On a phone
+/// receiver's address gives us -- the answer is a guess. Taking whichever
+/// non-loopback address `getifaddrs` lists first is not enough: on a phone
 /// that is as likely to be the cellular interface as the Wi-Fi one, and a
 /// cellular address handed to a Chromecast is a cast that hangs on a TCP
 /// connect nobody ever times out. So the candidates are ranked instead (see

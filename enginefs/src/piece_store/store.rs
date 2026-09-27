@@ -48,12 +48,9 @@ pub struct MissingPiece {
 ///
 /// # What reclaim costs
 ///
-/// One `fs::remove_file` per piece, on every filesystem. The earlier attempt
-/// at reclaim punched holes with `fallocate(FALLOC_FL_PUNCH_HOLE)`, which an
-/// `EOPNOTSUPP` filesystem answered by clearing the have-bits while freeing
-/// nothing, and whose ordering against the bitfield flush left a crash window
-/// where the recorded haves were holes. Neither failure has anywhere to live
-/// here.
+/// One `fs::remove_file` per piece, on every filesystem, never
+/// `fallocate(FALLOC_FL_PUNCH_HOLE)` punching holes into a whole file --
+/// see the module docs for why.
 ///
 /// # Files
 ///
@@ -68,13 +65,13 @@ pub struct MissingPiece {
 /// This type is a handle. Everything a torrent's store knows lives in one
 /// shared [`Inner`], and librqbit's [`TorrentStorage::take`] -- how it
 /// pauses a torrent, and how the initial check hands over to the paused
-/// state -- makes a second handle over the same `Inner` rather than a copy.
-/// The first version copied: the successor got a clone of the staged set and
-/// the removed-file set, and from then on the two could disagree about the
-/// same directory. That was tolerable while both sets were advisory. The
-/// held set below is not, and a completion landing on one handle while the
-/// other is about to become the live one would have been a piece the store
-/// held and never knew it held. What a handle owns alone is whether it is
+/// state -- makes a second handle over the same `Inner` rather than a copy:
+/// copying would let the successor's staged set and removed-file set
+/// disagree with the original's over the same directory, which is tolerable
+/// only while both sets are advisory. The held set below is not advisory,
+/// so a completion landing on one handle while the other is about to become
+/// the live one would be a piece the store held and never knew it held.
+/// What a handle owns alone is whether it is
 /// still the data path ([`Self::live`]): the taken handle refuses reads and
 /// writes, and everything addressed by path keeps working on it, because
 /// `Session::delete` deletes through the storage it took.
@@ -215,8 +212,8 @@ pub(super) struct Inner {
     /// Where [`PieceStore::complete_piece`] queues a piece to be flushed and
     /// renamed into place, or `None` until the first completion starts the
     /// committer thread. Bounded ([`COMMIT_QUEUE`]): a device that cannot
-    /// keep up makes a completion wait for room, which is the synchronous
-    /// commit this replaced and no worse.
+    /// keep up makes a completion wait for room -- no worse than committing
+    /// synchronously would.
     committer: Mutex<Option<SyncSender<Commit>>>,
     /// The first commit this store could not make durable -- see
     /// [`Inner::fail_commit`]. Sticky: from then on every write and every
@@ -450,9 +447,8 @@ impl HeldSnapshot {
     /// the tolerance a measurement of what was kept rather than a distance
     /// somebody chose. A big cache keeps more history, so a scrub back
     /// lands inside the run and joins; a small one keeps less, so the same
-    /// scrub lands outside it and is a new consumer. Three earlier rules
-    /// each guessed that distance in bytes and each was wrong in the field
-    /// -- see `docs/design/read-pattern-retention.md`.
+    /// scrub lands outside it and is a new consumer. Not a distance guessed
+    /// in bytes -- see `docs/design/read-pattern-retention.md`.
     ///
     /// `bound` is the entity's extent: a run never runs off the end of the
     /// file it belongs to.
@@ -1019,10 +1015,10 @@ impl Inner {
     /// `sync_all`s would vouch for them.
     ///
     /// What it costs: one fdatasync per piece, of 256 KiB to 4 MiB, at the
-    /// rate a playback downloads. That used to be paid on librqbit's
-    /// completion path with the waiting reader parked behind it -- 20 ms to
-    /// over a second on the Chromecast's eMMC under concurrent writes -- and
-    /// is paid here now, where nothing waits on it. The cached staged handle
+    /// rate a playback downloads -- paid here, off librqbit's completion
+    /// path, where nothing waits on it. Paid on that path instead, the
+    /// waiting reader parks behind it: 20 ms to over a second on the
+    /// Chromecast's eMMC under concurrent writes. The cached staged handle
     /// is the write handle when the piece was written through this store a
     /// moment ago; a piece whose handle had left the cache, or whose cached
     /// handle was a read's -- which Windows will not flush through -- is
@@ -1114,11 +1110,10 @@ impl Inner {
     /// librqbit has set its have-bit by now -- the completion returned `Ok`
     /// when the piece was queued -- and may have announced the piece, and
     /// there is no un-have to send. What this can still do is make the
-    /// failure what it was when the commit was synchronous: **fatal to the
-    /// torrent.** The error is kept and every later write and completion
-    /// librqbit asks of this store fails with it
+    /// failure **fatal to the torrent**: the error is kept and every later
+    /// write and completion librqbit asks of this store fails with it
     /// ([`Self::ensure_no_failed_commit`]), which librqbit treats exactly as
-    /// it treated a failed commit ("FATAL: error writing chunk to disk"): the
+    /// it does any failed write ("FATAL: error writing chunk to disk"): the
     /// torrent goes to Error, and a restart builds a fresh store whose
     /// `init` finds the piece staged and not complete, so the initial check
     /// does not claim it and it is downloaded again. `ENOSPC` recovery
@@ -1339,11 +1334,11 @@ impl Inner {
     /// it is therefore a hard error on the device and impossible to
     /// reproduce on any CI runner.
     ///
-    /// The 2026-09-12 field log is what that costs: one `EBADF` writing to
-    /// piece 5565 put the torrent into `torrent_error_state`, every later
-    /// request answered 502, and the session was over. A piece that goes
-    /// away is an ordinary thing here -- the reclaim's whole job -- and it
-    /// must cost the read or write that raced it, and nothing else.
+    /// Left unhandled, one such `EBADF` puts the torrent into
+    /// `torrent_error_state`, every later request answers 502, and the
+    /// session is over. A piece that goes away is an ordinary thing here --
+    /// the reclaim's whole job -- and it must cost the read or write that
+    /// raced it, and nothing else.
     ///
     /// Only the stale case retries: a real I/O error is returned at once,
     /// because reopening a failing disk twice tells nobody anything.
@@ -1535,9 +1530,9 @@ impl Inner {
     /// store holds the piece.** That is not a re-download, it is a shadow:
     /// a backend wrote a few chunks into a piece that was already finished
     /// (see `open_for_write` and `staged_over_held`), and served from it
-    /// every read hits EOF past those chunks or zeros between them. Field
-    /// log 2026-09-19, piece 4342: minutes of `reading 262144 bytes at N of
-    /// piece 4342` after the piece had been read whole. A legitimate
+    /// every read hits EOF past those chunks or zeros between them -- for
+    /// minutes at a time, well after the piece has already been read whole.
+    /// A legitimate
     /// re-download of a held piece -- one the initial check rejected, whose
     /// held bit was seeded from the disk before the check ran -- is only
     /// read by its own hash check, which runs once every chunk is written
@@ -1631,11 +1626,11 @@ impl Inner {
 /// ([`crate::chunk_store::CHUNKS_PER_DIRECTORY`]) and the staging suffix
 /// ([`crate::chunk_store::STAGING_SUFFIX`]) -- is
 /// [`crate::chunk_store::ChunkDir`]'s, shared with `/proxy`'s cache; what
-/// this type adds is the info hash and the have-set interlock. The `server`
-/// crate's cache cleaner used to walk the tree itself and unlink what it
-/// found, so the bucketing was written down in two crates at once: a change
-/// to it would have shown up over there as a silent accounting error rather
-/// than as a compile failure. Nothing walks it now.
+/// this type adds is the info hash and the have-set interlock. Nothing
+/// outside this module walks the tree or unlinks by path: a second place
+/// that knew the bucketing and the staging suffix by hand would turn a
+/// change to either into a silent accounting error somewhere else, rather
+/// than a compile failure here.
 ///
 /// What this type does *not* decide is which pieces may go. That is
 /// [`super::policy`]'s, and a caller that deletes a piece of a torrent the
@@ -1822,30 +1817,26 @@ impl StoreRoot {
         ChunkDir::new(self.torrent_dir(info_hash))
     }
 
-    /// Reclaim pieces by path, both copies of each -- **and nothing in
-    /// this process calls it any more.**
+    /// Reclaim pieces by path, both copies of each. `#[cfg(test)]` only,
+    /// and that is the interlock rather than a style choice: unlinking a
+    /// piece the backend still counts as held is the
+    /// advertise-then-serve-a-hole [`StoreRegistry::delete`] exists to
+    /// prevent, so nothing in this process calls it and a release build has
+    /// no unlink by path at all. A directory no store speaks for is the
+    /// boot sweep's, whole (see [`super::sweep`]).
     ///
-    /// It was the door for a hash no store is registered for: the cache
-    /// cleaner walked the root, found a directory no torrent in the session
-    /// claimed, and unlinked its pieces by name. Nothing walks the root now
-    /// and nothing outside a live store deletes a piece --
-    /// [`StoreRegistry::delete`] is where every reclaim in this process
-    /// ends, so that the store forgets its cached handle and clears its
-    /// held bit with the file. A directory no store speaks for is the boot
-    /// sweep's, whole.
-    ///
-    /// So it is kept for the tests that pin what an unlink loop owes its
-    /// caller -- both copies of a piece go together, a name the store never
-    /// wrote is never touched, and a piece the volume refuses does not
-    /// abandon the run -- which are the rules [`StoreRegistry::delete`]
-    /// runs by over the very same [`crate::chunk_store::ChunkDir`].
+    /// Kept for the tests that pin what an unlink loop owes its caller --
+    /// both copies of a piece go together, a name the store never wrote is
+    /// never touched, and a piece the volume refuses does not abandon the
+    /// run -- which are the same rules [`StoreRegistry::delete`] runs by
+    /// over the very same [`crate::chunk_store::ChunkDir`].
     ///
     /// Returns for how many pieces a file really left the disk -- **either
     /// copy**, not the complete one alone. A piece the caller was offered
     /// with only a staged copy (a torrent whose directory nothing ran `init`
     /// on this boot) occupies real blocks and gives them back when it goes,
-    /// and counting only the complete copy reported nothing freed while the
-    /// volume gained space.
+    /// and counting only the complete copy would report nothing freed while
+    /// the volume gained space.
     ///
     /// A piece with no file at all was not on the disk to leave it, and is
     /// not an error -- the caller asked for bytes back and there were none.
@@ -1855,19 +1846,13 @@ impl StoreRoot {
     /// the run, so a piece this leaves on the disk is one nothing will ever
     /// read, ever offer, or ever count as ours again -- and there is no
     /// retry a caller could make with an error, because the claim it would
-    /// need has been released by then. Returning at the first failure meant
-    /// the pieces after it stayed on a disk the caller had been told it
-    /// freed, and it threw away the count of the ones that had already gone:
-    /// `ENOSPC` recovery reads that number to decide whether a pass made
-    /// room, so booking zero for a delete that freed real blocks restarts
-    /// the torrents onto a disk nothing gained. What could not be unlinked
-    /// is logged where it happens.
-    /// `#[cfg(test)]`, and that is the interlock rather than a style
-    /// choice. Unlinking a piece the backend still counts as had is the
-    /// advertise-then-serve-a-hole this whole path exists to prevent; with
-    /// its last production caller gone, a door left open for one to come
-    /// back through is a door that will be used. A release build has no
-    /// unlink by path at all.
+    /// need has been released by then. Stopping at the first failure would
+    /// leave the pieces after it on a disk the caller had been told was
+    /// freed, and would throw away the count of the ones that had already
+    /// gone: `ENOSPC` recovery reads that number to decide whether a pass
+    /// made room, so booking zero for a delete that freed real blocks
+    /// restarts the torrents onto a disk nothing gained. What could not be
+    /// unlinked is logged where it happens.
     #[cfg(test)]
     pub(crate) fn delete_pieces(
         &self,
@@ -2210,7 +2195,7 @@ impl StorageFactory for PieceStoreFactory {
         Ok(())
     }
 
-    /// Yes, and only because this is now the session's *default* factory
+    /// Yes, because this is the session's *default* factory
     /// (`LibrqbitBackend::open_session`). It is a different promise from
     /// [`Self::ensure_can_release_pieces`] above, which is about the layout
     /// alone: this one asks whether a **restart** finds the data again, and
@@ -2223,10 +2208,10 @@ impl StorageFactory for PieceStoreFactory {
     /// process builds a factory over the same directory and finds the same
     /// pieces under the same info hash.
     ///
-    /// While this was not the default it was a bail naming this factory,
-    /// deliberately -- promising persistability then would have had a
-    /// persistent session accept an add whose data the next restart would
-    /// look for on the filesystem factory and not find.
+    /// Naming a factory that is not the default here would be a lie a
+    /// persistent session collects on: it would accept an add whose data
+    /// the next restart looks for on the filesystem factory instead, and
+    /// does not find.
     fn ensure_persistable(&self) -> anyhow::Result<()> {
         Ok(())
     }
@@ -2841,9 +2826,7 @@ mod tests {
     /// the seed reports it, the delete that follows calls `remove_file` on
     /// a directory, which fails with `EISDIR`. That is not `NotFound`, so
     /// the whole run of pieces is abandoned at it: every later piece in the
-    /// run stays on a disk the caller has been told it freed. The hot
-    /// listing the pass used to take answered under this rule before the
-    /// seed replaced it.
+    /// run stays on a disk the caller has been told it freed.
     #[test]
     fn a_directory_wearing_a_pieces_name_is_never_offered_as_one() {
         const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -3163,12 +3146,10 @@ mod tests {
         assert_eq!(buf.to_vec(), again);
     }
 
-    /// The open count is the reason the handle cache exists: a piece is
-    /// written in 16 KiB chunks and streamed in 8 KiB reads, and each of
-    /// those used to be an open and a close -- two opens for a read, since
-    /// the staging name was probed first. Now a piece written end to end
-    /// and a piece streamed end to end are one open each, and a complete
-    /// piece's read never asks the filesystem about a staged copy.
+    /// The open count is the reason the handle cache exists (see
+    /// [`crate::chunk_store::OpenChunks`]): a piece written end to end and a
+    /// piece streamed end to end are one open each, and a complete piece's
+    /// read never asks the filesystem about a staged copy.
     #[test]
     fn a_piece_is_opened_once_to_write_and_once_to_stream() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3286,13 +3267,12 @@ mod tests {
 
     /// **The reader waiting on a piece is not parked behind its flush.**
     ///
-    /// The field log this is for had head pieces waiting 20 ms to over a
-    /// second between their last chunk and the reader's wake-up: the flush
-    /// of the staged copy ran inside `on_piece_completed`, and librqbit
-    /// sets the have-bit -- which is what wakes the reader -- only after
-    /// that returns. So the completion must return with the flush still on
-    /// the device, and the piece must read back whole from its staged copy
-    /// meanwhile.
+    /// Without this, head pieces wait 20 ms to over a second between their
+    /// last chunk and the reader's wake-up: the flush of the staged copy
+    /// runs inside `on_piece_completed`, and librqbit sets the have-bit --
+    /// which is what wakes the reader -- only after that returns. So the
+    /// completion must return with the flush still on the device, and the
+    /// piece must read back whole from its staged copy meanwhile.
     ///
     /// It is held from the completion on -- the retention pass reads a
     /// reader's lookahead off the held set. But the durable record must not
@@ -3410,12 +3390,11 @@ mod tests {
 
     /// **A flush that fails after the completion returned is fatal, one
     /// write later.** librqbit has the have-bit by then and there is no
-    /// un-have; what is left is to fail the torrent the way the synchronous
-    /// commit did, at the next thing librqbit asks of the store, and with
-    /// the error's kind intact -- `ENOSPC` recovery recognises a full disk
-    /// by it. The staged bytes go: after a failed flush the page cache no
-    /// longer vouches for them, and a read must fail rather than risk
-    /// zeros.
+    /// un-have; what is left is to fail the torrent at the next thing
+    /// librqbit asks of the store, with the error's kind intact --
+    /// `ENOSPC` recovery recognises a full disk by it. The staged bytes go:
+    /// after a failed flush the page cache no longer vouches for them, and
+    /// a read must fail rather than risk zeros.
     #[test]
     fn a_flush_that_fails_after_the_completion_is_raised_at_the_next_write() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3659,11 +3638,11 @@ mod tests {
     ///
     /// This cannot be provoked through the filesystem from a test: on every
     /// CI runner an unlinked file stays readable through an open descriptor,
-    /// which is exactly why the failure reached a phone and not a build.
-    /// Android's FUSE-mediated `/storage/emulated` answers `EBADF` instead,
-    /// and on 2026-09-12 one of those -- writing to piece 5565, which a
-    /// retention pass had taken -- put the torrent into `torrent_error_state`
-    /// and ended the session. So the retry is driven here directly.
+    /// which is exactly why the failure reaches a phone and not a build.
+    /// Android's FUSE-mediated `/storage/emulated` answers `EBADF` instead
+    /// when a write races a retention reclaim of the same piece, which,
+    /// unhandled, puts the torrent into `torrent_error_state` and ends the
+    /// session. So the retry is driven here directly.
     #[test]
     fn a_stale_handle_is_thrown_away_and_the_io_done_again() {
         let opens = std::cell::Cell::new(0);
@@ -4066,8 +4045,7 @@ mod tests {
     /// A rename that fails takes the bit back: the bit was set when the
     /// piece was accepted, and a bit standing over a rename that will never
     /// land is a piece a pass would go on committing and announcing. The
-    /// failure itself is fatal to the store, one call later, as it was to
-    /// the torrent when the commit was synchronous.
+    /// failure itself is fatal to the store, one call later.
     #[test]
     fn a_rename_that_fails_takes_the_bit_back_and_fails_the_store() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4282,10 +4260,8 @@ mod tests {
     /// has to know -- which copy of a piece is newest, which files are
     /// already gone -- it knows because it is looking at the same state,
     /// and the same is true the other way round: an event on either handle
-    /// is the same event to both. The first version copied that state into
-    /// the successor, and a completion landing on the old handle between
-    /// the copy and librqbit swapping the box was a piece the store held
-    /// and never knew it held.
+    /// is the same event to both (see [`PieceStore`]'s type docs for why
+    /// this is shared rather than copied).
     #[test]
     fn taking_the_storage_moves_the_data_path_and_keeps_the_paths() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4394,8 +4370,9 @@ mod tests {
     /// room holds a long run, so a scrub back lands inside it; a cache
     /// under pressure holds a short one, so the same scrub lands outside
     /// and is a new consumer that has to be fetched for. Self-scaling in
-    /// the direction that makes bigger disks behave better, which none of
-    /// the byte-distance rules that preceded it did.
+    /// the direction that makes bigger disks behave better -- see
+    /// `docs/design/read-pattern-retention.md` for why a fixed byte
+    /// distance is not it.
     #[test]
     fn a_run_is_bounded_by_the_holes_around_it_and_by_the_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4445,17 +4422,12 @@ mod tests {
     /// only signal one of them has.**
     ///
     /// The two copies of a piece exist together in exactly one legitimate
-    /// case: one the policy dropped, being fetched again before its old file
-    /// is unlinked -- and the drop clears the held bit before the re-fetch
-    /// begins. Held *and* freshly staged is a backend writing where it was
-    /// told the piece was finished.
-    ///
-    /// It matters because the damage has a silent half. The same bug in
-    /// librqbit served reads past the end of the new staged file, which a
-    /// field log shows as `reading N bytes at X of piece P`; where the
-    /// staged file was sparse it served ZEROS out of the hole, which is
-    /// indistinguishable from media that happens to be quiet and appears in
-    /// no log at all. This count is what tells the two runs apart.
+    /// case (see [`PieceStore::open_for_write`]), so held *and* freshly
+    /// staged means a backend wrote where it was told the piece was
+    /// finished -- silently: such a staged file can read back past its end,
+    /// or return zeros out of a sparse hole indistinguishable from media
+    /// that happens to be quiet, with nothing in any log. This count is the
+    /// only signal that case has.
     #[test]
     fn a_staged_copy_over_a_held_piece_is_counted() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4484,9 +4456,9 @@ mod tests {
     /// **A short staged copy over a held piece is passed over for reads.**
     ///
     /// A backend that writes a chunk into a finished piece opens a staged
-    /// copy over it, and before this every read of that piece was served
-    /// the staged copy: EOF past its bytes, zeros between them. Field log
-    /// 2026-09-19, piece 4342. The complete copy is the one to read.
+    /// copy over it; served instead of the complete copy, every read of
+    /// that piece would hit EOF past its bytes, or zeros between them. The
+    /// complete copy is the one to read.
     #[test]
     fn a_short_staged_copy_over_a_held_piece_is_not_read() {
         let tmp = tempfile::tempdir().unwrap();

@@ -236,7 +236,7 @@ pub fn resolve_file_idx(
         .ok_or_else(|| "No playable file found".to_string())
 }
 
-/// Both live in `enginefs::engine` now, next to `guess_file_index_in` and
+/// Both live in `enginefs::engine`, next to `guess_file_index_in` and
 /// [`enginefs::engine::FileChoice`]: an add resolves which file a create
 /// request means, and it cannot call back up into the server to ask.
 pub use enginefs::engine::{file_matches_filter, is_video_name};

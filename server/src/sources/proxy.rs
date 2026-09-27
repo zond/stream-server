@@ -84,12 +84,11 @@ impl From<FetchFailure> for ProxySourceError {
 
 /// **Where a source's request headers come from.**
 ///
-/// A source built before this existed took a `BTreeMap` and nothing else,
-/// which is [`Self::Caller`] -- and which cannot hold a credential that
-/// expires, since the map is fixed at construction and a film is longer
-/// than an access token. [`Self::Own`] is the other half the design asked
-/// for (`docs/design/translated-sources.md`: "a `ProxySource` with a header
-/// supplier that refreshes").
+/// [`Self::Caller`] is a fixed `BTreeMap` -- it cannot hold a credential
+/// that expires, since the map is fixed at construction and a film is
+/// longer than an access token. [`Self::Own`] is the other half the design
+/// asked for (`docs/design/translated-sources.md`: "a `ProxySource` with a
+/// header supplier that refreshes").
 #[derive(Clone)]
 pub(crate) enum Credentials {
     /// The `h=` overrides **the caller named**, relayed to the origin
@@ -1118,9 +1117,8 @@ mod tests {
         );
         assert_eq!(origin.asked(), after_first + 1, "one request for the seek");
 
-        // And backwards, which is the seek an HTTP reader could not make
-        // at all before this: one request at the new offset, not a read
-        // through everything between it and where the reader was.
+        // And backwards: one request at the new offset, not a read through
+        // everything between it and where the reader was.
         let back = origin.asked();
         assert_eq!(reader.seek(io::SeekFrom::Start(8)).await.unwrap(), 8);
         let mut early = [0u8; 8];

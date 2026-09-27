@@ -1,18 +1,14 @@
 //! The cache's figures, and the one call that gives its slack back.
 //!
 //! **There is no cleaner here any more, and the module keeps the name it
-//! was given.** What it held was a filesystem watch, a debounce, a walk of
-//! the torrent-data root, an age rule, a size rule and a tier order -- a
-//! second owner of every byte under that root, choosing victims from a
-//! reading of the disk that was minutes old by the time it acted on it.
-//! Every byte now has exactly one owner that knows whether anybody wants
-//! it: the torrent engine's retention passes and the proxy cache's, which
-//! delete what nobody is playing and nobody is reading at the tick, at a
-//! switch, on the bell and at boot. So "clean" is no longer a choice of
-//! victims but a request to those owners for their slack
-//! ([`drop_slack`]), and the figures a client reads
-//! ([`usage`]) come from what the owners say they hold rather than from a
-//! walk of what is there.
+//! was given.** Every byte under the torrent-data root has exactly one
+//! owner that knows whether anybody wants it: the torrent engine's
+//! retention passes and the proxy cache's, which delete what nobody is
+//! playing and nobody is reading at the tick, at a switch, on the bell and
+//! at boot. So "clean" is a request to those owners for their slack
+//! ([`drop_slack`]), not a choice of victims, and the figures a client
+//! reads ([`usage`]) come from what the owners say they hold rather than
+//! from a walk of what is there.
 //!
 //! What is left is therefore the wire types ([`CacheUsage`],
 //! [`EvictionReport`]) and the two functions behind
@@ -24,15 +20,11 @@ use crate::state::AppState;
 /// Give back everything nobody is playing and nobody is reading, now, and
 /// report what is left -- what `ServerHandle::clean_cache_now` answers.
 ///
-/// **"Clean" is no longer a choice of victims.** It used to be a walk of
-/// the root that sorted what it found by age and size and evicted until it
-/// was under the cap, which meant a user pressing "clean now" could lose
-/// the film they were about to resume while a stale one survived on a
-/// tie-break. Every byte under the root now has an owner that knows
-/// whether anybody wants it, so this asks both of them for their slack --
-/// the same passes the tick and the switch run -- and nothing else is
-/// touched: a pin is kept until it is unpinned, and the window of the one
-/// entity being played is kept until something else is.
+/// **A clean is a request to the owners for their slack, not a choice of
+/// victims** (see the module doc for why). This asks both of them for
+/// their slack -- the same passes the tick and the switch run -- and
+/// nothing else is touched: a pin is kept until it is unpinned, and the
+/// window of the one entity being played is kept until something else is.
 ///
 /// So a clean that frees nothing is the ordinary answer on a device with
 /// one film playing and one pinned, and [`EvictionReport::over_limit`] is
@@ -78,9 +70,9 @@ pub(crate) async fn drop_slack(state: &AppState) -> EvictionReport {
 /// store speaks for -- a torrent held in Error, a directory a previous
 /// process left -- plus a `stat` of each staged (`.part`) copy a registered
 /// store has, because its held bits price complete pieces only. On the
-/// device this exists for that is a handful of syscalls where it used to be
-/// a `statx` of sixteen thousand files, and the answer is current rather
-/// than as old as the walk that produced it.
+/// device this exists for that is a handful of syscalls against sixteen
+/// thousand files, and the answer is current rather than as old as a walk
+/// would be.
 ///
 /// What it does not count is a **legacy whole-file download** left by an
 /// earlier version of this server, which lives beside the store
@@ -179,7 +171,7 @@ pub struct CacheUsage {
     pub total_bytes: u64,
     /// The limit actually enforced, in the same accounting: the smaller of
     /// `settings.cacheSize` and what the volume can give while keeping
-    /// [`crate::cache_budget::CACHE_FREE_SPACE_FLOOR`] free. `None` only
+    /// [`enginefs::CACHE_FREE_SPACE_FLOOR`] free. `None` only
     /// when neither caps anything -- `cacheSize` unlimited (JSON `null`)
     /// *and* the volume's free space unreadable.
     pub limit_bytes: Option<u64>,
@@ -227,7 +219,7 @@ pub struct EvictionReport {
     pub deleted: usize,
     /// The limit in force when this answered: the smaller of
     /// `settings.cacheSize` and what the volume could give while keeping
-    /// [`crate::cache_budget::CACHE_FREE_SPACE_FLOOR`] free, so on a device
+    /// [`enginefs::CACHE_FREE_SPACE_FLOOR`] free, so on a device
     /// with no `cacheSize` set this is still a number. Worked out over
     /// [`Self::total`], which is not quite the cap the owners are sized
     /// against (see `drop_slack`). `None` only when neither caps

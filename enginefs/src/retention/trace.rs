@@ -1,22 +1,16 @@
 //! **The retention trace: what a pass decided and why, in the log, under
 //! a setting.**
 //!
-//! A phone opened a 4K film and fetched 1.6 GB to play about a hundred
-//! megabytes. Four causes were fixed -- a tail probe claiming the playhead,
-//! a probe's window ordering a forward reach of fetch, a window sized under
-//! an open stream's lookahead, and a committed half sized from the disk
-//! rather than from the time it buys -- and every one of them was worked
-//! out afterwards, from piece counts, because nothing in the log said what
-//! a pass was deciding or why. This is what says it: one line per entity
-//! per ten seconds, a line per file on what its reads look like, the
-//! budget in force when it is published, and an immediate line for the one
-//! event that should never happen. Five field logs on the claim rules were
-//! read by these lines.
+//! Piece counts alone do not say what a pass was deciding or why; this
+//! line-per-entity trace does -- one line per entity per ten seconds, a
+//! line per file on what its reads look like, the budget in force when it
+//! is published, and an immediate line for the one event that should never
+//! happen. A phone opened a 4K film and fetched 1.6 GB to play about a
+//! hundred megabytes before these lines existed to explain why.
 //!
-//! It was written as temporary, to be deleted once a field log showed the
-//! fixes holding. That log exists (2026-09-15), and the lines stayed
-//! useful every time something else went wrong; so instead of going they
-//! are gated. Everything here logs at INFO on the `enginefs::retention::trace`
+//! Gated rather than removed, because the lines stay useful whenever
+//! something else goes wrong. Everything here logs at INFO on the
+//! `enginefs::retention::trace`
 //! target, and the server's log filter carries that target at `off` unless
 //! the `diagnosticsTrace` setting turns it on
 //! (`stream_server::diagnostics::logging::set_diagnostics_trace`), at which
