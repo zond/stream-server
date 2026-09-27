@@ -55,8 +55,14 @@ fn sweep(seen: &mut HashMap<String, Was>, now: Instant) {
 
 /// What the backing can say that the owner cannot; `None` for a backing
 /// that counts none of it (the proxy).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Backing {
+    /// What the owner's key is a key *within*, for a key that does not name
+    /// its entity on its own: a torrent's key is a file index, and file 0
+    /// of every torrent is one key. The trace lines -- and [`pass`]'s
+    /// interval and deltas -- are keyed by this and the key together, so two
+    /// torrents' counters are never subtracted from each other.
+    pub entity: Option<String>,
     /// Bytes this torrent has received from peers, ever.
     pub fetched: u64,
     /// Of those, the bytes that verified and were kept.
@@ -115,17 +121,25 @@ struct Was {
 static SEEN: LazyLock<parking_lot::Mutex<HashMap<String, Was>>> =
     LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
-/// One line for one pass over `key`, at most one per [`INTERVAL`].
-pub fn pass<K: Debug>(key: &K, sample: Pass<'_>) {
-    let name = format!("{key:?}");
+/// The name the trace lines give the entity the owner keys `key`: the key
+/// alone, or within the entity the backing names ([`Backing::entity`]).
+pub fn name<K: Debug>(key: &K, backing: Option<&Backing>) -> String {
+    match backing.and_then(|backing| backing.entity.as_deref()) {
+        Some(entity) => format!("{entity}/{key:?}"),
+        None => format!("{key:?}"),
+    }
+}
+
+/// One line for one pass over the entity called `name` ([`name`]), at most
+/// one per [`INTERVAL`] as of `now` -- the pass's own clock, never read here.
+pub fn pass(name: &str, now: Instant, sample: Pass<'_>) {
     let held = sample.held_behind + sample.held_ahead;
-    let now = Instant::now();
     let (fetched, verified) = sample
         .backing
         .map_or((0, 0), |backing| (backing.fetched, backing.verified));
     let over = {
         let mut seen = SEEN.lock();
-        match seen.get(&name) {
+        match seen.get(name) {
             Some(was) if now.duration_since(was.at) < INTERVAL => return,
             was => {
                 let over = was.map(|was| {
@@ -137,7 +151,7 @@ pub fn pass<K: Debug>(key: &K, sample: Pass<'_>) {
                 });
                 sweep(&mut seen, now);
                 seen.insert(
-                    name.clone(),
+                    name.to_string(),
                     Was {
                         at: now,
                         fetched,
@@ -194,15 +208,15 @@ pub fn pass<K: Debug>(key: &K, sample: Pass<'_>) {
 /// follows. Read the two together or not at all.
 ///
 /// [`Door::refuses`]: super::owner::Door::refuses
-pub fn planned_to_reclaim_inside_a_lookahead<K: Debug>(
-    key: &K,
+pub fn planned_to_reclaim_inside_a_lookahead(
+    name: &str,
     pieces: &[u32],
     reader: Range<u32>,
     lookahead_bytes: u64,
 ) {
     tracing::info!(
         target: "enginefs::retention::trace",
-        key = ?key,
+        key = %name,
         pieces = ?pieces,
         reader_start = reader.start,
         reader_end = reader.end,
@@ -246,7 +260,8 @@ pub struct StreamsSeen<'a> {
     pub sample: Option<(u64, Duration)>,
     /// What each stream has measured its consumer to be eating.
     pub rates: &'a [Option<u64>],
-    /// What the replacement policy would order, which nothing obeys.
+    /// What the detector's consumers are asking for, in pieces: the
+    /// want-windows the pass keeps and fetches.
     pub want: &'a [std::ops::Range<u32>],
     /// What this entity was allowed to hold when that was sized: what it
     /// holds now plus the volume's headroom. Without it a narrow want set
@@ -345,5 +360,25 @@ mod tests {
         sweep(&mut seen, now);
         assert_eq!(seen.len(), 1, "the stale entity stayed: {:?}", seen.keys());
         assert!(seen.contains_key("fresh"));
+    }
+
+    /// File 0 of one torrent and file 0 of another are two entities: the
+    /// name the lines, the interval and the deltas are keyed by carries the
+    /// torrent, and a backing that names none is keyed by its key alone.
+    #[test]
+    fn a_key_is_named_within_the_entity_its_backing_names() {
+        let backing = |entity: &str| Backing {
+            entity: Some(entity.to_string()),
+            fetched: 0,
+            verified: 0,
+            refused: 0,
+            piece_length: 1,
+            staged_over_held: 0,
+        };
+        let first = name(&0usize, Some(&backing("aaaa")));
+        let second = name(&0usize, Some(&backing("bbbb")));
+        assert_ne!(first, second);
+        assert_eq!(first, "aaaa/0");
+        assert_eq!(name(&0usize, None), "0");
     }
 }

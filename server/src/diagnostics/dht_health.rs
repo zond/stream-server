@@ -35,7 +35,7 @@
 //! their own level in `DEFAULT_LOG_FILTER` (`crate::DEFAULT_LOG_FILTER`),
 //! since this is now the thing that reports the state.
 //!
-//! The same state is served to clients as `dht` on `/stats.json` and as
+//! The same state is served to clients as
 //! [`crate::ServerHandle::dht_status`], so a client can say "DHT unavailable,
 //! using trackers only" rather than pretending peer discovery is healthy.
 

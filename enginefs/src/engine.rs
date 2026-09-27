@@ -976,6 +976,7 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
     ) -> Option<crate::retention::trace::Backing> {
         let transfer = self.handle.transfer_totals()?;
         Some(crate::retention::trace::Backing {
+            entity: Some(self.info_hash.clone()),
             fetched: transfer.fetched,
             verified: transfer.verified,
             refused: self.refused.load(Ordering::Relaxed),
@@ -1290,9 +1291,10 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
                 );
                 break;
             }
-            // **Asked piece by piece at the door**, which is a load and a
-            // bit test rather than a lock: what may not go is published as
-            // one bit per piece (`crate::retention::exempt`). A pinned
+            // **Asked piece by piece at the door**: after the door's `shut`
+            // (a pin read, asked again per piece), a load and a bit test
+            // rather than an owner lock, since what may not go is published
+            // as one bit per piece (`crate::retention::exempt`). A pinned
             // neighbour's span is the other half, and it is a listing away
             // rather than a bit, so it stays a range check.
             let mut parts: Vec<Range<u32>> = Vec::new();
@@ -1713,18 +1715,14 @@ impl<H: TorrentHandle> Engine<H> {
     /// playback is measured at the floor too, so the gate and the ladder
     /// agree about it.
     pub async fn held_stopped_for_space(&self) -> bool {
-        let run_state = self.handle.run_state();
-        matches!(run_state, crate::backend::RunState::Paused)
-            && crate::reconcile::volume_is_short(
-                crate::reconcile::line(
-                    crate::reconcile::Trigger::Timer,
-                    run_state,
-                    self.volumes.floor(),
-                ),
-                self.handle.has_metadata().await,
-                self.handle.is_finished().await,
-                self.volumes.available(),
+        self.stopped_for_space_below(|run_state| {
+            crate::reconcile::line(
+                crate::reconcile::Trigger::Timer,
+                run_state,
+                self.volumes.floor(),
             )
+        })
+        .await
     }
 
     /// Whether this torrent is stopped, and stopped because the volume it
@@ -1772,10 +1770,20 @@ impl<H: TorrentHandle> Engine<H> {
     /// number that moves on the scale of seconds. `false` for a volume nothing has probed yet
     /// -- unknown is not full.
     pub async fn is_stopped_for_space(&self) -> bool {
+        self.stopped_for_space_below(|_| self.volumes.floor()).await
+    }
+
+    /// The one shape of both questions above: stopped, and the volume short
+    /// of the line `line` draws for the run state it was stopped in (the
+    /// floor itself, or the reconciler's hysteresis line).
+    async fn stopped_for_space_below(
+        &self,
+        line: impl FnOnce(crate::backend::RunState) -> u64,
+    ) -> bool {
         let run_state = self.handle.run_state();
         matches!(run_state, crate::backend::RunState::Paused)
             && crate::reconcile::volume_is_short(
-                self.volumes.floor(),
+                line(run_state),
                 self.handle.has_metadata().await,
                 self.handle.is_finished().await,
                 self.volumes.available(),
@@ -1835,7 +1843,6 @@ impl<H: TorrentHandle> Engine<H> {
         }
     }
 
-    /// A fresh id for a reader that will register wakers.
     /// Whether a blocked-read probe line for `piece` of `file_idx` may go
     /// out now: one per piece per second, whatever the number of reads
     /// parked on it. Entries older than a minute are dropped on the way.
@@ -1852,6 +1859,7 @@ impl<H: TorrentHandle> Engine<H> {
         }
     }
 
+    /// A fresh id for a reader that will register wakers.
     pub(crate) fn next_reader_id(&self) -> u64 {
         self.next_reader_id.fetch_add(1, Ordering::Relaxed)
     }
@@ -2467,13 +2475,6 @@ impl<H: TorrentHandle> Engine<H> {
             .store(self.clock.now_secs(), Ordering::SeqCst);
     }
 
-    pub fn find_file_by_regex(&self, regex_str: &str) -> Option<usize> {
-        let _re = Regex::new(regex_str).ok()?;
-        // This is tricky now as find_file_by_regex was librqbit specific.
-        // For now, we'll assume we can list files.
-        None
-    }
-
     pub async fn guess_file_index(
         &self,
         series_info: Option<&crate::engine::SeriesInfo>,
@@ -2573,11 +2574,7 @@ impl<H: TorrentHandle> Engine<H> {
         let length = files[file_idx].length;
         let name = files[file_idx].name.clone();
 
-        if !self.handle.manages_playback_lifecycle()
-            && priority != 255
-            && start_offset == 0
-            && matches!(intent, Fetching::Streaming)
-        {
+        if priority != 255 && start_offset == 0 && matches!(intent, Fetching::Streaming) {
             let prepare_start = Instant::now();
             match self.handle.prepare_file_for_streaming(file_idx).await {
                 Ok(()) => tracing::info!(
@@ -2669,7 +2666,7 @@ impl<H: TorrentHandle> Engine<H> {
         let reader_start = Instant::now();
         let stream = self
             .handle
-            .get_file_reader(file_idx, start_offset, priority, None, lookahead_bytes)
+            .get_file_reader(file_idx, start_offset, lookahead_bytes)
             .await
             .context("get_file_reader")?;
         tracing::debug!(
@@ -2729,10 +2726,6 @@ mod pin_tests {
             None
         }
 
-        async fn add_trackers(&self, _trackers: Vec<String>) -> anyhow::Result<()> {
-            Ok(())
-        }
-
         fn run_state(&self) -> RunState {
             RunState::Live
         }
@@ -2741,8 +2734,6 @@ mod pin_tests {
             &self,
             _file_idx: usize,
             _start_offset: u64,
-            _priority: u8,
-            _bitrate: Option<u64>,
             _lookahead_bytes: u64,
         ) -> anyhow::Result<Box<dyn FileStreamTrait>> {
             anyhow::bail!("nothing here is read")

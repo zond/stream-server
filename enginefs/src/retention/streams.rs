@@ -210,9 +210,8 @@ impl Stream {
     ///
     /// Without a ceiling -- an entity whose length nobody has stated, which
     /// is a proxied URL -- there is no picture to compare against and the
-    /// delivery rate is all there is. That is the same choice the policy
-    /// this replaces makes: no duration, no time caps, byte arithmetic
-    /// alone.
+    /// delivery rate is all there is: no duration, no time caps, byte
+    /// arithmetic alone.
     ///
     /// **What it ate, not what we sent.** A player resumes where it stopped
     /// consuming, which is behind where we stopped sending by whatever sat
@@ -305,9 +304,7 @@ impl Stream {
     /// one measurement asked for would hand a consumer that read once -- a
     /// container index, a probe, anything that opens and closes -- a whole
     /// film's worth of lookahead off a single sample. That is not
-    /// hypothetical: it is the build that fetched 1.6 GB to play 100 MB,
-    /// and the reason the policy this replaces keeps a probe's window and
-    /// never wants it.
+    /// hypothetical: it is the build that fetched 1.6 GB to play 100 MB.
     ///
     /// Doubling costs the real consumer nothing. A grant is one step per
     /// pass of this file, not per read: a film reaches a 315 MB window
@@ -412,14 +409,7 @@ struct HeldRuns(Vec<Range<u32>>);
 
 impl HeldRuns {
     fn of(held: &BTreeSet<u32>) -> Self {
-        let mut runs: Vec<Range<u32>> = Vec::new();
-        for &piece in held {
-            match runs.last_mut() {
-                Some(run) if run.end == piece => run.end = piece.saturating_add(1),
-                _ => runs.push(piece..piece.saturating_add(1)),
-            }
-        }
-        Self(runs)
+        Self(crate::retention::sorted_runs(held.iter().copied()))
     }
 
     /// The maximal unbroken stretch of the listing containing `piece`,
@@ -750,27 +740,6 @@ const STREAM_DORMANT: std::time::Duration = std::time::Duration::from_secs(30);
 const PLAYHEAD_SMOOTHING_PIECE_SHARE: u64 = 8;
 
 impl FileStreams {
-    /// The pieces these streams want fetched ahead of them.
-    ///
-    /// **Shared as equal seconds, never as equal bytes.** Playback is gated
-    /// by the worst track: ninety seconds of subtitles buys nothing while
-    /// video has two, so the allocation that makes sense is the one that
-    /// maximises the minimum. Equal shares of the *bytes* does the opposite
-    /// -- ten megabytes split between a 3.5 MB/s film and a 20 kB/s second
-    /// track gives the film 1.4 seconds and the track four minutes.
-    ///
-    /// So a single `t` is solved for, such that every stream's rate times
-    /// `t` fits the budget, and each is granted `t` seconds. Scaling every
-    /// stream's byte target by one factor is the same arithmetic, since
-    /// bytes are rate times time; what must not happen is dividing the
-    /// budget into equal parts.
-    ///
-    /// Then each is floored at [`FLOOR_PIECES`] and grown towards its share
-    /// rather than jumped to it ([`Stream::grant`]). The floor is applied
-    /// after the share and not subtracted before it: two pieces on two
-    /// streams is sixteen megabytes, and a device with less free space than
-    /// that is not playing video, so it is not a case the allocation has to
-    /// be shaped around.
     /// What these streams would ask for over `seconds`, before anything is
     /// shared out -- the demand this file puts on the entity's allowance.
     fn asked(&self, seconds: u64, now: Instant) -> u64 {
@@ -1054,7 +1023,27 @@ impl Streams {
     }
 
     /// What every stream on every file of this entity wants fetched ahead
-    /// of it. See [`FileStreams::want`].
+    /// of it.
+    ///
+    /// **Shared as equal seconds, never as equal bytes.** Playback is gated
+    /// by the worst track: ninety seconds of subtitles buys nothing while
+    /// video has two, so the allocation that makes sense is the one that
+    /// maximises the minimum. Equal shares of the *bytes* does the opposite
+    /// -- ten megabytes split between a 3.5 MB/s film and a 20 kB/s second
+    /// track gives the film 1.4 seconds and the track four minutes.
+    ///
+    /// So a single `t` is solved for, such that every stream's rate times
+    /// `t` fits the budget, and each is granted `t` seconds. Scaling every
+    /// stream's byte target by one factor is the same arithmetic, since
+    /// bytes are rate times time; what must not happen is dividing the
+    /// budget into equal parts.
+    ///
+    /// Then each is floored at [`FLOOR_PIECES`] and grown towards its share
+    /// rather than jumped to it ([`Stream::grant`]). The floor is applied
+    /// after the share and not subtracted before it: two pieces on two
+    /// streams is sixteen megabytes, and a device with less free space than
+    /// that is not playing video, so it is not a case the allocation has to
+    /// be shaped around.
     pub fn want(
         &mut self,
         file: usize,
@@ -1139,17 +1128,6 @@ impl Streams {
             .map(|stream| stream.filling)
     }
 
-    /// What each stream on `file` has measured its consumer to be eating,
-    /// in bytes a second, or `None` for one that has not had two reads far
-    /// enough apart to say.
-    ///
-    /// Reported beside the raw `consumed`/`gap_ms` of the last sample, not
-    /// instead of them: at this seam a read is at most the 256 KiB the
-    /// response asks for, so a rate could be measuring the socket draining
-    /// while a player fills its buffer rather than the player consuming.
-    /// So nothing is ever sized from this alone: a window is sized from the
-    /// film's own arithmetic, which a measured rate may only lower
-    /// ([`Stream::demand`]).
     /// Every consumer of `file`, as the cache window needs to know it:
     /// where it is, what it has been eating, and whether it is still at
     /// it. See [`Reader`].
@@ -1171,6 +1149,17 @@ impl Streams {
             .unwrap_or_default()
     }
 
+    /// What each stream on `file` has measured its consumer to be eating,
+    /// in bytes a second, or `None` for one that has not had two reads far
+    /// enough apart to say.
+    ///
+    /// Reported beside the raw `consumed`/`gap_ms` of the last sample, not
+    /// instead of them: at this seam a read is at most the 256 KiB the
+    /// response asks for, so a rate could be measuring the socket draining
+    /// while a player fills its buffer rather than the player consuming.
+    /// So nothing is ever sized from this alone: a window is sized from the
+    /// film's own arithmetic, which a measured rate may only lower
+    /// ([`Stream::demand`]).
     pub fn rates(&self, file: usize) -> Vec<Option<u64>> {
         self.by_file
             .get(&file)

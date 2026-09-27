@@ -140,6 +140,9 @@ impl Ledger {
         exempt: impl Fn(u32) -> bool,
         want: usize,
     ) -> Vec<u32> {
+        if want == 0 {
+            return Vec::new();
+        }
         let mut candidates: Vec<(Duration, u32)> = self
             .by_piece
             .iter()
@@ -147,13 +150,16 @@ impl Ledger {
             .map(|(piece, used)| (used.age(now), *piece))
             .collect();
         // Oldest first, and a stable tie-break so two pieces of one age go
-        // in file order rather than in whatever order the map was walked.
-        candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        candidates
-            .into_iter()
-            .take(want)
-            .map(|(_, piece)| piece)
-            .collect()
+        // in file order rather than in whatever order the map was walked --
+        // a total order, so selecting the `want` first and sorting only
+        // those answers exactly what sorting everything would.
+        let order = |a: &(Duration, u32), b: &(Duration, u32)| b.0.cmp(&a.0).then(a.1.cmp(&b.1));
+        if candidates.len() > want {
+            candidates.select_nth_unstable_by(want - 1, order);
+            candidates.truncate(want);
+        }
+        candidates.sort_by(order);
+        candidates.into_iter().map(|(_, piece)| piece).collect()
     }
 
     /// How many pieces the ledger is tracking, for the trace line.

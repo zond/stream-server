@@ -1,9 +1,9 @@
 use crate::backend::dht_bootstrap::{self, BootstrapResolvers};
 use crate::backend::{
     BackendFileInfo, BtSettingEffect, BtSettingSupport, BtSettingsReport, DhtStatus,
-    DroppedFilePieces, EngineStats, FileStreamTrait, Footprint, Growler, LEAN_PEER_LIMIT,
-    PeerDiscovery, PeerSearch, RunState, Source, StartupPhase, StatsFile, StatsOptions, SwarmCap,
-    TorrentBackend, TorrentFilePriorityPlan, TorrentHandle, TorrentListenPort, TorrentPlacement,
+    DroppedFilePieces, EngineStats, FileStreamTrait, Footprint, LEAN_PEER_LIMIT, PeerDiscovery,
+    RunState, Source, StartupPhase, StatsFile, StatsOptions, TorrentBackend,
+    TorrentFilePriorityPlan, TorrentHandle, TorrentListenPort, TorrentPlacement,
     TorrentPrivacyConfig, TorrentProxyType, TorrentSource, TorrentSpeedProfile, TransferTotals,
 };
 use crate::scrape::SwarmScraper;
@@ -339,28 +339,19 @@ pub const TORRENT_ERROR_MESSAGE: &str = "the torrent is in an error state (its d
 
 /// Whether a torrent's error is the volume running out of space.
 ///
-/// The needles are not guesses. librqbit e314d8b writes payload through
-/// `nix::sys::uio::pwritev` (`storage/filesystem/opened_file.rs`), so on Linux
-/// and Android the cause in the chain is a `nix::errno::Errno`, **not** a
-/// `std::io::Error` -- downcasting to the latter would silently never match.
-/// `Errno`'s `Display` is nix's own static table (`ENOSPC => "No space left on
-/// device"`), rendered `"ENOSPC: No space left on device"`, which is verbatim
-/// what the field log that prompted this shows. Reproduced here by driving
-/// that exact call chain at `/dev/full` and printing the `{e:?}` librqbit
-/// stores in `TorrentStats.error`:
+/// The session's storage is the piece store, which writes payload through
+/// `std`'s positioned writes (`piece_store::store`'s `pwrite_all_at`:
+/// `write_all_at` on Unix, a `seek_write` loop on Windows), so the cause in
+/// the chain is a `std::io::Error`, and `std` decodes both `ENOSPC` and
+/// `ERROR_DISK_FULL` to `ErrorKind::StorageFull` -- that is the match, on
+/// every platform.
 ///
-/// ```text
-/// error writing to file 0 ("movie.mkv")
-///
-/// Caused by:
-///     0: error calling pwritev
-///     1: ENOSPC: No space left on device
-/// ```
-///
-/// Windows takes the `std::fs` path instead (`seek_write`), where the message
-/// is "There is not enough space on the disk." and shares no words with the
-/// unix one -- so that half is matched by kind, `ErrorKind::StorageFull`,
-/// which is what `std` decodes both `ENOSPC` and `ERROR_DISK_FULL` to.
+/// The text needle is for a chain that carries the cause as a message only:
+/// librqbit's own filesystem storage writes through `nix::sys::uio::pwritev`,
+/// whose `nix::errno::Errno` is no `std::io::Error` and renders as
+/// `"ENOSPC: No space left on device"` (a field log from before the piece
+/// store, reproduced at `/dev/full`), and anything else that turns an error
+/// into text before wrapping it would read the same.
 ///
 /// Anything else is a torrent problem, not a device problem, and must stay
 /// fatal: reclaiming space and restarting would be a loop.
@@ -551,7 +542,7 @@ impl SessionTuning {
             lsd: privacy.bt_enable_lsd,
             proxy_url: socks5_proxy_url(privacy),
             download_bps: download_bps(profile),
-            peer_limit: Some(profile.effective_connection_limits().1 as usize),
+            peer_limit: Some(profile.effective_connection_limits()),
             bind_device: bind_device_name(&privacy.bt_outgoing_interfaces),
         }
     }
@@ -737,7 +728,7 @@ pub fn bt_settings_support() -> &'static [BtSettingSupport] {
             setting: "btListenInterfaces",
             effect: NotHonoured,
             note: "the incoming listener is the launch configuration's TorrentListenPort \
-                   (42000-42010 for the binary, ephemeral when embedded), never this setting",
+                   (ServerConfig::torrent_listen_port), never this setting",
         },
         BtSettingSupport {
             setting: BT_OUTGOING_INTERFACES,
@@ -1073,45 +1064,22 @@ impl LibrqbitBackend {
             footprint: Footprint::Full,
             configured: session.peer_limit.unwrap_or(librqbit::DEFAULT_PEER_LIMIT),
         };
-        // Restore from session
-        let restored_handles = session.with_torrents(|iter| {
-            let mut map = HashMap::new();
-            for (_id, handle) in iter {
-                let info_hash = handle.info_hash().as_string();
-                map.insert(
-                    info_hash.clone(),
-                    LibrqbitHandle {
-                        handle: handle.clone(),
-                        info_hash,
-                        session: session.clone(),
-                        deferred_selections: deferred_selections.clone(),
-                        pinned_files: pinned_files.clone(),
-                        reported_errors: reported_errors.clone(),
-                        stream_positions: stream_positions.clone(),
-                        swarm_scraper: swarm_scraper.clone(),
-                    },
-                );
-            }
-            map
-        });
-
-        Ok((
-            Self {
-                session,
-                started_with,
-                dht_ever_bootstrapped: AtomicBool::new(false),
-                download_dir,
-                deferred_selections,
-                pinned_files,
-                reported_errors,
-                stream_positions,
-                swarm_scraper,
-                piece_reclaim,
-                caps: Mutex::new(caps),
-                store_registry,
-            },
-            restored_handles,
-        ))
+        let backend = Self {
+            session,
+            started_with,
+            dht_ever_bootstrapped: AtomicBool::new(false),
+            download_dir,
+            deferred_selections,
+            pinned_files,
+            reported_errors,
+            stream_positions,
+            swarm_scraper,
+            piece_reclaim,
+            caps: Mutex::new(caps),
+            store_registry,
+        };
+        let restored_handles = backend.restored_handles();
+        Ok((backend, restored_handles))
     }
 
     /// One attempt at `Session::new_with_opts` over the ports `listen_port`
@@ -1337,42 +1305,22 @@ impl LibrqbitBackend {
             footprint: Footprint::Full,
             configured: session.peer_limit.unwrap_or(librqbit::DEFAULT_PEER_LIMIT),
         };
-        let restored_handles = session.with_torrents(|iter| {
-            iter.map(|(_id, handle)| {
-                let info_hash = handle.info_hash().as_string();
-                (
-                    info_hash.clone(),
-                    LibrqbitHandle {
-                        handle: handle.clone(),
-                        info_hash,
-                        session: session.clone(),
-                        deferred_selections: deferred_selections.clone(),
-                        pinned_files: pinned_files.clone(),
-                        reported_errors: reported_errors.clone(),
-                        stream_positions: stream_positions.clone(),
-                        swarm_scraper: swarm_scraper.clone(),
-                    },
-                )
-            })
-            .collect()
-        });
-        Ok((
-            Self {
-                session,
-                started_with: SessionTuning::default(),
-                dht_ever_bootstrapped: AtomicBool::new(false),
-                download_dir,
-                deferred_selections,
-                pinned_files,
-                stream_positions,
-                reported_errors,
-                swarm_scraper,
-                piece_reclaim,
-                caps: Mutex::new(caps),
-                store_registry: opts.store_registry,
-            },
-            restored_handles,
-        ))
+        let backend = Self {
+            session,
+            started_with: SessionTuning::default(),
+            dht_ever_bootstrapped: AtomicBool::new(false),
+            download_dir,
+            deferred_selections,
+            pinned_files,
+            stream_positions,
+            reported_errors,
+            swarm_scraper,
+            piece_reclaim,
+            caps: Mutex::new(caps),
+            store_registry: opts.store_registry,
+        };
+        let restored_handles = backend.restored_handles();
+        Ok((backend, restored_handles))
     }
 }
 
@@ -1818,6 +1766,7 @@ impl Drop for ReleaseThenReselect {
     }
 }
 
+#[derive(Clone)]
 pub struct LibrqbitHandle {
     pub handle: Arc<ManagedTorrent>,
     pub info_hash: String,
@@ -1846,6 +1795,18 @@ pub struct LibrqbitHandle {
 /// arm extends the metainfo's announce list with `opts.trackers`). So the
 /// merged tracker list has to travel inside the URL, or a magnet add reaches
 /// librqbit tracker-less (DHT-only) and `stats().sources` comes back empty.
+///
+/// **And this is the only moment a torrent's trackers can be set.** librqbit
+/// has no API to add trackers to a torrent it already manages: the set lives
+/// in `ManagedTorrentShared::trackers`, a plain `HashSet<Url>` with no
+/// interior mutability, and `Session::make_peer_rx` hands
+/// `TrackerComms::start` a one-shot snapshot of it when the torrent goes
+/// live (`TrackerComms::add_tracker` is private startup plumbing). The only
+/// way to change them later is to remove and re-add the torrent, which would
+/// drop its peers and piece state mid-stream. So whichever request creates
+/// the engine supplies them (see `routes::compat::get_or_create_engine` in
+/// the server crate), a later request's extra trackers are not added, and
+/// `stats().sources` reports the set that was actually used.
 ///
 /// Appends one percent-encoded `tr=` per tracker not already in the URL
 /// (`Magnet::parse` collects every `tr` via `Url::query_pairs`, which
@@ -1936,10 +1897,20 @@ impl LibrqbitBackend {
         torrents.len()
     }
 
-    /// Wrap a librqbit handle as this backend's own. Only the tests build
-    /// one this way now: every production path gets its handle from the add
-    /// or from `get_torrent`.
-    #[cfg(test)]
+    /// Wrap a librqbit handle as this backend's own: the one place a
+    /// [`LibrqbitHandle`] is built, whether the torrent was restored, added
+    /// or looked up.
+    /// Every torrent the session restored, wrapped and keyed by info hash.
+    fn restored_handles(&self) -> HashMap<String, LibrqbitHandle> {
+        self.session.with_torrents(|iter| {
+            iter.map(|(_id, handle)| {
+                let handle = self.wrap(handle.clone());
+                (handle.info_hash.clone(), handle)
+            })
+            .collect()
+        })
+    }
+
     fn wrap(&self, handle: Arc<ManagedTorrent>) -> LibrqbitHandle {
         let info_hash = handle.info_hash().as_string();
         LibrqbitHandle {
@@ -2088,17 +2059,7 @@ impl TorrentBackend for LibrqbitBackend {
             apply_footprint(&handle, caps.footprint, caps.limit());
         }
 
-        let info_hash = handle.info_hash().as_string();
-        let handle = LibrqbitHandle {
-            handle,
-            info_hash,
-            session: self.session.clone(),
-            deferred_selections: self.deferred_selections.clone(),
-            pinned_files: self.pinned_files.clone(),
-            reported_errors: self.reported_errors.clone(),
-            stream_positions: self.stream_positions.clone(),
-            swarm_scraper: self.swarm_scraper.clone(),
-        };
+        let handle = self.wrap(handle);
         if added {
             handle.want_the_chosen_file(&placement).await;
         }
@@ -2108,17 +2069,7 @@ impl TorrentBackend for LibrqbitBackend {
     async fn get_torrent(&self, info_hash: &str) -> Option<Self::Handle> {
         let id = librqbit::api::TorrentIdOrHash::parse(info_hash).ok()?;
         let handle = self.session.get(id)?;
-        let info_hash = handle.info_hash().as_string();
-        Some(LibrqbitHandle {
-            handle,
-            info_hash,
-            session: self.session.clone(),
-            deferred_selections: self.deferred_selections.clone(),
-            pinned_files: self.pinned_files.clone(),
-            reported_errors: self.reported_errors.clone(),
-            stream_positions: self.stream_positions.clone(),
-            swarm_scraper: self.swarm_scraper.clone(),
-        })
+        Some(self.wrap(handle))
     }
 
     async fn remove_torrent(&self, info_hash: &str) -> Result<()> {
@@ -2138,6 +2089,13 @@ impl TorrentBackend for LibrqbitBackend {
         })
     }
 
+    /// The session's upload switch, which chokes every peer rather than
+    /// pausing anything, and wakes nobody when it is told what it already
+    /// says.
+    fn set_upload_enabled(&self, enabled: bool) {
+        self.session.set_upload_enabled(enabled);
+    }
+
     /// The per-torrent lever is librqbit's `ManagedTorrent::set_peer_limit`
     /// (the fork's runtime-adjustable live-peer cap: it hangs up on the
     /// surplus, least useful first, and re-queues the parked peers when the
@@ -2151,13 +2109,6 @@ impl TorrentBackend for LibrqbitBackend {
     /// Synchronous and cheap: atomics, one read lock per torrent, and a
     /// `Disconnect` message per surplus peer; the peers hang up on their
     /// own tasks afterwards. Nothing is awaited.
-    /// The session's upload switch, which chokes every peer rather than
-    /// pausing anything, and wakes nobody when it is told what it already
-    /// says.
-    fn set_upload_enabled(&self, enabled: bool) {
-        self.session.set_upload_enabled(enabled);
-    }
-
     fn set_footprint(&self, footprint: Footprint) {
         let mut caps = self.caps.lock();
         if caps.footprint == footprint {
@@ -2207,7 +2158,7 @@ impl TorrentBackend for LibrqbitBackend {
 #[async_trait::async_trait]
 impl TorrentHandle for LibrqbitHandle {
     fn info_hash(&self) -> String {
-        self.handle.info_hash().as_string()
+        self.info_hash.clone()
     }
 
     fn name(&self) -> Option<String> {
@@ -2442,7 +2393,7 @@ impl TorrentHandle for LibrqbitHandle {
 
         // server.js lists the torrent's peer sources here; we report the
         // tracker set the torrent was added with (fixed for its lifetime, see
-        // `add_trackers`) so clients can verify which trackers reached the
+        // `magnet_with_trackers`) so clients can verify which trackers reached the
         // engine. librqbit exposes no per-tracker announce bookkeeping, so the
         // counters stay 0 and `lastStarted` empty.
         let mut sources: Vec<Source> = self
@@ -2494,28 +2445,7 @@ impl TorrentHandle for LibrqbitHandle {
             in_flight_piece: None,
             files,
             sources,
-            opts: StatsOptions {
-                dht: true,
-                tracker: true,
-                path: "".to_string(),
-                growler: Growler {
-                    flood: 0,
-                    pulse: None,
-                },
-                peer_search: PeerSearch {
-                    max: 100,
-                    min: 10,
-                    sources: vec![],
-                },
-                swarm_cap: SwarmCap {
-                    max_speed: None,
-                    min_peers: None,
-                },
-                connections: None,
-                handshake_timeout: None,
-                timeout: None,
-                r#virtual: false,
-            },
+            opts: StatsOptions::reported(),
             download_speed,
             upload_speed,
             downloaded,
@@ -2578,25 +2508,6 @@ impl TorrentHandle for LibrqbitHandle {
         self.handle.metadata.load().is_some()
     }
 
-    /// Per-file completion from chunk-tracker have-bytes. `file_progress` is
-    /// empty while the torrent is still Initializing, in which case the file
-    /// is reported incomplete.
-    async fn is_file_complete(&self, file_idx: usize) -> bool {
-        let stats = self.handle.stats();
-        let Some(have) = stats.file_progress.get(file_idx).copied() else {
-            return false;
-        };
-        let Some(len) = self
-            .handle
-            .metadata
-            .load_full()
-            .and_then(|m| m.file_infos.get(file_idx).map(|fi| fi.len))
-        else {
-            return false;
-        };
-        have >= len
-    }
-
     /// Whether the backend stopped this torrent because the volume ran out
     /// of space, which the reconciler reads as a torrent to start again
     /// once the volume is over the resume line rather than as a dead one.
@@ -2623,8 +2534,8 @@ impl TorrentHandle for LibrqbitHandle {
     }
 
     /// librqbit's `ManagedTorrentState` (one `parking_lot` read through
-    /// `ManagedTorrent::with_state`, `torrent_state/mod.rs:317`), plus the
-    /// `paused` flag (`ManagedTorrent::is_paused`, `:662`) for the one
+    /// `ManagedTorrent::with_state`), plus the `paused` flag
+    /// (`ManagedTorrent::is_paused`) for the one
     /// variant that carries a pause intent. No stats rebuild, no per-file
     /// walk, no syscall.
     ///
@@ -2632,7 +2543,7 @@ impl TorrentHandle for LibrqbitHandle {
     /// it a bug state the outside world should never see, and normally it is
     /// invisible because every swap through it happens under one write guard
     /// -- except in `_start`'s `Paused` arm, which takes the state out and
-    /// then does `TorrentStateLive::new(..)?` (`mod.rs:610-612`), so a live
+    /// then does `TorrentStateLive::new(..)?`, so a live
     /// state that fails to build leaves the torrent empty for good. A torrent
     /// like that is neither running nor restartable, which is what `Gone`
     /// says; reporting it as `Live` would have a caller believe it is
@@ -2712,27 +2623,10 @@ impl TorrentHandle for LibrqbitHandle {
         self.session.unpause(&self.handle).await
     }
 
-    /// Deliberate no-op: librqbit (zond/rqbit `feat/configurable-stream-lookahead`)
-    /// has no API to add trackers to a torrent that is already managed. The
-    /// tracker set lives in `ManagedTorrentShared::trackers`, a plain
-    /// `HashSet<Url>` with no interior mutability, and `Session::make_peer_rx`
-    /// hands `TrackerComms::start` a one-shot snapshot of it when the torrent
-    /// goes live; `TrackerComms::add_tracker` is private startup plumbing. The
-    /// only way to change a torrent's trackers is to remove and re-add it,
-    /// which would drop its peers and piece state mid-stream. So trackers must
-    /// be supplied to `add_torrent` by whichever request creates the engine
-    /// (see `routes::compat::get_or_create_engine` in the server crate), and
-    /// `stats().sources` reports the set that was actually used.
-    async fn add_trackers(&self, _trackers: Vec<String>) -> Result<()> {
-        Ok(())
-    }
-
     async fn get_file_reader(
         &self,
         file_idx: usize,
         start_offset: u64,
-        _priority: u8,
-        _bitrate: Option<u64>,
         lookahead_bytes: u64,
     ) -> Result<Box<dyn FileStreamTrait>> {
         // Where the startup window is measured from now on, and how far
@@ -2764,6 +2658,12 @@ impl TorrentHandle for LibrqbitHandle {
             stream,
             _position: position,
         }))
+    }
+
+    /// Read off the metadata, rather than the default's walk building every
+    /// file's name only to count them: asked on every activation.
+    async fn file_count(&self) -> usize {
+        self.file_count_from_metadata().unwrap_or(0)
     }
 
     async fn get_files(&self) -> Vec<BackendFileInfo> {
@@ -3070,7 +2970,7 @@ impl TorrentHandle for LibrqbitHandle {
         self.apply_selection(
             SelectionOp::Reconcile {
                 active: plan.active_file,
-                hot: plan.hot_file.map(|h| h.file_idx),
+                hot: plan.hot_file,
             },
             file_count,
             "reconcile_file_priorities",
@@ -3423,21 +3323,6 @@ impl LibrqbitHandle {
                 );
                 false
             }
-        }
-    }
-}
-
-impl Clone for LibrqbitHandle {
-    fn clone(&self) -> Self {
-        Self {
-            handle: self.handle.clone(),
-            info_hash: self.info_hash.clone(),
-            session: self.session.clone(),
-            deferred_selections: self.deferred_selections.clone(),
-            pinned_files: self.pinned_files.clone(),
-            reported_errors: self.reported_errors.clone(),
-            stream_positions: self.stream_positions.clone(),
-            swarm_scraper: self.swarm_scraper.clone(),
         }
     }
 }
@@ -4204,15 +4089,14 @@ mod tests {
     /// This is the third librqbit shape, and the reason the ladder's first
     /// arm is where it is. `ManagedTorrent::pause` on an `Initializing`
     /// torrent sets the persisted flag and calls `request_pause()`;
-    /// `FileOps::initial_check` bails on that (`file_ops.rs:113`) and the
-    /// `Err` arm returns `Ok` without changing the state
-    /// (`torrent_state/mod.rs:590-593`), leaving the torrent
-    /// `Initializing` with no check running -- which
-    /// `wait_until_initialized` (`mod.rs:759`) polls for ever. Every
+    /// `FileOps::initial_check` bails on that and the check's continuation
+    /// leaves the state alone, so the torrent is `Initializing` with no
+    /// check running and nothing but an unpause to run it again. Every
     /// `/stream` request for that torrent goes through
-    /// `LibrqbitHandle::await_initialized`, so the visible symptom is a
-    /// player that never gets a first byte and a request that never
-    /// returns.
+    /// `LibrqbitHandle::await_initialized`, and
+    /// `ManagedTorrent::wait_until_initialized` refuses a waiter on that
+    /// pair -- it used to poll it for ever -- so the visible symptom is a
+    /// player that never gets its first byte.
     ///
     /// The volume here is full, so the free-space arm wants this torrent
     /// stopped and would make the call on any settled reading. It is the
@@ -4255,7 +4139,6 @@ mod tests {
         let mut efs = crate::BackendEngineFS::new_with_backend(
             backend,
             HashMap::from([(hash.clone(), handle.clone())]),
-            dir.join("cache"),
             dir.clone(),
         );
         efs.set_free_space_probe(move |_| Ok(probe.load(Ordering::SeqCst)));
@@ -4371,12 +4254,8 @@ mod tests {
             "and it came back stopped, exactly as it was left"
         );
 
-        let mut efs = crate::BackendEngineFS::new_with_backend(
-            backend,
-            restored,
-            dir.join("cache"),
-            dir.to_path_buf(),
-        );
+        let mut efs =
+            crate::BackendEngineFS::new_with_backend(backend, restored, dir.to_path_buf());
         efs.set_free_space_probe(|_| Ok(u64::MAX));
         efs.apply_pins(Some(crate::piece_store::PinSet::new()))
             .await;
@@ -4443,8 +4322,8 @@ mod tests {
 
     /// How far a torrent's initial check has got, or `None` once it is past
     /// initializing. `get_checked_bytes` is incremented by a whole piece as
-    /// each one is taken up, before it is read
-    /// (`crates/librqbit/src/file_ops.rs:120`), so over the whole-piece
+    /// each one is taken up, before it is read (`FileOps::initial_check`),
+    /// so over the whole-piece
     /// fixtures here it counts pieces exactly -- which is how these tests
     /// tell a check that stopped from one that ran on, with no sleeping.
     #[cfg(test)]
@@ -4515,13 +4394,13 @@ mod tests {
     /// guard on that fix: a rebase that lost it would fail here rather than
     /// in a field log.
     ///
-    /// At the pinned rev the shape is: `Session::unpause`
-    /// (`session.rs:1692`) reaches `start`, which writes the intent
-    /// (`torrent_state/mod.rs:867`) and then finds the initial check already
-    /// running and returns success having started nothing (`:763`). What
-    /// changed is the continuation: it now reads the intent off the guard
-    /// (`mod.rs:825`) rather than the `start_paused` captured a check ago,
-    /// so the unpause is honoured and this test asserts that it is.
+    /// At the pinned rev the shape is: `Session::unpause` reaches
+    /// `ManagedTorrent::start`, which writes the intent and then, in
+    /// `_start`'s `Initializing` arm, finds the initial check already
+    /// running and returns success having started nothing. What changed is
+    /// the continuation: it now reads the intent off the guard rather than
+    /// the `start_paused` captured a check ago, so the unpause is honoured
+    /// and this test asserts that it is.
     ///
     /// The last assertion is librqbit's own opinion rather than either of
     /// the two readings: it refuses to pause a torrent it considers paused,
@@ -4620,13 +4499,11 @@ mod tests {
     /// writing.
     ///
     /// `TorrentStateInitializing::check` still hands `pause_requested` to
-    /// `FileOps::initial_check` and to nothing else
-    /// (`torrent_state/initializing.rs:283`, read at `file_ops.rs:113`), and
+    /// `FileOps::initial_check` and to nothing else, and
     /// `validate_fastresume` still never reads it -- so the check returns
     /// `Ok` with the pause unseen. What the fix changed is what happens
-    /// next: the continuation applies the intent as it stands
-    /// (`torrent_state/mod.rs:825`) instead of the add-time `start_paused`,
-    /// and the torrent parks. Line refs are at the rev `Cargo.toml` pins.
+    /// next: the check's continuation in `_start` applies the intent as it
+    /// stands instead of the add-time `start_paused`, and the torrent parks.
     ///
     /// A restart is not decoration here. Fastresume needs a have-bitfield
     /// from a previous run, so the first session is what makes the second
@@ -4740,8 +4617,8 @@ mod tests {
     }
 
     /// Whether the session has written a have-bitfield yet
-    /// (`<info hash>.bitv` beside `session.json`, see
-    /// `crates/librqbit/src/session_persistence/json.rs:121`). Matched by
+    /// (`<info hash>.bitv` beside `session.json`, see librqbit's
+    /// `session_persistence::json`). Matched by
     /// extension rather than by name so nothing here depends on how librqbit
     /// formats an info hash.
     #[cfg(test)]
@@ -4756,15 +4633,15 @@ mod tests {
     }
 
     /// The third shape: a pause during a *full* check does stop it, and the
-    /// torrent is left `Initializing` rather than `Paused` -- a state
-    /// `wait_until_initialized` (`torrent_state/mod.rs:759`) polls forever.
-    /// `is_paused()` says "paused" for it, which is the one word that
-    /// suggests the very thing it is not: something a caller can start again
-    /// in one transition.
+    /// torrent is left `Initializing` rather than `Paused`, with no check
+    /// running -- a pair `ManagedTorrent::wait_until_initialized` refuses a
+    /// waiter on, since nothing but an unpause will move it. `is_paused()`
+    /// says "paused" for it, which is the one word that suggests the very
+    /// thing it is not: something a caller can start again in one
+    /// transition.
     ///
-    /// `FileOps::initial_check` bails on the request (`file_ops.rs:113`) and
-    /// the `Err` arm returns `Ok` without touching the state
-    /// (`torrent_state/mod.rs:590-593`).
+    /// `FileOps::initial_check` bails on the request and the check's
+    /// continuation leaves the state alone.
     ///
     /// A second torrent shares the gate and is *not* paused. It is the
     /// clock: nothing here waits on a duration, and "the paused torrent
@@ -5427,15 +5304,12 @@ mod tests {
         assert_eq!(file_progress_fields(100, 0), (0, 0.0));
     }
 
-    /// The classifier is fed the exact chain librqbit e314d8b builds, in the
-    /// exact shape `TorrentStats.error` renders it. The unix arm is text --
-    /// there is no `std::io::Error` in that chain at all, because the write
-    /// goes through `nix::sys::uio::pwritev` and the cause is a
-    /// `nix::errno::Errno` -- and the string below is what that `Errno`'s
-    /// `Display` produces, reproduced by driving the same call chain at
-    /// `/dev/full` and matching the field log verbatim. The Windows arm is
-    /// the kind, since `std`'s message there shares no words with the unix
-    /// one.
+    /// The classifier over both shapes a chain can carry the cause in: text
+    /// only -- the chain librqbit's own filesystem storage builds, whose
+    /// write goes through `nix::sys::uio::pwritev` and whose cause is a
+    /// `nix::errno::Errno`, matched verbatim to a field log -- and a
+    /// `std::io::Error` of kind `StorageFull`, which is what the piece
+    /// store's writes produce on every platform.
     #[test]
     fn out_of_space_is_told_apart_from_every_other_torrent_error() {
         let field_log = anyhow::anyhow!("ENOSPC: No space left on device")
@@ -5443,8 +5317,8 @@ mod tests {
             .context("error writing to file 0 (\"movie.mkv\")");
         assert!(is_out_of_space(&field_log));
 
-        // The same errno arriving as a `std::io::Error` -- the path Windows
-        // takes, and what any other caller in the chain would produce.
+        // The same errno arriving as a `std::io::Error` -- what the piece
+        // store's positioned writes produce, on Unix and Windows alike.
         let by_kind = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::StorageFull))
             .context("error writing to file 0");
         assert!(is_out_of_space(&by_kind));
@@ -5620,8 +5494,6 @@ mod tests {
             .get_file_reader(
                 0,
                 seek_to,
-                0,
-                None,
                 crate::backend::priorities::librqbit_stream_lookahead_bytes(
                     crate::backend::priorities::Fetching::Streaming,
                 ),
@@ -5681,8 +5553,6 @@ mod tests {
             .get_file_reader(
                 0,
                 0,
-                0,
-                None,
                 crate::backend::priorities::librqbit_stream_lookahead_bytes(
                     crate::backend::priorities::Fetching::Streaming,
                 ),
@@ -5706,8 +5576,6 @@ mod tests {
             .get_file_reader(
                 0,
                 payload_len - 1,
-                0,
-                None,
                 crate::backend::priorities::librqbit_stream_lookahead_bytes(
                     crate::backend::priorities::Fetching::Streaming,
                 ),
@@ -5746,12 +5614,9 @@ mod tests {
         let in_flight =
             |stats: EngineStats| stats.files[0].in_flight_piece.map(|piece| piece.index);
 
-        let head = handle
-            .get_file_reader(0, 0, 0, None, lookahead)
-            .await
-            .unwrap();
+        let head = handle.get_file_reader(0, 0, lookahead).await.unwrap();
         let tail = handle
-            .get_file_reader(0, payload_len - 1, 0, None, lookahead)
+            .get_file_reader(0, payload_len - 1, lookahead)
             .await
             .unwrap();
         assert_eq!(in_flight(TorrentHandle::stats(&handle).await), Some(2));
@@ -5799,8 +5664,6 @@ mod tests {
             .get_file_reader(
                 0,
                 0,
-                0,
-                None,
                 crate::backend::priorities::librqbit_stream_lookahead_bytes(
                     crate::backend::priorities::Fetching::Streaming,
                 ),
@@ -5871,8 +5734,6 @@ mod tests {
         assert!((stats.files[0].progress - 1.0).abs() < f64::EPSILON);
 
         assert!(TorrentHandle::is_finished(&handle).await);
-        assert!(handle.is_file_complete(0).await);
-        assert!(!handle.is_file_complete(1).await, "out-of-range file");
     }
 
     #[tokio::test]
@@ -5901,7 +5762,6 @@ mod tests {
         assert_eq!(stats.files[0].progress, 0.0);
 
         assert!(!TorrentHandle::is_finished(&handle).await);
-        assert!(!handle.is_file_complete(0).await);
     }
 
     /// **The reader is opened with exactly the lookahead it is handed.**
@@ -5925,7 +5785,7 @@ mod tests {
         handle.handle.wait_until_initialized().await.unwrap();
 
         assert!(
-            handle.get_file_reader(0, 0, 100, None, 0).await.is_err(),
+            handle.get_file_reader(0, 0, 0).await.is_err(),
             "a stream that reads nothing ahead is refused, so the number handed in is \
              the one the stream is opened with"
         );
@@ -5933,7 +5793,7 @@ mod tests {
             crate::backend::priorities::librqbit_stream_lookahead_bytes(Fetching::Streaming);
         for lookahead in [1, widest] {
             let mut reader = handle
-                .get_file_reader(0, 0, 100, None, lookahead)
+                .get_file_reader(0, 0, lookahead)
                 .await
                 .unwrap_or_else(|e| panic!("get_file_reader failed at {lookahead}: {e:#}"));
             let mut buf = [0u8; 1];
@@ -5968,7 +5828,7 @@ mod tests {
 
         // A reader opened to fetch one byte ahead: the window is the one
         // piece that byte is in.
-        let _reader = handle.get_file_reader(0, 0, 100, None, 1).await.unwrap();
+        let _reader = handle.get_file_reader(0, 0, 1).await.unwrap();
         let stats = TorrentHandle::stats(&handle).await;
         assert_eq!(stats.files[0].initial_window_bytes, Some(16 * 1024));
         assert_eq!(stats.files[0].initial_window_ready_bytes, Some(16 * 1024));
@@ -5997,7 +5857,7 @@ mod tests {
         let reaching_past_the_file = file_len + 1;
         assert!(startup < reaching_past_the_file);
         let _reader = handle
-            .get_file_reader(0, 0, 100, None, reaching_past_the_file)
+            .get_file_reader(0, 0, reaching_past_the_file)
             .await
             .unwrap();
         let stats = TorrentHandle::stats(&handle).await;
@@ -6249,8 +6109,6 @@ mod tests {
             .reconcile_file_priorities(TorrentFilePriorityPlan {
                 active_file: Some(1),
                 hot_file: None,
-                generation: 1,
-                reason: "test",
             })
             .await
             .unwrap();
@@ -6263,8 +6121,6 @@ mod tests {
             .get_file_reader(
                 1,
                 0,
-                1,
-                None,
                 crate::backend::priorities::librqbit_stream_lookahead_bytes(Fetching::Streaming),
             )
             .await
@@ -6307,8 +6163,6 @@ mod tests {
             .reconcile_file_priorities(TorrentFilePriorityPlan {
                 active_file: Some(0),
                 hot_file: None,
-                generation: 1,
-                reason: "test",
             })
             .await
             .unwrap();
@@ -6522,8 +6376,6 @@ mod tests {
             h.reconcile_file_priorities(TorrentFilePriorityPlan {
                 active_file: active,
                 hot_file: None,
-                generation: 1,
-                reason: "test",
             })
             .await
             .unwrap();
@@ -6620,8 +6472,6 @@ mod tests {
             .reconcile_file_priorities(TorrentFilePriorityPlan {
                 active_file: None,
                 hot_file: None,
-                generation: 1,
-                reason: "test",
             })
             .await
             .unwrap();
@@ -6898,8 +6748,6 @@ mod tests {
             .reconcile_file_priorities(TorrentFilePriorityPlan {
                 active_file: None,
                 hot_file: None,
-                generation: 1,
-                reason: "test",
             })
             .await
             .unwrap();
@@ -6914,7 +6762,6 @@ mod tests {
         assert_eq!(dropped.pieces().len(), file_pieces, "{dropped:?}");
         let stats = handle.handle.stats();
         assert_eq!(stats.file_progress[0], 0, "the file is not had: {stats}");
-        assert!(!handle.is_file_complete(0).await);
         assert!(!TorrentHandle::stats(&handle).await.files[0].complete);
         // The boundary piece went with it: the neighbour lost its share.
         let boundary_share = PIECE - lengths[0] % PIECE;
@@ -7041,12 +6888,8 @@ mod tests {
             .listen_addr()
             .expect("the client listens for the seeder");
 
-        let mut efs = crate::BackendEngineFS::new_with_backend(
-            backend,
-            restored,
-            client_dir.join("cache"),
-            client_dir.clone(),
-        );
+        let mut efs =
+            crate::BackendEngineFS::new_with_backend(backend, restored, client_dir.clone());
         // Declared, so the decision is about this test's inputs rather than
         // about however much room the machine running it happens to have.
         efs.set_free_space_probe(|_| Ok(u64::MAX));
@@ -7271,12 +7114,8 @@ mod tests {
             .await
             .unwrap();
 
-        let mut efs = crate::BackendEngineFS::new_with_backend(
-            backend,
-            restored,
-            client_dir.join("cache"),
-            client_dir.clone(),
-        );
+        let mut efs =
+            crate::BackendEngineFS::new_with_backend(backend, restored, client_dir.clone());
         efs.set_free_space_probe(|_| Ok(u64::MAX));
         plays(&efs, &hash);
 
@@ -7727,7 +7566,10 @@ mod tests {
             .get_torrent(&inner.info_hash().as_string())
             .await
             .unwrap();
-        assert!(handle.is_file_complete(0).await, "seeded");
+        assert!(
+            TorrentHandle::stats(&handle).await.files[0].complete,
+            "seeded"
+        );
 
         let error = handle
             .drop_file_pieces(0)
@@ -7830,8 +7672,6 @@ mod tests {
             .reconcile_file_priorities(TorrentFilePriorityPlan {
                 active_file: Some(0),
                 hot_file: None,
-                generation: 1,
-                reason: "test",
             })
             .await
             .unwrap();
@@ -7842,8 +7682,6 @@ mod tests {
             .get_file_reader(
                 0,
                 0,
-                0,
-                None,
                 crate::backend::priorities::librqbit_stream_lookahead_bytes(Fetching::Streaming),
             )
             .await
@@ -7948,11 +7786,13 @@ mod tests {
 
     /// `file_path` is the torrent's output folder joined with the file's
     /// relative name -- straight in the session root for a single-file
-    /// torrent, under the torrent's own folder for a multi-file one -- and
-    /// points at the real bytes. Out of range: None. `get_file_path` is the
-    /// same path as a string.
+    /// torrent, under the torrent's own folder for a multi-file one. **A
+    /// name, not a file**: the session's storage is the piece store, so
+    /// nothing is asserted about what is at the path (the fixture's own
+    /// source files happen to sit there, which proves nothing). Out of
+    /// range: None. `get_file_path` is the same path as a string.
     #[tokio::test]
-    async fn file_path_points_at_the_file_on_disk() {
+    async fn file_path_is_the_name_librqbit_gives_the_file() {
         use crate::backend::TorrentHandle;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
@@ -7988,9 +7828,6 @@ mod tests {
             single.get_file_path(0).await.as_deref(),
             Some(path.to_string_lossy().as_ref())
         );
-        let bytes = tokio::fs::read(&path).await.expect("path exists on disk");
-        assert_eq!(bytes.len(), 32 * 1024);
-        assert!(bytes.iter().enumerate().all(|(i, b)| *b == (i % 251) as u8));
         assert_eq!(single.file_path(1).await, None, "out of range");
 
         assert_eq!(
@@ -7998,11 +7835,8 @@ mod tests {
             Some(content_dir.join("b.bin").as_path())
         );
         assert_eq!(
-            tokio::fs::metadata(multi.file_path(a).await.unwrap())
-                .await
-                .unwrap()
-                .len(),
-            16 * 1024
+            multi.file_path(a).await.as_deref(),
+            Some(content_dir.join("a.bin").as_path())
         );
         assert_eq!(multi.file_path(2).await, None);
     }
@@ -8574,12 +8408,8 @@ mod tests {
             .session
             .listen_addr()
             .expect("the client listens for peers");
-        let mut efs = crate::BackendEngineFS::new_with_backend(
-            backend,
-            restored,
-            client_dir.join("cache"),
-            client_dir.to_path_buf(),
-        );
+        let mut efs =
+            crate::BackendEngineFS::new_with_backend(backend, restored, client_dir.to_path_buf());
         efs.set_free_space_probe(|_| Ok(u64::MAX));
         (efs, addr)
     }

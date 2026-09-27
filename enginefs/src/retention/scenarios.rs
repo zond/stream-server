@@ -1,12 +1,10 @@
-//! **Scenarios run through the harness, against the policy that is in
-//! `owner` today.**
+//! **Scenarios run through the harness, against the policy in `owner`.**
 //!
 //! Separate from [`crate::retention::scenario`] on purpose: that module is
-//! the harness, this one is what is asked of it, and only one of the two is
-//! meant to survive unchanged when the policy is swapped
-//! (`docs/design/read-pattern-retention.md`). A scenario here is a statement about
-//! a *cache*, not about an implementation, so the same file is what the
-//! replacement is measured against.
+//! the harness, this one is what is asked of it
+//! (`docs/design/read-pattern-retention.md`). A scenario here is a statement
+//! about a *cache*, not about an implementation, so the same file measures
+//! any policy `owner` runs.
 
 use std::time::Duration;
 

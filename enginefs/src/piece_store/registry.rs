@@ -50,9 +50,9 @@ use super::store::{HeldSnapshot, Inner, StoreRoot};
 /// process over two roots -- which the tests open -- have two of these, so
 /// a hash is looked up only among the stores that could hold it.
 pub struct StoreRegistry {
-    /// The root the registered stores are under. What a delete of a hash no
-    /// store is registered for still has to address, until every unlink in
-    /// the process goes through a registered store.
+    /// The root the registered stores are under: where the factory opens a
+    /// new store, and what [`Self::unregistered_bytes`] counts the stores
+    /// no session has opened under.
     root: StoreRoot,
     by_hash: Mutex<HashMap<String, Weak<Inner>>>,
     /// Who to tell when a store under this root accepts a piece, by the
@@ -289,6 +289,7 @@ impl StoreRegistry {
     /// Whether the store registered for `info_hash` is under its initial
     /// hash check. False for a hash with no store: there is nothing to
     /// check.
+    #[cfg(test)]
     pub fn checking(&self, info_hash: &str) -> bool {
         self.live(info_hash)
             .is_some_and(|inner| inner.is_checking())

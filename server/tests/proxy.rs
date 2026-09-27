@@ -22,28 +22,19 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 
-/// The config every test here spreads from: no DHT bootstrap name
-/// resolution, so starting a server makes no DNS query (see `embed.rs`).
+/// The offline config every binary that starts a server spreads from.
+#[path = "support/torrent_fixtures.rs"]
+mod torrent_fixtures;
+
+/// The config every test here spreads from: offline and with an empty pin
+/// record (`support/torrent_fixtures.rs`), and the same for the proxy
+/// cache's own pins: an embedder that keeps a record and has pinned
+/// nothing, under which a restart sweeps the cache clean. `None` would keep
+/// everything (`proxy_downloads.rs` has that case).
 fn offline_config() -> stream_server::ServerConfig {
     stream_server::ServerConfig {
-        resolve_dht_bootstrap_names: false,
-        // Neither file adds a BitTorrent torrent today, so nothing here
-        // reaches `merged_trackers` -- but the two halves of "offline"
-        // belong together, and `embed.rs` paid for having only one of them.
-        use_public_trackers: false,
-        // An embedder that keeps a pin record and has nothing in it yet.
-        // `None` is not the same thing -- it is "nobody said", which keeps
-        // every torrent's data and reports it all as pinned -- and it has a
-        // test of its own; spreading it here would turn every retention and
-        // idle-pause test in the file into one about a cache that may not be
-        // touched.
-        pins: Some(Default::default()),
-        // And the same for the proxy cache's own pins: an embedder that
-        // keeps a record and has pinned nothing, under which a restart
-        // sweeps the cache clean. `None` would keep everything
-        // (`proxy_downloads.rs` has that case).
         proxy_pins: Some(Vec::new()),
-        ..stream_server::ServerConfig::default()
+        ..torrent_fixtures::offline_config()
     }
 }
 

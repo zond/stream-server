@@ -76,9 +76,10 @@
 //! It is on the launch sweep's list of directories that reconcile
 //! themselves (`enginefs::piece_store::sweep`'s `NOT_OURS`): anything else
 //! under the download root is deleted at launch as a previous release's
-//! data, `.cache` and `.metadata` -- a pre-fork server's -- included. Nothing
-//! here is pinned -- a proxied stream nobody is reading is the first
-//! thing that should go.
+//! data, `.cache` and `.metadata` -- a pre-fork server's -- included. A
+//! proxied stream nobody is reading is the first thing that should go; the
+//! one exception is a key directory the embedder pinned as a download
+//! (`crate::proxy_downloads`).
 //!
 //! # What bounds it, and where the playhead comes from
 //!
@@ -183,6 +184,21 @@ pub const CHUNK_BYTES: u64 = 256 * 1024;
 /// and is not in the key.
 const RANGE_REQUEST_HEADERS: [&str; 2] = ["range", "if-range"];
 
+/// The player's negotiation headers: the forwarded ones that are half of
+/// the cache key (`routes::proxy::FORWARDED_REQUEST_HEADERS` minus
+/// [`RANGE_REQUEST_HEADERS`]), in the forwarded list's order, with the value
+/// the player sent. The key is hashed from this and a read-ahead source is
+/// built with it, so the two cannot disagree about which entity a player
+/// reads -- a source that carried a different set would fill a sibling key.
+pub(crate) fn negotiation_headers(
+    player_headers: &axum::http::HeaderMap,
+) -> impl Iterator<Item = (&'static str, &axum::http::HeaderValue)> {
+    crate::routes::proxy::FORWARDED_REQUEST_HEADERS
+        .into_iter()
+        .filter(|name| !RANGE_REQUEST_HEADERS.contains(name))
+        .filter_map(|name| player_headers.get(name).map(|value| (name, value)))
+}
+
 /// The blocking work this cache has started and has not finished: the chunk
 /// writes on their way to the disk, and the retention passes on their way
 /// round it.
@@ -241,6 +257,7 @@ impl DiskWork {
     /// The sibling of [`Self::settled`] for a caller with something else to
     /// check while it waits -- a bound on how much work is allowed to
     /// happen at all, which is not a thing an await can be interrupted by.
+    #[cfg(test)]
     pub fn idle(&self) -> bool {
         *self.count.borrow() == 0
     }
@@ -417,6 +434,16 @@ impl ProxyCache {
         &self.root
     }
 
+    /// The key directory a caller names by its key (a download row's
+    /// `infoHash`), or `None` for anything that is not a key this cache
+    /// writes: 64 lowercase hex digits, the SHA-256 every entry is named by.
+    /// Checked by spelling, never by where the joined path lands -- `..`
+    /// joins to a path whose parent is the root, and a delete there would
+    /// take the root's parent.
+    pub(crate) fn key_dir(&self, key: &str) -> Option<PathBuf> {
+        is_key_name(key).then(|| self.root.join(key))
+    }
+
     /// The playheads and windows of what is being read right now: this
     /// cache's retention owner, which is what reclaims its chunks and what
     /// `ServerHandle::cache_usage` asks for the protected half of the figure.
@@ -531,14 +558,9 @@ impl ProxyCache {
             field(name.to_ascii_lowercase().as_bytes());
             field(value.as_bytes());
         }
-        for name in crate::routes::proxy::FORWARDED_REQUEST_HEADERS {
-            if RANGE_REQUEST_HEADERS.contains(&name) {
-                continue;
-            }
-            if let Some(value) = player_headers.get(name) {
-                field(name.as_bytes());
-                field(value.as_bytes());
-            }
+        for (name, value) in negotiation_headers(player_headers) {
+            field(name.as_bytes());
+            field(value.as_bytes());
         }
         Some(Entry {
             dir: self.root.join(hex::encode(hash.finalize())),
@@ -653,7 +675,11 @@ impl ProxyCache {
     /// root; a path elsewhere is refused. Quiet, since only a download's
     /// bookkeeping ever asks for one.
     pub(crate) fn entry_for_key_dir(&self, dir: PathBuf, target: Arc<str>) -> Option<Entry> {
-        if dir.parent() != Some(self.root.as_path()) {
+        let named_a_key = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_key_name);
+        if !named_a_key || dir.parent() != Some(self.root.as_path()) {
             return None;
         }
         Some(Entry {
@@ -665,6 +691,15 @@ impl ProxyCache {
             quiet: false,
         })
     }
+}
+
+/// Whether `name` is spelled as a key directory is: `hex::encode` of a
+/// SHA-256, so 64 lowercase hex digits and nothing else.
+fn is_key_name(name: &str) -> bool {
+    name.len() == 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Whether a target names this server's own HTTP listener, in any of the
@@ -915,12 +950,6 @@ impl Entry {
         }
     }
 
-    /// The entity under this key, when there is exactly one.
-    ///
-    /// Two is what a kill between writing a new entity and removing the old
-    /// one leaves, and there is nothing here that can say which of them the
-    /// origin would send now -- so the request goes to the origin, and the
-    /// fill it comes back with removes the loser.
     /// This entry, with every reader it opens quiet: a download's filler
     /// is not a viewer (see
     /// [`crate::proxy_retention::ProxyRetention::reader_with`]).
@@ -969,13 +998,7 @@ impl Entry {
     /// -- and takes the bytes out of the occupancy figure. For a download
     /// the user deleted. Blocking.
     pub(crate) fn remove_all(&self) -> u64 {
-        let held: u64 = walkdir::WalkDir::new(&self.dir)
-            .into_iter()
-            .flatten()
-            .filter(|entry| entry.file_type().is_file())
-            .filter_map(|entry| entry.metadata().ok())
-            .map(|metadata| enginefs::chunk_store::occupied_bytes(&metadata))
-            .sum();
+        let held = tree_occupancy(&self.dir);
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
             for entity in entries.flatten() {
                 self.retention.forget(&entity.path());
@@ -994,6 +1017,12 @@ impl Entry {
         }
     }
 
+    /// The entity under this key, when there is exactly one.
+    ///
+    /// Two is what a kill between writing a new entity and removing the old
+    /// one leaves, and there is nothing here that can say which of them the
+    /// origin would send now -- so the request goes to the origin, and the
+    /// fill it comes back with removes the loser.
     fn sole_entity(&self) -> Option<(PathBuf, u64, String, String)> {
         let mut only: Option<(PathBuf, u64, String, String)> = None;
         for entry in std::fs::read_dir(&self.dir).ok()?.flatten() {
@@ -1058,9 +1087,6 @@ fn parse_entity_dir_name(name: &str) -> Option<(u64, String, String)> {
 /// is simply not one the cache keeps, like every other thing it declines.
 const MAX_ENTITY_DIR_NAME: usize = 255;
 
-/// Whether an entity of this length, type and validator can be filed at all.
-/// Asked by `routes::proxy::cacheable_entity` before a response is kept,
-/// because the answer is a refusal and every refusal lives there.
 /// See [`Entry::held_facts`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HeldFacts {
@@ -1070,6 +1096,9 @@ pub(crate) struct HeldFacts {
     pub complete: bool,
 }
 
+/// Whether an entity of this length, type and validator can be filed at all.
+/// Asked by `routes::proxy::cacheable_entity` before a response is kept,
+/// because the answer is a refusal and every refusal lives there.
 pub fn can_be_filed(total: u64, content_type: &str, validator: &str) -> bool {
     entity_dir_name(total, content_type, validator).len() <= MAX_ENTITY_DIR_NAME
 }
@@ -1130,13 +1159,7 @@ fn remove_other_entities(
         // state a cap over bytes that are not there
         // (`crate::proxy_retention::ProxyRetention::occupancy`). The walk is
         // over a directory that is about to be removed anyway.
-        let held: u64 = walkdir::WalkDir::new(&path)
-            .into_iter()
-            .flatten()
-            .filter(|entry| entry.file_type().is_file())
-            .filter_map(|entry| entry.metadata().ok())
-            .map(|metadata| enginefs::chunk_store::occupied_bytes(&metadata))
-            .sum();
+        let held = tree_occupancy(&path);
         let dropped = std::fs::remove_dir_all(&path);
         // Told whether it worked or not, and that is the point of putting
         // it here rather than in the `Ok` arm: `remove_dir_all` walks, so a
@@ -1238,8 +1261,6 @@ pub struct Cached {
 }
 
 impl Cached {
-    /// Whether the whole of what was asked for is here, so the origin need
-    /// not be opened at all.
     /// The entity's length.
     pub fn total(&self) -> u64 {
         self.total
@@ -1250,6 +1271,8 @@ impl Cached {
         &self.content_type
     }
 
+    /// Whether the whole of what was asked for is here, so the origin need
+    /// not be opened at all.
     pub fn complete(&self) -> bool {
         self.held_to >= self.last
     }
@@ -1548,6 +1571,20 @@ where
     }
 }
 
+/// What every file under `path` occupies, by the volume's own accounting
+/// (`enginefs::chunk_store::occupied_bytes`): what a removal of the tree is
+/// about to free. A walk, so only for a tree that is about to go -- the
+/// running figure is the owner's count, never this.
+fn tree_occupancy(path: &Path) -> u64 {
+    walkdir::WalkDir::new(path)
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry.file_type().is_file())
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|metadata| enginefs::chunk_store::occupied_bytes(&metadata))
+        .sum()
+}
+
 /// What one sweep did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SweepReport {
@@ -1571,24 +1608,26 @@ pub struct SweepReport {
     pub errors: usize,
 }
 
-/// Empty the proxy cache, at launch.
+/// Empty the proxy cache, at launch, of everything the embedder's pin
+/// record does not name.
 ///
-/// **Nothing here survives a restart, and that is the whole of it.** A
-/// proxied entity is kept for exactly as long as something is playing it: a
-/// window round the playhead while it is live, and nothing at all once a
-/// stream opens on anything else. A process that has served nothing is
-/// playing nothing, so every chunk under this root belongs to a playback
-/// that ended when the last process did -- there is no pin here, no claim
-/// that outlives the run, and no owner in this process that would ever
-/// count these bytes or reclaim them. Left alone they would be exactly the
-/// invisible disk usage the design exists to remove: on the disk, out of
-/// every occupancy figure this process publishes
-/// (`crate::proxy_retention::ProxyRetention::occupancy` counts what *it*
-/// wrote), and reclaimed by nothing.
+/// **Nothing unpinned survives a restart.** A proxied entity is kept for
+/// exactly as long as something is playing it: a window round the playhead
+/// while it is live, and nothing at all once a stream opens on anything
+/// else. A process that has served nothing is playing nothing, so every
+/// unpinned chunk under this root belongs to a playback that ended when the
+/// last process did -- no claim outlives the run but a pin, and no owner in
+/// this process would ever count these bytes or reclaim them. Left alone
+/// they would be exactly the invisible disk usage the design exists to
+/// remove: on the disk, out of every occupancy figure this process
+/// publishes (`crate::proxy_retention::ProxyRetention::occupancy` counts
+/// what *it* wrote), and reclaimed by nothing.
 ///
-/// Which also makes the occupancy count true from the first byte: the
-/// launch sweep is what makes "what this process wrote" and "what is on the
-/// disk" the same set.
+/// The key directories in `keep` -- the pinned downloads -- stay whole, and
+/// their bytes are reported so the owner books them
+/// (`crate::proxy_retention::ProxyRetention::restored`). That is what makes
+/// the occupancy count true from the first byte: what this process writes,
+/// plus what the sweep kept, is what is on the disk.
 ///
 /// Removed whole rather than chunk by chunk -- the key directory and every
 /// entity under it -- because an empty tree of directories is debris too.
@@ -1597,9 +1636,11 @@ pub struct SweepReport {
 pub fn sweep(root: &Path, keep: Option<&std::collections::HashSet<PathBuf>>) -> SweepReport {
     let mut report = SweepReport::default();
     // Nobody has named the pins: nothing is swept, the piece store's rule
-    // for the same silence. Every byte stays on the disk, counted by the
-    // owner once an entity is asked about and bounded by the budget like
-    // any other slack; what it is not is deleted for want of a claim.
+    // for the same silence -- nothing is deleted for want of a claim. The
+    // price is the count: nothing is kept by name either, so nothing is
+    // booked, and what an earlier process left is on the disk and in
+    // nobody's occupancy figure until something that takes it prices it
+    // (`proxy_retention`'s `Occupancy::take`).
     let Some(keep) = keep else {
         tracing::info!("proxy cache: no pin record named; sweeping nothing");
         return report;
@@ -1627,13 +1668,7 @@ pub fn sweep(root: &Path, keep: Option<&std::collections::HashSet<PathBuf>>) -> 
         // Measured before it goes, and by the volume's own accounting: a
         // partly-written chunk frees what its blocks free, not what its
         // length claims.
-        let held: u64 = walkdir::WalkDir::new(&path)
-            .into_iter()
-            .flatten()
-            .filter(|entry| entry.file_type().is_file())
-            .filter_map(|entry| entry.metadata().ok())
-            .map(|metadata| enginefs::chunk_store::occupied_bytes(&metadata))
-            .sum();
+        let held = tree_occupancy(&path);
         if keep.contains(&path) {
             report.kept += 1;
             report.kept_bytes += held;

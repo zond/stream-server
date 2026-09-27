@@ -27,11 +27,6 @@ carried in below.
   committed for sharing. A question about the policy, not a defect.
 - **The piece-commit failure paths are unmeasured on a device** -- see
   *Readable before durable* below.
-- **Small redundancies** (a 2026-09-14 reading, **not re-checked**, and at
-  least partly stale -- `Streams::busiest` now has a production caller in
-  `engine.rs`): `Consumers::at`, `Streams::busiest` and `Stream::eaten` were
-  said to live only for `trace::pass`; `Shape::piece_budget` is called only
-  from tests.
 - **A stale-looking name, kept on purpose**:
   `enginefs/src/retention/scenario.rs`'s `CONTAINER_METADATA_LOOKAHEAD` and
   `PLAYBACK_LOOKAHEAD` keep the field's numbers under the names of constants

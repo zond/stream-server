@@ -59,10 +59,9 @@ pub struct SweepReport {
 /// info hash, are removed too: the root belongs to this store alone, so
 /// anything in it that is not a torrent's pieces is debris from an interrupted
 /// write.
-pub fn sweep_unadopted(root: &StoreRoot, adopted: &HashSet<String>) -> SweepReport {
+pub fn sweep_unadopted(store: &StoreRoot, adopted: &HashSet<String>) -> SweepReport {
     let mut report = SweepReport::default();
-    let root = root.path();
-    let store = StoreRoot::new(root.to_path_buf());
+    let root = store.path();
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         // No piece root yet is the ordinary first-launch state, not a problem.
@@ -97,24 +96,31 @@ pub fn sweep_unadopted(root: &StoreRoot, adopted: &HashSet<String>) -> SweepRepo
             (true, Some(name)) => store.stat(name).occupancy(),
             _ => 0,
         };
-        let removed = if is_dir {
-            std::fs::remove_dir_all(&path)
-        } else {
-            std::fs::remove_file(&path)
-        };
-        match removed {
-            Ok(()) => {
-                tracing::info!(path = %path.display(), freed, "swept unadopted piece data");
-                report.removed += 1;
-                report.freed_bytes += freed;
-            }
-            Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "could not sweep piece data");
-                report.errors += 1;
-            }
-        }
+        remove_swept(&path, is_dir, freed, "unadopted piece data", &mut report);
     }
     report
+}
+
+/// Remove one entry a sweep has condemned, and book it in `report`: the one
+/// removal both launch sweeps make. `what` names the category for the log
+/// line; a failure is logged and counted, never fatal.
+fn remove_swept(path: &Path, is_dir: bool, freed: u64, what: &str, report: &mut SweepReport) {
+    let removed = if is_dir {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    match removed {
+        Ok(()) => {
+            tracing::info!(path = %path.display(), freed, what, "swept");
+            report.removed += 1;
+            report.freed_bytes += freed;
+        }
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, what, "could not sweep");
+            report.errors += 1;
+        }
+    }
 }
 
 /// The launch sweep, in the one order that is safe: whatever `record`
@@ -172,21 +178,11 @@ pub async fn sweep_before_session(download_dir: &Path, pins: Option<&PinSet>) ->
 /// every pin. **A new directory under the download root goes on this list,
 /// or the next launch deletes it.**
 ///
-/// `.cache` and `.metadata` were on it too, and are a previous release's
-/// data now like anything else here. `.cache` held a pre-fork server's
-/// `<hash>.torrent` files, which this server re-added at boot until dda7f96
-/// removed that restore; `.metadata` was read by nothing even then. Neither
-/// this crate, the server nor librqbit writes or reads either, and
-/// librqbit's own session files sit directly under the root, where
-/// [`is_session_artifact`] names them.
-///
-/// `.archives` was on it too, for the archive layer's extraction cache.
-/// Nothing writes that directory any more -- an archive member is ranges
-/// of the archive now, and there is nothing to extract -- and it never
-/// sat under *this* root anyway: it was `<cacheRoot>/.archives`, one level
-/// above the download dir this walks, which is why the exemption was never
-/// load-bearing. The server deletes what an older build left there, once,
-/// at launch (`stream_server::LEGACY_ARCHIVE_SCRATCH_DIR`).
+/// Nothing else is: `.cache` and `.metadata`, a pre-fork server's, are
+/// read and written by nothing -- not this crate, the server or librqbit,
+/// whose own session files sit directly under the root, where
+/// [`is_session_artifact`] names them -- so they are a previous release's
+/// data like anything else here.
 const NOT_OURS: [&str; 2] = [".pieces", ".proxy"];
 
 /// Whether `name`, directly under the download root, is something the
@@ -195,14 +191,12 @@ const NOT_OURS: [&str; 2] = [".pieces", ".proxy"];
 /// Taken from the cache cleaner's `is_session_artifact`, which is what
 /// exempted these from its walk for as long as it had one.
 ///
-/// `pinned-downloads.json` is on the list although this server no longer
-/// writes one: an install upgraded from a build that did still has the file,
-/// and sweeping it as a previous release's *data* would be this sweep
-/// deleting a record while a user might still get something out of it. librqbit keeps
-/// its resume data beside the data itself -- `session.json`, a `.torrent`
-/// and a `.bitv` per info hash -- and the DHT its bootstrap; the pin record
-/// is this crate's own, and its atomic write leaves a `pinned-downloads
-/// .json.tmp-<n>` behind if it is interrupted.
+/// librqbit keeps its resume data beside the data itself -- `session.json`,
+/// a `.torrent` and a `.bitv` per info hash -- and the DHT its bootstrap.
+/// `pinned-downloads.json` (and the `.tmp-<n>` an interrupted write of it
+/// left) is on the list although nothing writes one any more: an install
+/// upgraded from a build that did still has the file, and it is a record,
+/// not a previous release's data.
 fn is_session_artifact(name: &str) -> bool {
     let name = name.strip_suffix(".tmp").unwrap_or(name);
     if matches!(
@@ -278,26 +272,13 @@ pub fn sweep_legacy_downloads(download_dir: &Path) -> SweepReport {
                 .map(crate::chunk_store::occupied_bytes)
                 .unwrap_or(0)
         };
-        let removed = if is_dir {
-            std::fs::remove_dir_all(&path)
-        } else {
-            std::fs::remove_file(&path)
-        };
-        match removed {
-            Ok(()) => {
-                tracing::info!(
-                    path = %path.display(),
-                    freed,
-                    "swept a previous release's whole-file download"
-                );
-                report.removed += 1;
-                report.freed_bytes += freed;
-            }
-            Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "could not sweep legacy download data");
-                report.errors += 1;
-            }
-        }
+        remove_swept(
+            &path,
+            is_dir,
+            freed,
+            "a previous release's whole-file download",
+            &mut report,
+        );
     }
     report
 }
@@ -309,23 +290,9 @@ pub fn sweep_legacy_downloads(download_dir: &Path) -> SweepReport {
 /// once per launch over what a previous release left, and never again once
 /// that is gone.
 fn tree_bytes(dir: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .map(|entry| {
-            let path = entry.path();
-            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                tree_bytes(&path)
-            } else {
-                std::fs::metadata(&path)
-                    .as_ref()
-                    .map(crate::chunk_store::occupied_bytes)
-                    .unwrap_or(0)
-            }
-        })
-        .sum()
+    let mut files = Vec::new();
+    crate::chunk_store::collect_strays(dir, &mut files);
+    files.iter().map(crate::chunk_store::occupied_bytes).sum()
 }
 
 #[cfg(test)]

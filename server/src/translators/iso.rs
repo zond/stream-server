@@ -100,7 +100,7 @@ fn member(file: ImageFile) -> Member {
 
 /// The images module's refusal in the translators' words, and so in the
 /// route's status codes (`routes::archive::refusal_response`):
-/// `Unsupported` and `Encrypted` are `415` -- a well-formed image this
+/// `Unsupported` is `415` -- a well-formed image this
 /// server will not serve by range -- `Malformed` and `NotAnImage` are `422`
 /// -- the bytes are not what the prefix said they were -- and `Unreadable`
 /// is the read error, worded the way `Budget::read_exact` words one for
@@ -112,7 +112,6 @@ fn translate(refusal: images::Refusal, image: &str) -> Refusal {
             format: image_kind(format),
             what,
         },
-        images::Refusal::Encrypted { .. } => Refusal::Encrypted,
         images::Refusal::Malformed { format, detail } => {
             Refusal::Malformed(format!("{format}: {detail}"))
         }
@@ -335,10 +334,6 @@ mod tests {
     /// each of the images module's refusals lands on.
     #[test]
     fn every_image_refusal_has_a_translator_refusal() {
-        assert_eq!(
-            translate(images::Refusal::Encrypted { format: "UDF" }, "fixture.iso"),
-            Refusal::Encrypted
-        );
         assert!(matches!(
             translate(
                 images::Refusal::Unsupported {

@@ -36,11 +36,10 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
-use tokio::io::AsyncReadExt;
 use url::Url;
 
 use crate::proxy_cache::Entry;
-use crate::sources::{ByteSource, ProxySource, ReadHint};
+use crate::sources::{ByteSource, ProxySource};
 
 /// A pinned proxy download as the embedder names it, and persists it.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -201,11 +200,10 @@ impl ProxyDownloads {
         Some(dirs)
     }
 
-    /// Pins `key` and starts (or keeps) its filler over `source`. Answers the
-    /// key directory. Idempotent: a second pin of a running download changes
-    /// nothing but the name.
     /// Records the pin and, given a `source`, starts (or keeps) the filler
-    /// that fetches what the entry does not hold yet. `None` is a pin over
+    /// that fetches what the entry does not hold yet; answers the key
+    /// directory. Idempotent: a second pin of a running download changes
+    /// nothing but the name. `None` is a pin over
     /// an entry that is already whole ([`held_complete`]): nothing to fetch,
     /// so nothing is opened and the origin is not asked -- which is what
     /// lets a re-pin after a restart, or a pin of a file that was streamed
@@ -437,8 +435,11 @@ impl Filler {
                 break;
             }
             let until = (pos + FILL_STRIDE).min(total);
-            match self.fill(pos, until, &mut sink).await {
-                Ok(read) => pos += read,
+            // A range the disk holds is served from the disk (no origin
+            // request); a hole is fetched and lands in the cache on its way
+            // through.
+            match crate::proxy_retention::read_through(&self.source, pos, until, &mut sink).await {
+                Ok(()) => pos = until,
                 Err(error) => {
                     tracing::warn!(
                         dir = %self.dir.display(),
@@ -464,23 +465,5 @@ impl Filler {
             whole,
             "download filler: reached the end"
         );
-    }
-
-    /// One stride: open the quiet source at `from` and read to `until`. A
-    /// range the disk holds is served from the disk (no origin request);
-    /// a hole is fetched and lands in the cache on its way through. Answers
-    /// the bytes read.
-    async fn fill(&self, from: u64, until: u64, sink: &mut [u8]) -> std::io::Result<u64> {
-        let mut reader = self.source.open(from, ReadHint::of(until - from)).await?;
-        let mut read = 0u64;
-        while from + read < until {
-            let want = ((until - from - read) as usize).min(sink.len());
-            let n = reader.read(&mut sink[..want]).await?;
-            if n == 0 {
-                break;
-            }
-            read += n as u64;
-        }
-        Ok(read)
     }
 }

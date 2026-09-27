@@ -26,7 +26,7 @@
 //! LICENSING: `unrar-rs` is GPL-3.0-or-later, and this module is what the
 //! `rar` cargo feature turns on. See `server/Cargo.toml` and AGENTS.md.
 
-use super::{Body, Index, IndexReader, Member, Refusal, Translator};
+use super::{Body, Index, IndexReader, Member, Refusal, Translator, member_name};
 use crate::sources::{ByteSource, Extent};
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -226,12 +226,6 @@ fn direct(stored: &StoredMember, name: &str, sources: &[Arc<dyn ByteSource>]) ->
     Body::Direct(extents)
 }
 
-/// The name as the route matches it: `/`-separated, no leading slash. A
-/// RAR4 written on Windows stores `\`.
-fn member_name(name: &str) -> String {
-    name.replace('\\', "/").trim_start_matches('/').to_string()
-}
-
 /// What a compression method is called, for the sentence the player shows.
 fn method_name(method: u8) -> String {
     match method {
@@ -365,7 +359,9 @@ fn part_number<'a>(named: &'a str, lower: &'a str) -> Option<(&'a str, &'a str)>
 /// `stem` of a `stem.rNN` name, on the lowercased spelling.
 fn old_continuation(lower: &str) -> Option<&str> {
     let at = lower.len().checked_sub(4)?;
-    let suffix = &lower[at..];
+    // Four bytes from the end can be inside a character ("Amélie", "日本"),
+    // and a slice there panics; such a name is no `.rNN` anyway.
+    let suffix = lower.get(at..)?;
     (suffix.starts_with(".r") && suffix[2..].bytes().all(|byte| byte.is_ascii_digit()))
         .then_some(&lower[..at])
 }
@@ -945,17 +941,31 @@ mod tests {
         );
     }
 
+    /// A name whose last four bytes split a character is one volume, and
+    /// such a name among the siblings of a set is nobody's continuation --
+    /// neither is a slice through a character.
+    #[test]
+    fn a_name_ending_in_a_multibyte_character_is_one_volume() {
+        assert_eq!(
+            volume_set("Amélie", &names(&["Amélie", "日本"])).unwrap(),
+            names(&["Amélie"])
+        );
+        assert_eq!(volume_set("日本", &[]).unwrap(), names(&["日本"]));
+        assert_eq!(
+            volume_set(
+                "film.rar",
+                &names(&["film.rar", "Amélie", "日本", "film.r00"])
+            )
+            .unwrap(),
+            names(&["film.rar", "film.r00"])
+        );
+    }
+
     #[test]
     fn a_method_is_named_for_the_sentence_the_player_shows() {
         assert_eq!(method_name(3), "normal");
         assert_eq!(method_name(0), "store");
         assert_eq!(method_name(9), "method 9");
-    }
-
-    #[test]
-    fn a_windows_name_is_matched_with_slashes() {
-        assert_eq!(member_name("Season 1\\E01.mkv"), "Season 1/E01.mkv");
-        assert_eq!(member_name("/abs/x.mkv"), "abs/x.mkv");
     }
 
     /// **The fixtures are archives a real reader accepts.** Where `unrar`

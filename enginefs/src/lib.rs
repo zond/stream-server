@@ -28,11 +28,10 @@ pub use http_client::http_client_builder;
 pub use trackers::TrackerStorage;
 
 use crate::backend::librqbit::LibrqbitBackend;
-use crate::backend::priorities::EngineCacheConfig;
 
 use crate::backend::{
-    Footprint, HotFilePriorityPlan, RunState, TorrentBackend, TorrentFilePriorityPlan,
-    TorrentHandle, TorrentListenPort, TorrentPlacement, TorrentSource,
+    Footprint, RunState, TorrentBackend, TorrentFilePriorityPlan, TorrentHandle, TorrentPlacement,
+    TorrentSource,
 };
 
 const INACTIVE_TORRENT_REMOVE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
@@ -405,42 +404,9 @@ fn deletion_nonce() -> String {
     format!("{nanos:x}-{}", NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
-/// `Fn(path) -> u64` probe of the volume holding a path: available bytes
-/// (`fs4::available_space`), or an identity (`volume_id`) telling two paths
-/// on the same volume apart from two on different ones.
+/// `Fn(path) -> u64` probe of the volume holding a path: its available
+/// bytes (`fs4::available_space`).
 type VolumeProbe = Arc<dyn Fn(&std::path::Path) -> std::io::Result<u64> + Send + Sync>;
-
-/// An identity of the volume holding `path`, equal for two paths on the
-/// same volume: the device id on Unix; the path prefix (drive letter or
-/// UNC share) on Windows, where std exposes no stable volume serial.
-///
-/// Public because the server asks the same question of the roots it caps --
-/// a free-space cap is a statement about a volume, so roots on two volumes
-/// cannot share one budget -- and two answers to "are these the same volume"
-/// that disagree would be worse than either.
-#[cfg(unix)]
-pub fn volume_id(path: &std::path::Path) -> std::io::Result<u64> {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path).map(|metadata| metadata.dev())
-}
-
-#[cfg(windows)]
-pub fn volume_id(path: &std::path::Path) -> std::io::Result<u64> {
-    use std::hash::{Hash, Hasher};
-    match path.components().next() {
-        Some(std::path::Component::Prefix(prefix)) => {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            prefix.as_os_str().to_ascii_lowercase().hash(&mut hasher);
-            Ok(hasher.finish())
-        }
-        _ => Err(std::io::Error::other("relative path has no volume")),
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-pub fn volume_id(_path: &std::path::Path) -> std::io::Result<u64> {
-    Err(std::io::Error::other("volume identity unavailable"))
-}
 
 /// One pinned offline download, see [`BackendEngineFS::pinned_downloads`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -616,7 +582,6 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     /// Whether a torrent is added with the public tracker lists or with
     /// nothing but what its caller named. See [`crate::backend::PublicTrackers`].
     public_trackers: crate::backend::PublicTrackers,
-    pub cache_dir: std::path::PathBuf,
     pub download_dir: std::path::PathBuf,
     /// Track active streams per info_hash for legacy compatibility
     active_streams: Arc<RwLock<HashMap<String, usize>>>,
@@ -787,10 +752,14 @@ type DormantPins = Arc<parking_lot::Mutex<BTreeMap<String, std::collections::BTr
 struct MultiFileActiveSelection {
     file_idx: usize,
     generation: u64,
+    /// What made the selection and when, for the tests' activity snapshot.
+    #[cfg(test)]
     source: &'static str,
+    #[cfg(test)]
     last_seen_secs: u64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ActiveFileStreamSnapshot {
     pub info_hash: String,
@@ -801,12 +770,14 @@ pub struct ActiveFileStreamSnapshot {
 /// The one file the server is playing, as the diagnostics report it. Read
 /// off the liveness cell ([`crate::retention::live`]), which is where that
 /// fact lives.
+#[cfg(test)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ActiveFileSnapshot {
     pub info_hash: String,
     pub file_idx: usize,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MultiFileActiveSelectionSnapshot {
     pub info_hash: String,
@@ -816,6 +787,7 @@ pub struct MultiFileActiveSelectionSnapshot {
     pub last_seen_secs: u64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StreamActivitySnapshot {
     pub uptime_secs: u64,
@@ -840,6 +812,7 @@ pub struct StreamActivitySnapshot {
     pub paused_torrents: Vec<String>,
 }
 
+#[cfg(test)]
 impl StreamActivitySnapshot {
     /// Whether a player is reading from this server right now.
     ///
@@ -1025,13 +998,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     pub fn new_with_backend(
         backend: B,
         restored_handles: HashMap<String, B::Handle>,
-        cache_dir: std::path::PathBuf,
         download_dir: std::path::PathBuf,
     ) -> Self {
         Self::new_with_backend_and_storage(
             backend,
             restored_handles,
-            cache_dir,
             download_dir,
             None,
             crate::backend::PublicTrackers::Use,
@@ -1041,7 +1012,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     pub fn new_with_backend_and_storage(
         backend: B,
         restored_handles: HashMap<String, B::Handle>,
-        cache_dir: std::path::PathBuf,
         download_dir: std::path::PathBuf,
         tracker_storage: Option<Arc<dyn crate::trackers::TrackerStorage>>,
         public_trackers: crate::backend::PublicTrackers,
@@ -1114,7 +1084,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             engines: engines.clone(),
             tracker_manager,
             public_trackers,
-            cache_dir,
             download_dir: download_dir.clone(),
             active_streams: Arc::new(RwLock::new(HashMap::new())),
             active_file_streams: Arc::new(RwLock::new(HashMap::new())),
@@ -1456,7 +1425,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// torrent is read for what happened, and the arm that took each stop
     /// is a question about one torrent.
     ///
-    /// One free-space probe per distinct output folder, and no `stats()`
+    /// One free-space probe per pass -- every torrent's pieces land on the
+    /// one root ([`crate::reconcile::Volumes`]) -- and no `stats()`
     /// anywhere: every question asked of a handle here
     /// ([`TorrentHandle::run_state`], [`TorrentHandle::has_metadata`],
     /// [`TorrentHandle::is_finished`]) is one the trait promises to answer
@@ -1564,11 +1534,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// Decide for one engine and act on the decision, under that hash's
     /// reconcile lock.
     ///
-    /// `None` for a backend that manages its own playback lifecycle: it
-    /// pauses and resumes its torrents itself, and a second opinion from
-    /// here would be a second owner of the same state -- which is the whole
-    /// class of bug this reconciler exists to end.
-    ///
     /// **Every pause and every unpause in the process is made here.** Every
     /// arm of the ladder that stops a torrent -- the free-space one and
     /// "neither playing nor pinned" among them -- is this reconciler's, and
@@ -1589,9 +1554,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         now: u64,
         probed: &mut bool,
     ) -> Option<crate::reconcile::Verdict> {
-        if engine.handle.manages_playback_lifecycle() {
-            return None;
-        }
         let _guard = self.reconcile_locks.lock(&engine.info_hash).await;
         // The volume the pieces land on, which is one folder for every
         // torrent in the session (`Volumes::data_folder`) -- so a pass
@@ -1656,11 +1618,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 // One call for both arms. It is guarded on `Live` and not
                 // on the arm, because what makes a stop safe is the state
                 // it is made from: pausing an *initializing* torrent wedges
-                // its check for good (`file_ops.rs:113` bails it,
-                // `mod.rs:590-593` returns `Ok` without changing the state,
-                // and `wait_until_initialized` then polls a torrent with no
-                // check running for ever), and the ladder's first arm
-                // answers `Stop` for exactly that reading.
+                // its check (`FileOps::initial_check` bails on the pause,
+                // the state stays `Initializing` with no check running
+                // until an unpause, and `wait_until_initialized` refuses
+                // every waiter on it), and the ladder's first arm answers
+                // `Stop` for exactly that reading.
                 let stopped_here = self.stop_if_running(engine, &conditions, now).await;
                 if verdict.for_space {
                     self.after_stopping_for_space(engine, &conditions, now, stopped_here);
@@ -1923,14 +1885,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// *device*, and no other arm of the ladder makes one.
     ///
     /// Tying it to the start call instead is how a refusal that nothing
-    /// could ever clear shipped. The two ways out of a refusal that are not
-    /// a start are both ordinary: the torrent is stopped when the slack goes
-    /// and frees the volume, so the reconcile that follows leaves it
-    /// stopped and starts nothing; and the user then presses play,
-    /// which resumes it through `activate_file` before
-    /// [`Self::reconcile_hash`] is asked, so by the time the answer is `Run`
-    /// the torrent is already `Live` and there is no start to hang the lift
-    /// on. Every read on that engine then failed with `StorageFull`, for
+    /// could ever clear shipped. A way out of a refusal need not be a
+    /// start, and the ordinary one is not: the torrent is stopped when the
+    /// slack goes and frees the volume, so the reconcile that follows leaves
+    /// it stopped and starts nothing. Hung on the start, the lift never
+    /// came, and every read on that engine failed with `StorageFull`, for
     /// good, on a volume with room to spare.
     fn let_reads_park_again(&self, engine: &Arc<Engine<B::Handle>>) {
         if !engine.reads_refused() {
@@ -1963,9 +1922,32 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// the floor is reached, not after. A probe that failed rings nothing:
     /// an unreadable volume is not a full one.
     ///
-    /// Off the worker ([`Self::free_space_of`]), like every probe here.
+    /// Off the worker, like every probe here (see [`Self::free_space_of`]).
     async fn probe_volume(&self, folder: &std::path::Path, now: u64) {
-        let available = match self.free_space_of(folder).await {
+        // Both readings in one trip to the blocking pool: this runs every
+        // tick. The volume's size sizes the floor the free space is judged
+        // against, and is walked up like the probe, since the folder may not
+        // exist yet.
+        let (available, total) = {
+            let probe = Arc::clone(&self.free_space_probe);
+            let folder = folder.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                (
+                    probe_at_existing_ancestor(&*probe, &folder),
+                    folder.ancestors().find_map(crate::volume_total),
+                )
+            })
+            .await
+            .unwrap_or_else(|join| {
+                (
+                    Err(std::io::Error::other(format!(
+                        "the volume probe task failed: {join}"
+                    ))),
+                    None,
+                )
+            })
+        };
+        let available = match available {
             Ok(available) => Some(available),
             Err(error) => {
                 debug!(
@@ -1976,16 +1958,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 );
                 None
             }
-        };
-        // The volume's size, from beside the free space: it sizes the floor
-        // the reading is judged against. Walked up like the probe, since the
-        // folder may not exist yet, and off the worker for the same reason.
-        let total = {
-            let folder = folder.to_path_buf();
-            tokio::task::spawn_blocking(move || folder.ancestors().find_map(crate::volume_total))
-                .await
-                .ok()
-                .flatten()
         };
         let floor = crate::free_space_floor(total);
         if available.is_some_and(|available| available < crate::reconcile::resume_line(floor)) {
@@ -2287,7 +2259,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     ///
     /// Concurrent callers for one info hash share a single backend add: the
     /// first request's tracker list is the one used (librqbit cannot add
-    /// trackers to a torrent later, see `LibrqbitHandle::add_trackers`), and
+    /// trackers to a torrent later, see `magnet_with_trackers`), and
     /// the add runs detached so a poller that disconnects does not cancel the
     /// resolution a player is waiting on. Each add is bounded by
     /// [`METADATA_RESOLVE_TIMEOUT`].
@@ -2630,6 +2602,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
 
     /// The failure record of the last magnet add for `info_hash`, if it ended
     /// without an engine and has not been retried or swept since.
+    #[cfg(test)]
     pub async fn failed_magnet_add(&self, info_hash: &str) -> Option<FailedMagnetAdd> {
         match self.magnet_add_state(info_hash).await? {
             MagnetAddState::Adding(_) => None,
@@ -2675,10 +2648,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         engine
     }
 
-    pub async fn get_or_add_engine(&self, info_hash: &str) -> Result<Arc<Engine<B::Handle>>> {
-        Ok(self.get_or_add_magnet(info_hash, None).await?)
-    }
-
+    #[cfg(test)]
     pub async fn remove_engine(&self, info_hash: &str) {
         let mut engines = self.engines.write().await;
         engines.remove(&info_hash.to_lowercase());
@@ -2873,6 +2843,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// not the same thing as never having been told
     /// ([`crate::retention::CacheBudget::Unknown`], which is what this
     /// starts as).
+    #[cfg(test)]
     pub fn set_cache_budget(&self, limit: Option<u64>) {
         self.budget.set(limit, None);
     }
@@ -3183,20 +3154,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         })
     }
 
-    pub async fn get_all_statistics(&self) -> HashMap<String, crate::backend::EngineStats> {
-        let engines = self.engines.read().await;
-        let mut stats = HashMap::new();
-        for (hash, engine) in engines.iter() {
-            stats.insert(hash.clone(), engine.get_statistics().await);
-        }
-        stats
-    }
-
     pub async fn list_engines(&self) -> Vec<String> {
         let engines = self.engines.read().await;
         engines.keys().cloned().collect()
     }
 
+    #[cfg(test)]
     pub async fn stream_activity_snapshot(&self) -> StreamActivitySnapshot {
         let engines = self.engines.read().await;
         let engine_count = engines.len();
@@ -3386,18 +3349,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // of space is refusing it *after* the predecessor became slack,
         // which is what gives it room to be admitted at all.
         let beside = self.switch_to(&info_hash, file_idx).await;
-        let native_lifecycle = self
-            .get_engine(&info_hash)
-            .await
-            .is_some_and(|engine| engine.handle.manages_playback_lifecycle());
-        if native_lifecycle {
-            if let Some(engine) = self.get_engine(&info_hash).await {
-                engine.touch();
-            }
-        } else {
-            self.activate_file(&info_hash, file_idx, beside, "stream")
-                .await;
-        }
+        self.activate_file(&info_hash, file_idx, beside, "stream")
+            .await;
 
         // Registered, so this reads a player: sharing starts with the
         // stream rather than at the next tick.
@@ -3494,11 +3447,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// torrent. The start it may issue also un-wedges a torrent the last
     /// process left stopped, and the reader opens right after.
     ///
-    /// It used to read `if engine.idle_paused.swap(false) && resume()`,
-    /// which on a fresh process is `false && ...` -- dead code after every
-    /// restart, and a restart is exactly when a torrent comes up stopped
-    /// with nothing in this process able to say why.
-    ///
     /// **This call writes no activity register and no liveness cell.**
     /// [`crate::reconcile::Trigger::PlaybackStart`] says only *why* the
     /// question is being asked, never that anything is playing: the ladder
@@ -3514,9 +3462,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let Some(engine) = self.get_engine(&info_hash).await else {
             return;
         };
-        if engine.handle.manages_playback_lifecycle() {
-            return;
-        }
         engine.touch();
         self.reconcile_hash(&info_hash, crate::reconcile::Trigger::PlaybackStart)
             .await;
@@ -3538,9 +3483,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let mut is_multifile = false;
         if let Some(engine) = self.get_engine(info_hash).await {
             engine.touch();
-            if engine.handle.manages_playback_lifecycle() {
-                return;
-            }
             is_multifile = engine.handle.file_count().await > 1;
 
             // No resume here any more. Starting a torrent that is stopped
@@ -3556,16 +3498,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
         match beside {
             Some(playing) => {
-                // What is fetched beside a film, not what plays: no offset,
-                // priority or intent of it is read by any backend, only the
-                // file.
-                let aside = HotFilePriorityPlan {
-                    file_idx,
-                    start_offset: 0,
-                    priority: 0,
-                    bitrate_bytes_per_sec: None,
-                };
-                self.activate_multifile_file(info_hash, playing, Some(aside), source)
+                // What is fetched beside a film, not what plays.
+                self.activate_multifile_file(info_hash, playing, Some(file_idx), source)
                     .await;
             }
             None => {
@@ -3575,21 +3509,15 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
     }
 
+    #[cfg(test)]
     pub async fn activate_multifile_file_for_playback(
         &self,
         info_hash: &str,
         file_idx: usize,
-        hot_file: Option<HotFilePriorityPlan>,
+        hot_file: Option<usize>,
         source: &'static str,
     ) {
         let info_hash = info_hash.to_lowercase();
-        if self
-            .get_engine(&info_hash)
-            .await
-            .is_some_and(|engine| engine.handle.manages_playback_lifecycle())
-        {
-            return;
-        }
         self.activate_multifile_file(&info_hash, file_idx, hot_file, source)
             .await;
     }
@@ -3598,7 +3526,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         &self,
         info_hash: &str,
         file_idx: usize,
-        hot_file: Option<HotFilePriorityPlan>,
+        hot_file: Option<usize>,
         source: &'static str,
     ) {
         let Some(engine) = self.get_engine(info_hash).await else {
@@ -3610,7 +3538,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
 
         let generation = self.priority_generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let now = self.clock.now_secs();
         let previous_file_idx = {
             let mut selections = self.active_multifile_files.write().await;
             selections
@@ -3619,8 +3546,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     MultiFileActiveSelection {
                         file_idx,
                         generation,
+                        #[cfg(test)]
                         source,
-                        last_seen_secs: now,
+                        #[cfg(test)]
+                        last_seen_secs: self.clock.now_secs(),
                     },
                 )
                 .map(|selection| selection.file_idx)
@@ -3658,13 +3587,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     async fn reconcile_multifile_engine(
         engine: Arc<Engine<B::Handle>>,
         active_file: Option<usize>,
-        hot_file: Option<HotFilePriorityPlan>,
+        hot_file: Option<usize>,
         generation: u64,
         reason: &'static str,
     ) -> bool {
-        if engine.handle.manages_playback_lifecycle() {
-            return true;
-        }
         if engine.handle.file_count().await <= 1 {
             return false;
         }
@@ -3674,8 +3600,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             .reconcile_file_priorities(TorrentFilePriorityPlan {
                 active_file,
                 hot_file,
-                generation,
-                reason,
             })
             .await
         {
@@ -4115,11 +4039,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     ///
     /// **That precondition is checked here rather than assumed.** The
     /// caller reached this path because the *registry* had no engine, and
-    /// the registry is not the session: [`Self::remove_engine`] drops an
-    /// entry and leaves the torrent running ([`Self::remove_engine`] is
-    /// what a caller that wants the engine forgotten and the torrent kept
-    /// uses; the idle sweep does both halves, but under the
-    /// [`RemovalGate`], so no add of that hash runs between them), and a
+    /// the registry is not the session: an entry can go and leave the
+    /// torrent running (the tests' `remove_engine` does exactly that; the
+    /// idle sweep does both halves, but under the [`RemovalGate`], so no add
+    /// of that hash runs between them), and a
     /// magnet add
     /// parks the hash outside both for as long as metadata takes. Unlinking
     /// the directory in either case is the corruption this layer exists to
@@ -4770,14 +4693,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             }
         };
 
-        let native_lifecycle = if let Some(engine) = self.get_engine(&info_hash).await {
+        if let Some(engine) = self.get_engine(&info_hash).await {
             // Reset idle age so removal happens after the stream becomes
             // inactive, not after the stream originally started.
             engine.touch();
-            engine.handle.manages_playback_lifecycle()
-        } else {
-            false
-        };
+        }
         self.hand_live_on(&info_hash, file_idx).await;
 
         // Nothing schedules a pause here, and nothing stamps anything. The
@@ -4790,7 +4710,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // which `hand_live_on` above has just asked. One ladder, with no
         // task per stream deciding a second time.
 
-        if !native_lifecycle && file_streams_remaining == 0 {
+        if file_streams_remaining == 0 {
             self.schedule_file_cleanup(info_hash.clone(), file_idx)
                 .await;
         }
@@ -4896,13 +4816,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         file_idx: usize,
         delay: Duration,
     ) -> Option<tokio::task::JoinHandle<()>> {
-        if self
-            .get_engine(&info_hash)
-            .await
-            .is_some_and(|engine| engine.handle.manages_playback_lifecycle())
-        {
-            return None;
-        }
         let engines = self.engines.clone();
         let active_file_streams = self.active_file_streams.clone();
         let active_multifile_files = self.active_multifile_files.clone();
@@ -4999,6 +4912,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     /// Get a reference to the backend for direct access
+    #[cfg(test)]
     pub fn get_backend(&self) -> &Arc<B> {
         &self.backend
     }
@@ -5026,7 +4940,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// order *is* the design; two constructors with two copies of it is two
     /// chances to reverse steps 2 and 3.
     pub(crate) async fn boot<F, Fut>(
-        cache_dir: std::path::PathBuf,
         download_dir: std::path::PathBuf,
         tracker_storage: Option<Arc<dyn crate::trackers::TrackerStorage>>,
         pins: Option<crate::piece_store::PinSet>,
@@ -5042,7 +4955,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let efs = Self::new_with_backend_and_storage(
             backend,
             restored,
-            cache_dir,
             download_dir,
             tracker_storage,
             public_trackers,
@@ -5053,32 +4965,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
 }
 
 impl BackendEngineFS<LibrqbitBackend> {
-    pub async fn new(
-        root_dir: std::path::PathBuf,
-        _cache_config: EngineCacheConfig,
-    ) -> Result<Self> {
-        let download_dir = root_dir.join("rqbit-downloads");
-        let resolvers =
-            crate::backend::dht_bootstrap::DhtBootstrapDns::default().resolvers_in(&download_dir);
-        let session_dir = download_dir.clone();
-        Self::boot(
-            root_dir.join("cache"),
-            download_dir,
-            None,
-            None,
-            crate::backend::PublicTrackers::Use,
-            move || {
-                LibrqbitBackend::new(
-                    session_dir,
-                    TorrentListenPort::default(),
-                    Vec::new(),
-                    resolvers,
-                )
-            },
-        )
-        .await
-    }
-
     /// What of `config` reaches librqbit: `listen_port`,
     /// `dht_bootstrap_nodes` and `dht_bootstrap_dns` as the session's
     /// listener and DHT, and of `speed_profile` and `privacy` exactly what
@@ -5102,7 +4988,6 @@ impl BackendEngineFS<LibrqbitBackend> {
         );
         let session_dir = download_dir.clone();
         Self::boot(
-            root_dir.join("cache"),
             download_dir,
             tracker_storage,
             pins,
@@ -5118,17 +5003,6 @@ impl BackendEngineFS<LibrqbitBackend> {
             },
         )
         .await
-    }
-
-    /// librqbit sessions always persist downloads to disk, so the disk-backed
-    /// constructor is the same as the regular one.
-    pub async fn new_disk_backed(
-        root_dir: std::path::PathBuf,
-        config: crate::backend::BackendConfig,
-        tracker_storage: Option<Arc<dyn crate::trackers::TrackerStorage>>,
-        pins: Option<crate::piece_store::PinSet>,
-    ) -> Result<Self> {
-        Self::new_with_storage(root_dir, config, tracker_storage, pins).await
     }
 
     /// Push a `bt*` settings change at the running session and report what
@@ -5214,8 +5088,8 @@ mod tests {
     use super::*;
     use crate::backend::librqbit::{DeferredSelection, await_initialized};
     use crate::backend::{
-        BackendFileInfo, EngineStats, FileStreamTrait, Growler, PeerDiscovery, PeerSearch,
-        RunState, StartupPhase, StatsFile, StatsOptions, SwarmCap, TorrentFilePriorityPlan,
+        BackendFileInfo, EngineStats, FileStreamTrait, PeerDiscovery, RunState, StartupPhase,
+        StatsFile, StatsOptions, TorrentFilePriorityPlan,
     };
     use crate::reconcile::{Decision, Trigger};
     use std::sync::Mutex;
@@ -5258,7 +5132,6 @@ mod tests {
         last_active_file: Mutex<Option<usize>>,
         /// The hot file of the last plan, beside the active one.
         last_hot_file: Mutex<Option<usize>>,
-        last_generation: AtomicU64,
         /// Test knob: the piece indices `drop_file_pieces` hands back as
         /// the ones the backend has agreed to forget. Empty by default,
         /// which is a backend with nothing had.
@@ -5401,10 +5274,6 @@ mod tests {
         /// asks every torrent once per pass, so this is how a test sees the
         /// loop actually running.
         has_metadata: AtomicUsize,
-        /// Test knob: this handle pauses and resumes its own torrent, like
-        /// the native Android lifecycle backend. Everything at this layer
-        /// that decides when a torrent should run has to leave it alone.
-        native_lifecycle: AtomicBool,
         /// Test knob: `start_torrent` answers `Ok` and leaves the torrent
         /// stopped, which is what librqbit does when an initial check is in
         /// flight -- `Session::unpause` clears the persisted flag and
@@ -5506,11 +5375,7 @@ mod tests {
                 .reconcile_file_priorities
                 .fetch_add(1, Ordering::SeqCst);
             *self.counters.last_active_file.lock().unwrap() = plan.active_file;
-            *self.counters.last_hot_file.lock().unwrap() =
-                plan.hot_file.as_ref().map(|hot| hot.file_idx);
-            self.counters
-                .last_generation
-                .store(plan.generation, Ordering::SeqCst);
+            *self.counters.last_hot_file.lock().unwrap() = plan.hot_file;
         }
     }
 
@@ -5760,18 +5625,7 @@ mod tests {
                 piece_length: None,
                 files,
                 sources: vec![],
-                opts: StatsOptions {
-                    connections: None,
-                    dht: true,
-                    growler: Growler::default(),
-                    handshake_timeout: None,
-                    path: String::new(),
-                    peer_search: PeerSearch::default(),
-                    swarm_cap: SwarmCap::default(),
-                    timeout: None,
-                    tracker: true,
-                    r#virtual: false,
-                },
+                opts: StatsOptions::reported(),
                 download_speed: 0.0,
                 upload_speed: 0.0,
                 downloaded: 50,
@@ -5804,10 +5658,6 @@ mod tests {
                 error: None,
                 pinned_files: pinned.into_iter().collect(),
             }
-        }
-
-        async fn add_trackers(&self, _trackers: Vec<String>) -> Result<()> {
-            Ok(())
         }
 
         async fn pin_file(&self, file_idx: usize) -> Result<()> {
@@ -5998,10 +5848,6 @@ mod tests {
             }
         }
 
-        fn manages_playback_lifecycle(&self) -> bool {
-            self.counters.native_lifecycle.load(Ordering::SeqCst)
-        }
-
         /// Counted, so a test can see the reconciler's tick reach this
         /// torrent; the answer itself is the fake's files, as the real
         /// backend's is its metadata slot.
@@ -6101,8 +5947,6 @@ mod tests {
             &self,
             file_idx: usize,
             _start_offset: u64,
-            _priority: u8,
-            _bitrate: Option<u64>,
             lookahead_bytes: u64,
         ) -> Result<Box<dyn FileStreamTrait>> {
             self.gate().await?;
@@ -6162,7 +6006,6 @@ mod tests {
         let offline = BackendEngineFS::new_with_backend_and_storage(
             FakeBackend::new(vec![]),
             HashMap::new(),
-            root.join("cache"),
             root.join("downloads"),
             None,
             crate::backend::PublicTrackers::Off,
@@ -6183,7 +6026,6 @@ mod tests {
         let online = BackendEngineFS::new_with_backend_and_storage(
             FakeBackend::new(vec![]),
             HashMap::new(),
-            root.join("cache"),
             root.join("downloads"),
             None,
             crate::backend::PublicTrackers::Use,
@@ -6346,7 +6188,6 @@ mod tests {
         let enginefs = BackendEngineFS::new_with_backend(
             FakeBackend::new(vec![handle]),
             restored,
-            root.join("cache"),
             root.join("downloads"),
         );
         // File 0 of the fixture's torrent is the one being played, which is
@@ -6401,12 +6242,7 @@ mod tests {
         let backend = FakeBackend::new(vec![a, b]);
         let removed = backend.removed_with_files.clone();
         let root = fake_engine_root();
-        let enginefs = BackendEngineFS::new_with_backend(
-            backend,
-            restored,
-            root.join("cache"),
-            root.join("downloads"),
-        );
+        let enginefs = BackendEngineFS::new_with_backend(backend, restored, root.join("downloads"));
         TwoEngines {
             enginefs,
             counters: [counters_a, counters_b],
@@ -6445,7 +6281,6 @@ mod tests {
         let enginefs = BackendEngineFS::new_with_backend(
             FakeBackend::new(Vec::new()),
             HashMap::new(),
-            root.join("cache"),
             root.join("downloads"),
         );
 
@@ -6471,7 +6306,6 @@ mod tests {
         let enginefs = BackendEngineFS::new_with_backend(
             FakeBackend::new(Vec::new()),
             HashMap::new(),
-            root.join("cache"),
             root.join("downloads"),
         );
 
@@ -6593,14 +6427,7 @@ mod tests {
         let (enginefs, counters, init) =
             test_enginefs_initializing(3, crate::backend::librqbit::TORRENT_INIT_TIMEOUT);
 
-        let hot = |file_idx: usize| {
-            Some(HotFilePriorityPlan {
-                file_idx,
-                start_offset: 0,
-                priority: 1,
-                bitrate_bytes_per_sec: None,
-            })
-        };
+        let hot = Some;
         // Both activations return immediately: reconcile defers, it must not
         // block the caller (background cleanup loops also drive it).
         let started = tokio::time::Instant::now();
@@ -6628,9 +6455,8 @@ mod tests {
             .await,
             "deferred reconcile must be applied after initialization"
         );
-        // Coalesced: only the latest plan (file 2, generation 2) was applied.
+        // Coalesced: only the latest plan (file 2) was applied.
         assert_eq!(*counters.last_active_file.lock().unwrap(), Some(2));
-        assert_eq!(counters.last_generation.load(Ordering::SeqCst), 2);
         assert_eq!(
             counters.applied_while_initializing.load(Ordering::SeqCst),
             0
@@ -6785,18 +6611,7 @@ mod tests {
             piece_length: None,
             files: vec![file(10, 100), file(60, 60)],
             sources: vec![],
-            opts: StatsOptions {
-                connections: None,
-                dht: true,
-                growler: Growler::default(),
-                handshake_timeout: None,
-                path: String::new(),
-                peer_search: PeerSearch::default(),
-                swarm_cap: SwarmCap::default(),
-                timeout: None,
-                tracker: true,
-                r#virtual: false,
-            },
+            opts: StatsOptions::reported(),
             download_speed: 0.0,
             upload_speed: 0.0,
             downloaded: 0,
@@ -7208,12 +7023,8 @@ mod tests {
         let backend = FakeBackend::new(vec![handle]);
         let placements = backend.placements.clone();
         let root = fake_engine_root();
-        let enginefs = BackendEngineFS::new_with_backend(
-            backend,
-            HashMap::new(),
-            root.join("cache"),
-            root.join("downloads"),
-        );
+        let enginefs =
+            BackendEngineFS::new_with_backend(backend, HashMap::new(), root.join("downloads"));
 
         let placement = TorrentPlacement {
             only_files: Some(vec![0]),
@@ -7266,7 +7077,6 @@ mod tests {
         let enginefs = BackendEngineFS::new_with_backend(
             FakeBackend::new(vec![handle]),
             HashMap::new(),
-            root.join("cache"),
             root.join("downloads"),
         );
         (enginefs, counters)
@@ -7394,7 +7204,6 @@ mod tests {
         let enginefs = BackendEngineFS::new_with_backend(
             FakeBackend::new(vec![handle]),
             HashMap::new(),
-            root.path().join("cache"),
             root.path().join("downloads"),
         );
         enginefs.backend.hold_add.store(true, Ordering::SeqCst);
@@ -7983,23 +7792,6 @@ mod tests {
         assert_eq!(
             enginefs.reconcile_tick().await,
             vec![(TEST_HASH.to_string(), Decision::Run)]
-        );
-    }
-
-    /// A backend that pauses and resumes its own torrents gets no second
-    /// opinion from here. Two owners of one pause is the whole class of bug
-    /// the reconciler exists to end, and it must not start by becoming one.
-    #[tokio::test(start_paused = true)]
-    async fn a_torrent_whose_backend_owns_its_lifecycle_is_left_alone() {
-        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
-        enginefs.set_free_space_probe(|_| Ok(0));
-        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
-        counters.native_lifecycle.store(true, Ordering::SeqCst);
-
-        assert!(enginefs.reconcile_tick().await.is_empty());
-        assert_eq!(
-            enginefs.reconcile_hash(TEST_HASH, Trigger::Timer).await,
-            None
         );
     }
 
@@ -9958,7 +9750,6 @@ mod tests {
         let mut enginefs = BackendEngineFS::new_with_backend(
             FakeBackend::new(vec![handle]),
             HashMap::new(),
-            root.join("cache"),
             root.join("downloads"),
         );
         enginefs.set_free_space_probe(|_| Ok(0));
@@ -10023,7 +9814,6 @@ mod tests {
         let enginefs = BackendEngineFS::new_with_backend(
             FakeBackend::new(vec![handle]),
             HashMap::new(),
-            root.join("cache"),
             root.join("downloads"),
         );
         (enginefs, counters)
@@ -10390,7 +10180,6 @@ mod tests {
                     torrents: HashMap::from([(hash.clone(), bytes.clone())]),
                 },
                 HashMap::new(),
-                tmp.path().join("cache"),
                 tmp.path().join("dl"),
             );
             enginefs.set_free_space_probe(|_| Ok(0));
@@ -10468,7 +10257,6 @@ mod tests {
                 torrents: HashMap::from([(hash.clone(), bytes.clone())]),
             },
             HashMap::new(),
-            tmp.path().join("cache"),
             tmp.path().join("dl"),
         );
         enginefs.set_free_space_probe(|_| Ok(u64::MAX));
@@ -10543,7 +10331,6 @@ mod tests {
         let enginefs = BackendEngineFS::new_with_backend(
             FakeBackend::new(vec![handle.clone()]),
             HashMap::from([(TEST_HASH.to_string(), handle)]),
-            root.join("cache"),
             root.join("downloads"),
         );
         let download_dir = root.join("downloads");
@@ -10625,7 +10412,6 @@ mod tests {
         };
         let seen = Arc::new(AtomicUsize::new(0));
         let enginefs = BackendEngineFS::boot(
-            root.join("cache"),
             download_dir.clone(),
             None,
             Some(pins),
@@ -11327,7 +11113,6 @@ mod tests {
             let enginefs = BackendEngineFS::new_with_backend(
                 FakeBackend::new(vec![handle]),
                 restored,
-                root.join("cache"),
                 root.join("downloads"),
             );
             (enginefs, counters)
@@ -11428,7 +11213,6 @@ mod tests {
             let enginefs = BackendEngineFS::new_with_backend(
                 FakeBackend::new(vec![handle]),
                 restored,
-                root.join("cache"),
                 root.join("downloads"),
             );
             (enginefs, counters)
@@ -16765,7 +16549,6 @@ mod tests {
         let enginefs = BackendEngineFS::new_with_backend(
             FakeBackend::new(vec![handle]),
             HashMap::new(),
-            root.path().join("cache"),
             root.path().join("downloads"),
         );
         std::fs::create_dir_all(root.path().join("downloads")).unwrap();
@@ -16853,7 +16636,6 @@ mod tests {
         let enginefs = BackendEngineFS::new_with_backend(
             FakeBackend::new(vec![handle]),
             HashMap::new(),
-            root.path().join("cache"),
             root.path().join("downloads"),
         );
         std::fs::create_dir_all(root.path().join("downloads")).unwrap();
@@ -16914,7 +16696,6 @@ mod tests {
         let enginefs = BackendEngineFS::new_with_backend(
             FakeBackend::new(vec![handle]),
             HashMap::new(),
-            root.path().join("cache"),
             root.path().join("downloads"),
         );
         std::fs::create_dir_all(root.path().join("downloads")).unwrap();
@@ -17081,7 +16862,6 @@ mod tests {
         let enginefs = BackendEngineFS::new_with_backend(
             FakeBackend::new(vec![handle]),
             HashMap::new(),
-            root.path().join("cache"),
             root.path().join("rqbit-downloads"),
         );
         std::fs::create_dir_all(root.path().join("rqbit-downloads")).unwrap();
@@ -17148,7 +16928,6 @@ mod tests {
         let enginefs = BackendEngineFS::new_with_backend(
             FakeBackend::new(Vec::new()),
             HashMap::new(),
-            root.path().join("cache"),
             root.path().join("rqbit-downloads"),
         );
         let pieces = enginefs.piece_store().path().to_path_buf();
@@ -17203,7 +16982,7 @@ mod tests {
         let piece = pieces.join("0").join("1");
         std::fs::write(&piece, [7u8; 100]).unwrap();
 
-        enginefs.get_or_add_engine(TEST_HASH).await.unwrap();
+        enginefs.get_or_add_magnet(TEST_HASH, None).await.unwrap();
         enginefs.remove_engine(TEST_HASH).await;
         assert!(enginefs.get_engine(TEST_HASH).await.is_none());
         assert!(
@@ -17260,7 +17039,6 @@ mod tests {
         let enginefs = BackendEngineFS::new_with_backend(
             FakeBackend::new(Vec::new()),
             HashMap::new(),
-            root.path().join("cache"),
             root.path().join("rqbit-downloads"),
         );
         std::fs::create_dir_all(root.path().join("rqbit-downloads")).unwrap();
@@ -17774,7 +17552,6 @@ mod tests {
         let mut enginefs = BackendEngineFS::new_with_backend(
             FakeBackend::new(vec![handle]),
             HashMap::new(),
-            root.path().join("cache"),
             root.path().join("downloads"),
         );
         // No room, so the pin is refused and drops the torrent it added.
@@ -17837,7 +17614,6 @@ mod tests {
         let enginefs = Arc::new(BackendEngineFS::new_with_backend(
             FakeBackend::new(vec![handle]),
             HashMap::new(),
-            root.path().join("cache"),
             root.path().join("downloads"),
         ));
         enginefs
@@ -17881,7 +17657,6 @@ mod tests {
         let enginefs = Arc::new(BackendEngineFS::new_with_backend(
             FakeBackend::new(vec![handle]),
             HashMap::new(),
-            root.path().join("cache"),
             root.path().join("downloads"),
         ));
         enginefs.backend.hold_add.store(true, Ordering::SeqCst);
@@ -18140,7 +17915,6 @@ mod tests {
                 removed: removed.clone(),
             },
             HashMap::new(),
-            root.path().join("cache"),
             root.path().join("downloads"),
         );
         Gated {

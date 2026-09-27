@@ -18,56 +18,13 @@ mod rar_fixtures;
 #[path = "support/fixture_pins.rs"]
 mod fixture_pins;
 
-/// Client builder that sends the server's bearer token on every request --
-/// every control route requires it, and every server has one.
-fn bearer_client_builder(handle: &ServerHandle) -> reqwest::blocking::ClientBuilder {
-    let mut headers = reqwest::header::HeaderMap::new();
-    let token = handle.auth_token().expect("every launch generates a token");
-    headers.insert(
-        reqwest::header::AUTHORIZATION,
-        format!("Bearer {token}").parse().expect("valid header"),
-    );
-    reqwest::blocking::Client::builder().default_headers(headers)
-}
-
-fn bearer_client(handle: &ServerHandle) -> anyhow::Result<reqwest::blocking::Client> {
-    Ok(bearer_client_builder(handle).build()?)
-}
-
-/// The base config every test here spreads from: `ServerConfig::default()`
-/// with DHT bootstrap name resolution turned off, so starting a server makes
-/// no DNS query and no DNS-over-HTTPS request, and with the public tracker
-/// lists off, so adding a torrent announces to nothing. The stock configs
-/// leave both on (that is asserted below); tests must stay offline, and on a
-/// runner with no DNS at all the resolution ladder would otherwise spend its
-/// whole budget failing, once per server.
-///
-/// The tracker half was missing until a Windows CI failure printed a
-/// torrent's `sources`: twenty-seven public trackers, one of them answering
-/// a scrape 59 seconds old. Every test in this file was doing live tracker
-/// I/O. `real_torrent` passes `trackers: Vec::new()`, which looked like
-/// enough and never was -- `EngineFS::merged_trackers` prepends the built-in
-/// list and whatever the tracker manager has fetched, below the caller.
-fn offline_config() -> ServerConfig {
-    ServerConfig {
-        resolve_dht_bootstrap_names: false,
-        use_public_trackers: false,
-        // And no multicast either. Two of these switches were not enough:
-        // local service discovery stayed on, every test announced its info
-        // hashes to the network the runner was on, and two concurrent runs
-        // of a fixture built from the same bytes -- the same info hash --
-        // found each other and fed each other pieces.
-        enable_local_service_discovery: false,
-        // An embedder that keeps a pin record and has nothing in it yet.
-        // `None` is not the same thing -- it is "nobody said", which keeps
-        // every torrent's data and reports it all as pinned -- and it has a
-        // test of its own; spreading it here would turn every retention and
-        // idle-pause test in the file into one about a cache that may not be
-        // touched.
-        pins: Some(Default::default()),
-        ..ServerConfig::default()
-    }
-}
+/// The offline config, the control client, a real torrent and the piece
+/// count, shared with every binary that starts a server.
+#[path = "support/torrent_fixtures.rs"]
+mod torrent_fixtures;
+use torrent_fixtures::{
+    bearer_client, bearer_client_builder, offline_config, pieces_held, real_torrent,
+};
 
 /// [`offline_config`] for a test that seeds a torrent's pieces itself and
 /// then reads them back.
@@ -487,10 +444,7 @@ fn background_traffic_is_dark_on_an_idle_server() -> anyhow::Result<()> {
 
     // And it created nothing on the way: the engine still knows no torrent.
     let (engine, runtime) = handle.engine_for_tests();
-    let torrents: Vec<String> = runtime
-        .block_on(engine.get_all_statistics())
-        .into_keys()
-        .collect();
+    let torrents: Vec<String> = runtime.block_on(engine.list_engines());
     assert!(torrents.is_empty(), "asking lit an engine: {torrents:?}");
 
     handle.shutdown()?;
@@ -1558,31 +1512,6 @@ fn a_zero_length_torrent_file_is_an_empty_body_not_a_416() -> anyhow::Result<()>
     Ok(())
 }
 
-/// A real multi-file torrent (correct piece hashes, 16 KiB pieces) built
-/// from the files under `dir`, whose name becomes the torrent name --
-/// librqbit's `<root>/<name>` folder in the cache root. Returns the
-/// metainfo bytes and the info hash.
-fn real_torrent(dir: &std::path::Path) -> (Vec<u8>, String) {
-    let rt = tokio::runtime::Runtime::new().expect("runtime");
-    rt.block_on(async {
-        let t = librqbit::create_torrent(
-            dir,
-            librqbit::CreateTorrentOptions {
-                name: None,
-                trackers: Vec::new(),
-                piece_length: Some(16384),
-            },
-            &librqbit::spawn_utils::BlockingSpawner::new(1),
-        )
-        .await
-        .expect("create torrent");
-        (
-            t.as_bytes().expect("serialize").to_vec(),
-            t.info_hash().as_string(),
-        )
-    })
-}
-
 /// Pre-seed a whole torrent's data where the server actually reads it: the
 /// piece store. See [`seed_piece_store_pieces`] for the rules.
 fn seed_piece_store(cache_root: &std::path::Path, torrent_bytes: &[u8], content: &std::path::Path) {
@@ -1728,12 +1657,6 @@ fn seed_piece_store_pieces(
 /// streaming cache and an offline download alike.
 fn piece_store(cache_root: &std::path::Path) -> enginefs::piece_store::StoreRoot {
     enginefs::piece_store::StoreRoot::in_download_dir(&cache_root.join("rqbit-downloads"))
-}
-
-/// How many pieces the store holds for a torrent -- asked of the store, so
-/// nothing here has to know how they are laid out.
-fn pieces_held(cache_root: &std::path::Path, info_hash: &str) -> usize {
-    piece_store(cache_root).stat(info_hash).pieces.len()
 }
 
 /// The indices of the complete pieces a torrent's piece store holds.
@@ -3450,7 +3373,7 @@ fn a_clean_takes_no_pinned_and_no_ownerless_byte() -> anyhow::Result<()> {
     // Written *after* the server opened, and that is the whole of why it is
     // here rather than above: a previous release's whole-file data is the
     // one category with no owner, and the launch sweep
-    // (`piece_store::sweep_legacy_downloads`) is what takes it -- at launch,
+    // (`piece_store::sweep::sweep_legacy_downloads`) is what takes it -- at launch,
     // and nowhere else. Put here, these stand for the life of the process
     // exactly as they would in one that had already booted, which is what
     // makes them a witness that no *route* takes them.
@@ -4015,9 +3938,9 @@ fn a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it() -> anyhow
 /// Without it the timer would start it a couple of seconds later and the
 /// test would pass whatever the route did.
 ///
-/// Nothing seeds this fixture, so the member is never read and the client
-/// gives up -- which is the point. What the request has to leave behind is
-/// a torrent that is running.
+/// Nothing seeds this fixture, so the member is never read and the request
+/// parks -- which is the point. What the request has to cause, while it is
+/// parked, is a torrent that is running.
 #[test]
 fn an_archive_member_request_starts_the_torrent_it_reads_from() -> anyhow::Result<()> {
     const FLOOR: u64 = enginefs::CACHE_FREE_SPACE_FLOOR;
@@ -4094,29 +4017,44 @@ fn an_archive_member_request_starts_the_torrent_it_reads_from() -> anyhow::Resul
     // `torrent:<info hash>/<path in the torrent>` is one path segment, so
     // the separator inside it is encoded; the member after it is the
     // wildcard. The zip reader goes looking for the central directory and
-    // parks there for ever, so the client giving up is the expected end --
-    // and the timeout is generous rather than tight because what is being
-    // waited for is the *server* reaching its registration, on a loaded
-    // machine running the whole suite in parallel.
-    let anonymous = reqwest::blocking::Client::new();
-    match anonymous
-        .get(format!(
-            "{base}/zip/stream/torrent:{info_hash}%2Ffixture.zip/first.txt"
-        ))
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-    {
-        Ok(response) => assert_ne!(
-            response.status(),
-            reqwest::StatusCode::NOT_FOUND,
+    // parks there for ever, so the request is sent on a socket of its own
+    // and the torrent watched while it is parked -- the start is what the
+    // request has to cause, and waiting out a client timeout would only
+    // spend the suite's time. The bound is generous because what is waited
+    // for is the *server* reaching its registration, on a loaded machine
+    // running the whole suite in parallel.
+    let mut request = std::net::TcpStream::connect(handle.http_addr())?;
+    std::io::Write::write_all(
+        &mut request,
+        format!(
+            "GET /zip/stream/torrent:{info_hash}%2Ffixture.zip/first.txt HTTP/1.1\r\n\
+             Host: {}\r\n\r\n",
+            handle.http_addr()
+        )
+        .as_bytes(),
+    )?;
+    request.set_read_timeout(Some(std::time::Duration::from_millis(50)))?;
+    let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
+    let mut answered = Vec::new();
+    while swarm_paused(&handle)? {
+        let mut buf = [0u8; 512];
+        match std::io::Read::read(&mut request, &mut buf) {
+            // Closed: nothing more will come, and the read no longer waits.
+            Ok(0) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Ok(read) => answered.extend_from_slice(&buf[..read]),
+            Err(_) => {}
+        }
+        anyhow::ensure!(
+            !answered.starts_with(b"HTTP/1.1 404"),
             "the route found neither the torrent nor the archive member"
-        ),
-        Err(error) => assert!(error.is_timeout(), "{error}"),
+        );
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the archive request never started the torrent it was about to read from: {}",
+            String::from_utf8_lossy(&answered)
+        );
     }
-    assert!(
-        !swarm_paused(&handle)?,
-        "the archive request started the torrent it was about to read from"
-    );
+    drop(request);
 
     handle.shutdown()?;
     handle.join()?;
@@ -4135,9 +4073,9 @@ fn member_payload(len: usize) -> Vec<u8> {
 /// because such a fixture needs to know where the member's bytes are:
 /// uncompressed, they run from a local header at the front to the central
 /// directory at the back, so a hole anywhere in the middle of the file is a
-/// hole in the member's data and nowhere else. `Stored` is also the member
-/// that is served from the torrent with no extraction at all, so a test
-/// about extractions asks for `Deflate`.
+/// hole in the member's data and nowhere else. `Stored` is also the only
+/// member that is served at all -- a compressed one is refused -- so a test
+/// about the refusal asks for `Deflate`.
 fn member_zip(member: &str, len: usize, compression: async_zip::Compression) -> Vec<u8> {
     let data = member_payload(len);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -4627,8 +4565,8 @@ fn a_rar_set_in_a_torrent_missing_its_middle_volume_is_refused_by_name() -> anyh
 ///
 /// The body is held open by the fixture rather than by the client's reading
 /// pace: the middle of the archive is missing from the piece store and no
-/// peer will bring it, so the extraction parks there and the response stays
-/// open however slowly or quickly the client reads.
+/// peer will bring it, so the member's read parks there and the response
+/// stays open however slowly or quickly the client reads.
 #[test]
 fn an_archive_body_keeps_its_torrent_running_while_it_is_open() -> anyhow::Result<()> {
     const MEMBER: &str = "member.bin";
@@ -4639,7 +4577,7 @@ fn an_archive_body_keeps_its_torrent_running_while_it_is_open() -> anyhow::Resul
 
     // The hole sits well inside the member's own bytes: the local header at
     // the front and the central directory at the back are both seeded, so the
-    // zip opens and the extraction gets going before it stalls.
+    // zip opens and the member's read gets going before it stalls.
     let (handle, base, info_hash) = archive_member_server(
         config_dir.path(),
         cache_dir.path(),

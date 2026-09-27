@@ -90,10 +90,10 @@
 //! [`store::StoreRoot::in_download_dir`] of the same `download_dir` librqbit
 //! persists the session into.
 //! It is passed to no individual add, and that is not a stylistic choice:
-//! three things had to be decided in the rqbit fork before it could be wired
-//! at all, and all three are about the have-set rather than about storage.
-//! All three are settled at the rev this crate pins, and the last of them is
-//! what let [`policy`] be wired up ([`crate::retention`]).
+//! the things below had to be decided in the rqbit fork before it could be
+//! wired at all, and they are about the have-set rather than about storage.
+//! All of them are settled at the rev this crate pins, and the last of them
+//! is what let [`policy`] be wired up ([`crate::retention`]).
 //!
 //! **Settled: where the have-set comes from.** `initial_check` walks files in
 //! order and, on the first read error in a file, marks the rest of that file
@@ -148,7 +148,7 @@
 //! (`<download dir>/<torrent name>/<file>`), not under it, so
 //! [`store::StoreRoot::unregistered_bytes`] never reads them (it is one
 //! `read_dir` of `.pieces`) and no usage figure counts them -- and so
-//! [`sweep_legacy_downloads`] removes them whole, on the first launch that
+//! [`sweep::sweep_legacy_downloads`] removes them whole, on the first launch that
 //! is handed a pin set, on the same hop as [`sweep_before_session`]'s sweep
 //! of `.pieces`. Named here rather than left to be discovered: a category
 //! of byte with no owner and no deleter is how a disk becomes unbounded,
@@ -193,7 +193,6 @@ pub mod registry;
 pub mod store;
 pub mod sweep;
 
-pub use crate::chunk_store::StoredChunk as StoredPiece;
 pub use layout::{FileSpec, PieceLayout, Segment};
 pub use pin_record::{PinSet, PinsUnknown};
 pub use policy::{Buffering, Decision, RetentionPolicy, Shape, Share};
@@ -201,7 +200,7 @@ pub use registry::{DeleteOutcome, PieceCompleted, StoreRegistry};
 pub use store::{
     HeldSnapshot, MissingPiece, PieceStore, PieceStoreFactory, StoreRoot, StoredTorrent, layout_of,
 };
-pub use sweep::{SweepReport, sweep_before_session, sweep_legacy_downloads, sweep_unadopted};
+pub use sweep::{SweepReport, sweep_before_session};
 
 /// The store's directory inside a torrent cache root.
 ///

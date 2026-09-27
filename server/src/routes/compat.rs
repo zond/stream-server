@@ -15,6 +15,21 @@ pub struct FileCandidate {
     pub length: u64,
 }
 
+/// A torrent's files as [`resolve_file_idx`] chooses among them, in the
+/// torrent's own order: the one mapping the stream route, the stats and the
+/// panel numbers share, so the three cannot pick different files.
+pub fn candidates(files: &[enginefs::backend::BackendFileInfo]) -> Vec<FileCandidate> {
+    files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| FileCandidate {
+            index,
+            name: file.name.clone(),
+            length: file.length,
+        })
+        .collect()
+}
+
 pub fn query_values(query: Option<&str>, name: &str) -> Vec<String> {
     query
         .map(|q| {
@@ -68,7 +83,7 @@ pub fn query_value_is_true(value: &str) -> bool {
 /// that may be the first to touch a torrent (stream, HEAD, both `stats.json`
 /// variants) must create the engine through this or
 /// `EngineFS::get_or_begin_add_magnet`: the librqbit backend cannot add
-/// trackers to a torrent after the fact (see `LibrqbitHandle::add_trackers`),
+/// trackers to a torrent after the fact (see `magnet_with_trackers`),
 /// so whichever request arrives first fixes the tracker set for the whole
 /// session. A stats poll racing the first stream request must therefore not
 /// create a tracker-less engine that the stream request then silently reuses.

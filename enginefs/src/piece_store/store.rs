@@ -813,15 +813,6 @@ impl PieceStore {
         Ok(())
     }
 
-    /// `init` as librqbit runs it, for a test that wants the check it
-    /// begins: the seed and the registration, and the store left checking
-    /// until a take ends it.
-    #[cfg(any(test, feature = "test-seed"))]
-    pub fn init_begins_check_for_tests(&self) -> anyhow::Result<()> {
-        std::fs::create_dir_all(self.dir())?;
-        self.seed_from_disk()
-    }
-
     fn ensure_live(&self) -> anyhow::Result<()> {
         if self.live.load(Ordering::Acquire) {
             Ok(())

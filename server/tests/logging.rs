@@ -15,7 +15,12 @@ fn a_second_start_in_one_process_rotates_nothing() -> anyhow::Result<()> {
         config_dir: Some(dir.path().join("config")),
         cache_dir: Some(dir.path().join("cache")),
         init_logging: true,
+        // Ephemeral, and offline like every other server a test starts: the
+        // default HTTP port is a fixed one another process may hold.
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         resolve_dht_bootstrap_names: false,
+        use_public_trackers: false,
+        enable_local_service_discovery: false,
         pins: Some(Default::default()),
         ..ServerConfig::default()
     };

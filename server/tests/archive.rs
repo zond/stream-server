@@ -14,26 +14,11 @@ use std::sync::{Arc, Mutex};
 #[path = "support/rar_fixtures.rs"]
 mod rar_fixtures;
 
-fn offline_config() -> stream_server::ServerConfig {
-    stream_server::ServerConfig {
-        resolve_dht_bootstrap_names: false,
-        // Neither file adds a BitTorrent torrent today, so nothing here
-        // reaches `merged_trackers` -- but the two halves of "offline"
-        // belong together, and `embed.rs` paid for having only one of them.
-        use_public_trackers: false,
-        // And no multicast: see `embed.rs`, where a test run announcing its
-        // info hashes found another test run and fed it pieces.
-        enable_local_service_discovery: false,
-        // An embedder that keeps a pin record and has nothing in it yet.
-        // `None` is not the same thing -- it is "nobody said", which keeps
-        // every torrent's data and reports it all as pinned -- and it has a
-        // test of its own; spreading it here would turn every retention and
-        // idle-pause test in the file into one about a cache that may not be
-        // touched.
-        pins: Some(Default::default()),
-        ..stream_server::ServerConfig::default()
-    }
-}
+/// The offline config, the control client and a real torrent, shared with
+/// every binary that starts a server.
+#[path = "support/torrent_fixtures.rs"]
+mod torrent_fixtures;
+use torrent_fixtures::offline_config;
 
 const FIRST_CONTENT: &[u8] = b"hello from the first entry\n";
 

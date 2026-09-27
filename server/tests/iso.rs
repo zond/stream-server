@@ -24,6 +24,12 @@ use stream_server::{ServerConfig, ServerHandle};
 #[path = "support/fixture_pins.rs"]
 mod fixture_pins;
 
+/// The offline config, the control client and a real torrent, shared with
+/// every binary that starts a server.
+#[path = "support/torrent_fixtures.rs"]
+mod torrent_fixtures;
+use torrent_fixtures::{bearer_client, real_torrent, seed_single_file};
+
 /// Offline, and with the pin set unknown.
 ///
 /// Every server here reads a disc image this file seeded into the piece
@@ -34,11 +40,7 @@ mod fixture_pins;
 /// Nothing in this file is about retention, so nothing here wants that
 /// timer.
 fn offline_config() -> ServerConfig {
-    fixture_pins::keep_what_the_fixture_seeded(ServerConfig {
-        resolve_dht_bootstrap_names: false,
-        use_public_trackers: false,
-        ..ServerConfig::default()
-    })
+    fixture_pins::keep_what_the_fixture_seeded(torrent_fixtures::offline_config())
 }
 
 /// How long a torrent's initial check is given (`embed.rs` waits the same).
@@ -179,7 +181,7 @@ impl Server {
         // After the start, never before: the launch-time sweep deletes a
         // piece directory the pin set does not name (see
         // `embed.rs::seed_piece_store_pieces`).
-        seed_piece_store(&self.cache_root, &torrent, image);
+        seed_single_file(&self.cache_root, &torrent, image);
         let client = bearer_client(&self.handle)?;
         client
             .post(format!("{}/create", self.base))
@@ -249,73 +251,6 @@ impl Server {
         self.handle.shutdown()?;
         self.handle.join()?;
         Ok(())
-    }
-}
-
-fn bearer_client(handle: &ServerHandle) -> anyhow::Result<reqwest::blocking::Client> {
-    let mut headers = reqwest::header::HeaderMap::new();
-    let token = handle.auth_token().expect("every launch generates a token");
-    headers.insert(
-        reqwest::header::AUTHORIZATION,
-        format!("Bearer {token}").parse().expect("valid header"),
-    );
-    Ok(reqwest::blocking::Client::builder()
-        .default_headers(headers)
-        .build()?)
-}
-
-/// A real `.torrent` of `dir`, and its info hash.
-fn real_torrent(dir: &Path) -> (Vec<u8>, String) {
-    let rt = tokio::runtime::Runtime::new().expect("runtime");
-    rt.block_on(async {
-        let t = librqbit::create_torrent(
-            dir,
-            librqbit::CreateTorrentOptions {
-                name: None,
-                trackers: Vec::new(),
-                piece_length: Some(16384),
-            },
-            &librqbit::spawn_utils::BlockingSpawner::new(1),
-        )
-        .await
-        .expect("create torrent");
-        (
-            t.as_bytes().expect("serialize").to_vec(),
-            t.info_hash().as_string(),
-        )
-    })
-}
-
-/// Pre-seed a one-file torrent's every piece where the server reads them:
-/// the piece store. The single-file case of `embed.rs`'s
-/// `seed_piece_store_pieces`, with the layout asked of the store.
-fn seed_piece_store(cache_root: &Path, torrent_bytes: &[u8], content: &[u8]) {
-    let meta = librqbit::torrent_from_bytes(torrent_bytes).expect("parse the torrent back");
-    let info_hash = meta.info_hash.as_string();
-    let info = meta.info.data.validate().expect("validated metainfo");
-    let piece_length = info.lengths().default_piece_length() as u64;
-    assert_eq!(
-        content.len() as u64,
-        info.lengths().total_length(),
-        "the fixture and the torrent disagree about the payload"
-    );
-    let store =
-        enginefs::piece_store::StoreRoot::in_download_dir(&cache_root.join("rqbit-downloads"));
-    let layout = enginefs::piece_store::PieceLayout::new(
-        piece_length,
-        content.len() as u64,
-        [enginefs::piece_store::FileSpec {
-            len: content.len() as u64,
-            padding: false,
-        }],
-    )
-    .expect("a layout for the fixture");
-    let pieces =
-        enginefs::piece_store::PieceStore::new(store.torrent_dir(&info_hash), Arc::new(layout));
-    for (index, piece) in content.chunks(piece_length as usize).enumerate() {
-        let path = pieces.piece_path(index as u32);
-        std::fs::create_dir_all(path.parent().expect("a bucket")).expect("piece bucket");
-        std::fs::write(&path, piece).expect("write a piece");
     }
 }
 

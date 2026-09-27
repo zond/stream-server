@@ -224,6 +224,7 @@ pub const fn librqbit_stream_lookahead_bytes(fetching: Fetching) -> u64 {
 /// and not readable yet, so the bar can move while the piece fails its
 /// hash and drops back -- a rare cost against a bar that moves in 512
 /// steps rather than two.
+#[cfg(test)]
 pub fn initial_window_progress(
     file_offset: u64,
     file_len: u64,
@@ -307,21 +308,6 @@ pub fn reader_piece_index(
     }
     let within = read_from.min(file_len - 1);
     Some((file_offset + within) / piece_length)
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct EngineCacheConfig {
-    pub size: u64,
-    pub enabled: bool,
-}
-
-impl Default for EngineCacheConfig {
-    fn default() -> Self {
-        Self {
-            size: 10 * 1024 * 1024 * 1024, // 10 GB
-            enabled: true,
-        }
-    }
 }
 
 #[cfg(test)]

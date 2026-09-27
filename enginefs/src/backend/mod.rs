@@ -290,20 +290,6 @@ impl std::fmt::Debug for DroppedFilePieces {
     }
 }
 
-/// What a torrent is actually doing, read from the backend's own state
-/// machine rather than from its persisted "paused" flag.
-///
-/// The two are not the same thing, and the difference is not academic:
-/// librqbit keeps a `paused` bool on the torrent *and* a
-/// `ManagedTorrentState` enum, writes them at different moments, and lets
-/// them disagree in **both** directions across a torrent's initial check
-/// (see [`TorrentHandle::run_state`] for the two sequences and the source
-/// lines). A caller that asks "is it paused?" therefore gets an answer that
-/// can be wrong either way; a caller that asks "what is it doing?" gets the
-/// state the torrent will actually behave as.
-///
-/// Nothing here is a claim about *why* a torrent is stopped -- that is the
-/// caller's policy to recompute, not the backend's to remember.
 /// See [`TorrentHandle::retry_outlook`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RetryOutlook {
@@ -319,6 +305,19 @@ pub struct RetryOutlook {
     pub next_retry: Option<std::time::Duration>,
 }
 
+/// What a torrent is actually doing, read from the backend's own state
+/// machine rather than from its persisted "paused" flag.
+///
+/// The two are not the same thing, and the difference is not academic:
+/// librqbit keeps a `paused` bool on the torrent *and* a
+/// `ManagedTorrentState` enum, writes them at different moments, and lets
+/// them disagree in **both** directions across a torrent's initial check
+/// (see [`TorrentHandle::run_state`] for the two sequences). A caller that asks "is it paused?" therefore gets an answer that
+/// can be wrong either way; a caller that asks "what is it doing?" gets the
+/// state the torrent will actually behave as.
+///
+/// Nothing here is a claim about *why* a torrent is stopped -- that is the
+/// caller's policy to recompute, not the backend's to remember.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
     /// Connected to peers, reading and writing: the only state in which a
@@ -329,8 +328,8 @@ pub enum RunState {
     Paused,
     /// Hash-checking, or between checks. **Not a settled state**: nothing may
     /// be concluded from it about where the torrent will end up, because that
-    /// depends on a `start_paused` captured when the check began, which is
-    /// not observable from here.
+    /// is decided when the check finishes, by the pause intent as it stands
+    /// then.
     ///
     /// `pause_requested` is the backend's persisted pause intent for a
     /// torrent in this state -- see [`TorrentHandle::run_state`] for exactly
@@ -344,10 +343,6 @@ pub enum RunState {
     Gone,
 }
 
-// `'static` because a handle is what the retention owner's backing is built
-// over (`engine::TorrentBacking<H>`), and the owner's `Backing` is `'static`
-// so a pass can be spawned as a task. Every handle is a concrete type with
-// no borrow in it, so nothing is excluded.
 /// One holder of a claim on a piece a read is waiting on, as the blocked
 /// read's diagnostic prints it: the two halves of the backend's takeover
 /// rule (rqbit's `CLAIMS.md`) beside what is left to fetch.
@@ -385,6 +380,10 @@ impl std::fmt::Display for ClaimLine {
     }
 }
 
+// `'static` because a handle is what the retention owner's backing is built
+// over (`engine::TorrentBacking<H>`), and the owner's `Backing` is `'static`
+// so a pass can be spawned as a task. Every handle is a concrete type with
+// no borrow in it, so nothing is excluded.
 #[async_trait::async_trait]
 pub trait TorrentHandle: Send + Sync + Clone + 'static {
     fn info_hash(&self) -> String;
@@ -407,7 +406,6 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     /// of the sum and the sum reads as "not grown"); a caller reporting the
     /// totals themselves must pass the absence on.
     fn transfer_totals(&self) -> Option<TransferTotals>;
-    async fn add_trackers(&self, trackers: Vec<String>) -> Result<()>;
     /// Cheap check for whether every file the torrent wants is whole on the
     /// disk -- [`EngineStats::is_finished`] without the rest of the
     /// statistics. Unlike `stats()`, this must not rebuild the full statistics
@@ -435,61 +433,53 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     async fn has_metadata(&self) -> bool {
         self.stats().await.has_metadata
     }
-    /// Whether this handle owns file selection, resume, and idle-pause
-    /// lifecycle internally.
-    fn manages_playback_lifecycle(&self) -> bool {
-        false
-    }
-    /// Cheap per-file completion check used to avoid probing sparse local files.
-    async fn is_file_complete(&self, _file_idx: usize) -> bool {
-        false
-    }
     /// What the torrent is doing right now: [`RunState`], read from the
     /// backend's state machine, never from its `paused` flag.
     ///
     /// The flag is what `is_paused()` returns and what every "did we pause
-    /// this?" question used to be asked of, and across a torrent's initial
-    /// check it is wrong in both directions. Read against librqbit at the
-    /// pinned rev (`c280959`), all line numbers in
-    /// `crates/librqbit/src/`:
+    /// this?" question used to be asked of. The flag and the state are two
+    /// writes, and across a torrent's initial check they have disagreed in
+    /// both directions. Read against upstream librqbit (`c280959`), by
+    /// function:
     ///
-    /// * **A swallowed unpause.** `Session::unpause` (`session.rs:1660`) is
-    ///   `ManagedTorrent::start`, which writes `g.paused = false`
-    ///   (`torrent_state/mod.rs:649`) *before* `_start` looks at the state.
-    ///   The `Initializing` arm then finds a check already running --
-    ///   `if !init.try_start_check() { return Ok(()) }` (`:548-551`) -- and
-    ///   returns success having started nothing. That in-flight check
-    ///   finishes with the `start_paused` captured when *it* began, so its
-    ///   continuation re-enters `_start` (`:587`) and, if the torrent was
-    ///   added paused, returns at `:607` leaving the state `Paused`. Net:
-    ///   a stopped torrent whose flag says it is running.
-    /// * **A swallowed pause.** `TorrentStateInitializing::check` only ever
-    ///   passes `pause_requested` to `FileOps::initial_check`
-    ///   (`torrent_state/initializing.rs:279`, read at `file_ops.rs:113`);
-    ///   `validate_fastresume` (`initializing.rs:117-244`) never reads it.
-    ///   So a pause landing during a *fastresume* check sets the flag,
-    ///   `request_pause()` is ignored, the check returns `Ok`, and the
-    ///   continuation applies the add-time `start_paused` -- `false` for a
-    ///   torrent restored unpaused -- and takes it `Live` (`:606-620`). Net:
-    ///   a downloading torrent whose flag says it is paused. This is the
-    ///   measured 3 MiB -> 12 MiB overshoot past the free-space floor.
+    /// * **A swallowed unpause.** `Session::unpause` is
+    ///   `ManagedTorrent::start`, which writes the intent *before* `_start`
+    ///   looks at the state; the `Initializing` arm then finds a check
+    ///   already running and returns success having started nothing, and
+    ///   that check's continuation landed on the `start_paused` captured when
+    ///   *it* began. Net: a stopped torrent whose flag says it is running.
+    /// * **A swallowed pause.** `TorrentStateInitializing::check` hands
+    ///   `pause_requested` to `FileOps::initial_check` and to nothing else,
+    ///   so a pause during a *fastresume* check went unseen, and the
+    ///   continuation applied the add-time `start_paused` -- `false` for a
+    ///   torrent restored unpaused -- and took it `Live`. Net: a downloading
+    ///   torrent whose flag says it is paused. This is the measured
+    ///   3 MiB -> 12 MiB overshoot past the free-space floor.
+    ///
+    /// The fork's `f21c3a3e` has the continuation read the intent under the
+    /// lock as it stands when the check finishes, which closes both; the
+    /// librqbit tests `an_unpause_during_the_initial_check_starts_the_torrent`
+    /// and `a_pause_during_a_fastresume_check_leaves_the_torrent_parked` are
+    /// this side's guard on it. The rule stays, because two writes are two
+    /// writes.
     ///
     /// There is a third shape with no flag divergence but no settled state
-    /// either: a pause during a *full* check does bail it (`file_ops.rs:113`),
-    /// and the `Err` arm returns `Ok` without changing the state
-    /// (`mod.rs:590-593`), leaving the torrent `Initializing` with no check
-    /// running -- which `wait_until_initialized` (`mod.rs:759`) polls
-    /// forever. `Paused` and `Initializing { .. }` are different answers here
-    /// for that reason: only the first is a state a caller can start again.
+    /// either: a pause during a *full* check does stop it (`FileOps::
+    /// initial_check` bails on the request), and the continuation leaves the
+    /// torrent `Initializing` with no check running and nothing but an
+    /// unpause to run it again -- `ManagedTorrent::wait_until_initialized`
+    /// refuses a waiter on exactly that pair. `Paused` and `Initializing
+    /// { .. }` are different answers here for that reason: only the first is
+    /// a state a caller can start again in one transition.
     ///
     /// `pause_requested` on that variant is the backend's *persisted pause
     /// intent*, not librqbit's private `pause_requested` bool, which is
-    /// `pub(crate)` (`initializing.rs:103`) and cannot be read from outside
-    /// the crate at this rev. For an initializing torrent the two agree
-    /// wherever `ManagedTorrent::pause` set them, since it writes both under
-    /// the one write guard (`mod.rs:677-683`); they differ for a torrent
-    /// *added* paused, where `start_paused` sets the flag and the
-    /// `Initializing` arm clears the bool (`mod.rs:550`). Both mean the same
+    /// `pub(crate)` on `TorrentStateInitializing` and cannot be read from
+    /// outside the crate. For an initializing torrent the two agree wherever
+    /// `ManagedTorrent::pause` set them, since it writes both under the one
+    /// write guard; they differ for a torrent *added* paused, where
+    /// `start_paused` sets the flag and `_start`'s `Initializing` arm clears
+    /// the bool. Both mean the same
     /// thing to a caller -- a pause is pending on this check -- which is why
     /// the flag is the honest thing to report. What it does **not** tell you
     /// is whether the check is still running.
@@ -580,17 +570,6 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     /// start it made.
     async fn start_torrent(&self) -> Result<()> {
         anyhow::bail!("this backend cannot start a stopped torrent")
-    }
-    /// Throttle (or restore) the torrent's upload rate to control seeding
-    /// WITHOUT disconnecting peers. Pausing a torrent disconnects every peer,
-    /// and after a long idle the swarm cannot be reliably re-acquired (tracker
-    /// min-announce-intervals reject the reannounce and the DHT routing table
-    /// decays), which stalls the next episode's download indefinitely. Clamping
-    /// upload instead stops seeding while keeping the torrent connected, so a
-    /// newly-requested file downloads immediately from the existing peers.
-    /// `true` = clamp upload to a trickle; `false` = restore unlimited upload.
-    async fn set_upload_throttled(&self, _throttled: bool) -> Result<()> {
-        Ok(())
     }
     /// Reconcile wanted files for multi-file torrents. Backends that cannot
     /// apply per-file priorities may leave this as a no-op.
@@ -759,8 +738,6 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
         &self,
         file_idx: usize,
         start_offset: u64,
-        priority: u8,
-        bitrate: Option<u64>,
         lookahead_bytes: u64,
     ) -> Result<Box<dyn FileStreamTrait>>;
     async fn get_files(&self) -> Vec<BackendFileInfo>;
@@ -779,20 +756,14 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     async fn prepare_file_for_streaming(&self, file_idx: usize) -> Result<()>;
 }
 
+/// Which files of a multi-file torrent playback wants: the one being
+/// played, and one fetched beside it (a subtitle opened during a film).
+/// Files, and nothing else about them -- no backend reads an offset, a
+/// priority or a bitrate of either.
 #[derive(Debug, Clone)]
 pub struct TorrentFilePriorityPlan {
     pub active_file: Option<usize>,
-    pub hot_file: Option<HotFilePriorityPlan>,
-    pub generation: u64,
-    pub reason: &'static str,
-}
-
-#[derive(Debug, Clone)]
-pub struct HotFilePriorityPlan {
-    pub file_idx: usize,
-    pub start_offset: u64,
-    pub priority: u8,
-    pub bitrate_bytes_per_sec: Option<u64>,
+    pub hot_file: Option<usize>,
 }
 
 /// What the mainline DHT looks like from this host, as the backend sees it.
@@ -1116,16 +1087,6 @@ pub struct PeerSearch {
     pub sources: Vec<String>,
 }
 
-impl Default for PeerSearch {
-    fn default() -> Self {
-        Self {
-            max: 200,
-            min: 40,
-            sources: Vec::new(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[derive(Default)]
@@ -1189,31 +1150,27 @@ pub const MAX_EFFECTIVE_BT_CONNECTIONS: u64 = 1200;
 pub const MIN_EFFECTIVE_BT_CONNECTIONS: u64 = 80;
 
 impl TorrentSpeedProfile {
-    /// `(session-wide, per-torrent, was the request normalized)`.
-    ///
-    /// Only the per-torrent figure is used -- it is librqbit's live-peer
-    /// cap, per torrent, and there is no session-wide one to set. The
-    /// derivation is `/4` clamped to 40..=200: the divisor is there
+    /// The per-torrent live-peer cap `btMaxConnections` makes: librqbit's
+    /// cap is per torrent, and there is no session-wide one to set. The
+    /// setting is normalised first (0 or the legacy "unlimited" is the
+    /// default, anything else clamped to
+    /// [`MIN_EFFECTIVE_BT_CONNECTIONS`]..=[`MAX_EFFECTIVE_BT_CONNECTIONS`]),
+    /// and the derivation is `/4` clamped to 40..=200: the divisor is there
     /// because the setting is a session-wide number in Stremio's model and
     /// a device usually has a few torrents alive, and the floor of 40 is
     /// what a stream needs to keep its window ahead of the playhead. With
     /// the default of [`DEFAULT_BT_MAX_CONNECTIONS`] that lands exactly on
     /// the floor, which is deliberate -- see that constant.
-    pub fn effective_connection_limits(&self) -> (i32, i32, bool) {
+    pub fn effective_connection_limits(&self) -> usize {
         let requested = self.bt_max_connections;
         let normalized = if requested == 0 || requested >= LEGACY_UNLIMITED_BT_MAX_CONNECTIONS {
             DEFAULT_BT_MAX_CONNECTIONS
         } else {
             requested.clamp(MIN_EFFECTIVE_BT_CONNECTIONS, MAX_EFFECTIVE_BT_CONNECTIONS)
         };
-
-        let per_torrent = (normalized / 4).clamp(40, 200).min(normalized).max(1);
-
-        (
-            normalized as i32,
-            per_torrent as i32,
-            normalized != requested,
-        )
+        // Never above `normalized` and never zero, since `normalized` is at
+        // least `MIN_EFFECTIVE_BT_CONNECTIONS`.
+        (normalized / 4).clamp(40, 200) as usize
     }
 }
 
@@ -1409,10 +1366,6 @@ impl TorrentListenPort {
 pub struct BackendConfig {
     /// Where librqbit listens for incoming peers; read once at session start.
     pub listen_port: TorrentListenPort,
-    pub cache: priorities::EngineCacheConfig,
-    pub growler: Growler,
-    pub peer_search: PeerSearch,
-    pub swarm_cap: SwarmCap,
     pub speed_profile: TorrentSpeedProfile,
     pub privacy: TorrentPrivacyConfig,
     /// DHT bootstrap nodes (`host:port`), read once at session start like
@@ -1467,6 +1420,32 @@ pub struct StatsOptions {
     pub timeout: Option<u64>,
     pub tracker: bool,
     pub r#virtual: bool,
+}
+
+impl StatsOptions {
+    /// The `opts` every stats answer carries: server.js's option block, in
+    /// the shape stremio-core parses. Nothing here reads it -- librqbit runs
+    /// no peer search and no growler -- so it is one fixed answer, built in
+    /// one place, and a torrent resolving its metadata says the same as one
+    /// that has it.
+    pub fn reported() -> Self {
+        Self {
+            connections: None,
+            dht: true,
+            growler: Growler::default(),
+            handshake_timeout: None,
+            path: String::new(),
+            peer_search: PeerSearch {
+                max: 100,
+                min: 10,
+                sources: Vec::new(),
+            },
+            swarm_cap: SwarmCap::default(),
+            timeout: None,
+            tracker: true,
+            r#virtual: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -1643,18 +1622,7 @@ impl EngineStats {
                     ..Source::default()
                 })
                 .collect(),
-            opts: StatsOptions {
-                connections: None,
-                dht: true,
-                growler: Growler::default(),
-                handshake_timeout: None,
-                path: String::new(),
-                peer_search: PeerSearch::default(),
-                swarm_cap: SwarmCap::default(),
-                timeout: None,
-                tracker: true,
-                r#virtual: false,
-            },
+            opts: StatsOptions::reported(),
             download_speed: 0.0,
             upload_speed: 0.0,
             downloaded: 0,

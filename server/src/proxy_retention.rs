@@ -27,10 +27,11 @@
 //! therefore a reader with no playhead and no window: what it has is a
 //! promise, which is the other half of this module.
 //!
-//! Nothing here is persisted for the same reason. Nothing survives a
-//! restart either: the launch sweep empties this cache before the router
-//! serves, so a chunk on the disk is one this process wrote and a reader
-//! this process has.
+//! Nothing here is persisted for the same reason. Nothing unpinned survives
+//! a restart either: the launch sweep empties this cache of everything but
+//! the pinned downloads before the router serves, so a chunk on the disk is
+//! one this process wrote or one a pin kept -- and neither comes with a
+//! playhead.
 //!
 //! # An open read holds what it promised, and that is the missing interlock
 //!
@@ -422,7 +423,7 @@ async fn prefetch(
                     return;
                 }
                 let until = (from + PREFETCH_STRIDE).min(end);
-                if let Err(error) = prefetch_run(&source, from, until, &mut sink).await {
+                if let Err(error) = read_through(&source, from, until, &mut sink).await {
                     tracing::warn!(
                         key = %key_dir.display(),
                         origin = %source.describe(),
@@ -444,7 +445,13 @@ async fn prefetch(
 /// Reads `from..until` of `source` into `sink` and drops it: the read is
 /// the point, since a quiet source's reader files every chunk it passes
 /// in the cache on the way (`crate::routes::proxy::cache_assisted_range`).
-async fn prefetch_run(
+/// The read-ahead's and the download filler's one read loop.
+///
+/// A source that ends before `until` is an `UnexpectedEof`, never a short
+/// success: a caller that stepped past what was not read would either
+/// leave a hole it believes filled or, asking again at once, spin on an
+/// origin that keeps answering nothing -- an error is what makes it wait.
+pub(crate) async fn read_through(
     source: &crate::sources::ProxySource,
     from: u64,
     until: u64,
@@ -458,7 +465,10 @@ async fn prefetch_run(
         let want = ((until - from - read) as usize).min(sink.len());
         let n = reader.read(&mut sink[..want]).await?;
         if n == 0 {
-            break;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("the source ended at {} of {from}..{until}", from + read),
+            ));
         }
         read += n as u64;
     }
@@ -468,14 +478,7 @@ async fn prefetch_run(
 /// The fewest ranges that cover `chunks`, which must be sorted and
 /// distinct.
 fn runs_of(chunks: &[u32]) -> Vec<Range<u32>> {
-    let mut runs: Vec<Range<u32>> = Vec::new();
-    for &chunk in chunks {
-        match runs.last_mut() {
-            Some(run) if run.end == chunk => run.end += 1,
-            _ => runs.push(chunk..chunk + 1),
-        }
-    }
-    runs
+    enginefs::retention::sorted_runs(chunks.iter().copied())
 }
 
 /// A proxied entity, as the owner sees it: a chunk directory, its length,
@@ -760,10 +763,6 @@ impl Backing for ProxyBacking {
         }
     }
 
-    /// A pinned download: the entity's key directory is in the pin set.
-    /// `key` is the entity directory (`<key dir>/<total_type_validator>`),
-    /// so the pin is looked up by its parent. A copy-out read of the set,
-    /// as the contract asks: no owner lock is held here.
     /// The proxy's fetch of the want set: see [`Prefetcher`].
     ///
     /// `windows` are the pass's want-windows in chunk indices (each open
@@ -835,6 +834,10 @@ impl Backing for ProxyBacking {
         );
     }
 
+    /// A pinned download: the entity's key directory is in the pin set.
+    /// `key` is the entity directory (`<key dir>/<total_type_validator>`),
+    /// so the pin is looked up by its parent. A copy-out read of the set,
+    /// as the contract asks: no owner lock is held here.
     fn keeps_everything(&self, key: &PathBuf) -> bool {
         let pins = self
             .pins
@@ -1136,10 +1139,10 @@ pub(crate) enum OnDisk {
 /// and an unlink during the walk cannot leave a name the walk has already
 /// passed standing in the set. It costs that entity's chunk writes the
 /// length of one listing, once, and the listing is a short one -- the
-/// launch sweep empties this cache before the router serves
-/// (`proxy_cache::sweep`), so what a seed walks is what this process has
-/// written since playback started, and the first pass comes one stride into
-/// the film.
+/// launch sweep empties this cache of everything but the pinned downloads
+/// before the router serves (`proxy_cache::sweep`), so what a seed walks is
+/// what this process has written since playback started, or a pinned
+/// download's own entity, and the first pass comes one stride into the film.
 ///
 /// A seed that **fails** installs nothing. A listing the filesystem refused
 /// -- `EMFILE` on a television out of descriptors, a permission lost under
@@ -1538,9 +1541,6 @@ impl ProxyRetention {
         }
     }
 
-    /// Names the pinned key directories. `Some(set)` is the embedder's
-    /// record, `None` its absence (see [`Self::pins`]). Called once at boot,
-    /// before the sweep, and thereafter by [`Self::pin`]/[`Self::unpin`].
     /// Registers how the entity under `key_dir` is fetched when no player
     /// is asking -- a quiet source over its URL and credentials -- so the
     /// passes can read ahead of a player ([`Prefetcher`]). Called by the
@@ -1611,6 +1611,9 @@ impl ProxyRetention {
         );
     }
 
+    /// Names the pinned key directories. `Some(set)` is the embedder's
+    /// record, `None` its absence (see [`Self::pins`]). Called once at boot,
+    /// before the sweep, and thereafter by [`Self::pin`]/[`Self::unpin`].
     pub fn set_pins(&self, pins: Option<HashSet<PathBuf>>) {
         *self
             .pins
@@ -1644,16 +1647,6 @@ impl ProxyRetention {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .is_some_and(|pins| pins.contains(key_dir))
-    }
-
-    /// The pinned key directories, for a listing.
-    pub fn pinned(&self) -> Vec<PathBuf> {
-        self.pins
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            .map(|pins| pins.iter().cloned().collect())
-            .unwrap_or_default()
     }
 
     /// Bytes the launch sweep found on the disk and kept (pinned
@@ -1897,11 +1890,13 @@ impl ProxyRetention {
     /// `occupied + available - floor` that reads as a *larger* cap and
     /// grows the cache with every pass.
     ///
-    /// What it does not hear is a *writer* outside this process -- and
-    /// there is none left to hear. The launch sweep empties this root
-    /// before the router serves anything (`proxy_cache::sweep`), so "what
-    /// this process wrote" and "what is on the disk" are the same set from
-    /// the first byte.
+    /// What it does not hear is a *writer* outside this process. The launch
+    /// sweep empties this root of everything but the pinned downloads
+    /// before the router serves anything and books what it kept
+    /// ([`Self::restored`]), so the count and the disk are the same set from
+    /// the first byte -- except after a start that named no pin record,
+    /// which sweeps nothing and books nothing: what an earlier process left
+    /// is then on the disk and in nobody's count (`Occupancy::take`).
     pub fn occupancy(&self) -> u64 {
         self.occupancy.bytes()
     }

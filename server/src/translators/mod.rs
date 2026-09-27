@@ -12,8 +12,7 @@
 //! sequentially but refuse seeks": a compressed film is a [`Refusal`] with
 //! a sentence the player shows. That is the decision the whole design
 //! rests on -- only the thing that downloads a file may store it -- and it
-//! is why `.archives`, the extraction cache under the cache root, ceases
-//! to exist for the formats that have come through here. See
+//! is why there is no extraction cache. See
 //! `docs/design/translated-sources.md`.
 //!
 //! Verification is the fetcher's: a torrent's bytes are piece-verified by
@@ -431,6 +430,25 @@ impl Translator for TarGz {
     }
 }
 
+/// A member's name as the route matches it: `/`-separated, with no
+/// leading `/` or `./`. Every translator names its members through this and
+/// nothing else, because a name is what a request selects by: a RAR or 7z
+/// written on Windows (and some ZIPs) store `\\`, and `tar cf x.tar
+/// ./movie.mkv` stores `./movie.mkv` -- a member the route could not find by
+/// the name the player shows.
+pub(crate) fn member_name(stored: &str) -> String {
+    let mut name = stored.replace('\\', "/");
+    loop {
+        if let Some(rest) = name.strip_prefix('/') {
+            name = rest.to_string();
+        } else if let Some(rest) = name.strip_prefix("./") {
+            name = rest.to_string();
+        } else {
+            return name;
+        }
+    }
+}
+
 /// Little-endian integers out of a header, `None` past its end -- a
 /// truncated structure is a refusal the caller words, never a panic.
 pub(crate) fn le_u16(bytes: &[u8], at: usize) -> Option<u16> {
@@ -479,6 +497,18 @@ mod tests {
 
     fn source(bytes: Vec<u8>) -> Arc<dyn ByteSource> {
         Arc::new(MemorySource::new("fixture", bytes))
+    }
+
+    /// One spelling of a member's name whatever wrote the container.
+    #[test]
+    fn a_member_is_named_with_slashes_and_no_leading_root() {
+        assert_eq!(member_name("Season 1\\E01.mkv"), "Season 1/E01.mkv");
+        assert_eq!(member_name("/abs/x.mkv"), "abs/x.mkv");
+        assert_eq!(member_name("./movie.mkv"), "movie.mkv");
+        assert_eq!(member_name(".\\sub\\movie.mkv"), "sub/movie.mkv");
+        assert_eq!(member_name("/././/movie.mkv"), "movie.mkv");
+        assert_eq!(member_name("dir/./movie.mkv"), "dir/./movie.mkv");
+        assert_eq!(member_name(".hidden"), ".hidden");
     }
 
     /// A refusal is one sentence about the file, and its kind is the word

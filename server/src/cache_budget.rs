@@ -184,10 +184,9 @@ impl CacheLimit {
 /// fail is the platform's business, not this function's: `statvfs` wants
 /// the path to exist, so on Unix a root not yet created is unreadable, while
 /// Windows resolves the volume from the drive letter (`GetVolumePathNameW`)
-/// and answers for a directory nothing has made yet. The tests therefore
-/// The test for what an unreadable volume does therefore writes the `None`
-/// straight into a [`CacheLimit`] rather than finding a path the OS will
-/// refuse.
+/// and answers for a directory nothing has made yet. The test for what an
+/// unreadable volume does therefore writes the `None` straight into a
+/// [`CacheLimit`] rather than finding a path the OS will refuse.
 pub(crate) fn available_space(path: &std::path::Path) -> Option<u64> {
     match fs4::available_space(path) {
         Ok(available) => Some(available),

@@ -138,10 +138,6 @@ impl PieceLayout {
         self.total_length
     }
 
-    pub fn file_count(&self) -> usize {
-        self.files.len()
-    }
-
     /// The length of one piece. Every piece is [`Self::default_piece_length`]
     /// except the last, which is short exactly when the total length does not
     /// divide evenly -- when it does, the last piece is full size, which is
@@ -181,10 +177,6 @@ impl PieceLayout {
     /// `FileExtent::owns_bytes`. `false` for an out-of-range id.
     pub fn owns_bytes(&self, file_id: usize) -> bool {
         self.files.get(file_id).is_some_and(|f| f.owns_bytes)
-    }
-
-    pub fn file_len(&self, file_id: usize) -> anyhow::Result<u64> {
-        Ok(self.file(file_id)?.len)
     }
 
     fn file(&self, file_id: usize) -> anyhow::Result<&FileExtent> {

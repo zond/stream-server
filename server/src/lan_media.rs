@@ -75,11 +75,6 @@ impl LanMedia {
         }
     }
 
-    /// The address a listener would bind, whether or not one is running.
-    pub fn configured_addr(&self) -> Option<SocketAddr> {
-        self.configured_addr
-    }
-
     /// The address the listener is bound to right now, or `None` when it is
     /// not running. With a configured port of 0 this is the OS-assigned port,
     /// which is why the answer comes from the listener and not from the

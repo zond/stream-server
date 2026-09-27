@@ -191,10 +191,7 @@ impl HttpsDohResolver {
     /// [`DOH_ENDPOINTS`]. `None` if the TLS stack will not build, in which
     /// case there simply is no DoH fallback -- not a start-up failure.
     pub fn new() -> Option<Self> {
-        let client = crate::http_client_builder()
-            .timeout(DOH_REQUEST_TIMEOUT)
-            .build()
-            .ok()?;
+        let client = crate::http_client_builder().build().ok()?;
         Some(Self {
             client,
             endpoints: DOH_ENDPOINTS.iter().map(|s| s.to_string()).collect(),
@@ -216,26 +213,29 @@ impl DohDnsResolver for HttpsDohResolver {
         let name = urlencoding::encode(host);
         for endpoint in &self.endpoints {
             let url = format!("{endpoint}?name={name}&type=A");
+            // One bound, on the request: it runs from the connect to the
+            // last byte of the body, so it covers the whole exchange, and an
+            // injected client (`with_client`) is bounded the same way.
             let request = self
                 .client
                 .get(&url)
                 .header("accept", "application/dns-json")
                 .timeout(DOH_REQUEST_TIMEOUT)
                 .send();
-            let body = match tokio::time::timeout(DOH_REQUEST_TIMEOUT, request).await {
-                Ok(Ok(response)) => match response.error_for_status() {
+            let body = match request.await {
+                Ok(response) => match response.error_for_status() {
                     Ok(response) => response.text().await.ok(),
                     Err(e) => {
                         debug!(host, endpoint, error = %e, "DoH provider returned an error status");
                         None
                     }
                 },
-                Ok(Err(e)) => {
-                    debug!(host, endpoint, error = %e, "DoH request failed");
+                Err(e) if e.is_timeout() => {
+                    debug!(host, endpoint, "DoH request timed out");
                     None
                 }
-                Err(_) => {
-                    debug!(host, endpoint, "DoH request timed out");
+                Err(e) => {
+                    debug!(host, endpoint, error = %e, "DoH request failed");
                     None
                 }
             };

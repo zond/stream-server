@@ -308,7 +308,7 @@ impl MetadataResolutionGuard {
         let guard = Self { active_readers };
 
         engine.touch();
-        if !engine.handle.manages_playback_lifecycle() && !engine.handle.has_metadata().await {
+        if !engine.handle.has_metadata().await {
             engine_fs
                 .reconcile_hash(
                     &engine.info_hash,
@@ -374,8 +374,8 @@ impl PlaybackQuery {
     }
 }
 
-/// What a read is for, from the only two things the request really says:
-/// who asked, and whether it is a download.
+/// What a read is for, from the one thing the request really says: whether
+/// it is a download.
 ///
 /// **The range is not read at all any more.** Its offset and length used to
 /// be classified into eight intents -- a first read, a seek, a sequential
@@ -385,13 +385,7 @@ impl PlaybackQuery {
 /// viewer. Every one of those questions is now answered by watching what
 /// the reads do, so this is down to the one bit a read cannot be watched
 /// into telling us: whether anybody is waiting for these bytes at a rate.
-fn playback_intent_for_request(priority: u8, is_download: bool) -> Fetching {
-    // The server's own reads -- priority 255 is the reconciler's probe, 0 a
-    // background fetch -- read a header and stop, so the small number is
-    // the right one for them too.
-    if priority == 255 || priority == 0 {
-        return Fetching::Streaming;
-    }
+fn playback_intent_for_request(is_download: bool) -> Fetching {
     if is_download {
         Fetching::Download
     } else {
@@ -399,41 +393,35 @@ fn playback_intent_for_request(priority: u8, is_download: bool) -> Fetching {
     }
 }
 
+/// The `Content-Type` a torrent file is served with, by its extension and
+/// whatever case it is written in (`MOVIE.MKV` is a Matroska file too).
+/// A table of its own rather than `mime_guess`, which the archive and FTP
+/// routes use, because the two disagree where a player cares: `mime_guess`
+/// calls `.ts` `video/vnd.dlna.mpeg-tts` and `.opus` `audio/ogg`, and knows
+/// no `.eac3`.
 fn content_type_for_name(name: &str) -> &'static str {
-    if name.ends_with(".mp4") {
-        "video/mp4"
-    } else if name.ends_with(".mkv") {
-        "video/x-matroska"
-    } else if name.ends_with(".ts") {
-        "video/mp2t"
-    } else if name.ends_with(".avi") {
-        "video/x-msvideo"
-    } else if name.ends_with(".mov") {
-        "video/quicktime"
-    } else if name.ends_with(".wmv") {
-        "video/x-ms-wmv"
-    } else if name.ends_with(".webm") {
-        "video/webm"
-    } else if name.ends_with(".mp3") {
-        "audio/mpeg"
-    } else if name.ends_with(".m4a") {
-        "audio/mp4"
-    } else if name.ends_with(".aac") {
-        "audio/aac"
-    } else if name.ends_with(".flac") {
-        "audio/flac"
-    } else if name.ends_with(".wav") {
-        "audio/wav"
-    } else if name.ends_with(".ogg") {
-        "audio/ogg"
-    } else if name.ends_with(".opus") {
-        "audio/opus"
-    } else if name.ends_with(".ac3") {
-        "audio/ac3"
-    } else if name.ends_with(".eac3") || name.ends_with(".ec3") {
-        "audio/eac3"
-    } else {
-        "application/octet-stream"
+    let extension = name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    match extension.as_str() {
+        "mp4" => "video/mp4",
+        "mkv" => "video/x-matroska",
+        "ts" => "video/mp2t",
+        "avi" => "video/x-msvideo",
+        "mov" => "video/quicktime",
+        "wmv" => "video/x-ms-wmv",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "flac" => "audio/flac",
+        "wav" => "audio/wav",
+        "ogg" => "audio/ogg",
+        "opus" => "audio/opus",
+        "ac3" => "audio/ac3",
+        "eac3" | "ec3" => "audio/eac3",
+        _ => "application/octet-stream",
     }
 }
 
@@ -881,15 +869,7 @@ async fn head_stream_video_with(
 
     let _metadata_resolution = MetadataResolutionGuard::acquire(&engine_fs, &engine).await;
     let files = engine.handle.get_files().await;
-    let candidates = files
-        .iter()
-        .enumerate()
-        .map(|(index, file)| compat::FileCandidate {
-            index,
-            name: file.name.clone(),
-            length: file.length,
-        })
-        .collect::<Vec<_>>();
+    let candidates = compat::candidates(&files);
     let idx = match compat::resolve_file_idx(&requested_idx, &candidates, &query.filters) {
         Ok(idx) => idx,
         Err(err) => {
@@ -918,7 +898,7 @@ async fn head_stream_video_with(
     let Some(framing) = util::MediaRange::of(range_header.as_deref(), size) else {
         return util::range_not_satisfiable(size);
     };
-    let (start, end, is_partial) = (framing.start, framing.end, framing.partial);
+    let (start, end) = (framing.start, framing.end);
     let mut res_headers = header::HeaderMap::new();
     res_headers.insert(
         header::CONTENT_TYPE,
@@ -942,11 +922,7 @@ async fn head_stream_video_with(
         end
     );
 
-    if is_partial {
-        (StatusCode::PARTIAL_CONTENT, res_headers, Body::empty()).into_response()
-    } else {
-        (StatusCode::OK, res_headers, Body::empty()).into_response()
-    }
+    (framing.status(), res_headers, Body::empty()).into_response()
 }
 
 pub async fn stream_video(
@@ -1027,15 +1003,7 @@ async fn stream_video_with(
 
     let _metadata_resolution = MetadataResolutionGuard::acquire(&engine_fs, &engine).await;
     let files = engine.handle.get_files().await;
-    let candidates = files
-        .iter()
-        .enumerate()
-        .map(|(index, file)| compat::FileCandidate {
-            index,
-            name: file.name.clone(),
-            length: file.length,
-        })
-        .collect::<Vec<_>>();
+    let candidates = compat::candidates(&files);
     let idx = match compat::resolve_file_idx(&requested_idx, &candidates, &query.filters) {
         Ok(idx) => idx,
         Err(err) => {
@@ -1107,13 +1075,11 @@ async fn stream_video_with(
         return refusal.into_response();
     }
     let start_offset_hint = start;
-    // Parse priority from enginefs-prio header
-    let priority: u8 = if let Some(prio_val) = headers.get("enginefs-prio") {
-        prio_val.to_str().unwrap_or("1").parse().unwrap_or(1)
-    } else {
-        1
-    };
-    let playback_intent = playback_intent_for_request(priority, is_download);
+    // A player's read, at the ordinary priority. The server's own reads
+    // (the probes that pass 255 to skip the playback preparation) never
+    // come through this route, and no request header may ask for that.
+    let priority: u8 = 1;
+    let playback_intent = playback_intent_for_request(is_download);
     // **Always on, unlike the retention trace.** What the player actually
     // asked for, before anything here interprets it: two lines per range
     // request, which is the order every field log so far has been read in
@@ -1121,7 +1087,7 @@ async fn stream_video_with(
     // the retention trace's lines are placed into when that is on.
     //
     // `intent` is *our* label -- `playback_intent_for_request` derives it
-    // from the priority header and the download flag. A player says neither;
+    // from the download flag. A player says nothing of the kind;
     // it sends a byte range. So the range itself is logged beside the label,
     // because a question about what a player is doing cannot be answered by
     // reading back our own guess about it.
@@ -1142,7 +1108,6 @@ async fn stream_video_with(
         from_end = size.saturating_sub(start),
         end,
         is_partial,
-        priority,
         intent = ?playback_intent,
         stage = "stream_request",
         "a player asked for a range"
@@ -1153,7 +1118,6 @@ async fn stream_video_with(
         Some(profile) => profile,
         None => state.settings.read().await.buffer_profile,
     };
-    let native_lifecycle = engine.handle.manages_playback_lifecycle();
     if !is_download && !is_partial && start == 0 {
         tracing::info!(
             stream_id,
@@ -1169,9 +1133,7 @@ async fn stream_video_with(
     // and a persistence write -- for the same set. Planned from this
     // request alone it would also drop the film an aside open (a subtitle)
     // is fetched beside, which `on_stream_start` keeps selected.
-    if !native_lifecycle {
-        engine_fs.focus_torrent(&info_hash).await;
-    }
+    engine_fs.focus_torrent(&info_hash).await;
 
     // Await the async get_file
     tracing::debug!(
@@ -1179,7 +1141,6 @@ async fn stream_video_with(
         info_hash = %info_hash,
         file_idx = idx,
         start_offset = start_offset_hint,
-        priority,
         intent = ?playback_intent,
         buffer = buffer_profile.as_str(),
         "stream_video calling get_file"
@@ -1288,10 +1249,8 @@ async fn stream_video_with(
     // for torrent pieces that have not arrived yet.
     let reader = file.take(content_length);
 
-    // Use ReaderStream to convert AsyncRead to Stream for Axum Body
-    // OPTIMIZATION: Use 256KB buffer for improved throughput with large pieces
-    // Larger buffer = fewer poll_read calls = less priority calculation overhead
-    let base_stream = tokio_util::io::ReaderStream::with_capacity(reader, 262144);
+    // Read in `MEDIA_BODY_CHUNK_BYTES` (see there for what 4 KiB reads cost).
+    let base_stream = crate::routes::archive::media_body(reader);
 
     // Wrap with StreamGuard to notify when stream ends
     let mut lifecycle = lifecycle;
@@ -1329,11 +1288,7 @@ async fn stream_video_with(
         );
     }
 
-    if is_partial {
-        (StatusCode::PARTIAL_CONTENT, res_headers, body).into_response()
-    } else {
-        (StatusCode::OK, res_headers, body).into_response()
-    }
+    (framing.status(), res_headers, body).into_response()
 }
 
 /// Map a failed `try_get_file_with_intent` to the HTTP response for a stream
@@ -1387,6 +1342,17 @@ fn stream_open_failure_status(err: &GetFileError) -> (StatusCode, String) {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    /// A file's type is its extension's, in any case.
+    #[test]
+    fn a_content_type_is_read_off_the_extension_in_any_case() {
+        assert_eq!(content_type_for_name("Movie.mkv"), "video/x-matroska");
+        assert_eq!(content_type_for_name("MOVIE.MKV"), "video/x-matroska");
+        assert_eq!(content_type_for_name("dir/Track.Ec3"), "audio/eac3");
+        assert_eq!(content_type_for_name("clip.TS"), "video/mp2t");
+        assert_eq!(content_type_for_name("README"), "application/octet-stream");
+        assert_eq!(content_type_for_name("mkv"), "application/octet-stream");
+    }
 
     /// The bound is on the *request*, not on the passes: a reclaim parked
     /// on a disk that has stopped answering must not hold a player's
@@ -1595,31 +1561,14 @@ mod tests {
         let file_size: u64 = 10 * 1024 * 1024 * 1024;
         for start in [0, 1024, file_size - 25_962_800, file_size - 1024] {
             assert_eq!(
-                playback_intent_for_request(1, true),
+                playback_intent_for_request(true),
                 Fetching::Download,
                 "a download, asking from {start}"
             );
             assert_eq!(
-                playback_intent_for_request(1, false),
+                playback_intent_for_request(false),
                 Fetching::Streaming,
                 "a player, asking from {start}"
-            );
-        }
-    }
-
-    /// The server's own reads: priority 255 is the reconciler's probe, 0 a
-    /// background fetch. Both read a header and stop.
-    #[test]
-    fn the_servers_own_reads_take_the_streaming_window() {
-        for priority in [0, 255] {
-            assert_eq!(
-                playback_intent_for_request(priority, false),
-                Fetching::Streaming
-            );
-            assert_eq!(
-                playback_intent_for_request(priority, true),
-                Fetching::Streaming,
-                "a probe is not turned into a download by a query parameter"
             );
         }
     }

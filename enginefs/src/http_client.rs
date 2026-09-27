@@ -69,10 +69,10 @@
 ///
 /// What it buys is that nothing silently stops verifying. Everything this
 /// server speaks HTTPS to is on the open internet -- public trackers, a
-/// tracker list on GitHub, DoH resolvers, Stremio's certificate API, and the
-/// remote media URLs `/proxy` and `/ftp` are handed -- and that traffic is
+/// tracker list on GitHub, DoH resolvers, Google Drive, and the remote media
+/// URLs `/proxy` and the archive `/create`s are handed -- and that traffic is
 /// worth protecting: an announce URL carries this peer's identity and the
-/// torrents it holds, `/get-https` carries the user's Stremio auth key, and a
+/// torrents it holds, a Drive request carries the user's grant, and a
 /// proxied stream URL often carries a credential of its own. A device or
 /// organisation that has installed its own CA keeps working, which is what
 /// stops a failure here from being routed around.
@@ -103,10 +103,7 @@ pub fn http_client_builder() -> reqwest::ClientBuilder {
 /// is read until the client's timeout. Refused at once on a declared
 /// `Content-Length` over the cap, and otherwise at the first chunk that
 /// crosses it.
-pub(crate) async fn read_capped(
-    mut response: reqwest::Response,
-    max: usize,
-) -> anyhow::Result<Vec<u8>> {
+pub async fn read_capped(mut response: reqwest::Response, max: usize) -> anyhow::Result<Vec<u8>> {
     if let Some(declared) = response.content_length()
         && declared > max as u64
     {

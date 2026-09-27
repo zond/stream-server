@@ -12,8 +12,8 @@
 //! say which one is *its* player's. So the client mints the name instead. It
 //! puts a token of its own in the proxy URL it hands the player (`p=` --
 //! see [`crate::routes::proxy`]), every stream opened through such a URL is
-//! registered here under that token, and one control call closes every
-//! stream bearing it. A pleasant side effect: the count of live streams for
+//! registered here under that token, and one call
+//! (`ServerHandle::close_proxy_streams`) closes every stream bearing it. A pleasant side effect: the count of live streams for
 //! a token is the count of players actually attached, which nothing outside
 //! this process could work out before.
 //!
@@ -23,7 +23,7 @@
 //! not the end of the stream: ffmpeg is started with `reconnect=1`, and a
 //! body that broke mid-file is re-fetched through the very same
 //! `/proxy/...&p=<token>` URL -- measured, three times over on one live
-//! reader, each close answering `{"closed":1}` and each answer followed by
+//! reader, each close answering 1 and each answer followed by
 //! a fresh origin fetch at the offset the last one died at. So the token is
 //! struck off too: [`ProxyStreams::is_closed`] stays true for it, and
 //! `/proxy` refuses any later request bearing it. The pair is what ends a
@@ -32,8 +32,8 @@
 //! **Ask the player to quit first, then close.** A cancelled demuxer never
 //! reaches the reconnect at all (ffmpeg checks its interrupt callback
 //! before the retry sleep, before every `url_read` and inside the socket
-//! poll), so the close then finds nothing left to close and answers
-//! `{"closed":0}` -- which is the quiet, correct outcome. Closing *first*
+//! poll), so the close then finds nothing left to close and answers 0 --
+//! which is the quiet, correct outcome. Closing *first*
 //! races the cancel, and losing that race is a reconnect provoked on the
 //! way out: one more origin connection for a player that is leaving.
 //!
@@ -101,7 +101,7 @@ impl ProxyStreams {
     /// which is the cheap half -- a refusal that costs the origin nothing --
     /// but that check is over long before the origin's first byte arrives.
     /// The window is the whole time-to-first-byte: measured, a close during
-    /// one answered `{"closed":0}` and 3.9 MB was relayed afterwards, under
+    /// one answered 0 and 3.9 MB was relayed afterwards, under
     /// a token nothing could name any more. So the retirement and the
     /// registration are decided under the same lock, and a stream either
     /// belongs to a token that is still live or is never registered at all.
@@ -126,7 +126,7 @@ impl ProxyStreams {
     /// the registry's stream must go around the *whole* body: `Chain` never
     /// polls its second stream until the first has ended, so a close during
     /// the head of a body that registered only the tail was answered
-    /// `{"closed":1}` while every remaining chunk of the head kept coming off
+    /// 1 while every remaining chunk of the head kept coming off
     /// disk -- the close was polled, but only by the half that was not being
     /// read. Deciding first and wrapping last is how both hold.
     pub fn register(self: &Arc<Self>, token: Option<String>) -> Option<Handle> {
@@ -313,7 +313,7 @@ impl Stream for ClosableStream {
             this.ended = true;
             this.registration = None;
             return Poll::Ready(Some(Err(std::io::Error::other(
-                "proxied stream closed by control request",
+                "proxied stream closed by its client",
             ))));
         }
         let next = this.inner.as_mut().poll_next(cx);
@@ -347,7 +347,7 @@ mod tests {
     /// A stream opened while its token was live but registered after the
     /// close: the fetch was in flight the whole time, which is the window
     /// `/proxy`'s pre-fetch check cannot see. It is refused rather than
-    /// registered, so the close that already answered `{"closed":0}` is
+    /// registered, so the close that already answered 0 is
     /// still the end of that player's stream.
     #[test]
     fn a_token_retired_while_its_stream_was_opening_is_refused_the_stream() {

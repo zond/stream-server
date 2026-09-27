@@ -36,6 +36,12 @@
 
 use std::net::SocketAddr;
 
+/// The offline config, the control client and a real torrent, shared with
+/// every binary that starts a server.
+#[path = "support/torrent_fixtures.rs"]
+mod torrent_fixtures;
+use torrent_fixtures::offline_config;
+
 /// The volumes, in order. **Order is the whole of what a set is**: an
 /// extent names the volume it lives in by position in this list.
 const VOLUMES: [&str; 4] = [
@@ -44,16 +50,6 @@ const VOLUMES: [&str; 4] = [
     "https://archive.org/download/Quran.Giants/Quran.Giants.CD.part3.rar",
     "https://archive.org/download/Quran.Giants/Quran.Giants.CD.part4.rar",
 ];
-
-fn offline_config() -> stream_server::ServerConfig {
-    stream_server::ServerConfig {
-        resolve_dht_bootstrap_names: false,
-        use_public_trackers: false,
-        enable_local_service_discovery: false,
-        pins: Some(Default::default()),
-        ..stream_server::ServerConfig::default()
-    }
-}
 
 /// Four volumes of real WinRAR headers, read, and the member refused for
 /// what it actually is.

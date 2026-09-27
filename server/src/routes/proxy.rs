@@ -430,9 +430,10 @@ fn custom_request_headers(overrides: &BTreeMap<String, String>) -> HeaderMap {
                 headers.insert(header_name, header_value);
             }
             _ => {
+                // The name only: an `h=` value is as likely as not a
+                // credential, and an invalid one is still somebody's.
                 tracing::debug!(
                     name = %name,
-                    value = %value,
                     "Skipping invalid custom request header from h= proxy param"
                 );
             }
@@ -1530,9 +1531,10 @@ async fn proxy(
     headers: HeaderMap,
     method: Method,
 ) -> Response {
-    // Porting the logic from express_805.js
-    // Format 1: ?d=URL (standard)
-    // Format 2: /<query_params>/<path> (Core) where query_params contains d=ORIGIN&h=HEADER&r=RESPONSE_HEADER
+    // Two spellings of one request: `/proxy?d=<url>&...` (the query
+    // format), and `/proxy/d=<origin>&h=<header>&r=<response header>/<path>`
+    // (the Core format), where the parameters are a path segment of their
+    // own and the target's path follows them.
 
     // What the end-of-body line measures against: a player waits for the
     // origin's first byte as surely as for the last one. See
@@ -1676,13 +1678,8 @@ async fn proxy(
         // The player's negotiation headers, which are half of the cache
         // key: the source has to fetch into the entity the player reads.
         let mut negotiation = HeaderMap::new();
-        for name in FORWARDED_REQUEST_HEADERS {
-            if matches!(name, "range" | "if-range") {
-                continue;
-            }
-            if let Some(value) = headers.get(name) {
-                negotiation.insert(name, value.clone());
-            }
+        for (name, value) in crate::proxy_cache::negotiation_headers(&headers) {
+            negotiation.insert(name, value.clone());
         }
         let source = crate::sources::ProxySource::from_probe(
             state.proxy_cache.clone(),
@@ -1912,8 +1909,8 @@ async fn proxy(
     // **The registry's stream goes around the whole body, head included.**
     // It used to wrap the origin's stream alone, with the head chained in
     // front of that, and `Chain` never polls its second stream until the
-    // first has ended -- so a close during the head was answered
-    // `{"closed":1}`, `live()` fell to zero, and every remaining chunk of the
+    // first has ended -- so a close during the head was answered 1,
+    // `live()` fell to zero, and every remaining chunk of the
     // head kept coming off disk to a player whose client had finished with
     // it; the read broke only when the tail was first polled. Wrapped last,
     // the close is polled on every poll of the body, head reads included
@@ -2474,7 +2471,7 @@ pub(crate) async fn cache_assisted_range(
             ) =>
         {
             tracing::debug!(
-                url = %url,
+                origin = %util::log_origin(url.as_str()),
                 "this request would rewrite the body the cache holds; fetching it instead"
             );
             None
@@ -2483,7 +2480,7 @@ pub(crate) async fn cache_assisted_range(
         // Nothing is fetched, and the origin never learns this read happened.
         Some(cached) if cached.complete() => {
             tracing::debug!(
-                url = %url,
+                origin = %util::log_origin(url.as_str()),
                 first = cached.first,
                 last = cached.last,
                 "answering a proxied range from the cache"

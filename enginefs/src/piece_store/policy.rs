@@ -4,7 +4,7 @@
 //! The store can hold a piece or give it back, and the want-set can want a
 //! piece or stop wanting it. Neither of them decides *which* pieces. That
 //! decision is a handful of numbers -- a budget, a piece length, the pieces of
-//! one file, where the playhead is -- and it lives here on its own, beside
+//! one file, what the readers were granted -- and it lives here on its own, beside
 //! [`super::layout`] and for the same reason: it is the part that is easy to
 //! get quietly wrong and easy to test exhaustively, and it should not have to
 //! be reasoned about through a session, a disk and a swarm.
@@ -23,12 +23,13 @@
 //!
 //! **If it does not, it is split:**
 //!
-//! * One part is a rolling window around the playhead, roughly 90% ahead and
-//!   10% behind, so a short scan back is served from disk instead of from the
-//!   swarm.
+//! * One part is not shared. What goes in it is what the entity's consumers
+//!   are asking for -- the runs of the file the read-pattern detector sees
+//!   being read (`crate::retention::streams`) -- and no number here bounds
+//!   that; what is sized here is how much of the budget it leaves.
 //! * The other is committed for sharing. It is filled *opportunistically*,
-//!   from pieces we already hold -- nothing here ever asks for a byte outside
-//!   the playhead -- and once a piece is in it, it stays.
+//!   from pieces we already hold -- nothing here ever asks for a byte no
+//!   consumer asked for -- and once a piece is in it, it stays.
 //!
 //! Where the split falls is not a half any more. Both parts are bounded in
 //! *time* first ([`Buffering`]) -- so many seconds of this stream at the rate
@@ -41,8 +42,8 @@
 //! **Only what is committed is advertised** -- once an engine can be told
 //! that. That is the whole of being a good citizen here: a piece we might
 //! reclaim is never announced, so we never advertise-then-refuse, which is
-//! what gets a client choked. A window piece would be held and readable and
-//! *not* announced, because the window moves and it will go. On a small volume
+//! what gets a client choked. An unshared piece is held and readable and
+//! *not* announced, because it will go. On a small volume
 //! that means we honestly seed little; on a roomy one we seed everything.
 //!
 //! **That last part was a decision this module could state and not perform,
@@ -136,12 +137,10 @@
 use std::collections::BTreeSet;
 use std::ops::Range;
 
-/// How much of the rolling window sits behind the playhead, in percent. The
-/// rest is ahead.
-///
-/// Behind is for a scan back -- a few seconds of rewind, a player re-reading
-/// its container index -- not for a real seek, which reaches the swarm again
-/// whatever we do. Ahead is what keeps playback fed, so it gets the rest.
+/// How much of the unshared part is counted as sitting behind a reader when
+/// it is sized from a forward reach ([`window_for_reach`]), in percent: what
+/// is left in the sizing of the rolling window this part used to be, 90%
+/// ahead of the playhead and 10% behind it.
 const BEHIND_PERCENT: u64 = 10;
 
 /// How much of the budget is committed for sharing rather than spent on the
@@ -151,9 +150,9 @@ const BEHIND_PERCENT: u64 = 10;
 /// policy governs, and it is a number rather than a branch.** The budget is
 /// split between what playback needs and what a peer may be offered; a
 /// proxied URL response is not seeded, so nobody can be offered any of it and
-/// the whole budget is window. Everything else -- the 90/10 window, the
-/// release rule, the reclaim -- is the same arithmetic on both, which is what
-/// "one retention policy over both stores" means.
+/// the whole budget is unshared. Everything else -- the sizing, and the rule
+/// that a committed piece is never reclaimed -- is the same on both, which is
+/// what "one retention policy over both stores" means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Share {
     /// Half of it: a torrent's pieces, which a peer may ask us for.
@@ -383,6 +382,7 @@ impl Shape {
     /// The two halves are disjoint as *sets* -- a piece is committed
     /// exactly when the unshared half lets go of it -- so they sum, and the
     /// sum is the budget.
+    #[cfg(test)]
     pub fn piece_budget(self) -> Option<u32> {
         match self {
             Self::Whole => None,
@@ -394,7 +394,7 @@ impl Shape {
     }
 }
 
-/// What one pass decided, at one playhead position.
+/// What one pass decided.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Decision {
     /// What this pass gives back: held, uncommitted, and not asked for by
@@ -415,7 +415,7 @@ pub struct Decision {
 }
 
 /// The policy for one file being streamed, carrying the committed set across
-/// playhead positions.
+/// passes.
 ///
 /// It governs a range of *torrent* piece indices -- the pieces of the file
 /// being played -- and ignores everything outside it, so the pieces of a
@@ -539,8 +539,8 @@ impl RetentionPolicy {
     ///
     /// Where the split falls is [`Share`]'s and there is no branch on the
     /// kind of stream here: a torrent gives half of it to the committed set,
-    /// a proxied response gives none, and what is left over is the window in
-    /// both cases.
+    /// a proxied response gives none, and what is left over is the unshared
+    /// part in both cases.
     fn shape_for(
         budget_bytes: u64,
         piece_length: u64,
@@ -678,6 +678,7 @@ impl RetentionPolicy {
         &self.committed
     }
 
+    #[cfg(test)]
     pub fn is_advertised(&self, piece: u32) -> bool {
         self.committed.contains(&piece)
     }
@@ -754,29 +755,30 @@ impl RetentionPolicy {
             && !self.committed.contains(&piece)
     }
 
-    /// Decide, for a playhead on `playhead` over the pieces we currently
-    /// `held`, what the window covers, what joins the committed set, and what
-    /// to give back.
+    /// Decide, over the pieces we currently `held`, what joins the committed
+    /// set, what leaves it, and which of `giving_up` to give back.
     ///
     /// `held` is what is on disk -- the have-set, which under this design is
-    /// the piece files themselves. Pieces outside this file's range are not
-    /// this policy's to touch and are skipped, not reclaimed.
+    /// the piece files themselves. `giving_up` is what the pass has already
+    /// chosen to let go of: what the entity's consumers are not asking for,
+    /// oldest by effective age, as much as the allowance needs
+    /// (`crate::retention::streams`). Pieces outside this file's range are
+    /// not this policy's to touch and are skipped, not reclaimed.
     ///
     /// Three things can happen to a held piece of this file, not two. A piece
     /// already in the committed set is **left alone** -- not reclaimed, and
     /// not committed a second time -- because nothing here ever takes a
-    /// committed piece back (see [`Decision::committed`]); a caller that reads
-    /// this as two outcomes and reclaims whatever is outside the window
-    /// deletes the pieces it is advertising, which is the advertise-then-
-    /// refuse the whole policy exists to avoid. Any *other* held piece is
-    /// **committed** if the draw chose it ([`Self::chosen`]) and **reclaimed**
-    /// if it is outside the window and the draw did not. The playhead decides
-    /// neither: membership was settled when the policy was built, so a piece is
-    /// committed the moment we hold it, whether the window is still over it or
-    /// has never been, and a seek in either direction commits exactly the
-    /// pieces it happens to have brought in.
+    /// committed piece back (see [`Decision::committed`]); a caller that
+    /// reclaimed whatever it was giving up would delete the pieces it is
+    /// advertising, which is the advertise-then-refuse the whole policy
+    /// exists to avoid. Any *other* held piece is **committed** if the draw
+    /// chose it ([`Self::chosen`]), and **reclaimed** if it is in
+    /// `giving_up` and the draw did not choose it. Where anybody is reading
+    /// decides neither: membership was settled when the policy was built, so
+    /// a piece is committed the moment we hold it, and a seek in either
+    /// direction commits exactly the pieces it happens to have brought in.
     ///
-    /// Idempotent for a fixed playhead and a fixed `held`: the second call
+    /// Idempotent for a fixed `giving_up` and a fixed `held`: the second call
     /// commits nothing new -- the pieces it would commit are committed -- and
     /// reclaims the same pieces, because a reclaim is a request rather than a
     /// record. The caller is what makes that true, by deleting them and no

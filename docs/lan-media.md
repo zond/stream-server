@@ -93,11 +93,13 @@ exists as an operator veto that no embedder call can override.
 
 **Nothing a stranger could make this device *do* is on it.** The test of a route belonging on the LAN is that it serves bytes the loopback side has already arranged and cannot be made to arrange anything. `/proxy` and `/ftp` fail it outright -- each fetches a caller-named remote URL, which makes it an open proxy for whoever can reach it -- and so do the archive `/create` routes, which fetch an index from a caller-named URL, and the loopback stream route's first request for an info hash, which starts a torrent with the caller's trackers on this device's disk and connection (the LAN's stream route only looks a hash up, `EngineAccess::ExistingOnly`). That is tolerable on loopback -- which is not "only this app": every app on the device reaches it, and so does every page a browser on it has open, which is why loopback answers no CORS -- but not on a listener the whole LAN can reach. (A host that binds the main listener to `0.0.0.0` makes them reachable anyway -- see the [README](../README.md#quick-start).) The consequence is deliberate: a stream stremio-core plays *through* `/proxy` (an addon stream that needs request headers a player cannot attach) cannot be cast from this listener. Casting it needs another path -- the client resolving it itself, or an addon that hands out a header-free URL -- and the server does not paper over the gap by widening the LAN surface.
 
-CORS is set up for what a receiver needs: `Content-Type`, `Accept-Encoding`
-and `Range` are named allowed request headers (Google's Web Receiver CORS
-requirements ask for exactly those, and even a plain MP4 needs CORS once
-tracks are involved), and `Accept-Ranges`, `Content-Range` and
-`Content-Length` are exposed to script so a player can seek. This is the one
+CORS is set up for what a receiver needs (`lan_cors_layer` in
+`server/src/lib.rs`): any origin and method; `Accept`, `Accept-Encoding`,
+`Content-Type` and `Range` named as allowed request headers (Google's Web
+Receiver CORS requirements ask for the last three, and even a plain MP4 needs
+CORS once tracks are involved); and `Accept-Ranges`, `Content-Disposition`,
+`Content-Encoding`, `Content-Length`, `Content-Range` and `Content-Type`
+exposed to script, so a player can seek. A preflight is cached for a day. This is the one
 listener that answers CORS: the receiver is a browser media element, and the
 loopback listener's readers are not. Byte-range
 requests and `HEAD` work on this listener exactly as they do on loopback.

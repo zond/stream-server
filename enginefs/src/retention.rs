@@ -60,16 +60,12 @@ pub mod live;
 pub mod owner;
 /// The scenario harness and the fake backing every retention test is built
 /// over. **Test-only**, and a sibling of [`owner`] rather than a part of it
-/// on purpose: the policy in `owner` is being replaced whole
-/// (`docs/design/read-pattern-retention.md`), the replacement has to be proved
-/// against the same scenarios, and a fixture that lived inside the module
-/// being replaced would have to move -- taking its scenarios with it -- at
-/// the moment the comparison matters most.
+/// on purpose: a scenario is a statement about a cache, and has to outlive
+/// any rewrite of the module it measures.
 #[cfg(test)]
 pub(crate) mod scenario;
 /// What is asked of the harness: scenarios that are statements about a
-/// cache rather than about an implementation, so the same file measures the
-/// policy that replaces this one.
+/// cache rather than about an implementation.
 #[cfg(test)]
 mod scenarios;
 pub mod streams;
@@ -760,11 +756,19 @@ pub(crate) fn runs(pieces: &[u32]) -> Vec<Range<u32>> {
     let mut sorted: Vec<u32> = pieces.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
+    sorted_runs(sorted)
+}
+
+/// [`runs`] of indices that are already ascending and distinct -- a
+/// `BTreeSet`'s, a listing's -- so nothing is copied or sorted. The one
+/// run-builder both adapters use: the piece store's sets and the proxy's
+/// chunk listings alike.
+pub fn sorted_runs(indices: impl IntoIterator<Item = u32>) -> Vec<Range<u32>> {
     let mut runs: Vec<Range<u32>> = Vec::new();
-    for piece in sorted {
+    for index in indices {
         match runs.last_mut() {
-            Some(run) if run.end == piece => run.end = piece + 1,
-            _ => runs.push(piece..piece + 1),
+            Some(run) if run.end == index => run.end = index.saturating_add(1),
+            _ => runs.push(index..index.saturating_add(1)),
         }
     }
     runs

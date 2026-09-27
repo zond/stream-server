@@ -1001,6 +1001,31 @@ pub mod udf {
         image
     }
 
+    /// A good image whose root directory's first file identifier (the
+    /// parent entry, 40 bytes) claims a CRC over the whole directory, with
+    /// the CRC and checksum resealed to match: every byte it covers is
+    /// real, and all but its own belong to the identifier after it.
+    pub fn udf_with_a_fid_crc_past_its_end() -> Vec<u8> {
+        let mut b = volume();
+        let dir_len = b.directory(
+            ROOT_DIR_BLOCK,
+            ROOT_FE_BLOCK,
+            &[("MOVIE.BIN", false, FILE_FE_BLOCK)],
+        ) as usize;
+        let mut image = minimal_udf();
+        let start = Builder::block_offset(ROOT_DIR_BLOCK) as usize;
+        let d = &mut image[start..start + dir_len];
+        let crc_len = dir_len - 16;
+        let crc = crc_itu_t(&d[16..16 + crc_len]);
+        put_u16(d, 8, crc);
+        put_u16(d, 10, crc_len as u16);
+        d[4] = 0;
+        let sum: u32 = d[..4].iter().map(|&b| b as u32).sum::<u32>()
+            + d[5..16].iter().map(|&b| b as u32).sum::<u32>();
+        d[4] = (sum & 0xff) as u8;
+        image
+    }
+
     /// A subdirectory whose ICB is the root's own.
     pub fn udf_with_directory_cycle() -> Vec<u8> {
         let mut b = volume();

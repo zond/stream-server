@@ -17,8 +17,8 @@
 //! makes that a statement about the want-set and not about the fixture.
 //!
 //! A binary of its own because the file this would otherwise belong in is
-//! being edited elsewhere; the fixture helpers are the usual per-binary
-//! copies (`stream_body_end.rs` carries the single-file versions of them).
+//! being edited elsewhere; the shared scaffolding is
+//! `support/torrent_fixtures.rs`, and the multi-file seeding here is its own.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -28,6 +28,12 @@ use std::time::{Duration, Instant};
 /// unknown, and which tests may not.
 #[path = "support/fixture_pins.rs"]
 mod fixture_pins;
+
+/// The offline config, the control client and a real torrent, shared with
+/// every binary that starts a server.
+#[path = "support/torrent_fixtures.rs"]
+mod torrent_fixtures;
+use torrent_fixtures::bearer_client;
 
 /// 16 KiB pieces, and both files a whole number of them, so no piece
 /// straddles the two: a fixture that seeds one file seeds whole pieces.
@@ -146,20 +152,6 @@ fn seed_one_file(cache_root: &Path, torrent_bytes: &[u8], content: &Path, only: 
     assert!(written > 0, "the fixture seeded no piece at all");
 }
 
-fn bearer_client(
-    handle: &stream_server::ServerHandle,
-) -> anyhow::Result<reqwest::blocking::Client> {
-    let mut headers = reqwest::header::HeaderMap::new();
-    let token = handle.auth_token().expect("every launch generates a token");
-    headers.insert(
-        reqwest::header::AUTHORIZATION,
-        format!("Bearer {token}").parse().expect("valid header"),
-    );
-    Ok(reqwest::blocking::Client::builder()
-        .default_headers(headers)
-        .build()?)
-}
-
 /// Offline like every other embedded-server test (no DNS, no trackers), with
 /// the pin set unknown so nothing reclaims what the fixture seeded.
 fn config(cache: &Path, config_dir: &Path) -> stream_server::ServerConfig {
@@ -167,9 +159,7 @@ fn config(cache: &Path, config_dir: &Path) -> stream_server::ServerConfig {
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.to_path_buf()),
         cache_dir: Some(cache.to_path_buf()),
-        resolve_dht_bootstrap_names: false,
-        use_public_trackers: false,
-        ..Default::default()
+        ..torrent_fixtures::offline_config()
     })
 }
 

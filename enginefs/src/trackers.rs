@@ -304,22 +304,7 @@ impl TrackerManager {
 
     /// Get the current list of trackers
     pub async fn get_trackers(&self) -> Vec<String> {
-        let guard = self.trackers.read().await;
-        if guard.is_empty() {
-            // Fallback if empty (shouldn't happen if fetch works, but good to have)
-            Vec::new()
-        } else {
-            guard.clone()
-        }
-    }
-
-    /// Force refresh trackers now (useful for manual refresh via API)
-    pub async fn force_refresh(&self) -> anyhow::Result<()> {
-        if let Some(ref storage) = self.storage {
-            // Reset last updated to force refresh
-            storage.save_trackers(Vec::new(), 0);
-        }
-        self.refresh_if_needed().await
+        self.trackers.read().await.clone()
     }
 }
 

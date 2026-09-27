@@ -16,7 +16,9 @@
 //! **`tar.gz` is not this**: see [`super::TarGz`]. A gzip stream has no way
 //! in at the middle, so it is refused whole rather than indexed.
 
-use super::{Body, Budget, Index, Member, Refusal, Translator, direct_extent, only_source};
+use super::{
+    Body, Budget, Index, Member, Refusal, Translator, direct_extent, member_name, only_source,
+};
 use crate::sources::ByteSource;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -110,7 +112,8 @@ impl Translator for Tar {
                 // `\0` spelling is as common as `0` in tars written by
                 // hand.
                 b'0' | b'\0' => {
-                    let name = pending_name.take().unwrap_or_else(|| name_of(&header));
+                    let name =
+                        member_name(&pending_name.take().unwrap_or_else(|| name_of(&header)));
                     let extents = match direct_extent(source.as_ref(), "tar", &name, data_at, size)
                     {
                         Ok(extents) => Body::Direct(extents),
@@ -225,7 +228,10 @@ fn pax_fields(data: &[u8]) -> (Option<String>, Option<u64>) {
         else {
             break;
         };
-        if len == 0 || len > rest.len() {
+        // A record's length counts its own digits and the space, so one
+        // that ends at or before the space is malformed; slicing it would
+        // panic, and a panic here aborts the process.
+        if len <= space || len > rest.len() {
             break;
         }
         let record = &rest[space + 1..len];
@@ -366,6 +372,29 @@ mod tests {
         );
     }
 
+    /// A name stored as `./movie.mkv` (what `tar cf x.tar ./movie.mkv`
+    /// writes) is the member `movie.mkv`: the name a request selects by.
+    #[tokio::test]
+    async fn a_name_stored_under_dot_slash_is_named_without_it() {
+        let mut archive = Vec::new();
+        let record = pax_record("path", "./movie.mkv");
+        archive.extend_from_slice(&pax_block(record.as_bytes()));
+        archive.extend_from_slice(record.as_bytes());
+        archive.resize(archive.len().next_multiple_of(512), 0);
+        let mut header = ::tar::Header::new_ustar();
+        header.set_path("stub").unwrap();
+        header.set_size(512);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive.extend_from_slice(header.as_bytes());
+        archive.extend_from_slice(&payload(512));
+        archive.extend_from_slice(&[0u8; 1024]);
+        let index = Tar.index(&sources(archive)).await.expect("indexed");
+        assert_eq!(index.members.len(), 1, "{:?}", index.members);
+        assert_eq!(index.members[0].name, "movie.mkv");
+        assert!(index.find("movie.mkv").is_some());
+    }
+
     /// One PAX record, `len key=value\n`, where `len` counts itself --
     /// so it is found by trying, exactly as the writers do.
     fn pax_record(key: &str, value: &str) -> String {
@@ -454,6 +483,18 @@ mod tests {
         // The name field went with the header; only the size matters here.
         let refusal = Tar.index(&sources(archive)).await.expect_err("truncated");
         assert!(matches!(refusal, Refusal::Malformed(_)), "{refusal:?}");
+    }
+
+    /// A record whose stated length ends before its own space is
+    /// malformed, and reading it stops -- it must not slice backwards.
+    #[test]
+    fn a_pax_record_shorter_than_its_length_field_is_refused() {
+        assert_eq!(pax_fields(b"1 path=x\n"), (None, None));
+        assert_eq!(pax_fields(b"2 path=x\n"), (None, None));
+        assert_eq!(
+            pax_fields(b"10 path=x\n1 size=5\n"),
+            (Some("x".into()), None)
+        );
     }
 
     #[test]

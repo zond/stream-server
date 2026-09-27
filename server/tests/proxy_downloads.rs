@@ -45,6 +45,18 @@ struct Origin {
 
 impl Origin {
     fn start(ranges: bool) -> anyhow::Result<Self> {
+        Self::start_answering(ranges, false)
+    }
+
+    /// An origin that answers its first request whole and every later one
+    /// with a `206` that carries no bytes -- a range that ends before it
+    /// begins, as a broken CDN answers.
+    fn start_stingy() -> anyhow::Result<Self> {
+        Self::start_answering(true, true)
+    }
+
+    fn start_answering(ranges: bool, stingy: bool) -> anyhow::Result<Self> {
+        let answered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let (sender, requests) = std::sync::mpsc::channel();
@@ -53,6 +65,7 @@ impl Origin {
                 let Ok(mut stream) = stream else { break };
                 let Ok(peer) = stream.try_clone() else { break };
                 let sender = sender.clone();
+                let answered = answered.clone();
                 std::thread::spawn(move || {
                     let mut reader = BufReader::new(peer);
                     let mut line = String::new();
@@ -74,7 +87,12 @@ impl Origin {
                     }
                     let request = Request { headers };
                     let _ = sender.send(request.clone());
-                    answer(&request, &mut stream, ranges);
+                    let first = answered.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                    if stingy && !first {
+                        answer_nothing(&request, &mut stream);
+                    } else {
+                        answer(&request, &mut stream, ranges);
+                    }
                 });
             }
         });
@@ -92,6 +110,24 @@ impl Origin {
         }
         asked
     }
+}
+
+/// A `206` for the range asked, with an empty body.
+fn answer_nothing(request: &Request, socket: &mut TcpStream) {
+    let first = request
+        .range()
+        .and_then(|value| value.trim_start_matches("bytes=").split_once('-'))
+        .and_then(|(first, _)| first.parse::<usize>().ok())
+        .unwrap_or(0);
+    let head = format!(
+        "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\n\
+         Content-Type: video/mp4\r\nETag: {ORIGIN_ETAG}\r\n\
+         Content-Range: bytes {first}-{}/{ORIGIN_LENGTH}\r\n\
+         Content-Length: 0\r\nConnection: close\r\n\r\n",
+        ORIGIN_LENGTH - 1
+    );
+    let _ = socket.write_all(head.as_bytes());
+    let _ = socket.flush();
 }
 
 fn answer(request: &Request, socket: &mut TcpStream, ranges: bool) {
@@ -135,14 +171,15 @@ fn answer(request: &Request, socket: &mut TcpStream, ranges: bool) {
     let _ = socket.flush();
 }
 
+/// The offline config every binary that starts a server spreads from.
+#[path = "support/torrent_fixtures.rs"]
+mod torrent_fixtures;
+
 fn offline_config() -> ServerConfig {
     ServerConfig {
-        resolve_dht_bootstrap_names: false,
-        use_public_trackers: false,
-        pins: Some(Default::default()),
         // An embedder that keeps a proxy pin record and has pinned nothing.
         proxy_pins: Some(Vec::new()),
-        ..ServerConfig::default()
+        ..torrent_fixtures::offline_config()
     }
 }
 
@@ -517,6 +554,85 @@ fn a_request_that_names_no_source_is_refused() -> anyhow::Result<()> {
         );
     }
     assert!(fixture.downloads()?.is_empty(), "nothing was pinned");
+    fixture.stop()?;
+    Ok(())
+}
+
+/// An unpin names a key, and only a key: 64 lowercase hex digits, the
+/// spelling the cache writes. `..` joins to a path whose parent is the
+/// proxy root, and deleting "its" files once took the whole torrent-data
+/// root with it; every other spelling is refused as well, and nothing
+/// outside the key directory -- nor the pinned download beside it -- is
+/// touched.
+#[test]
+fn an_unpin_that_names_no_key_touches_nothing() -> anyhow::Result<()> {
+    let origin = Origin::start(true)?;
+    let fixture = Fixture::start(Some(Vec::new()))?;
+    let row = fixture.pin_url(&origin.url("/kept.mp4"))?;
+    let key = row["infoHash"].as_str().expect("a key").to_string();
+    fixture.wait_complete(&key)?;
+    let proxy_root = fixture.proxy_root();
+    let outside = proxy_root.parent().expect("a parent").join("marker");
+    std::fs::write(&outside, b"not the proxy's")?;
+    let beside = proxy_root.join("marker");
+    std::fs::write(&beside, b"not a key")?;
+
+    for bad in [
+        "..".to_string(),
+        "../..".to_string(),
+        ".".to_string(),
+        String::new(),
+        "marker".to_string(),
+        key.to_uppercase(),
+        key[..63].to_string(),
+        format!("{key}0"),
+        format!("../.proxy/{key}"),
+    ] {
+        let outcome = fixture.handle.unpin_proxy_download(&bad, true)?;
+        assert!(
+            !outcome.unpinned && !outcome.deleted_files,
+            "{bad:?} is not a key: {outcome:?}"
+        );
+    }
+    assert!(
+        outside.is_file(),
+        "nothing above the proxy root was deleted"
+    );
+    assert!(
+        beside.is_file(),
+        "nothing in it that is not a key was deleted"
+    );
+    assert!(
+        key_dir_exists(&fixture, &key),
+        "the pinned download is still there"
+    );
+    assert!(
+        fixture
+            .downloads()?
+            .iter()
+            .any(|row| row["infoHash"] == key),
+        "and still listed"
+    );
+    fixture.stop()?;
+    Ok(())
+}
+
+/// An origin that answers a fill with no bytes is asked again after the
+/// filler's retry wait, not at once: a stride that read nothing is a
+/// failure, and stepping `pos += 0` in a loop with no sleep spun one
+/// request after another at the origin for as long as the pin stood.
+#[test]
+fn an_origin_that_answers_nothing_is_not_asked_in_a_loop() -> anyhow::Result<()> {
+    let origin = Origin::start_stingy()?;
+    let fixture = Fixture::start(Some(Vec::new()))?;
+    fixture.pin_url(&origin.url("/stingy.mp4"))?;
+    std::thread::sleep(Duration::from_secs(2));
+    let asked = origin.asked();
+    assert!(
+        asked.len() < 20,
+        "{} requests in two seconds: the filler is spinning",
+        asked.len()
+    );
     fixture.stop()?;
     Ok(())
 }

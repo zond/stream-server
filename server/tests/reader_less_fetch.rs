@@ -24,6 +24,12 @@ use stream_server::ServerConfig;
 #[path = "support/fixture_pins.rs"]
 mod fixture_pins;
 
+/// The offline config, the control client and a real torrent, shared with
+/// every binary that starts a server.
+#[path = "support/torrent_fixtures.rs"]
+mod torrent_fixtures;
+use torrent_fixtures::{offline_config, pieces_held};
+
 /// The fixture's piece length. Big enough that 64 MiB is a thousand-odd
 /// pieces rather than four thousand files in the store.
 const PIECE: u32 = 256 * 1024;
@@ -62,25 +68,6 @@ const TAIL: std::time::Duration =
 /// bound is 16 MiB, a quarter of [`PAYLOAD`], so a torrent that stopped
 /// being stopped fails it well before it could finish.
 const FETCH_BOUND: u64 = SEEDER_BPS as u64 * 4 * enginefs::reconcile::RECONCILE_INTERVAL.as_secs();
-
-/// The base config: no DNS, no trackers, nothing outbound of its own -- the
-/// same two switches `embed.rs` explains at length -- and the pin set the
-/// shipping client publishes.
-fn offline_config() -> ServerConfig {
-    ServerConfig {
-        resolve_dht_bootstrap_names: false,
-        use_public_trackers: false,
-        // The run's own nonce below already makes this torrent nobody
-        // else's; this makes sure of it from the other side, and keeps the
-        // measurement off the network the runner sits on.
-        enable_local_service_discovery: false,
-        // An embedder that keeps a pin record and has named nothing in it:
-        // xtremio's `downloads::pins()` over an empty registry. The `None`
-        // arm below overrides exactly this field and nothing else.
-        pins: Some(Default::default()),
-        ..ServerConfig::default()
-    }
-}
 
 /// What one run of [`watch_a_torrent_nobody_reads`] saw.
 struct Reading {
@@ -386,13 +373,4 @@ fn write_payload(path: &std::path::Path, len: usize) {
     let mut data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
     data[..nonce.len()].copy_from_slice(&nonce);
     std::fs::write(path, data).expect("write payload");
-}
-
-/// How many pieces the store holds for a torrent -- asked of the store, so
-/// nothing here has to know how they are laid out.
-fn pieces_held(cache_root: &std::path::Path, info_hash: &str) -> usize {
-    enginefs::piece_store::StoreRoot::in_download_dir(&cache_root.join("rqbit-downloads"))
-        .stat(info_hash)
-        .pieces
-        .len()
 }

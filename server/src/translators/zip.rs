@@ -21,7 +21,7 @@
 
 use super::{
     Body, Budget, Index, Member, Refusal, Translator, direct_extent, le_u16, le_u32, le_u64,
-    only_source,
+    member_name, only_source,
 };
 use crate::sources::ByteSource;
 use async_trait::async_trait;
@@ -84,7 +84,7 @@ impl Translator for Zip {
             }
             let body = entry.body(&mut budget, source.as_ref()).await?;
             members.push(Member {
-                name: entry.name,
+                name: member_name(&entry.name),
                 len: entry.uncompressed_size,
                 body,
             });

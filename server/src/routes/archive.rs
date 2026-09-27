@@ -43,9 +43,9 @@ struct CreateQuery {
 /// seek of the piece store, a ranged read through the proxy cache -- per
 /// boxed future, per socket write; measured at some fourteen times the CPU
 /// per byte of a 256 KiB read on a desktop core, on what is the streaming
-/// hot path of the weakest devices this runs on. The same figure the
-/// torrent stream route reads with (`routes::stream`), and the same
-/// 256 KiB per active stream it costs.
+/// hot path of the weakest devices this runs on. Every media body reads
+/// with it -- the torrent stream route, the archive members and `/ftp` --
+/// at 256 KiB per active stream.
 pub(crate) const MEDIA_BODY_CHUNK_BYTES: usize = 256 * 1024;
 
 /// The response body for a media reader: [`MEDIA_BODY_CHUNK_BYTES`] per read.
@@ -851,9 +851,12 @@ async fn session_for(
     // insert leases what it made, so the read that follows cannot find it
     // gone: indexing the container is itself what moved the live entity,
     // and a look-up after the insert would be a second chance for the cell
-    // to move again in between.
-    Ok(state.translated_archives.insert(
-        key.to_string(),
+    // to move again in between. Insert-if-absent, because a player opens a
+    // member with several requests at once: two that both missed above
+    // both indexed, and the first one in is the session every later request
+    // gets -- the other index is dropped rather than replacing a session
+    // somebody already holds a lease on.
+    Ok(state.translated_archives.get_or_insert_with(key, || {
         TranslatedSession::new(
             key,
             SessionSources::Torrent {
@@ -862,8 +865,8 @@ async fn session_for(
             },
             index,
             None,
-        ),
-    ))
+        )
+    }))
 }
 
 /// The sources a body of this session reads through -- the ones it holds,

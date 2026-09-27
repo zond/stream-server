@@ -377,7 +377,12 @@ impl DriveCredential {
             // the body is never in it, which is what matters.
             .map_err(|error| DriveError::Unreachable(error.to_string()))?;
         let status = response.status();
-        let body = read_capped(response, MAX_REFRESH_BODY).await?;
+        // Read whole but never past the cap (`read_capped`): a refresh
+        // service is somebody else's, and `Response::bytes` would buffer
+        // whatever it sends before anyone could look at the length.
+        let body = enginefs::http_client::read_capped(response, MAX_REFRESH_BODY)
+            .await
+            .map_err(|error| DriveError::Unreachable(format!("the refresh answer: {error:#}")))?;
         if status.is_success() {
             let RefreshedToken {
                 access_token,
@@ -397,33 +402,6 @@ impl DriveCredential {
         }
         Err(DriveError::Refused(status.as_u16()))
     }
-}
-
-/// A response body read whole but never past `max`: refused on a declared
-/// length over it, and otherwise at the first chunk that crosses it.
-///
-/// `Response::bytes` would buffer whatever the far end sends before anyone
-/// could look at the length, so a cap checked afterwards bounds nothing.
-async fn read_capped(mut response: reqwest::Response, max: usize) -> Result<Vec<u8>, DriveError> {
-    let too_large = || DriveError::Unreachable("the refresh answer was too large".to_string());
-    if response
-        .content_length()
-        .is_some_and(|len| len > max as u64)
-    {
-        return Err(too_large());
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| DriveError::Unreachable(error.to_string()))?
-    {
-        if body.len() + chunk.len() > max {
-            return Err(too_large());
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
 }
 
 #[async_trait::async_trait]

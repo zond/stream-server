@@ -173,12 +173,6 @@ impl<T> Lease<T> {
             usage: entry.usage.clone(),
         }
     }
-
-    /// The session behind the lease, for a stream that needs to own it
-    /// beyond the lease's own lifetime.
-    pub fn shared(&self) -> &Arc<T> {
-        &self.value
-    }
 }
 
 impl<T> Deref for Lease<T> {

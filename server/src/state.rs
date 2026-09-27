@@ -8,16 +8,13 @@ use tokio::sync::RwLock;
 
 #[derive(Clone)]
 pub struct AppState {
-    /// The one torrent engine: every route and the diagnostics read this. There used to be a second field,
-    /// `download_engine`, holding the same `Arc` -- see `run()`.
+    /// The one torrent engine: every route and the diagnostics read this.
     pub engine: Arc<EngineFS>,
     pub settings: Arc<RwLock<ServerSettings>>,
     /// `settings.json` on disk and the one way anything writes it (see
     /// [`SettingsFile`]). Shared with the tracker refresher's
     /// [`TrackerStorageBridge`], which is built before this state is.
     pub settings_file: Arc<SettingsFile>,
-    pub config_dir: PathBuf,
-    pub log_dir: PathBuf,
     pub base_url: String,
     pub http_addr: SocketAddr,
     /// Bearer token the control routes require. `run` always sets one (see
@@ -89,34 +86,15 @@ pub struct AppState {
 }
 
 impl AppState {
-    #[allow(unused)]
-    pub fn new(engine: Arc<EngineFS>, settings: ServerSettings, config_dir: PathBuf) -> Self {
-        let log_dir = config_dir.join("logs");
-        Self::new_with_shared_settings_and_log_dir(
-            engine,
-            Arc::new(RwLock::new(settings)),
-            config_dir,
-            log_dir,
-        )
-    }
-
-    #[allow(unused)]
-    pub fn new_with_shared_settings(
+    /// A state around the one engine, with the settings and the file they
+    /// are kept in that `run` loaded before the engine was opened; `run`
+    /// fills in the rest (the addresses, the token, the LAN listener, the
+    /// Drive endpoints) before anything reads them.
+    pub fn new(
         engine: Arc<EngineFS>,
         settings: Arc<RwLock<ServerSettings>>,
-        config_dir: PathBuf,
+        settings_file: Arc<SettingsFile>,
     ) -> Self {
-        let log_dir = config_dir.join("logs");
-        Self::new_with_shared_settings_and_log_dir(engine, settings, config_dir, log_dir)
-    }
-
-    pub fn new_with_shared_settings_and_log_dir(
-        engine: Arc<EngineFS>,
-        settings: Arc<RwLock<ServerSettings>>,
-        config_dir: PathBuf,
-        log_dir: PathBuf,
-    ) -> Self {
-        let settings_file = Arc::new(SettingsFile::new(config_dir.join("settings.json")));
         // The published cap, shared and not copied: `/proxy`'s cache and
         // the piece store are two adapters over one chunk store on one
         // volume, and the retention policy over them is sized from one
@@ -130,8 +108,6 @@ impl AppState {
             engine,
             settings,
             settings_file,
-            config_dir,
-            log_dir,
             base_url: "http://127.0.0.1:11470".to_string(),
             http_addr: SocketAddr::from(([127, 0, 0, 1], 11470)),
             auth_token: None,
@@ -156,11 +132,6 @@ impl AppState {
     pub async fn save_settings(&self) -> anyhow::Result<()> {
         self.settings_file.save(&self.settings).await
     }
-
-    /// [`SettingsFile::load`] for the `settings.json` under `config_dir`.
-    pub fn load_settings(config_dir: &Path, defaults: &ServerSettings) -> ServerSettings {
-        SettingsFile::new(config_dir.join("settings.json")).load(defaults)
-    }
 }
 
 /// `settings.json` on disk, and the one way anything writes it.
@@ -169,8 +140,8 @@ impl AppState {
 /// (every `POST /settings` and `update_settings`) and the tracker
 /// refresher's `save_trackers`, each a plain `tokio::fs::write` -- an
 /// `open(O_TRUNC)` and a `write` -- with nothing between them. Two of those
-/// in flight at once (a settings change during the startup tracker refresh,
-/// or `force_refresh`, which writes twice back to back) left the file as one
+/// in flight at once (a settings change during the startup tracker
+/// refresh) left the file as one
 /// writer's bytes with the other's tail behind them, which does not parse;
 /// and a kill between the truncate and the write left it empty. Either way
 /// the next launch read nothing it could use, fell through to the defaults
@@ -202,6 +173,7 @@ impl SettingsFile {
         }
     }
 
+    #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.path
     }

@@ -143,11 +143,11 @@ pub mod translators;
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub http_addr: SocketAddr,
-    /// Settings, logs and certificates. `None`
-    /// uses the platform config dir (needs `HOME`/`XDG_*`); embedders must
-    /// set it explicitly.
+    /// Settings and logs. `None` uses the platform config dir (needs
+    /// `HOME`/`XDG_*`); embedders must set it explicitly.
     pub config_dir: Option<PathBuf>,
-    /// Torrent downloads, session/DHT state and archive caches. `None`
+    /// Torrent data (the piece store), the proxy cache and the session's
+    /// DHT and resume state. `None`
     /// means `config_dir/cache` when `config_dir` is set, otherwise the
     /// platform cache dir. No environment variable is consulted once
     /// `config_dir` is given.
@@ -548,8 +548,7 @@ impl ServerHandle {
     }
 
     /// Pin `file_idx` of `info_hash` as an offline download (see
-    /// `routes::downloads::pin_download`, which the download control route
-    /// shares): created through the magnet registry with `trackers` (as in
+    /// `routes::downloads::pin_download`): created through the magnet registry with `trackers` (as in
     /// [`Self::engine_stats`]) when new, kept wanted and exempt from
     /// eviction, persisted across restarts. The torrent does not move --
     /// pinning is retention, not a location. Fails with
@@ -1125,8 +1124,7 @@ pub fn start(cfg: ServerConfig) -> anyhow::Result<ServerHandle> {
 /// instead of consulting the OS user directories. Embedders (Android in
 /// particular) run without `HOME`/`XDG_*` and no passwd fallback, so nothing
 /// on the startup path may depend on an environment-derived location. Only
-/// when neither directory is given (the desktop binary) do we fall back to the
-/// platform defaults.
+/// when neither directory is given do we fall back to the platform defaults.
 fn resolve_dirs(cfg: &ServerConfig) -> anyhow::Result<(PathBuf, PathBuf)> {
     let config_dir = match cfg.config_dir.clone() {
         Some(path) => path,
@@ -1289,47 +1287,8 @@ pub async fn run(
 
     let backend_config = enginefs::backend::BackendConfig {
         listen_port: cfg.torrent_listen_port.clone(),
-        cache: enginefs::backend::priorities::EngineCacheConfig {
-            size: routes::system::cache_size_bytes(settings.cache_size),
-            enabled: true,
-        },
-        growler: enginefs::backend::Growler::default(),
-        peer_search: enginefs::backend::PeerSearch {
-            min: settings.bt_min_peers_for_stable,
-            ..Default::default()
-        },
-        swarm_cap: enginefs::backend::SwarmCap::default(),
-        speed_profile: enginefs::backend::TorrentSpeedProfile {
-            bt_download_speed_hard_limit: settings.bt_download_speed_hard_limit,
-            bt_download_speed_soft_limit: settings.bt_download_speed_soft_limit,
-            bt_handshake_timeout: settings.bt_handshake_timeout,
-            bt_max_connections: settings.bt_max_connections,
-            bt_min_peers_for_stable: settings.bt_min_peers_for_stable,
-            bt_request_timeout: settings.bt_request_timeout,
-        },
-        privacy: enginefs::backend::TorrentPrivacyConfig {
-            bt_enable_dht: settings.bt_enable_dht,
-            bt_enable_pex: settings.bt_enable_pex,
-            bt_enable_lsd: settings.bt_enable_lsd,
-            bt_encryption_mode: settings.bt_encryption_mode,
-            bt_anonymous_mode: settings.bt_anonymous_mode,
-            bt_allow_multiple_connections_per_ip: settings.bt_allow_multiple_connections_per_ip,
-            bt_listen_interfaces: settings.bt_listen_interfaces.clone(),
-            bt_outgoing_interfaces: settings.bt_outgoing_interfaces.clone(),
-            bt_outgoing_port: settings.bt_outgoing_port,
-            bt_num_outgoing_ports: settings.bt_num_outgoing_ports,
-            bt_proxy_type: settings.bt_proxy_type,
-            bt_proxy_host: settings.bt_proxy_host.clone(),
-            bt_proxy_port: settings.bt_proxy_port,
-            bt_proxy_username: settings.bt_proxy_username.clone(),
-            bt_proxy_password: settings.bt_proxy_password.clone(),
-            bt_proxy_hostnames: settings.bt_proxy_hostnames,
-            bt_proxy_peer_connections: settings.bt_proxy_peer_connections,
-            bt_proxy_tracker_connections: settings.bt_proxy_tracker_connections,
-            bt_proxy_send_host_in_connect: settings.bt_proxy_send_host_in_connect,
-            bt_validate_https_trackers: settings.bt_validate_https_trackers,
-            bt_ssrf_mitigation: settings.bt_ssrf_mitigation,
-        },
+        speed_profile: settings.speed_profile(),
+        privacy: settings.privacy_config(),
         dht_bootstrap_nodes: settings.dht_bootstrap_nodes.clone().unwrap_or_default(),
         dht_bootstrap_dns: if cfg.resolve_dht_bootstrap_names {
             enginefs::backend::dht_bootstrap::DhtBootstrapDns::Resolve
@@ -1343,19 +1302,11 @@ pub async fn run(
         },
     };
 
-    // One engine, opened on the one torrent-data root. `AppState` used to
-    // carry two fields, `engine` and `download_engine`, from a design that
-    // meant to pair a memory-only stream engine with a disk-backed download
-    // engine; librqbit sessions always persist to disk and no memory-only
-    // storage was ever built, so `EngineFS::new_disk_backed` was
-    // `new_with_storage` under another name and the same `Arc` went in both
-    // fields -- every reader read one instance twice and skipped the
-    // duplicate with `Arc::ptr_eq`. (There was also a retry through
-    // `new_with_storage` when `new_disk_backed` failed, described as falling
-    // back to memory-only mode: the same constructor, failing the same way.
-    // A failure here is a failure.)
+    // One engine, opened on the one torrent-data root; librqbit sessions
+    // always persist to disk, so there is no second, memory-only engine and
+    // no fallback to one. A failure here is a failure.
     let engine = Arc::new(
-        EngineFS::new_disk_backed(
+        EngineFS::new_with_storage(
             torrent_data_root.clone(),
             backend_config,
             Some(tracker_storage),
@@ -1364,13 +1315,7 @@ pub async fn run(
         .await?,
     );
 
-    let mut state = AppState::new_with_shared_settings_and_log_dir(
-        engine,
-        settings_arc.clone(),
-        config_dir.clone(),
-        log_dir.clone(),
-    );
-    state.settings_file = settings_file;
+    let mut state = AppState::new(engine, settings_arc.clone(), settings_file);
     state.base_url = base_url.clone();
     state.http_addr = public_http_addr;
     state.auth_token = Some(Arc::from(cfg.auth.resolve()?));

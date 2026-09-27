@@ -1,34 +1,23 @@
 //! **The scenario harness: a film, a disk, a script of timed reads, and a
 //! record of what the policy did to them.**
 //!
-//! It exists because the retention policy is about to be replaced whole
-//! (`docs/design/read-pattern-retention.md`). The old one cannot be left running
-//! beside the new one -- it would have to be the one deciding, which is the
-//! thing being replaced -- so the new one is built standalone and proved
-//! against scaffolded scenarios before anything is swapped. A harness that
-//! is written at the same time as the policy it checks proves nothing about
-//! either, so this one is written first and proves itself against the
-//! **old** policy, by reproducing a failure the field has already seen:
-//! `scenarios::the_second_track_at_the_tail_*`.
+//! It is how a claim about the retention policy
+//! (`docs/design/read-pattern-retention.md`) is proved against a film rather
+//! than against a function: a script of reads, played through the owner the
+//! way a player's reads are, and the disk and the backend's want-set read
+//! back afterwards.
 //!
 //! # Why here, and not under `owner`
 //!
-//! Every piece of this except the harness itself used to be `owner.rs`'s
-//! `mod tests` preamble, where only that module's own tests could reach it.
-//! It is a sibling of `owner` now, `pub(crate)` under `cfg(test)`, for one
-//! reason: **the thing it has to outlive is `owner` itself**. A fixture
-//! that is a child of the module being replaced has to move again at the
-//! swap, and a scenario written against it would have to be rewritten with
-//! it -- which is the one thing that must not happen to the scenarios,
-//! because their whole job is to be run unchanged against both policies and
-//! compared.
-//!
-//! For the same reason the harness reaches the owner through its **public**
-//! surface only ([`Retention::install`], [`Retention::reader_on`],
-//! [`Reader::note_at`], [`Retention::turn`], [`Retention::pass`]) and never
-//! through `State` or the policy. That is a constraint on the harness and
-//! not a courtesy: the seam it is allowed to use is the seam the
-//! replacement has to be drivable through too.
+//! A sibling of `owner`, `pub(crate)` under `cfg(test)`, because a
+//! scenario is a statement about a *cache* and not about the module that
+//! implements it: it must survive a rewrite of `owner` unchanged. So the
+//! harness reaches the owner through its **public** surface only
+//! ([`Retention::install`], [`Retention::reader_on`], [`Reader::note`],
+//! [`Retention::turn`], [`Retention::pass_at`]) and never through `State` or
+//! the policy. That is a constraint on the harness and not a courtesy: the
+//! seam it is allowed to use is the seam any policy has to be drivable
+//! through.
 //!
 //! # The clock
 //!
@@ -353,15 +342,6 @@ impl<S: Side> FakeBacking<S> {
 }
 
 impl<S: Side> FakeBacking<S> {
-    /// **A consumer that has just read `bytes` of this file from `at`**, as
-    /// the detector sees it.
-    ///
-    /// What makes a reader a consumer rather than a position: a delivered
-    /// byte moves the head, and a *read* is what says there is somebody
-    /// moving through the file who must be fetched for and not deleted
-    /// from under. Both real read paths report every read they serve
-    /// (`Engine::note_read`, `proxy_retention::Reader::note_read`); a test
-    /// that wants a live consumer says so here.
     /// A viewer seeking to `at` and playing on from there: three
     /// quarter-piece reads, which is what it takes for the smoothed
     /// position ([`crate::retention::streams::Stream`]) to land inside the
@@ -374,6 +354,15 @@ impl<S: Side> FakeBacking<S> {
         }
     }
 
+    /// **A consumer that has just read `bytes` of this file from `at`**, as
+    /// the detector sees it.
+    ///
+    /// What makes a reader a consumer rather than a position: a delivered
+    /// byte moves the head, and a *read* is what says there is somebody
+    /// moving through the file who must be fetched for and not deleted
+    /// from under. Both real read paths report every read they serve
+    /// (`Engine::note_read`, `proxy_retention::Reader::note_read`); a test
+    /// that wants a live consumer says so here.
     pub(crate) fn read_from(&self, at: u64, bytes: u64) {
         self.note_read(1, at, at.saturating_add(bytes), std::time::Instant::now());
     }
@@ -603,6 +592,7 @@ impl<S: Side> Backing for FakeBacking<S> {
         domain: &FakeDomain,
     ) -> Option<crate::retention::trace::Backing> {
         Some(crate::retention::trace::Backing {
+            entity: None,
             fetched: 0,
             verified: 0,
             refused: 0,

@@ -91,7 +91,12 @@ async fn stream_ftp(Path(filename): Path<String>, Query(params): Query<FtpQuery>
         // file were all a `200` with nothing in it. The transfer is opened
         // here before a single header is written, so the three are a status.
         Err(e) => {
-            tracing::debug!(url = %body.ftp_url, error = %e, "FTP transfer failed");
+            // The origin only: an FTP URL carries its login as `user:password@`.
+            tracing::debug!(
+                origin = %crate::routes::util::log_origin(&body.ftp_url),
+                error = %e,
+                "FTP transfer failed"
+            );
             return (
                 StatusCode::BAD_GATEWAY,
                 format!("FTP transfer failed: {}", e),
@@ -100,7 +105,9 @@ async fn stream_ftp(Path(filename): Path<String>, Query(params): Query<FtpQuery>
         }
     };
 
-    let stream = tokio_util::io::ReaderStream::new(data);
+    // A media body's reads, not `ReaderStream::new`'s 4 KiB ones
+    // (`archive::MEDIA_BODY_CHUNK_BYTES`).
+    let stream = crate::routes::archive::media_body(data);
 
     let content_type = mime_guess::from_path(&filename)
         .first_or_octet_stream()

@@ -140,18 +140,6 @@ impl TorrentFileSource {
         Self::at(engine, info_hash, file_idx, &files).await
     }
 
-    /// The file at `file_idx`, for a caller that resolved the index itself
-    /// (`routes::compat::resolve_file_idx`, a sibling volume of a set).
-    pub async fn open_index(
-        engine: Arc<enginefs::EngineFS>,
-        info_hash: &str,
-        file_idx: usize,
-    ) -> io::Result<Self> {
-        let info_hash = info_hash.to_lowercase();
-        let files = Self::files(&engine, &info_hash).await?;
-        Self::at(engine, info_hash, file_idx, &files).await
-    }
-
     /// The names of the torrent's files, in the torrent's own order --
     /// what a translator that comes in sets is handed to pick its sibling
     /// volumes out of (`Translator::volumes`). The order is the list's,
@@ -211,12 +199,6 @@ impl TorrentFileSource {
             index_reader: tokio::sync::Mutex::new(None),
             _stream: stream,
         })
-    }
-
-    /// Which file of which torrent this is, for a caller that has to name
-    /// it to the engine.
-    pub fn file_idx(&self) -> usize {
-        self.file_idx
     }
 
     /// A reader on this file at `offset`, at the streaming intent.

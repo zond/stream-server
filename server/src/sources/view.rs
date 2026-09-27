@@ -117,21 +117,6 @@ impl MemberView {
         })
     }
 
-    /// The whole of one source as one member: the single-extent case,
-    /// which is what a container that *is* the file looks like.
-    pub fn whole(name: impl Into<String>, source: Arc<dyn ByteSource>) -> io::Result<Self> {
-        let len = source.len();
-        Self::new(
-            name,
-            vec![source],
-            vec![Extent {
-                source: 0,
-                offset: 0,
-                len,
-            }],
-        )
-    }
-
     /// A reader over the member from its first byte.
     pub fn reader(&self) -> MemberReader {
         self.reader_at(0)
@@ -147,11 +132,6 @@ impl MemberView {
             state: State::Idle,
             seeking: None,
         }
-    }
-
-    /// What the member is called, as its container states it.
-    pub fn name(&self) -> &str {
-        &self.member.name
     }
 }
 

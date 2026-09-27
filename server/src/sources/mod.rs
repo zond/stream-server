@@ -36,6 +36,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek};
 
 pub mod drive;
 pub mod proxy;
+#[cfg(test)]
 pub mod testing;
 pub mod torrent;
 pub mod view;
@@ -87,11 +88,6 @@ impl ReadHint {
     /// `bytes` from the offset.
     pub fn of(bytes: u64) -> Self {
         Self { bytes }
-    }
-
-    /// How many bytes were hinted at.
-    pub fn bytes(self) -> u64 {
-        self.bytes
     }
 
     /// The last byte this hint covers in a source of `len` bytes, or `None`

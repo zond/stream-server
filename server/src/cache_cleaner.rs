@@ -87,7 +87,7 @@ pub(crate) async fn drop_slack(state: &AppState) -> EvictionReport {
 /// (`<download dir>/<torrent name>/<file>`) rather than under it: no store
 /// speaks for it and nothing here wrote it. It is not converted -- "there
 /// is no migration" (see `enginefs::piece_store`) -- but it is deleted:
-/// `enginefs::piece_store::sweep_legacy_downloads` removes whatever under
+/// `enginefs::piece_store::sweep::sweep_legacy_downloads` removes whatever under
 /// the download root is not another component's directory or a session
 /// file, at launch, on every boot that is handed a pin set. On a boot with
 /// none the sweep does not run, and an unpin asked to delete the file's

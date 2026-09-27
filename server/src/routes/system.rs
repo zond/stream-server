@@ -303,11 +303,12 @@ pub struct ServerSettings {
     /// How far ahead playback reads: the default
     /// [`BufferProfile`](enginefs::backend::priorities::BufferProfile) for
     /// every stream request that does not carry a `buffer=` override.
-    /// `normal` (the default) is the behaviour this server has always had;
-    /// `large` and `maximum` multiply the playback read-ahead windows by 2
-    /// and 4, which helps a spotty connection or a player with a shallower
-    /// buffer than mpv's, and costs proportionally more disk in the piece
-    /// cache and more bandwidth spent ahead of what is watched. The startup
+    /// The unit is seconds of film: `normal` (the default) holds and reads
+    /// ahead 90 s of it, `large` four minutes and `maximum` a day -- in
+    /// effect the whole file, as far as the cache budget reaches -- which
+    /// helps a spotty connection and costs more disk in the piece cache and
+    /// more bandwidth spent ahead of what is watched (`docs/settings.md`,
+    /// Buffer profiles). The startup
     /// window is the same under every profile, so first-frame latency does
     /// not change. A value that is not one of the three leaves the setting
     /// as it was, like every other wrong-typed value.
@@ -450,9 +451,10 @@ fn resolve_cache_size(v: &Value) -> Option<Option<f64>> {
 }
 
 /// Convert the client-facing `cacheSize` (bytes, `None` = unlimited) into a
-/// byte cap for the engine's retention code. `None` (and any out-of-range or
-/// non-finite value) saturates to `u64::MAX`, which is effectively
-/// unbounded for every downstream size comparison.
+/// byte cap for the engine's retention code. `None` is `u64::MAX`, which is
+/// effectively unbounded for every downstream size comparison. A number is
+/// cast, and the cast saturates: a negative or `NaN` becomes 0, and one past
+/// `u64::MAX` (infinity included) becomes `u64::MAX`.
 pub fn cache_size_bytes(cache_size: Option<f64>) -> u64 {
     match cache_size {
         Some(n) => n as u64,
@@ -655,6 +657,49 @@ fn update_string_setting(
     }
 }
 
+impl ServerSettings {
+    /// The `bt*` speed settings as the backend takes them: what the session
+    /// is built from at start and what `update_settings` pushes at it.
+    pub fn speed_profile(&self) -> enginefs::backend::TorrentSpeedProfile {
+        enginefs::backend::TorrentSpeedProfile {
+            bt_download_speed_hard_limit: self.bt_download_speed_hard_limit,
+            bt_download_speed_soft_limit: self.bt_download_speed_soft_limit,
+            bt_handshake_timeout: self.bt_handshake_timeout,
+            bt_max_connections: self.bt_max_connections,
+            bt_min_peers_for_stable: self.bt_min_peers_for_stable,
+            bt_request_timeout: self.bt_request_timeout,
+        }
+    }
+
+    /// The `bt*` privacy and network settings as the backend takes them,
+    /// for the same two readers as [`ServerSettings::speed_profile`].
+    pub fn privacy_config(&self) -> TorrentPrivacyConfig {
+        TorrentPrivacyConfig {
+            bt_enable_dht: self.bt_enable_dht,
+            bt_enable_pex: self.bt_enable_pex,
+            bt_enable_lsd: self.bt_enable_lsd,
+            bt_encryption_mode: self.bt_encryption_mode,
+            bt_anonymous_mode: self.bt_anonymous_mode,
+            bt_allow_multiple_connections_per_ip: self.bt_allow_multiple_connections_per_ip,
+            bt_listen_interfaces: self.bt_listen_interfaces.clone(),
+            bt_outgoing_interfaces: self.bt_outgoing_interfaces.clone(),
+            bt_outgoing_port: self.bt_outgoing_port,
+            bt_num_outgoing_ports: self.bt_num_outgoing_ports,
+            bt_proxy_type: self.bt_proxy_type,
+            bt_proxy_host: self.bt_proxy_host.clone(),
+            bt_proxy_port: self.bt_proxy_port,
+            bt_proxy_username: self.bt_proxy_username.clone(),
+            bt_proxy_password: self.bt_proxy_password.clone(),
+            bt_proxy_hostnames: self.bt_proxy_hostnames,
+            bt_proxy_peer_connections: self.bt_proxy_peer_connections,
+            bt_proxy_tracker_connections: self.bt_proxy_tracker_connections,
+            bt_proxy_send_host_in_connect: self.bt_proxy_send_host_in_connect,
+            bt_validate_https_trackers: self.bt_validate_https_trackers,
+            bt_ssrf_mitigation: self.bt_ssrf_mitigation,
+        }
+    }
+}
+
 impl Default for ServerSettings {
     fn default() -> Self {
         let cache_root = std::env::var("STREMIO_CACHE_ROOT")
@@ -740,7 +785,12 @@ pub async fn update_settings(
     state: &AppState,
     payload: &Value,
 ) -> anyhow::Result<(ServerSettings, BtSettingsReport)> {
-    tracing::debug!("update_settings: received payload: {:?}", payload);
+    // The keys and never the values: a patch can carry `btProxyPassword`.
+    let keys: Vec<&str> = payload
+        .as_object()
+        .map(|patch| patch.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    tracing::debug!(?keys, "update_settings: received a patch");
 
     // `cacheRoot` is the one validated setting: an unusable directory -- or
     // a value that is not a string -- fails the whole update (nothing is
@@ -930,38 +980,8 @@ pub async fn update_settings(
     let lan_media_enabled = settings.lan_media_enabled;
     let diagnostics_trace = settings.diagnostics_trace;
 
-    // Build new speed profile from updated settings
-    let new_profile = enginefs::backend::TorrentSpeedProfile {
-        bt_download_speed_hard_limit: settings.bt_download_speed_hard_limit,
-        bt_download_speed_soft_limit: settings.bt_download_speed_soft_limit,
-        bt_handshake_timeout: settings.bt_handshake_timeout,
-        bt_max_connections: settings.bt_max_connections,
-        bt_min_peers_for_stable: settings.bt_min_peers_for_stable,
-        bt_request_timeout: settings.bt_request_timeout,
-    };
-    let new_privacy = TorrentPrivacyConfig {
-        bt_enable_dht: settings.bt_enable_dht,
-        bt_enable_pex: settings.bt_enable_pex,
-        bt_enable_lsd: settings.bt_enable_lsd,
-        bt_encryption_mode: settings.bt_encryption_mode,
-        bt_anonymous_mode: settings.bt_anonymous_mode,
-        bt_allow_multiple_connections_per_ip: settings.bt_allow_multiple_connections_per_ip,
-        bt_listen_interfaces: settings.bt_listen_interfaces.clone(),
-        bt_outgoing_interfaces: settings.bt_outgoing_interfaces.clone(),
-        bt_outgoing_port: settings.bt_outgoing_port,
-        bt_num_outgoing_ports: settings.bt_num_outgoing_ports,
-        bt_proxy_type: settings.bt_proxy_type,
-        bt_proxy_host: settings.bt_proxy_host.clone(),
-        bt_proxy_port: settings.bt_proxy_port,
-        bt_proxy_username: settings.bt_proxy_username.clone(),
-        bt_proxy_password: settings.bt_proxy_password.clone(),
-        bt_proxy_hostnames: settings.bt_proxy_hostnames,
-        bt_proxy_peer_connections: settings.bt_proxy_peer_connections,
-        bt_proxy_tracker_connections: settings.bt_proxy_tracker_connections,
-        bt_proxy_send_host_in_connect: settings.bt_proxy_send_host_in_connect,
-        bt_validate_https_trackers: settings.bt_validate_https_trackers,
-        bt_ssrf_mitigation: settings.bt_ssrf_mitigation,
-    };
+    let new_profile = settings.speed_profile();
+    let new_privacy = settings.privacy_config();
 
     // Release the write lock before saving
     let updated = settings.clone();
@@ -1184,15 +1204,7 @@ pub async fn file_stats(
             return Ok(stats);
         }
     }
-    let candidates = files
-        .iter()
-        .enumerate()
-        .map(|(index, file)| compat::FileCandidate {
-            index,
-            name: file.name.clone(),
-            length: file.length,
-        })
-        .collect::<Vec<_>>();
+    let candidates = compat::candidates(&files);
     let idx = compat::resolve_file_idx(requested_idx, &candidates, filters)
         .map_err(|err| FileNotFound(err.to_string()))?;
     let mut stats = engine.get_statistics().await;

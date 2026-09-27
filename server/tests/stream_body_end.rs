@@ -23,13 +23,18 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Why a test that seeds its own torrent data runs with the pin set
 /// unknown, and which tests may not.
 #[path = "support/fixture_pins.rs"]
 mod fixture_pins;
+
+/// The offline config, the control client and a real torrent, shared with
+/// every binary that starts a server.
+#[path = "support/torrent_fixtures.rs"]
+mod torrent_fixtures;
+use torrent_fixtures::{bearer_client, real_torrent_with_pieces, seed_single_file};
 
 /// Reading the log files back, which is what this test asserts over.
 #[path = "support/log_lines.rs"]
@@ -52,83 +57,6 @@ fn byte_at(offset: usize) -> u8 {
     (offset % 251) as u8
 }
 
-/// A real `.torrent` of `dir`, and its info hash. 64 KiB pieces, which for
-/// [`PAYLOAD`] is 128 of them to seed rather than 512.
-fn real_torrent(dir: &Path) -> (Vec<u8>, String) {
-    let rt = tokio::runtime::Runtime::new().expect("runtime");
-    rt.block_on(async {
-        let t = librqbit::create_torrent(
-            dir,
-            librqbit::CreateTorrentOptions {
-                name: None,
-                trackers: Vec::new(),
-                piece_length: Some(64 * 1024),
-            },
-            &librqbit::spawn_utils::BlockingSpawner::new(1),
-        )
-        .await
-        .expect("create torrent");
-        (
-            t.as_bytes().expect("serialize").to_vec(),
-            t.info_hash().as_string(),
-        )
-    })
-}
-
-/// Pre-seed a one-file torrent's every piece where the server reads them:
-/// the piece store. The single-file case of `embed.rs`'s
-/// `seed_piece_store_pieces`, with the layout asked of the store.
-///
-/// **Call this after the server has started**, never before: the
-/// launch-time sweep deletes every piece directory the embedder's pin set
-/// does not name, and one seeded before the process comes up is exactly
-/// that.
-fn seed_piece_store(cache_root: &Path, torrent_bytes: &[u8], content: &[u8]) {
-    let meta = librqbit::torrent_from_bytes(torrent_bytes).expect("parse the torrent back");
-    let info_hash = meta.info_hash.as_string();
-    let info = meta.info.data.validate().expect("validated metainfo");
-    let piece_length = info.lengths().default_piece_length() as u64;
-    assert_eq!(
-        content.len() as u64,
-        info.lengths().total_length(),
-        "the fixture and the torrent disagree about the payload"
-    );
-    let store =
-        enginefs::piece_store::StoreRoot::in_download_dir(&cache_root.join("rqbit-downloads"));
-    let layout = enginefs::piece_store::PieceLayout::new(
-        piece_length,
-        content.len() as u64,
-        [enginefs::piece_store::FileSpec {
-            len: content.len() as u64,
-            padding: false,
-        }],
-    )
-    .expect("a layout for the fixture");
-    let pieces =
-        enginefs::piece_store::PieceStore::new(store.torrent_dir(&info_hash), Arc::new(layout));
-    for (index, piece) in content.chunks(piece_length as usize).enumerate() {
-        let path = pieces.piece_path(index as u32);
-        std::fs::create_dir_all(path.parent().expect("a bucket")).expect("piece bucket");
-        std::fs::write(&path, piece).expect("write a piece");
-    }
-}
-
-/// The control client: `/create` is a control route and takes the launch's
-/// bearer token.
-fn bearer_client(
-    handle: &stream_server::ServerHandle,
-) -> anyhow::Result<reqwest::blocking::Client> {
-    let mut headers = reqwest::header::HeaderMap::new();
-    let token = handle.auth_token().expect("every launch generates a token");
-    headers.insert(
-        reqwest::header::AUTHORIZATION,
-        format!("Bearer {token}").parse().expect("valid header"),
-    );
-    Ok(reqwest::blocking::Client::builder()
-        .default_headers(headers)
-        .build()?)
-}
-
 /// The torrent added and checked, and the URL its one file is played from.
 fn seeded_stream_url(
     handle: &stream_server::ServerHandle,
@@ -140,8 +68,10 @@ fn seeded_stream_url(
     let content = src.join("Feature");
     std::fs::create_dir_all(&content)?;
     std::fs::write(content.join("movie.bin"), payload)?;
-    let (torrent, info_hash) = real_torrent(&content);
-    seed_piece_store(cache_root, &torrent, payload);
+    // 64 KiB pieces, which for [`PAYLOAD`] is 128 of them to seed rather
+    // than 512.
+    let (torrent, info_hash) = real_torrent_with_pieces(&content, 64 * 1024);
+    seed_single_file(cache_root, &torrent, payload);
 
     let client = bearer_client(handle)?;
     client
@@ -197,11 +127,7 @@ fn a_torrent_body_says_whether_it_was_delivered_or_hung_up_on() -> anyhow::Resul
         init_logging: true,
         // Nothing seeds this fixture, so nothing may take its pieces back:
         // see [`fixture_pins`].
-        ..fixture_pins::keep_what_the_fixture_seeded(stream_server::ServerConfig {
-            resolve_dht_bootstrap_names: false,
-            use_public_trackers: false,
-            ..stream_server::ServerConfig::default()
-        })
+        ..fixture_pins::keep_what_the_fixture_seeded(torrent_fixtures::offline_config())
     })?;
     let base = format!("http://{}", handle.http_addr());
     let payload: Vec<u8> = (0..PAYLOAD).map(byte_at).collect();

@@ -63,15 +63,15 @@ curl -X POST "$BASE/settings" -H "Authorization: Bearer $TOKEN" \
 
 | Setting | Type | Default | Description |
 | --- | --- | --- | --- |
-| `btEnableDht` | boolean | `true` | Enables DHT peer discovery. Disable to avoid announcing through the decentralized DHT network. |
+| `btEnableDht` | boolean | `true` | DHT peer discovery. The DHT is created with the session, so `false` means no DHT at all, and a change takes effect on the **next server start**. |
 | `btEnablePex` | boolean | `true` | Not honoured: librqbit has no PeX switch (`ut_pex` is always on for public torrents), so neither value changes anything. |
-| `btEnableLsd` | boolean | `true` | Enables Local Service Discovery on the LAN. Disable to avoid local-network peer discovery. |
-| `btEncryptionMode` | string or number | `"allow"` | Encryption policy. Accepts `"allow"`/`0`, `"require"`/`1`, or `"disable"`/`2`. |
-| `btAnonymousMode` | boolean | `false` | Enables anonymous mode, which reduces identifying client metadata where supported. |
-| `btAllowMultipleConnectionsPerIp` | boolean | `false` | Allows more than one peer connection per IP address. Keep disabled unless you explicitly need it. |
-| `btValidateHttpsTrackers` | boolean | `true` | Validates HTTPS tracker certificates. Disabling this weakens tracker TLS checks. |
-| `btSsrfMitigation` | boolean | `true` | Keeps SSRF mitigations enabled for tracker and web seed access. |
-| `dhtBootstrapNodes` | array of strings, or `null` | `null` (the built-in list) | DHT bootstrap nodes (`"host:port"`) used to seed the routing table on a cold start. A non-empty list *replaces* the default entirely; `null` or `[]` uses it. Invalid entries (no `host:port` split, or an unparseable/zero port) are dropped with a warning instead of failing the request. Unlike the other `bt*` settings above, this one is read once when librqbit's session opens, so a change here takes effect on the **next server start**, not the running session. |
+| `btEnableLsd` | boolean | `true` | Local Service Discovery multicast on the LAN, on or off for the whole session; takes effect on the **next server start**. |
+| `btEncryptionMode` | string or number | `"allow"` | Not honoured: librqbit speaks plain BitTorrent only (no MSE/PE), so `"require"` cannot be met and `"disable"` is what always stands. Accepts `"allow"`/`0`, `"require"`/`1`, or `"disable"`/`2`. |
+| `btAnonymousMode` | boolean | `false` | Not honoured: no equivalent; the client name and peer id are librqbit's own. |
+| `btAllowMultipleConnectionsPerIp` | boolean | `false` | Not honoured: librqbit has no per-IP connection rule. |
+| `btValidateHttpsTrackers` | boolean | `true` | Not honoured: HTTPS tracker certificates are always validated, and that cannot be turned off. |
+| `btSsrfMitigation` | boolean | `true` | Not honoured: no equivalent. |
+| `dhtBootstrapNodes` | array of strings, or `null` | `null` (the built-in list) | DHT bootstrap nodes (`"host:port"`) used to seed the routing table on a cold start. A non-empty list *replaces* the default entirely; `null` or `[]` uses it. Invalid entries (no `host:port` split, or an unparseable/zero port) are dropped with a warning instead of failing the request. Like `btEnableDht` and `btEnableLsd`, this is read once when librqbit's session opens, so a change here takes effect on the **next server start**, not the running session. |
 
 The built-in bootstrap list, why it is those two hosts, and how the server resolves the names before librqbit sees them (so an address literal configured here skips DNS altogether) are under [DHT health](stats.md#dht-health-serverhandledht_status). Once a session has run, librqbit persists its routing table to `dht.json` and loads it on every later start, so `dhtBootstrapNodes` normally matters only on a first run or after that file is lost.
 
@@ -99,15 +99,15 @@ to pick; librqbit has no knob for a fixed range.
 
 | Setting | Type | Default | Description |
 | --- | --- | --- | --- |
-| `btProxyType` | string or number | `"none"` | Proxy type. Accepts `"none"`/`0`, `"socks4"`/`1`, `"socks5"`/`2`, `"socks5Password"`/`3`, `"http"`/`4`, or `"httpPassword"`/`5`. |
-| `btProxyHost` | string | `""` | Proxy host or IP address. |
-| `btProxyPort` | number | `0` | Proxy port. |
-| `btProxyUsername` | string | `""` | Proxy username for authenticated proxy types. |
-| `btProxyPassword` | string | `""` | Proxy password for authenticated proxy types. |
-| `btProxyHostnames` | boolean | `true` | Resolves hostnames through the proxy where supported. |
-| `btProxyPeerConnections` | boolean | `false` | Routes peer connections through the proxy. |
-| `btProxyTrackerConnections` | boolean | `true` | Routes tracker connections through the proxy. |
-| `btProxySendHostInConnect` | boolean | `false` | Sends the hostname in HTTP `CONNECT` requests where supported. |
+| `btProxyType` | string or number | `"none"` | Proxy type; takes effect on the **next server start**. Accepts `"none"`/`0`, `"socks4"`/`1`, `"socks5"`/`2`, `"socks5Password"`/`3`, `"http"`/`4`, or `"httpPassword"`/`5`, but only `socks5` and `socks5Password` are applied: librqbit has no SOCKS4 or HTTP proxy, and those values run the session unproxied. |
+| `btProxyHost` | string | `""` | With `btProxyType` and `btProxyPort`, the one SOCKS5 proxy peer connections and HTTP(S) tracker requests go through; next server start. |
+| `btProxyPort` | number | `0` | See `btProxyHost`. |
+| `btProxyUsername` | string | `""` | Sent for `socks5Password` only; next server start. |
+| `btProxyPassword` | string | `""` | Sent for `socks5Password` only; next server start. Never logged. |
+| `btProxyHostnames` | boolean | `true` | Not honoured: peers are addresses, and tracker hostnames are resolved locally (SOCKS5, not SOCKS5h). |
+| `btProxyPeerConnections` | boolean | `false` | Not honoured: peer connections always go through a configured proxy. |
+| `btProxyTrackerConnections` | boolean | `true` | Not honoured: HTTP(S) tracker requests always go through a configured proxy; UDP trackers and the DHT never can. |
+| `btProxySendHostInConnect` | boolean | `false` | Not honoured: an HTTP `CONNECT` option, and librqbit has no HTTP proxy. |
 
 
 

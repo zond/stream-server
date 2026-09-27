@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-/// One pinned download as the routes and `ServerHandle` report it.
+/// One pinned download as `ServerHandle::downloads` reports it.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadInfo {
@@ -77,8 +77,8 @@ pub struct DownloadInfo {
 pub const DORMANT_DOWNLOAD_ERROR: &str = "the torrent is not managed right now; \
      the pin is kept and applies when it comes back";
 
-/// Pin `file_idx` of `info_hash` as an offline download, exactly what
-/// `POST /{infoHash}/{fileIdx}/download` will answer: the engine is created
+/// Pin `file_idx` of `info_hash` as an offline download, behind
+/// `ServerHandle::pin_download`: the engine is created
 /// through the magnet registry with `trackers` (normalised like the stats
 /// routes' `tr=` values) when the hash is new, and the file is kept wanted
 /// and exempt from eviction (see
@@ -299,11 +299,11 @@ fn spawn_download_progress_log(
     });
 }
 
-/// Drop the pin on `file_idx` of `info_hash`, exactly what
-/// `DELETE /{infoHash}/{fileIdx}/download` answers. [`UnpinOutcome`] says
-/// whether a pin was actually cleared (false for an unknown torrent or an
-/// unpinned file) and whether data actually went -- which is what the
-/// response reports, not the request's own flag.
+/// Drop the pin on `file_idx` of `info_hash`, behind
+/// `ServerHandle::unpin_download`. [`UnpinOutcome`] says whether a pin was
+/// actually cleared (false for an unknown torrent or an unpinned file) and
+/// whether data actually went -- which is what the caller is told, not its
+/// own flag echoed back.
 /// `delete_files` also deletes the data -- the whole torrent when this was
 /// its last pin, only that file while other pins hold, and, for a pin whose
 /// torrent the backend does not have, its directory in the piece store
@@ -323,7 +323,7 @@ pub async fn unpin_download(
         .await
 }
 
-/// Every pinned download, exactly what `GET /downloads.json` answers:
+/// Every pinned download, behind `ServerHandle::downloads`:
 /// ordered by info hash then file index, the live ones first and the
 /// dormant ones (torrent not restored, [`DORMANT_DOWNLOAD_ERROR`]) after
 /// them. One stats call per torrent, not per file.
@@ -344,8 +344,8 @@ pub async fn downloads(state: &AppState) -> Vec<DownloadInfo> {
     let engine_fs = state.engine.clone();
     let unknown = engine_fs.pins_unknown();
     // A set, not a list: both sources can name the same file, and a
-    // `GET /downloads.json` that returns one download twice is one no
-    // client can reconcile against its own list.
+    // listing that names one download twice is one no client can
+    // reconcile against its own list.
     let mut by_hash: BTreeMap<String, std::collections::BTreeSet<usize>> = BTreeMap::new();
     if unknown {
         for info_hash in engine_fs.list_engines().await {
@@ -592,13 +592,12 @@ pub fn proxy_download_key(
 /// Drops a proxy download's pin by its key (the row's `infoHash`), with
 /// `delete_files` its bytes too (`ServerHandle::unpin_proxy_download`).
 pub async fn unpin_proxy_download(state: &AppState, key: &str, delete_files: bool) -> UnpinOutcome {
-    let dir = state.proxy_cache.root().join(key);
-    if dir.parent() != Some(state.proxy_cache.root()) || key.is_empty() {
+    let Some(dir) = state.proxy_cache.key_dir(key) else {
         return UnpinOutcome {
             unpinned: false,
             deleted_files: false,
         };
-    }
+    };
     let state = state.clone();
     tokio::task::spawn_blocking(move || {
         let (unpinned, freed) = state.proxy_downloads.unpin(&state, &dir, delete_files);
@@ -627,10 +626,9 @@ pub async fn stream_proxy_download(
     Path(key): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let dir = state.proxy_cache.root().join(&key);
-    if key.is_empty() || dir.parent() != Some(state.proxy_cache.root()) {
+    let Some(dir) = state.proxy_cache.key_dir(&key) else {
         return StatusCode::NOT_FOUND.into_response();
-    }
+    };
     let Some((pin, name)) = state
         .proxy_downloads
         .snapshot()

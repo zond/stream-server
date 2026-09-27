@@ -175,17 +175,6 @@ impl StoredChunk {
     pub fn files(&self) -> impl Iterator<Item = &Metadata> {
         self.complete.iter().chain(self.staged.iter())
     }
-
-    /// The more recent modification time of the two copies, or `None` when
-    /// neither can be read.
-    ///
-    /// The more recent, not the older: the two exist together only while a
-    /// chunk is being written again over one not yet deleted, and the age
-    /// that describes those bytes is the age of the write, not of the copy
-    /// it is replacing.
-    pub fn modified(&self) -> Option<std::time::SystemTime> {
-        self.files().filter_map(|file| file.modified().ok()).max()
-    }
 }
 
 /// Everything one [`ChunkDir::stat`] found.
@@ -431,11 +420,10 @@ impl ChunkDir {
     ///
     /// **Crate-private, and that is the point.** There is one door into the
     /// unlink per adapter and this is not a third one: the torrent
-    /// adapter's is `StoreRoot::delete_pieces`, itself crate-private and
-    /// called only from `retention`, which either holds the
-    /// `DroppedFilePieces` claim that keeps the delete atomic with
-    /// librqbit's have-set or has established there is no have-set to
-    /// interlock against; and the `/proxy` adapter's is its own. A
+    /// adapter's is `StoreRegistry::delete`, called from `retention` under
+    /// the `DroppedFilePieces` claim that keeps the delete atomic with
+    /// librqbit's have-set (or with no have-set left to interlock against);
+    /// and the `/proxy` adapter's is its own. A
     /// generic *public* `remove` on the shared store would be exactly the
     /// second door that interlock exists to refuse -- somewhere to unlink a
     /// torrent's piece behind the backend's back and have it go on
@@ -552,9 +540,10 @@ impl ChunkDir {
     ///
     /// [`Self::stat`] answers the same question and more, and the more is
     /// what makes it the wrong call on a hot path: it costs a `metadata` per
-    /// file, and the retention pass asks this of a streaming torrent every
-    /// couple of seconds -- some 6,750 `statx` calls a pass for a 27 GB
-    /// torrent, for two numbers it does not want.
+    /// file, and this is asked of a proxied entity by its retention pass's
+    /// seed and by the read-ahead -- a `statx` per chunk, for two numbers
+    /// neither wants. (The torrent side never lists: the piece store keeps
+    /// its held set in memory.)
     ///
     /// `Err` is a directory that could not be listed, and it is the whole
     /// answer: a listing with one bucket missing from it would be an
@@ -962,6 +951,7 @@ impl OpenChunks {
 
     /// Whether any handle is being held open. What a test asking "does a
     /// paused torrent keep descriptors?" reads.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.handles.lock().is_empty()
     }

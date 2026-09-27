@@ -27,11 +27,10 @@
 //!   extents; UDF's allocation descriptors are a list by construction. The
 //!   result type carries that for both. Directories are not files.
 //!
-//! The module is `pub` so that the crate's lint level (`warnings = "deny"`,
-//! workspace-wide) does not call a finished, tested parser dead code while
-//! the route that will use it is still a step away. The step that follows
-//! adapts [`ImageReader`] to the repository's `ByteSource` and maps
-//! [`Refusal`] onto the HTTP answers in `docs/design/translated-sources.md` §3.
+//! `crate::translators::iso` is what uses it: it adapts [`ImageReader`] to
+//! the repository's `ByteSource` and maps [`Refusal`] onto the translators'
+//! refusals, and so onto the route's answers. The module is `pub` for its
+//! [`fixtures`], which the integration tests read.
 
 use async_trait::async_trait;
 use std::fmt;
@@ -41,10 +40,10 @@ use std::sync::Arc;
 pub mod iso9660;
 pub mod udf;
 
-/// **Not behind `#[cfg(test)]`**, for the same reason `sources::testing`
-/// is not: the integration tests put these images inside a torrent and
-/// behind a URL and read them back through the routes, and a fixture that
-/// existed only in unit builds would leave the end-to-end claim untested.
+/// **Not behind `#[cfg(test)]`**: the integration tests put these images
+/// inside a torrent and behind a URL and read them back through the routes,
+/// and a fixture that existed only in unit builds would leave the
+/// end-to-end claim untested.
 /// Nothing in it reads a file or opens a socket; it is a few functions
 /// that fill a `Vec<u8>` with descriptors.
 pub mod fixtures;
@@ -59,8 +58,8 @@ pub const SECTOR: u64 = 2048;
 ///
 /// Deliberately the smallest trait that can be implemented over anything:
 /// a file, a slice in memory, a torrent's piece store, a ranged HTTP
-/// entity. The adapting step wraps the repository's `ByteSource` in one of
-/// these (`len` and `read_at` are the same two calls under different
+/// entity. `crate::translators::iso` wraps the repository's `ByteSource` in
+/// one of these (`len` and `read_at` are the same two calls under different
 /// names), which is why nothing here asks for seeking, buffering or a
 /// stream.
 #[async_trait]
@@ -201,9 +200,6 @@ pub enum Refusal {
         format: &'static str,
         detail: String,
     },
-    /// The image, or the part of it the index needs, is encrypted. There is
-    /// no key here and a guess is ciphertext.
-    Encrypted { format: &'static str },
     /// The reader failed. The image may be fine; these bytes are not
     /// available.
     Unreadable { detail: String },
@@ -217,7 +213,6 @@ impl fmt::Display for Refusal {
                 write!(f, "{format} image uses {what}, which is not supported")
             }
             Self::Malformed { format, detail } => write!(f, "malformed {format} image: {detail}"),
-            Self::Encrypted { format } => write!(f, "{format} image is encrypted"),
             Self::Unreadable { detail } => write!(f, "image could not be read: {detail}"),
         }
     }
@@ -372,21 +367,11 @@ impl<'a> Budget<'a> {
     }
 }
 
-// Little-endian readers over untrusted bytes. Each returns `None` rather
-// than panicking when the slice is too short: a descriptor that ends early
-// is a malformed image and the caller turns it into that refusal, with the
-// name of the field it was reading.
-pub(crate) fn le_u16(b: &[u8], at: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(b.get(at..at + 2)?.try_into().ok()?))
-}
-
-pub(crate) fn le_u32(b: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
-}
-
-pub(crate) fn le_u64(b: &[u8], at: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(b.get(at..at + 8)?.try_into().ok()?))
-}
+// Little-endian readers over untrusted bytes, the translators' own: each
+// returns `None` rather than panicking when the slice is too short, since a
+// descriptor that ends early is a malformed image and the caller turns it
+// into that refusal, with the name of the field it was reading.
+pub(crate) use crate::translators::{le_u16, le_u32, le_u64};
 
 /// Trim a file's extents so that they sum to exactly `len`.
 ///

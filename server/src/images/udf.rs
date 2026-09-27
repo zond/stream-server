@@ -533,7 +533,16 @@ impl<'a> Volume<'a> {
             let mut pos = 0usize;
             while pos + 38 <= bytes.len() {
                 let fid = &bytes[pos..];
-                match check_tag(fid, &self.budget)? {
+                let len_fi = fid[19] as usize;
+                let len_iu = le_u16(fid, 36).expect("at least 38 bytes") as usize;
+                let total = 38 + len_iu + len_fi;
+                let padded = total.next_multiple_of(4);
+                // The tag is checked against this descriptor's own bytes and
+                // no more: a CRC length is sixteen bits, and one that ran on
+                // into the directory's later identifiers would CRC up to 64
+                // KiB for every 40 bytes stepped -- quadratic in the size of
+                // a directory somebody else wrote.
+                match check_tag(&fid[..padded.min(fid.len())], &self.budget)? {
                     Some(TAG_FILE_IDENTIFIER) => {}
                     // An all-zero tag is unwritten space at the end of the
                     // directory's last block, not a descriptor.
@@ -545,16 +554,6 @@ impl<'a> Volume<'a> {
                     }
                 }
                 let characteristics = fid[18];
-                let len_fi = fid[19] as usize;
-                let len_iu = le_u16(fid, 36).expect("at least 38 bytes") as usize;
-                let total = 38usize
-                    .checked_add(len_iu)
-                    .and_then(|t| t.checked_add(len_fi))
-                    .ok_or_else(|| {
-                        self.budget
-                            .malformed("a file identifier's length overflows")
-                    })?;
-                let padded = total.next_multiple_of(4);
                 if total > fid.len() {
                     return Err(self.budget.malformed(format!(
                         "a file identifier in `{path}` claims {total} bytes and {} are left",
@@ -1011,6 +1010,16 @@ mod tests {
         let err = index(&image).await.expect_err("refused");
         assert!(
             matches!(&err, Refusal::Malformed { detail, .. } if detail.contains("CRC")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_identifier_whose_crc_runs_past_it_is_refused() {
+        let image = MemoryImage::new(fx::udf_with_a_fid_crc_past_its_end());
+        let err = index(&image).await.expect_err("refused");
+        assert!(
+            matches!(&err, Refusal::Malformed { detail, .. } if detail.contains("says its body is")),
             "{err:?}"
         );
     }

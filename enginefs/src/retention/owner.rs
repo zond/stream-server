@@ -3,25 +3,22 @@
 //!
 //! Both retention drivers -- `Engine::retain` over a torrent's piece store
 //! and `server::proxy_retention` over a proxied body's chunk store -- run the
-//! same arithmetic ([`RetentionPolicy`]) and validate a different number of
-//! times, and four review rounds found the same defect in each: **a value
-//! read at one moment, trusted at another**. The policy itself was the worst
-//! case. Both sides `take()` it out of its slot for the length of a pass and
-//! put it back afterwards, so a pass that dies at an await -- the runtime
+//! same arithmetic ([`RetentionPolicy`]) through this one owner, and the
+//! defect it is built against is **a value read at one moment, trusted at
+//! another**. The policy is the case that matters: a pass that took it out
+//! of its slot for its own length and died at an await -- the runtime
 //! shutting down, the blocking pool refusing a task, a panic in the unlink
-//! closure -- walks off with the policy, and the entity is unbounded until
-//! the budget's *value* changes. Both sides then grew shadows of the policy
-//! beside the empty slot (`bounds`, `bounded`, `windows`-as-snapshot) so a
-//! panel or the cleaner asking mid-pass would not be told "nothing bounds
-//! this stream", and the torrent's clear left a range held back beside an
-//! empty slot when the backend refused to re-advertise it -- held back and
-//! read as announced, the one combination that is never right.
+//! closure -- would walk off with it, and the entity would be unbounded
+//! until the budget's *value* changed; and a clear that emptied the slot
+//! before the backend re-advertised the range would, on a refusal, leave
+//! it held back beside an empty slot -- held back and read as announced,
+//! the one combination that is never right.
 //!
 //! Here the policy is resident in [`State::installed`], behind a lock that
 //! is never held across an await, and it is never taken out: a pass advances
 //! it in place. What a pass holds instead is the entity's **turn**, a tokio
-//! mutex over a zero-sized [`Turn`] token -- `Engine::announce` made per
-//! entity and given to the proxy too. Whoever holds the turn is the one
+//! mutex over a zero-sized [`Turn`] token, one per entity on both sides.
+//! Whoever holds the turn is the one
 //! party installing, clearing or passing on that entity, and the turn *is*
 //! held across that party's I/O, because that is what keeps "nothing
 //! becomes announced between the decision and the unlink" true.
@@ -43,9 +40,9 @@
 //! * **X** -- locks outside the owner: `pinned_files`, [`RetentionBudget`],
 //!   the liveness cell, librqbit's own, the filesystem.
 //!
-//! 1. L1 → L2 only, and only inside [`Retention::holdings`] and
-//!    [`Retention::forget_empty`], which take L1 and read each entity's L2
-//!    under it; never L2 → L1. An entity holds its own `Arc` and never
+//! 1. L1 → L2 only, and only inside [`Retention::holdings`],
+//!    [`Retention::forget_empty`] and `drawn_in`, which take L1 and read
+//!    each entity's L2 under it; never L2 → L1. An entity holds its own `Arc` and never
 //!    reaches the map. (Every other reader of the map --
 //!    [`Retention::readers`], `lookup`, `entity` -- copies the `Arc`s out
 //!    and releases L1 before touching any L2.)
@@ -55,19 +52,16 @@
 //!    called under L2 (`policy` from [`Reader::note`]'s decide, `index_of`
 //!    from the [`Door`] and every head reading) and must take no lock and do
 //!    no I/O. [`Backing::policy`] returns its `Err` as a value and the
-//!    caller logs after unlock (today's one exception, the proxy's `decide`
-//!    logging under its map lock, is gone). [`Backing::keeps_everything`]
+//!    caller logs after unlock. [`Backing::keeps_everything`]
 //!    (`pinned_files.read()`) is asked before L2 is taken, in the [`Door`]
 //!    and in the pass.
 //! 3. T is awaited (`lock().await`) only with NO owner lock held:
 //!    [`Retention::pass`]'s callers, [`Retention::install`] and
 //!    [`Retention::clear`] take it first. T → L2 briefly is allowed.
 //!    `try_lock` on T IS allowed under L2 -- deliberately:
-//!    "is a pass running" and "is this byte due" must be one reading (today
-//!    `running` and `moved` are read under one map lock), and **every exit
-//!    of the pass** must decide `again` and either hand the claim on or drop
-//!    it INSIDE its L2 block (today `running = false` and
-//!    `arms_another_pass` run under one lock). Releasing L2 before the
+//!    "is a pass running" and "is this byte due" must be one reading, and
+//!    **every exit of the pass** must decide `again` and either hand the
+//!    claim on or drop it INSIDE its L2 block. Releasing L2 before the
 //!    `try_lock`, or the claim after L2, reopens the swallowed-last-byte
 //!    hole: a byte delivered between the conclusion and the release finds a
 //!    pass "running", starts none, and nothing remembers that it wanted
@@ -76,17 +70,14 @@
 //!    L1 and is for callers holding nothing.
 //! 4. T is per entity and never nested: every party takes one turn, does
 //!    its work and releases it before taking another, and nothing here
-//!    touches two entities in one act. [`Retention::install`] used to,
-//!    retiring every sibling under an ordering lock of its own; both are
-//!    gone with the value that replaced them (see
-//!    [`crate::retention::live`]).
+//!    touches two entities in one act -- what makes a sibling slack is the
+//!    liveness value ([`crate::retention::live`]), not an install.
 //! 5. Writes to `installed`, `windows`, `stride` and the in-place advance of
 //!    the policy require `&mut Turn`, so "written only under the turn" is a
 //!    type -- with one documented exception: [`State::install_now`]
 //!    ([`Install::OnDeliveredByte`]) writes `installed`, `decided` and
 //!    `stride` and resets every reader's `passed_at` under L2 alone from
-//!    [`Reader::note`] while a pass may hold T (the writes today's `decide`
-//!    makes). Legal only because [`Share::Nothing`] holds nothing back (no
+//!    [`Reader::note`] while a pass may hold T. Legal only because [`Share::Nothing`] holds nothing back (no
 //!    foreign state to keep in step; const-asserted in [`Retention::new`]),
 //!    and it is why the pass re-checks budget and domain at the post-listing
 //!    re-read and before writing its windows. `decided` has no turn-writer:
@@ -151,30 +142,27 @@
 //! dropped or handed on inside that block ([`State::owes_a_pass`]). There
 //! is no `abandon` and no `put_back`, because nothing was taken out.
 //!
-//! # Departures from the design
+//! # Rules the steps above do not spell out
 //!
-//! Where this file differs from the approved synthesis, on purpose:
-//!
-//! * The design's `try_turn` comment says "never waits; legal under L2". It
-//!   looks its entity up under L1, so it is NOT legal under L2 (L2 → L1
-//!   inverts rule 1); the `try_lock` rule 3 allows under L2 is
-//!   [`Reader::note`]'s on an entity it already holds.
+//! * [`Retention::try_turn`] never waits, but it looks its entity up under
+//!   L1, so it is NOT legal under L2 (L2 → L1 inverts rule 1); the
+//!   `try_lock` rule 3 allows under L2 is [`Reader::note`]'s on an entity it
+//!   already holds.
 //! * `again` is decided on every exit of the pass, not only at step 9, and a
 //!   pass refused at its re-read (or overtaken during its reclaim) hands the
 //!   claim on outright rather than asking the stride rule of a head it never
-//!   measured. The design's step 9 alone reopened the swallowed-last-byte
-//!   hole for a last byte delivered under a budget change; see
-//!   [`Retention::pass`].
+//!   measured: step 9 alone would swallow a last byte delivered under a
+//!   budget change; see [`Retention::pass`].
 //! * `passed_at` is written only when the windows are (budget and domain
-//!   unchanged). Today's `finish` writes it regardless, which undoes the
-//!   "every reader is due again" its own `decide` promises.
-//! * `clear` forgets `decided` with the policy (design A's step 1; the
-//!   synthesis dropped the words). Without it a cleared
+//!   unchanged): writing it regardless would undo the "every reader is due
+//!   again" a publication promises.
+//! * `clear` forgets `decided` with the policy. Without it a cleared
 //!   [`Install::OnDeliveredByte`] entity is never decided again until the
 //!   budget's value changes.
-//! * The windows are written only if budget AND domain are unchanged (the
-//!   synthesis says budget). Strictly more conservative; the domain check is
-//!   dead today because only `install`, under the turn, writes the domain.
+//! * The windows are written only if budget AND domain are unchanged. The
+//!   domain check is dead as things stand, because only `install`, under the
+//!   turn, writes the domain; it is kept because it is the conservative
+//!   direction.
 //! * Step 2 snapshots `{domain, budget}` and the head's piece, and reads
 //!   heads and promises afresh at step 5 with no fallback to a step-2 copy:
 //!   an entity cannot vanish under a pass, because the pass holds its `Arc`.
@@ -183,19 +171,18 @@
 //!   install that answers `Unbounded` (a pin, a budget that covers the
 //!   file) leaves an entity with nothing installed in the map until a
 //!   slack pass finds it holding nothing ([`Retention::forget_empty`]) --
-//!   one small struct per file ever installed on, and gate-equivalent to
-//!   today's missing slot.
+//!   one small struct per file ever installed on.
 //! * An entity left unbounded wants its whole extent again
-//!   ([`Backing::want_all`]), which the design's step 3 does not say. Its
-//!   passes trim the backend's want-set to the window ([`Backing::want`] at
-//!   step 6), and a dropped piece stays dropped until something wants it; a
-//!   pin on a single-file torrent changes no selection, so without this the
-//!   download the user asked to keep would stop at the window's edge. It is
-//!   asked by the pass under a pin and by an install that ends with nothing
-//!   installed -- not by every clear: an install that replaces one policy
-//!   with another has a window to trim to at its next pass, and a file the
-//!   reader left is [`Mode::Slack`], with its pieces on their way off the
-//!   disk rather than something to fetch whole.
+//!   ([`Backing::want_all`]). Its passes trim the backend's want-set to the
+//!   window ([`Backing::want`] at step 6), and a dropped piece stays dropped
+//!   until something wants it; a pin on a single-file torrent changes no
+//!   selection, so without this the download the user asked to keep would
+//!   stop at the window's edge. It is asked by the pass under a pin and by
+//!   an install that ends with nothing installed -- not by every clear: an
+//!   install that replaces one policy with another has a window to trim to
+//!   at its next pass, and a file the reader left is [`Mode::Slack`], with
+//!   its pieces on their way off the disk rather than something to fetch
+//!   whole.
 //! * Two policies on one torrent are legal: each file is its own entity
 //!   with its own head, its own window and its own [`Mode`], and the one
 //!   that is neither played nor read is the one whose bytes go.
@@ -415,18 +402,6 @@ impl Asking {
     }
 }
 
-/// A set of pieces as its runs, ascending.
-fn runs_of(pieces: &BTreeSet<u32>) -> Vec<Range<u32>> {
-    let mut runs: Vec<Range<u32>> = Vec::new();
-    for &piece in pieces {
-        match runs.last_mut() {
-            Some(run) if run.end == piece => run.end = piece + 1,
-            _ => runs.push(piece..piece + 1),
-        }
-    }
-    runs
-}
-
 /// What the consumers of one entity are asking of its disk.
 #[derive(Debug)]
 pub struct Consumers {
@@ -494,8 +469,8 @@ pub trait Backing: Sized + Send + Sync + 'static {
     /// torrent's file index.
     type Want: Copy + Send + Sync;
     /// What a pass needs handed to it and never owns: the proxy's `()`; the
-    /// torrent's store root, handed to the pass as `retain` is handed one
-    /// today, so no constructor changes.
+    /// torrent's store root, handed to the pass as `Engine::retain` is handed
+    /// one.
     type Store: Sync;
     /// How the budget is split. [`Share::Nothing`] says [`Self::advertise`]
     /// is unreachable from the pass: the committed set has capacity zero, so
@@ -806,7 +781,7 @@ struct State<B: Backing> {
     /// **Where the entity is being consumed, as the detector last said**:
     /// the piece the busiest stream had reached at the last pass
     /// ([`Consumers::at`]), or `None` when the detector was silent -- no
-    /// pass yet, nothing reading it for `STREAM_IDLE`, or the policy gone.
+    /// pass yet, nothing reading it for `STREAM_DORMANT`, or the policy gone.
     /// What [`Self::holding`] reports as the head ahead of every reading
     /// off the readers: which of several readers is the viewer is a
     /// question about behaviour, and mpv's index crawler is regularly the
@@ -1435,8 +1410,8 @@ impl<B: Backing> Retention<B> {
                 return InstallOutcome::Kept;
             }
         }
-        // Resolved under the turn, as `policy_for` runs under `announce`
-        // today: what the backend says the file is, now. A fresh entity was
+        // Resolved under the turn: what the backend says the file is, now. A
+        // fresh entity was
         // resolved a moment ago to be made at all, and is not asked twice.
         let resolved = match fresh {
             Some(domain) => Some(domain),
@@ -1579,6 +1554,7 @@ impl<B: Backing> Retention<B> {
 
     /// Forget the policy for `key` and put back what it was holding back.
     /// Under the turn.
+    #[cfg(test)]
     pub async fn clear(&self, key: &B::Key) {
         let Some(entity) = self.lookup(key) else {
             return;
@@ -1595,12 +1571,10 @@ impl<B: Backing> Retention<B> {
     /// refused.
     ///
     /// **The range is advertised back first, and the policy forgotten only
-    /// when that succeeded.** Today's order is the reverse -- slot to
-    /// `None`, then re-advertise, and a backend that refuses leaves the
-    /// pieces held back beside an empty slot, which the deleted cache
-    /// cleaner's gate read as announced: held back and protected at once,
-    /// the one combination that is never right, logged at debug. Here a
-    /// refusal keeps the policy (still bounding, still holding back, still
+    /// when that succeeded.** The other order -- slot to `None`, then
+    /// re-advertise -- leaves a refused range held back beside an empty
+    /// slot: held back and read as unbounded at once, the one combination
+    /// that is never right. Here a refusal keeps the policy (still bounding, still holding back, still
     /// telling the truth about it), warns, and the next clear -- the next
     /// pass under a pin, the next install -- retries. Under [`Share::Nothing`] nothing was held
     /// back and there is nothing to put back.
@@ -2051,8 +2025,7 @@ impl<B: Backing> Retention<B> {
     /// pass held the turn started nothing; if it was the last of its body,
     /// this decision is the only thing that remembers it wanted a pass, and
     /// that is as true of a pass that refused at its re-read as of one that
-    /// concluded. Today's proxy re-arms from every finish and from no
-    /// abandon; here the rule is one: a pass that measured something owes
+    /// concluded. The rule is one: a pass that measured something owes
     /// another if the head moved a stride from what it measured, and a pass
     /// that measured nothing because the policy was replaced under it owes
     /// one outright, because the byte that replaced it was due and could not
@@ -2138,7 +2111,9 @@ impl<B: Backing> Retention<B> {
             let committed = state
                 .installed
                 .as_ref()
-                .map(|installed| runs_of(installed.policy.advertised()))
+                .map(|installed| {
+                    crate::retention::sorted_runs(installed.policy.advertised().iter().copied())
+                })
                 .unwrap_or_default();
             let mut holding: Vec<Range<u32>> = state
                 .readers
@@ -2227,6 +2202,12 @@ impl<B: Backing> Retention<B> {
         // asked for, or the old one that no longer exists. The byte that
         // decided it is owed the pass it could not start: `nothing` with no
         // measurement hands the claim on while something is installed.
+        // Asked once per pass: whether the trace target is on at all
+        // (`crate::retention::trace`). A disabled target is refused by
+        // `tracing` at each call site anyway; this is what keeps the work
+        // that only feeds those lines from being done for nothing.
+        let tracing_on =
+            tracing::enabled!(target: "enginefs::retention::trace", tracing::Level::INFO);
         let (decision, want_windows, door_policy, at, consumed_at, doomed, asserted, traced) = {
             let mut state = entity.state.lock();
             if !state.still(&begin) {
@@ -2261,21 +2242,23 @@ impl<B: Backing> Retention<B> {
                 .collect();
             // For [`crate::retention::trace`]: the heads and the lookaheads
             // of the reads that are open, and what the read that owns the
-            // head this pass measures from is for. Gathered whether or not
-            // the trace is on -- it is a few readers' worth of arithmetic,
-            // and the lines themselves are refused at the call site when the
-            // `diagnosticsTrace` setting is off.
-            let traced_readers: Vec<(u32, u64)> = state
-                .readers
-                .values()
-                .filter_map(|reader| {
-                    Some((
-                        B::index_of(&state.domain, reader.head()?)?,
-                        reader.buffering.lookahead_bytes,
-                    ))
-                })
-                .collect();
-            let traced_buffering = state.buffering();
+            // head this pass measures from is for. Gathered only while the
+            // trace is on: a pass runs every two seconds per file, and the
+            // `diagnosticsTrace` setting is off on every device that is not
+            // being diagnosed.
+            let traced = tracing_on.then(|| {
+                let readers: Vec<(u32, u64)> = state
+                    .readers
+                    .values()
+                    .filter_map(|reader| {
+                        Some((
+                            B::index_of(&state.domain, reader.head()?)?,
+                            reader.buffering.lookahead_bytes,
+                        ))
+                    })
+                    .collect();
+                (readers, state.buffering())
+            });
             let Some((decision, policy)) =
                 state.advance(&mut claim.guard, &consumers.reclaim, &held)
             else {
@@ -2369,7 +2352,7 @@ impl<B: Backing> Retention<B> {
                 consumed_at,
                 state.doomed.clone(),
                 state.asserted_epoch(),
-                (traced_readers, traced_buffering),
+                traced,
             )
         };
         // 6. Advertise what is committed before reclaiming: the two sets are
@@ -2480,11 +2463,12 @@ impl<B: Backing> Retention<B> {
             .reclaim(store, &begin.domain, runs(&alone), door)
             .await;
         // The pass's trace lines; see [`crate::retention::trace`] for what
-        // turns them on.
-        {
-            let (readers, buffering) = traced;
+        // turns them on. Everything here is for them alone, so none of it is
+        // done while they are off.
+        if let Some((readers, buffering)) = traced {
             let backing = self.backing.trace(store, &begin.domain);
-            if let Some(piece_length) = backing.map(|backing| backing.piece_length) {
+            let name = trace::name(key, backing.as_ref());
+            if let Some(piece_length) = backing.as_ref().map(|backing| backing.piece_length) {
                 for (head, lookahead) in &readers {
                     let ahead = head.saturating_add(
                         u32::try_from(lookahead.div_ceil(piece_length.max(1))).unwrap_or(u32::MAX),
@@ -2497,7 +2481,7 @@ impl<B: Backing> Retention<B> {
                         .collect();
                     if !inside.is_empty() {
                         trace::planned_to_reclaim_inside_a_lookahead(
-                            key,
+                            &name,
                             &inside,
                             *head..ahead,
                             *lookahead,
@@ -2510,7 +2494,8 @@ impl<B: Backing> Retention<B> {
                 .filter(|piece| B::extent(&begin.domain).contains(piece))
                 .partition::<Vec<u32>, _>(|piece| **piece < consumed_at);
             trace::pass(
-                key,
+                &name,
+                now,
                 trace::Pass {
                     playhead: consumed_at,
                     wanted: want_windows
@@ -3286,10 +3271,6 @@ impl<B: Backing> Reader<B> {
         self.entity.state.lock().domain.clone()
     }
 
-    /// This read will deliver `pieces` off the disk, and until it has,
-    /// nothing may unlink them. The range shrinks from the front as
-    /// [`Self::note`] reports bytes going out, and is released whole when
-    /// this handle is dropped. An empty promise records nothing.
     /// The piece at `at` is what this read is waiting for.
     ///
     /// [`Self::promises`] in the entity's own coordinates, so a caller that
@@ -3307,6 +3288,10 @@ impl<B: Backing> Reader<B> {
         }
     }
 
+    /// This read will deliver `pieces` off the disk, and until it has,
+    /// nothing may unlink them. The range shrinks from the front as
+    /// [`Self::note`] reports bytes going out, and is released whole when
+    /// this handle is dropped. An empty promise records nothing.
     pub fn promises(&self, pieces: Range<u32>) {
         if pieces.is_empty() {
             return;
@@ -3358,8 +3343,7 @@ impl<B: Backing> Reader<B> {
     /// No clock: nothing here is timed. The reads a detector measures are
     /// stamped where they are served ([`crate::retention::streams::Read`]),
     /// and the pass measures against the clock it is handed
-    /// ([`Retention::pass_at`]); a `note_at(at, now)` that took a clock and
-    /// discarded it stood here for a while and said otherwise.
+    /// ([`Retention::pass_at`]).
     pub fn note(&self, at: B::Position) -> Option<Claim> {
         let budget = self.owner.budget.get();
         let (claim, refused) = {
@@ -3463,12 +3447,14 @@ impl<B: Backing> Door<B> {
 
     /// **Whether `index` may not be taken at this instant.**
     ///
-    /// A load and a bit test, and on the live path nothing else: the set
-    /// was published by the pass under the entity's lock, and every promise
-    /// made since was written into it under that same lock. The door is
-    /// never a writer -- two unordered writers to one piece of state is the
-    /// defect this owner keeps finding -- and it takes no lock, because it
-    /// is asked once per candidate piece, per unlink, from a blocking
+    /// [`Self::shut`] first -- the backing's pin read and, on a slack pass,
+    /// its liveness read, each a lock outside the owner -- and then, on the
+    /// live path, a load and a bit test: the set was published by the pass
+    /// under the entity's lock, and every promise made since was written
+    /// into it under that same lock. The door is never a writer -- two
+    /// unordered writers to one piece of state is the defect this owner
+    /// keeps finding -- and it takes no owner lock on the live path, because
+    /// it is asked once per candidate piece, per unlink, from a blocking
     /// thread.
     ///
     /// The race it tolerates is a region that grew onto a piece just after
@@ -3520,12 +3506,11 @@ mod tests {
     /// **A pass that dies leaves the policy where it was, and the next one
     /// runs.**
     ///
-    /// The abandoned-pass hole, closed by construction: today both drivers
-    /// `take()` the policy for the length of a pass, so a pass future
-    /// dropped at its listing -- the runtime shutting down -- walks off with
-    /// it, and on the proxy the `running` flag it set is never cleared, so
-    /// no later pass runs either. Here the policy never moves and the claim
-    /// is a guard.
+    /// The abandoned-pass hole, closed by construction: a driver that took
+    /// the policy for the length of a pass would lose it to a pass future
+    /// dropped at its listing -- the runtime shutting down -- and a
+    /// `running` flag it set would never be cleared, so no later pass would
+    /// run either. Here the policy never moves and the claim is a guard.
     #[tokio::test]
     async fn a_pass_dropped_at_its_listing_leaves_the_policy_installed_and_the_next_pass_runs() {
         let (backing, owner, _budget) = proxy();
@@ -3561,10 +3546,9 @@ mod tests {
     /// **A reclaim whose closure dies reports nothing freed and touches
     /// nothing.**
     ///
-    /// Today's proxy `abandon(None)` after a join error: the policy went
-    /// down with the task, `bounded` and the windows stand as shadows of
-    /// it, and the entity is unbounded until the budget's value changes.
-    /// Here there is nothing to lose.
+    /// A pass that took the policy out for its length would lose it with
+    /// the task, and the entity would be unbounded until the budget's value
+    /// changed. Here there is nothing to lose.
     #[tokio::test]
     async fn a_reclaim_that_panics_leaves_the_policy_the_decision_and_the_windows_untouched() {
         let (backing, owner, _budget) = proxy();
@@ -3917,11 +3901,10 @@ mod tests {
     /// **A clear the backend refuses keeps the policy**, and a later clear
     /// retries and succeeds.
     ///
-    /// The one deliberate change from today. Today's `clear_retention_locked`
-    /// empties the slot first and re-advertises second, so a refusal leaves
-    /// the range held back beside an empty slot: the gate reads it as
-    /// announced, and nothing retries. Here the order is the other way and
-    /// the policy stands until the range really is given back.
+    /// Emptying the slot first and re-advertising second would leave a
+    /// refused range held back beside an empty slot, with nothing to retry.
+    /// Here the order is the other way and the policy stands until the range
+    /// really is given back.
     #[tokio::test]
     async fn a_clear_the_backend_refuses_keeps_the_policy_and_a_later_clear_retries() {
         let (backing, owner, _budget) = torrent();
@@ -3998,7 +3981,7 @@ mod tests {
         let second = parking_lot::Mutex::new(Some(second));
         // A body framed over piece 4 that ends while the unlinks run: the
         // pass snapshotted its promise at the re-read and honours it to the
-        // end, as today's does.
+        // end.
         let ended = owner.reader(0, domain(0, 0..8));
         ended.promises(4..5);
         let ended = parking_lot::Mutex::new(Some(ended));
@@ -4829,8 +4812,8 @@ mod tests {
         assert_eq!(backing.on_disk(), vec![2]);
 
         // The same publish landing during the unlinks rather than the
-        // listing: the re-read has passed, the unlinks stand as refetch cost
-        // (as today's do), and the conclusion is still not written.
+        // listing: the re-read has passed, the unlinks stand as refetch cost,
+        // and the conclusion is still not written.
         budget.set(Some(4 * PIECE), None);
         // A publish makes every reader due again, whatever the stride: the
         // old `passed_at` described a shape that no longer exists.
@@ -4916,8 +4899,7 @@ mod tests {
     /// re-read, correctly: it measured for a budget nobody holds. Dropped
     /// there with no `again`, the claim takes the last byte's pass with it,
     /// and the tail the fill wrote stays over budget until the grace prunes
-    /// the entity. Today's proxy re-arms from every finish; the owner hands
-    /// the claim on from the refusal too.
+    /// the entity. The owner hands the claim on from the refusal too.
     #[tokio::test]
     async fn the_last_byte_under_a_new_budget_during_a_refused_pass_gets_its_pass() {
         let (backing, owner, budget) = proxy();

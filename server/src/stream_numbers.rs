@@ -363,15 +363,7 @@ impl StreamFile {
         };
         let engine = engines.peek_engine(info_hash).await?;
         let files = engine.handle.get_files().await;
-        let candidates: Vec<_> = files
-            .iter()
-            .enumerate()
-            .map(|(index, file)| crate::routes::compat::FileCandidate {
-                index,
-                name: file.name.clone(),
-                length: file.length,
-            })
-            .collect();
+        let candidates = crate::routes::compat::candidates(&files);
         Self::auto(&candidates, filters)
     }
 

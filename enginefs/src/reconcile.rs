@@ -172,20 +172,20 @@ pub struct Conditions {
 ///
 /// 1. **Not a settled reading -> [`Decision::Stop`].** An `Initializing` reading is
 ///    not a state anything may conclude from: where the torrent ends up
-///    when its check finishes is decided by a `start_paused` captured when
-///    the check began, which is not observable from out here (see
-///    [`crate::backend::TorrentHandle::run_state`]). `Gone` is a torrent
-///    the backend holds no state for at all. Neither is a reading that says
-///    "this should be running", and the honest answer to "should it be
-///    running?" is therefore no -- which is also the safe direction, since
-///    the one way a check can end by surprise is the fastresume divergence
-///    that takes a torrent *live*. What no caller may do is turn this into
-///    a pause call on an initializing torrent: pausing one wedges it
-///    (`file_ops.rs:113` bails the check, `mod.rs:590-593` returns `Ok`
-///    without changing the state, and `wait_until_initialized` then polls a
-///    torrent that has no check running for ever). An actuator acts on
-///    settled readings; this arm exists so the arms below cannot read
-///    `playing` or `available` off an unsettled one and conclude `Run`.
+///    when its check finishes is decided then, by the pause intent as it
+///    stands at that moment, so nothing read before it says where it will
+///    land (see [`crate::backend::TorrentHandle::run_state`]). `Gone` is a
+///    torrent the backend holds no state for at all. Neither is a reading
+///    that says "this should be running", and the honest answer to "should
+///    it be running?" is therefore no -- which is also the safe direction.
+///    What no caller may do is turn this into a pause call on an
+///    initializing torrent: pausing one wedges it (`FileOps::initial_check`
+///    bails on the pause, the check's continuation leaves the state
+///    `Initializing` with no check running, nothing but an unpause runs it
+///    again, and `ManagedTorrent::wait_until_initialized` refuses every
+///    waiter on that pair). An actuator acts on settled readings; this arm
+///    exists so the arms below cannot read `playing` or `available` off an
+///    unsettled one and conclude `Run`.
 /// 2. **Want-set not re-applied -> [`Decision::Stop`].**
 ///    [`Conditions::settled`]: a torrent this process has not put its
 ///    want-set back on must not be started, because under piece reclaim it
@@ -208,14 +208,11 @@ pub struct Conditions {
 ///    it -- playing or pinned -- since a torrent nobody wants is one whose
 ///    bytes the retention owner is taking anyway (`EngineFS::retain_engine`
 ///    removes an unwanted errored torrent with its files). Anything else
-///    is `Leave`: not ours, no call, and no read refusal lifted.
-///
-///    It used to be the cache cleaner's, which restarted a stopped torrent
-///    after a pass that freed something. That made the restart a
-///    consequence of *an eviction having happened* rather than of the
-///    device having room, so a device that gained a gigabyte by any other
-///    means left the torrent dead, and a pass that freed a byte restarted
-///    one onto a volume still under the floor.
+///    is `Leave`: not ours, no call, and no read refusal lifted. The
+///    restart is a consequence of the device having room, never of an
+///    eviction having happened: a device that gained a gigabyte by any
+///    other means gets its torrent back, and a pass that freed a byte does
+///    not restart one onto a volume still under the floor.
 /// 4. **No metadata -> [`Decision::Run`].** A resolving magnet must stay
 ///    connected to the swarm: the thing it is fetching is the info
 ///    dictionary, it writes no file data while it does, and stopping it is
@@ -228,19 +225,24 @@ pub struct Conditions {
 ///    volume to zero. A finished torrent writes nothing and so is never
 ///    stopped by this arm. Which line, and what an unreadable probe means,
 ///    is `line` and [`volume_is_short`].
-/// 6. **Playing or pinned -> [`Decision::Run`], otherwise
+/// 6. **An unreadable volume, and the torrent still has data to fetch ->
+///    [`Decision::Leave`] for the timer, [`Decision::Run`] for a
+///    playback.** An unreadable volume is not a full one. The timer has no
+///    opinion -- it asks again in two seconds, and a probe that has started
+///    failing is a broken environment, not evidence about a disk -- and the
+///    user who is waiting gets their stream, since refusing to start a
+///    torrent because `statvfs` failed would make an unreadable volume look
+///    like a server that plays nothing.
+/// 7. **Playing or pinned -> [`Decision::Run`], otherwise
 ///    [`Decision::Stop`].** Someone is watching it, or someone asked for it
 ///    offline; and if neither, a running torrent is fetching a film nobody
 ///    is watching, into a cache whose next pass will delete every byte of
 ///    it. So it is stopped, seeding on or off.
 ///
-///    There was a seventh arm here -- the idle one -- with a grace period,
-///    a `last_active_at` stamp per engine and a [`Trigger`] gate to keep it
-///    from reading registers its own asker was still writing. All three
-///    were scaffolding round a clock that was standing in for a fact, and
-///    the fact is now readable: [`Conditions::playing`] is the liveness
-///    value ([`crate::retention::live`]), written once when the server sees
-///    a stream open and not by anything a request leaves behind. A viewer
+///    No clock decides this arm and no [`Trigger`] gates it:
+///    [`Conditions::playing`] is the liveness value
+///    ([`crate::retention::live`]), written once when the server sees a
+///    stream open and not by anything a request leaves behind. A viewer
 ///    who pauses keeps their torrent running and their window intact for as
 ///    long as they like; a viewer who opens something else loses both at
 ///    the next tick. Seeding is what a *pinned* torrent does, and pins are

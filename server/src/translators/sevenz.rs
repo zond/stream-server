@@ -40,6 +40,7 @@
 
 use super::{
     Body, Budget, Index, IndexReader, Member, Refusal, Translator, direct_extent, le_u32, le_u64,
+    member_name,
 };
 use crate::sources::ByteSource;
 use async_trait::async_trait;
@@ -396,12 +397,6 @@ fn method_names(block: &Block) -> String {
     } else {
         names.join(" + ")
     }
-}
-
-/// The name as the route matches it: `/`-separated, no leading slash. A
-/// 7z written on Windows stores `\`.
-fn member_name(name: &str) -> String {
-    name.replace('\\', "/").trim_start_matches('/').to_string()
 }
 
 #[cfg(test)]
@@ -800,12 +795,5 @@ mod tests {
         assert_eq!(empty.body, Body::Direct(Vec::new()));
         let film = index.find("videos/film.bin").expect("the film").1;
         assert_eq!(gather(&bytes, extents_of(film)), payload(4096));
-    }
-
-    /// A name written on Windows is matched the way the route spells it.
-    #[test]
-    fn a_windows_name_is_slash_separated() {
-        assert_eq!(member_name("videos\\film.bin"), "videos/film.bin");
-        assert_eq!(member_name("/videos/film.bin"), "videos/film.bin");
     }
 }
