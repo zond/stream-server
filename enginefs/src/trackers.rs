@@ -91,7 +91,7 @@ impl TrackerManager {
                     .refresh_trackers_internal(DEFAULT_TRACKERS_URL)
                     .await
                 {
-                    warn!(error = %e, "Failed to refresh trackers");
+                    warn!(error = format!("{e:#}"), "Failed to refresh trackers");
                 }
             }
         }));
@@ -115,7 +115,7 @@ impl TrackerManager {
 
             // Check if refresh is needed
             if let Err(e) = manager.refresh_if_needed().await {
-                warn!(error = %e, "Failed initial tracker refresh");
+                warn!(error = format!("{e:#}"), "Failed initial tracker refresh");
             }
 
             // Periodic check for refresh
@@ -123,7 +123,7 @@ impl TrackerManager {
             loop {
                 interval.tick().await;
                 if let Err(e) = manager.refresh_if_needed().await {
-                    warn!(error = %e, "Failed to refresh trackers");
+                    warn!(error = format!("{e:#}"), "Failed to refresh trackers");
                 }
             }
         }));
