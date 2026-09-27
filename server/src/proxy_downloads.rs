@@ -217,8 +217,14 @@ impl ProxyDownloads {
         source: Option<Arc<ProxySource>>,
     ) -> PathBuf {
         let dir = entry.dir().to_path_buf();
-        state.proxy_cache.retention().pin(dir.clone());
+        // The table first, and the retention owner told under it -- here
+        // and in [`Self::unpin`]: with the two done under different locks,
+        // an unpin landing between this pin's `retention.pin` and its
+        // record left a listed download with a filler running and no pin
+        // keeping what it fetched. The order is table, then retention;
+        // nothing takes them the other way round.
         let mut pinned = self.table();
+        state.proxy_cache.retention().pin(dir.clone());
         let record = pinned.entry(dir.clone()).or_insert_with(|| Pinned {
             name: name.clone().unwrap_or_else(|| key.default_name()),
             key: key.clone(),
@@ -251,11 +257,16 @@ impl ProxyDownloads {
         dir: &PathBuf,
         delete_files: bool,
     ) -> (bool, u64) {
-        let record = self.table().remove(dir);
-        if let Some(filler) = record.as_ref().and_then(|record| record.filler.as_ref()) {
-            filler.abort();
-        }
-        let was_pinned = state.proxy_cache.retention().unpin(dir) || record.is_some();
+        // Under the table, as [`Self::pin`] is: a pin cannot land between
+        // the record going and the retention owner hearing it.
+        let was_pinned = {
+            let mut pinned = self.table();
+            let record = pinned.remove(dir);
+            if let Some(filler) = record.as_ref().and_then(|record| record.filler.as_ref()) {
+                filler.abort();
+            }
+            state.proxy_cache.retention().unpin(dir) || record.is_some()
+        };
         let freed = if delete_files {
             state
                 .proxy_cache

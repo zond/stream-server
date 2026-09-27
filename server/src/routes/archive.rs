@@ -15,6 +15,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio_util::io::ReaderStream;
@@ -796,6 +797,28 @@ async fn stream_translated(
     (framing.status(), res_headers, body).into_response()
 }
 
+/// `key` in the one spelling the session registry files it under.
+///
+/// A `torrent:<info hash>/<path>` key names its torrent by a hash, and a
+/// hash is hex whatever its case: the engine folds it before it looks a
+/// torrent up (`TorrentFileSource`), so `torrent:ABC…/film.rar` and
+/// `torrent:abc…/film.rar` are one archive -- and filed as they were
+/// written they were two sessions over it, each indexing it and each
+/// holding a lease. Only the hash is folded; the path is the torrent's own
+/// and its case means something. Any other key is the registry's own name
+/// for a `/create`d session and is returned as it came.
+fn canonical_key(key: &str) -> Cow<'_, str> {
+    match key
+        .strip_prefix("torrent:")
+        .and_then(|rest| rest.split_once('/'))
+    {
+        Some((hash, path)) if hash.bytes().any(|byte| byte.is_ascii_uppercase()) => {
+            Cow::Owned(format!("torrent:{}/{path}", hash.to_ascii_lowercase()))
+        }
+        _ => Cow::Borrowed(key),
+    }
+}
+
 /// The session under `key`, leased -- creating it for the `torrent:` form,
 /// which has no `/create` of its own.
 async fn session_for(
@@ -803,6 +826,8 @@ async fn session_for(
     translator: &dyn Translator,
     key: &str,
 ) -> Result<Lease<TranslatedSession>, Box<Response>> {
+    let key = canonical_key(key);
+    let key = key.as_ref();
     if let Some(session) = state.translated_archives.get(key) {
         return Ok(session);
     }
@@ -906,6 +931,23 @@ fn encode_path_segments(path: &str) -> String {
 mod tests {
     use super::*;
     use futures_util::StreamExt;
+
+    /// **A `torrent:` key's hash is folded, and nothing else is.** The
+    /// session registry is keyed by the string, so two spellings of one
+    /// hash were two sessions over one archive.
+    #[test]
+    fn a_torrent_key_is_filed_under_its_lowercase_hash() {
+        const UPPER: &str = "torrent:0123456789ABCDEF0123456789ABCDEF01234567/Film.Part1.RAR";
+        const LOWER: &str = "torrent:0123456789abcdef0123456789abcdef01234567/Film.Part1.RAR";
+        assert_eq!(canonical_key(UPPER), canonical_key(LOWER));
+        assert_eq!(canonical_key(UPPER), LOWER, "the path keeps its case");
+        assert!(matches!(canonical_key(LOWER), Cow::Borrowed(_)));
+        // A `/create`d session's key is the registry's own, and a key
+        // with no path is refused later; neither is rewritten.
+        for key in ["0123ABCD", "torrent:ABCDEF"] {
+            assert_eq!(canonical_key(key), key);
+        }
+    }
 
     /// A body over a reader that can fill whatever it is handed is read in
     /// media-sized chunks, not the 4 KiB `ReaderStream::new` would ask for.

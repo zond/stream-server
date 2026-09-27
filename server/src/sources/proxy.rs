@@ -260,8 +260,16 @@ impl ProxySource {
             .map_err(ProxySourceError::Credentials)?;
         let mut probe = HeaderMap::new();
         probe.insert(header::RANGE, HeaderValue::from_static("bytes=0-0"));
-        let answer =
-            cache_assisted_range(None, &Method::GET, &url, &probe, &request_headers, None).await?;
+        let answer = cache_assisted_range(
+            None,
+            self_addr,
+            &Method::GET,
+            &url,
+            &probe,
+            &request_headers,
+            None,
+        )
+        .await?;
         let RangeAnswer::Origin(origin) = answer else {
             // Unreachable with no entry to look up in, and stated rather
             // than assumed: a hit here would be an answer about the store
@@ -461,6 +469,7 @@ impl Entity {
         let request_headers = self.credentials.headers().await?;
         let answer = cache_assisted_range(
             self.entry(),
+            self.self_addr,
             &Method::GET,
             &self.url,
             &headers,

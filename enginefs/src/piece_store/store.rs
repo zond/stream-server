@@ -1079,7 +1079,7 @@ impl Inner {
             // satisfy, and the completeness criterion for a torrent
             // piece is the swarm's SHA-1, which has already passed by
             // the time this runs.
-            self.chunks.commit(index, None).map_err(|e| (e, "rename"))
+            self.chunks.commit(index).map_err(|e| (e, "rename"))
         });
         match committed {
             Ok(()) => {

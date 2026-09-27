@@ -9,7 +9,7 @@ What `GET`/`POST /settings` and `ServerHandle::settings`/`update_settings` read 
 | Key | Default | Effect |
 |---|---|---|
 | `cacheRoot` | the configured cache directory | The one torrent-data root. A change applies at the next start -- see [Offline downloads](storage.md#offline-downloads) |
-| `cacheSize` | `10737418240` (10 GiB) | Bytes the cache may hold; `null` is unlimited. The cap actually enforced is the smaller of this and what the volume can give -- see [What bounds the cache](storage.md#what-bounds-the-cache) |
+| `cacheSize` | `10737418240` (10 GiB) | Bytes the cache may hold; `null` is unlimited, and `0` is "no caching" -- a cap of zero, the tightest there is, never read as unlimited (a pin and what a live stream is inside are still kept, as under any cap). The cap actually enforced is the smaller of this and what the volume can give -- see [What bounds the cache](storage.md#what-bounds-the-cache) |
 | `bufferProfile` | `"normal"` | See [Buffer profiles](#buffer-profiles) |
 | `seedingEnabled` | `true` | Sharing. `false` chokes every upload while no player is reading from this server, and lets uploads run while one is (a paused player still holds its response open, so it counts as reading). It is a session-wide upload switch: downloads are not affected, no torrent is paused and no peer dropped. See [Background activity](stats.md#background-activity) |
 | `lanMediaEnabled` | `false` | Whether the [LAN media listener](lan-media.md) may run at all; setting it to `false` also stops a running one |

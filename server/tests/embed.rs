@@ -3330,6 +3330,93 @@ fn a_clean_restates_the_cap_before_it_reports_it() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// **Two settings updates at once are applied in the order they are saved.**
+///
+/// The settings lock is dropped before an update reaches the engine, so
+/// with nothing else ordering them two updates could merge in one order
+/// and apply in the other: `seedingEnabled` saved as `false` and the
+/// session left uploading, which is the one setting a viewer turns off to
+/// stop something. Opposite updates are raced round after round; after
+/// each round the session, the live settings and the file agree.
+#[test]
+fn opposite_settings_updates_at_once_leave_the_session_as_saved() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let handle = stream_server::start(ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_dir.path().join("cache")),
+        ..offline_config()
+    })?;
+    let (engine, _runtime) = handle.engine_for_tests();
+    let settings_file = config_dir.path().join("config").join("settings.json");
+
+    for round in 0..500 {
+        std::thread::scope(|scope| -> anyhow::Result<()> {
+            let on = scope
+                .spawn(|| handle.update_settings(serde_json::json!({ "seedingEnabled": true })));
+            let off = scope
+                .spawn(|| handle.update_settings(serde_json::json!({ "seedingEnabled": false })));
+            on.join().expect("the update did not panic")?;
+            off.join().expect("the update did not panic")?;
+            Ok(())
+        })?;
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_file)?)?;
+        let saved = saved["seedingEnabled"]
+            .as_bool()
+            .expect("seedingEnabled is saved");
+        assert_eq!(
+            handle.settings()?.seeding_enabled,
+            saved,
+            "round {round}: the live settings are what was saved"
+        );
+        assert_eq!(
+            engine.seeding_enabled(),
+            saved,
+            "round {round}: the session's upload switch is what was saved"
+        );
+    }
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// **`cacheSize: 0` is "no caching", a cap of zero -- never "no limit".**
+///
+/// stremio-core offers 0 as its own selection beside the "∞" that sends
+/// `null`, and the app reads it the same way; a publisher that filtered the
+/// zero out as "unset" handed a user who asked to cache nothing a cache
+/// bounded only by the volume. Posted the way the core posts it, and read
+/// where the retention policies read the cap.
+#[test]
+fn a_cache_size_of_zero_publishes_a_cap_of_zero() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let handle = stream_server::start(ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_dir.path().join("cache")),
+        ..offline_config()
+    })?;
+    let base = format!("http://{}", handle.http_addr());
+    bearer_client(&handle)?
+        .post(format!("{base}/settings"))
+        .json(&serde_json::json!({ "cacheSize": 0 }))
+        .send()?
+        .error_for_status()?;
+    assert_eq!(
+        handle.published_cache_budget(),
+        Some(0),
+        "cacheSize 0 is a cap of zero, not the volume's free space"
+    );
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
 /// `ServerHandle::cache_usage` reads the cache without touching it, and
 /// `ServerHandle::clean_cache_now` answers in the same figures.
 ///
@@ -4315,6 +4402,20 @@ fn a_stored_member_in_a_torrent_is_served_without_an_extraction() -> anyhow::Res
         .send()?;
     assert_eq!(back.status(), reqwest::StatusCode::PARTIAL_CONTENT);
     assert_eq!(back.bytes()?.as_ref(), &payload[1024..5120]);
+
+    // The hash in either case names the same archive: the key is filed
+    // under its lowercase hash (`routes::archive::canonical_key`), so this
+    // is served by the session the reads above made.
+    let upper = anonymous
+        .get(archive_member_url(
+            &base,
+            &info_hash.to_ascii_uppercase(),
+            MEMBER,
+        ))
+        .header(reqwest::header::RANGE, "bytes=1024-5119")
+        .send()?;
+    assert_eq!(upper.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(upper.bytes()?.as_ref(), &payload[1024..5120]);
 
     // A `HEAD` promises what the `GET` delivered, as it does for a plain
     // file: same framing, same headers (`routes::util::MediaRange`).

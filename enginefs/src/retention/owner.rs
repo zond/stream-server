@@ -1987,7 +1987,11 @@ impl<B: Backing> Retention<B> {
             .await;
         let empty = {
             let state = entity.state.lock();
-            let empty = reclaimed >= held.len() && state.readers.is_empty();
+            // Against what this pass could take, not against everything
+            // held: a boundary piece another file shares is never among
+            // `alone`, so a file that has one was never "empty" by the
+            // held count, and its entity outlived every slack pass.
+            let empty = reclaimed >= alone.len() && state.readers.is_empty();
             // Nothing is installed after `go_slack`, so no exit of a slack
             // pass ever owes another one; the claim goes here like any
             // other pass's (rule 3).
@@ -4404,6 +4408,37 @@ mod tests {
             (0..8).collect::<BTreeSet<u32>>(),
             "the pinned entity's range is back in what we announce, and the \
              pieces it holds with it"
+        );
+    }
+
+    /// **A slack pass that took everything it could take forgets the
+    /// entity, a shared boundary piece notwithstanding.** The piece another
+    /// file shares is never this file's to take (`Backing::alone`), so
+    /// measured against everything held the file was never empty, and its
+    /// entity stood for the rest of the process over nothing of its own.
+    #[tokio::test]
+    async fn a_slack_pass_forgets_an_entity_whose_last_piece_is_shared() {
+        let (backing, owner, _budget) = torrent();
+        // File zero's eight pieces (the fake's listing is not narrowed to
+        // a file, so only file zero's are on it), the last of which file
+        // one shares.
+        *backing.held.lock() = (0..8).collect();
+        backing.shared.lock().insert(7);
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
+        let opens = owner.opens_of(&0);
+        let claim = owner.turn(&0).await.expect("the turn");
+        let reclaimed = owner
+            .pass(&0, &(), claim, Mode::Slack { opens })
+            .await
+            .concluded
+            .expect("a pass that ran")
+            .reclaimed;
+
+        assert_eq!(reclaimed, 7, "everything file zero has alone");
+        assert_eq!(backing.on_disk(), vec![7], "the shared piece stays");
+        assert!(
+            !owner.holdings().iter().any(|(key, _)| *key == 0),
+            "and the entity is forgotten: nothing is left that a pass over it may take"
         );
     }
 

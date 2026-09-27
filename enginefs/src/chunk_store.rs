@@ -33,14 +33,16 @@
 //!   would let two fillers interleave into one file; collapsing to the
 //!   anonymous form alone would break the incremental write and the recovery
 //!   of a staged piece at launch.
-//! * **The commit trigger.** [`ChunkDir::commit`] is the rename and nothing
-//!   else; *when* it runs is the adapter's. librqbit calls it after its own
-//!   SHA-1 check. A URL response has no hash, so the proxy calls it once the
-//!   expected byte count has been buffered, and passes that count as
-//!   `expected_len` so the store refuses a commit that disagrees with it.
-//!   The torrent adapter passes `None`, and must: librqbit never writes
-//!   BEP-47 padding, so a piece whose tail is padding is committed *short*,
-//!   and there is no length a legal padded piece would satisfy.
+//! * **The commit criterion.** *When* a chunk is complete is the adapter's.
+//!   librqbit's is its own SHA-1 check, after which the torrent adapter
+//!   calls [`ChunkDir::commit`] -- the rename and nothing else, with no
+//!   length check, and there must be none: librqbit never writes BEP-47
+//!   padding, so a piece whose tail is padding is committed *short*, and
+//!   there is no length a legal padded piece would satisfy. A URL response
+//!   has no hash, so the proxy buffers a chunk whole and hands it to
+//!   [`ChunkDir::write_whole`] with the byte count its entity says it
+//!   should be (`expected_len`), which refuses a chunk that disagrees
+//!   before anything is written.
 //!
 //! # What is deliberately not parameterised
 //!
@@ -307,12 +309,14 @@ impl ChunkDir {
     /// within one directory, which is the single instant at which the
     /// have-record for a chunk comes into being.
     ///
-    /// `expected_len` is the commit criterion the adapter owns -- see the
-    /// module docs. `Some(n)` refuses a staged copy that is not `n` bytes,
-    /// which is how a URL response's completeness is established when there
-    /// is no hash to check it against. `None` commits whatever is there,
-    /// which is what a torrent piece needs: librqbit never writes BEP-47
-    /// padding, so a piece whose tail is padding is legally *short*.
+    /// No length is checked, and none may be: the one adapter that commits
+    /// this way is the torrent's, whose criterion is librqbit's SHA-1 check
+    /// before the call, and librqbit never writes BEP-47 padding, so a piece
+    /// whose tail is padding is legally *short* -- there is no length a
+    /// legal padded piece would satisfy. The proxy's criterion, the byte
+    /// count of a URL response's chunk, is [`Self::write_whole`]'s
+    /// `expected_len`, checked where the bytes still are. See the module
+    /// docs.
     ///
     /// Idempotent in the direction that matters: called for a chunk already
     /// in place with nothing staged, it says so rather than failing, because
@@ -320,17 +324,9 @@ impl ChunkDir {
     ///
     /// The caller forgets its cached handles first: the staged handle names a
     /// file about to become the complete one.
-    pub fn commit(&self, index: u64, expected_len: Option<u64>) -> io::Result<()> {
+    pub fn commit(&self, index: u64) -> io::Result<()> {
         let staged = self.staging_path(index);
         let path = self.chunk_path(index);
-        if let Some(want) = expected_len {
-            let len = std::fs::metadata(&staged)?.len();
-            if len != want {
-                return Err(io::Error::other(format!(
-                    "staged chunk {index} is {len} bytes where its entity says {want}"
-                )));
-            }
-        }
         match std::fs::rename(&staged, &path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound && path.is_file() => Ok(()),
@@ -350,8 +346,8 @@ impl ChunkDir {
     /// rename would name a path the first had already moved away.
     ///
     /// `expected_len` is checked against the buffer before anything is
-    /// written -- the same criterion [`Self::commit`] takes, applied where
-    /// the bytes still are.
+    /// written: the proxy's commit criterion, a URL response's chunk having
+    /// no hash to be checked against.
     ///
     /// The bucket is made here, and made again if it is gone by the time
     /// the temporary is written: `server::proxy_cache` prunes the
@@ -1014,7 +1010,7 @@ mod tests {
         let mut staged = chunks.open_staged_for_write(7).unwrap();
         staged.write_all(b"abcd").unwrap();
         drop(staged);
-        chunks.commit(7, None).unwrap();
+        chunks.commit(7).unwrap();
         assert_eq!(std::fs::read(chunks.chunk_path(7)).unwrap(), b"abcd");
 
         chunks.write_whole(8, b"efgh", Some(4)).unwrap();

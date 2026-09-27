@@ -270,13 +270,36 @@ impl Buffering {
 /// below this, and the budget is still what bounds it from above.
 const SMALLEST_TIME_CAP_BYTES: u64 = 64 * 1024 * 1024;
 
-/// The smallest window whose forward reach covers `bytes`.
+/// The most pieces a lookahead of `bytes` can pin, wherever in a piece it
+/// starts: its whole pieces, and one more for the piece it starts inside of
+/// and runs off the end of. Zero for no lookahead.
+///
+/// This is the window's floor ([`RetentionPolicy::shape_for`]), and it is a
+/// count of pieces and nothing else. It used to be sized as a forward reach
+/// ([`window_for_reach`]), which assumed a tenth of the window sat behind a
+/// playhead -- but what the floor protects is the lookahead the backend
+/// refuses to forget, which has nothing behind it, so the floor came out a
+/// ninth over the lookahead and the committed set that much under what the
+/// rule leaves it.
+fn pieces_touched_by(bytes: u64, piece_length: u64) -> u32 {
+    debug_assert!(piece_length > 0, "a piece length of zero");
+    if bytes == 0 {
+        return 0;
+    }
+    bytes
+        .div_ceil(piece_length.max(1))
+        .saturating_add(1)
+        .min(u64::from(u32::MAX)) as u32
+}
+
+/// The smallest window whose forward reach covers `bytes`: what a time cap
+/// on the window comes to in pieces.
 ///
 /// The reach is the window less the `BEHIND_PERCENT` of it that sits
-/// behind the playhead, so the floor is stated on the reach and converted
-/// here rather than being applied to the window directly: a floor read as
-/// a window would leave the forward reach a tenth short of the lookahead it
-/// exists to cover, which is the whole of what it is for.
+/// behind the playhead, so a cap stated as seconds of forward buffer is
+/// converted here rather than being applied to the window directly: read as
+/// a window it would leave the forward reach a tenth short of the seconds
+/// the profile asked for.
 fn window_for_reach(bytes: u64, piece_length: u64) -> u32 {
     debug_assert!(piece_length > 0, "a piece length of zero");
     let pieces = bytes.div_ceil(piece_length.max(1)).min(u64::from(u32::MAX));
@@ -560,7 +583,7 @@ impl RetentionPolicy {
         // already pinning, overfills the budget is a disk that can never
         // come back under it, because neither is a set the pass may
         // reclaim. See [`Buffering`].
-        let floor = window_for_reach(buffering.lookahead_bytes, piece_length);
+        let floor = pieces_touched_by(buffering.lookahead_bytes, piece_length);
         // Three numbers, composed in one order: what the disk can hold,
         // what the viewer asked for in time, and what an open stream is
         // already fetching.
@@ -1016,10 +1039,11 @@ mod tests {
                 ..watching(3, Some(90))
             }),
             Shape::Split {
-                unshared: 166,
+                unshared: 151,
                 committed: 67
             },
-            "the window holds the 600 MiB an open stream is fetching, not the 90 seconds asked for"
+            "the window holds every piece the 600 MiB an open stream is fetching can touch -- \
+             150 whole pieces and the one it starts inside of -- not the 90 seconds asked for"
         );
     }
 
@@ -1119,7 +1143,16 @@ mod tests {
         // well past the small budgets.
         for half_pieces in 1..=80u64 {
             let granted = half_pieces * piece / 2;
-            let floor = window_for_reach(granted, piece);
+            // The floor, counted rather than computed: the most pieces a
+            // lookahead of `granted` bytes touches, over where in a piece it
+            // can start -- the piece of its first byte to the piece of its
+            // last.
+            let floor = [0, 1, piece / 2, piece - 1]
+                .into_iter()
+                .map(|start| (start + granted - 1) / piece - start / piece + 1)
+                .max()
+                .map(|touched| u32::try_from(touched).expect("a few pieces"))
+                .expect("four starts");
             for budget_pieces in 1..=200u32 {
                 let policy = RetentionPolicy::new(
                     u64::from(budget_pieces) * piece,
@@ -1179,8 +1212,11 @@ mod tests {
                 unshared: 20,
                 committed: 20
             },
-            "a reach of eighteen pieces already covers nine: the floor is a no-op"
+            "twenty pieces already cover the ten a nine-piece lookahead can touch: the floor is a no-op"
         );
+        // What that lookahead can touch, counted: begun one byte into a
+        // piece, its last byte is in the tenth.
+        let touched = u32::try_from((1 + 9 * PIECE - 1) / PIECE + 1).expect("ten");
 
         let mut tight = RetentionPolicy::new(
             4 * PIECE,
@@ -1194,15 +1230,15 @@ mod tests {
         assert_eq!(
             tight.shape(),
             Shape::Split {
-                unshared: 9,
+                unshared: touched,
                 committed: 0
             },
             "the floor takes the whole budget and then some, and the committed half is nothing"
         );
         assert_eq!(
-            u64::from(tight.shape().piece_budget().unwrap_or(0)) * PIECE,
-            9 * PIECE,
-            "and what it covers is exactly the lookahead the stream was granted"
+            tight.shape().piece_budget(),
+            Some(touched),
+            "and what it covers is exactly the pieces the lookahead the stream was granted can touch"
         );
 
         roomy.carry_into(&mut tight);

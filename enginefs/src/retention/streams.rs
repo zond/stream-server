@@ -1131,13 +1131,24 @@ impl Streams {
     /// Every consumer of `file`, as the cache window needs to know it:
     /// where it is, what it has been eating, and whether it is still at
     /// it. See [`Reader`].
+    ///
+    /// **Less every stream the file's reading has moved on from** -- one
+    /// that another stream began after it was last read, the rule
+    /// [`FileStreams::current_viewer`] applies. A seek leaves exactly that
+    /// behind: the stream the viewer left keeps its place, the window moves
+    /// with the new one and takes what was ahead of the old, and the old
+    /// one then stands at the end of what is held with nothing in front of
+    /// it -- which is what a *stalled* reader looks like, so the window
+    /// reported the film as about to stop, for as long as the old stream
+    /// was remembered. A crawler beside a viewer is not moved on from: it
+    /// is read again after the viewer began.
     pub fn readers(&self, file: usize, now: Instant) -> Vec<Reader> {
         self.by_file
             .get(&file)
             .map(|streams| {
-                streams
-                    .streams
-                    .iter()
+                let all = &streams.streams;
+                all.iter()
+                    .filter(|stream| !all.iter().any(|other| other.began > stream.seen))
                     .map(|stream| Reader {
                         at: stream.end.saturating_sub(1),
                         rate: stream.rate,
@@ -2290,6 +2301,69 @@ mod tests {
             streams.viewer_filling(t0 + Duration::from_secs(14)),
             Some(true),
             "the stream the viewer left answered for the one it is on"
+        );
+    }
+
+    /// **After a seek, the stream the viewer left is nobody's reader.**
+    /// It stays in the file's list for [`STREAM_DORMANT`], and before this
+    /// it was handed to the cache window with the rest: the window had
+    /// moved with the new stream and taken what was ahead of the old one,
+    /// so the old one stood at the end of what is held with nothing in
+    /// front of it -- a stalled reader, reported as the film about to stop.
+    /// A crawler read again after the seek is still a reader.
+    #[test]
+    fn after_a_seek_the_readers_are_the_streams_still_being_read() {
+        let t0 = Instant::now();
+        let mut streams = Streams::default();
+        stream_on(&mut streams, 0, 0, 100, 3_500_000, t0);
+        stream_on(&mut streams, 0, 0, 4_000, 3_500_000, t0);
+        let file = streams.by_file.get_mut(&0).unwrap();
+        // The film, last read before the seek; the new stream, begun after.
+        file.streams[0].seen = t0 + Duration::from_secs(10);
+        file.streams[1].began = t0 + Duration::from_secs(12);
+        file.streams[1].seen = t0 + Duration::from_secs(13);
+        let now = t0 + Duration::from_secs(14);
+
+        let readers = streams.readers(0, now);
+        assert_eq!(
+            readers.iter().map(|reader| reader.at).collect::<Vec<_>>(),
+            vec![4_000 * PIECE - 1],
+            "only the stream the viewer is on now"
+        );
+
+        // What the window makes of them: the disk round the new stream is
+        // held, the old one's read-ahead went with the seek.
+        let held = 3_999..4_010u32;
+        let heads = readers.iter().map(|reader| {
+            let piece = u32::try_from(reader.at / PIECE).unwrap();
+            let ahead = if held.contains(&piece) {
+                u64::from(held.end) * PIECE - reader.at
+            } else {
+                0
+            };
+            crate::retention::HeadRun {
+                behind_bytes: 0,
+                ahead_bytes: ahead,
+                rate: reader.rate,
+                idle: reader.idle,
+                last_read: reader.last_read,
+            }
+        });
+        let window = crate::retention::CacheWindow::worst_of(heads, None, (0, 0));
+        assert!(
+            window.ahead_seconds.is_some_and(|seconds| seconds > 1.0),
+            "the film has the new stream's run in hand, not the old one's nothing: {window:?}"
+        );
+
+        // A crawler opened before the seek and read again after it.
+        stream_on(&mut streams, 0, 0, 5_000, 3_500_000, t0);
+        let file = streams.by_file.get_mut(&0).unwrap();
+        file.streams[2].began = t0 + Duration::from_secs(1);
+        file.streams[2].seen = t0 + Duration::from_secs(13);
+        assert_eq!(
+            streams.readers(0, now).len(),
+            2,
+            "the crawler is still read, so it is still a reader"
         );
     }
 

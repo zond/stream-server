@@ -231,6 +231,10 @@ pub(crate) struct FakeBacking<S: Side> {
     pub(crate) on_reading: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// Run between two runs of one reclaim.
     pub(crate) between_runs: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Pieces another file shares, which [`Backing::alone`] leaves out: a
+    /// torrent's boundary piece belongs to both files it spans, and no
+    /// pass over one of them may take it.
+    pub(crate) shared: parking_lot::Mutex<BTreeSet<u32>>,
     pub(crate) _side: PhantomData<S>,
 }
 
@@ -272,6 +276,7 @@ impl<S: Side> FakeBacking<S> {
             on_reclaim: parking_lot::Mutex::new(None),
             on_reading: parking_lot::Mutex::new(None),
             between_runs: parking_lot::Mutex::new(None),
+            shared: parking_lot::Mutex::new(BTreeSet::new()),
             _side: PhantomData,
         })
     }
@@ -531,7 +536,12 @@ impl<S: Side> Backing for FakeBacking<S> {
     }
 
     async fn alone(&self, _domain: &FakeDomain, pieces: &[u32]) -> Vec<u32> {
-        pieces.to_vec()
+        let shared = self.shared.lock();
+        pieces
+            .iter()
+            .copied()
+            .filter(|piece| !shared.contains(piece))
+            .collect()
     }
 
     async fn want_all(&self, domain: &FakeDomain) {

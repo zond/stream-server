@@ -310,6 +310,11 @@ fn is_a_playlist(
             && !cannot_be_a_playlist(origin_content_type))
 }
 
+/// How long [`http_client`] waits for an origin to accept a connection.
+/// Generous for a slow mobile network, and short of what a connect with no
+/// bound of ours waits out (see [`http_client`]).
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// The process's one outbound HTTP client, on this workspace's own trust
 /// roots (`enginefs::http_client_builder`) and no platform verifier.
 ///
@@ -320,10 +325,18 @@ fn is_a_playlist(
 /// about. It inherits `Policy::none()`, which is right for a refresh: the
 /// endpoint is a constant this server was handed, and a redirect away from
 /// it is not somewhere a refresh token follows.
+///
+/// A connect is bounded ([`CONNECT_TIMEOUT`]) and nothing else is: a body
+/// is a film and streams for as long as it plays, but an origin that never
+/// answers the SYN -- a dead host, a blackholed address -- held the player's
+/// request open for as long as the platform took to give up: 30 s on Linux
+/// (reqwest's default `TCP_USER_TIMEOUT`), the kernel's own retry budget
+/// elsewhere, with nothing said.
 pub(crate) fn http_client() -> Option<&'static Client> {
     HTTP_CLIENT
         .get_or_init(|| {
             enginefs::http_client_builder()
+                .connect_timeout(CONNECT_TIMEOUT)
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|e| tracing::error!("Failed to build proxy HTTP client: {e}"))
@@ -1613,6 +1626,7 @@ async fn proxy(
     // and not two.
     let answer = match cache_assisted_range(
         cache_entry,
+        state.http_addr,
         &method,
         &url,
         &headers,
@@ -2293,7 +2307,11 @@ pub(crate) enum FetchFailure {
     NoClient,
     /// The origin could not be reached, or dropped the connection.
     Transport(String),
-    /// The chain never stopped redirecting ([`MAX_REDIRECTS`]).
+    /// The chain never stopped redirecting ([`MAX_REDIRECTS`]) -- or an
+    /// origin redirected it back into this server, which is a ring the hop
+    /// count cannot see (each turn through our own `/proxy` is a new
+    /// request with a count of its own) and so is answered as the ring it
+    /// is.
     TooManyRedirects,
 }
 
@@ -2401,11 +2419,16 @@ pub(crate) fn with_cached_head(
 /// not touch at all -- see [`crate::proxy_cache::ProxyCache::entry`] for
 /// the whole of that list.
 ///
+/// `self_addr` is this server's own HTTP listener: a redirect hop that
+/// names it is refused ([`crate::proxy_cache::names_this_server`]), since
+/// following it would turn one request into an unbounded chain of our own.
+///
 /// The lookup lists one directory per thousand chunks of the range -- a
 /// few `getdents` for a cached film, still filesystem reads -- so it goes
 /// to the blocking pool rather than onto the reactor.
 pub(crate) async fn cache_assisted_range(
     cache_entry: Option<crate::proxy_cache::Entry>,
+    self_addr: std::net::SocketAddr,
     method: &Method,
     url: &Url,
     player_headers: &HeaderMap,
@@ -2668,6 +2691,17 @@ pub(crate) async fn cache_assisted_range(
         let Some(location) = redirect_target(&response, &fetched_url) else {
             break response;
         };
+        if crate::proxy_cache::names_this_server(&location, self_addr) {
+            // Back into this server: every turn through our own `/proxy`
+            // starts a count of its own, so [`MAX_REDIRECTS`] never ends
+            // it, and each turn holds a request open while it opens the
+            // next. Refused as the ring it is.
+            tracing::warn!(
+                target_origin = %url.origin().ascii_serialization(),
+                "a redirect points back into this server; giving up"
+            );
+            return Err(FetchFailure::TooManyRedirects);
+        }
         if hops >= MAX_REDIRECTS {
             tracing::warn!(
                 target_origin = %url.origin().ascii_serialization(),

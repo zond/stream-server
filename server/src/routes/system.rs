@@ -454,7 +454,9 @@ fn resolve_cache_size(v: &Value) -> Option<Option<f64>> {
 /// byte cap for the engine's retention code. `None` is `u64::MAX`, which is
 /// effectively unbounded for every downstream size comparison. A number is
 /// cast, and the cast saturates: a negative or `NaN` becomes 0, and one past
-/// `u64::MAX` (infinity included) becomes `u64::MAX`.
+/// `u64::MAX` (infinity included) becomes `u64::MAX`. 0 is the explicit
+/// "no caching" selection and is enforced as a cap of zero
+/// (`cache_budget::CacheLimit`), never as "no limit".
 pub fn cache_size_bytes(cache_size: Option<f64>) -> u64 {
     match cache_size {
         Some(n) => n as u64,
@@ -791,6 +793,11 @@ pub async fn update_settings(
         .map(|patch| patch.keys().map(String::as_str).collect())
         .unwrap_or_default();
     tracing::debug!(?keys, "update_settings: received a patch");
+
+    // Held to the end, across the engine calls and the save: see
+    // `AppState::settings_update`. What is merged, applied and saved is
+    // then one update's, in the order the updates took the turn.
+    let _one_update = state.settings_update.lock().await;
 
     // `cacheRoot` is the one validated setting: an unusable directory -- or
     // a value that is not a string -- fails the whole update (nothing is

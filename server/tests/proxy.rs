@@ -5640,6 +5640,86 @@ fn a_redirect_chain_longer_than_the_hop_bound_is_given_up_on() -> anyhow::Result
     Ok(())
 }
 
+/// An origin that never answers the SYN is given up on within the proxy's
+/// connect bound (15 s), not whatever the platform happens to give up at:
+/// the kernel's retry budget is two minutes on Linux, cut to 30 s there
+/// only by reqwest's default `TCP_USER_TIMEOUT`, and the player's request
+/// is held open all the while. `10.255.255.1` is a private address nothing
+/// routes an answer back from, which is the shape of a dead host. The
+/// bound asserted sits between the two, so this fails on either of them.
+#[test]
+fn an_origin_that_never_accepts_is_given_up_on_within_the_connect_bound() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let target = "http://10.255.255.1/film.mkv";
+    let began = std::time::Instant::now();
+    let response = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?
+        .get(format!("{}/proxy/?d={}", fixture.base, encode(target)))
+        .send()?;
+    let waited = began.elapsed();
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    assert!(
+        waited < std::time::Duration::from_secs(25),
+        "the connect was bounded by the proxy, not the kernel: {waited:?}"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
+/// A redirect back into this server's own `/proxy` is a ring the hop count
+/// cannot see: each turn through the route is a new request with a count
+/// of its own, holding a connection open while it opens the next, so an
+/// origin that answers `302 {base}/proxy/d=<itself>` turned one request
+/// into an unbounded chain of ours. The hop is refused, as a ring is, and
+/// the origin is asked exactly once.
+#[test]
+fn a_redirect_back_into_this_server_is_refused_not_followed() -> anyhow::Result<()> {
+    let base = std::sync::Arc::new(std::sync::OnceLock::<String>::new());
+    let origin = Origin::start_with({
+        let base = base.clone();
+        move |_request: &Request, socket: &mut TcpStream| {
+            let base = base
+                .get()
+                .expect("the server is up before the first request");
+            let origin = format!("http://{}", socket.local_addr().expect("a bound socket"));
+            let _ = socket.write_all(
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {base}/proxy/d={}/loop.mkv\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n",
+                    encode(&origin)
+                )
+                .as_bytes(),
+            );
+            let _ = socket.flush();
+        }
+    })?;
+
+    let fixture = fixture_with(origin)?;
+    base.set(fixture.base.clone()).expect("set once");
+    let target = format!("http://{}/loop.mkv", fixture.origin.addr);
+    // Bounded, so the ring this refuses fails the test rather than hanging it.
+    let response = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?
+        .get(format!("{}/proxy/?d={}", fixture.base, encode(&target)))
+        .send()?;
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    assert!(response.text()?.contains("too many redirects"));
+    assert_eq!(fixture.origin.next_request().target(), "/loop.mkv");
+    assert!(
+        fixture.origin.was_asked_for_nothing_more(),
+        "the redirect into this server was not followed: the response is already back, \
+         so a second turn would have reached the origin by now"
+    );
+
+    drop(fixture.handle);
+    Ok(())
+}
+
 /// A `302` this proxy will not follow because of where it points: only
 /// `http`/`https` is fetched, since the one thing a route that fetches
 /// whatever a caller names must not do is let an *origin* send it somewhere

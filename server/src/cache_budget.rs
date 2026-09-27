@@ -109,7 +109,8 @@ pub(crate) use enginefs::CACHE_FREE_SPACE_FLOOR;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CacheLimit {
     /// `settings.cacheSize` in bytes: `u64::MAX` when unset, and 0 for the
-    /// "no limit" the eviction rule has always read it as.
+    /// "no caching" it means to stremio-core and to the app -- a cap of
+    /// zero, the tightest there is, never "no limit".
     pub(crate) configured: u64,
     /// Bytes the volume holding the cache will still give an unprivileged
     /// writer, or `None` when it could not be read.
@@ -138,8 +139,13 @@ impl CacheLimit {
         }
     }
 
-    /// The cap to enforce against `occupied` bytes of cache, or `None` for no
-    /// cap at all.
+    /// The cap to enforce against `occupied` bytes of cache.
+    ///
+    /// Always a number: `configured` is one even when unset (`u64::MAX`),
+    /// and 0 is a cap of zero ("no caching"), not the absence of one. The
+    /// `Option` is the shape the publication takes
+    /// (`RetentionBudget::set`, whose `None` is an unbounded budget), which
+    /// this never asks for.
     ///
     /// `occupied + available` is what the volume would offer if the cache
     /// were empty, so holding [`Self::floor`] of that back leaves
@@ -149,17 +155,15 @@ impl CacheLimit {
     /// something has to be evicted -- and where an unsaturated subtraction
     /// would have wrapped to a cap of "everything".
     pub(crate) fn effective(&self, occupied: u64) -> Option<u64> {
-        let configured = (self.configured != 0).then_some(self.configured);
         let from_disk = self.available.map(|available| {
             occupied
                 .saturating_add(available)
                 .saturating_sub(self.floor)
         });
-        match (configured, from_disk) {
-            (Some(configured), Some(from_disk)) => Some(configured.min(from_disk)),
-            (Some(only), None) | (None, Some(only)) => Some(only),
-            (None, None) => None,
-        }
+        Some(match from_disk {
+            Some(from_disk) => self.configured.min(from_disk),
+            None => self.configured,
+        })
     }
 }
 
@@ -356,7 +360,7 @@ where
     // from.
     enginefs::retention::trace::budget_published(
         cap,
-        (configured != 0).then_some(configured),
+        Some(configured),
         available.map(|available| occupied.saturating_add(available).saturating_sub(floor)),
     );
     publish(budget, cap, headroom);
@@ -783,12 +787,14 @@ mod tests {
             CacheLimit::configured(u64::MAX).effective(4096),
             Some(u64::MAX)
         );
-        assert_eq!(CacheLimit::configured(0).effective(4096), None);
+        // 0 is "no caching" -- a cap of zero -- and never "no limit".
+        assert_eq!(CacheLimit::configured(0).effective(4096), Some(0));
 
         // What a publication builds when the root's free space cannot be
         // read: a cap with no filesystem reading behind it, so the
-        // configured cap -- or no cap -- is what it states.
-        for (configured, expected) in [(1024, Some(1024)), (u64::MAX, Some(u64::MAX)), (0, None)] {
+        // configured cap is what it states.
+        for (configured, expected) in [(1024, Some(1024)), (u64::MAX, Some(u64::MAX)), (0, Some(0))]
+        {
             let limit = CacheLimit {
                 configured,
                 available: None,

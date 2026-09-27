@@ -83,6 +83,12 @@ pub struct AppState {
     /// time, each reading its inputs inside its turn (see
     /// `crate::cache_budget::publish_now`).
     pub budget_publication: Arc<tokio::sync::Mutex<()>>,
+    /// One settings update at a time, from the merge to the save
+    /// (`routes::system::update_settings`). The settings lock alone is
+    /// dropped before the update is pushed into the engine, so two updates
+    /// could merge in one order and apply in the other: a `seedingEnabled`
+    /// saved as `false` with the session left uploading.
+    pub settings_update: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -125,6 +131,7 @@ impl AppState {
             lan_media: Arc::new(crate::lan_media::LanMedia::new(None)),
             traffic_window: Arc::new(enginefs::traffic::TrafficWindow::new()),
             budget_publication: Arc::default(),
+            settings_update: Arc::default(),
         }
     }
 

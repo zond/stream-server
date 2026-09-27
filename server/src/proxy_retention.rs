@@ -714,12 +714,14 @@ impl Backing for ProxyBacking {
         kept.extend(asking.holding.iter().cloned());
         kept.extend(asking.committed.iter().cloned());
         exempt.publish(&kept);
-        // What must go, and no more: the overhang over the allowance, taken
-        // coldest first. What nothing else needs is scrub-back, and giving
-        // it up early buys nothing and costs the origin a second fetch.
-        let over = (held.len() as u64)
-            .saturating_mul(CHUNK_BYTES)
-            .saturating_sub(available);
+        // What must go, and no more: the overhang over what the entity may
+        // hold, taken coldest first. What nothing else needs is scrub-back,
+        // and giving it up early buys nothing and costs the origin a second
+        // fetch. `Asking::overhang`, the one computation the torrent's half
+        // and the scenarios run too -- measured against the whole disk
+        // allowance and not the windows' `available`, which would take a
+        // committed set off twice.
+        let over = asking.overhang(CHUNK_BYTES, held.len());
         let how_many = usize::try_from(over.div_ceil(CHUNK_BYTES.max(1))).unwrap_or(0);
         let (tracked, reclaim) = streams.coldest_of(0, now, &kept, how_many);
         // One body is one reader here, but a proxied entity can still be

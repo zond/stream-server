@@ -704,9 +704,13 @@ fn is_key_name(name: &str) -> bool {
 
 /// Whether a target names this server's own HTTP listener, in any of the
 /// spellings that reach it: `127.0.0.1`, `::1`, `localhost`, or the address
-/// it actually bound. Not a security check -- `/proxy` is loopback-only
-/// anyway -- but a budget one: bytes the engine is already serving out of the
-/// cache root must not be stored a second time against the same volume's cap.
+/// it actually bound. Here, a budget check: bytes the engine is already
+/// serving out of the cache root must not be stored a second time against
+/// the same volume's cap. The redirect loop in
+/// [`crate::routes::proxy::cache_assisted_range`] asks it too, about every
+/// hop an origin names: a `302` back into this server's own `/proxy` is a
+/// loop the hop count cannot see, since every turn of it is a new request
+/// with a count of its own.
 ///
 /// The port has to match too. Loopback alone is not this server: an addon or
 /// a debrid helper a viewer runs on the same machine is a perfectly ordinary
@@ -719,7 +723,7 @@ fn is_key_name(name: &str) -> bool {
 /// any address this host's interfaces carry. Each of them used to be cached
 /// as somebody else's bytes, against the same volume's cap that the engine
 /// was already filling.
-fn names_this_server(url: &Url, self_addr: std::net::SocketAddr) -> bool {
+pub(crate) fn names_this_server(url: &Url, self_addr: std::net::SocketAddr) -> bool {
     use std::net::IpAddr;
 
     if url.port_or_known_default() != Some(self_addr.port()) {

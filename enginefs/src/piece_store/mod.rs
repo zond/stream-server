@@ -76,11 +76,13 @@
 //! **addressable** (`<piece>.part`, reopened across many 16 KiB writes, read
 //! back by the hash check through one handle, recovered at `init`), where a
 //! `/proxy` fill stages anonymously because two uncoalesced fillers may be
-//! writing one chunk. And it commits with **no expected length**: librqbit
-//! never writes padding, so a piece whose tail is padding is committed
-//! short, and there is no length a legal padded piece would satisfy. A URL
-//! response, which has no hash to be checked against, passes the byte count
-//! it buffered instead.
+//! writing one chunk. And it commits with **no length check**
+//! ([`crate::chunk_store::ChunkDir::commit`] takes none): librqbit never
+//! writes padding, so a piece whose tail is padding is committed short, and
+//! there is no length a legal padded piece would satisfy. A URL response,
+//! which has no hash to be checked against, is written whole with the byte
+//! count its entity states (`ChunkDir::write_whole`'s `expected_len`)
+//! instead.
 //!
 //! # How it is wired in
 //!
