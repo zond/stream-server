@@ -1,0 +1,12 @@
+# Every HTTPS client starts at `enginefs::http_client_builder`, which brings
+# its own roots (Mozilla's plus the platform's CA files, read in Rust). A
+# client built any other way makes reqwest construct rustls-platform-verifier,
+# which on Android is Java: a CRL download and parse per handshake, and a
+# panic in an embedder that never initialised it. Blocking clients (tests,
+# plain HTTP to localhost) are not covered.
+disallowed-methods = [
+    { path = "reqwest::Client::new", reason = "start at enginefs::http_client_builder" },
+    { path = "reqwest::Client::builder", reason = "start at enginefs::http_client_builder" },
+    { path = "reqwest::ClientBuilder::new", reason = "start at enginefs::http_client_builder" },
+    { path = "reqwest::get", reason = "start at enginefs::http_client_builder" },
+]

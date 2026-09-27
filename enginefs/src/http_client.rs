@@ -77,16 +77,14 @@
 /// organisation that has installed its own CA keeps working, which is what
 /// stops a failure here from being routed around.
 ///
-/// One client in this workspace deliberately does **not** start here: a proxy
-/// unit test builds a bare client to make a connection that is refused before
-/// any TLS. `/proxy` used to have a second one -- an unverified retry that
-/// took `danger_accept_invalid_certs` when a chain would not verify, and
-/// remembered that origin for the life of the process -- which made every
-/// word above advisory. It is gone; see `routes::proxy`.
+/// Every async client in the workspace starts here: `clippy.toml` refuses
+/// the other constructors, so an embedder may leave the platform verifier
+/// uninitialised (xtremio does).
 ///
 /// The other half of the policy -- that the platform verifier is never
 /// constructed -- is `tests/tls_roots.rs`, which needs a test binary of its
 /// own.
+#[allow(clippy::disallowed_methods)] // the one door clippy.toml points everyone to
 pub fn http_client_builder() -> reqwest::ClientBuilder {
     reqwest::ClientBuilder::new().tls_certs_only(
         mozilla_roots()
