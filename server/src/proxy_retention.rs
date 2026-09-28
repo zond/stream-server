@@ -1791,19 +1791,20 @@ impl ProxyRetention {
         });
     }
 
-    /// What this cache holds of the stream `target` names, split at the
-    /// playhead -- the proxy half of `crate::stream_numbers`.
+    /// The unbroken run of chunks this cache holds of the stream `target`
+    /// names round the playhead, split at it -- the proxy half of
+    /// `crate::stream_numbers`.
     ///
-    /// `None` is "nothing here is about that URL", and it covers four
-    /// different truths that a client shows the same way, by drawing no
-    /// row: no reader of this process has ever been opened on that target,
-    /// nothing of this process is *playing* it, no byte of it has reached a
-    /// player yet so there is no playhead to split at, and -- the case that
-    /// is a policy statement rather than an absence -- nothing is *bounding*
-    /// this entity, because the budget covers it or no budget has been
-    /// published. What is on the disk then is not a window, it is whatever
-    /// has been fetched and not yet given back, and putting that under the
-    /// same label would give one row two meanings.
+    /// **Under every budget.** A budget that splits the entity bounds how
+    /// long the run can grow; one that covers it, or none published, lets
+    /// it grow to whatever has been fetched. Either way it is what a scrub
+    /// back and playback can be served without the origin.
+    ///
+    /// `None` is "nothing here is about that URL", and it covers three
+    /// truths that a client shows the same way, by drawing no row: no
+    /// reader of this process has ever been opened on that target, nothing
+    /// of this process is *playing* it, and no byte of it has reached a
+    /// player yet so there is no playhead to split at.
     ///
     /// Two entities can carry one target -- the key covers the player
     /// headers that reach the origin too -- and the one the liveness cell
@@ -1820,9 +1821,12 @@ impl ProxyRetention {
         now: std::time::Instant,
     ) -> Option<enginefs::retention::CacheWindow> {
         let live = self.live.reading();
-        let (key, holding) = self.owner.holdings().into_iter().find(|(key, holding)| {
-            &*holding.domain.target == target && holding.installed.is_some() && live.is_proxy(key)
-        })?;
+        let (key, holding) = self
+            .owner
+            .holdings()
+            .into_iter()
+            .find(|(key, holding)| &*holding.domain.target == target && live.is_proxy(key))?;
+        let total = holding.domain.total;
         let dir = holding.domain.dir;
         // No held set, no window: a panel shown an empty window would be
         // shown a measurement nobody made. Only the seed can fail, and a
@@ -1835,7 +1839,7 @@ impl ProxyRetention {
             .window_readers_of(dir.path(), now)
             .into_iter()
             .map(|reader| {
-                let (behind_bytes, ahead_bytes) = Self::run_around(&held, reader.at);
+                let (behind_bytes, ahead_bytes) = Self::run_around(&held, reader.at, total);
                 enginefs::retention::HeadRun {
                     behind_bytes,
                     ahead_bytes,
@@ -1847,15 +1851,18 @@ impl ProxyRetention {
         Some(enginefs::retention::CacheWindow::worst_of(
             heads,
             self.owner.bitrate(&key),
-            Self::run_around(&held, holding.last_position?),
+            Self::run_around(&held, holding.last_position?, total),
         ))
     }
 
     /// The unbroken run of held chunks the byte `at` stands in, as bytes
     /// behind and bytes ahead of it -- to the byte, so a reader waiting at
     /// the end of what is held has next to nothing ahead of it rather than
-    /// the rest of its chunk. Nothing held under it is a run of nothing.
-    fn run_around(held: &BTreeSet<u64>, at: u64) -> (u64, u64) {
+    /// the rest of its chunk. Nothing held under it is a run of nothing; a
+    /// missing chunk ends the run on either side. Clipped to the entity's
+    /// `total` bytes, since its last chunk is usually shorter than
+    /// [`CHUNK_BYTES`].
+    fn run_around(held: &BTreeSet<u64>, at: u64, total: u64) -> (u64, u64) {
         let chunk = at / CHUNK_BYTES;
         if !held.contains(&chunk) {
             return (0, 0);
@@ -1870,7 +1877,9 @@ impl ProxyRetention {
         }
         (
             at - start.saturating_mul(CHUNK_BYTES),
-            end.saturating_mul(CHUNK_BYTES) - at,
+            end.saturating_mul(CHUNK_BYTES)
+                .min(total)
+                .saturating_sub(at),
         )
     }
 
@@ -3238,16 +3247,14 @@ mod tests {
         drop(reader);
     }
 
-    /// The two absences a panel draws no row for, told apart from a zero.
+    /// The absence a panel draws no row for, told apart from a zero.
     ///
     /// A reader that has delivered nothing has no playhead to split at --
-    /// the freshness rule this whole module is built on -- and a stream
-    /// nothing is *bounding* has no window at all: what is on its disk is
-    /// then everything that was fetched, until a switch or a slack pass
-    /// takes the lot -- a different quantity, and one row cannot honestly
-    /// carry both.
+    /// the freshness rule this whole module is built on. A stream nothing
+    /// is *bounding* is not that absence:
+    /// [`a_stream_nothing_bounds_shows_the_unbroken_run_round_its_playhead`].
     #[tokio::test]
-    async fn a_stream_with_no_playhead_or_no_policy_has_no_window_to_show() {
+    async fn a_stream_with_no_playhead_has_no_window_to_show() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = ChunkDir::new(tmp.path().join("entity"));
         write_chunks(&dir, 0..16);
@@ -3261,22 +3268,62 @@ mod tests {
             "a body has been framed, but no byte of it has reached a player"
         );
         drop(opened);
+    }
 
-        // A budget that covers the entity: nothing here is bounded.
-        let covered = tempfile::tempdir().unwrap();
-        let dir = ChunkDir::new(covered.path().join("entity"));
-        write_chunks(&dir, 0..16);
-        let unbounded = retention(Some(32 * CHUNK_BYTES));
-        let reader = unbounded.reader(&dir, TOTAL, TARGET.into());
-        reader.note(4 * CHUNK_BYTES);
-        reader.note_read(
-            4 * CHUNK_BYTES,
-            4 * CHUNK_BYTES + 1,
-            Instant::now(),
-            Instant::now(),
-        );
-        assert_eq!(unbounded.window(TARGET, std::time::Instant::now()), None);
-        drop(reader);
+    /// **A stream nothing bounds shows its run like any other**: the
+    /// unbroken chunks round the playhead, ended by the first one missing
+    /// and by the entity's own end, and moving with the playhead.
+    ///
+    /// A budget that covers the entity, or none published, changes how
+    /// long the run can grow -- nothing reclaims, so it is whatever was
+    /// fetched -- and not what a viewer is asking: how far back a scrub is
+    /// served, and how much playback has in hand.
+    #[tokio::test]
+    async fn a_stream_nothing_bounds_shows_the_unbroken_run_round_its_playhead() {
+        // Sixteen chunks, the last one a hundred bytes long.
+        let total = 15 * CHUNK_BYTES + 100;
+        for (shape, limit) in [
+            ("a budget covering the entity", Some(32 * CHUNK_BYTES)),
+            ("no budget published", None),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = ChunkDir::new(tmp.path().join("entity"));
+            // A hole at chunk six.
+            write_chunks(&dir, (0..6).chain(7..15));
+            dir.write_whole(15, &[0u8; 100], Some(100))
+                .expect("a chunk");
+            let retention = retention(limit);
+            let reader = retention.reader(&dir, total, TARGET.into());
+            let play = |at: u64| {
+                reader.note(at);
+                reader.note_read(at, at + 1, Instant::now(), Instant::now());
+            };
+            let window = |behind_bytes, ahead_bytes| {
+                Some(enginefs::retention::CacheWindow {
+                    behind_bytes,
+                    ahead_bytes,
+                    behind_seconds: None,
+                    ahead_seconds: None,
+                })
+            };
+
+            play(4 * CHUNK_BYTES + 5);
+            assert_eq!(
+                retention.window(TARGET, std::time::Instant::now()),
+                window(4 * CHUNK_BYTES + 5, 2 * CHUNK_BYTES - 5),
+                "{shape}: chunks nought to five round the playhead -- the hole \
+                 at six ends the half ahead"
+            );
+
+            play(10 * CHUNK_BYTES);
+            assert_eq!(
+                retention.window(TARGET, std::time::Instant::now()),
+                window(3 * CHUNK_BYTES, 5 * CHUNK_BYTES + 100),
+                "{shape}: past the hole the run is chunks seven to fifteen, \
+                 and ends at the entity's last byte, not its last chunk's"
+            );
+            drop(reader);
+        }
     }
 
     /// Once a byte has gone out, the window round it is refused to

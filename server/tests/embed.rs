@@ -2886,15 +2886,19 @@ fn a_panels_numbers_are_about_the_file_the_url_resolved_to() -> anyhow::Result<(
         );
         Ok(())
     };
-    // And the other file: this server holds it, and nothing is bounding it,
-    // which is a stream with no window rather than a stream with no rows.
+    // And the other file: this server holds the torrent, and nothing of
+    // this process is measuring that file -- no reader has been inside it,
+    // or the viewer left it and the switch's slack pass took it off the
+    // disk and forgot it -- which is a stream with no window rather than a
+    // stream with no rows.
     let no_window_for = |url: &str| -> anyhow::Result<()> {
         let numbers = handle
             .stream_numbers(url)?
             .ok_or_else(|| anyhow::anyhow!("this server is holding the stream {url} names"))?;
         anyhow::ensure!(
             numbers.window.is_none(),
-            "no reader is inside the file {url} names, so it has no window: {numbers:?}"
+            "nothing of this process is measuring the file {url} names, so it has no \
+             window: {numbers:?}"
         );
         Ok(())
     };
@@ -3039,6 +3043,24 @@ fn a_panel_asking_about_a_torrent_stream_is_told_what_is_on_the_disk() -> anyhow
     // holds and nothing takes any of it -- which is what leaves the cache
     // the setting below is about to be measured against whole.
     play(0)?;
+    // **And the panel is told the run round the playhead all the same.**
+    // Nothing bounds the stream, so the run is everything fetched round the
+    // playhead -- here the whole file, unbroken, the playhead a few bytes
+    // into its first piece.
+    let unbounded = handle
+        .stream_numbers(&player_url)?
+        .expect("this server is holding that stream")
+        .window
+        .expect("a stream nothing bounds still has a run round its playhead");
+    assert_eq!(
+        unbounded.behind_bytes + unbounded.ahead_bytes,
+        PIECES * PIECE,
+        "every piece of the file is on the disk, so the run is all of it: {unbounded:?}"
+    );
+    assert!(
+        unbounded.behind_bytes < PIECE,
+        "split where the player is, at the head of the file: {unbounded:?}"
+    );
     handle.update_settings(serde_json::json!({ "cacheSize": BUDGET as f64 }))?;
     assert_eq!(
         handle.cache_usage()?.limit_bytes,

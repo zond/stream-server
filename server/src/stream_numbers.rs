@@ -2,7 +2,8 @@
 //! URL the player is playing.
 //!
 //! A client's playback panel wants two rows of numbers about the stream on
-//! screen: what our cache holds around the playhead, and -- for a torrent --
+//! screen: the bytes our cache holds unbroken behind and ahead of the
+//! playhead ([`CacheWindow`]), and -- for a torrent --
 //! what we have committed for sharing and what the session has moved. Both
 //! rows are readings of a store, and there are two stores: the piece store
 //! keyed by info hash ([`enginefs::piece_store`]) and the proxy cache keyed
@@ -50,12 +51,13 @@
 //!
 //! * **no [`StreamNumbers`] at all** -- this server is not holding that
 //!   stream;
-//! * **no [`StreamNumbers::window`]** -- no retention policy is bounding the
-//!   stream (the budget covers it, or none has been published yet), or no
-//!   reader has been anywhere inside it in this process. Where nothing is
-//!   bounding a stream, what is on the disk is not a window: it is whatever
-//!   has been fetched and not yet given back, which is a different
-//!   quantity, and one row cannot honestly carry both;
+//! * **no [`StreamNumbers::window`]** -- no reader has been anywhere inside
+//!   the stream in this process, so there is no playhead to measure from
+//!   (and, for a proxied stream, it is not the one being played). **The
+//!   budget has nothing to do with it**: a stream the budget covers, one
+//!   no budget has been published for and a pinned file each have a
+//!   window, which is then whatever has been fetched round the playhead --
+//!   still exactly what a scrub back and playback can be served from;
 //! * **no [`StreamNumbers::sharing`]** -- a proxied response is not seeded.
 //!   There is no swarm, so there is no committed set and no ratio, and the
 //!   row is absent rather than a line of zeroes;
@@ -82,8 +84,9 @@ use crate::state::AppState;
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamNumbers {
-    /// What is on the disk for this stream, split at the playhead. See the
-    /// module docs for what its absence means.
+    /// The unbroken run of this stream on the disk round the playhead,
+    /// split at it, under any budget. See the module docs for what its
+    /// absence means.
     pub window: Option<CacheWindow>,
     /// The sharing row: torrents only.
     pub sharing: Option<Sharing>,
@@ -261,8 +264,8 @@ impl StreamStore for ProxyCache {
     /// Never a [`StreamNumbers::sharing`]: a proxied response is not seeded.
     async fn stream_numbers(&self, url: &Url) -> Option<StreamNumbers> {
         let target = proxied_target(url)?;
-        // Off the reactor: the window is counted from a listing of the
-        // entity's chunk directories.
+        // Off the reactor: the first ask of an entity seeds its held set
+        // from a listing of its chunk directories.
         let retention = self.retention().clone();
         let window = tokio::task::spawn_blocking(move || {
             retention.window(target.as_str(), std::time::Instant::now())

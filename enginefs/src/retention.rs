@@ -204,12 +204,13 @@ pub(crate) fn playhead_piece(span: &FilePieceSpan, piece_length: u64, offset_in_
     piece.clamp(u64::from(span.pieces.start), u64::from(last)) as u32
 }
 
-/// One reading of one file's retention policy: what range it governs, how
-/// much of it is committed, and every reader inside it.
+/// One reading of one file's retention state: the file's pieces, every
+/// reader inside it, and -- where a policy stands -- how much of it is
+/// committed.
 ///
-/// A value rather than a borrow of the policy, because the question it
-/// exists to answer -- [`Self::window`] -- is finished against the store's
-/// held set, read outside the lock the policy lives behind.
+/// A value rather than a borrow of the owner's state, because the question
+/// it exists to answer -- [`Self::window`] -- is finished against the
+/// store's held set, read outside the lock that state lives behind.
 ///
 /// **Every number here is an observation and none of them survives the
 /// call.** The readers are where they were and what they were eating at
@@ -218,6 +219,7 @@ pub(crate) fn playhead_piece(span: &FilePieceSpan, piece_length: u64, offset_in_
 /// later is a second measurement, not a memory of this one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PolicyReading {
+    /// The file's pieces, first to last: the bound a run is measured in.
     pieces: Range<u32>,
     piece_length: u64,
     /// What a second of this film costs, when the arithmetic can say:
@@ -228,14 +230,21 @@ pub struct PolicyReading {
     /// Where playback is by the detector's own account, for the window
     /// when no reader is live: bytes only, since nothing is eating them.
     fallback: PiecePosition,
-    committed: usize,
+    /// How many pieces the policy has committed, or `None` where no policy
+    /// stands: the budget covers the file, none has been published, or a
+    /// pin keeps everything.
+    committed: Option<usize>,
 }
 
-/// A byte position in piece space: the piece and the offset into it.
+/// A byte position in piece space: the piece and the offset into it, and
+/// the same byte as an offset into its file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PiecePosition {
     pub piece: u32,
     pub offset: u64,
+    /// The byte's offset into its file: what a run is clipped to, since a
+    /// file's first and last piece may hold a neighbour's bytes too.
+    pub in_file: u64,
 }
 
 /// A [`streams::Reader`] placed in piece space.
@@ -254,7 +263,7 @@ impl PolicyReading {
         film_rate: Option<u64>,
         readers: Vec<PieceReader>,
         fallback: PiecePosition,
-        committed: usize,
+        committed: Option<usize>,
     ) -> Self {
         Self {
             pieces,
@@ -267,22 +276,28 @@ impl PolicyReading {
     }
 
     /// Bytes the policy has committed: pieces we have advertised and
-    /// promised never to reclaim.
+    /// promised never to reclaim. `None` where no policy stands, which has
+    /// promised nothing whatever it announces.
     ///
     /// Piece count times piece length, so the last piece of a file counts
-    /// whole. The window below is counted the same way, and the two are
-    /// meant to be read against each other.
-    pub fn committed_bytes(&self) -> u64 {
-        (self.committed as u64).saturating_mul(self.piece_length)
+    /// whole.
+    pub fn committed_bytes(&self) -> Option<u64> {
+        self.committed
+            .map(|committed| (committed as u64).saturating_mul(self.piece_length))
     }
 
-    /// What the store holds around the reader that will run out first.
-    /// See [`CacheWindow::worst_of`] for the rule; this only measures each
-    /// reader's run in bytes and hands them over.
-    pub fn window(&self, held: &HeldSnapshot) -> CacheWindow {
+    /// What the store holds around the reader that will run out first, in
+    /// a file of `file_bytes` bytes. See [`CacheWindow::worst_of`] for the
+    /// rule; this only measures each reader's run in bytes and hands them
+    /// over.
+    ///
+    /// **Whatever the budget.** The run is what is on the disk, and a
+    /// budget that covers the file changes how long it can grow, not what
+    /// it is: nothing here asks whether a policy stands.
+    pub fn window(&self, held: &HeldSnapshot, file_bytes: u64) -> CacheWindow {
         CacheWindow::worst_of(
             self.readers.iter().map(|reader| {
-                let (behind_bytes, ahead_bytes) = self.run_around(reader.at, held);
+                let (behind_bytes, ahead_bytes) = self.run_around(reader.at, held, file_bytes);
                 HeadRun {
                     behind_bytes,
                     ahead_bytes,
@@ -292,7 +307,7 @@ impl PolicyReading {
                 }
             }),
             self.film_rate,
-            self.run_around(self.fallback, held),
+            self.run_around(self.fallback, held, file_bytes),
         )
     }
 
@@ -300,8 +315,14 @@ impl PolicyReading {
     /// bytes ahead of it -- **to the byte**, not the piece. A reader stalled
     /// at the last byte of what is held has one byte ahead of it, not four
     /// mebibytes, and the difference is the whole of whether it reads as
-    /// waiting. Nothing held under it is a run of nothing.
-    fn run_around(&self, at: PiecePosition, held: &HeldSnapshot) -> (u64, u64) {
+    /// waiting. Nothing held under it is a run of nothing; a missing piece
+    /// ends the run on either side.
+    ///
+    /// **Clipped to the file**, `file_bytes` long: a file's first and last
+    /// piece carry its neighbours' bytes too (or, at the end of the
+    /// torrent, fewer bytes than a piece), and none of those are this
+    /// stream's to scrub into or play.
+    fn run_around(&self, at: PiecePosition, held: &HeldSnapshot, file_bytes: u64) -> (u64, u64) {
         let Some(run) = held.run_containing(at.piece, self.pieces.clone()) else {
             return (0, 0);
         };
@@ -309,7 +330,10 @@ impl PolicyReading {
         let ahead = u64::from(run.end - at.piece)
             .saturating_mul(self.piece_length)
             .saturating_sub(at.offset);
-        (behind, ahead)
+        (
+            behind.min(at.in_file),
+            ahead.min(file_bytes.saturating_sub(at.in_file)),
+        )
     }
 }
 
@@ -329,13 +353,24 @@ pub struct HeadRun {
     pub last_read: u64,
 }
 
-/// What one stream's cache holds around the playhead, in bytes.
+/// What one stream's cache holds around the playhead, in bytes: the
+/// **unbroken** run of the stream on the disk that the playhead stands in,
+/// split at the playhead.
 ///
 /// A live reading of a store and nothing else: what is on the disk for the
 /// stream being played, split at the byte a player has actually reached.
 /// Both stores answer in this shape -- the piece store counting pieces of
 /// the file, the proxy cache counting chunks of the entity -- because it is
-/// the same question about the same volume.
+/// the same question about the same volume. Only complete, readable units
+/// count, and the first one missing on either side ends that half: bytes
+/// past a hole are not something playback or a scrub can reach without a
+/// fetch. Neither half reaches outside the stream.
+///
+/// **Not the retention policy's window**, and not only where a policy
+/// stands. Under a budget that splits the file the run is usually what the
+/// policy kept; under one that covers the file, none published, or a pin,
+/// it is whatever has been fetched round the playhead -- the same quantity,
+/// and just as much what a viewer can scrub back into and has in hand.
 ///
 /// It is never anything's stored state. At process start there is no
 /// playhead in either store (`enginefs::engine::Engine`'s is `None`, the
@@ -344,10 +379,11 @@ pub struct HeadRun {
 #[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheWindow {
-    /// Bytes of the stream we hold behind the playhead: what a scan back
-    /// is served from.
+    /// Bytes of the stream held, unbroken, behind the playhead: what a
+    /// scan back is served from without a fetch.
     pub behind_bytes: u64,
-    /// Bytes we hold from the playhead on: what playback has in hand.
+    /// Bytes held, unbroken, from the playhead on: what playback has in
+    /// hand. The byte at the playhead counts here.
     pub ahead_bytes: u64,
     /// How long the run behind lasts the reader that owns it, in seconds
     /// at its own demand; `None` when no reader is live and the bytes are
@@ -465,12 +501,14 @@ fn demand_of(rate: Option<u64>, film_rate: Option<u64>) -> Option<f64> {
 /// and a stored counter is a claim about a past this process never saw.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TorrentStreamNumbers {
-    /// What the piece store holds of the file, split at the playhead, or
-    /// `None` where there is no policy or no playhead to split at.
+    /// The unbroken run of the file the piece store holds round the
+    /// playhead, split at it, under any budget; `None` where no reader has
+    /// been inside the file in this process, so there is no playhead to
+    /// split at.
     pub window: Option<CacheWindow>,
-    /// Bytes advertised and promised never to be reclaimed. Absent with
-    /// [`Self::window`] and for the same reasons: with no policy installed
-    /// nothing has been promised, whatever is announced.
+    /// Bytes advertised and promised never to be reclaimed, or `None`
+    /// where no policy is installed: nothing has then been promised,
+    /// whatever is announced.
     pub committed_bytes: Option<u64>,
     /// What this torrent has fetched and sent since it was added, in this
     /// process, or `None` where the backend has no counters to read: a

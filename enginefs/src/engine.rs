@@ -1871,18 +1871,22 @@ impl<H: TorrentHandle> Engine<H> {
         );
     }
 
-    /// What the retention policy says about `file_idx` right now, or `None`
+    /// What the retention state says about `file_idx` right now, or `None`
     /// where there is nothing to say.
     ///
-    /// The two absences are both real and neither is a zero. **No policy**
-    /// is a torrent nothing is bounding -- the budget covers the file, no
-    /// budget has been published yet, or a pin keeps everything -- so there
-    /// is no window and no committed set to have a size. **No playhead** is
-    /// a file no reader has been inside in this process: nothing that
-    /// survives a restart says where a player had got to, and inventing one
-    /// from what is on the disk would put a window round a region nobody
-    /// has ever read. A reader in another file of the torrent is that
-    /// file's; this file keeps the head its own last byte left it with.
+    /// **No playhead** is the one absence, and it is not a zero: a file no
+    /// reader has been inside in this process -- no stream opened on it, so
+    /// it has no entity, or one that has no head yet. Nothing that survives
+    /// a restart says where a player had got to, and inventing one from
+    /// what is on the disk would put a window round a region nobody has
+    /// ever read. A reader in another file of the torrent is that file's;
+    /// this file keeps the head its own last byte left it with.
+    ///
+    /// **No policy is not an absence here.** A torrent nothing is bounding
+    /// -- the budget covers the file, no budget has been published yet, or
+    /// a pin keeps everything -- still has a run on the disk round its
+    /// playhead; what it lacks is a committed set, which the reading then
+    /// has no size for ([`crate::retention::PolicyReading::committed_bytes`]).
     ///
     /// One copy-out of the owner's state and no I/O: the reading is finished
     /// against a listing of the store, which the caller takes for itself
@@ -1905,7 +1909,6 @@ impl<H: TorrentHandle> Engine<H> {
     ) -> Option<crate::retention::PolicyReading> {
         use crate::retention::{PiecePosition, PieceReader};
         let holding = self.retention.holding(&file_idx)?;
-        let installed = holding.installed?;
         let piece_length = holding.domain.piece_length;
         let span_offset = holding.domain.span.offset;
         let place = |at: u64| -> Option<PiecePosition> {
@@ -1913,6 +1916,7 @@ impl<H: TorrentHandle> Engine<H> {
             Some(PiecePosition {
                 piece,
                 offset: span_offset.saturating_add(at) % piece_length,
+                in_file: at,
             })
         };
         let fallback = place(holding.head?.1)?;
@@ -1932,12 +1936,12 @@ impl<H: TorrentHandle> Engine<H> {
                 .collect()
         };
         Some(crate::retention::PolicyReading::new(
-            installed.pieces,
+            holding.extent,
             piece_length,
             self.retention.bitrate(&file_idx),
             readers,
             fallback,
-            installed.committed.len(),
+            holding.installed.map(|installed| installed.committed.len()),
         ))
     }
 

@@ -3082,10 +3082,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     ///
     /// `None` is a hash no engine exists for: a stream this server is not
     /// holding, which is not an error and has no rows. Inside a `Some`,
-    /// `window` and `committed_bytes` are absent together and mean exactly
-    /// what [`Engine::policy_reading`] says they mean -- no policy governs
-    /// this file, no reader has been inside it, or the reader has moved to
-    /// another file. `transfer` is absent for a torrent whose backend keeps
+    /// `window` is the unbroken run of the file on the disk round its
+    /// playhead, **under every budget** -- split, covering, unknown, none,
+    /// or a pin -- and is absent only where [`Engine::policy_reading`] has
+    /// no playhead: no reader has been inside this file in this process.
+    /// `committed_bytes` is absent with it, and also wherever no policy is
+    /// installed, which has promised nothing. `transfer` is absent for a torrent whose backend keeps
     /// no counters to read: see
     /// [`crate::backend::TorrentHandle::transfer_totals`], which is where
     /// that absence is decided and why it is not a zero.
@@ -3117,9 +3119,18 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // `init` has not seeded it -- has no held set to count, and that is
         // no numbers, not a window of zero.
         let held = self.registry.held(info_hash)?;
+        // What the run is clipped to: the file's own bytes, off the
+        // metadata librqbit already holds. A file the list does not have
+        // is not clipped, rather than read as empty.
+        let file_bytes = engine
+            .handle
+            .get_files()
+            .await
+            .get(file_idx)
+            .map_or(u64::MAX, |file| file.length);
         Some(crate::retention::TorrentStreamNumbers {
-            window: Some(reading.window(&held)),
-            committed_bytes: Some(reading.committed_bytes()),
+            window: Some(reading.window(&held, file_bytes)),
+            committed_bytes: reading.committed_bytes(),
             transfer,
             refused_reclaims,
         })
@@ -11676,6 +11687,226 @@ mod tests {
         );
     }
 
+    /// **The window is the run round the playhead whatever the budget.**
+    ///
+    /// A viewer asks the same thing of every stream -- how far back can I
+    /// scrub, how much is in hand -- and a budget that covers the file, one
+    /// never published, no cap at all, or a pin change how long the run
+    /// may grow, not what it is. So every budget shape answers the same
+    /// two numbers for the same disk and the same playhead; only the
+    /// committed set, which a policy alone makes, comes and goes.
+    #[tokio::test]
+    async fn a_stream_reports_the_run_round_its_playhead_under_every_budget() {
+        // What each budget is published as, and whether it installs a
+        // policy (a split) or not (the rest).
+        let shapes: [(&str, Option<Option<u64>>, bool); 4] = [
+            ("never published", None, false),
+            ("no cap", Some(None), false),
+            ("a budget covering the file", Some(Some(1_000_000)), false),
+            ("a budget splitting the file", Some(Some(50)), true),
+        ];
+        for (shape, budget, bounded) in shapes {
+            let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+            counters.pieces_per_file.store(4, Ordering::SeqCst);
+            let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+            if let Some(budget) = budget {
+                enginefs.set_cache_budget(budget);
+            }
+            let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+            std::fs::create_dir_all(&bucket).unwrap();
+            for piece in [0u32, 1, 2] {
+                std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+            }
+            engine.begin_retention(0).await;
+            engine.test_read_at(0, 30);
+            let _store = seeded_store(&enginefs, &engine);
+
+            let numbers = enginefs
+                .torrent_stream_numbers(TEST_HASH, 0)
+                .await
+                .expect("the engine exists");
+            assert_eq!(
+                numbers.window,
+                Some(crate::retention::CacheWindow {
+                    behind_bytes: 30,
+                    ahead_bytes: 45,
+                    ..Default::default()
+                }),
+                "{shape}: piece zero and five bytes of piece one behind the \
+                 playhead, the rest of piece one and piece two ahead of it"
+            );
+            assert_eq!(
+                numbers.committed_bytes.is_some(),
+                bounded,
+                "{shape}: a committed set only where a policy stands: {numbers:?}"
+            );
+        }
+
+        // And a pin, which drops the policy of a file being played.
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        engine.pinned_files.write().insert(0);
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [0u32, 1, 2] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        engine.begin_retention(0).await;
+        engine.test_read_at(0, 30);
+        let _store = seeded_store(&enginefs, &engine);
+        let numbers = enginefs
+            .torrent_stream_numbers(TEST_HASH, 0)
+            .await
+            .expect("the engine exists");
+        assert_eq!(
+            (numbers.window, numbers.committed_bytes),
+            (
+                Some(crate::retention::CacheWindow {
+                    behind_bytes: 30,
+                    ahead_bytes: 45,
+                    ..Default::default()
+                }),
+                None
+            ),
+            "a pinned file: its run, and nothing promised"
+        );
+    }
+
+    /// **The run is consecutive: the first piece missing ends it, and it
+    /// moves with the playhead.**
+    ///
+    /// Bytes past a hole are not in hand -- playback stops at the hole and
+    /// waits for a fetch -- so they are not ahead of anything, however many
+    /// of them there are. Under a budget covering the file, where nothing
+    /// reclaims and the disk can be a patchwork of what was fetched.
+    #[tokio::test]
+    async fn the_run_ends_at_the_first_missing_piece_and_follows_the_playhead() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 200)]);
+        // Eight pieces of twenty-five bytes.
+        counters.pieces_per_file.store(8, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(1_000_000));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        // Two holes: piece two, and piece five.
+        for piece in [0u32, 1, 3, 4, 6, 7] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        engine.begin_retention(0).await;
+        let store = seeded_store(&enginefs, &engine);
+        let window = || async {
+            enginefs
+                .torrent_stream_numbers(TEST_HASH, 0)
+                .await
+                .expect("the engine exists")
+                .window
+        };
+        let run = |behind_bytes, ahead_bytes| {
+            Some(crate::retention::CacheWindow {
+                behind_bytes,
+                ahead_bytes,
+                ..Default::default()
+            })
+        };
+
+        engine.test_read_at(0, 30);
+        assert_eq!(
+            window().await,
+            run(30, 20),
+            "piece one's run is pieces zero and one: the hole at two ends the \
+             ahead half, and pieces three to seven are not in hand"
+        );
+
+        engine.test_read_at(0, 110);
+        assert_eq!(
+            window().await,
+            run(35, 15),
+            "the playhead moved into piece four: its run is pieces three and \
+             four, with a hole on either side"
+        );
+
+        engine.test_read_at(0, 55);
+        assert_eq!(
+            window().await,
+            run(0, 0),
+            "a playhead on the missing piece stands in no run at all"
+        );
+
+        // The hole fills, and the run is the three runs joined.
+        std::fs::write(bucket.join("2"), [7u8; 25]).unwrap();
+        store.init_for_tests().unwrap();
+        assert_eq!(
+            window().await,
+            run(55, 70),
+            "pieces zero to four unbroken round byte fifty-five"
+        );
+    }
+
+    /// **The run stops at the file's own edges**, not at its pieces'.
+    ///
+    /// A file that does not begin or end on a piece boundary shares its
+    /// first and last piece -- with its neighbour, or with nothing at the
+    /// end of the torrent, where the last piece is short. Counting those
+    /// pieces whole would tell a viewer they can scrub back into the
+    /// previous episode and have bytes in hand past the end of the film.
+    #[tokio::test]
+    async fn the_run_is_clipped_to_the_file_at_both_ends() {
+        // Pieces of 90 / 4 = 22 bytes. The first file is bytes 0..90 and
+        // the second 90..200: pieces four to nine, piece four shared with
+        // the first file (88..110) and piece nine the torrent's short last
+        // (198..200).
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("Show.S01E01.mkv".into(), 90),
+            ("Show.S01E02.mkv".into(), 110),
+        ]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in 0..9u32 {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 22]).unwrap();
+        }
+        std::fs::write(bucket.join("9"), [7u8; 2]).unwrap();
+        engine.begin_retention(1).await;
+        let _store = seeded_store(&enginefs, &engine);
+        let window = || async {
+            enginefs
+                .torrent_stream_numbers(TEST_HASH, 1)
+                .await
+                .expect("the engine exists")
+                .window
+        };
+
+        // Five bytes into the second episode: byte 95, seven bytes into
+        // piece four -- two of which are the first episode's.
+        engine.test_read_at(1, 5);
+        assert_eq!(
+            window().await,
+            Some(crate::retention::CacheWindow {
+                behind_bytes: 5,
+                ahead_bytes: 105,
+                ..Default::default()
+            }),
+            "five bytes of this episode are behind it, not the seven of its \
+             piece; the whole rest of the episode is ahead"
+        );
+
+        // Five bytes from the end: byte 195, nineteen into piece eight.
+        engine.test_read_at(1, 105);
+        assert_eq!(
+            window().await,
+            Some(crate::retention::CacheWindow {
+                behind_bytes: 105,
+                ahead_bytes: 5,
+                ..Default::default()
+            }),
+            "five bytes are left of the episode, not the twenty-five its last \
+             two pieces would count"
+        );
+    }
+
     /// **What the cache holds is the store's own count, and what no pass
     /// may take is a pin or a live window -- neither read off the disk.**
     ///
@@ -13890,10 +14121,10 @@ mod tests {
     /// same way. A torrent this server does not hold has no answer at all; a
     /// torrent no reader has been inside has no playhead, and inventing one
     /// from what is on the disk would put a window round a region nobody
-    /// has ever read; a torrent nothing is bounding has no window and no
-    /// committed set, whatever it announces.
+    /// has ever read. A torrent nothing is bounding is not an absence of a
+    /// window: [`a_stream_reports_the_run_round_its_playhead_under_every_budget`].
     #[tokio::test]
-    async fn a_stream_with_no_playhead_and_no_policy_reports_no_window() {
+    async fn a_stream_with_no_playhead_reports_no_window() {
         let (enginefs, _counters) = test_enginefs_with_file_count(2);
         assert!(
             enginefs
@@ -13924,34 +14155,22 @@ mod tests {
             .await
             .expect("the engine exists");
         assert_eq!((numbers.window, numbers.committed_bytes), (None, None));
-
-        // And a budget that covers the file installs no policy, so there is
-        // nothing bounding this stream to have a window or a committed set.
-        let (enginefs, _counters) = test_enginefs_with_file_count(1);
-        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
-        enginefs.set_cache_budget(Some(1_000_000));
-        engine.begin_retention(0).await;
-        engine.test_read_at(0, 0);
-        let numbers = enginefs
-            .torrent_stream_numbers(TEST_HASH, 0)
-            .await
-            .expect("the engine exists");
-        assert_eq!((numbers.window, numbers.committed_bytes), (None, None));
     }
 
-    /// **A stream stops being bounded, and the panel has to hear that.**
+    /// **A stream stops being bounded, and the panel has to hear that --
+    /// in the committed set, not in the run round the playhead.**
     ///
-    /// The panel's numbers are a reading *of* the policy, and a policy that
-    /// is dropped takes its window and its committed set with it. Two
-    /// ordinary things drop one: a pin taken while the file is playing,
-    /// which hands the whole file back to the user and to the swarm, and a
-    /// budget that has grown to cover the file, which is a torrent nothing
-    /// needs to bound. Left standing, the bounds
-    /// would go on reporting a window and a promise for a stream that has
-    /// neither, which by this server's own contract is a statement and not
-    /// a stale number.
+    /// A policy that is dropped takes its committed set with it: nothing is
+    /// promised any more, whatever is announced. Two ordinary things drop
+    /// one: a pin taken while the file is playing, which hands the whole
+    /// file back to the user and to the swarm, and a budget that has grown
+    /// to cover the file, which is a torrent nothing needs to bound. Left
+    /// standing, the promise would be reported for a stream that has none,
+    /// which by this server's own contract is a statement and not a stale
+    /// number. The pieces round the playhead are still on the disk, and
+    /// the window says so.
     #[tokio::test]
-    async fn a_stream_whose_policy_is_dropped_stops_reporting_a_window() {
+    async fn a_stream_whose_policy_is_dropped_reports_its_run_and_no_promise() {
         /// What this server says is bounding the first file of the fixture.
         async fn bounded(
             enginefs: &BackendEngineFS<FakeBackend>,
@@ -14004,9 +14223,16 @@ mod tests {
         );
         assert_eq!(
             bounded(&enginefs).await,
-            (None, None),
-            "and nothing bounds the stream now, so there is no window and \
-             nothing promised: the reading went with the policy it was of"
+            (
+                Some(crate::retention::CacheWindow {
+                    behind_bytes: 25,
+                    ahead_bytes: 75,
+                    ..Default::default()
+                }),
+                None
+            ),
+            "and nothing bounds the stream now, so nothing is promised -- but \
+             the same four pieces are on the disk round the same playhead"
         );
 
         // The other way a policy goes: a budget that has grown to cover the
@@ -14027,10 +14253,17 @@ mod tests {
         engine.begin_retention(0).await;
         assert_eq!(
             bounded(&enginefs).await,
-            (None, None),
-            "the budget covers the whole file, so no policy is installed -- \
-             and a window left over from the one that was is a claim about a \
-             stream nothing is bounding"
+            (
+                Some(crate::retention::CacheWindow {
+                    behind_bytes: 25,
+                    ahead_bytes: 75,
+                    ..Default::default()
+                }),
+                None
+            ),
+            "the budget covers the whole file, so no policy is installed and \
+             nothing is promised -- and the run round the playhead is what \
+             the disk holds, as it was"
         );
     }
 
