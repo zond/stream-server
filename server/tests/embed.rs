@@ -2950,8 +2950,20 @@ fn a_panels_numbers_are_about_the_file_the_url_resolved_to() -> anyhow::Result<(
         &format!("{base}/{info_hash}/{filtered_idx}"),
         &filtered_pieces,
     )?;
-    no_window_for(&auto_url)?;
-    no_window_for(&format!("{base}/{info_hash}/{picked_idx}"))?;
+    // The episode left behind is forgotten by the switch's slack drop,
+    // which runs on its own task after the read that moved the playhead:
+    // asked until it has, within a bound, so a slow runner reads the answer
+    // and not the moment before it. A window that never goes still fails.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let left = no_window_for(&auto_url)
+            .and_then(|()| no_window_for(&format!("{base}/{info_hash}/{picked_idx}")));
+        match left {
+            Ok(()) => break,
+            Err(error) if std::time::Instant::now() >= deadline => return Err(error),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
 
     handle.shutdown()?;
     handle.join()?;
