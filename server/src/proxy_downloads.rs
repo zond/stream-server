@@ -157,9 +157,21 @@ struct Pinned {
 #[derive(Default)]
 pub struct ProxyDownloads {
     pinned: Mutex<HashMap<PathBuf, Pinned>>,
+    /// Every byte the fillers have brought in from their origins since the
+    /// process started -- see [`Self::fetched_over_http`].
+    fetched: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ProxyDownloads {
+    /// Every byte the downloads' fillers have brought in from their
+    /// origins since the process started: what a download of what is not
+    /// a torrent adds to the activity light's down half
+    /// (`enginefs::traffic::Reading::fetched_over_http`). Only ever grows.
+    /// What a filler found already on disk is not in it.
+    pub(crate) fn fetched_over_http(&self) -> u64 {
+        self.fetched.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn table(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, Pinned>> {
         self.pinned
             .lock()
@@ -214,7 +226,7 @@ impl ProxyDownloads {
         key: ProxyPinKey,
         name: Option<String>,
         entry: Entry,
-        source: Option<Arc<ProxySource>>,
+        source: Option<ProxySource>,
     ) -> PathBuf {
         let dir = entry.dir().to_path_buf();
         // The table first, and the retention owner told under it -- here
@@ -240,7 +252,7 @@ impl ProxyDownloads {
         if let Some(source) = source.filter(|_| !running) {
             let filler = Filler {
                 entry: entry.quiet(),
-                source,
+                source: Arc::new(source.counting_into(self.fetched.clone())),
                 retention: state.proxy_cache.retention().clone(),
                 dir: dir.clone(),
             };
@@ -321,7 +333,7 @@ pub(crate) async fn pin_url(
     }
     let source =
         ProxySource::open(state.proxy_cache.clone(), state.http_addr, url, headers).await?;
-    let source = Arc::new(source.for_filling());
+    let source = source.for_filling();
     Ok(state
         .proxy_downloads
         .pin(state, key, name, entry, Some(source)))
@@ -418,7 +430,7 @@ pub(crate) async fn pin_drive(
         .await
         .map_err(crate::routes::drive::DriveOpenError::Drive)?;
     let name = name.or_else(|| source.name().map(str::to_string));
-    let source = Arc::new(source.filling_source());
+    let source = source.filling_source();
     Ok(state
         .proxy_downloads
         .pin(state, key, name, entry, Some(source)))

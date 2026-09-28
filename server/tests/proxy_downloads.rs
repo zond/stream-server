@@ -635,3 +635,74 @@ fn an_origin_that_answers_nothing_is_not_asked_in_a_loop() -> anyhow::Result<()>
     fixture.stop()?;
     Ok(())
 }
+
+/// Polls the activity light until `lit` holds of a reading, or fails after
+/// a bound saying what it last read. The light is judged over windows of
+/// `window_secs`, so a verdict takes at least one of them to arrive.
+fn wait_for_light(
+    handle: &ServerHandle,
+    what: &str,
+    lit: impl Fn(&enginefs::traffic::BackgroundTraffic) -> bool,
+) -> anyhow::Result<enginefs::traffic::BackgroundTraffic> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let reading = handle.background_traffic()?;
+        if lit(&reading) {
+            return Ok(reading);
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "the light never showed {what}: {reading:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// **A download of what is not a torrent lights the down half of the
+/// activity light, and a player's own reads through the proxy do not.**
+/// An addon link has no peers and no torrent counters; what its filler
+/// brings in from the origin is what the light counts. What a player
+/// fetches through `/proxy` is the viewer's own, and a poster or a
+/// subtitle is not a download either, so none of that is in the count.
+#[test]
+fn a_url_download_lights_the_way_down_and_a_players_read_does_not() -> anyhow::Result<()> {
+    let origin = Origin::start(true)?;
+    let fixture = Fixture::start(Some(Vec::new()))?;
+    let base = format!("http://{}", fixture.handle.http_addr());
+
+    let played = origin.url("/films/played.mp4");
+    let response = reqwest::blocking::Client::new()
+        .get(format!("{base}/proxy/?d={}", urlencoding::encode(&played)))
+        .header(reqwest::header::RANGE, "bytes=0-")
+        .send()?;
+    assert!(response.status().is_success(), "{}", response.status());
+    assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
+    assert_eq!(
+        fixture.handle.background_traffic()?.bytes_downloaded,
+        0,
+        "a player's read through the proxy is not a download"
+    );
+
+    let row = fixture.pin_url(&origin.url("/films/the-film.mp4"))?;
+    let key = row["infoHash"].as_str().expect("a key").to_string();
+    let lit = wait_for_light(&fixture.handle, "the download", |reading| {
+        reading.downloading
+    })?;
+    assert!(
+        !lit.uploading && !lit.playing && lit.active,
+        "only the way down, and nothing was playing: {lit:?}"
+    );
+    fixture.wait_complete(&key)?;
+    let whole = fixture.handle.background_traffic()?.bytes_downloaded;
+    assert!(
+        (ORIGIN_LENGTH as u64..2 * ORIGIN_LENGTH as u64).contains(&whole),
+        "the count is what the filler fetched, about the file once: {whole}"
+    );
+
+    // Finished, it fetches nothing more, and the light goes out.
+    wait_for_light(&fixture.handle, "the download finishing", |reading| {
+        !reading.active
+    })?;
+    fixture.stop()?;
+    Ok(())
+}

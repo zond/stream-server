@@ -593,10 +593,21 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     /// wanted at a time. Single-file torrents bypass this selector.
     active_multifile_files: Arc<RwLock<HashMap<String, MultiFileActiveSelection>>>,
     priority_generation: Arc<AtomicU64>,
-    /// The user's sharing setting: with it on this server uploads all the
-    /// time, and with it off only while a player is reading from it. See
+    /// The user's sharing setting: whether what is shared keeps uploading
+    /// once nothing is playing and nothing is downloading. See
     /// [`Self::apply_upload_switch`].
     seeding_enabled: Arc<AtomicBool>,
+    /// The embedder says the app is away on a device where that stops the
+    /// idle sharing -- a phone or a tablet in the background. Not
+    /// persisted: it is a fact about this run of the app, and a fresh
+    /// server is in the foreground. See [`Self::set_idle_sharing_held`].
+    idle_sharing_held: Arc<AtomicBool>,
+    /// How many streams have started since the process did. Only ever
+    /// grows, so two readings that differ say a stream started between
+    /// them however briefly it lasted -- which a look at the live counters
+    /// at each reading cannot say. What the activity light's window reads
+    /// ([`Self::playback_starts`]).
+    playback_starts: Arc<AtomicU64>,
     /// Held across [`Self::apply_upload_switch`]'s reading and its write.
     upload_switch: Arc<tokio::sync::Mutex<()>>,
     /// Magnet adds still inside the backend's `add_torrent`, plus the failure
@@ -1321,6 +1332,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             active_multifile_files: Arc::new(RwLock::new(HashMap::new())),
             priority_generation: Arc::new(AtomicU64::new(0)),
             seeding_enabled: Arc::new(AtomicBool::new(true)),
+            idle_sharing_held: Arc::new(AtomicBool::new(false)),
+            playback_starts: Arc::new(AtomicU64::new(0)),
             upload_switch: Arc::new(tokio::sync::Mutex::new(())),
             magnet_adds: Arc::new(RwLock::new(HashMap::new())),
             pin_locks: parking_lot::Mutex::new(HashMap::new()),
@@ -3188,20 +3201,62 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         self.seeding_enabled.load(Ordering::Relaxed)
     }
 
-    /// Tell the backend whether to upload, from what is true now: always
-    /// while the sharing setting is on, and with it off only while a
-    /// player is reading from this server.
+    /// Hold the idle sharing off (`true`) or let the setting decide again
+    /// (`false`), applied before this returns. The embedder holds it while
+    /// the app is in the background on a phone or a tablet, where somebody
+    /// who put the device away does not expect it to go on spending their
+    /// data; a television or a desktop is never held. Playing and
+    /// downloading still upload, held or not -- see
+    /// [`Self::apply_upload_switch`].
     ///
-    /// **"A player is reading" is [`Self::playback_is_live`]**, the answer
-    /// the activity light is drawn from, so the light can never show an
-    /// upload the setting has ruled out: it is lit only while nothing is
-    /// playing, and with the setting off that is exactly when nothing
-    /// uploads. A player that is paused still holds its response open,
-    /// so a paused film keeps sharing. While one is reading, every torrent
-    /// uploads -- the one being watched and a title kept offline alike --
-    /// because the switch is the session's: it chokes peers, it does not
-    /// choose between torrents, and a rule that did would be the retention
-    /// owner's advertise mask, which is not a thing to share.
+    /// Not a setting and not persisted: the app says it on every change of
+    /// its lifecycle, and a server that restarts starts in the foreground.
+    pub async fn set_idle_sharing_held(&self, held: bool) {
+        self.idle_sharing_held.store(held, Ordering::Relaxed);
+        self.apply_upload_switch().await;
+        tracing::info!(held, "Idle sharing hold updated");
+    }
+
+    /// Whether [`Self::set_idle_sharing_held`] last held the idle sharing.
+    pub fn idle_sharing_held(&self) -> bool {
+        self.idle_sharing_held.load(Ordering::Relaxed)
+    }
+
+    /// How many streams have started since the process did -- see the
+    /// field. The activity light reads it beside [`Self::playback_is_live`]
+    /// so that a playback that began and ended between two of its readings
+    /// still counts as one it saw ([`crate::traffic::Reading`]).
+    pub fn playback_starts(&self) -> u64 {
+        self.playback_starts.load(Ordering::SeqCst)
+    }
+
+    /// Tell the backend whether to upload, from what is true now. One
+    /// switch for the whole session, on when at least one torrent has a
+    /// reason to share:
+    ///
+    /// * **a player is reading** from this server
+    ///   ([`Self::playback_is_live`]), always;
+    /// * **a torrent download is on its way** -- pinned, live and not
+    ///   finished ([`Self::a_torrent_download_is_running`]) -- always, in the
+    ///   foreground or the background and whatever the setting says:
+    ///   downloading is activity, not idling, and a torrent client that
+    ///   took a film without giving back while it did is a leech;
+    /// * otherwise, what was played or downloaded before shares only while
+    ///   **the setting is on and the embedder is not holding it**
+    ///   ([`Self::set_idle_sharing_held`]).
+    ///
+    /// **One switch, not one per torrent.** When any torrent may upload,
+    /// every torrent may (zond's call: sharing from one is sharing), and
+    /// what a torrent announces at all is the retention owner's advertised
+    /// set, which this does not touch. It chokes peers; it does not choose
+    /// between torrents.
+    ///
+    /// **"A player is reading" is the activity light's own answer**, so
+    /// the light can never show an upload the setting has ruled out while
+    /// nothing plays: a lit "up" with the setting off is a download on its
+    /// way, which is exactly what the rule lets share. A player that is
+    /// paused still holds its response open, so a paused film keeps
+    /// sharing.
     ///
     /// Only uploading is switched. Nothing is paused and no peer is
     /// dropped, so what a torrent downloads is still the ladder's and the
@@ -3209,16 +3264,37 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// Unchoke per peer.
     ///
     /// **Recomputed, never remembered**: asked where the answer can turn
-    /// true (a stream opening, the setting moving) so sharing starts at
-    /// once, and on every reconciler tick, which is where it turns false.
-    /// Serialised, because the reading and the write are two steps with an
-    /// await between them: a tick that read "nothing playing" just before
-    /// a stream registered must not land its "off" after the open's "on".
+    /// true (a stream opening, a pin, the setting or the hold moving) so
+    /// sharing starts at once, and on every reconciler tick, which is where
+    /// it turns false -- a stream ending, a download finishing. Serialised,
+    /// because the reading and the write are two steps with an await
+    /// between them: a tick that read "nothing playing" just before a
+    /// stream registered must not land its "off" after the open's "on".
     /// Under the lock the later caller reads the later registers.
     async fn apply_upload_switch(&self) {
         let _turn = self.upload_switch.lock().await;
-        let enabled = self.seeding_enabled() || self.playback_is_live().await;
+        let idle_allowed = self.seeding_enabled() && !self.idle_sharing_held();
+        let enabled = idle_allowed
+            || self.playback_is_live().await
+            || self.a_torrent_download_is_running().await;
         self.backend.set_upload_enabled(enabled);
+    }
+
+    /// Whether a torrent download is on its way: a pinned torrent that is
+    /// live and has not finished. A pin stopped for space or in error is
+    /// moving nothing and is not counted; nor is one still checking, which
+    /// is not talking to peers yet (the tick after it goes live counts it).
+    async fn a_torrent_download_is_running(&self) -> bool {
+        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
+        for engine in engines {
+            if engine.is_pinned()
+                && engine.handle.run_state() == crate::backend::RunState::Live
+                && !engine.handle.is_finished().await
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// Put the torrent `info_hash` back to work after the backend stopped it
@@ -3591,6 +3667,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             *count += 1;
         }
         rollback.counted_stream();
+        // Never taken back, not even by the rollback: a start that was
+        // abandoned was still a player asking, and the light's window must
+        // not claim the bytes it moved.
+        self.playback_starts.fetch_add(1, Ordering::SeqCst);
         {
             let mut streams = self.active_file_streams.write().await;
             let count = streams.entry((info_hash.clone(), file_idx)).or_insert(0);
@@ -4062,6 +4142,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             .await;
         self.reconcile_with_active_selection(engine.clone(), "pin_download")
             .await;
+        // A download on its way uploads whatever the setting says, so the
+        // switch is asked now rather than at the next tick.
+        self.apply_upload_switch().await;
         tracing::info!(
             info_hash = %engine.info_hash,
             file_idx,
@@ -9814,6 +9897,113 @@ mod tests {
         assert_eq!(told(), Some(false), "turned off with nothing playing");
         enginefs.set_seeding_enabled(true).await;
         assert_eq!(told(), Some(true), "turned on again");
+    }
+
+    /// **A torrent download on its way uploads whatever the setting and the
+    /// hold say, and stops when it finishes.** Downloading is activity, not
+    /// idling: with sharing off and the app held in the background, a pin
+    /// that is still fetching turns the switch on the moment it is pinned,
+    /// and the tick after it finishes turns it off again -- what is left is
+    /// a finished download, which shares only on the idle terms.
+    #[tokio::test]
+    async fn a_torrent_download_on_its_way_uploads_whatever_the_setting_says() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        let upload = enginefs.backend.upload_enabled.clone();
+        let told = || *upload.lock().unwrap();
+
+        enginefs.set_seeding_enabled(false).await;
+        enginefs.set_idle_sharing_held(true).await;
+        assert_eq!(told(), Some(false), "off, held, and nothing is moving");
+
+        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        assert_eq!(told(), Some(true), "a download on its way shares at once");
+        enginefs.reconcile_tick().await;
+        assert_eq!(told(), Some(true), "and the tick agrees while it fetches");
+
+        counters.seeded.store(true, Ordering::SeqCst);
+        enginefs.reconcile_tick().await;
+        assert_eq!(
+            told(),
+            Some(false),
+            "a finished download shares on the idle terms, and they say no"
+        );
+
+        enginefs.set_idle_sharing_held(false).await;
+        enginefs.set_seeding_enabled(true).await;
+        assert_eq!(told(), Some(true), "and on the idle terms it shares again");
+    }
+
+    /// **A download that is not live is not on its way.** One stopped for
+    /// space moves nothing, so it gives the switch no reason to be on.
+    #[tokio::test]
+    async fn a_stopped_download_is_not_a_reason_to_upload() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        let upload = enginefs.backend.upload_enabled.clone();
+        let told = || *upload.lock().unwrap();
+
+        enginefs.set_seeding_enabled(false).await;
+        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        assert_eq!(told(), Some(true));
+
+        counters.paused.store(true, Ordering::SeqCst);
+        enginefs.set_seeding_enabled(false).await;
+        assert_eq!(told(), Some(false), "a paused pin is not downloading");
+    }
+
+    /// **The hold stops the idle sharing and nothing else.** Held, a
+    /// server with sharing on uploads nothing while nothing plays -- what a
+    /// phone in the background asks for -- but a player reading still
+    /// shares, and letting go gives the setting back at once.
+    #[tokio::test]
+    async fn the_hold_stops_idle_sharing_but_not_a_player() {
+        let (mut enginefs, _counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        let upload = enginefs.backend.upload_enabled.clone();
+        let told = || *upload.lock().unwrap();
+
+        enginefs.reconcile_tick().await;
+        assert_eq!(told(), Some(true), "on by default");
+        enginefs.set_idle_sharing_held(true).await;
+        assert!(enginefs.idle_sharing_held());
+        assert_eq!(told(), Some(false), "held with nothing playing");
+
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        assert_eq!(told(), Some(true), "a player shares, held or not");
+        enginefs.on_stream_end(TEST_HASH, 0).await;
+        enginefs.reconcile_tick().await;
+        assert_eq!(told(), Some(false), "and the hold is back once it leaves");
+
+        enginefs.set_idle_sharing_held(false).await;
+        assert_eq!(told(), Some(true), "let go: the setting decides again");
+        assert!(
+            enginefs.seeding_enabled(),
+            "the hold never touched the setting"
+        );
+    }
+
+    /// **Every stream start is counted, and the count never goes down** --
+    /// not when the stream ends, which is the point: the light compares two
+    /// readings of it, and a playback that started and ended between them
+    /// must still show as a difference.
+    #[tokio::test]
+    async fn playback_starts_count_every_start_and_never_go_down() {
+        let (mut enginefs, _counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        assert_eq!(enginefs.playback_starts(), 0);
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        enginefs.on_stream_end(TEST_HASH, 0).await;
+        assert_eq!(enginefs.playback_starts(), 1, "ended, still counted");
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        enginefs
+            .on_stale_stream_start_unreconciled(TEST_HASH, 0)
+            .await;
+        assert_eq!(enginefs.playback_starts(), 3, "every kind of start");
+        enginefs.on_stream_end(TEST_HASH, 0).await;
+        enginefs.on_stream_end(TEST_HASH, 0).await;
+        assert!(!enginefs.playback_is_live().await);
+        assert_eq!(enginefs.playback_starts(), 3);
     }
 
     /// The same of the reconciler's own tick, whose await is

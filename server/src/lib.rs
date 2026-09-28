@@ -872,6 +872,31 @@ impl ServerHandle {
         self.state.engine.footprint() == enginefs::backend::Footprint::Lean
     }
 
+    /// Hold the idle sharing off (`true`) or give it back to the
+    /// `seedingEnabled` setting (`false`). An app calls it with `true`
+    /// while it is in the background on a phone or a tablet, where
+    /// somebody who put the device away does not expect it to go on
+    /// spending their data, and never on a television or a desktop.
+    ///
+    /// Held, nothing uploads **while nothing plays and no torrent download
+    /// is on its way**: a player reading and a download still fetching
+    /// share whatever this says, since that is activity, not idling. See
+    /// `enginefs::EngineFS::set_idle_sharing_held` for the whole rule.
+    ///
+    /// Not a setting and not persisted -- it is a fact about this run of
+    /// the app, so the app says it on every change of its lifecycle and a
+    /// server that starts again starts unheld. Applied before this
+    /// returns.
+    pub fn set_idle_sharing_held(&self, held: bool) -> anyhow::Result<()> {
+        let state = self.state.clone();
+        self.block_on_server(async move { state.engine.set_idle_sharing_held(held).await })
+    }
+
+    /// Whether [`Self::set_idle_sharing_held`] last held the idle sharing.
+    pub fn idle_sharing_held(&self) -> bool {
+        self.state.engine.idle_sharing_held()
+    }
+
     /// The live-peer cap librqbit is enforcing on `info_hash` right now --
     /// the one lever [`Self::set_background`] moves -- or `None` when this
     /// server holds no such torrent.

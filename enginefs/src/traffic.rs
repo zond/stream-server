@@ -33,6 +33,14 @@
 //! sum over -- the one engine's, so a torrent cannot be in one and not the
 //! other.
 //!
+//! **A download of what is not a torrent** -- an addon link, a Google Drive
+//! file -- has no peers and no librqbit counters, and it uses the
+//! connection all the same. Its filler counts what it brings in from the
+//! origin ([`Reading::fetched_over_http`]), which lights the down half
+//! beside the torrents'. Only what a download fetched: a player's own
+//! requests to the proxy, a poster or a subtitle are not in it. The up
+//! half stays the torrents' -- nothing else here uploads.
+//!
 //! The counters are the live state's, so a torrent that pauses or is removed
 //! takes its bytes out of the sum; a sum that dropped reads as "not grown",
 //! and a torrent that stopped is not using the connection. Nothing in the
@@ -88,6 +96,26 @@ const _: () = assert!(
     "a window of the ordinary length must not be stale the moment it closes"
 );
 
+/// One reading of what the light is judged from, taken by whoever can see
+/// all of it -- the server, in one place (see the module docs).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Reading {
+    /// The torrents' own peer counters, summed over the torrents that exist.
+    pub torrents: TransferTotals,
+    /// Bytes the downloads of what is not a torrent have brought in from
+    /// their origins since the process started. Only ever grows.
+    pub fetched_over_http: u64,
+    /// Whether a player is reading from the server right now
+    /// (`BackendEngineFS::playback_is_live`).
+    pub playing: bool,
+    /// How many streams have started since the process did
+    /// (`BackendEngineFS::playback_starts`). Only ever grows, so a change
+    /// between two readings is a playback between them, however briefly it
+    /// lasted -- one that began and ended between two polls is otherwise
+    /// seen by neither, and the bytes it pulled in light the light.
+    pub playback_starts: u64,
+}
+
 /// What a client's activity light is: each direction of the connection over
 /// the last window, with nothing playing over it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -105,11 +133,12 @@ pub struct BackgroundTraffic {
     /// Whether a player is reading from this server as this is answered.
     pub playing: bool,
     /// The sums the verdict was judged from: bytes received from and sent to
-    /// peers, over the torrents that exist right now. Not since the process
-    /// started -- a torrent that pauses or leaves takes its bytes with it --
-    /// so a rate taken between two readings is a rate only while the set of
-    /// torrents held still, which the verdict's own "grew" test already
-    /// allows for.
+    /// peers, over the torrents that exist right now, and on the way down
+    /// the bytes the downloads of what is not a torrent fetched. The
+    /// torrents' part is not since the process started -- a torrent that
+    /// pauses or leaves takes its bytes with it -- so a rate taken between
+    /// two readings is a rate only while the set of torrents held still,
+    /// which the verdict's own "grew" test already allows for.
     pub bytes_downloaded: u64,
     pub bytes_uploaded: u64,
     /// The window the halves were judged over ([`TRAFFIC_WINDOW`]), in
@@ -128,9 +157,9 @@ pub struct BackgroundTraffic {
 /// [`TrafficWindow::sample`]).
 ///
 /// It carries its own epoch (a `tokio::time::Instant`, so it follows a paused
-/// test clock) rather than borrowing an engine's: the server that owns one
-/// of these has two engine fields, each with a clock of its own, and the
-/// window has to be judged against one clock whatever those fields hold.
+/// test clock) rather than borrowing an engine's: the window is the
+/// server's, fed from the engine and from the proxy's downloads alike, and
+/// it is judged against one clock whatever either of them keeps.
 #[derive(Debug)]
 pub struct TrafficWindow {
     epoch: tokio::time::Instant,
@@ -142,9 +171,12 @@ struct WindowState {
     /// False until a first reading has been taken. Nothing can be said before
     /// that: one sample of a total says only what the total is.
     started: bool,
-    /// When the standing verdict's window closed, and the totals then.
+    /// When the standing verdict's window closed, and the counters then.
     at_secs: u64,
     totals: TransferTotals,
+    fetched_over_http: u64,
+    /// The start count at the last reading, whichever window it was in.
+    playback_starts: u64,
     /// The standing verdict, per half: the counter grew over that window and
     /// nothing was seen playing at any observation of it.
     downloading: bool,
@@ -167,11 +199,14 @@ impl TrafficWindow {
         }
     }
 
-    /// Read the connection's totals against the last reading and answer the
-    /// light's question, now. `playing` is whether a player is reading right
-    /// now (`BackendEngineFS::playback_is_live`), and it is judged over the
-    /// same window as the traffic: a window is "not watched" only if no
-    /// observation of it, or of the time since, found a player.
+    /// Read the connection's counters against the last reading and answer
+    /// the light's question, now. Playback is judged over the same window as
+    /// the traffic: a window is "not watched" only if no observation of it,
+    /// or of the time since, found a player -- where an observation finds
+    /// one if a player is reading as it is taken, **or if a stream started
+    /// since the reading before it** ([`Reading::playback_starts`]). The
+    /// second half is what catches a short playback that fell between two
+    /// polls, which the first cannot see.
     ///
     /// That is deliberately the pessimistic reading, and it is what keeps the
     /// light from blaming the viewer's own playback on the background. The
@@ -187,20 +222,27 @@ impl TrafficWindow {
     /// the standing verdict is about a stretch a player has now been seen
     /// in, and reporting it a moment longer would be reporting a fact that
     /// has stopped being one.
-    pub fn sample(&self, totals: TransferTotals, playing: bool) -> BackgroundTraffic {
-        self.sample_at(self.epoch.elapsed().as_secs(), totals, playing)
+    pub fn sample(&self, reading: Reading) -> BackgroundTraffic {
+        self.sample_at(self.epoch.elapsed().as_secs(), reading)
     }
 
     /// [`Self::sample`] at a caller-supplied clock, for tests that want the
     /// windows exact.
-    pub fn sample_at(
-        &self,
-        now_secs: u64,
-        totals: TransferTotals,
-        playing: bool,
-    ) -> BackgroundTraffic {
+    pub fn sample_at(&self, now_secs: u64, reading: Reading) -> BackgroundTraffic {
+        let Reading {
+            torrents: totals,
+            fetched_over_http,
+            playing,
+            playback_starts,
+        } = reading;
         let mut state = self.state.lock();
-        state.seen_playing |= playing;
+        // A stream that started since the last reading was a player here,
+        // even if it has gone again. The first reading has nothing to
+        // compare with, and is a baseline anyway.
+        let started = state.started && playback_starts != state.playback_starts;
+        state.playback_starts = playback_starts;
+        let seen = playing || started;
+        state.seen_playing |= seen;
 
         let elapsed = now_secs.saturating_sub(state.at_secs);
         if !state.started || elapsed >= TRAFFIC_WINDOW.as_secs() {
@@ -209,13 +251,16 @@ impl TrafficWindow {
             // `TRAFFIC_WINDOW_STALE_AFTER`.
             let judged = state.started && elapsed <= TRAFFIC_WINDOW_STALE_AFTER.as_secs();
             let quiet = judged && !state.seen_playing;
-            state.downloading = quiet && totals.fetched > state.totals.fetched;
+            state.downloading = quiet
+                && (totals.fetched > state.totals.fetched
+                    || fetched_over_http > state.fetched_over_http);
             state.uploading = quiet && totals.uploaded > state.totals.uploaded;
             state.started = true;
             state.at_secs = now_secs;
             state.totals = totals;
+            state.fetched_over_http = fetched_over_http;
             // This observation belongs to the window that just opened.
-            state.seen_playing = playing;
+            state.seen_playing = seen;
         }
 
         let downloading = state.downloading && !state.seen_playing;
@@ -225,7 +270,7 @@ impl TrafficWindow {
             downloading,
             uploading,
             playing,
-            bytes_downloaded: totals.fetched,
+            bytes_downloaded: totals.fetched.saturating_add(fetched_over_http),
             bytes_uploaded: totals.uploaded,
             window_secs: TRAFFIC_WINDOW.as_secs(),
         }
@@ -244,6 +289,8 @@ mod tests {
     struct Fixture {
         window: TrafficWindow,
         totals: Cell<TransferTotals>,
+        fetched_over_http: Cell<u64>,
+        playback_starts: Cell<u64>,
     }
 
     impl Fixture {
@@ -251,7 +298,21 @@ mod tests {
             Self {
                 window: TrafficWindow::new(),
                 totals: Cell::default(),
+                fetched_over_http: Cell::default(),
+                playback_starts: Cell::default(),
             }
+        }
+
+        /// A download of what is not a torrent brought `bytes` in.
+        fn fetch_over_http(&self, bytes: u64) {
+            self.fetched_over_http
+                .set(self.fetched_over_http.get() + bytes);
+        }
+
+        /// A stream started, and -- as far as any reading will see -- has
+        /// ended by the next one.
+        fn start_a_stream(&self) {
+            self.playback_starts.set(self.playback_starts.get() + 1);
         }
 
         fn download(&self, bytes: u64) {
@@ -267,7 +328,15 @@ mod tests {
         }
 
         fn ask(&self, now: u64, playing: bool) -> BackgroundTraffic {
-            self.window.sample_at(now, self.totals.get(), playing)
+            self.window.sample_at(
+                now,
+                Reading {
+                    torrents: self.totals.get(),
+                    fetched_over_http: self.fetched_over_http.get(),
+                    playing,
+                    playback_starts: self.playback_starts.get(),
+                },
+            )
         }
     }
 
@@ -438,19 +507,114 @@ mod tests {
         assert_eq!(answer.window_secs, WINDOW);
     }
 
+    /// **A playback that began and ended between two readings is still a
+    /// playback.** Neither reading finds a player, so the live counters
+    /// alone would call the window unwatched and the bytes that player
+    /// pulled in would light the light -- the false light after a short
+    /// play. The start count moved between them, and that is enough.
+    #[test]
+    fn a_playback_between_two_readings_is_seen() {
+        let f = Fixture::new();
+        f.ask(0, false);
+
+        f.start_a_stream();
+        f.download(1_000);
+        f.upload(1_000);
+        let closed = f.ask(WINDOW, false);
+        assert!(
+            !closed.downloading && !closed.uploading && !closed.active,
+            "a stream started inside this window; its bytes are the viewer's"
+        );
+
+        // It spoke for the window it was in and the one the closing
+        // reading opened, as a player seen at a close does -- and no more.
+        f.download(1_000);
+        assert!(!f.ask(WINDOW * 2, false).active);
+        f.download(1_000);
+        assert!(
+            f.ask(WINDOW * 3, false).active,
+            "a count that stopped moving is no player"
+        );
+    }
+
+    /// The same inside a window: a start seen mid-window puts a standing
+    /// verdict out at once, like a player seen there.
+    #[test]
+    fn a_start_seen_mid_window_puts_the_light_out() {
+        let f = Fixture::new();
+        f.ask(0, false);
+        f.download(1);
+        assert!(f.ask(WINDOW, false).active);
+
+        f.start_a_stream();
+        assert!(!f.ask(WINDOW + 1, false).active);
+        assert!(
+            !f.ask(WINDOW + 2, false).active,
+            "and stays out for the window"
+        );
+    }
+
+    /// The first reading has no count to compare with, so a server that
+    /// has played before the light first asked is not taken to be playing
+    /// now -- and a first reading is a baseline anyway.
+    #[test]
+    fn the_first_readings_count_is_a_baseline() {
+        let f = Fixture::new();
+        f.playback_starts.set(7);
+        f.ask(0, false);
+        f.download(1);
+        assert!(f.ask(WINDOW, false).active);
+    }
+
+    /// **A download of what is not a torrent lights the down half**, and
+    /// only that half: nothing but a torrent uploads.
+    #[test]
+    fn a_download_over_http_lights_the_way_down() {
+        let f = Fixture::new();
+        f.ask(0, false);
+        f.fetch_over_http(64 * 1024);
+        let lit = f.ask(WINDOW, false);
+        assert!(lit.downloading && !lit.uploading && lit.active);
+        assert_eq!(lit.bytes_downloaded, 64 * 1024);
+
+        // Summed with the torrents' for the report, judged apart for the
+        // verdict: a torrent that left cannot hide a download that grew.
+        f.download(1_000);
+        f.ask(WINDOW * 2, false);
+        f.totals.set(TransferTotals::default());
+        f.fetch_over_http(1);
+        let after = f.ask(WINDOW * 3, false);
+        assert!(
+            after.downloading,
+            "the torrents' sum dropped, the download's grew"
+        );
+
+        assert!(!f.ask(WINDOW * 4, false).active, "and it stopped");
+    }
+
+    /// And like the torrents' bytes, what a download fetched while a
+    /// player was reading is not background.
+    #[test]
+    fn a_download_over_http_under_a_player_is_not_background() {
+        let f = Fixture::new();
+        f.ask(0, true);
+        f.fetch_over_http(1);
+        assert!(!f.ask(WINDOW, true).active);
+    }
+
     /// `sample` without a clock argument reads the window's own epoch, which
     /// under a paused runtime is the test's clock.
     #[tokio::test(start_paused = true)]
     async fn the_window_keeps_its_own_clock() {
         let window = TrafficWindow::new();
-        let mut totals = TransferTotals::default();
-        window.sample(totals, false);
-        totals.fetched += 1;
+        let mut reading = Reading::default();
+        window.sample(reading);
+        reading.torrents.fetched += 1;
         assert!(
-            !window.sample(totals, false).active,
+            !window.sample(reading).active,
             "no time has passed, so the first window has not closed"
         );
         tokio::time::advance(TRAFFIC_WINDOW).await;
-        assert!(window.sample(totals, false).downloading);
+        assert!(window.sample(reading).downloading);
     }
 }

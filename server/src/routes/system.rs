@@ -25,9 +25,13 @@ use serde_json::{Value, json};
 /// separately would sample them a moment apart across FFI and get a light
 /// that flickers whenever they disagree. *Traffic* is the sum of every
 /// existing torrent's own peer counters
-/// ([`enginefs::backend::TransferTotals`]) compared against the last
-/// reading; *nothing playing* is [`enginefs::EngineFS::playback_is_live`], held over
-/// the window and not just now (see [`enginefs::traffic::TrafficWindow::sample`]).
+/// ([`enginefs::backend::TransferTotals`]) plus what the downloads of what
+/// is not a torrent fetched from their origins
+/// ([`crate::proxy_downloads::ProxyDownloads::fetched_over_http`]),
+/// compared against the last reading; *nothing playing* is
+/// [`enginefs::EngineFS::playback_is_live`] and no stream started
+/// ([`enginefs::EngineFS::playback_starts`]), held over the window and not
+/// just now (see [`enginefs::traffic::TrafficWindow::sample`]).
 ///
 /// Cheap and a peek, so it can be polled every second or two for the life
 /// of the process: per torrent that exists, one read of librqbit's live
@@ -39,14 +43,22 @@ use serde_json::{Value, json};
 /// nothing -- no engine, no magnet add -- so it never goes near
 /// `stats_target`.
 pub async fn background_traffic(state: &AppState) -> enginefs::traffic::BackgroundTraffic {
-    let totals = state
+    let torrents = state
         .engine
         .transfer_totals()
         .await
         .into_values()
         .fold(TransferTotals::default(), TransferTotals::plus);
+    // The start count before the live check: a stream that starts between
+    // the two is then seen by the check, or by the next reading's count.
+    let playback_starts = state.engine.playback_starts();
     let playing = state.engine.playback_is_live().await;
-    state.traffic_window.sample(totals, playing)
+    state.traffic_window.sample(enginefs::traffic::Reading {
+        torrents,
+        fetched_over_http: state.proxy_downloads.fetched_over_http(),
+        playing,
+        playback_starts,
+    })
 }
 
 /// Whether the mainline DHT works on this host -- see

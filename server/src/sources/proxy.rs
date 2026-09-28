@@ -190,6 +190,7 @@ pub struct ProxySource {
 /// What issuing a ranged read of this entity takes. Behind an `Arc`
 /// because a reader outlives the call that opened it and has to be able to
 /// ask again -- which is what a seek on one is.
+#[derive(Clone)]
 struct Entity {
     /// The cache the reads go through. The entry is taken per read, as the
     /// route takes one per request: an `Entry` is a key's directory and
@@ -226,6 +227,12 @@ struct Entity {
     describe: String,
     /// Readers are quiet -- not viewers. See [`ProxySource::for_filling`].
     quiet: bool,
+    /// Where the bytes this source brings in from the origin are counted:
+    /// a download's filler, whose fetching is what the activity light's
+    /// down half shows for what is not a torrent
+    /// ([`ProxySource::counting_into`]). `None` for a player's reads and
+    /// their read-ahead, which are the viewer's own.
+    fetched: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl ProxySource {
@@ -343,6 +350,7 @@ impl ProxySource {
                 content_type: entity.content_type,
                 validator: entity.validator,
                 quiet: false,
+                fetched: None,
             }),
         }
     }
@@ -377,19 +385,25 @@ impl ProxySource {
     /// same credentials, same cache key -- the bytes it lands are the ones
     /// a player later reads.
     pub(crate) fn for_filling(&self) -> Self {
-        let entity = &*self.entity;
         Self {
             entity: Arc::new(Entity {
-                cache: entity.cache.clone(),
-                self_addr: entity.self_addr,
-                url: entity.url.clone(),
-                credentials: entity.credentials.clone(),
-                player_headers: entity.player_headers.clone(),
-                total: entity.total,
-                content_type: entity.content_type.clone(),
-                validator: entity.validator.clone(),
-                describe: entity.describe.clone(),
                 quiet: true,
+                ..(*self.entity).clone()
+            }),
+        }
+    }
+
+    /// This source with every byte it fetches from the origin added to
+    /// `counter` -- what a cache hit serves is not counted, since it did
+    /// not cross the connection. A download's filler counts into the
+    /// downloads' total (`crate::proxy_downloads::ProxyDownloads`), which
+    /// is how a download of what is not a torrent lights the activity
+    /// light; nothing else counts.
+    pub(crate) fn counting_into(&self, counter: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        Self {
+            entity: Arc::new(Entity {
+                fetched: Some(counter),
+                ..(*self.entity).clone()
             }),
         }
     }
@@ -517,13 +531,30 @@ impl Entity {
                         self.describe
                     )));
                 }
+                let body = origin_body(response);
+                let body = match &self.fetched {
+                    Some(counter) => counted(body, counter.clone()),
+                    None => body,
+                };
                 Ok(with_cached_head(
-                    cache_filling(origin_body(response), cacheable, entry),
+                    cache_filling(body, cacheable, entry),
                     head,
                 ))
             }
         }
     }
+}
+
+/// `body`, with the length of every chunk added to `counter` as it goes
+/// past -- what reached this server, whether or not the reader went on to
+/// want all of it.
+fn counted(body: ProxiedBody, counter: Arc<std::sync::atomic::AtomicU64>) -> ProxiedBody {
+    use futures_util::StreamExt;
+    Box::pin(body.inspect(move |chunk| {
+        if let Ok(chunk) = chunk {
+            counter.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }))
 }
 
 #[async_trait::async_trait]

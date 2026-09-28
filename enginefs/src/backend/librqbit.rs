@@ -4844,6 +4844,100 @@ mod tests {
         }
     }
 
+    /// **A restart takes a torrent's counters back to zero**, which is
+    /// what the activity light's arithmetic is built on: the light sums
+    /// these per torrent and reads a sum that went down as "not grown"
+    /// (`traffic::tests::a_sum_that_dropped_has_not_grown`), and that is
+    /// only the whole story if a stopped-and-started torrent really does
+    /// begin counting again -- librqbit keeps them in the live state, and
+    /// a start builds a new one. Were they carried across instead, the
+    /// light would be right by luck rather than by design, so it is pinned
+    /// here against a real seeder.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_takes_the_transfer_counters_back_to_zero() {
+        use crate::backend::TorrentHandle;
+        /// What must have arrived before the stop, so a first reading after
+        /// the start can be told apart from it. At the seeder's rate this
+        /// is two seconds of fetching; a reading taken within a poll of the
+        /// start has had no time to get near it.
+        const BEFORE: u64 = 256 * 1024;
+
+        let src = tempfile::tempdir().unwrap();
+        let payload = src.path().join("payload.bin");
+        write_payload(&payload, 8 * 1024 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+        let seeder = slow_seeder(src.path(), &torrent_bytes, 128 * 1024).await;
+        let seeder_addr = seeder.listen_addr().expect("the seeder listens");
+
+        let dl = tempfile::tempdir().unwrap();
+        let backend = LibrqbitBackend::new_for_tests(dl.path().to_path_buf())
+            .await
+            .expect("hermetic session");
+        let response = backend
+            .session
+            .add_torrent(
+                librqbit::AddTorrent::from_bytes(bytes::Bytes::from(torrent_bytes.clone())),
+                Some(librqbit::AddTorrentOptions {
+                    overwrite: true,
+                    initial_peers: Some(vec![seeder_addr]),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("add torrent");
+        let (librqbit::AddTorrentResponse::Added(_, inner)
+        | librqbit::AddTorrentResponse::AlreadyManaged(_, inner)) = response
+        else {
+            panic!("expected the torrent to be added");
+        };
+        let handle = backend.wrap(inner);
+
+        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
+        let fetched = loop {
+            let fetched = handle.transfer_totals().unwrap_or_default().fetched;
+            if fetched >= BEFORE {
+                break fetched;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the seeder fed only {fetched} bytes"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+
+        handle
+            .stop_torrent()
+            .await
+            .expect("the reconciler stops it");
+        wait_until_paused(&handle).await;
+        handle
+            .start_torrent()
+            .await
+            .expect("and the reconciler starts it again");
+        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
+        let after = loop {
+            if let Some(totals) = handle.transfer_totals() {
+                break totals;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the counters never became readable again"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert!(
+            after.fetched < fetched,
+            "the restarted torrent's counter carried on from {fetched} (now {}): the \
+             light's per-torrent sums would not drop when a torrent restarts",
+            after.fetched
+        );
+        assert!(
+            after.fetched < BEFORE,
+            "it started again from nothing, not from where it was: {}",
+            after.fetched
+        );
+    }
+
     /// Wait until this torrent has received bytes from a peer, and return
     /// how long that took.
     ///
