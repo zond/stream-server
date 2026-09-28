@@ -66,6 +66,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features
 
+      # Both views of the docs: the public one a reader of the crate gets,
+      # and the private one that links across modules. Workspace lints make
+      # any rustdoc warning an error.
+      - name: Docs
+        run: |
+          cargo doc --no-deps --all-features
+          cargo doc --no-deps --all-features --document-private-items
+
       - name: Test
         run: cargo test
 

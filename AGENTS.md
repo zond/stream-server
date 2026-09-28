@@ -56,6 +56,7 @@ committing, all of these, gated on their exit codes (never through a
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings   # the workspace lints already deny warnings and clippy::all
+cargo doc --no-deps --all-features && cargo doc --no-deps --all-features --document-private-items   # links must resolve in both views
 cargo test
 cargo test -p server --no-default-features               # the MIT build; the only place cfg(not(feature = "rar")) compiles
 cargo ndk -t armeabi-v7a -t arm64-v8a check -p server --all-targets   # needs an NDK; CI runs it

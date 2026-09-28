@@ -50,7 +50,7 @@ pub struct Read {
 /// "bytes in front of it" means "waiting for more" and not "has some".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reader {
-    /// The last byte it read. [`Stream::end`] is exclusive, and at a
+    /// The last byte it read. `Stream::end` is exclusive, and at a
     /// boundary would name the unit this reader is waiting for rather than
     /// the one it is reading out of.
     pub at: u64,
@@ -1051,8 +1051,8 @@ impl Streams {
     /// bytes are rate times time; what must not happen is dividing the
     /// budget into equal parts.
     ///
-    /// Then each is floored at [`FLOOR_PIECES`] and grown towards its share
-    /// rather than jumped to it ([`Stream::grant`]). The floor is applied
+    /// Then each is floored at `FLOOR_PIECES` and grown towards its share
+    /// rather than jumped to it (`Stream::grant`). The floor is applied
     /// after the share and not subtracted before it: two pieces on two
     /// streams is sixteen megabytes, and a device with less free space than
     /// that is not playing video, so it is not a case the allocation has to
@@ -1100,7 +1100,7 @@ impl Streams {
     /// **The piece the file is being consumed at**: where its busiest
     /// stream has reached, or `None` for a file nothing is reading.
     ///
-    /// Busiest by the bytes its reads have asked for ([`Stream::eaten`]),
+    /// Busiest by the bytes its reads have asked for (`Stream::eaten`),
     /// not by its measured rate: a rate is admitted only from a read that
     /// came back late, so a stream that has measured none is priced at the
     /// film's own arithmetic and would outrank a viewer measured slower
@@ -1119,10 +1119,10 @@ impl Streams {
 
     /// **Whether the viewer's window is still filling** -- the live stream
     /// that has asked for the most bytes, over every file of the entity,
-    /// had its last grant cut short by the doubling ([`Stream::grant`]).
+    /// had its last grant cut short by the doubling (`Stream::grant`).
     /// `None` for an entity nothing live is reading. Of each file's
     /// streams only the ones its reading has not moved on from count
-    /// ([`FileStreams::current_viewer`]): after a seek, the stream being
+    /// (`FileStreams::current_viewer`): after a seek, the stream being
     /// ramped is the new one, not the one with the longer history.
     ///
     /// What a stall reported by the player is read against: a window
@@ -1147,7 +1147,7 @@ impl Streams {
     ///
     /// **Less every stream the file's reading has moved on from** -- one
     /// that another stream began after it was last read, the rule
-    /// [`FileStreams::current_viewer`] applies. A seek leaves exactly that
+    /// `FileStreams::current_viewer` applies. A seek leaves exactly that
     /// behind: the stream the viewer left keeps its place, the window moves
     /// with the new one and takes what was ahead of the old, and the old
     /// one then stands at the end of what is held with nothing in front of
@@ -1183,7 +1183,7 @@ impl Streams {
     /// while a player fills its buffer rather than the player consuming.
     /// So nothing is ever sized from this alone: a window is sized from the
     /// film's own arithmetic, which a measured rate may only lower
-    /// ([`Stream::demand`]).
+    /// (`Stream::demand`).
     pub fn rates(&self, file: usize) -> Vec<Option<u64>> {
         self.by_file
             .get(&file)
@@ -1202,7 +1202,7 @@ impl Streams {
     /// the gap is however long the socket took -- which is a delivery rate
     /// while the player is filling its buffer, and its true consumption
     /// only once that buffer is full and TCP backpressure sets the pace.
-    /// Which of the two a number is, is what [`Stream::sample`] settles:
+    /// Which of the two a number is, is what `Stream::sample` settles:
     /// most of them are delivery, so a sample is refused unless the player
     /// came back later than the picture it was carrying, and what survives
     /// may only ever lower the film's own arithmetic. These two halves stay

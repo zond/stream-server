@@ -2,7 +2,7 @@
 //!
 //! This is the source an archive behind a web link is read from: the
 //! `urls` an addon puts in `rarUrls`/`zipUrls`, a debrid link, a CDN. A
-//! read of it is the route's own read -- [`cache_assisted_range`], which
+//! read of it is the route's own read -- `cache_assisted_range`, which
 //! serves what the cache holds and fetches exactly the rest under
 //! `If-Range`, filling the cache on the way past. The cache stays the
 //! owner of those bytes: its retention pass keeps reclaiming them and
@@ -15,13 +15,13 @@
 //! exists to prevent; the refusal has a sentence the player can show
 //! ([`ProxySourceError`]).
 //!
-//! Credentials travel one of two ways ([`Credentials`]): the caller's own
+//! Credentials travel one of two ways (`Credentials`): the caller's own
 //! `h=` request headers, relayed as `/proxy` relays them, or a header this
 //! server mints per request out of a grant only it holds -- which is what
 //! a credential that expires halfway through a film has to be. Whether
 //! either read is *kept* is a third thing and not a property of the
 //! header: the proxy cache refuses every credentialed request, and the one
-//! way past that is a [`Vouch`] from the source's own constructor that its
+//! way past that is a `Vouch` from the source's own constructor that its
 //! URL identifies the bytes. Neither credential reaches a log --
 //! [`ByteSource::describe`] is the target's origin and nothing else.
 
@@ -51,7 +51,7 @@ pub enum ProxySourceError {
     /// It could not be reached at all.
     Fetch(String),
     /// The headers this read was to go out with could not be minted at
-    /// all: the grant behind them ([`Credentials::Own`]) is not usable.
+    /// all: the grant behind them (`Credentials::Own`) is not usable.
     /// The error is the grant's own and carries its own typed reason --
     /// `DriveError::in_read` is how a caller gets it back.
     Credentials(io::Error),

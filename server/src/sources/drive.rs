@@ -20,7 +20,7 @@
 //! renewal cannot be a call back into the app: a token expiring in the
 //! middle of a byte range must not need a round trip across FFI on a
 //! device whose frame budget is already spent. [`DriveCredential`] is a
-//! [`OwnGrant`] -- asked for headers once per request, on this side of
+//! `OwnGrant` -- asked for headers once per request, on this side of
 //! that boundary, in Rust.
 //!
 //! Four things it is careful about, each of which is a stall or a leak if
@@ -29,7 +29,7 @@
 //! * **Renewed before it bites.** A read that `401`s mid-film is a stall
 //!   the viewer sees and then a retry they wait through. The credential
 //!   knows when the token expires and renews while there is still
-//!   [`RENEW_MARGIN`] left, so the origin is never handed one it will
+//!   `RENEW_MARGIN` left, so the origin is never handed one it will
 //!   refuse.
 //! * **A renewal is a wait, not a failure.** Reads already streaming carry
 //!   the token they left with and are untouched: Google does not revoke a

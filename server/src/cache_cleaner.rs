@@ -158,7 +158,7 @@ fn cache_usage(
 }
 
 /// What the cache currently occupies against its configured limit
-/// ([`usage`]), in the one occupancy accounting this repository has
+/// (`usage`), in the one occupancy accounting this repository has
 /// ([`enginefs::chunk_store::occupied_bytes`] -- allocated blocks, never
 /// apparent length). `serde`-serializable so it crosses the
 /// `ServerHandle::cache_usage` boundary (FFI, as JSON) as is.
@@ -181,7 +181,7 @@ pub struct CacheUsage {
     /// nothing is evictable -- cleaning cannot help until playback moves on
     /// or something is unpinned. Never more than `total_bytes`: it is a
     /// part of that figure and a client reads it as one (see
-    /// [`cache_usage`] for the one case where the two readings would
+    /// `cache_usage` for the one case where the two readings would
     /// otherwise disagree).
     pub protected_bytes: u64,
     /// How many **files and proxied entities** that is -- not how many
@@ -190,7 +190,7 @@ pub struct CacheUsage {
     pub protected_files: usize,
 }
 
-/// What one [`drop_slack`] call left behind, in occupancy bytes
+/// What one `drop_slack` call left behind, in occupancy bytes
 /// ([`enginefs::chunk_store::occupied_bytes`]) throughout.
 /// `serde`-serializable so it crosses the `ServerHandle::clean_cache_now`
 /// boundary (FFI, as JSON) as is.

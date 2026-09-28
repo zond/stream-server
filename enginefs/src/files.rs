@@ -215,7 +215,7 @@ pub struct FileHandle<H: TorrentHandle> {
 ///
 /// Built before the backend stream is asked for, because that is when the
 /// reader on the file's entity has to be taken -- see
-/// [`Self::reader_on`].
+/// `Self::reader_on`.
 #[derive(Debug, Clone, Copy)]
 pub struct Opening {
     /// Which file of the torrent.

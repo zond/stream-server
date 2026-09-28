@@ -1980,7 +1980,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     /// Take a fresh reading of the volume the pieces land on, now, and ring
-    /// the bell if it is short ([`Self::probe_volume`]).
+    /// the bell if it is short (`Self::probe_volume`).
     ///
     /// For a caller that has just given bytes back and must not be judged
     /// by the reading taken before it: the recorded one is at most one
@@ -2162,7 +2162,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// half of what [`Self::get_or_add_magnet_placed`] does for a magnet.
     /// Unlike that one there is nothing to join: a blob add has no registry
     /// entry, so the placement always counts, including on the re-add the
-    /// [`RemovalGate`] may make.
+    /// `RemovalGate` may make.
     pub async fn add_torrent_placed(
         &self,
         source: TorrentSource,
@@ -2955,7 +2955,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     /// Turn sharing while idle on or off: what the upload switch reads
-    /// ([`Self::apply_upload_switch`]), applied before this returns.
+    /// (`Self::apply_upload_switch`), applied before this returns.
     ///
     /// That is all it does: the ladder governs whether a torrent runs, and
     /// no arm of it reads this setting.
@@ -3010,7 +3010,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// **The reconciler is the caller**, off
     /// [`crate::reconcile::Decision::RestartFromError`]: an ENOSPC error on
     /// a volume that has room again, held to the dwell
-    /// ([`Self::restart_if_the_dwell_allows`]). Restarting re-checks the
+    /// (`Self::restart_if_the_dwell_allows`). Restarting re-checks the
     /// torrent's storage and takes it live, which is the one transition the
     /// rest of the ladder cannot make -- `start_torrent` on a torrent in
     /// the error state starts nothing.
@@ -3083,7 +3083,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// `None` is a hash no engine exists for: a stream this server is not
     /// holding, which is not an error and has no rows. Inside a `Some`,
     /// `window` and `committed_bytes` are absent together and mean exactly
-    /// what [`Engine::policy_reading`] says they mean -- no policy governs
+    /// what `Engine::policy_reading` says they mean -- no policy governs
     /// this file, no reader has been inside it, or the reader has moved to
     /// another file. `transfer` is absent for a torrent whose backend keeps
     /// no counters to read: see
@@ -3604,7 +3604,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// that is already managed drops, re-adds and moves nothing.
     ///
     /// Not persisted here: the embedder keeps the record and hands the set
-    /// back at the next startup, where [`Self::apply_pins`] re-applies it to
+    /// back at the next startup, where `Self::apply_pins` re-applies it to
     /// the torrents the backend restored (librqbit keeps the file in its
     /// persisted `only_files`, so the download itself resumes; the pin makes
     /// it exempt from eviction again). Pins that found no torrent stay
@@ -4465,7 +4465,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         pinned
     }
 
-    /// The pins [`Self::apply_pins`] found no torrent for, ordered like
+    /// The pins `Self::apply_pins` found no torrent for, ordered like
     /// [`Self::pinned_downloads`] -- pins the embedder named of a torrent
     /// the backend did not restore (a `.torrent` that will not parse, an
     /// add that errored). They are not downloading anything: the

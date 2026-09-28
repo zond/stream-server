@@ -33,10 +33,10 @@
 //! bytes, so the files in it lie end to end in that order, and the one
 //! asked for starts after the ones before it in the same block. That sum
 //! is the only part of this not read straight out of a header, and it is
-//! what [`members_of`] carries along as it walks.
+//! what `members_of` carries along as it walks.
 //!
 //! Everything else -- LZMA, LZMA2, PPMd, a filter chain, AES -- is a
-//! [`Refusal`], and which one is decided in [`body_of`].
+//! [`Refusal`], and which one is decided in `body_of`.
 
 use super::{
     Body, Budget, Index, IndexReader, Member, Refusal, Translator, direct_extent, le_u32, le_u64,

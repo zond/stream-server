@@ -14,7 +14,7 @@
 //! it held back beside an empty slot -- held back and read as announced,
 //! the one combination that is never right.
 //!
-//! Here the policy is resident in [`State::installed`], behind a lock that
+//! Here the policy is resident in `State::installed`, behind a lock that
 //! is never held across an await, and it is never taken out: a pass advances
 //! it in place. What a pass holds instead is the entity's **turn**, a tokio
 //! mutex over a zero-sized [`Turn`] token, one per entity on both sides.
@@ -29,11 +29,11 @@
 //!
 //! Locks, outermost first:
 //!
-//! * **L1** [`Retention::entities`] (`parking_lot::Mutex`) -- lookup, insert,
+//! * **L1** `Retention::entities` (`parking_lot::Mutex`) -- lookup, insert,
 //!   prune and iterate-for-holdings.
-//! * **L2** [`Entity::state`] (`parking_lot::Mutex`) -- every datum,
+//! * **L2** `Entity::state` (`parking_lot::Mutex`) -- every datum,
 //!   including the resident [`RetentionPolicy`].
-//! * **T** [`Entity::turn`] (`tokio::sync::Mutex<Turn>`) -- the entity's turn.
+//! * **T** `Entity::turn` (`tokio::sync::Mutex<Turn>`) -- the entity's turn.
 //!   Protects no memory; orders this process's changes to the world outside
 //!   it (what librqbit advertises, what the directory holds). The ONLY thing
 //!   ever held across an await.
@@ -74,7 +74,7 @@
 //!    liveness value ([`crate::retention::live`]), not an install.
 //! 5. Writes to `installed`, `windows`, `stride` and the in-place advance of
 //!    the policy require `&mut Turn`, so "written only under the turn" is a
-//!    type -- with one documented exception: [`State::install_now`]
+//!    type -- with one documented exception: `State::install_now`
 //!    ([`Install::OnDeliveredByte`]) writes `installed`, `decided` and
 //!    `stride` and resets every reader's `passed_at` under L2 alone from
 //!    [`Reader::note`] while a pass may hold T. Legal only because [`Share::Nothing`] holds nothing back (no
@@ -98,7 +98,7 @@
 //!
 //! Two passes, and which one runs is the driver's, from one reading of what
 //! is being played ([`Mode`]). [`Mode::Slack`] is the short one, written
-//! out on [`Retention::slack_pass`]: re-establish that it really is slack
+//! out on `Retention::slack_pass`: re-establish that it really is slack
 //! under the turn, hold the whole extent back, drop the policy and the
 //! windows, take every byte off the disk, forget the entity if nothing is
 //! left. The re-establishing is the first step and not a formality -- the
@@ -139,7 +139,7 @@
 //! Every early return leaves the policy exactly where it is, and every one
 //! of them -- the pin, nothing installed, the failed listing, the refused
 //! re-read -- decides `again` under L2 the way step 9 does, with the claim
-//! dropped or handed on inside that block ([`State::owes_a_pass`]). There
+//! dropped or handed on inside that block (`State::owes_a_pass`). There
 //! is no `abandon` and no `put_back`, because nothing was taken out.
 //!
 //! # Rules the steps above do not spell out
@@ -490,7 +490,7 @@ pub trait Backing: Sized + Send + Sync + 'static {
     fn piece_length(domain: &Self::Domain) -> Option<u64>;
     /// How many bytes the entity is, or `None` where the backing cannot say.
     ///
-    /// Only [`State::buffering`] asks, and only to turn a player's stated
+    /// Only `State::buffering` asks, and only to turn a player's stated
     /// duration into the film's bitrate -- which is what a window measured
     /// in seconds needs. Size over duration gives that number exactly, at
     /// the first report, with nothing to converge and no read pattern to be
@@ -517,7 +517,7 @@ pub trait Backing: Sized + Send + Sync + 'static {
     /// entity bounds nothing and holds nothing back.
     ///
     /// `buffering` is what the entity's open readers have already been
-    /// promised ([`State::buffering`]), which the window may not be sized
+    /// promised (`State::buffering`), which the window may not be sized
     /// under.
     fn policy(
         domain: &Self::Domain,
@@ -591,7 +591,7 @@ pub trait Backing: Sized + Send + Sync + 'static {
     /// having asked for it. It cannot be prevented from this side -- the
     /// seed runs under librqbit's own lock, where the call that holds
     /// pieces back is refused -- so the pass notices instead
-    /// ([`Installed::asserted_epoch`]). A backing that rebuilds no such
+    /// (`Installed::asserted_epoch`). A backing that rebuilds no such
     /// record answers the default and is never asked to re-issue anything.
     ///
     /// Read at step 6 of the pass with the turn held and no owner lock, so
@@ -1082,9 +1082,9 @@ pub struct Holding<B: Backing> {
     /// Some reader has delivered a byte and has not ended.
     pub live_playhead: bool,
     /// Where the entity is being consumed: the detector's answer from the
-    /// last pass ([`State::consumed_at`], the piece its busiest stream had
+    /// last pass (`State::consumed_at`, the piece its busiest stream had
     /// reached), and only when the detector is silent the readers' head in
-    /// the order [`State::head`] asks -- a live read's, else where playback
+    /// the order `State::head` asks -- a live read's, else where playback
     /// last got to. `None` when nothing has ever read it.
     ///
     /// **This, and not [`Self::last_position`] or the newest reader, is
@@ -1318,7 +1318,7 @@ impl<B: Backing> Retention<B> {
     }
 
     /// **How long the entity's film is**, without saying where anything is
-    /// in it; see [`State::duration`]. What a cast can state.
+    /// in it; see `State::duration`. What a cast can state.
     ///
     /// It gives the time caps their number without measuring anything:
     /// bytes of file over seconds of film is the bitrate by definition, so
@@ -1345,7 +1345,7 @@ impl<B: Backing> Retention<B> {
     /// ([`crate::retention::live`]); the file a reader left is
     /// [`Mode::Slack`] at the next pass, and a slack pass takes its bytes
     /// off the disk rather than putting its range back into what we
-    /// announce ([`Self::slack_pass`] says why that matters).
+    /// announce (`Self::slack_pass` says why that matters).
     ///
     /// Under this key's turn alone: a pin clears; a policy that already
     /// describes this domain under this budget is kept untouched (nothing
@@ -1728,7 +1728,7 @@ impl<B: Backing> Retention<B> {
     /// What can have happened while this waited for the turn is refused
     /// rather than raced. A pass that gave the piece back meanwhile has
     /// **doomed** it, and a doomed piece is never put back into what we
-    /// announce ([`State::doomed`]) -- the pass's own belt, worn here for
+    /// announce (`State::doomed`) -- the pass's own belt, worn here for
     /// the same reason. A pass that committed it already, or a policy that
     /// was replaced under it, leaves nothing to commit
     /// ([`RetentionPolicy::commit_drawn`]); a piece the draw did not choose
@@ -2710,7 +2710,7 @@ impl<B: Backing> Retention<B> {
             .unwrap_or(0)
     }
 
-    /// How many streams have been opened on `key` ([`State::opens`]), for a
+    /// How many streams have been opened on `key` (`State::opens`), for a
     /// driver about to decide a [`Mode`]. `0` for a key with no entity,
     /// which is also what its first open will have counted from.
     pub fn opens_of(&self, key: &B::Key) -> u64 {

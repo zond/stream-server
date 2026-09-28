@@ -1942,7 +1942,7 @@ impl TorrentBackend for LibrqbitBackend {
     /// `placement.only_files` is the torrent's initial want-set; librqbit
     /// rejects an out-of-range index at add time. `placement.choose` is the
     /// same want-set named by file rather than by index, and is settled by
-    /// [`LibrqbitHandle::want_the_chosen_file`] below -- it cannot be an
+    /// `LibrqbitHandle::want_the_chosen_file` below -- it cannot be an
     /// `only_files` here, since the indices it resolves to are indices into
     /// a file list this call is what produces. No output folder is ever
     /// named -- librqbit picks its own, and the payload goes to the piece
@@ -2449,7 +2449,7 @@ impl TorrentHandle for LibrqbitHandle {
     }
 
     /// Every file the torrent wants is whole on the disk
-    /// ([`Self::wanted_on_disk`]). One stats snapshot and a walk of the file
+    /// (`Self::wanted_on_disk`). One stats snapshot and a walk of the file
     /// table, no per-piece work: the per-file have-bytes come precomputed
     /// from the chunk tracker.
     async fn is_finished(&self) -> bool {

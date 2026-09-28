@@ -185,7 +185,7 @@ fn largest_file(files: &[crate::backend::BackendFileInfo], video_only: bool) -> 
 }
 
 /// Whether a file name is one of the container extensions the routes treat as
-/// playable video. Narrower than [`GUESS_MEDIA_EXTENSIONS`], which also counts
+/// playable video. Narrower than `GUESS_MEDIA_EXTENSIONS`, which also counts
 /// audio: this one answers "what would a player be sent".
 pub fn is_video_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
@@ -1379,7 +1379,7 @@ pub struct Engine<H: TorrentHandle> {
     /// While non-empty the engine is exempt from idle removal and the
     /// reconciler runs it; the handle keeps its own copy for the
     /// want-set planner (`TorrentHandle::pin_file`). Shared with
-    /// [`TorrentBacking`], which is how the retention owner learns of a
+    /// `TorrentBacking`, which is how the retention owner learns of a
     /// pin: read as a copy-out, never under any lock of the owner's.
     pub pinned_files: Arc<parking_lot::RwLock<BTreeSet<usize>>>,
     /// The process-wide "nobody named the pin set" condition, shared with
@@ -2368,10 +2368,10 @@ impl<H: TorrentHandle> Engine<H> {
 
     /// Whether anything about this torrent is pinned -- what exempts it
     /// from idle removal and makes the reconciler run it. Not what keeps
-    /// its bytes: that is per file ([`TorrentBacking::keeps_everything`]),
+    /// its bytes: that is per file (`TorrentBacking::keeps_everything`),
     /// and the files beside a pinned one are retained as any other.
     ///
-    /// Always true while the pin set is unknown ([`Self::pins_unknown`]):
+    /// Always true while the pin set is unknown (`Self::pins_unknown`):
     /// the embedder is the only thing that can say what a pin is, and a boot
     /// it said nothing to must report and treat every restored torrent as
     /// pinned rather than as unpinned. There is no way out of it inside the

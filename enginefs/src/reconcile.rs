@@ -155,7 +155,7 @@ pub struct Conditions {
     pub available: Option<u64>,
     /// The free space to keep on that volume, sized to it
     /// ([`crate::free_space_floor`]) and read beside `available` -- the two
-    /// are one reading of one device ([`Volumes::record`]). Carried rather
+    /// are one reading of one device (`Volumes::record`). Carried rather
     /// than looked up so the ladder measures against the floor the reading
     /// was taken under, not one recomputed from a volume it may since have
     /// left.

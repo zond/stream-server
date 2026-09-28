@@ -16,7 +16,7 @@
 //! * a piece the window **releases** is committed, and only then advertised;
 //! * everything else the torrent holds of that file is **reclaimed**, which
 //!   is the backend forgetting it and the store unlinking it, in that order
-//!   and under one claim ([`take_claimed`]).
+//!   and under one claim (`take_claimed`).
 //!
 //! So while a file is being played, the only pieces of it a peer is told
 //! about are ones nothing will reclaim while it is -- what
@@ -743,7 +743,7 @@ pub(crate) fn runs(pieces: &[u32]) -> Vec<Range<u32>> {
     sorted_runs(sorted)
 }
 
-/// [`runs`] of indices that are already ascending and distinct -- a
+/// `runs` of indices that are already ascending and distinct -- a
 /// `BTreeSet`'s, a listing's -- so nothing is copied or sorted. The one
 /// run-builder both adapters use: the piece store's sets and the proxy's
 /// chunk listings alike.

@@ -116,7 +116,7 @@ ZIP, 7Z, TAR and ISO streaming are always built in and not gated by any feature 
 | Job | What it runs |
 |---|---|
 | Format | `cargo fmt --all --check` |
-| Clippy and Tests | `cargo clippy --all-targets --all-features` and `cargo test`; the workspace lints in `Cargo.toml` deny every warning and all of `clippy::all` |
+| Clippy and Tests | `cargo clippy --all-targets --all-features`, `cargo doc --no-deps --all-features` (public and `--document-private-items`) and `cargo test`; the workspace lints in `Cargo.toml` deny every warning and all of `clippy::all` |
 | MIT build (no RAR) | `cargo test -p server --no-default-features` -- the only place the `cfg(not(feature = "rar"))` paths compile |
 | Android check (armv7, aarch64) | `cargo ndk -t armeabi-v7a -t arm64-v8a check -p server --all-targets --locked`, with the runner's NDK: a check, not a build -- nothing links and no test runs |
 | Windows Build and Test | `cargo build` and `cargo test` -- the only job that compiles the `cfg(windows)` half of `diagnostics` |

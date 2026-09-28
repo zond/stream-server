@@ -57,7 +57,7 @@
 //! **Which pieces we share is drawn before playback starts, not learned from
 //! it.** The committed set is a uniformly random subset of the file's pieces,
 //! of the size the committed capacity allows, taken from a seed held per
-//! entity for that entity's life (see [`choose`]). Random and not a stride,
+//! entity for that entity's life (see `choose`). Random and not a stride,
 //! because a stride is a lattice -- two clients with the same k differ only by
 //! phase and can still overlap almost completely -- and independent draws
 //! overlap only by chance, which is the property that makes peers who cannot
@@ -231,7 +231,7 @@ pub struct Buffering {
     /// on its own.
     pub bytes_per_second: Option<u64>,
     /// The draw that decides which pieces of this entity this process
-    /// offers to the swarm; see [`choose`].
+    /// offers to the swarm; see `choose`.
     ///
     /// One per entity, held for as long as the entity is, and **random**:
     /// clients that all keep the same pieces cover a torrent as unevenly as
@@ -737,7 +737,7 @@ impl RetentionPolicy {
     /// to be lost in and nothing for a sampling pass to miss -- it commits
     /// the whole file as it arrives.
     ///
-    /// The capacity is respected by [`Self::chosen`] being sized from it,
+    /// The capacity is respected by `Self::chosen` being sized from it,
     /// which is the same thing that bounds `advance`; nothing here can
     /// commit a piece the draw did not choose.
     pub fn commit_drawn(&mut self, piece: u32) -> bool {
@@ -778,7 +778,7 @@ impl RetentionPolicy {
     /// reclaimed whatever it was giving up would delete the pieces it is
     /// advertising, which is the advertise-then-refuse the whole policy
     /// exists to avoid. Any *other* held piece is **committed** if the draw
-    /// chose it ([`Self::chosen`]), and **reclaimed** if it is in
+    /// chose it (`Self::chosen`), and **reclaimed** if it is in
     /// `giving_up` and the draw did not choose it. Where anybody is reading
     /// decides neither: membership was settled when the policy was built, so
     /// a piece is committed the moment we hold it, and a seek in either
