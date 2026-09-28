@@ -264,7 +264,18 @@ pub struct DroppedFilePieces {
     /// this trait cannot name librqbit's `DroppedPieces` without making
     /// every backend depend on librqbit.
     _claim: Box<dyn std::any::Any + Send>,
+    /// A test backend's witness of what leaves the disk under this claim:
+    /// handed the pieces the unlink really took, on the task that awaited
+    /// it ([`crate::retention::unlink`]), so a fake that knows what it
+    /// announced can fail the test that deleted one of those pieces while
+    /// it was in the swarm.
+    #[cfg(test)]
+    unlinked: Option<UnlinkWitness>,
 }
+
+/// See [`DroppedFilePieces::witnessed_by`].
+#[cfg(test)]
+pub(crate) type UnlinkWitness = Box<dyn FnOnce(&[u32]) + Send>;
 
 impl DroppedFilePieces {
     /// `pieces` are the indices actually dropped; `claim` is whatever the
@@ -273,7 +284,21 @@ impl DroppedFilePieces {
         Self {
             pieces,
             _claim: Box::new(claim),
+            #[cfg(test)]
+            unlinked: None,
         }
+    }
+
+    /// Have `witness` told which of these pieces really left the disk.
+    #[cfg(test)]
+    pub(crate) fn witnessed_by(mut self, witness: impl FnOnce(&[u32]) + Send + 'static) -> Self {
+        self.unlinked = Some(Box::new(witness));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_witness(&mut self) -> Option<UnlinkWitness> {
+        self.unlinked.take()
     }
 
     /// The pieces the backend forgot, in the order it dropped them.
@@ -646,20 +671,24 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
         Ok(0)
     }
 
-    /// Hold `pieces` back from what we announce to peers, or put them back.
+    /// Advertise `pieces` to peers (`true`), or clear them from what the
+    /// torrent advertises (`false`).
     ///
-    /// A held-back piece is one we have, read and serve but tell nobody
-    /// about: it is cleared from the handshake bitfield and completing it
-    /// sends no Have. It is the third state the retention policy is written
-    /// for -- a piece inside the playback window is kept and readable and
-    /// *may be reclaimed*, so announcing it invites a request for bytes we
-    /// are about to throw away.
+    /// **Nothing is advertised until this says so**, from the moment a
+    /// torrent exists: the librqbit backend runs its session under the
+    /// fork's `explicit_piece_advertising`. A piece is announced -- in the
+    /// handshake bitfield, by a Have as it completes -- when it is ours and
+    /// advertised, and a request for one we did not advertise is not served.
+    /// Advertising a piece before it arrives is how a set chosen up front is
+    /// shared: each piece is announced the moment it completes.
     ///
-    /// Idempotent, and settable **before** a piece is downloaded, which is
-    /// the only ordering under which no Have ever goes out for it: there is
-    /// no un-Have in BitTorrent. Returns how many pieces changed. A backend
-    /// with nothing to hold back answers `Ok(0)` and has announced
-    /// everything it has, which is what the reclaim gate reads.
+    /// **An announcement is never taken back while the torrent is in the
+    /// swarm.** There is no un-Have in BitTorrent, and librqbit refuses a
+    /// `false` over an announced piece of a live torrent. `false` is for a
+    /// stopped torrent only -- the end of a play session, which stops the
+    /// torrent first ([`crate::BackendEngineFS`]'s `EndShares`) -- and
+    /// nothing else calls it. Returns how many pieces changed. A backend
+    /// with no advertised set answers `Ok(0)`.
     async fn set_pieces_advertised(
         &self,
         _pieces: std::ops::Range<u32>,
@@ -667,6 +696,34 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     ) -> Result<usize> {
         Ok(0)
     }
+
+    /// What [`Self::set_pieces_advertised`] has left advertised, ascending,
+    /// or `None` when the backend keeps no such set -- and then there is no
+    /// announcement of ours to end. Read, never remembered: the backend's
+    /// set is the truth, and it outlives every record this crate keeps (a
+    /// restart out of an error keeps it; a torrent removed and added again
+    /// starts with none).
+    async fn advertised_pieces(&self) -> Option<Vec<u32>> {
+        None
+    }
+
+    /// The first `len` bytes of `file_idx` (fewer if the file is shorter),
+    /// if every piece they lie in is held -- read off the disk, never
+    /// fetched -- or `None`: not held yet, or a backend that cannot say.
+    /// What tells an archive from a film by its content
+    /// ([`crate::retention::sniff`]).
+    async fn read_file_head(&self, _file_idx: usize, _len: u64) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// A test backend's check of what a torrent is about to announce as it
+    /// starts: `shares` is every piece a play session drew or a pin covers,
+    /// and a fake that keeps an advertised set fails the test whose start
+    /// would announce anything outside it -- a stale set the fork kept
+    /// across a pause or an error.
+    #[cfg(test)]
+    fn check_start(&self, _shares: &std::collections::BTreeSet<u32>) {}
+
     /// The file's on-disk path, as the backend names it (librqbit: the
     /// torrent's own output folder joined with the file's relative name).
     ///

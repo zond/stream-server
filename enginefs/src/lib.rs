@@ -1472,8 +1472,15 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // the viewer has just opened.
         let live = self.live.reading();
         for engine in engines {
+            self.run_due_deletes(&engine.info_hash).await;
             if let Some(verdict) = self
-                .reconcile_engine(&engine, crate::reconcile::Trigger::Timer, now, &mut probed)
+                .reconcile_engine(
+                    &engine,
+                    crate::reconcile::Trigger::Timer,
+                    now,
+                    &mut probed,
+                    false,
+                )
                 .await
             {
                 decisions.push((engine.info_hash.clone(), verdict.decision));
@@ -1520,8 +1527,30 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let engine = self.peek_engine(info_hash).await?;
         let now = self.clock.now_secs();
         let mut probed = false;
-        self.reconcile_engine(&engine, trigger, now, &mut probed)
+        self.reconcile_engine(&engine, trigger, now, &mut probed, false)
             .await
+    }
+
+    /// [`Self::reconcile_hash`] for an explicit delete of one of the
+    /// torrent's downloads, which ends what the torrent announces that
+    /// nothing shares **now** -- whoever plays the torrent, and whatever the
+    /// sharing setting says: `EndShares` stops it, makes its advertised set
+    /// again, and starts it again only for what still needs it. The caller
+    /// has made sure no read of the deleted file is open.
+    async fn reconcile_hash_ending_shares(&self, info_hash: &str) {
+        let Some(engine) = self.peek_engine(info_hash).await else {
+            return;
+        };
+        let now = self.clock.now_secs();
+        let mut probed = false;
+        self.reconcile_engine(
+            &engine,
+            crate::reconcile::Trigger::Timer,
+            now,
+            &mut probed,
+            true,
+        )
+        .await;
     }
 
     /// Decide for one engine and act on the decision, under that hash's
@@ -1546,8 +1575,31 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         trigger: crate::reconcile::Trigger,
         now: u64,
         probed: &mut bool,
+        ending_shares: bool,
     ) -> Option<crate::reconcile::Verdict> {
         let _guard = self.reconcile_locks.lock(&engine.info_hash).await;
+        // **A torrent out of the swarm announces nothing stale when it comes
+        // back.** The fork keeps the advertised set across a pause and an
+        // error, and a play session's draw can go -- its slack pass takes
+        // the draw with the bytes once the torrent has stopped -- while its
+        // pieces stay advertised: the torrent would announce them again the
+        // moment it started, the next download of each piece announced to
+        // every peer. So a stopped torrent's set is made again from what is
+        // shared now whenever it holds more, whoever is playing it: out of
+        // the swarm, the rebuild interrupts nobody. Before any start this
+        // reconcile could make, and every start is a reconcile's.
+        if matches!(
+            engine.handle.run_state(),
+            RunState::Paused | RunState::Error
+        ) && engine.advertises_unshared().await
+            && let Err(error) = engine.advertise_afresh().await
+        {
+            tracing::warn!(
+                info_hash = %engine.info_hash,
+                error = %format!("{error:#}"),
+                "could not make a stopped torrent's advertised set again; the next reconcile tries again"
+            );
+        }
         // The volume the pieces land on, which is one folder for every
         // torrent in the session (`Volumes::data_folder`) -- so a pass
         // probes it once, not once per torrent.
@@ -1586,8 +1638,24 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             // run state beside it. Only the `Error` arm reads it, and only
             // the error state can make it true.
             out_of_space: engine.handle.is_out_of_space().await,
+            // The backend's advertised set against what is still shared,
+            // read now -- off the cell itself, like `playing` above.
+            // Or, for an explicit delete, anything advertised that nothing
+            // shares ([`Self::reconcile_hash_ending_shares`]).
+            shares_to_end: match ending_shares {
+                true => engine.advertises_unshared().await,
+                false => engine.shares_to_end().await,
+            },
         };
-        let verdict = crate::reconcile::verdict(&conditions, trigger);
+        let mut verdict = crate::reconcile::verdict(&conditions, trigger);
+        let mut conditions = conditions;
+        let mut trigger = trigger;
+        let mut ended = false;
+        let mut moved_before = None;
+        if verdict.decision == crate::reconcile::Decision::EndShares {
+            moved_before = Some(engine.last_transition_at());
+            (conditions, trigger, verdict, ended) = self.end_shares(engine, conditions, now).await;
+        }
         // Every input, so a field log answers *why* on its own: a decision
         // without its inputs cannot be argued with.
         tracing::debug!(
@@ -1640,10 +1708,99 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             // and a `statvfs` that stopped answering is evidence neither
             // that the volume filled nor that it cleared -- the same reason
             // `reconcile::Volumes::record` leaves the stall clock alone for
-            // one.
-            crate::reconcile::Decision::Leave => {}
+            // one. And shares that could not be ended this time: the
+            // torrent stays stopped, and the next reconcile tries again.
+            crate::reconcile::Decision::Leave | crate::reconcile::Decision::EndShares => {}
+        }
+        // An end of shares' stop, and the start after it, are not the
+        // ladder changing its mind: they cost the torrent no dwell, so a
+        // start the backend did not take is made by the next reconcile, the
+        // timer's included, at once.
+        if let Some(at) = moved_before {
+            engine.restore_transition(at);
+        }
+        // The ended sessions' bytes, now that the torrent is running again
+        // if it is wanted: no longer advertised, so no longer anybody's.
+        // **On a task of its own, never awaited here**: this reconcile is the
+        // next episode's, holding its request and the hash's lock, and its
+        // reader must not wait on a single unlink of the last episode.
+        if ended {
+            let engine = engine.clone();
+            let registry = self.registry.clone();
+            tokio::spawn(async move {
+                engine.drop_slack(&registry).await;
+            });
         }
         Some(verdict)
+    }
+
+    /// Act on a [`crate::reconcile::Decision::EndShares`], under the hash's
+    /// reconcile lock the caller holds: stop the torrent, end what it
+    /// shares that nobody shares any more ([`Engine::end_shares`]), and
+    /// decide again. Hands back the conditions, trigger and verdict the
+    /// caller then acts on, and whether the shares were ended -- after the
+    /// caller has started the torrent again, the ended sessions' bytes are
+    /// its to take ([`Engine::drop_slack`]).
+    ///
+    /// **Stop, rebuild, start, then delete.** There is no un-Have in
+    /// BitTorrent, and an announcement ends only with the torrent leaving
+    /// the swarm: once the stop has landed no peer is connected, and the
+    /// advertised set may be made again from what is still shared. Then the
+    /// torrent starts again if it is wanted, and only after that do the
+    /// ended sessions' bytes go -- they are no longer advertised, so they
+    /// may go with the torrent live -- so the next episode of the same
+    /// torrent waits on the rebuild alone, never on the unlinks. The lock
+    /// keeps every other start out until the rebuild is done.
+    ///
+    /// **A stop made here never costs a dwell, and never outlives this
+    /// call on a torrent that is wanted.** The decision after it is taken as
+    /// a [`crate::reconcile::Trigger::PlaybackStart`], whoever asked, and
+    /// with nothing left to end: an end that failed -- the backend would not
+    /// rebuild the set -- still starts the torrent again at once (what it
+    /// announced stays announced, which breaks nothing), and the next
+    /// reconcile tries the end again. A torrent nobody wants stays stopped.
+    async fn end_shares(
+        &self,
+        engine: &Arc<Engine<B::Handle>>,
+        conditions: crate::reconcile::Conditions,
+        now: u64,
+    ) -> (
+        crate::reconcile::Conditions,
+        crate::reconcile::Trigger,
+        crate::reconcile::Verdict,
+        bool,
+    ) {
+        let was_live = conditions.run_state == RunState::Live;
+        self.stop_if_running(engine, &conditions, now).await;
+        let mut ended = false;
+        if engine.handle.run_state() == RunState::Paused {
+            match engine.end_shares().await {
+                Ok(()) => {
+                    ended = true;
+                    tracing::info!(
+                        info_hash = %engine.info_hash,
+                        was_live,
+                        "torrent_shares_ended"
+                    );
+                }
+                Err(error) => tracing::warn!(
+                    info_hash = %engine.info_hash,
+                    error = %format!("{error:#}"),
+                    "could not end what a stopped torrent shares; starting it again if it is \
+                     wanted, and the next reconcile tries again"
+                ),
+            }
+        }
+        let conditions = crate::reconcile::Conditions {
+            run_state: engine.handle.run_state(),
+            shares_to_end: false,
+            playing: self.live.is_torrent(&engine.info_hash) || engine.retention.readers() > 0,
+            pinned: engine.is_pinned(),
+            ..conditions
+        };
+        let trigger = crate::reconcile::Trigger::PlaybackStart;
+        let verdict = crate::reconcile::verdict(&conditions, trigger);
+        (conditions, trigger, verdict, ended)
     }
 
     /// The ladder's `Stop`, for both of its arms: stop the torrent if it is
@@ -1790,6 +1947,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 return;
             }
         }
+        #[cfg(test)]
+        engine.handle.check_start(&engine.drawn_or_pinned().await);
         match engine.handle.start_torrent().await {
             Ok(()) => {
                 engine.record_transition(now);
@@ -1844,6 +2003,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 return;
             }
         }
+        // What it advertises was made again from what is shared at the top of
+        // this reconcile ([`Self::reconcile_engine`]), so it comes back
+        // announcing nothing of a session that ended while it was dead.
+        #[cfg(test)]
+        engine.handle.check_start(&engine.drawn_or_pinned().await);
         match self.restart_from_error(&engine.info_hash).await {
             Ok(true) => {
                 engine.record_transition(now);
@@ -2718,7 +2882,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 info_hash = %engine.info_hash,
                 committed = pass.committed,
                 reclaimed = pass.reclaimed,
-                withdrawn = pass.withdrawn,
+                lost = pass.lost,
                 "retention pass"
             );
         }
@@ -2775,6 +2939,14 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// tick would not have done -- what it buys is the two seconds between
     /// them, which on a switch is the difference between a stream that fits
     /// and a `507`.
+    ///
+    /// **What a peer may have been told of goes only once the torrent has
+    /// left the swarm.** The passes here take what nobody was told of at
+    /// once; a torrent that advertises what nobody shares any more -- the
+    /// film the viewer has just left -- is reconciled now, whose `EndShares`
+    /// stops it before its bytes go, and starts it again only if it is
+    /// still wanted. Those bytes are counted too, from the store's own
+    /// reading before and after.
     pub async fn drop_slack(&self) -> usize {
         let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
         let mut reclaimed = 0;
@@ -2789,8 +2961,55 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     "slack dropped"
                 );
             }
+            if engine.shares_to_end().await {
+                let held = || {
+                    self.registry
+                        .held(&engine.info_hash)
+                        .map(|held| held.all().len())
+                        .unwrap_or(0)
+                };
+                let before = held();
+                self.reconcile_hash(&engine.info_hash, crate::reconcile::Trigger::Timer)
+                    .await;
+                // The end takes the ended sessions' bytes on a task of its
+                // own; a slack drop is asked for them now, and counts them.
+                engine.drop_slack(&self.registry).await;
+                reclaimed += before.saturating_sub(held());
+            }
         }
         reclaimed
+    }
+
+    /// **Shutdown's: every torrent leaves the swarm, then every play
+    /// session's bytes go.** Best effort -- the caller bounds it, and the
+    /// process may be killed first -- and whatever is left is the next
+    /// start's: the launch sweep takes every torrent nobody pinned, and a
+    /// restored torrent advertises nothing until told.
+    ///
+    /// Each torrent under its reconcile lock, stopped first and only then
+    /// emptied of every played file's bytes no pin covers
+    /// ([`Engine::end_every_session`]):
+    /// there is no un-Have, and a peer still connected could ask for a piece
+    /// that is going. Nothing is started again; the reconciler's task is
+    /// gone by now.
+    pub async fn end_every_session(&self) -> usize {
+        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
+        let mut freed = 0;
+        for engine in engines {
+            let _guard = self.reconcile_locks.lock(&engine.info_hash).await;
+            if engine.handle.run_state() == RunState::Live
+                && let Err(error) = engine.handle.stop_torrent().await
+            {
+                debug!(
+                    info_hash = %engine.info_hash,
+                    error = %format!("{error:#}"),
+                    "the backend would not stop the torrent at shutdown"
+                );
+            }
+            freed += engine.end_every_session(&self.registry).await;
+        }
+        tracing::info!(freed, "play_sessions_ended_at_shutdown");
+        freed
     }
 
     /// The liveness cell: which entity this server is playing. Handed to
@@ -3086,8 +3305,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// playhead, **under every budget** -- split, covering, unknown, none,
     /// or a pin -- and is absent only where [`Engine::policy_reading`] has
     /// no playhead: no reader has been inside this file in this process.
-    /// `committed_bytes` is absent with it, and also wherever no policy is
-    /// installed, which has promised nothing. `transfer` is absent for a torrent whose backend keeps
+    /// `committed_bytes` is absent with it, and also wherever the play
+    /// session has promised nothing -- no draw decided yet, or a pin; under a
+    /// budget that covers the file it is every byte of the file held, all of
+    /// which the session shares. `transfer` is absent for a torrent whose backend keeps
     /// no counters to read: see
     /// [`crate::backend::TorrentHandle::transfer_totals`], which is where
     /// that absence is decided and why it is not a zero.
@@ -3130,7 +3351,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             .map_or(u64::MAX, |file| file.length);
         Some(crate::retention::TorrentStreamNumbers {
             window: Some(reading.window(&held, file_bytes)),
-            committed_bytes: reading.committed_bytes(),
+            committed_bytes: reading.committed_bytes(&held),
             transfer,
             refused_reclaims,
         })
@@ -3239,6 +3460,39 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             .any(|count| *count > 0)
     }
 
+    /// **The viewer's player, by its token, asked for `played`**: the
+    /// viewer's play session is on that from now on, unless the token is an
+    /// older screen of the viewer than the newest one heard from
+    /// ([`crate::retention::sessions`]). What a session shares, and when
+    /// what it left ends, follow this and nothing else; a request without a
+    /// token never calls it.
+    ///
+    /// Called before the request registers its stream, so the reconcile
+    /// that request makes already sees the move: the next episode of the
+    /// same torrent ends what the last one shared on the spot, before its
+    /// reader waits on a byte.
+    pub fn note_player(
+        &self,
+        token: &str,
+        played: crate::retention::sessions::Played,
+    ) -> crate::retention::sessions::Heard {
+        let heard = self.live.sessions().play(token, played.clone());
+        match heard {
+            crate::retention::sessions::Heard::Current { moved: true } => {
+                tracing::info!(token, ?played, "play_session_moved");
+            }
+            crate::retention::sessions::Heard::Stale => {
+                tracing::debug!(
+                    token,
+                    ?played,
+                    "a request of an older player screen moved nothing"
+                );
+            }
+            crate::retention::sessions::Heard::Current { moved: false } => {}
+        }
+        heard
+    }
+
     /// Called when a stream starts for a torrent file.
     /// Several torrent files may be active at once; cleanup is per file stream.
     ///
@@ -3250,7 +3504,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// and must end it with [`Self::on_stream_end`]; the two never both
     /// fire, because returning is what disarms the rollback.
     pub async fn on_stream_start(&self, info_hash: &str, file_idx: usize) {
-        self.start_stream(info_hash, file_idx, true).await;
+        self.start_stream(info_hash, file_idx, true, true).await;
     }
 
     /// **How long the film is**, with no position: what a cast can say and
@@ -3298,10 +3552,28 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     ///
     /// Cancel-safe and handed over exactly as `on_stream_start` is.
     pub async fn on_stream_start_unreconciled(&self, info_hash: &str, file_idx: usize) {
-        self.start_stream(info_hash, file_idx, false).await;
+        self.start_stream(info_hash, file_idx, false, true).await;
     }
 
-    async fn start_stream(&self, info_hash: &str, file_idx: usize, reconcile: bool) {
+    /// [`Self::on_stream_start_unreconciled`] for a request of an older
+    /// screen of its viewer than the newest one heard from
+    /// ([`crate::retention::sessions::Heard::Stale`]): the last screen's
+    /// player reconnecting while the next one takes over. It is served --
+    /// registered, counted, its file selected -- and **moves nothing**: the
+    /// liveness cell stays where the viewer's newest screen put it, as it
+    /// does for an aside, so the episode the viewer is on is not made slack
+    /// by the one they left.
+    pub async fn on_stale_stream_start_unreconciled(&self, info_hash: &str, file_idx: usize) {
+        self.start_stream(info_hash, file_idx, false, false).await;
+    }
+
+    async fn start_stream(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+        reconcile: bool,
+        moves_cell: bool,
+    ) {
         let info_hash = info_hash.to_lowercase();
         let mut rollback = StreamStartRollback::armed(self, info_hash.clone(), file_idx);
         // Counted before the aside rule is asked, and not after the
@@ -3331,7 +3603,16 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // becomes of this request -- the disk gate that refuses it for want
         // of space is refusing it *after* the predecessor became slack,
         // which is what gives it room to be admitted at all.
-        let beside = self.switch_to(&info_hash, file_idx).await;
+        let beside = match moves_cell {
+            true => self.switch_to(&info_hash, file_idx).await,
+            // What the cell names of this torrent stays selected beside it,
+            // as for an aside.
+            false => self
+                .live
+                .reading()
+                .file_of(&info_hash)
+                .filter(|playing| *playing != file_idx),
+        };
         self.activate_file(&info_hash, file_idx, beside, "stream")
             .await;
 
@@ -3766,6 +4047,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 }
             }
         }
+        // A download is shared whole, finished or not: advertised now, so
+        // each piece is announced as it completes and the ones already here
+        // at once.
+        engine.advertise_shares().await;
         engine.touch();
         // The pin is registered above, so the ladder reads `pinned` and
         // wants this torrent running where nothing playing would have had it
@@ -3793,8 +4078,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     ///
     /// Without `delete_files` only the pin goes, and the file is cache again:
     /// the want-set is reconciled against the current playback selection,
-    /// and unless the file is being played the next tick's pass reclaims
-    /// its pieces like any other unplayed file's. With no other pin on the
+    /// and unless the file is being played its pieces go like any other
+    /// unplayed file's -- once the torrent has left the swarm, since the
+    /// download announced them (the reconciler's `EndShares`, at the next
+    /// tick or the next slack drop). With no other pin on the
     /// torrent and nothing of it playing, the reconciler stops the torrent
     /// on that tick and idle removal applies to the engine again. (Not
     /// while the pin set is unknown, which keeps everything and counts
@@ -3804,8 +4091,14 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// pinned (the caller wants the download gone; a pin lost to a crash
     /// must not leave the bytes behind), see
     /// `Self::delete_download_data`: the whole torrent when this was its
-    /// last pin and nothing is reading it, only this file while other pins
-    /// hold or another file of the torrent is streaming. A *dormant* pin has
+    /// last pin and nothing is on it, only this file while other pins hold,
+    /// another file of the torrent is streaming, or the viewer played one
+    /// since. **A delete happens now**: it is an explicit request, so the
+    /// torrent leaves the swarm and the bytes go whatever the sharing
+    /// setting says and whoever's play session is on the torrent, and what
+    /// a session drew of the file goes with it. The one thing it waits for
+    /// is a read of this very file (in practice a cast): the pin goes at
+    /// once, and the bytes when that read ends. A *dormant* pin has
     /// no engine to delete anything through, so its bytes -- the torrent's
     /// directory in the piece store -- are taken by
     /// `Self::delete_dormant_download_data`, which first makes sure the
@@ -3944,7 +4237,39 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
         let was_pinned = engine.pinned_files.write().remove(&file_idx);
         engine.handle.unpin_file(file_idx).await?;
+        // **A delete is an explicit request, and it happens now** -- whatever
+        // the sharing setting says and whoever's play session is on the
+        // torrent. The one thing it waits for is a read of this very file
+        // (in practice a cast in progress): the pin and the download's entry
+        // go at once, and the bytes as soon as that read ends
+        // ([`Self::run_due_deletes`]).
+        if delete_files && engine.retention.readers_of(&file_idx) > 0 {
+            if was_pinned {
+                self.reconcile_with_active_selection(engine.clone(), "unpin_download")
+                    .await;
+            }
+            engine.wait_to_delete(file_idx);
+            tracing::info!(
+                info_hash = %engine.info_hash,
+                file_idx,
+                "the deleted download's file is being read; its bytes go when the read ends"
+            );
+            return Ok(UnpinOutcome {
+                unpinned: was_pinned,
+                deleted_files: false,
+            });
+        }
         if delete_files {
+            // Nothing reads the file: what its play session drew ends with
+            // it, and the torrent is no longer the one playing on its
+            // account -- or the reconcile below would start it again for a
+            // file that is gone.
+            engine.retention.end_play_session(&file_idx).await;
+            self.live
+                .forget(&crate::retention::live::LiveEntity::Torrent {
+                    info_hash: info_hash.clone(),
+                    file_idx,
+                });
             // Before the want-set is re-planned, because it is planned from
             // exactly this bookkeeping: `reconcile_with_active_selection`
             // unions the registered active file into `only_files`, so
@@ -3967,10 +4292,16 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // the torrent under that reader fails its reads and deletes the
         // pieces it is playing. The live registers are asked, after this
         // file's own playback was forgotten above, the same evidence a
-        // refused pin reads before it drops its add; while anything is on
-        // the torrent only this file goes, through the per-file path.
+        // refused pin reads before it drops its add -- and the viewer's
+        // play session, when it is on another file of the torrent; while
+        // anything is on the torrent only this file goes, through the
+        // per-file path.
+        let sessions = self.live.sessions();
+        let played_beside =
+            sessions.on_torrent(&info_hash) && !sessions.on_file(&info_hash, file_idx);
         let drops_torrent = delete_files
             && !engine.is_pinned()
+            && !played_beside
             && !self.torrent_activity_registers(&info_hash, &engine).await;
         if (was_pinned || delete_files) && !drops_torrent {
             self.reconcile_with_active_selection(engine.clone(), "unpin_download")
@@ -3995,6 +4326,39 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             unpinned: was_pinned,
             deleted_files,
         })
+    }
+
+    /// **The deletes that waited for a read of their file, once it has
+    /// ended** ([`Engine::wait_to_delete`]): each runs as the delete it was,
+    /// under the hash's pin lock. Asked when a stream of the torrent ends
+    /// and at every tick -- a read's end is its last reader's drop as much
+    /// as its response's, and either may come last.
+    async fn run_due_deletes(&self, info_hash: &str) {
+        let Some(engine) = self.peek_engine(info_hash).await else {
+            return;
+        };
+        let due = engine.take_due_deletes();
+        if due.is_empty() {
+            return;
+        }
+        let lock = self.pin_lock(info_hash);
+        let _guard = lock.mutex().lock().await;
+        for file_idx in due {
+            match self.unpin_download_locked(info_hash, file_idx, true).await {
+                Ok(outcome) => tracing::info!(
+                    info_hash,
+                    file_idx,
+                    deleted = outcome.deleted_files,
+                    "the delete that waited for its file's read ran"
+                ),
+                Err(error) => tracing::warn!(
+                    info_hash,
+                    file_idx,
+                    %error,
+                    "the delete that waited for its file's read failed"
+                ),
+            }
+        }
     }
 
     /// Delete what a *dormant* pin of `info_hash` (no torrent in the
@@ -4245,7 +4609,66 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 );
                 return false;
             };
-            let dropped = match engine.handle.drop_file_pieces(file_idx).await {
+            // What the store holds of the file now, to say afterwards
+            // whether bytes really left: some of them may go through the
+            // reconcile below rather than through this call's own drop.
+            let span = engine
+                .handle
+                .file_pieces(file_idx)
+                .await
+                .map(|span| span.pieces);
+            let held_of_file = || {
+                span.clone()
+                    .and_then(|span| {
+                        self.registry
+                            .held(&engine.info_hash)
+                            .map(|held| held.in_range(span).len())
+                    })
+                    .unwrap_or(0)
+            };
+            let held_before = held_of_file();
+            // **What the torrent announced of the file ends before a byte of
+            // it goes.** The pin is gone, so the download's pieces are
+            // advertised and shared by nothing: the reconciler's `EndShares`
+            // stops the torrent, takes what nobody plays, makes its
+            // advertised set again from what is still shared, and starts it
+            // again if it is still wanted. What is left of the file after
+            // that is announced to nobody, and goes below. It does so whoever
+            // plays the torrent -- a viewer's session on it, a read of
+            // another of its files, which the stop and the start interrupt
+            // for a moment: deleting is an explicit request, and it happens
+            // at once ([`Self::reconcile_hash_ending_shares`]). A read of
+            // this file itself is the one thing that defers it, and the
+            // caller has waited that out.
+            self.reconcile_hash_ending_shares(&engine.info_hash).await;
+            // **Unless something of the file is still announced** after
+            // that: the end refused by the backend with the torrent still in
+            // the swarm, or a boundary piece a still-pinned neighbour shares.
+            // A piece a peer may have been told of cannot leave the disk
+            // while the torrent is in the swarm, so the file's pieces stay,
+            // and go with the torrent's next `EndShares` like any unpinned
+            // file's. What leaves the disk now is reported, and that is not
+            // them.
+            let announced = engine.handle.run_state() == RunState::Live
+                && match (span.clone(), engine.handle.advertised_pieces().await) {
+                    (Some(span), Some(advertised)) => {
+                        advertised.iter().any(|piece| span.contains(piece))
+                    }
+                    _ => false,
+                };
+            let dropped = match announced {
+                true => {
+                    tracing::info!(
+                        info_hash = %engine.info_hash,
+                        file_idx,
+                        "the deleted download's pieces are still announced; they go once the \
+                         torrent leaves the swarm"
+                    );
+                    Ok(None)
+                }
+                false => engine.handle.drop_file_pieces(file_idx).await,
+            };
+            let dropped = match dropped {
                 Ok(dropped) => dropped,
                 Err(error) => {
                     tracing::warn!(
@@ -4322,7 +4745,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 // take them: the backend still believes it has them.
                 None => 0,
             };
-            let deleted = file_removed || pieces_freed > 0;
+            let deleted = file_removed || pieces_freed > 0 || held_of_file() < held_before;
             if deleted {
                 tracing::info!(
                     info_hash = %engine.info_hash,
@@ -4422,6 +4845,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 engine.pinned_files.write().insert(file_idx);
                 applied += 1;
             }
+            // A download is shared whole, and advertised before the
+            // reconciler starts the torrent below: a restored torrent
+            // advertises nothing until told.
+            engine.advertise_shares().await;
             engine.touch();
         }
         let dormant_count = dormant.len();
@@ -4664,6 +5091,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             engine.touch();
         }
         self.hand_live_on(&info_hash, file_idx).await;
+        self.run_due_deletes(&info_hash).await;
 
         // Nothing schedules a pause here, and nothing stamps anything. The
         // last stream ending is not a decision: it takes nothing off the
@@ -4745,7 +5173,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     .map(|(_, file)| *file),
             )
             .filter(|file| *file != file_idx && open(*file))
-            .min()
+            // The file a player's session is on, if one of them is: the
+            // lowest index is a guess, and it could be an older file a read
+            // was still open on -- handing the cell back to the episode the
+            // viewer had left.
+            .min_by_key(|file| (!self.live.sessions().on_file(info_hash, *file), *file))
         else {
             return;
         };
@@ -5125,6 +5557,10 @@ mod tests {
         reselected: Mutex<Vec<std::ops::Range<u32>>>,
         /// The lookahead every reader was opened with, in order.
         lookaheads: Mutex<Vec<u64>>,
+        /// What the fake advertised at the moment each reader opened, in
+        /// order: what a play session shares has to be decided -- and
+        /// advertised -- before its reader asks for a byte.
+        advertised_at_reader: Mutex<Vec<Vec<u32>>>,
         /// Test knob: park the next `get_file_reader` call, the way
         /// `advertise_gate` parks a pass. The fake sends on the first
         /// channel as it enters the call and waits on the second before
@@ -5162,8 +5598,21 @@ mod tests {
         /// librqbit's own spelling of a want-set nothing has narrowed.
         wanted_files: Mutex<Option<std::collections::BTreeSet<usize>>>,
         /// Every `set_pieces_advertised` call, in order: which range, and
-        /// whether it was put into what we announce or held back out of it.
+        /// whether it was advertised or cleared from what is advertised.
         advertised: Mutex<Vec<(std::ops::Range<u32>, bool)>>,
+        /// **The fake's advertised set**, the fork's under
+        /// `explicit_piece_advertising`: empty until something advertises,
+        /// grown by `set_pieces_advertised(_, true)`, and cleared by
+        /// `(_, false)` only while the fake torrent is not live -- what
+        /// `advertised_pieces` answers.
+        advertised_set: Mutex<std::collections::BTreeSet<u32>>,
+        /// **Every breach of the sharing rule the fake saw**: an
+        /// announcement withdrawn while the torrent was live, or a piece it
+        /// advertised taken off the disk while it was live. Each one panics
+        /// where it is seen and is kept here too, and the counters refuse
+        /// to go away with one recorded, so a breach on a task nobody
+        /// awaits still fails the test that caused it.
+        violations: Arc<Mutex<Vec<String>>>,
         /// Test knob: park the next `set_pieces_advertised` call. The fake
         /// sends on the first channel as it enters the call and waits on
         /// the second before returning, so a test can ask its questions
@@ -5176,6 +5625,42 @@ mod tests {
                 tokio::sync::oneshot::Receiver<()>,
             )>,
         >,
+        /// Test knob: park the next `reselect_pieces` call, the way
+        /// `advertise_gate` parks an advertise. A pass makes one at its sixth
+        /// step, wanting its windows again before it trims the rest
+        /// (`TorrentBacking::want`), with the file's turn held and its
+        /// decision made: the one place a test can be inside a pass that
+        /// has decided and not yet unlinked anything.
+        reselect_gate: Mutex<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                tokio::sync::oneshot::Receiver<()>,
+            )>,
+        >,
+        /// Test knob: park the next `drop_pieces` call, the way
+        /// `advertise_gate` parks an advertise: where a test is inside a
+        /// reclaim, with the file's turn held, before the run it is about
+        /// to give back.
+        drop_gate: Mutex<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                tokio::sync::oneshot::Receiver<()>,
+            )>,
+        >,
+        /// Test knob: park the next `read_file_head` call, the way
+        /// `drop_gate` parks a drop: where a play session's draw waits on
+        /// the file's first bytes, with the file's turn held.
+        head_gate: Mutex<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                tokio::sync::oneshot::Receiver<()>,
+            )>,
+        >,
+        /// Test knob: what the fake says a file's first bytes are
+        /// ([`TorrentHandle::read_file_head`]), by file index. A file not
+        /// named reads as zeroes -- a film, not an archive -- and one named
+        /// with `None` has no head held yet.
+        file_heads: Mutex<HashMap<usize, Option<Vec<u8>>>>,
         /// Test knob: the backend will not change what it advertises --
         /// librqbit's answer for a torrent whose state has gone. Every
         /// `set_pieces_advertised` fails and records nothing while it is
@@ -5251,6 +5736,56 @@ mod tests {
         stop_gate: tokio::sync::Notify,
         hold_start: AtomicBool,
         start_gate: tokio::sync::Notify,
+    }
+
+    impl FakeCounters {
+        /// Record a breach of the sharing rule, and fail where it happened.
+        /// Where it happened may be a task nobody awaits, whose panic is
+        /// swallowed: the record is what the test's [`Counters`] asks.
+        fn violate(&self, breach: String) -> ! {
+            self.violations.lock().unwrap().push(breach.clone());
+            panic!("{breach}");
+        }
+
+        /// Fail unless the fake saw no breach of the sharing rule.
+        fn assert_kept_the_rule(&self) {
+            let violations = self.violations.lock().unwrap();
+            assert!(
+                violations.is_empty(),
+                "the sharing rule was broken: {violations:?}"
+            );
+        }
+    }
+
+    /// **The test's own hold on the fake's counters, which checks the
+    /// sharing rule when the test ends** ([`FakeCounters::assert_kept_the_rule`]).
+    ///
+    /// Every fixture hands one back, and it drops with the test's other
+    /// locals -- on the test's own task, where a failed assertion fails the
+    /// test. The counters' own drop could not be that check: the last `Arc`
+    /// of them goes wherever the engine's last task ends, which may be
+    /// inside the runtime's shutdown, where a panic is caught and dropped;
+    /// and a breach seen on a spawned pass panics a task nobody awaits.
+    /// Both are recorded, and this is what reads the record.
+    ///
+    /// Derefs to the `Arc`, so `counters.clone()` is the `Arc` a fake handle
+    /// takes and every counter reads as before.
+    #[derive(Default)]
+    struct Counters(Arc<FakeCounters>);
+
+    impl std::ops::Deref for Counters {
+        type Target = Arc<FakeCounters>;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl Drop for Counters {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                self.0.assert_kept_the_rule();
+            }
+        }
     }
 
     /// Simulates librqbit's `Initializing` state for the fake torrent: the
@@ -5686,13 +6221,79 @@ mod tests {
             if self.counters.refuses_advertise.load(Ordering::SeqCst) {
                 anyhow::bail!("this fake will not change what it advertises");
             }
-            let count = (pieces.end - pieces.start) as usize;
+            let count = {
+                let mut set = self.counters.advertised_set.lock().unwrap();
+                if advertised {
+                    let total = self.files.len() as u64 * self.pieces_per_file();
+                    pieces
+                        .clone()
+                        .take_while(|piece| u64::from(*piece) < total)
+                        .filter(|piece| set.insert(*piece))
+                        .count()
+                } else {
+                    // The fork refuses to withdraw an announcement from a
+                    // live torrent. Nothing here may even ask.
+                    if self.run_state() == RunState::Live {
+                        drop(set);
+                        self.counters.violate(format!(
+                            "{}: asked to stop advertising {pieces:?} while the torrent is live",
+                            self.info_hash
+                        ));
+                    }
+                    let before = set.len();
+                    set.retain(|piece| !pieces.contains(piece));
+                    before - set.len()
+                }
+            };
             self.counters
                 .advertised
                 .lock()
                 .unwrap()
                 .push((pieces, advertised));
             Ok(count)
+        }
+
+        async fn read_file_head(&self, file_idx: usize, len: u64) -> Option<Vec<u8>> {
+            let gate = self.counters.head_gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
+            let length = self.files.get(file_idx)?.length;
+            match self.counters.file_heads.lock().unwrap().get(&file_idx) {
+                Some(head) => head.clone(),
+                None => Some(vec![0; len.min(length) as usize]),
+            }
+        }
+
+        fn check_start(&self, shares: &std::collections::BTreeSet<u32>) {
+            let stale: Vec<u32> = self
+                .counters
+                .advertised_set
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .filter(|piece| !shares.contains(piece))
+                .collect();
+            if !stale.is_empty() {
+                self.counters.violate(format!(
+                    "{}: started advertising {stale:?}, which no play session drew and no pin covers",
+                    self.info_hash
+                ));
+            }
+        }
+
+        async fn advertised_pieces(&self) -> Option<Vec<u32>> {
+            Some(
+                self.counters
+                    .advertised_set
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .copied()
+                    .collect(),
+            )
         }
 
         /// One piece per file, matching `file_pieces` above, so a policy
@@ -5729,6 +6330,13 @@ mod tests {
             pieces: std::ops::Range<u32>,
             after: crate::backend::AfterRelease,
         ) -> Result<Option<crate::backend::DroppedFilePieces>> {
+            // Parked inside the call, if a test asked for it: see
+            // `FakeCounters::drop_gate`.
+            let gate = self.counters.drop_gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
             let asked = pieces.clone();
             self.counters
                 .dropped_ranges
@@ -5751,17 +6359,56 @@ mod tests {
                 .lock()
                 .unwrap()
                 .extend(dropped.iter().copied());
-            Ok(Some(crate::backend::DroppedFilePieces::new(
-                dropped,
-                ClaimProbe {
-                    released_on: self.counters.claim_released_on.clone(),
-                },
-            )))
+            // What a peer may have been told of, of what this claim lets go:
+            // advertised, on a torrent that is live. None of it may leave
+            // the disk under the claim.
+            let announced: std::collections::BTreeSet<u32> = if self.run_state() == RunState::Live {
+                let set = self.counters.advertised_set.lock().unwrap();
+                dropped
+                    .iter()
+                    .copied()
+                    .filter(|piece| set.contains(piece))
+                    .collect()
+            } else {
+                Default::default()
+            };
+            let violations = self.counters.violations.clone();
+            let info_hash = self.info_hash.clone();
+            Ok(Some(
+                crate::backend::DroppedFilePieces::new(
+                    dropped,
+                    ClaimProbe {
+                        released_on: self.counters.claim_released_on.clone(),
+                    },
+                )
+                .witnessed_by(move |gone| {
+                    let breached: Vec<u32> = gone
+                        .iter()
+                        .copied()
+                        .filter(|piece| announced.contains(piece))
+                        .collect();
+                    if !breached.is_empty() {
+                        let breach = format!(
+                            "{info_hash}: pieces {breached:?} were advertised and left the disk \
+                             while the torrent was live"
+                        );
+                        violations.lock().unwrap().push(breach.clone());
+                        panic!("{breach}");
+                    }
+                }),
+            ))
         }
 
         /// Like librqbit: only a piece that was dropped changes, and the
         /// count is how many did.
         async fn reselect_pieces(&self, pieces: std::ops::Range<u32>) -> Result<usize> {
+            // Parked inside the call, if a test asked for it: see
+            // `FakeCounters::reselect_gate`.
+            let gate = self.counters.reselect_gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
             self.counters
                 .reselected
                 .lock()
@@ -5922,6 +6569,19 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(lookahead_bytes);
+            let advertised: Vec<u32> = self
+                .counters
+                .advertised_set
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect();
+            self.counters
+                .advertised_at_reader
+                .lock()
+                .unwrap()
+                .push(advertised);
             let len = self
                 .files
                 .get(file_idx)
@@ -5943,7 +6603,7 @@ mod tests {
         }
     }
 
-    fn test_enginefs() -> (BackendEngineFS<FakeBackend>, Arc<FakeCounters>) {
+    fn test_enginefs() -> (BackendEngineFS<FakeBackend>, Counters) {
         test_enginefs_with_file_count(1)
     }
 
@@ -6030,7 +6690,7 @@ mod tests {
 
     fn test_enginefs_with_file_count(
         file_count: usize,
-    ) -> (BackendEngineFS<FakeBackend>, Arc<FakeCounters>) {
+    ) -> (BackendEngineFS<FakeBackend>, Counters) {
         test_enginefs_with_files(
             (0..file_count)
                 .map(|idx| (format!("video-{idx}.mkv"), 100))
@@ -6040,7 +6700,7 @@ mod tests {
 
     fn test_enginefs_with_files(
         files: Vec<(String, u64)>,
-    ) -> (BackendEngineFS<FakeBackend>, Arc<FakeCounters>) {
+    ) -> (BackendEngineFS<FakeBackend>, Counters) {
         let (enginefs, counters, _init) =
             test_enginefs_with_init(files, FakeInit::new(true, Duration::from_secs(60)));
         (enginefs, counters)
@@ -6105,11 +6765,7 @@ mod tests {
     fn test_enginefs_initializing(
         file_count: usize,
         timeout: Duration,
-    ) -> (
-        BackendEngineFS<FakeBackend>,
-        Arc<FakeCounters>,
-        Arc<FakeInit>,
-    ) {
+    ) -> (BackendEngineFS<FakeBackend>, Counters, Arc<FakeInit>) {
         test_enginefs_with_init(
             (0..file_count)
                 .map(|idx| (format!("video-{idx}.mkv"), 100))
@@ -6121,12 +6777,8 @@ mod tests {
     fn test_enginefs_with_init(
         files: Vec<(String, u64)>,
         init: Arc<FakeInit>,
-    ) -> (
-        BackendEngineFS<FakeBackend>,
-        Arc<FakeCounters>,
-        Arc<FakeInit>,
-    ) {
-        let counters = Arc::new(FakeCounters::default());
+    ) -> (BackendEngineFS<FakeBackend>, Counters, Arc<FakeInit>) {
+        let counters = Counters::default();
         let handle = FakeHandle {
             info_hash: TEST_HASH.to_string(),
             counters: counters.clone(),
@@ -6167,13 +6819,13 @@ mod tests {
     /// for policies that must treat engines differently.
     struct TwoEngines {
         enginefs: BackendEngineFS<FakeBackend>,
-        counters: [Arc<FakeCounters>; 2],
+        counters: [Counters; 2],
         removed: Arc<Mutex<Vec<String>>>,
     }
 
     fn test_enginefs_with_two_engines() -> TwoEngines {
         let make = |hash: &str| {
-            let counters = Arc::new(FakeCounters::default());
+            let counters = Counters::default();
             let handle = FakeHandle {
                 info_hash: hash.to_string(),
                 counters: counters.clone(),
@@ -6964,10 +7616,10 @@ mod tests {
     /// placement.
     #[tokio::test]
     async fn magnet_registry_passes_the_placement_to_the_backend_add() {
-        let counters = Arc::new(FakeCounters::default());
+        let counters = Counters::default();
         let handle = FakeHandle {
             info_hash: TEST_HASH.to_string(),
-            counters,
+            counters: counters.clone(),
             files: vec![BackendFileInfo {
                 name: "video.mkv".into(),
                 length: 100,
@@ -7014,8 +7666,8 @@ mod tests {
 
     /// Engine over the fake backend with nothing managed yet: a pin has to
     /// add the torrent, so what the add asks for is observable.
-    fn test_enginefs_unmanaged() -> (BackendEngineFS<FakeBackend>, Arc<FakeCounters>) {
-        let counters = Arc::new(FakeCounters::default());
+    fn test_enginefs_unmanaged() -> (BackendEngineFS<FakeBackend>, Counters) {
+        let counters = Counters::default();
         let handle = FakeHandle {
             info_hash: TEST_HASH.to_string(),
             counters: counters.clone(),
@@ -7141,10 +7793,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_cancelled_pin_leaves_no_lock_behind() {
         let root = tempfile::tempdir().unwrap();
-        let counters = Arc::new(FakeCounters::default());
+        let counters = Counters::default();
         let handle = FakeHandle {
             info_hash: TEST_HASH.to_string(),
-            counters,
+            counters: counters.clone(),
             files: vec![BackendFileInfo {
                 name: "video-0.mkv".to_string(),
                 length: 100,
@@ -7321,9 +7973,7 @@ mod tests {
     /// timeout there is: left running it would take the very torrent they
     /// watch the reconciler decide about out of the registry underneath
     /// them.
-    fn test_enginefs_for_reconciler(
-        file_count: usize,
-    ) -> (BackendEngineFS<FakeBackend>, Arc<FakeCounters>) {
+    fn test_enginefs_for_reconciler(file_count: usize) -> (BackendEngineFS<FakeBackend>, Counters) {
         let (enginefs, counters) = test_enginefs_with_file_count(file_count);
         if let Some(sweep) = enginefs.take_sweep_task() {
             sweep.abort();
@@ -7355,6 +8005,9 @@ mod tests {
             },
             false,
         );
+        // The viewer, whichever of its screens the test was on: a token
+        // with no screen number is always current.
+        enginefs.note_player("tv", crate::retention::sessions::Played::Elsewhere);
     }
 
     /// Every call the reconciler could make and does not, in one place.
@@ -7374,6 +8027,44 @@ mod tests {
             info_hash: TEST_HASH.to_string(),
             file_idx,
         })
+    }
+
+    /// The token the tests' player sends (`p=`), as the app mints it:
+    /// `<viewer>.<screen>`, the viewer "tv" on its first player screen.
+    const PLAYER: &str = "tv.1";
+
+    /// A play session on `file_idx` of `info_hash`, sharing it.
+    fn played(info_hash: &str, file_idx: usize) -> crate::retention::sessions::Played {
+        crate::retention::sessions::Played::Torrent {
+            info_hash: info_hash.to_string(),
+            file_idx,
+            shares: true,
+        }
+    }
+
+    /// **The viewer plays `file_idx` of `engine`, and the player has said
+    /// how long it is**: the liveness cell names the file, the player's
+    /// session is on it ([`PLAYER`]), the open is the player's
+    /// ([`Engine::begin_retention`]), and with the film's length
+    /// stated its play session's draw is decided now -- the state every test
+    /// of what a play session shares starts from. Nothing is registered and
+    /// no reconcile is asked; a test that wants those opens a stream.
+    async fn play_file(
+        enginefs: &BackendEngineFS<FakeBackend>,
+        engine: &Arc<Engine<FakeHandle>>,
+        file_idx: usize,
+    ) {
+        enginefs.live().open(
+            crate::retention::live::LiveEntity::Torrent {
+                info_hash: engine.info_hash.clone(),
+                file_idx,
+            },
+            false,
+        );
+        enginefs.note_player(PLAYER, played(&engine.info_hash, file_idx));
+        engine.begin_retention(file_idx).await;
+        engine.told_duration(file_idx, Duration::from_secs(1));
+        engine.retention.settle_draw(&file_idx).await;
     }
 
     /// What the torrent is actually doing, which is the only thing any of
@@ -9650,10 +10341,10 @@ mod tests {
         enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
 
         // Freshly added for the pin: measured.
-        let counters = Arc::new(FakeCounters::default());
+        let counters = Counters::default();
         let handle = FakeHandle {
             info_hash: TEST_HASH.to_string(),
-            counters,
+            counters: counters.clone(),
             files: vec![BackendFileInfo {
                 name: "video.mkv".into(),
                 length: 100,
@@ -9711,8 +10402,8 @@ mod tests {
     /// Engine over an unmanaged fake torrent that is still checking (as a
     /// real torrent is right after `add_torrent` returns), for pins that
     /// add it.
-    fn test_enginefs_unmanaged_checking() -> (BackendEngineFS<FakeBackend>, Arc<FakeCounters>) {
-        let counters = Arc::new(FakeCounters::default());
+    fn test_enginefs_unmanaged_checking() -> (BackendEngineFS<FakeBackend>, Counters) {
+        let counters = Counters::default();
         let handle = FakeHandle {
             info_hash: TEST_HASH.to_string(),
             counters: counters.clone(),
@@ -10229,9 +10920,10 @@ mod tests {
         const ORPHAN_HASH: &str = "1111111111111111111111111111111111111111";
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
+        let counters = Counters::default();
         let handle = FakeHandle {
             info_hash: TEST_HASH.to_string(),
-            counters: Arc::new(FakeCounters::default()),
+            counters: counters.clone(),
             files: vec![BackendFileInfo {
                 name: "video-0.mkv".to_string(),
                 length: 100,
@@ -10311,9 +11003,10 @@ mod tests {
             std::fs::write(dir.join("0"), [1u8; 1024]).unwrap();
         }
 
+        let counters = Counters::default();
         let handle = FakeHandle {
             info_hash: TEST_HASH.to_string(),
-            counters: Arc::new(FakeCounters::default()),
+            counters: counters.clone(),
             files: vec![BackendFileInfo {
                 name: "video-0.mkv".to_string(),
                 length: 100,
@@ -10504,7 +11197,7 @@ mod tests {
     /// of a pin's scope start from.
     async fn one_file_of_two_pinned() -> (
         BackendEngineFS<FakeBackend>,
-        Arc<FakeCounters>,
+        Counters,
         Arc<Engine<FakeHandle>>,
         std::path::PathBuf,
         crate::piece_store::PieceStore,
@@ -10645,8 +11338,7 @@ mod tests {
     /// is out of the backend's want-set, which is where a pin stands for
     /// the length of the backend call that selects its file: the engine
     /// records the pin first.
-    fn a_neighbour_the_backend_does_not_want_yet()
-    -> (BackendEngineFS<FakeBackend>, Arc<FakeCounters>) {
+    fn a_neighbour_the_backend_does_not_want_yet() -> (BackendEngineFS<FakeBackend>, Counters) {
         let (enginefs, counters) = test_enginefs_with_files(vec![
             ("Show.S01E01.mkv".into(), 100),
             ("Show.S01E02.mkv".into(), 110),
@@ -10947,16 +11639,14 @@ mod tests {
         );
     }
 
-    /// **What a file beside a pinned one holds back never hides the piece
-    /// the two share.**
+    /// **The piece a played file shares with a pinned neighbour stays, and
+    /// stays announced, when the played file's session ends.**
     ///
-    /// An unpinned file's policy holds its whole extent back when it is
-    /// installed, and its slack pass does it again on every tick for as
-    /// long as the entity holds anything. The boundary piece a pinned
-    /// neighbour shares is in that extent, and the slack pass never takes
-    /// it -- it is the pinned file's -- so the entity never empties and the
-    /// hold-back is never lifted: one piece of a file the user asked to
-    /// keep and share, announced to nobody for as long as the pin stands.
+    /// The boundary piece is in the played file's extent and the slack pass
+    /// never takes it -- it is the pinned file's. Ending the session stops
+    /// the torrent, takes the played file's own bytes, clears the advertised
+    /// set and advertises again what is still shared: the pinned file whole,
+    /// the boundary piece with it.
     #[tokio::test]
     async fn a_pinned_neighbours_boundary_piece_stays_announced() {
         let (enginefs, counters) = a_neighbour_the_backend_does_not_want_yet();
@@ -10970,7 +11660,7 @@ mod tests {
             std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
         }
         let _store = seeded_store(&enginefs, &engine);
-        engine.begin_retention(1).await;
+        play_file(&enginefs, &engine, 1).await;
         engine.test_read_at(1, 0);
         engine
             .retain(enginefs.store_registry(), &playing(1))
@@ -10982,19 +11672,18 @@ mod tests {
             !bucket.join("4").exists() && bucket.join("8").is_file(),
             "the second episode went, and the piece it shares with the pinned one stayed"
         );
-        let advertised = counters.advertised.lock().unwrap().clone();
+        assert_eq!(
+            counters.stop_torrent.load(Ordering::SeqCst),
+            1,
+            "the session ended with the torrent out of the swarm"
+        );
+        let advertised = fake_advertises(&counters);
         assert!(
-            advertised
-                .iter()
-                .any(|(range, on)| !on && range.contains(&4)),
-            "the second episode was held back: {advertised:?}"
+            !advertised.contains(&4),
+            "the second episode's piece is still advertised: {advertised:?}"
         );
         assert!(
-            advertised
-                .iter()
-                .rev()
-                .find(|(range, _)| range.contains(&8))
-                .is_none_or(|(_, on)| *on),
+            advertised.contains(&8),
             "piece eight is the pinned episode's, and announced: {advertised:?}"
         );
     }
@@ -11007,7 +11696,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let make = |files: usize| {
-            let counters = Arc::new(FakeCounters::default());
+            let counters = Counters::default();
             let handle = FakeHandle {
                 info_hash: TEST_HASH.to_string(),
                 counters: counters.clone(),
@@ -11103,7 +11792,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let make = |restored: bool, backend_hash: &str| {
-            let counters = Arc::new(FakeCounters::default());
+            let counters = Counters::default();
             let handle = FakeHandle {
                 info_hash: backend_hash.to_string(),
                 counters: counters.clone(),
@@ -11697,15 +12386,17 @@ mod tests {
     /// committed set, which a policy alone makes, comes and goes.
     #[tokio::test]
     async fn a_stream_reports_the_run_round_its_playhead_under_every_budget() {
-        // What each budget is published as, and whether it installs a
-        // policy (a split) or not (the rest).
+        // What each budget is published as, and whether the play session
+        // has promised anything under it: a split's policy, and a covering
+        // budget's draw of the whole file; not a budget nothing can be sized
+        // against.
         let shapes: [(&str, Option<Option<u64>>, bool); 4] = [
             ("never published", None, false),
             ("no cap", Some(None), false),
-            ("a budget covering the file", Some(Some(1_000_000)), false),
+            ("a budget covering the file", Some(Some(1_000_000)), true),
             ("a budget splitting the file", Some(Some(50)), true),
         ];
-        for (shape, budget, bounded) in shapes {
+        for (shape, budget, promised) in shapes {
             let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
             counters.pieces_per_file.store(4, Ordering::SeqCst);
             let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
@@ -11717,7 +12408,7 @@ mod tests {
             for piece in [0u32, 1, 2] {
                 std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
             }
-            engine.begin_retention(0).await;
+            play_file(&enginefs, &engine, 0).await;
             engine.test_read_at(0, 30);
             let _store = seeded_store(&enginefs, &engine);
 
@@ -11737,8 +12428,8 @@ mod tests {
             );
             assert_eq!(
                 numbers.committed_bytes.is_some(),
-                bounded,
-                "{shape}: a committed set only where a policy stands: {numbers:?}"
+                promised,
+                "{shape}: a committed set only where the session promised one: {numbers:?}"
             );
         }
 
@@ -12264,7 +12955,7 @@ mod tests {
         // what the window has released, and ask while it is in there.
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        *counters.reselect_gate.lock().unwrap() = Some((entered_tx, release_rx));
         engine.test_read_at(0, 25);
         let running = tokio::spawn({
             let engine = engine.clone();
@@ -12629,7 +13320,7 @@ mod tests {
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let store = seeded_store(&enginefs, &engine);
-        engine.begin_retention(0).await;
+        play_file(&enginefs, &engine, 0).await;
         engine.test_read_at(0, 0);
         let selected = || -> std::collections::BTreeSet<u32> {
             let dropped = counters.dropped.lock().unwrap();
@@ -13494,7 +14185,7 @@ mod tests {
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let _store = seeded_store(&enginefs, &engine);
-        engine.begin_retention(0).await;
+        play_file(&enginefs, &engine, 0).await;
         engine.test_read_at(0, 0);
         engine
             .retain(enginefs.store_registry(), &playing(0))
@@ -13506,16 +14197,14 @@ mod tests {
             vec![(3..4, crate::backend::AfterRelease::LeaveDropped)]
         );
 
-        // The reader moves on to episode two: episode two is held back, and
-        // episode one is touched not at all. Its range is **not** given
-        // back -- it is a file nobody is playing, so its pieces are on
-        // their way off the disk, and announcing them first would be a Have
-        // for bytes that go seconds later (issue (a)).
-        engine.begin_retention(1).await;
+        // The reader moves on to episode two: episode two's draw is
+        // advertised, and episode one is touched not at all -- nothing of it
+        // is announced beyond its own draw, and nothing is taken back.
+        play_file(&enginefs, &engine, 1).await;
         assert_eq!(
             *counters.advertised.lock().unwrap(),
-            vec![(0..4, false), (4..8, false)],
-            "episode two is held back and episode one is left alone"
+            vec![(1..2, true), (5..6, true)],
+            "episode two's draw is advertised and episode one is left alone"
         );
         assert_eq!(
             *counters.reselected.lock().unwrap(),
@@ -13524,12 +14213,13 @@ mod tests {
         );
 
         // The budget goes: the next install on episode two ends with
-        // nothing installed, and the file is wanted whole.
+        // nothing installed, and the file is wanted whole -- and shares what
+        // its session drew, no more.
         enginefs.set_cache_budget(None);
         engine.begin_retention(1).await;
         assert_eq!(
             counters.advertised.lock().unwrap().last(),
-            Some(&(4..8, true))
+            Some(&(5..6, true))
         );
         assert_eq!(*counters.reselected.lock().unwrap(), vec![0..3, 4..8]);
 
@@ -13620,13 +14310,9 @@ mod tests {
     /// registration goes with it. The answer is then "no store", and an
     /// empty set would have been a very definite measurement instead: the
     /// policy's `advance` keeps only the committed pieces the set names, so
-    /// one pass over an empty answer would withdraw every committed piece
-    /// from what we announce -- after peers had been told, and there is no
-    /// un-Have -- and the next, with the store back, would find them outside
-    /// the window and no longer committed and reclaim them: the promise the
-    /// whole design rests on, that what we announce is what nothing will
-    /// ever reclaim, would break for the file. A pass with no store
-    /// concludes nothing.
+    /// one pass over an empty answer would count every committed piece lost
+    /// off a disk that still holds it, and act on a disk it never read. A
+    /// pass with no store concludes nothing.
     ///
     /// The fixture is the two-pass one above: a second pass commits piece 0.
     /// Then the store goes -- the torrent errored and librqbit dropped its
@@ -13645,7 +14331,7 @@ mod tests {
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let store = seeded_store(&enginefs, &engine);
-        engine.begin_retention(0).await;
+        play_file(&enginefs, &engine, 0).await;
         engine.test_read_at(0, 0);
         engine
             .retain(enginefs.store_registry(), &playing(0))
@@ -13681,7 +14367,7 @@ mod tests {
         );
         assert!(
             counters.advertised.lock().unwrap().is_empty(),
-            "and in particular it withdraws nothing from what we announce: {:?}",
+            "and in particular it says nothing to the backend: {:?}",
             counters.advertised.lock().unwrap()
         );
         assert!(
@@ -13819,7 +14505,7 @@ mod tests {
         store.init_for_tests().unwrap();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        *counters.reselect_gate.lock().unwrap() = Some((entered_tx, release_rx));
         engine.test_read_at(0, 25);
         let running = tokio::spawn({
             let engine = engine.clone();
@@ -13875,7 +14561,7 @@ mod tests {
     /// the report of a delivered byte (`test_read_at` here, the reader's
     /// `poll_read` in production) runs on every one and takes none of the
     /// pass's locks, so playback walks on while the pass commits and
-    /// withdraws. librqbit refuses to drop what its own live stream is
+    /// reclaims. librqbit refuses to drop what its own live stream is
     /// about to read, but that refusal is the forward lookahead alone (4
     /// MiB), blind to the tenth of the window kept behind the playhead for
     /// a scan back, empty when no stream is open, and promised by no
@@ -13924,7 +14610,7 @@ mod tests {
         store.init_for_tests().unwrap();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        *counters.reselect_gate.lock().unwrap() = Some((entered_tx, release_rx));
         engine.test_read_at(0, 25);
         let running = tokio::spawn({
             let engine = engine.clone();
@@ -14008,7 +14694,7 @@ mod tests {
         store.init_for_tests().unwrap();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        *counters.reselect_gate.lock().unwrap() = Some((entered_tx, release_rx));
         // The user pins from inside the first drop -- between the parts.
         *counters.on_first_drop.lock().unwrap() = Some(Box::new({
             let engine = engine.clone();
@@ -14195,7 +14881,14 @@ mod tests {
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
         enginefs.set_cache_budget(Some(50));
         let _store = seeded(&enginefs, &engine);
-        engine.begin_retention(0).await;
+        // Played, and drawn: the play session shares a piece of it.
+        play_file(&enginefs, &engine, 0).await;
+        assert!(
+            engine
+                .retention
+                .draw_of(&0)
+                .is_some_and(|draw| !draw.is_empty())
+        );
         engine.test_read_at(0, 25);
         assert_eq!(
             bounded(&enginefs).await,
@@ -14242,6 +14935,8 @@ mod tests {
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
         enginefs.set_cache_budget(Some(50));
         let _store = seeded(&enginefs, &engine);
+        // The player's, with no length stated yet: the draw waits.
+        enginefs.note_player(PLAYER, played(TEST_HASH, 0));
         engine.begin_retention(0).await;
         engine.test_read_at(0, 25);
         assert!(
@@ -14259,10 +14954,12 @@ mod tests {
                     ahead_bytes: 75,
                     ..Default::default()
                 }),
-                None
+                Some(100)
             ),
-            "the budget covers the whole file, so no policy is installed and \
-             nothing is promised -- and the run round the playhead is what \
+            "the budget covers the whole file, so no policy is installed -- and \
+             the play session, which had not drawn while it waited for the \
+             film's rate, draws the whole file: every byte of it held is \
+             committed, read-ahead and all. The run round the playhead is what \
              the disk holds, as it was"
         );
     }
@@ -14284,7 +14981,7 @@ mod tests {
         }
 
         let _store = seeded_store(&enginefs, &engine);
-        engine.begin_retention(0).await;
+        play_file(&enginefs, &engine, 0).await;
         engine.test_read_at(0, 0);
         engine
             .retain(enginefs.store_registry(), &playing(0))
@@ -14576,7 +15273,7 @@ mod tests {
         store.init_for_tests().unwrap();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
-        *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        *counters.reselect_gate.lock().unwrap() = Some((entered_tx, release_rx));
         engine.test_read_at(0, 25);
         let running = tokio::spawn({
             let engine = engine.clone();
@@ -14617,33 +15314,29 @@ mod tests {
         );
     }
 
-    /// **A pin whose range the backend will not take back keeps its policy
-    /// until it can.**
-    ///
-    /// Emptying the slot before re-advertising would let a backend refusal
-    /// strand the range held back beside an empty slot: the cleaner's gate
-    /// would read the torrent as announced, nothing would share the pieces
-    /// and nothing would ever reclaim them -- held back and protected at
-    /// once, the one combination that is never right. The range is
-    /// advertised back first, and the policy forgotten only once that
-    /// succeeds, so a refusal leaves a policy that still tells the truth
-    /// about what is held back, and the next pass under the pin retries.
+    /// **A pin on a file being played shares it whole, and its policy
+    /// goes.** A download is announced whole, finished or not: the tick
+    /// advertises every piece of the pinned file the backend does not
+    /// advertise yet -- only ever adding, so the draw it already shared
+    /// stays -- and the pin's pass forgets the policy. A backend that
+    /// refuses the advertise costs the swarm the pieces until a later tick
+    /// can, and nothing else: there is nothing half done to hold the policy
+    /// up for.
     #[tokio::test]
-    async fn a_pin_whose_range_the_backend_will_not_take_back_keeps_the_policy_until_it_can() {
+    async fn a_pin_on_a_played_file_shares_it_whole_and_its_policy_goes() {
         let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
         counters.pieces_per_file.store(4, Ordering::SeqCst);
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
         enginefs.set_cache_budget(Some(50));
-        engine.begin_retention(0).await;
+        play_file(&enginefs, &engine, 0).await;
         engine.test_read_at(0, 0);
         assert_eq!(
             *counters.advertised.lock().unwrap(),
-            vec![(0..4, false)],
-            "the file's range is held back"
+            vec![(1..2, true)],
+            "the file's draw"
         );
 
-        // The user pins the file, and the backend will not have the range
-        // back.
+        // The user pins the file, and the backend will not advertise.
         engine.pinned_files.write().insert(0);
         counters.refuses_advertise.store(true, Ordering::SeqCst);
         assert!(
@@ -14659,36 +15352,22 @@ mod tests {
                 .holding(&0)
                 .expect("the file has an entity")
                 .installed
-                .is_some(),
-            "and the policy stands, because its range is still held back: a cell \
-             that said otherwise would be the held-back-and-announced combination"
-        );
-        assert_eq!(
-            *counters.advertised.lock().unwrap(),
-            vec![(0..4, false)],
-            "nothing was put back, because the backend refused"
-        );
-
-        // The backend can again, and the next pass under the pin retries.
-        counters.refuses_advertise.store(false, Ordering::SeqCst);
-        assert!(
-            engine
-                .retain(enginefs.store_registry(), &playing(0))
-                .await
-                .is_none()
-        );
-        assert!(
-            engine
-                .retention
-                .holding(&0)
-                .expect("the file has an entity")
-                .installed
                 .is_none(),
-            "the range is back in what we announce, and only now is the policy gone"
+            "the policy went with the pin"
         );
+        assert_eq!(*counters.advertised.lock().unwrap(), vec![(1..2, true)]);
+
+        // The backend can again, and the next tick shares the file whole.
+        counters.refuses_advertise.store(false, Ordering::SeqCst);
+        engine.retain(enginefs.store_registry(), &playing(0)).await;
         assert_eq!(
             *counters.advertised.lock().unwrap(),
-            vec![(0..4, false), (0..4, true)]
+            vec![(1..2, true), (0..1, true), (2..4, true)],
+            "every piece of the pinned file, the draw's already among them"
+        );
+        assert_eq!(
+            engine.handle.advertised_pieces().await,
+            Some(vec![0, 1, 2, 3])
         );
     }
 
@@ -14901,22 +15580,22 @@ mod tests {
     /// that has completed has its Have go out in that gap -- to be
     /// reclaimed a pass later, with no un-Have to take it back.
     #[tokio::test]
-    async fn a_second_reader_on_the_same_file_under_the_same_budget_re_holds_nothing_back() {
+    async fn a_second_reader_on_the_same_file_under_the_same_budget_advertises_nothing_again() {
         let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 100)]);
         counters.pieces_per_file.store(4, Ordering::SeqCst);
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
         enginefs.set_cache_budget(Some(50));
-        engine.begin_retention(0).await;
+        play_file(&enginefs, &engine, 0).await;
         engine.test_read_at(0, 0);
-        assert_eq!(*counters.advertised.lock().unwrap(), vec![(0..4, false)]);
+        assert_eq!(*counters.advertised.lock().unwrap(), vec![(1..2, true)]);
 
         // The viewer seeks: a second reader opens on the same file.
         engine.begin_retention(0).await;
         assert_eq!(
             *counters.advertised.lock().unwrap(),
-            vec![(0..4, false)],
+            vec![(1..2, true)],
             "the policy already installed describes this file under this budget, \
-             so nothing was given back and nothing re-held-back"
+             and the play session's draw was advertised once"
         );
         assert!(
             !engine.standing().await.policies.is_empty(),
@@ -14933,7 +15612,7 @@ mod tests {
     /// file 0 is 0..4 and file 1 is 4..8; pieces 0 and 1 are on the disk.
     async fn two_policies_standing() -> (
         BackendEngineFS<FakeBackend>,
-        Arc<FakeCounters>,
+        Counters,
         Arc<Engine<FakeHandle>>,
         std::path::PathBuf,
         crate::piece_store::PieceStore,
@@ -14950,7 +15629,7 @@ mod tests {
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
         let store = seeded_store(&enginefs, &engine);
-        engine.begin_retention(0).await;
+        play_file(&enginefs, &engine, 0).await;
         engine.test_read_at(0, 0);
         engine
             .retain(enginefs.store_registry(), &playing(0))
@@ -14964,15 +15643,15 @@ mod tests {
             .await
             .expect("a pass");
 
-        // The viewer opens file 1. Nothing is retired: each file is its own
-        // entity with its own head and its own window, so both policies
-        // stand from here on.
+        // File 1 is opened while file 0 is the one being played -- a side
+        // file, as the aside rule has it. Nothing is retired: each file is
+        // its own entity with its own head and its own window, so both
+        // policies stand from here on. Only the file being played shares.
         engine.begin_retention(1).await;
         assert_eq!(
             *counters.advertised.lock().unwrap(),
-            vec![(0..4, false), (1..2, true), (4..8, false)],
-            "file 0 held back and the piece of its draw committed; file 1 held \
-             back; nothing of file 0 put back"
+            vec![(1..2, true)],
+            "file 0's draw, advertised at its open, and nothing of file 1"
         );
         assert_eq!(
             engine
@@ -14988,64 +15667,114 @@ mod tests {
         (enginefs, counters, engine, bucket, store)
     }
 
-    /// **A switch to the next episode makes the first file slack: its
-    /// bytes go and its range is never announced again.**
+    /// **A switch to the next episode of the same torrent stops the torrent
+    /// before the first file's bytes go, then starts it again for the new
+    /// file with a fresh advertised set.**
     ///
-    /// This is issue (a), and it is what the liveness value is for.
-    /// Retiring the first file on install without marking it slack would
-    /// put its whole range *back* into what we announce, and nothing would
-    /// delete the bytes until a cleaner walk got round to them: a Have per
-    /// switch for pieces about to go, and a disk that keeps every film
-    /// anybody has opened this session.
+    /// The file the viewer left is [`Mode::Slack`] at the very next tick,
+    /// and its committed piece is one a peer may have been told of: there is
+    /// no un-Have, so the tick takes nothing of it while the torrent is in
+    /// the swarm. The reconciler reads the advertised piece nobody shares
+    /// any more and ends it: the torrent stops -- its peers are gone -- the
+    /// first file's bytes go, the committed piece with them, the advertised
+    /// set is cleared and made again from what is still shared (the second
+    /// file's draw), and the torrent, still being played, starts at once.
+    /// The fake fails the test on the spot if an advertised piece leaves the
+    /// disk while it is live, or if anything asks it to stop advertising
+    /// while it is live.
     ///
-    /// Now the file the viewer left is [`Mode::Slack`] at the very next
-    /// tick: its extent is held back before a single unlink, every piece it
-    /// holds is taken, its policy and windows go, its entity is forgotten,
-    /// and nothing of it is ever announced again. The file being played
-    /// keeps its window through the same tick and commits what the window
-    /// releases, as it always did.
+    /// This test asserted, before the sharing rule, that the tick deleted
+    /// the committed piece "including the one it had committed for sharing"
+    /// with the torrent live; it now asserts that nothing of it goes until
+    /// the torrent has stopped.
     ///
     /// [`Mode::Slack`]: crate::retention::owner::Mode::Slack
     #[tokio::test]
-    async fn a_switch_to_the_next_file_makes_the_first_slack_and_takes_its_bytes() {
+    async fn a_switch_to_the_next_file_stops_the_torrent_before_the_first_files_bytes_go() {
         let (enginefs, counters, engine, bucket, store) = two_policies_standing().await;
-        // The server sees a stream open on file 1: the switch.
+        // The server sees a stream open on file 1: the switch, as the stream
+        // route makes it -- the cell first, the reconcile after the disk
+        // gate (`focus_torrent`).
         assert_eq!(
             engine.standing().await.policies[0].mode,
             crate::retention::owner::Mode::Live,
             "while file 0 is being played its pass is the live one, which keeps \
              what it committed"
         );
-        enginefs.on_stream_start(TEST_HASH, 1).await;
+        // The player's request for file 1 (`p=`): its session moves at once.
+        enginefs.note_player("tv.2", played(TEST_HASH, 1));
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 1).await;
         assert_eq!(enginefs.live().reading().file_of(TEST_HASH), Some(1));
         assert!(
             matches!(
                 engine.standing().await.policies[0].mode,
                 crate::retention::owner::Mode::Slack { .. }
             ),
-            "and the moment the viewer leaves it, its next pass is the slack one: \
-             a policy on its way out keeps nothing it committed"
+            "and the moment the viewer leaves it, its next pass is the slack one"
+        );
+        // File 1, the one the player plays now, draws its shared set once its
+        // length is known, advertised on the live torrent.
+        engine.told_duration(1, Duration::from_secs(1));
+        engine.retention.settle_draw(&1).await;
+        assert_eq!(
+            counters.advertised.lock().unwrap().last(),
+            Some(&(5..6, true)),
+            "the file the player plays draws once its session is on it"
         );
         counters.advertised.lock().unwrap().clear();
 
-        // The viewer reads file 1: piece 4.
+        // The viewer reads file 1: piece 4. A tick in between runs with the
+        // torrent live, and takes nothing a peer may have been told of.
         std::fs::write(bucket.join("4"), [7u8; 25]).unwrap();
         store.init_for_tests().unwrap();
         engine.test_read_at(1, 0);
         let live = enginefs.live().reading();
-        let pass = engine
-            .retain(enginefs.store_registry(), &live)
-            .await
-            .expect("a pass");
+        engine.retain(enginefs.store_registry(), &live).await;
+        assert!(
+            bucket.join("1").exists(),
+            "the committed piece of the file left behind went while the torrent was live"
+        );
+        assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 0);
+        assert!(engine.shares_to_end().await, "and it is a share to end");
 
+        // The stream's reconcile ends it: stop, re-advertise, start -- and
+        // only then are the left file's bytes taken, so the next episode
+        // waits on the rebuild alone. Witnessed from inside the first unlink.
+        let at_first_drop: Arc<Mutex<Option<(usize, usize, RunState)>>> = Arc::default();
+        *counters.on_first_drop.lock().unwrap() = Some(Box::new({
+            let at_first_drop = at_first_drop.clone();
+            let counters = counters.0.clone();
+            let handle = engine.handle.clone();
+            move || {
+                *at_first_drop.lock().unwrap() = Some((
+                    counters.start_torrent.load(Ordering::SeqCst),
+                    counters.advertised.lock().unwrap().len(),
+                    handle.run_state(),
+                ));
+            }
+        }));
+        enginefs.focus_torrent(TEST_HASH).await;
+        // The unlinks run on a task of their own, after the reconcile.
+        assert!(
+            wait_until(TEST_WAIT_BOUND, || !bucket.join("1").exists()
+                && !bucket.join("0").exists())
+            .await,
+            "the left file's bytes stayed"
+        );
         assert_eq!(
-            pass.reclaimed, 1,
-            "the held piece of the file left behind that no reader is still \
-             promised: {pass:?}"
+            *at_first_drop.lock().unwrap(),
+            Some((1, 2, RunState::Live)),
+            "the left file's first piece went before the torrent had started \
+             again with its advertised set rebuilt"
+        );
+        assert_eq!(
+            counters.stop_torrent.load(Ordering::SeqCst),
+            1,
+            "the torrent left the swarm"
         );
         assert!(
-            !bucket.join("1").exists(),
-            "including the one it had committed for sharing"
+            !bucket.join("1").exists() && !bucket.join("0").exists(),
+            "the left file's bytes went, the committed piece with them"
         );
         assert!(
             bucket.join("4").is_file(),
@@ -15057,12 +15786,18 @@ mod tests {
         );
         assert_eq!(
             *counters.advertised.lock().unwrap(),
-            vec![(0..4, false)],
-            "held back before a byte of it was unlinked, and never put back"
+            vec![(0..u32::MAX, false), (5..6, true)],
+            "cleared with the torrent stopped, and the new file's draw advertised again"
         );
+        assert_eq!(
+            counters.start_torrent.load(Ordering::SeqCst),
+            1,
+            "and it started again for the file being played, without a dwell"
+        );
+        assert_eq!(engine.handle.run_state(), RunState::Live);
+        assert!(!engine.shares_to_end().await);
 
-        // And the file being played goes on committing what its window
-        // releases.
+        // And the file being played goes on committing its draw.
         std::fs::write(bucket.join("5"), [7u8; 25]).unwrap();
         store.init_for_tests().unwrap();
         engine.test_read_at(1, 25);
@@ -15074,7 +15809,2119 @@ mod tests {
         assert_eq!(
             counters.advertised.lock().unwrap().last(),
             Some(&(5..6, true)),
-            "the piece of file 1's draw is announced"
+            "and nothing more was advertised for it"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // The sharing rule, end to end over the fake backend. Every test here
+    // runs under the fake's invariant (`FakeCounters::violations`): it fails
+    // on the spot if an announcement is withdrawn while the torrent is live,
+    // or an advertised piece leaves the disk while it is live.
+    // ---------------------------------------------------------------------
+
+    /// A forty-piece film of twenty-five byte pieces with nothing on the
+    /// disk, one file of one torrent, under `budget` bytes, and the one the
+    /// viewer is playing: the liveness cell names it, so a player's open of
+    /// it is the play session that shares. A thousand bytes over a thousand
+    /// seconds is a byte a second, so ninety seconds of it -- the `Normal`
+    /// profile's read-ahead and the committed set's time cap -- is ninety
+    /// bytes; the player states the length only after its first open, as
+    /// the app does ([`Engine::told_duration`]).
+    async fn a_film_under(
+        budget: u64,
+    ) -> (
+        BackendEngineFS<FakeBackend>,
+        Counters,
+        Arc<Engine<FakeHandle>>,
+    ) {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 1000)]);
+        counters.pieces_per_file.store(40, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(budget));
+        enginefs.live().open(
+            crate::retention::live::LiveEntity::Torrent {
+                info_hash: TEST_HASH.to_string(),
+                file_idx: 0,
+            },
+            false,
+        );
+        enginefs.note_player(PLAYER, played(TEST_HASH, 0));
+        (enginefs, counters, engine)
+    }
+
+    fn fake_advertises(counters: &FakeCounters) -> Vec<u32> {
+        counters
+            .advertised_set
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// **A play session shares its draw and nothing else, decided before
+    /// its reader opens and never grown or taken back.**
+    ///
+    /// The torrent is in the session -- added and live -- and announces
+    /// nothing: nothing has chosen anything. The stream's open draws the
+    /// shared set -- under a budget that covers the file, the whole file --
+    /// and advertises it before the reader asks for a byte; the torrent's
+    /// other file, which nobody plays, is not in it. A seek, and a budget
+    /// that falls under the stream and rises again, share nothing more and
+    /// take nothing back.
+    #[tokio::test]
+    async fn a_play_advertises_its_draw_before_the_reader_opens_and_nothing_else() {
+        use crate::backend::priorities::{BufferProfile, Fetching};
+        let (enginefs, counters) =
+            test_enginefs_with_files(vec![("film.mkv".into(), 1000), ("extra.mkv".into(), 1000)]);
+        counters.pieces_per_file.store(40, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(1500));
+        assert_eq!(engine.handle.run_state(), RunState::Live);
+        assert!(
+            fake_advertises(&counters).is_empty(),
+            "a torrent announced something before anything chose it"
+        );
+
+        // The viewer's stream opens, as the stream route opens it: the cell
+        // first, then the reader.
+        enginefs.note_player(PLAYER, played(TEST_HASH, 0));
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        let first = engine
+            .try_get_file_with_intent(0, 0, 255, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("a reader");
+        let drawn = fake_advertises(&counters);
+        assert_eq!(
+            drawn,
+            (0..40).collect::<Vec<_>>(),
+            "a budget that covers the file shares the file, and only it"
+        );
+        assert_eq!(
+            *counters.advertised_at_reader.lock().unwrap(),
+            vec![drawn.clone()],
+            "the draw was advertised before the reader opened"
+        );
+        let draws = engine.retention.draws();
+
+        // A seek; a budget that falls under the stream, and a later open
+        // under it; a budget that rises again.
+        let second = engine
+            .try_get_file_with_intent(0, 500, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("a reader");
+        enginefs.set_cache_budget(Some(250));
+        let third = engine
+            .try_get_file_with_intent(0, 250, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("a reader");
+        enginefs.set_cache_budget(Some(1500));
+        let fourth = engine
+            .try_get_file_with_intent(0, 750, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("a reader");
+        assert_eq!(
+            fake_advertises(&counters),
+            drawn,
+            "a seek or a budget that moved changed what the session shares"
+        );
+        assert_eq!(engine.retention.draws(), draws, "and nothing redrew it");
+        assert!(
+            counters
+                .advertised
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, advertised)| *advertised),
+            "and nothing was withdrawn"
+        );
+        drop((first, second, third, fourth));
+    }
+
+    /// **A budget that cannot hold the stream's read-ahead and a shared set
+    /// shares nothing: playing wins.**
+    ///
+    /// Five pieces of budget beside a read-ahead that can touch five leave
+    /// nothing; so do ten beside a read-ahead the whole cache caps; so do
+    /// two. The draw waits for the film's rate, and is then decided against
+    /// what a reader of the film is really granted -- the rate times the
+    /// profile's seconds -- not against the first open's placeholder.
+    #[tokio::test]
+    async fn a_budget_that_cannot_hold_the_read_ahead_and_a_share_shares_nothing() {
+        use crate::backend::priorities::{BufferProfile, Fetching};
+        for (budget, length) in [(125, 1000), (250, 100), (50, 1000)] {
+            let (enginefs, counters, engine) = a_film_under(budget).await;
+            let first = engine
+                .try_get_file_with_intent(0, 0, 255, Fetching::Streaming, BufferProfile::Normal)
+                .await
+                .expect("a reader");
+            assert!(
+                engine.retention.draws().is_empty(),
+                "the draw waits for the film's rate"
+            );
+            enginefs
+                .on_duration(TEST_HASH, 0, Duration::from_secs(length))
+                .await;
+            let second = engine
+                .try_get_file_with_intent(0, 0, 1, Fetching::Streaming, BufferProfile::Normal)
+                .await
+                .expect("a reader");
+            assert!(
+                fake_advertises(&counters).is_empty(),
+                "a budget of {budget} with a {length} s film shared {:?}",
+                fake_advertises(&counters)
+            );
+            assert_eq!(
+                engine.retention.draws(),
+                vec![(0, std::collections::BTreeSet::new())],
+                "the session drew, and drew nothing"
+            );
+            drop((first, second));
+        }
+    }
+
+    /// **The draw is sized against the read-ahead the opening states**,
+    /// which is not in the entity's reader map yet when the install runs:
+    /// ten pieces of budget beside a read-ahead that can touch five, nine
+    /// and eleven share five, one and nothing.
+    #[tokio::test]
+    async fn the_draw_is_sized_against_the_read_ahead_the_opening_states() {
+        for (lookahead, shared) in [(90u64, 5usize), (200, 1), (250, 0)] {
+            let (_enginefs, counters, engine) = a_film_under(250).await;
+            engine
+                .begin_retention_opening(
+                    0,
+                    crate::piece_store::Buffering {
+                        lookahead_bytes: lookahead,
+                        ..Default::default()
+                    },
+                    crate::retention::owner::Opener::Player,
+                )
+                .await;
+            // The player states the film's length: the draw is decided now,
+            // beside the read-ahead the opening stated.
+            engine.told_duration(0, Duration::from_secs(1000));
+            engine.retention.settle_draw(&0).await;
+            assert_eq!(
+                fake_advertises(&counters).len(),
+                shared,
+                "a read-ahead of {lookahead} bytes"
+            );
+        }
+    }
+
+    /// **A subtitle fetched while the film plays shares nothing, and its end
+    /// stops nothing.**
+    ///
+    /// The player's own request for a side file of the torrent it is
+    /// playing, while the film is still being read: the aside rule keeps the
+    /// liveness cell on the film, and only the file being played draws.
+    /// Drawn -- under this budget, which covers either file, the whole file
+    /// at once -- the subtitle's set would be advertised before its reader
+    /// had even registered, and ended the moment its read closed: a draw
+    /// nobody shares any more is a share to end, and ending it stops the
+    /// torrent under the film. So the subtitle announces nothing at any
+    /// point of its life, the film's torrent never leaves the swarm, and
+    /// what it announces is the film's draw and nothing else.
+    #[tokio::test]
+    async fn a_side_file_read_during_playback_announces_nothing_and_stops_nothing() {
+        use crate::backend::priorities::{BufferProfile, Fetching};
+        let (enginefs, counters) =
+            test_enginefs_with_files(vec![("film.mkv".into(), 1000), ("film.srt".into(), 1000)]);
+        counters.pieces_per_file.store(40, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(1_000_000));
+
+        // The film, opened as the stream route opens it for the player's
+        // request, and being read.
+        enginefs.note_player(PLAYER, played(TEST_HASH, 0));
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        enginefs.focus_torrent(TEST_HASH).await;
+        let film = engine
+            .try_get_file_with_intent(0, 0, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("the film");
+        let reading = engine
+            .retention
+            .reader_on(&0, (0, 0), crate::piece_store::Buffering::default())
+            .expect("the film's entity");
+        reading.promises(0..1);
+        let film_draw: Vec<u32> = (0..40).collect();
+        assert_eq!(fake_advertises(&counters), film_draw, "the film's draw");
+
+        // The subtitle: an aside, its open parked in the backend's reader --
+        // installed, and its reader not registered yet.
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 1).await;
+        assert_eq!(enginefs.live().reading().file_of(TEST_HASH), Some(0));
+        enginefs.focus_torrent(TEST_HASH).await;
+        let (entered, release) = (
+            tokio::sync::oneshot::channel::<()>(),
+            tokio::sync::oneshot::channel::<()>(),
+        );
+        *counters.reader_gate.lock().unwrap() = Some((entered.0, release.1));
+        let opening = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                engine
+                    .try_get_file_with_intent(1, 0, 1, Fetching::Streaming, BufferProfile::Normal)
+                    .await
+                    .map(|_| ())
+            }
+        });
+        entered
+            .1
+            .await
+            .expect("the subtitle's open reached the backend");
+        assert_eq!(
+            fake_advertises(&counters),
+            film_draw,
+            "the subtitle's open announced something"
+        );
+        assert!(
+            !engine.shares_to_end().await,
+            "an open with no reader yet made a share to end"
+        );
+        release.0.send(()).expect("the parked open");
+        opening
+            .await
+            .expect("joined")
+            .expect("the subtitle's reader");
+        assert!(
+            engine.retention.draws().iter().all(|(file, _)| *file == 0),
+            "the subtitle drew: {:?}",
+            engine.retention.draws()
+        );
+
+        // Its read ends and its connection closes; the ticks and a switch's
+        // slack drop run over the torrent.
+        enginefs.on_stream_end(TEST_HASH, 1).await;
+        for _ in 0..2 {
+            enginefs.reconcile_tick().await;
+        }
+        enginefs.drop_slack().await;
+        assert_eq!(
+            counters.stop_torrent.load(Ordering::SeqCst),
+            0,
+            "the film's torrent left the swarm under the film"
+        );
+        assert_eq!(engine.handle.run_state(), RunState::Live);
+        assert_eq!(fake_advertises(&counters), film_draw);
+        drop((film, reading));
+    }
+
+    /// **An archive played across its volumes shares nothing and never
+    /// stops the torrent.**
+    ///
+    /// A RAR set in a torrent is read by a translated source that opens a
+    /// reader on each volume as the member's body crosses into it
+    /// (`server::sources::torrent`): the stream registered first, then the
+    /// reader, unshared. Drawn like a player's stream -- under a budget that
+    /// covers every volume, each one whole at its open -- the set was
+    /// advertised past the budget, every volume boundary left a draw that
+    /// nobody shared, and ending it stopped the torrent under the film. So
+    /// archive playback draws nothing: under-shared, never interrupted.
+    #[tokio::test]
+    async fn an_archive_played_across_its_volumes_announces_nothing_and_stops_nothing() {
+        use crate::backend::priorities::{BufferProfile, Fetching};
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("film.part1.rar".into(), 1000),
+            ("film.part2.rar".into(), 1000),
+            ("film.part3.rar".into(), 1000),
+        ]);
+        counters.pieces_per_file.store(40, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(1_000_000));
+
+        let mut volumes = Vec::new();
+        for volume in 0..3 {
+            enginefs.on_stream_start(TEST_HASH, volume).await;
+            let reader = engine
+                .try_get_file_with_intent(
+                    volume,
+                    0,
+                    1,
+                    Fetching::Streaming,
+                    BufferProfile::default(),
+                )
+                .await
+                .expect("the volume's reader");
+            engine.test_read_at(volume, 0);
+            volumes.push(reader);
+            assert!(
+                fake_advertises(&counters).is_empty(),
+                "volume {volume} announced {:?}",
+                fake_advertises(&counters)
+            );
+            enginefs.reconcile_tick().await;
+            assert_eq!(
+                counters.stop_torrent.load(Ordering::SeqCst),
+                0,
+                "the torrent left the swarm at volume {volume}"
+            );
+        }
+        // A seek back into the first volume reopens it.
+        volumes.push(
+            engine
+                .try_get_file_with_intent(0, 500, 1, Fetching::Streaming, BufferProfile::default())
+                .await
+                .expect("the first volume again"),
+        );
+        assert!(fake_advertises(&counters).is_empty());
+
+        // The member's body ends: the sources go, and their streams with them.
+        drop(volumes);
+        for volume in 0..3 {
+            enginefs.on_stream_end(TEST_HASH, volume).await;
+        }
+        enginefs.reconcile_tick().await;
+        enginefs.drop_slack().await;
+        assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 0);
+        assert!(engine.retention.draws().is_empty(), "a volume drew");
+        assert!(fake_advertises(&counters).is_empty());
+    }
+
+    /// **The draw waits for the film's rate, and is sized beside the
+    /// read-ahead a reader of the film is really granted.**
+    ///
+    /// A 400 MiB film of hundred 4 MiB pieces under 200 MiB of budget. Its
+    /// first open comes before the player has said how long it is, so what
+    /// it states is the intent's placeholder, 32 MiB: a draw sized beside
+    /// that is half the budget, 25 pieces. The player then says the film is
+    /// 200 s long -- 2 MiB/s, so the ninety seconds the `Normal` profile
+    /// asks for are 180 MiB, which every later open is granted. Beside
+    /// that, 200 MiB holds four pieces of shared set, and the disk stays
+    /// under its budget with both: that is the draw, made once the rate is
+    /// known and never changed after -- not by another open, a budget that
+    /// grows, or the length stated again.
+    #[tokio::test]
+    async fn the_draw_is_sized_with_the_rate_that_arrives_after_the_first_open() {
+        use crate::backend::priorities::{BufferProfile, Fetching};
+        const MIB: u64 = 1024 * 1024;
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 400 * MIB)]);
+        counters.pieces_per_file.store(100, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(200 * MIB));
+        enginefs.note_player(PLAYER, played(TEST_HASH, 0));
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+
+        let first = engine
+            .try_get_file_with_intent(0, 0, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("a reader");
+        assert!(
+            engine.retention.draws().is_empty(),
+            "drawn before the film's rate was known"
+        );
+        assert!(fake_advertises(&counters).is_empty());
+
+        enginefs
+            .on_duration(TEST_HASH, 0, Duration::from_secs(200))
+            .await;
+        enginefs.reconcile_tick().await;
+        let draw = engine
+            .retention
+            .draw_of(&0)
+            .expect("drawn once the rate was known");
+        assert_eq!(
+            draw.len(),
+            4,
+            "four pieces beside a 180 MiB read-ahead: {draw:?}"
+        );
+        assert_eq!(
+            fake_advertises(&counters),
+            draw.iter().copied().collect::<Vec<_>>()
+        );
+        assert!(
+            draw.len() as u64 * 4 * MIB + 180 * MIB <= 200 * MIB,
+            "the draw and the read-ahead do not fit the budget together"
+        );
+
+        // Fixed from here.
+        let second = engine
+            .try_get_file_with_intent(0, 200 * MIB, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("a seek");
+        enginefs.set_cache_budget(Some(400 * MIB - 1));
+        let third = engine
+            .try_get_file_with_intent(0, 100 * MIB, 1, Fetching::Streaming, BufferProfile::Large)
+            .await
+            .expect("another seek");
+        enginefs
+            .on_duration(TEST_HASH, 0, Duration::from_secs(20))
+            .await;
+        enginefs.reconcile_tick().await;
+        assert_eq!(engine.retention.draw_of(&0), Some(draw.clone()));
+        assert_eq!(
+            fake_advertises(&counters),
+            draw.into_iter().collect::<Vec<_>>()
+        );
+        drop((first, second, third));
+    }
+
+    /// **An unpin while the torrent is played stops nothing until playback
+    /// leaves it.**
+    ///
+    /// A download is shared whole, and unpinned it is shared by nothing:
+    /// what it announced has to end, and that ends only with the torrent
+    /// leaving the swarm. But the viewer is watching another file of the
+    /// same torrent, and stopping the torrent would stop the film for a
+    /// reason the viewer did not give. So the unpin waits: the torrent
+    /// stays in the swarm, the download's pieces stay announced and on the
+    /// disk -- nothing may take them while a peer may ask -- and the moment
+    /// playback leaves the torrent it stops, and they go.
+    #[tokio::test]
+    async fn an_unpin_while_the_torrent_is_played_stops_nothing_until_playback_leaves() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        enginefs
+            .apply_pins(Some(crate::piece_store::PinSet::from([(
+                TEST_HASH.to_string(),
+                vec![1usize],
+            )])))
+            .await;
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [0u32, 1, 4, 5] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+        play_file(&enginefs, &engine, 0).await;
+        engine.test_read_at(0, 0);
+        assert_eq!(fake_advertises(&counters), vec![1, 4, 5, 6, 7]);
+
+        assert!(
+            enginefs
+                .unpin_download(TEST_HASH, 1, false)
+                .await
+                .unwrap()
+                .unpinned
+        );
+        for _ in 0..2 {
+            enginefs.reconcile_tick().await;
+        }
+        enginefs.drop_slack().await;
+        assert_eq!(
+            counters.stop_torrent.load(Ordering::SeqCst),
+            0,
+            "an unpin stopped the torrent being played"
+        );
+        assert_eq!(engine.handle.run_state(), RunState::Live);
+        assert_eq!(
+            fake_advertises(&counters),
+            vec![1, 4, 5, 6, 7],
+            "and nothing was withdrawn"
+        );
+        assert!(
+            bucket.join("4").is_file() && bucket.join("5").is_file(),
+            "the download's announced pieces left the disk with the torrent in the swarm"
+        );
+
+        // Playback leaves the torrent.
+        nothing_torrent_is_playing(&enginefs);
+        enginefs.reconcile_tick().await;
+        assert_eq!(
+            counters.stop_torrent.load(Ordering::SeqCst),
+            1,
+            "playback left, and the torrent left the swarm"
+        );
+        assert!(
+            [0u32, 1, 4, 5]
+                .iter()
+                .all(|piece| !bucket.join(piece.to_string()).exists()),
+            "and then the ended session's bytes and the download's went"
+        );
+        assert!(fake_advertises(&counters).is_empty());
+        assert_eq!(engine.handle.run_state(), RunState::Paused);
+    }
+
+    /// **A torrent restarted out of an error announces nothing of a play
+    /// session that ended while it was dead.**
+    ///
+    /// The fork keeps a torrent's advertised set across a restart from
+    /// error. The viewer was playing file 0 when a write hit a full disk,
+    /// and moved on to something else while the torrent was dead; it is
+    /// restarted for the download it carries. Carried across, its set
+    /// would announce file 0's draw again -- a session nobody shares any
+    /// more -- to every peer the restarted torrent meets. So the set is made
+    /// again first, from what is shared now: the download, whole.
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_out_of_error_announces_nothing_of_a_session_that_ended_meanwhile() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(2);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        enginefs
+            .apply_pins(Some(crate::piece_store::PinSet::from([(
+                TEST_HASH.to_string(),
+                vec![1usize],
+            )])))
+            .await;
+        play_file(&enginefs, &engine, 0).await;
+        assert_eq!(fake_advertises(&counters), vec![1, 4, 5, 6, 7]);
+
+        counters.out_of_space.store(true, Ordering::SeqCst);
+        nothing_torrent_is_playing(&enginefs);
+        enginefs.reconcile_tick().await;
+        assert_eq!(
+            counters.restart_from_error.load(Ordering::SeqCst),
+            1,
+            "restarted for its download"
+        );
+        assert_eq!(engine.handle.run_state(), RunState::Live);
+        assert_eq!(
+            fake_advertises(&counters),
+            vec![4, 5, 6, 7],
+            "the restarted torrent announces the ended session's draw"
+        );
+    }
+
+    /// **The files nothing opened on a torrent nobody plays go -- except
+    /// what the torrent announces while it is in the swarm.**
+    ///
+    /// `reclaim_rest` takes the pieces no entity covers once nobody plays
+    /// the torrent. A download just unpinned is exactly such pieces, and
+    /// they are still announced: the pin advertised them, and only the
+    /// torrent leaving the swarm ends that. Taken now, with the torrent
+    /// live, they are bytes a peer was told of, gone.
+    #[tokio::test]
+    async fn the_rest_of_a_torrent_nobody_plays_keeps_what_it_announces_in_the_swarm() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        enginefs.apply_pins(Some(Default::default())).await;
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [0u32, 4, 5] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+        // File 1 was a download, advertised whole, and is unpinned; nothing
+        // ever opened it, so no entity covers it. Nobody plays the torrent,
+        // and it is still live.
+        engine.pinned_files.write().insert(1);
+        engine.advertise_shares().await;
+        engine.pinned_files.write().remove(&1);
+        nothing_torrent_is_playing(&enginefs);
+        assert_eq!(engine.handle.run_state(), RunState::Live);
+
+        engine
+            .retain(enginefs.store_registry(), &enginefs.live().reading())
+            .await;
+        assert!(
+            !bucket.join("0").exists(),
+            "the piece nothing opened and nothing announced went"
+        );
+        assert!(
+            bucket.join("4").is_file() && bucket.join("5").is_file(),
+            "the announced pieces left the disk with the torrent in the swarm"
+        );
+    }
+
+    /// **A breach of the sharing rule on a task nobody awaits still fails
+    /// the test that caused it.**
+    ///
+    /// The fake panics where it sees a breach, and a panic on a spawned task
+    /// goes to that task's `JoinHandle` -- which the caller of a background
+    /// task never reads, and which this test reads and throws away. The
+    /// breach is recorded as well, and the test's own [`Counters`] asks the
+    /// record when the test ends, on the test's own task.
+    #[tokio::test]
+    #[should_panic(expected = "the sharing rule was broken")]
+    async fn a_breach_on_a_task_nobody_awaits_still_fails_the_test() {
+        let (enginefs, _counters) = test_enginefs_with_file_count(1);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        engine
+            .handle
+            .set_pieces_advertised(0..1, true)
+            .await
+            .unwrap();
+        let handle = engine.handle.clone();
+        let breach =
+            tokio::spawn(async move { handle.set_pieces_advertised(0..1, false).await }).await;
+        assert!(
+            breach.is_err(),
+            "the withdrawal from a live torrent went through"
+        );
+    }
+
+    /// **A slack drop run on a background task keeps the rule too**: the
+    /// torrent the viewer left is still in the swarm, and what it announced
+    /// stays on the disk until it has left it. This test's only check is
+    /// the fake's record, read on this task when the test ends: the drop
+    /// runs where the switch task runs it, on a task whose panic nobody
+    /// reads.
+    #[tokio::test]
+    async fn a_slack_drop_on_a_background_task_takes_nothing_announced() {
+        let (two, engine, _bucket) = one_of_two_torrents_played().await;
+        two.enginefs
+            .on_stream_start_unreconciled(OTHER_HASH, 0)
+            .await;
+        let registry = two.enginefs.store_registry().clone();
+        let background = engine.clone();
+        let _ = tokio::spawn(async move { background.drop_slack(&registry).await }).await;
+    }
+
+    /// Run `file_idx`'s live pass at `now` and again past the draw's
+    /// fallback, with a byte delivered: what would make a play session that
+    /// waited for a rate draw anyway.
+    async fn passes_past_the_fallback(
+        enginefs: &BackendEngineFS<FakeBackend>,
+        engine: &Arc<Engine<FakeHandle>>,
+        file_idx: usize,
+    ) {
+        let now = std::time::Instant::now();
+        for at in [now, now + crate::retention::owner::DRAW_FALLBACK * 2] {
+            engine.test_read_at(file_idx, 0);
+            let claim = engine.retention.turn(&file_idx).await.expect("the turn");
+            engine
+                .retention
+                .pass_at(
+                    &file_idx,
+                    enginefs.store_registry(),
+                    claim,
+                    crate::retention::owner::Mode::Live,
+                    at,
+                )
+                .await;
+        }
+    }
+
+    /// **A subtitle read in the film's seek gap takes nothing from the
+    /// film, and draws nothing however long it is read.**
+    ///
+    /// A seek closes every read of the film for a moment; a subtitle
+    /// request landing in it (no `p=`) takes the liveness cell as any open
+    /// of an unread torrent's file does, and keeps it while it is read. The
+    /// cell decides windows and runs; what is shared is the player's
+    /// session's, which only a `p=` request moves -- so the film's draw is
+    /// still shared, nothing is a share to end, the torrent never stops,
+    /// and the subtitle -- opened here as a player's open would be, past
+    /// the draw's fallback -- draws nothing: no session is on it.
+    #[tokio::test]
+    async fn a_subtitle_in_the_films_seek_gap_takes_nothing_and_draws_nothing() {
+        use crate::backend::priorities::{BufferProfile, Fetching};
+        let (enginefs, counters) =
+            test_enginefs_with_files(vec![("film.mkv".into(), 1000), ("film.srt".into(), 1000)]);
+        counters.pieces_per_file.store(40, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(1_000_000));
+        nothing_torrent_is_playing(&enginefs);
+
+        enginefs.note_player(PLAYER, played(TEST_HASH, 0));
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        enginefs.focus_torrent(TEST_HASH).await;
+        let film = engine
+            .try_get_file_with_intent(0, 0, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("the film");
+        let film_draw: Vec<u32> = (0..40).collect();
+        assert_eq!(fake_advertises(&counters), film_draw, "the film's draw");
+
+        // The seek: the film's read and its connection close.
+        drop(film);
+        enginefs.on_stream_end(TEST_HASH, 0).await;
+        // The subtitle, in the gap: no player token.
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 1).await;
+        enginefs.focus_torrent(TEST_HASH).await;
+        let subtitle = engine
+            .try_get_file_with_intent(1, 0, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("the subtitle");
+        passes_past_the_fallback(&enginefs, &engine, 1).await;
+        for _ in 0..2 {
+            enginefs.reconcile_tick().await;
+        }
+        enginefs.drop_slack().await;
+        assert!(
+            engine.retention.draw_of(&1).is_none(),
+            "the subtitle drew: {:?}",
+            engine.retention.draw_of(&1)
+        );
+        assert_eq!(
+            counters.stop_torrent.load(Ordering::SeqCst),
+            0,
+            "the torrent left the swarm under the film"
+        );
+        assert_eq!(fake_advertises(&counters), film_draw);
+
+        // The film reopens at the new offset.
+        enginefs.note_player(PLAYER, played(TEST_HASH, 0));
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        enginefs.focus_torrent(TEST_HASH).await;
+        let film = engine
+            .try_get_file_with_intent(0, 500, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("the film again");
+        drop(subtitle);
+        enginefs.on_stream_end(TEST_HASH, 1).await;
+        enginefs.reconcile_tick().await;
+        assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 0);
+        assert_eq!(engine.handle.run_state(), RunState::Live);
+        assert_eq!(fake_advertises(&counters), film_draw);
+        drop(film);
+    }
+
+    /// **A stream opened with no player token never draws**, whatever holds
+    /// the liveness cell and however long it plays: another client on the
+    /// HTTP routes, a read of the server's own. Under a budget that covers
+    /// the file, where a player's open draws the whole file at once.
+    #[tokio::test]
+    async fn a_stream_with_no_player_token_never_draws() {
+        use crate::backend::priorities::{BufferProfile, Fetching};
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 1000)]);
+        counters.pieces_per_file.store(40, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(1_000_000));
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        let stream = engine
+            .try_get_file_with_intent(0, 0, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("the stream");
+        engine.told_duration(0, Duration::from_secs(1));
+        passes_past_the_fallback(&enginefs, &engine, 0).await;
+        enginefs.reconcile_tick().await;
+        assert!(engine.retention.draw_of(&0).is_none(), "it drew");
+        assert!(fake_advertises(&counters).is_empty());
+        drop(stream);
+    }
+
+    /// **An end of shares that fails still starts the viewer's torrent at
+    /// once, and the retry never waits out the dwell.**
+    ///
+    /// The next episode ends what the last one shared: the torrent stops,
+    /// and the backend will not rebuild its advertised set. Left stopped,
+    /// the episode being watched parked until a later reconcile -- which,
+    /// taken on the timer, waited out `RECONCILE_MIN_DWELL` after the stop
+    /// this made. So the torrent is started again at once, announcing what
+    /// it announced, and the next reconcile ends the shares; a torrent the
+    /// start did not take (the backend parked it again) is started by that
+    /// reconcile with no dwell either.
+    #[tokio::test]
+    async fn a_failed_end_of_shares_restarts_at_once_and_retries_without_the_dwell() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        play_file(&enginefs, &engine, 0).await;
+        assert_eq!(fake_advertises(&counters), vec![1]);
+
+        // The next episode, and a backend that will not rebuild the set.
+        enginefs.note_player("tv.2", played(TEST_HASH, 1));
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 1).await;
+        counters.refuses_advertise.store(true, Ordering::SeqCst);
+        enginefs.focus_torrent(TEST_HASH).await;
+        assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            engine.handle.run_state(),
+            RunState::Live,
+            "a failed end left the viewer's torrent stopped"
+        );
+        assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 1);
+
+        // The retry, on the timer: it ends the shares, and the backend parks
+        // the torrent at its start, as librqbit does under a check.
+        counters.refuses_advertise.store(false, Ordering::SeqCst);
+        counters.swallow_start.store(true, Ordering::SeqCst);
+        enginefs.reconcile_tick().await;
+        assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 2);
+        assert_eq!(fake_advertises(&counters), Vec::<u32>::new());
+        assert_eq!(engine.handle.run_state(), RunState::Paused);
+
+        // And the next timer reconcile starts it, seconds after the last
+        // move: no dwell for a stop an end made.
+        counters.swallow_start.store(false, Ordering::SeqCst);
+        enginefs.reconcile_tick().await;
+        assert_eq!(
+            engine.handle.run_state(),
+            RunState::Live,
+            "the viewer's torrent waited out the dwell"
+        );
+    }
+
+    /// **Two players on two files of one torrent never stop it under each
+    /// other.** One plays episode one, another client with a token of its
+    /// own plays episode five: two viewers, two sessions. (Not a case
+    /// xtremio makes -- its server is embedded, and no other device's player
+    /// uses it -- but a second token on the HTTP routes must not stop the
+    /// first viewer's torrent.) Either moving
+    /// on leaves a draw nobody shares, and ending it would stop the torrent
+    /// under the other player, so it waits -- announced, and on the disk --
+    /// until no session is on the torrent, and ends then.
+    #[tokio::test]
+    async fn two_players_on_one_torrent_never_stop_it_under_each_other() {
+        let (enginefs, counters) = test_enginefs_with_file_count(4);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let sit_down = |token: &'static str, file_idx: usize| {
+            let (enginefs, engine) = (&enginefs, &engine);
+            async move {
+                enginefs.note_player(token, played(TEST_HASH, file_idx));
+                enginefs
+                    .on_stream_start_unreconciled(TEST_HASH, file_idx)
+                    .await;
+                enginefs.focus_torrent(TEST_HASH).await;
+                engine.begin_retention(file_idx).await;
+                engine.told_duration(file_idx, Duration::from_secs(1));
+                engine.retention.settle_draw(&file_idx).await;
+            }
+        };
+        sit_down("tv.1", 0).await;
+        sit_down("phone.1", 1).await;
+        let both = fake_advertises(&counters);
+        assert!(both.len() >= 2, "both players' draws: {both:?}");
+
+        sit_down("tv.2", 2).await;
+        sit_down("phone.2", 3).await;
+        for _ in 0..2 {
+            enginefs.reconcile_tick().await;
+        }
+        assert_eq!(
+            counters.stop_torrent.load(Ordering::SeqCst),
+            0,
+            "one player's move stopped the torrent under the other"
+        );
+        let advertised = fake_advertises(&counters);
+        assert!(
+            both.iter().all(|piece| advertised.contains(piece)),
+            "the left draws are still announced: {advertised:?}"
+        );
+
+        // Both leave the torrent: nobody is on it, and what they left ends.
+        enginefs.note_player("tv.3", crate::retention::sessions::Played::Elsewhere);
+        nothing_torrent_is_playing(&enginefs);
+        enginefs.note_player("phone.3", crate::retention::sessions::Played::Elsewhere);
+        enginefs.reconcile_tick().await;
+        assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 1);
+        assert!(fake_advertises(&counters).is_empty());
+    }
+
+    /// **The live file's last read closing hands the cell to the file the
+    /// player's session is on**, not to the lowest-numbered file with a
+    /// read open -- which can be an older one the viewer left.
+    #[tokio::test]
+    async fn a_hand_on_goes_to_the_file_the_players_session_is_on() {
+        let (enginefs, _counters) = test_enginefs_with_file_count(3);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let mut reads = Vec::new();
+        for file_idx in [0usize, 1, 2] {
+            if file_idx == 2 {
+                enginefs.note_player(PLAYER, played(TEST_HASH, 2));
+            }
+            enginefs.on_stream_start(TEST_HASH, file_idx).await;
+            engine.begin_retention(file_idx).await;
+            let reader = engine
+                .retention
+                .reader_on(
+                    &file_idx,
+                    (file_idx, 0),
+                    crate::piece_store::Buffering::default(),
+                )
+                .expect("an entity");
+            reader.promises(0..1);
+            reads.push(reader);
+        }
+        assert_eq!(enginefs.live().reading().file_of(TEST_HASH), Some(0));
+        drop(reads.remove(0));
+        enginefs.on_stream_end(TEST_HASH, 0).await;
+        assert_eq!(
+            enginefs.live().reading().file_of(TEST_HASH),
+            Some(2),
+            "the cell went to a file the player is not playing"
+        );
+    }
+
+    /// **The old player screen stating its film's length again moves
+    /// nothing.** The player has moved on to the next episode; the screen it
+    /// left, still reading, reports the length of what it had -- which is no
+    /// request for anything. The session stays where the player's last
+    /// `p=` request put it, and nothing ends.
+    #[tokio::test]
+    async fn a_length_stated_by_the_screen_the_player_left_moves_nothing() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        play_file(&enginefs, &engine, 0).await;
+        enginefs.note_player("tv.2", played(TEST_HASH, 1));
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 1).await;
+        enginefs.focus_torrent(TEST_HASH).await;
+        engine.begin_retention(1).await;
+        engine.told_duration(1, Duration::from_secs(1));
+        engine.retention.settle_draw(&1).await;
+        let (stops, advertised) = (
+            counters.stop_torrent.load(Ordering::SeqCst),
+            fake_advertises(&counters),
+        );
+        let reading = enginefs.live().reading();
+
+        enginefs
+            .on_duration(TEST_HASH, 0, Duration::from_secs(1))
+            .await;
+        enginefs.reconcile_tick().await;
+        assert_eq!(
+            enginefs.live().sessions().of(PLAYER),
+            Some(played(TEST_HASH, 1))
+        );
+        assert_eq!(enginefs.live().reading(), reading);
+        assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), stops);
+        assert_eq!(fake_advertises(&counters), advertised);
+    }
+
+    /// Every piece file the store holds of this fixture's torrent.
+    fn pieces_on_disk(bucket: &std::path::Path) -> Vec<u32> {
+        let mut pieces: Vec<u32> = std::fs::read_dir(bucket)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        pieces.sort_unstable();
+        pieces
+    }
+
+    /// **The shared set is never fetched for the swarm.** A draw's pieces the
+    /// store does not hold yet are announced when the viewer's own window
+    /// brings them in, and a pass trims them out of what is fetched like
+    /// any piece outside its windows -- on the first pass after the draw,
+    /// and again after a seek. Kept wanted because they are advertised,
+    /// librqbit fetched the whole draw for peers the viewer never met.
+    #[tokio::test]
+    async fn a_draws_unheld_pieces_are_never_fetched_for_the_swarm() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 400)]);
+        counters.pieces_per_file.store(16, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        // Eight pieces of twenty-five bytes: four of window, four drawn.
+        enginefs.set_cache_budget(Some(200));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("0"), [7u8; 25]).unwrap();
+        let _store = seeded_store(&enginefs, &engine);
+        play_file(&enginefs, &engine, 0).await;
+        let draw = engine
+            .retention
+            .draw_of(&0)
+            .expect("drawn before any pass trimmed anything");
+        let fetched_for_the_swarm = || -> Vec<u32> {
+            let dropped = counters.dropped.lock().unwrap();
+            let windows = engine
+                .retention
+                .holding(&0)
+                .map(|holding| holding.windows)
+                .unwrap_or_default();
+            draw.iter()
+                .copied()
+                .filter(|piece| {
+                    *piece != 0
+                        && !windows.iter().any(|window| window.contains(piece))
+                        && !dropped.contains(piece)
+                })
+                .collect()
+        };
+
+        for at in [0u64, 300] {
+            engine.test_read_at(0, at);
+            engine
+                .retain(enginefs.store_registry(), &playing(0))
+                .await
+                .expect("a pass");
+            let outside = draw
+                .iter()
+                .filter(|piece| {
+                    **piece != 0
+                        && !engine.retention.holding(&0).is_some_and(|holding| {
+                            holding.windows.iter().any(|window| window.contains(piece))
+                        })
+                })
+                .count();
+            assert!(
+                outside > 0,
+                "the draw lies inside the window at {at}: {draw:?}"
+            );
+            assert_eq!(
+                fetched_for_the_swarm(),
+                Vec::<u32>::new(),
+                "at {at}: draw pieces nobody's window asked for are still wanted"
+            );
+        }
+    }
+
+    /// **A resumed film is still drawn**: its first bytes are read only for
+    /// the container's header, the player goes straight on to the resume
+    /// point, and the draw waits on those bytes to tell a film from an
+    /// archive. So the head stays wanted and out of every unlink while the
+    /// draw waits -- a pass at the resume point does not trim it -- and
+    /// once it is held the draw is made and the head is an ordinary piece
+    /// again, trimmed like any other outside the window.
+    #[tokio::test]
+    async fn a_resumed_film_keeps_its_head_until_the_draw_has_read_it() {
+        const PIECE: u64 = 64 * 1024;
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 16 * PIECE)]);
+        counters.pieces_per_file.store(16, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(8 * PIECE));
+        let _store = seeded_store(&enginefs, &engine);
+        // The head is not held yet.
+        counters.file_heads.lock().unwrap().insert(0, None);
+        enginefs.live().open(
+            crate::retention::live::LiveEntity::Torrent {
+                info_hash: TEST_HASH.to_string(),
+                file_idx: 0,
+            },
+            false,
+        );
+        enginefs.note_player(PLAYER, played(TEST_HASH, 0));
+        engine.begin_retention(0).await;
+        engine.told_duration(0, Duration::from_secs(1));
+        engine.retention.settle_draw(&0).await;
+        assert_eq!(
+            engine.retention.draw_of(&0),
+            None,
+            "drawn with no head held"
+        );
+
+        // The player has read the header and gone on to the resume point.
+        engine.test_read_at(0, 12 * PIECE);
+        engine
+            .retain(enginefs.store_registry(), &playing(0))
+            .await
+            .expect("a pass at the resume point");
+        assert!(
+            (1u32..8).any(|piece| counters.dropped.lock().unwrap().contains(&piece)),
+            "the pass trimmed nothing outside its window: {:?}",
+            counters.dropped.lock().unwrap()
+        );
+        assert!(
+            !counters.dropped.lock().unwrap().contains(&0),
+            "the head was trimmed before the draw could read it"
+        );
+        assert_eq!(engine.retention.draw_of(&0), None);
+
+        // The head arrives: the next pass reads it, and draws.
+        counters.file_heads.lock().unwrap().remove(&0);
+        engine
+            .retain(enginefs.store_registry(), &playing(0))
+            .await
+            .expect("a pass");
+        assert!(
+            engine
+                .retention
+                .draw_of(&0)
+                .is_some_and(|draw| !draw.is_empty()),
+            "the resumed film's session drew nothing"
+        );
+        engine
+            .retain(enginefs.store_registry(), &playing(0))
+            .await
+            .expect("a pass");
+        let draw = engine.retention.draw_of(&0).unwrap_or_default();
+        assert!(
+            draw.contains(&0) || counters.dropped.lock().unwrap().contains(&0),
+            "the head is still held back from the trim once the draw is made"
+        );
+    }
+
+    /// **A head that spans pieces is not given back half held.** Under
+    /// pieces smaller than the bytes the draw reads, the head is several
+    /// pieces, and while one of them is still to come the ones on the disk
+    /// are out of every unlink: reclaimed, they would be fetched again --
+    /// the head is wanted until the draw has read it -- and given back
+    /// again, pass after pass, for the life of the film.
+    #[tokio::test]
+    async fn a_head_held_in_part_is_not_reclaimed() {
+        const PIECE: u64 = 16 * 1024;
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 16 * PIECE)]);
+        counters.pieces_per_file.store(16, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        // One piece of budget, and two of the head's three on the disk.
+        enginefs.set_cache_budget(Some(PIECE));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [0u32, 1] {
+            std::fs::write(bucket.join(piece.to_string()), vec![0u8; PIECE as usize]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+        counters.file_heads.lock().unwrap().insert(0, None);
+        enginefs.live().open(
+            crate::retention::live::LiveEntity::Torrent {
+                info_hash: TEST_HASH.to_string(),
+                file_idx: 0,
+            },
+            false,
+        );
+        enginefs.note_player(PLAYER, played(TEST_HASH, 0));
+        engine.begin_retention(0).await;
+        engine.told_duration(0, Duration::from_secs(1));
+
+        engine.test_read_at(0, 12 * PIECE);
+        engine
+            .retain(enginefs.store_registry(), &playing(0))
+            .await
+            .expect("a pass at the resume point");
+        assert_eq!(
+            pieces_on_disk(&bucket),
+            vec![0, 1],
+            "the half-held head was given back while the draw waits on it"
+        );
+        assert_eq!(engine.retention.draw_of(&0), None);
+    }
+
+    /// **A binge through the app's screens: each next episode moves the
+    /// viewer's session, restarts the torrent, and takes the last episode
+    /// off the disk after the restart -- never past the cap.**
+    ///
+    /// The app opens each episode on a new player screen, and each screen
+    /// has a token of its own: `tv.1`, `tv.2`, `tv.3` -- one viewer, three
+    /// screens. Keyed on the whole token, three sessions would each hold
+    /// their episode shared for the whole binge, every draw kept past the
+    /// budget; keyed on the viewer, each new screen moves the one session.
+    #[tokio::test]
+    async fn a_binge_through_new_screens_moves_one_session_and_stays_under_the_cap() {
+        let (enginefs, counters) = test_enginefs_with_file_count(3);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        // Two pieces of twenty-five bytes.
+        enginefs.set_cache_budget(Some(50));
+        nothing_torrent_is_playing(&enginefs);
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        let store = seeded_store(&enginefs, &engine);
+        for episode in 0..3usize {
+            let first = episode as u32 * 4;
+            let at_first_drop: Arc<Mutex<Option<(usize, RunState)>>> = Arc::default();
+            *counters.on_first_drop.lock().unwrap() = Some(Box::new({
+                let at_first_drop = at_first_drop.clone();
+                let counters = counters.0.clone();
+                let handle = engine.handle.clone();
+                move || {
+                    *at_first_drop.lock().unwrap() = Some((
+                        counters.start_torrent.load(Ordering::SeqCst),
+                        handle.run_state(),
+                    ));
+                }
+            }));
+            let token = format!("tv.{}", episode + 1);
+            enginefs.note_player(&token, played(TEST_HASH, episode));
+            enginefs
+                .on_stream_start_unreconciled(TEST_HASH, episode)
+                .await;
+            enginefs.focus_torrent(TEST_HASH).await;
+            engine.begin_retention(episode).await;
+            engine.told_duration(episode, Duration::from_secs(1));
+            engine.retention.settle_draw(&episode).await;
+            // The episode plays: its first two pieces arrive.
+            for piece in [first, first + 1] {
+                std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+            }
+            store.init_for_tests().unwrap();
+            engine.test_read_at(episode, 25);
+            engine
+                .retain(enginefs.store_registry(), &enginefs.live().reading())
+                .await;
+            if episode > 0 {
+                let before = first - 4;
+                assert!(
+                    wait_until(TEST_WAIT_BOUND, || {
+                        let held = pieces_on_disk(&bucket);
+                        !held.contains(&before) && !held.contains(&(before + 1))
+                    })
+                    .await,
+                    "episode {episode}'s predecessor stayed on the disk: {:?}",
+                    pieces_on_disk(&bucket)
+                );
+                assert_eq!(
+                    *at_first_drop.lock().unwrap(),
+                    Some((episode, RunState::Live)),
+                    "the predecessor went before the torrent had started again"
+                );
+            }
+            let held = pieces_on_disk(&bucket);
+            assert!(
+                held.len() <= 2,
+                "episode {episode}: {held:?} is over the two-piece cap"
+            );
+        }
+        assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 2);
+    }
+
+    /// **A binge whose last screen is still reading when the next one
+    /// takes over.** The app opens episode two on screen `tv.2` while
+    /// `tv.1`'s player has not yet let go of episode one: the move still
+    /// ends what episode one shared at once -- the torrent stops, its set
+    /// is made again, it starts for episode two -- but the drop that
+    /// follows takes nothing of a file a read is open on. Once that read
+    /// ends, the next tick takes episode one off the disk.
+    #[tokio::test]
+    async fn a_binge_with_the_last_screen_still_reading_deletes_it_after_the_read() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        nothing_torrent_is_playing(&enginefs);
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        let store = seeded_store(&enginefs, &engine);
+        let open_episode = |token: &'static str, episode: usize| {
+            let (enginefs, engine) = (&enginefs, &engine);
+            async move {
+                enginefs.note_player(token, played(TEST_HASH, episode));
+                enginefs
+                    .on_stream_start_unreconciled(TEST_HASH, episode)
+                    .await;
+                enginefs.focus_torrent(TEST_HASH).await;
+                engine.begin_retention(episode).await;
+                engine.told_duration(episode, Duration::from_secs(1));
+                engine.retention.settle_draw(&episode).await;
+            }
+        };
+
+        open_episode("tv.1", 0).await;
+        for piece in [0u32, 1] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        store.init_for_tests().unwrap();
+        // Screen one's read of episode one, still open.
+        let reader = engine
+            .retention
+            .reader_on(&0, (0, 0), crate::piece_store::Buffering::default())
+            .expect("episode one has an entity");
+        reader.promises(0..1);
+        let stops = counters.stop_torrent.load(Ordering::SeqCst);
+
+        open_episode("tv.2", 1).await;
+        assert_eq!(
+            counters.stop_torrent.load(Ordering::SeqCst),
+            stops + 1,
+            "the move did not end what episode one shared"
+        );
+        assert_eq!(engine.handle.run_state(), RunState::Live);
+        engine.drop_slack(enginefs.store_registry()).await;
+        assert_eq!(
+            pieces_on_disk(&bucket),
+            vec![0, 1],
+            "the drop took a file a read is open on"
+        );
+
+        drop(reader);
+        enginefs.on_stream_end(TEST_HASH, 0).await;
+        enginefs.reconcile_tick().await;
+        assert!(
+            wait_until(TEST_WAIT_BOUND, || pieces_on_disk(&bucket).is_empty()).await,
+            "episode one stayed on the disk after its read ended: {:?}",
+            pieces_on_disk(&bucket)
+        );
+    }
+
+    /// **The same film on a new screen is no move**: the viewer closed the
+    /// player and opened it again. Nothing ends, the torrent does not
+    /// restart, and the play session's draw stands and is adopted.
+    #[tokio::test]
+    async fn the_same_film_on_a_new_screen_moves_nothing() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        play_file(&enginefs, &engine, 0).await;
+        let (draw, advertised) = (engine.retention.draw_of(&0), fake_advertises(&counters));
+        assert!(draw.as_ref().is_some_and(|draw| !draw.is_empty()));
+
+        assert_eq!(
+            enginefs.note_player("tv.2", played(TEST_HASH, 0)),
+            crate::retention::sessions::Heard::Current { moved: false }
+        );
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        enginefs.focus_torrent(TEST_HASH).await;
+        engine.begin_retention(0).await;
+        enginefs.reconcile_tick().await;
+        assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 0);
+        assert_eq!(engine.retention.draw_of(&0), draw);
+        assert_eq!(fake_advertises(&counters), advertised);
+    }
+
+    /// **A reconnect of the screen the viewer left moves nothing.** The next
+    /// episode's screen has taken over; the last screen's player, still
+    /// tearing down, asks for its episode once more. That request is an
+    /// older screen's: it neither moves the session back nor starts one,
+    /// and what the next episode shares is not ended by it.
+    #[tokio::test]
+    async fn a_reconnect_of_the_screen_left_behind_moves_nothing() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        play_file(&enginefs, &engine, 0).await;
+        enginefs.note_player("tv.2", played(TEST_HASH, 1));
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 1).await;
+        enginefs.focus_torrent(TEST_HASH).await;
+        engine.begin_retention(1).await;
+        engine.told_duration(1, Duration::from_secs(1));
+        engine.retention.settle_draw(&1).await;
+        let (stops, advertised) = (
+            counters.stop_torrent.load(Ordering::SeqCst),
+            fake_advertises(&counters),
+        );
+
+        assert_eq!(
+            enginefs.note_player(PLAYER, played(TEST_HASH, 0)),
+            crate::retention::sessions::Heard::Stale
+        );
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        enginefs.focus_torrent(TEST_HASH).await;
+        enginefs.reconcile_tick().await;
+        assert_eq!(
+            enginefs.live().sessions().of("tv.2"),
+            Some(played(TEST_HASH, 1))
+        );
+        assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), stops);
+        assert_eq!(fake_advertises(&counters), advertised);
+    }
+
+    /// **A torrent stopped while its play session was on it announces
+    /// nothing stale when it starts again.** The viewer went back to the
+    /// board; another stream took the cell, the torrent stopped, and its
+    /// file's slack pass took the draw with the bytes -- while the fork kept
+    /// the advertised set. The viewer opens the film again: the torrent
+    /// starts, and the fake's check at the start fails a test whose torrent
+    /// would announce a piece no session drew and no pin covers.
+    #[tokio::test]
+    async fn a_stopped_torrent_reopened_announces_nothing_stale() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [0u32, 1] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+        play_file(&enginefs, &engine, 0).await;
+        let advertised = fake_advertises(&counters);
+        assert!(!advertised.is_empty());
+
+        // Another stream takes the cell; the viewer's session stays.
+        enginefs.live().open(
+            crate::retention::live::LiveEntity::Proxy {
+                dir: "/elsewhere".into(),
+            },
+            false,
+        );
+        let mut rounds = 0;
+        while engine.retention.draw_of(&0).is_some() {
+            rounds += 1;
+            assert!(rounds < 10, "the stopped torrent's file kept its draw");
+            enginefs.reconcile_tick().await;
+        }
+        assert_eq!(engine.handle.run_state(), RunState::Paused);
+        assert_eq!(
+            fake_advertises(&counters),
+            advertised,
+            "the fork kept the set"
+        );
+
+        // The viewer opens the film again.
+        enginefs.note_player("tv.2", played(TEST_HASH, 0));
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        enginefs.focus_torrent(TEST_HASH).await;
+        assert_eq!(engine.handle.run_state(), RunState::Live);
+        assert!(
+            fake_advertises(&counters).is_empty(),
+            "the restarted torrent announces the old draw: {:?}",
+            fake_advertises(&counters)
+        );
+    }
+
+    /// **A read with no player token draws nothing, even on a file a
+    /// viewer's session is on**: the phone's player put its session on the
+    /// film and left for the board, and another client plays the film over
+    /// the HTTP route. That client's open is not a player's.
+    #[tokio::test]
+    async fn a_read_with_no_player_token_draws_nothing_on_a_file_a_session_is_on() {
+        use crate::backend::priorities::{BufferProfile, Fetching};
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 1000)]);
+        counters.pieces_per_file.store(40, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(1_000_000));
+        enginefs.note_player("phone.1", played(TEST_HASH, 0));
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        let stream = engine
+            .try_get_file_unshared(0, 0, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("the other client's stream");
+        engine.told_duration(0, Duration::from_secs(1));
+        passes_past_the_fallback(&enginefs, &engine, 0).await;
+        enginefs.reconcile_tick().await;
+        assert!(engine.retention.draw_of(&0).is_none(), "it drew");
+        assert!(fake_advertises(&counters).is_empty());
+        drop(stream);
+    }
+
+    /// **An archive is told by its content, not its name**, and its play
+    /// session shares nothing: a file named like a film whose first bytes
+    /// are a RAR's, under a budget that covers it, where a film would be
+    /// shared whole at the open. Until its first bytes are held, nothing is
+    /// decided.
+    #[tokio::test]
+    async fn an_archive_told_by_its_content_shares_nothing() {
+        use crate::backend::priorities::{BufferProfile, Fetching};
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 1000)]);
+        counters.pieces_per_file.store(40, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(1_000_000));
+        counters.file_heads.lock().unwrap().insert(0, None);
+        enginefs.note_player(PLAYER, played(TEST_HASH, 0));
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        let stream = engine
+            .try_get_file_with_intent(0, 0, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("the stream");
+        assert!(
+            engine.retention.draw_of(&0).is_none(),
+            "drawn before the file's first bytes were held"
+        );
+
+        let mut head = vec![0u8; 1000];
+        head[..7].copy_from_slice(b"Rar!\x1a\x07\x00");
+        counters.file_heads.lock().unwrap().insert(0, Some(head));
+        engine.retention.settle_draw(&0).await;
+        assert_eq!(
+            engine.retention.draw_of(&0),
+            Some(std::collections::BTreeSet::new()),
+            "an archive's play session draws nothing"
+        );
+        assert!(fake_advertises(&counters).is_empty());
+        drop(stream);
+    }
+
+    /// **A draw whose first bytes were read across a move is not made.**
+    /// The play session's draw waits on the file's head; while that read
+    /// is parked the viewer's next screen moves its session to another
+    /// file. The draw would share a file nobody plays -- recorded and
+    /// advertised, ended only by stopping the torrent -- so it is asked
+    /// again whether a session plays the file before anything is recorded.
+    #[tokio::test]
+    async fn a_draw_whose_head_read_straddles_a_move_is_not_made() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        // The budget covers the file: the draw is due at the open.
+        enginefs.set_cache_budget(Some(1_000_000));
+        let (entered, release) = (
+            tokio::sync::oneshot::channel::<()>(),
+            tokio::sync::oneshot::channel::<()>(),
+        );
+        *counters.head_gate.lock().unwrap() = Some((entered.0, release.1));
+        enginefs.note_player(PLAYER, played(TEST_HASH, 0));
+        let open = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.begin_retention(0).await }
+        });
+        tokio::time::timeout(TEST_WAIT_BOUND, entered.1)
+            .await
+            .expect("the draw reads the file's head")
+            .expect("the gate");
+
+        enginefs.note_player("tv.2", played(TEST_HASH, 1));
+        release.0.send(()).expect("the parked head read");
+        tokio::time::timeout(TEST_WAIT_BOUND, open)
+            .await
+            .expect("the open finishes")
+            .expect("the open task");
+        assert_eq!(
+            engine.retention.draw_of(&0),
+            None,
+            "a draw was made for a file the viewer had left"
+        );
+        assert!(fake_advertises(&counters).is_empty());
+    }
+
+    /// **The next episode's reader does not wait on the last episode's
+    /// unlinks.** They run after the restart, on a task of their own: here
+    /// the first of them is parked, and the next episode's reconcile and
+    /// its reader's open both finish while it is.
+    #[tokio::test]
+    async fn the_next_episodes_reader_does_not_wait_on_the_last_ones_unlinks() {
+        use crate::backend::priorities::{BufferProfile, Fetching};
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [0u32, 1] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+        play_file(&enginefs, &engine, 0).await;
+        engine.test_read_at(0, 0);
+
+        let (entered, release) = (
+            tokio::sync::oneshot::channel::<()>(),
+            tokio::sync::oneshot::channel::<()>(),
+        );
+        *counters.drop_gate.lock().unwrap() = Some((entered.0, release.1));
+        enginefs.note_player("tv.2", played(TEST_HASH, 1));
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 1).await;
+        assert!(
+            tokio::time::timeout(TEST_WAIT_BOUND, enginefs.focus_torrent(TEST_HASH))
+                .await
+                .is_ok(),
+            "the next episode's reconcile waited on the last one's unlinks"
+        );
+        let reader = tokio::time::timeout(
+            TEST_WAIT_BOUND,
+            engine.try_get_file_with_intent(1, 0, 1, Fetching::Streaming, BufferProfile::Normal),
+        )
+        .await
+        .expect("the next episode's reader waited on the unlinks")
+        .expect("the next episode's reader");
+        entered
+            .1
+            .await
+            .expect("the unlinks reached their first drop");
+        release.0.send(()).expect("the parked drop");
+        assert!(
+            wait_until(TEST_WAIT_BOUND, || !bucket.join("1").exists()).await,
+            "the last episode's pieces stayed"
+        );
+        drop(reader);
+    }
+
+    /// **A live pass leaves alone a piece another file announced**: the
+    /// piece a file shares with its neighbour, advertised by the
+    /// neighbour's session, outside this file's window and over its
+    /// allowance. Taken, it is a piece a peer was told of, gone.
+    #[tokio::test]
+    async fn a_live_pass_leaves_alone_a_boundary_piece_the_neighbour_announced() {
+        let (enginefs, _counters) = a_neighbour_the_backend_does_not_want_yet();
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in 4u32..9 {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+        // The third episode's session announced the boundary piece.
+        engine
+            .handle
+            .set_pieces_advertised(8..9, true)
+            .await
+            .unwrap();
+        enginefs.live().open(
+            crate::retention::live::LiveEntity::Torrent {
+                info_hash: TEST_HASH.to_string(),
+                file_idx: 1,
+            },
+            false,
+        );
+        engine.begin_retention(1).await;
+        engine.test_read_at(1, 0);
+        engine
+            .retain(enginefs.store_registry(), &playing(1))
+            .await
+            .expect("a pass");
+        assert!(
+            bucket.join("8").is_file(),
+            "the announced boundary piece went"
+        );
+        assert!(
+            !bucket.join("6").exists() || !bucket.join("7").exists(),
+            "the pass took nothing at all: {:?}",
+            pieces_on_disk(&bucket)
+        );
+    }
+
+    /// **The want step leaves alone a piece another file announced, even
+    /// one that arrives under its drop**: the boundary piece the neighbour's
+    /// session advertised, not on the disk when the pass listed it and
+    /// complete by the time the pass's drop of everything outside its
+    /// window runs. Dropped and unlinked, it is a piece a peer was told of,
+    /// gone.
+    #[tokio::test]
+    async fn the_want_step_leaves_alone_a_boundary_piece_the_neighbour_announced() {
+        let (enginefs, counters) = a_neighbour_the_backend_does_not_want_yet();
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [4u32, 5] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+        engine
+            .handle
+            .set_pieces_advertised(8..9, true)
+            .await
+            .unwrap();
+        let arrived: Arc<Mutex<Option<crate::piece_store::PieceStore>>> = Arc::default();
+        *counters.on_first_drop.lock().unwrap() = Some(Box::new({
+            let bucket = bucket.clone();
+            let registry = enginefs.store_registry().clone();
+            let layout = engine.handle.layout().expect("a layout");
+            let arrived = arrived.clone();
+            move || {
+                std::fs::write(bucket.join("8"), [7u8; 25]).unwrap();
+                let store = crate::piece_store::PieceStore::under(registry, TEST_HASH, layout);
+                store.init_for_tests().unwrap();
+                *arrived.lock().unwrap() = Some(store);
+            }
+        }));
+        enginefs.live().open(
+            crate::retention::live::LiveEntity::Torrent {
+                info_hash: TEST_HASH.to_string(),
+                file_idx: 1,
+            },
+            false,
+        );
+        engine.begin_retention(1).await;
+        engine.test_read_at(1, 0);
+        engine
+            .retain(enginefs.store_registry(), &playing(1))
+            .await
+            .expect("a pass");
+        assert!(
+            counters.on_first_drop.lock().unwrap().is_none(),
+            "the want step dropped nothing, so nothing arrived under it"
+        );
+        assert!(
+            bucket.join("8").is_file(),
+            "the announced boundary piece that arrived under the drop went"
+        );
+    }
+
+    /// **A slack pass that began on a stopped torrent takes nothing it
+    /// announces once the torrent has started under it.** The pass found
+    /// the torrent paused -- no peer to be told of anything -- and the
+    /// torrent was started between its first run and its second, the second
+    /// holding an advertised piece.
+    #[tokio::test]
+    async fn a_slack_pass_takes_nothing_announced_once_the_torrent_starts_under_it() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [0u32, 1, 3] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+        engine.begin_retention(0).await;
+        nothing_torrent_is_playing(&enginefs);
+        counters.paused.store(true, Ordering::SeqCst);
+        engine
+            .handle
+            .set_pieces_advertised(3..4, true)
+            .await
+            .unwrap();
+        *counters.on_first_drop.lock().unwrap() = Some(Box::new({
+            let counters = counters.0.clone();
+            move || counters.paused.store(false, Ordering::SeqCst)
+        }));
+        engine.drop_slack(enginefs.store_registry()).await;
+        assert!(!bucket.join("0").exists() && !bucket.join("1").exists());
+        assert!(
+            bucket.join("3").is_file(),
+            "an announced piece went with the torrent live"
+        );
+    }
+
+    /// **A drawn piece that completes under the want step is never
+    /// unlinked with the torrent live.**
+    ///
+    /// The pass's want step stops wanting every piece outside the window
+    /// that the listing did not find, and unlinks whatever of them the
+    /// store has *now* -- a piece that completed between the listing and
+    /// the drop. A piece of the draw is among them if it is outside the
+    /// window, and it is advertised: announced the instant it completed.
+    /// So the draw is in what the pass holds out of every unlink, and it
+    /// stays on the disk.
+    #[tokio::test]
+    async fn a_drawn_piece_that_arrives_under_the_want_step_is_never_unlinked() {
+        let (enginefs, counters) = test_enginefs_with_file_count(1);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("3"), [7u8; 25]).unwrap();
+        let _store = seeded_store(&enginefs, &engine);
+        play_file(&enginefs, &engine, 0).await;
+        assert_eq!(fake_advertises(&counters), vec![1], "the draw");
+        // The viewer is at the last piece; piece 1 -- the draw -- completes
+        // inside the want step's drop of everything outside the window: the
+        // store that registers now holds it, and is kept for the unlink.
+        let arrived: Arc<Mutex<Option<crate::piece_store::PieceStore>>> = Arc::default();
+        *counters.on_first_drop.lock().unwrap() = Some(Box::new({
+            let bucket = bucket.clone();
+            let registry = enginefs.store_registry().clone();
+            let layout = engine.handle.layout().expect("a layout");
+            let arrived = arrived.clone();
+            move || {
+                std::fs::write(bucket.join("1"), [7u8; 25]).unwrap();
+                let store = crate::piece_store::PieceStore::under(registry, TEST_HASH, layout);
+                store.init_for_tests().unwrap();
+                *arrived.lock().unwrap() = Some(store);
+            }
+        }));
+        engine.test_read_at(0, 75);
+        engine
+            .retain(enginefs.store_registry(), &playing(0))
+            .await
+            .expect("a pass");
+        assert!(
+            counters.on_first_drop.lock().unwrap().is_none(),
+            "the want step dropped nothing, so nothing arrived under it"
+        );
+        assert!(
+            bucket.join("1").is_file(),
+            "the drawn piece that arrived under the drop was unlinked"
+        );
+    }
+
+    /// Two torrents of two four-piece files each, file 0 of the first
+    /// played with pieces 0 and 1 on the disk and its draw -- piece 1 --
+    /// advertised and committed; the second with nothing. What a switch to
+    /// the second leaves behind.
+    async fn one_of_two_torrents_played()
+    -> (TwoEngines, Arc<Engine<FakeHandle>>, std::path::PathBuf) {
+        let two = test_enginefs_with_two_engines();
+        for counters in &two.counters {
+            counters.pieces_per_file.store(4, Ordering::SeqCst);
+            counters
+                .drops_what_it_is_asked
+                .store(true, Ordering::SeqCst);
+        }
+        let enginefs = &two.enginefs;
+        enginefs.set_cache_budget(Some(50));
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [0u32, 1] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let store = seeded_store(enginefs, &engine);
+        // Leaked: the registry holds it weakly, and the test outlives this.
+        std::mem::forget(store);
+        enginefs.note_player(PLAYER, played(TEST_HASH, 0));
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        engine.begin_retention(0).await;
+        // The player states the film's length; the pass below draws.
+        engine.told_duration(0, Duration::from_secs(1));
+        engine.test_read_at(0, 0);
+        engine
+            .retain(enginefs.store_registry(), &enginefs.live().reading())
+            .await
+            .expect("a pass");
+        assert_eq!(fake_advertises(&two.counters[0]), vec![1]);
+        (two, engine, bucket)
+    }
+
+    /// **A switch to another torrent stops the torrent left behind before
+    /// its bytes go.**
+    ///
+    /// The switch task (`drop_slack`) runs the moment the cell moves, and
+    /// the torrent the viewer left advertises a piece its play session
+    /// drew: that is a share to end, so it is reconciled at once -- stopped,
+    /// then emptied, its advertised set cleared -- and it stays stopped,
+    /// since nobody plays or pinned it. Before the rule the switch task
+    /// deleted it while it was still in the swarm, up to a tick before the
+    /// reconciler stopped it.
+    #[tokio::test]
+    async fn a_switch_to_another_torrent_stops_the_one_left_before_its_bytes_go() {
+        let (two, engine, bucket) = one_of_two_torrents_played().await;
+        let enginefs = &two.enginefs;
+        let left = &two.counters[0];
+        enginefs.note_player(PLAYER, played(OTHER_HASH, 0));
+        enginefs.on_stream_start_unreconciled(OTHER_HASH, 0).await;
+        assert!(engine.shares_to_end().await);
+
+        enginefs.drop_slack().await;
+        assert_eq!(
+            left.stop_torrent.load(Ordering::SeqCst),
+            1,
+            "the torrent left behind left the swarm"
+        );
+        assert!(
+            !bucket.join("0").exists() && !bucket.join("1").exists(),
+            "and then its play session's bytes went, the announced piece among them"
+        );
+        assert!(
+            fake_advertises(left).is_empty(),
+            "and its advertised set with them"
+        );
+        assert_eq!(
+            left.start_torrent.load(Ordering::SeqCst),
+            0,
+            "nobody plays it and nobody pinned it: it stays out of the swarm"
+        );
+        assert_eq!(engine.handle.run_state(), RunState::Paused);
+        assert_eq!(two.counters[1].stop_torrent.load(Ordering::SeqCst), 0);
+    }
+
+    /// **A cache clean ends what a torrent nobody plays shares by stopping
+    /// it first.** `clean_cache_now`, the running-low bell and the stream
+    /// route's disk gate all call `drop_slack`; a torrent still live that
+    /// advertises what nobody shares is stopped before its bytes go, never
+    /// emptied under its peers.
+    #[tokio::test]
+    async fn a_cache_clean_stops_a_torrent_before_it_takes_what_it_announced() {
+        let (two, engine, bucket) = one_of_two_torrents_played().await;
+        let enginefs = &two.enginefs;
+        nothing_torrent_is_playing(enginefs);
+        let freed = enginefs.drop_slack().await;
+        assert_eq!(freed, 2, "both pieces of the ended session");
+        assert_eq!(two.counters[0].stop_torrent.load(Ordering::SeqCst), 1);
+        assert!(!bucket.join("1").exists());
+        assert_eq!(engine.handle.run_state(), RunState::Paused);
+        assert!(!engine.shares_to_end().await);
+    }
+
+    /// **A download is shared whole, from the pin, and keeps being shared
+    /// once it has finished.** Nothing a play session does ends it: it is
+    /// in what the torrent shares for as long as the pin stands, so the
+    /// torrent is never stopped for it and its pieces never withdrawn.
+    #[tokio::test]
+    async fn a_download_is_shared_whole_and_stays_shared_once_it_has_finished() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        nothing_torrent_is_playing(&enginefs);
+        enginefs
+            .apply_pins(Some(crate::piece_store::PinSet::from([(
+                TEST_HASH.to_string(),
+                vec![1usize],
+            )])))
+            .await;
+        assert_eq!(
+            fake_advertises(&counters),
+            vec![4, 5, 6, 7],
+            "the pinned file, whole, before anything of it is here"
+        );
+        // It downloads, and finishes.
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in 4u32..8 {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+        counters.seeded.store(true, Ordering::SeqCst);
+        for _ in 0..3 {
+            enginefs.reconcile_tick().await;
+        }
+        assert_eq!(fake_advertises(&counters), vec![4, 5, 6, 7]);
+        assert!(!engine.shares_to_end().await);
+        assert_eq!(
+            counters.stop_torrent.load(Ordering::SeqCst),
+            0,
+            "a finished download is still shared: its torrent runs"
+        );
+        assert!((4u32..8).all(|piece| bucket.join(piece.to_string()).is_file()));
+    }
+
+    /// **A restart out of an error neither withdraws nor re-advertises
+    /// anything.** The backend keeps what it advertises across the restart
+    /// (the fork's set is not in the chunk tracker the restart rebuilds),
+    /// so there is nothing for a pass to put right, and a pass that tried
+    /// -- the hold-back re-issue of old -- would be a withdrawal from a live
+    /// torrent, which the fake fails on the spot.
+    #[tokio::test]
+    async fn a_restart_out_of_error_neither_withdraws_nor_re_advertises() {
+        let (enginefs, counters) = test_enginefs_with_file_count(1);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        play_file(&enginefs, &engine, 0).await;
+        engine.test_read_at(0, 0);
+        let before = counters.advertised.lock().unwrap().clone();
+        assert_eq!(before, vec![(1..2, true)]);
+
+        counters.out_of_space.store(true, Ordering::SeqCst);
+        engine.handle.restart_from_error().await.expect("restart");
+        for _ in 0..2 {
+            engine.retain(enginefs.store_registry(), &playing(0)).await;
+        }
+        assert_eq!(*counters.advertised.lock().unwrap(), before);
+        assert_eq!(fake_advertises(&counters), vec![1]);
+    }
+
+    /// **Shutdown stops every torrent, then takes what the play sessions
+    /// fetched, and leaves the downloads.** Best effort -- the next start's
+    /// launch sweep takes whatever is left of a torrent nobody pinned -- but
+    /// in that order: a torrent still in the swarm is never emptied.
+    #[tokio::test]
+    async fn shutdown_stops_every_torrent_before_it_takes_the_played_files() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        enginefs
+            .apply_pins(Some(crate::piece_store::PinSet::from([(
+                TEST_HASH.to_string(),
+                vec![1usize],
+            )])))
+            .await;
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in [0u32, 1, 4, 5] {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+        play_file(&enginefs, &engine, 0).await;
+        engine.test_read_at(0, 0);
+        assert_eq!(fake_advertises(&counters), vec![1, 4, 5, 6, 7]);
+
+        let freed = enginefs.end_every_session().await;
+        assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 1);
+        assert_eq!(freed, 2, "the played file's two pieces");
+        assert!(!bucket.join("0").exists() && !bucket.join("1").exists());
+        assert!(
+            bucket.join("4").is_file() && bucket.join("5").is_file(),
+            "and the download's stay"
+        );
+        assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 0);
+    }
+
+    /// **An unpin that keeps the bytes still ends what the download
+    /// announced with the torrent stopped first**, and the torrent rejoins
+    /// for the download still pinned.
+    ///
+    /// Nothing opened the unpinned file in this process, so no entity holds
+    /// it: its pieces are outside every entity, which is what a reclaim of
+    /// the rest takes -- and a reclaim of the rest on a live torrent leaves
+    /// what it advertises alone. The switch task, a cache clean or the tick
+    /// then find a share to end and stop the torrent before those bytes go.
+    #[tokio::test]
+    async fn an_unpin_ends_what_the_download_announced_with_the_torrent_stopped_first() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        nothing_torrent_is_playing(&enginefs);
+        enginefs
+            .apply_pins(Some(crate::piece_store::PinSet::from([(
+                TEST_HASH.to_string(),
+                vec![0usize, 1],
+            )])))
+            .await;
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in 0u32..8 {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+        assert_eq!(fake_advertises(&counters), (0..8).collect::<Vec<_>>());
+
+        let outcome = enginefs
+            .unpin_download(TEST_HASH, 0, false)
+            .await
+            .expect("the unpin");
+        assert!(outcome.unpinned && !outcome.deleted_files, "{outcome:?}");
+        assert_eq!(fake_advertises(&counters), (0..8).collect::<Vec<_>>());
+
+        let freed = enginefs.drop_slack().await;
+        assert_eq!(freed, 4, "the unpinned file's pieces");
+        assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 1);
+        assert!((0u32..4).all(|piece| !bucket.join(piece.to_string()).exists()));
+        assert!((4u32..8).all(|piece| bucket.join(piece.to_string()).is_file()));
+        assert_eq!(fake_advertises(&counters), vec![4, 5, 6, 7]);
+        assert_eq!(counters.start_torrent.load(Ordering::SeqCst), 1);
+    }
+
+    /// **An unpin that deletes a download others keep the torrent running
+    /// for stops the torrent before a byte of it goes**, and starts it
+    /// again for the download that is left, advertising that one alone.
+    #[tokio::test]
+    async fn an_unpin_that_deletes_a_shared_download_stops_the_torrent_first() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        // A name for the file, which the per-file delete asks for; nothing
+        // is ever written there.
+        *counters.output_folder.lock().unwrap() = Some(fake_engine_root().join("placed"));
+        nothing_torrent_is_playing(&enginefs);
+        enginefs
+            .apply_pins(Some(crate::piece_store::PinSet::from([(
+                TEST_HASH.to_string(),
+                vec![0usize, 1],
+            )])))
+            .await;
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in 0u32..8 {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+        assert_eq!(fake_advertises(&counters), (0..8).collect::<Vec<_>>());
+        assert_eq!(engine.handle.run_state(), RunState::Live);
+
+        let outcome = enginefs
+            .unpin_download(TEST_HASH, 0, true)
+            .await
+            .expect("the unpin");
+        assert!(outcome.unpinned && outcome.deleted_files, "{outcome:?}");
+        assert_eq!(
+            counters.stop_torrent.load(Ordering::SeqCst),
+            1,
+            "the torrent left the swarm before the download's bytes went"
+        );
+        assert!((0u32..4).all(|piece| !bucket.join(piece.to_string()).exists()));
+        assert!((4u32..8).all(|piece| bucket.join(piece.to_string()).is_file()));
+        assert_eq!(fake_advertises(&counters), vec![4, 5, 6, 7]);
+        assert_eq!(
+            counters.start_torrent.load(Ordering::SeqCst),
+            1,
+            "and it rejoined for the download still pinned"
         );
     }
 
@@ -15250,6 +18097,33 @@ mod tests {
             ),
             (Some(1), None)
         );
+    }
+
+    /// **An older screen's open is served beside the file being played,
+    /// and moves nothing.** Its file is selected -- the request is answered
+    /// -- with the file the cell names kept in the want-set, as an aside's
+    /// is, and the cell stays: no read of the played file need be open for
+    /// it to, since the viewer's newest screen said where it is.
+    #[tokio::test]
+    async fn an_older_screens_open_is_served_beside_the_played_file() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        enginefs.note_player("tv.2", played(TEST_HASH, 1));
+        enginefs.on_stream_start(TEST_HASH, 1).await;
+        enginefs.on_stream_end(TEST_HASH, 1).await;
+
+        enginefs
+            .on_stale_stream_start_unreconciled(TEST_HASH, 0)
+            .await;
+        assert!(enginefs.live().is_torrent_file(TEST_HASH, 1));
+        assert_eq!(
+            (
+                *counters.last_active_file.lock().unwrap(),
+                *counters.last_hot_file.lock().unwrap()
+            ),
+            (Some(1), Some(0)),
+            "the older screen's file was not selected beside the played one"
+        );
+        enginefs.on_stream_end(TEST_HASH, 0).await;
     }
 
     /// **A selection leaves the other files' stream counts alone.**
@@ -15600,7 +18474,7 @@ mod tests {
     /// disk. A hundred ticks pass here and nothing moves; the install a
     /// resume makes finds the policy already describing this file under
     /// this budget and keeps it untouched, which is what makes the resume
-    /// free rather than a fresh hold-back.
+    /// free rather than a fresh draw.
     #[tokio::test]
     async fn a_stopped_playback_keeps_its_window_and_a_resume_keeps_the_policy() {
         let (enginefs, counters) = test_enginefs_with_file_count(1);
@@ -15678,30 +18552,23 @@ mod tests {
         let _store = seeded_store(&enginefs, &engine);
         nothing_torrent_is_playing(&enginefs);
 
-        // The first run's hold-back is parked, and the viewer opens the
-        // torrent again while it is.
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
-        let running = tokio::spawn({
-            let engine = engine.clone();
-            let registry = enginefs.store_registry().clone();
-            let live = enginefs.live().reading();
-            async move { engine.retain(&registry, &live).await }
-        });
-        tokio::time::timeout(Duration::from_secs(10), entered_rx)
+        // The viewer opens the torrent again inside the first run's drop.
+        *counters.on_first_drop.lock().unwrap() = Some(Box::new({
+            let live = enginefs.live().clone();
+            move || {
+                live.open(
+                    crate::retention::live::LiveEntity::Torrent {
+                        info_hash: TEST_HASH.to_string(),
+                        file_idx: 0,
+                    },
+                    false,
+                );
+            }
+        }));
+        let pass = engine
+            .retain(enginefs.store_registry(), &enginefs.live().reading())
             .await
-            .expect("the reclaim reached the call that holds its first run back")
-            .expect("the fake said so");
-        enginefs.live().open(
-            crate::retention::live::LiveEntity::Torrent {
-                info_hash: TEST_HASH.to_string(),
-                file_idx: 0,
-            },
-            false,
-        );
-        release_tx.send(()).expect("the reclaim is waiting on this");
-        let pass = running.await.expect("the task").expect("a pass");
+            .expect("a pass");
 
         assert_eq!(pass.reclaimed, 2, "the first run went: {pass:?}");
         assert!(!bucket.join("0").exists() && !bucket.join("1").exists());
@@ -15801,12 +18668,15 @@ mod tests {
             std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
         }
         let _store = seeded_store(&enginefs, &engine);
-        engine.begin_retention(0).await;
+        play_file(&enginefs, &engine, 0).await;
         engine.test_read_at(0, 0);
 
-        // The viewer opens something else, and comes back while the first
-        // run of the pass that follows is being unlinked.
+        // The viewer opens something else -- the reconciler stops the
+        // torrent nobody plays, so the file's draw is announced to nobody --
+        // and comes back while the first run of the pass that follows is
+        // being unlinked.
         nothing_torrent_is_playing(&enginefs);
+        counters.paused.store(true, Ordering::SeqCst);
         *counters.on_first_drop.lock().unwrap() = Some(Box::new({
             let live = enginefs.live().clone();
             move || {
@@ -15832,9 +18702,9 @@ mod tests {
             "and the run after the viewer came back was never asked for"
         );
         assert_eq!(
-            *counters.advertised.lock().unwrap().last().unwrap(),
-            (0..4, false),
-            "the whole extent was held back before a byte of it went"
+            *counters.advertised.lock().unwrap(),
+            vec![(1..2, true)],
+            "the draw, advertised at the open; nothing was withdrawn"
         );
 
         // And the entity the stopped pass left behind has no policy any
@@ -15980,7 +18850,7 @@ mod tests {
         assert_eq!(
             *counters.advertised.lock().unwrap(),
             vec![],
-            "nothing of it was held back from the swarm"
+            "nothing about it was said to the backend"
         );
         assert_eq!(
             engine.standing().await.policies.len(),
@@ -16027,12 +18897,15 @@ mod tests {
         engine.begin_retention(1).await;
         engine.test_read_at(1, 0);
 
-        // Nothing is playing: the tick's reading makes both files slack.
+        // Nothing is playing: the tick's reading makes both files slack, and
+        // the reconciler has stopped the torrent, so what their draws
+        // announced goes with the rest.
         nothing_torrent_is_playing(&enginefs);
+        counters.paused.store(true, Ordering::SeqCst);
         let tick = enginefs.live().reading();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        *counters.advertise_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        *counters.drop_gate.lock().unwrap() = Some((entered_tx, release_rx));
         let running = tokio::spawn({
             let engine = engine.clone();
             let registry = enginefs.store_registry().clone();
@@ -16040,7 +18913,7 @@ mod tests {
         });
         tokio::time::timeout(Duration::from_secs(10), entered_rx)
             .await
-            .expect("the pass reached the call that holds file 0 back")
+            .expect("the pass reached the call that gives file 0's run back")
             .expect("the fake said so");
 
         // The viewer opens file 1 while file 0 is being emptied.
@@ -16575,19 +19448,34 @@ mod tests {
     /// pinned and episode 2 playing, where deleting episode 1's download
     /// must not remove the whole torrent -- that would fail episode 2's
     /// reads and delete the pieces it is playing. Only the deleted file
-    /// goes, through the per-file path; once nothing reads the torrent the
-    /// same delete takes all of it.
+    /// goes, through the per-file path, and at once -- the torrent leaves
+    /// the swarm for a moment under episode 2's read and starts again for
+    /// it; once nothing reads the torrent the same delete takes all of it.
     #[tokio::test]
     async fn deleting_the_last_pin_keeps_a_torrent_another_file_streams_from() {
         let tmp = tempfile::tempdir().unwrap();
         let (enginefs, counters) = test_enginefs_with_file_count(3);
         *counters.output_folder.lock().unwrap() = Some(tmp.path().to_path_buf());
         enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        // Another file of the torrent is streaming -- to a client with no
+        // player token, so no play session is on the torrent: its open
+        // stream is what the stop would cut.
         enginefs
             .active_file_streams
             .write()
             .await
             .insert((TEST_HASH.to_string(), 1), 1);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        let stream = engine
+            .try_get_file_unshared(
+                1,
+                0,
+                1,
+                crate::backend::priorities::Fetching::Streaming,
+                crate::backend::priorities::BufferProfile::Normal,
+            )
+            .await
+            .expect("the other file's stream");
 
         assert!(
             enginefs
@@ -16606,19 +19494,275 @@ mod tests {
             "the torrent another file streams from is not dropped"
         );
         assert!(enginefs.get_engine(TEST_HASH).await.is_some());
-        assert_eq!(
-            *counters.dropped_ranges.lock().unwrap(),
-            vec![(0..1, crate::backend::AfterRelease::Reselect)],
-            "only the deleted file's pieces are dropped"
+        // A delete is an explicit request and happens now: the torrent
+        // leaves the swarm under the other file's read, the deleted
+        // download's pieces go, and it starts again for that read.
+        assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 1);
+        assert!(
+            !counters.dropped_ranges.lock().unwrap().is_empty(),
+            "the deleted download's pieces stayed"
         );
+        assert_eq!(engine.handle.run_state(), RunState::Live);
 
         // The stream ends; a delete now has nobody to keep the torrent for.
+        drop(stream);
         enginefs.active_file_streams.write().await.clear();
         enginefs.unpin_download(TEST_HASH, 2, true).await.unwrap();
         assert_eq!(
             *enginefs.get_backend().removed_with_files.lock().unwrap(),
             vec![TEST_HASH.to_string()]
         );
+    }
+
+    /// **A torrent whose last stream has ended is nobody's playback**,
+    /// though the liveness cell stays on it: deleting one of its downloads
+    /// ends what that download announced at once -- the torrent stops, its
+    /// set is made again, it starts for the download still pinned -- and
+    /// the file's bytes really go.
+    #[tokio::test]
+    async fn a_delete_on_a_torrent_whose_last_stream_ended_takes_the_bytes() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        let tmp = tempfile::tempdir().unwrap();
+        *counters.output_folder.lock().unwrap() = Some(tmp.path().to_path_buf());
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("0"), [7u8; 4096]).unwrap();
+        *counters.drops_pieces.lock().unwrap() = vec![0];
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        let _store = seeded_store(&enginefs, &engine);
+        enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+        enginefs.pin_download(TEST_HASH, 1, None).await.unwrap();
+        // A stream of the torrent opened and ended: the cell stays on it.
+        enginefs.on_stream_start(TEST_HASH, 1).await;
+        enginefs.on_stream_end(TEST_HASH, 1).await;
+        assert!(enginefs.live().reading().is_torrent(TEST_HASH));
+
+        assert_eq!(
+            enginefs.unpin_download(TEST_HASH, 0, true).await.unwrap(),
+            UnpinOutcome {
+                unpinned: true,
+                deleted_files: true,
+            },
+            "the bytes stayed: the unpin was deferred for a torrent nobody plays"
+        );
+        assert!(!bucket.join("0").exists());
+    }
+
+    /// **A download deleted from the board goes now**, whatever the
+    /// sharing setting says and though the viewer's play session is on it:
+    /// deleting is an explicit request. With something else on the torrent
+    /// -- another pin, the viewer's session on another file of it, a
+    /// response of another file still open -- it leaves the swarm, the
+    /// file's bytes go at once, what a session drew of the file goes with
+    /// them, and it starts again only for what still needs it: a pin or a
+    /// session, not the deleted file the viewer last played and not a
+    /// response nothing reads. As the torrent's last download, the whole
+    /// torrent goes with its files.
+    #[tokio::test]
+    async fn a_download_deleted_from_the_board_goes_now_whatever_the_setting() {
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Else {
+            Nothing,
+            Pin,
+            Session,
+            Response,
+        }
+        for seeding in [true, false] {
+            for other in [Else::Nothing, Else::Pin, Else::Session, Else::Response] {
+                let other_pin = other != Else::Nothing;
+                let case =
+                    format!("sharing when idle {seeding}, on the torrent besides: {other:?}");
+                let (enginefs, counters) = test_enginefs_with_file_count(2);
+                counters.pieces_per_file.store(4, Ordering::SeqCst);
+                counters
+                    .drops_what_it_is_asked
+                    .store(true, Ordering::SeqCst);
+                *counters.output_folder.lock().unwrap() = Some(fake_engine_root().join("placed"));
+                let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+                let pinned = match other {
+                    Else::Pin => vec![0usize, 1],
+                    Else::Nothing | Else::Session | Else::Response => vec![0usize],
+                };
+                let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+                std::fs::create_dir_all(&bucket).unwrap();
+                for piece in 0u32..8 {
+                    std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+                }
+                let _store = seeded_store(&enginefs, &engine);
+                // A budget over the whole torrent: a played file draws all of it.
+                enginefs.set_cache_budget(Some(200));
+                enginefs.set_seeding_enabled(seeding).await;
+                // The viewer watched the file it downloads -- or, for `Session`,
+                // the file beside it -- and is back on the board: its session is
+                // on that file, nothing reads it.
+                let watched = match other {
+                    Else::Session => 1,
+                    Else::Nothing | Else::Pin | Else::Response => 0,
+                };
+                play_file(&enginefs, &engine, watched).await;
+                if other == Else::Response {
+                    enginefs
+                        .active_file_streams
+                        .write()
+                        .await
+                        .insert((TEST_HASH.to_string(), 1), 1);
+                }
+                assert!(
+                    engine
+                        .retention
+                        .draw_of(&watched)
+                        .is_some_and(|draw| !draw.is_empty()),
+                    "{case}: the watched file drew nothing"
+                );
+                // And downloaded it: the draw it made stands under the pin.
+                enginefs
+                    .apply_pins(Some(crate::piece_store::PinSet::from([(
+                        TEST_HASH.to_string(),
+                        pinned,
+                    )])))
+                    .await;
+                enginefs.reconcile_tick().await;
+                assert_eq!(engine.handle.run_state(), RunState::Live, "{case}");
+                let stops = counters.stop_torrent.load(Ordering::SeqCst);
+                let starts = counters.start_torrent.load(Ordering::SeqCst);
+
+                let outcome = enginefs
+                    .unpin_download(TEST_HASH, 0, true)
+                    .await
+                    .expect("the delete");
+                assert!(
+                    outcome.unpinned && outcome.deleted_files,
+                    "{case}: {outcome:?}"
+                );
+                if !other_pin {
+                    assert_eq!(
+                        *enginefs.get_backend().removed_with_files.lock().unwrap(),
+                        vec![TEST_HASH.to_string()],
+                        "{case}: the torrent's last download took the torrent with it"
+                    );
+                    continue;
+                }
+                assert_eq!(
+                    counters.stop_torrent.load(Ordering::SeqCst),
+                    stops + 1,
+                    "{case}: the torrent left the swarm before the bytes went"
+                );
+                assert!(
+                    (0u32..4).all(|piece| !bucket.join(piece.to_string()).exists()),
+                    "{case}: the deleted file's bytes stayed: {:?}",
+                    pieces_on_disk(&bucket)
+                );
+                assert_eq!(
+                    engine.retention.draw_of(&0),
+                    None,
+                    "{case}: the session's draw outlived its file"
+                );
+                let restarts = other != Else::Response;
+                assert_eq!(
+                    counters.start_torrent.load(Ordering::SeqCst),
+                    starts + usize::from(restarts),
+                    "{case}: started again only for what still needs it"
+                );
+                assert_eq!(
+                    engine.handle.run_state() == RunState::Live,
+                    restarts,
+                    "{case}"
+                );
+                if restarts {
+                    assert!(
+                        (4u32..8).all(|piece| bucket.join(piece.to_string()).is_file()),
+                        "{case}: what still needs the torrent lost its bytes"
+                    );
+                }
+                if other == Else::Pin {
+                    assert_eq!(fake_advertises(&counters), vec![4, 5, 6, 7], "{case}");
+                }
+            }
+        }
+    }
+
+    /// **A download whose file is being read is deleted when the read
+    /// ends** -- in practice a cast in progress. The pin goes at once; the
+    /// bytes stay under the read, and go the moment it ends, unless the
+    /// viewer pinned the file again meanwhile. The read ends with its last
+    /// reader and with its response, in either order: the one that comes
+    /// last runs the delete, or the next tick does.
+    #[tokio::test]
+    async fn a_download_deleted_while_its_file_is_read_goes_when_the_read_ends() {
+        use crate::backend::priorities::{BufferProfile, Fetching};
+        for (pinned_again, reader_last) in [(false, false), (false, true), (true, false)] {
+            let (enginefs, counters) = test_enginefs_with_file_count(2);
+            counters.pieces_per_file.store(4, Ordering::SeqCst);
+            counters
+                .drops_what_it_is_asked
+                .store(true, Ordering::SeqCst);
+            *counters.output_folder.lock().unwrap() = Some(fake_engine_root().join("placed"));
+            let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+            enginefs
+                .apply_pins(Some(crate::piece_store::PinSet::from([(
+                    TEST_HASH.to_string(),
+                    vec![0usize, 1],
+                )])))
+                .await;
+            let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+            std::fs::create_dir_all(&bucket).unwrap();
+            for piece in 0u32..8 {
+                std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+            }
+            let _store = seeded_store(&enginefs, &engine);
+            play_file(&enginefs, &engine, 0).await;
+            let cast = engine
+                .try_get_file_unshared(0, 0, 1, Fetching::Streaming, BufferProfile::Normal)
+                .await
+                .expect("the cast's read");
+
+            let outcome = enginefs.unpin_download(TEST_HASH, 0, true).await.unwrap();
+            assert!(outcome.unpinned && !outcome.deleted_files, "{outcome:?}");
+            assert!(
+                !engine.pinned_file_indices().contains(&0),
+                "the pin went at once"
+            );
+            assert_eq!(pieces_on_disk(&bucket), (0u32..8).collect::<Vec<_>>());
+            assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 0);
+
+            if pinned_again {
+                enginefs.pin_download(TEST_HASH, 0, None).await.unwrap();
+            }
+            match reader_last {
+                false => {
+                    drop(cast);
+                    enginefs.on_stream_end(TEST_HASH, 0).await;
+                }
+                true => {
+                    // The response ended with its reader still held: the
+                    // delete waits on, and the tick after the reader's drop
+                    // runs it.
+                    enginefs.on_stream_end(TEST_HASH, 0).await;
+                    assert_eq!(pieces_on_disk(&bucket), (0u32..8).collect::<Vec<_>>());
+                    drop(cast);
+                    enginefs.reconcile_tick().await;
+                }
+            }
+            match pinned_again {
+                false => {
+                    assert!(
+                        (0u32..4).all(|piece| !bucket.join(piece.to_string()).exists()),
+                        "the bytes stayed after the read ended: {:?}",
+                        pieces_on_disk(&bucket)
+                    );
+                    assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 1);
+                    assert_eq!(fake_advertises(&counters), vec![4, 5, 6, 7]);
+                }
+                true => {
+                    assert_eq!(
+                        pieces_on_disk(&bucket),
+                        (0u32..8).collect::<Vec<_>>(),
+                        "a file pinned again was deleted by the delete it replaced"
+                    );
+                    assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 0);
+                }
+            }
+        }
     }
 
     /// A delete of a file nothing pinned (a pin lost to a crash, or a plain
@@ -16653,7 +19797,7 @@ mod tests {
     #[tokio::test]
     async fn unpin_download_queues_behind_an_in_flight_pin_a_stream_joined() {
         let root = tempfile::tempdir().unwrap();
-        let counters = Arc::new(FakeCounters::default());
+        let counters = Counters::default();
         let handle = FakeHandle {
             info_hash: TEST_HASH.to_string(),
             counters: counters.clone(),
@@ -16740,7 +19884,7 @@ mod tests {
     #[tokio::test]
     async fn unpin_download_aborts_an_in_flight_pin_nobody_joined() {
         let root = tempfile::tempdir().unwrap();
-        let counters = Arc::new(FakeCounters::default());
+        let counters = Counters::default();
         let handle = FakeHandle {
             info_hash: TEST_HASH.to_string(),
             counters: counters.clone(),
@@ -16802,10 +19946,10 @@ mod tests {
     #[tokio::test]
     async fn unpin_download_of_a_dormant_pin_deletes_nothing() {
         let root = tempfile::tempdir().unwrap();
-        let counters = Arc::new(FakeCounters::default());
+        let counters = Counters::default();
         let handle = FakeHandle {
             info_hash: OTHER_HASH.to_string(),
-            counters,
+            counters: counters.clone(),
             files: vec![BackendFileInfo {
                 name: "video-0.mkv".to_string(),
                 length: 100,
@@ -16858,6 +20002,9 @@ mod tests {
     #[tokio::test]
     async fn a_per_file_delete_takes_the_pieces_the_backend_gave_up() {
         let (enginefs, counters) = test_enginefs_with_file_count(2);
+        // Nobody is watching the torrent: what the download announced ends
+        // with the unpin, the torrent out of the swarm first.
+        nothing_torrent_is_playing(&enginefs);
         *counters.output_folder.lock().unwrap() = Some(enginefs.download_dir.join("show"));
         let pieces = enginefs.piece_store().torrent_dir(TEST_HASH);
         let bucket = pieces.join("0");
@@ -16960,9 +20107,10 @@ mod tests {
     #[tokio::test]
     async fn unpin_download_of_a_dormant_pin_deletes_its_pieces() {
         let root = tempfile::tempdir().unwrap();
+        let counters = Counters::default();
         let handle = FakeHandle {
             info_hash: OTHER_HASH.to_string(),
-            counters: Arc::new(FakeCounters::default()),
+            counters: counters.clone(),
             files: vec![BackendFileInfo {
                 name: "video-0.mkv".to_string(),
                 length: 100,
@@ -17649,10 +20797,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_add_under_a_refused_pins_drop_waits_and_adds_again() {
         let root = tempfile::tempdir().unwrap();
-        let counters = Arc::new(FakeCounters::default());
+        let counters = Counters::default();
         let handle = FakeHandle {
             info_hash: TEST_HASH.to_string(),
-            counters,
+            counters: counters.clone(),
             files: vec![BackendFileInfo {
                 name: "video-0.mkv".to_string(),
                 length: 100,
@@ -17708,10 +20856,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_add_under_a_dormant_pins_delete_waits_and_adds_again() {
         let root = tempfile::tempdir().unwrap();
-        let counters = Arc::new(FakeCounters::default());
+        let counters = Counters::default();
         let handle = FakeHandle {
             info_hash: TEST_HASH.to_string(),
-            counters,
+            counters: counters.clone(),
             files: vec![BackendFileInfo {
                 name: "video-0.mkv".to_string(),
                 length: 100,
@@ -17755,7 +20903,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_magnet_timeout_leaves_a_torrent_another_add_published() {
         let root = tempfile::tempdir().unwrap();
-        let counters = Arc::new(FakeCounters::default());
+        let counters = Counters::default();
         let handle = FakeHandle {
             info_hash: TEST_HASH.to_string(),
             counters: counters.clone(),
@@ -17986,6 +21134,8 @@ mod tests {
         behaviour: Arc<Mutex<AddBehaviour>>,
         removed: Arc<Mutex<Vec<String>>>,
         _root: tempfile::TempDir,
+        /// The fake handle's counters, checked when the test ends.
+        _counters: Counters,
     }
 
     impl Gated {
@@ -18007,9 +21157,10 @@ mod tests {
         let adds = Arc::new(AtomicUsize::new(0));
         let behaviour = Arc::new(Mutex::new(AddBehaviour::WaitForRelease));
         let removed = Arc::new(Mutex::new(Vec::new()));
+        let counters = Counters::default();
         let handle = FakeHandle {
             info_hash: TEST_HASH.to_string(),
-            counters: Arc::new(FakeCounters::default()),
+            counters: counters.clone(),
             files: vec![BackendFileInfo {
                 name: "video.mkv".to_string(),
                 length: 100,
@@ -18035,6 +21186,7 @@ mod tests {
             behaviour,
             removed,
             _root: root,
+            _counters: counters,
         }
     }
 

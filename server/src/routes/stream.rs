@@ -127,18 +127,32 @@ impl StreamLifecycleGuard {
     /// return the guard owns it. Putting the two in one function with no
     /// `.await` between them is what leaves no third state: a registration
     /// neither side is holding.
+    ///
+    /// `stale` is a request of an older screen of its viewer
+    /// ([`enginefs::retention::sessions::Heard::Stale`]): registered and
+    /// served the same, and the liveness cell stays where it is.
     async fn start(
         engine: Arc<enginefs::EngineFS>,
         info_hash: String,
         file_idx: usize,
         stream_id: u64,
+        stale: bool,
     ) -> Self {
         // Unreconciled: the route asks the reconciler once, after its disk
         // gate ([`EngineFS::focus_torrent`]), because that is the reading
         // that can restart a torrent the gate has just made room for.
-        engine
-            .on_stream_start_unreconciled(&info_hash, file_idx)
-            .await;
+        match stale {
+            false => {
+                engine
+                    .on_stream_start_unreconciled(&info_hash, file_idx)
+                    .await
+            }
+            true => {
+                engine
+                    .on_stale_stream_start_unreconciled(&info_hash, file_idx)
+                    .await
+            }
+        }
         Self::new(engine.clone(), info_hash, file_idx, stream_id)
     }
 
@@ -327,6 +341,14 @@ struct PlaybackQuery {
     /// build does not know, because a player that guessed wrong should get
     /// the server's default rather than a failed stream.
     buffer: Option<BufferProfile>,
+    /// `p=`: the player token of the app's player this request is for --
+    /// the one statement that a request is the viewer's playback. Only such
+    /// a request has a play session: it moves the token's session to the
+    /// file it names, and only its open may share a drawn set of that file
+    /// ([`enginefs::retention::sessions`]). `None` for anything else -- a
+    /// subtitle or side file, another client, the server's own reads --
+    /// which is served and fetched ahead of as a stream and shares nothing.
+    player_token: Option<String>,
 }
 
 impl PlaybackQuery {
@@ -354,6 +376,13 @@ impl PlaybackQuery {
                         parsed.filters.push(value.into_owned());
                     }
                 }
+                "p" => {
+                    if let Some((_, value)) = url::form_urlencoded::parse(field.as_bytes()).next()
+                        && !value.is_empty()
+                    {
+                        parsed.player_token = Some(value.into_owned());
+                    }
+                }
                 // Tracker values can be numerous and heavily escaped. They are
                 // decoded lazily only if this request must create an engine.
                 _ => {}
@@ -361,6 +390,26 @@ impl PlaybackQuery {
         }
         parsed
     }
+}
+
+/// Whether a file of a torrent is one the app plays through a translated
+/// source rather than as the film itself -- an archive or a disc image,
+/// whose member is served out of it by the archive routes. By name, the one
+/// thing the stream route knows of it before a byte is read: the player
+/// opens such a file, fails to recognise it, and the app routes its member,
+/// so the file itself is never what plays.
+///
+/// **Archive playback shares nothing**: a play session on one of these draws
+/// nothing ([`enginefs::retention::sessions::Played::Torrent`]'s `shares`).
+fn played_through_a_translator(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let Some((_, extension)) = lower.rsplit_once('.') else {
+        return false;
+    };
+    matches!(extension, "rar" | "zip" | "7z" | "iso" | "tar")
+        || (extension.len() == 3
+            && extension.starts_with('r')
+            && extension[1..].bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// What a read is for, from the one thing the request really says: whether
@@ -1025,8 +1074,30 @@ async fn stream_video_with(
     // registered, so the next attempt would ask the same stale question. A
     // refused request still moves the live entity, which is right: the
     // viewer really has left the old one.
+    // **The player's own request moves its play session**, and nothing else
+    // does. Before the stream registers, so the reconcile this request
+    // makes sees the move: the next episode of the same torrent ends what
+    // the last one shared at once (stop, the advertised set made again,
+    // start), before this reader waits on a byte.
+    //
+    // An older screen's request is served and moves nothing: not the
+    // session, and not the liveness cell either.
+    let shares = !played_through_a_translator(&name);
+    let heard = query.player_token.as_deref().map(|token| {
+        engine_fs.note_player(
+            token,
+            enginefs::retention::sessions::Played::Torrent {
+                info_hash: info_hash.clone(),
+                file_idx: idx,
+                shares,
+            },
+        )
+    });
+    let stale = heard == Some(enginefs::retention::sessions::Heard::Stale);
+    let players = heard.is_some() && !stale && shares;
     let lifecycle =
-        StreamLifecycleGuard::start(engine_fs.clone(), info_hash.clone(), idx, stream_id).await;
+        StreamLifecycleGuard::start(engine_fs.clone(), info_hash.clone(), idx, stream_id, stale)
+            .await;
     if let Err(refusal) = ensure_disk_ready_or_refuse(
         &state,
         &engine_fs,
@@ -1104,16 +1175,32 @@ async fn stream_video_with(
         buffer = buffer_profile.as_str(),
         "stream_video calling get_file"
     );
-    let mut file = match engine
-        .try_get_file_with_intent(
-            idx,
-            start_offset_hint,
-            priority,
-            playback_intent,
-            buffer_profile,
-        )
-        .await
-    {
+    // The current screen of the viewer's player, on a file its session
+    // shares, is the one open whose play session may draw; every other
+    // open -- no token, an older screen's reconnect, an archive -- draws
+    // nothing.
+    let opened = if players {
+        engine
+            .try_get_file_with_intent(
+                idx,
+                start_offset_hint,
+                priority,
+                playback_intent,
+                buffer_profile,
+            )
+            .await
+    } else {
+        engine
+            .try_get_file_unshared(
+                idx,
+                start_offset_hint,
+                priority,
+                playback_intent,
+                buffer_profile,
+            )
+            .await
+    };
+    let mut file = match opened {
         Ok(file) => file,
         Err(err) => return stream_open_failure_response(stream_id, &info_hash, idx, err),
     };
@@ -1539,6 +1626,51 @@ mod tests {
         assert!(query.download);
         assert_eq!(query.filters, ["Episode 02"]);
         assert_eq!(query.buffer, None);
+    }
+
+    /// **`p=` is the player's token, read like `f=`**, and an empty one is
+    /// no token: only the app's player sends it.
+    #[test]
+    fn the_player_token_is_read_off_the_query() {
+        assert_eq!(
+            PlaybackQuery::parse(Some("buffer=large&p=tv.1")).player_token,
+            Some("tv.1".to_string())
+        );
+        assert_eq!(
+            PlaybackQuery::parse(Some("p=player%201")).player_token,
+            Some("player 1".to_string())
+        );
+        for raw in ["p=", "buffer=large", "tr=udp%3A%2F%2Fx"] {
+            assert_eq!(PlaybackQuery::parse(Some(raw)).player_token, None, "{raw}");
+        }
+    }
+
+    /// **Which files the app plays through a translated source**: archives
+    /// and disc images, by name -- a split RAR's numbered volumes among them
+    /// -- and nothing that merely looks like one.
+    #[test]
+    fn an_archive_is_told_by_its_name() {
+        for name in [
+            "Film.rar",
+            "film.part1.RAR",
+            "film.r00",
+            "Film.zip",
+            "disc.iso",
+            "a.7z",
+            "b.tar",
+        ] {
+            assert!(played_through_a_translator(name), "{name}");
+        }
+        for name in [
+            "Film.mkv",
+            "film.srt",
+            "rar",
+            "film.rarx",
+            "film.r0",
+            "film.mp4",
+        ] {
+            assert!(!played_through_a_translator(name), "{name}");
+        }
     }
 
     #[test]

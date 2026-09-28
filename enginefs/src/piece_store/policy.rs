@@ -18,8 +18,8 @@
 //! halves of the cache sized against different numbers.
 //!
 //! **If the budget covers the whole file we keep the whole file** and share
-//! all of it. No split and no window. This is the phone with 379 GB free and
-//! it is every desktop.
+//! all of it: the draw is every piece. No split and no window. This is the
+//! phone with 379 GB free and it is every desktop.
 //!
 //! **If it does not, it is split:**
 //!
@@ -39,25 +39,29 @@
 //! the committed set is, the two have to fit under the budget together, and
 //! the committed half is the one that can give ([`Buffering`]).
 //!
-//! **Only what is committed is advertised** -- once an engine can be told
-//! that. That is the whole of being a good citizen here: a piece we might
+//! **Only the draw is advertised**, and a piece of it is announced when we
+//! hold it. That is the whole of being a good citizen here: a piece we might
 //! reclaim is never announced, so we never advertise-then-refuse, which is
 //! what gets a client choked. An unshared piece is held and readable and
 //! *not* announced, because it will go. On a small volume
 //! that means we honestly seed little; on a roomy one we seed everything.
 //!
 //! **That last part is a decision this module states but does not perform.**
-//! [`RetentionPolicy::advertised`] says which pieces to show a peer, and
+//! [`RetentionPolicy::draw`] says which pieces to show a peer, and
 //! [`crate::retention`] is what turns it into what librqbit actually
-//! announces, through the fork's `ManagedTorrent::set_pieces_advertised`
-//! (see the `piece_store` module docs for why that third state exists).
+//! announces, through the fork's `ManagedTorrent::set_pieces_advertised`,
+//! under which a torrent announces nothing it was not told to.
 //!
 //! # Two choices worth stating, because they look arbitrary
 //!
-//! **Which pieces we share is drawn before playback starts, not learned from
-//! it.** The committed set is a uniformly random subset of the file's pieces,
-//! of the size the committed capacity allows, taken from a seed held per
-//! entity for that entity's life (see [`choose`]). Random and not a stride,
+//! **Which pieces we share is drawn once per play session, and never
+//! changes.** The draw is a uniformly random subset of the file's pieces, of
+//! the size the committed capacity allows once the stream's read-ahead is
+//! known -- the budget less the real read-ahead, the film's bitrate times
+//! the viewer's seconds, nothing when the budget cannot hold both -- taken
+//! from a seed held per entity (see [`choose`]). A seek, a budget that rises
+//! or falls, a length stated again: none of them redraws it, because a
+//! redraw is either a withdrawal or a set the viewer never agreed to share. Random and not a stride,
 //! because a stride is a lattice -- two clients with the same k differ only by
 //! phase and can still overlap almost completely -- and independent draws
 //! overlap only by chance, which is the property that makes peers who cannot
@@ -91,14 +95,15 @@
 //! finds held that the event missed, which is a property of the window and
 //! the tick and not of the draw.
 //!
-//! **Nothing once committed is ever un-announced or reclaimed.** There is no
+//! **Nothing drawn is ever un-announced or reclaimed.** There is no
 //! un-have in BitTorrent: hiding a piece changes only the bitfield a *new*
 //! peer is handed at its handshake, while a peer that already holds our Have
-//! can still ask for it and, the bytes being gone, be hung up on. So a
-//! capacity that shrinks under the set only stops it growing
-//! ([`RetentionPolicy::observe`]), and a smaller budget adopts the whole of
-//! what the bigger one announced, over its capacity and all
-//! ([`RetentionPolicy::carry_into`]).
+//! can still ask for it. So a capacity that shrinks under the draw leaves it
+//! as it is ([`RetentionPolicy::observe`]), and a policy under another
+//! budget adopts the draw whole, over its capacity and all
+//! ([`RetentionPolicy::carry_into`]). The draw ends with the play session:
+//! the torrent leaves the swarm first, and only then are its pieces deleted
+//! (`crate::BackendEngineFS`'s `EndShares`).
 //!
 //! **The set under-fills, and that is correct.** It is never fetched for: we
 //! commit what we hold, and we hold what the viewer's window fetched, so a
@@ -115,9 +120,9 @@
 //!
 //! # What this does not decide
 //!
-//! Nothing durable. The committed set is per-session state held in this
-//! struct: sharing runs between sessions and stops when the next stream
-//! starts, and there is no set to re-adopt at launch. A piece it never
+//! Nothing durable. The draw is per-session state held by the retention
+//! owner: sharing runs for the play session and ends when playback moves to
+//! anything else, and there is no set to re-adopt at launch. A piece it never
 //! reclaimed still has to be claimed by the startup sweep like everything else
 //! (see [`super::sweep`]), because "clean on close" does not run when Android
 //! kills the app.
@@ -242,6 +247,26 @@ pub struct Buffering {
 }
 
 impl Buffering {
+    /// What two readers of one entity ask of it together: the larger
+    /// lookahead, since each fetches its own and the window has to hold
+    /// both, and the more generous of each profile -- a second reader
+    /// asking for less must not shrink the window under the one already
+    /// open. `None` is a reader that stated no profile and says nothing
+    /// either way. The rate and the seed are the entity's, not a reader's,
+    /// and are `self`'s.
+    pub fn widest(self, other: Buffering) -> Buffering {
+        let most = |a: Option<u64>, b: Option<u64>| match (a, b) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        Buffering {
+            lookahead_bytes: self.lookahead_bytes.max(other.lookahead_bytes),
+            window_seconds: most(self.window_seconds, other.window_seconds),
+            committed_seconds: most(self.committed_seconds, other.committed_seconds),
+            ..self
+        }
+    }
+
     /// Bytes `seconds` of this stream comes to, or `None` with no bitrate
     /// to convert it at.
     fn over(&self, seconds: u64) -> Option<u64> {
@@ -417,11 +442,10 @@ pub struct Decision {
     /// Pieces that left the committed set because we no longer hold them.
     ///
     /// Nothing here takes a committed piece away, so this is only ever the
-    /// disk losing one behind our back -- but "only advertise what is
-    /// committed" has to hold in both directions, and a committed piece that
-    /// is gone is exactly the advertise-then-refuse this policy exists to
-    /// avoid.
-    pub withdrawn: Vec<u32>,
+    /// disk losing one behind our back. Nothing is withdrawn for it: the
+    /// piece stays in the draw, the backend announces only what it has, and
+    /// a piece that comes back is committed again.
+    pub lost: Vec<u32>,
 }
 
 /// The policy for one file being streamed, carrying the committed set across
@@ -452,8 +476,9 @@ pub struct RetentionPolicy {
     share: Share,
     shape: Shape,
     committed: BTreeSet<u32>,
-    /// The pieces this policy will share, drawn when it was built and
-    /// never changed except to follow the capacity up or down.
+    /// The pieces this policy will share: the draw, made when the first
+    /// policy of the play session was built and never changed after it
+    /// ([`Self::adopt_draw`], [`Self::carry_into`]).
     ///
     /// **Membership is decided in advance, not sampled from playback** (see
     /// the module docs for why). A chosen piece is committed the moment we
@@ -470,11 +495,9 @@ pub struct RetentionPolicy {
     /// bytes for the swarm rather than for the viewer -- on a metered phone
     /// a trade nobody agreed to.
     ///
-    /// Empty and unused under [`Shape::Whole`], where every piece of the
-    /// file is shared as it arrives.
+    /// Every piece of the file under [`Shape::Whole`], which shares the
+    /// whole file as it arrives.
     chosen: BTreeSet<u32>,
-    /// The draw [`Self::chosen`] came out of; see [`choose`].
-    seed: u64,
 }
 
 impl RetentionPolicy {
@@ -521,7 +544,7 @@ impl RetentionPolicy {
         }
         let shape = Self::shape_for(budget_bytes, piece_length, bytes, share, buffering);
         let chosen = match shape {
-            Shape::Whole => BTreeSet::new(),
+            Shape::Whole => pieces.clone().collect(),
             Shape::Split { committed, .. } => choose(buffering.seed, pieces.clone(), committed),
         };
         Ok(Self {
@@ -533,7 +556,6 @@ impl RetentionPolicy {
             shape,
             committed: BTreeSet::new(),
             chosen,
-            seed: buffering.seed,
         })
     }
 
@@ -628,10 +650,11 @@ impl RetentionPolicy {
     ///
     /// The budget, the file and the share are this policy's own and are not
     /// re-read: a budget that moves builds a new policy through
-    /// [`Self::carry_into`], which is where a committed set over the new
-    /// capacity is dealt with. Nothing here takes a committed piece away
-    /// (see [`Decision::committed`]); a capacity that shrinks under one
-    /// only stops the set growing.
+    /// [`Self::carry_into`]. **The draw does not move with the shape**, in
+    /// either direction: a capacity that grows under it would share pieces
+    /// the viewer's read-ahead was sized against, and one that shrinks
+    /// would withdraw what we announced. What the shape moves is the window
+    /// the pass keeps and fetches.
     pub fn observe(&mut self, buffering: Buffering) -> bool {
         let shape = Self::shape_for(
             self.budget_bytes,
@@ -641,29 +664,8 @@ impl RetentionPolicy {
             buffering,
         );
         let moved = shape != self.shape;
-        let was = self.capacity();
         self.shape = shape;
-        if self.capacity() != was {
-            // Lowest-rank-`count` is nested in `count`, so this keeps every
-            // piece the old set had where it grew and drops only unchosen
-            // ones where it shrank -- and whatever is already committed
-            // stays chosen whatever the capacity says, because nothing this
-            // policy has announced is ever taken back.
-            self.chosen = match self.shape {
-                Shape::Whole => BTreeSet::new(),
-                Shape::Split { committed, .. } => choose(self.seed, self.pieces.clone(), committed),
-            };
-            self.chosen.extend(self.committed.iter().copied());
-        }
         moved
-    }
-
-    /// How many pieces the committed set may hold.
-    fn capacity(&self) -> u32 {
-        match self.shape {
-            Shape::Whole => self.pieces.end - self.pieces.start,
-            Shape::Split { committed, .. } => committed,
-        }
     }
 
     /// The pieces of the file this policy governs.
@@ -675,15 +677,36 @@ impl RetentionPolicy {
         self.shape
     }
 
-    /// The committed set: what is advertised, and nothing else is.
+    /// The committed set: the pieces of the draw we hold, which is what a
+    /// peer is told we have.
     ///
-    /// [`crate::retention`] is what makes that true -- it holds the whole
-    /// file back from what the torrent announces before the reader opens,
-    /// and puts a piece back only when [`Self::advance`] commits it. What
-    /// we announce is exactly what nothing will reclaim while the entity is
-    /// being played.
+    /// [`crate::retention`] is what makes that true -- it advertises the
+    /// draw once, when the play session decides it, and the backend
+    /// announces each piece of it as it completes (or at once, if it is
+    /// held already), and nothing else. What we announce is
+    /// exactly what nothing will reclaim while the torrent is in the swarm.
     pub fn advertised(&self) -> &BTreeSet<u32> {
         &self.committed
+    }
+
+    /// The draw: every piece this policy shares, held or not. What is
+    /// advertised to the backend, and what no reclaim may take.
+    pub fn draw(&self) -> &BTreeSet<u32> {
+        &self.chosen
+    }
+
+    /// Share `draw` and nothing else: the draw the play session made with
+    /// its first policy, handed to every policy after it -- one built at
+    /// another open, one under another budget. Pieces outside this file are
+    /// not this policy's and are left out.
+    pub fn adopt_draw(&mut self, draw: &BTreeSet<u32>) {
+        self.chosen = draw
+            .iter()
+            .copied()
+            .filter(|piece| self.pieces.contains(piece))
+            .collect();
+        let chosen = &self.chosen;
+        self.committed.retain(|piece| chosen.contains(piece));
     }
 
     #[cfg(test)]
@@ -700,26 +723,22 @@ impl RetentionPolicy {
     /// reclaim it -- pieces a peer was told about minutes ago, deleted
     /// under it.
     ///
-    /// **Nothing comes back over the new budget's capacity, because nothing
-    /// is ever taken back.** There is no un-have in BitTorrent: hiding a
-    /// piece changes only the bitfield a *new* peer is sent at its
-    /// handshake, and a peer that already has our Have can still ask for
-    /// it -- at which point, the bytes being gone, the fork's upload path
-    /// can only hang up, there being no reject message to send. A client
-    /// that advertises and then disconnects is an unreliable peer, and some
-    /// clients snub or ban for it. So a smaller budget adopts what the
-    /// bigger one announced, over its capacity and all: those bytes are the
-    /// price of having said we had them, and they are bounded by the
-    /// capacity that said it.
+    /// **The draw comes across whole, whatever the new budget's capacity.**
+    /// There is no un-have in BitTorrent: hiding a piece changes only the
+    /// bitfield a *new* peer is sent at its handshake, and a peer that
+    /// already has our Have can still ask for it. A client that advertises
+    /// and then cannot serve is an unreliable peer, and some clients snub or
+    /// ban for it. So a smaller budget keeps what the bigger one drew, over
+    /// its capacity and all -- those bytes are the price of having said we
+    /// would share them, bounded by the capacity that said it -- and a
+    /// bigger one shares no more than was drawn.
     pub fn carry_into(&self, next: &mut Self) {
         debug_assert_eq!(
             self.pieces, next.pieces,
             "a policy carried onto another file's pieces"
         );
+        next.chosen = self.chosen.clone();
         next.committed = self.committed.clone();
-        // Chosen as well as committed: a piece we announce is one nothing
-        // may reclaim, and [`Self::advance`] reads that off the chosen set.
-        next.chosen.extend(next.committed.iter().copied());
     }
 
     /// **Commit `piece`, which we have just been found to hold**, and say
@@ -732,14 +751,8 @@ impl RetentionPolicy {
     /// this is what hears it; see
     /// [`crate::retention::owner::Retention::commit_completed`].
     ///
-    /// The drawn set alone, so [`Shape::Whole`] is untouched: a budget that
-    /// covers the file reclaims nothing, so there is no window for a piece
-    /// to be lost in and nothing for a sampling pass to miss -- it commits
-    /// the whole file as it arrives.
-    ///
-    /// The capacity is respected by [`Self::chosen`] being sized from it,
-    /// which is the same thing that bounds `advance`; nothing here can
-    /// commit a piece the draw did not choose.
+    /// The draw alone: nothing here can commit a piece the draw did not
+    /// choose, which is the same thing that bounds `advance`.
     pub fn commit_drawn(&mut self, piece: u32) -> bool {
         if !self.draws(piece) {
             return false;
@@ -792,13 +805,13 @@ impl RetentionPolicy {
     pub fn advance(&mut self, giving_up: &[u32], held: &BTreeSet<u32>) -> Decision {
         let mut decision = Decision::default();
 
-        // A committed piece we have stopped holding cannot stay advertised.
-        let withdrawn = &mut decision.withdrawn;
+        // A committed piece we have stopped holding is not ours to count.
+        let lost = &mut decision.lost;
         self.committed.retain(|piece| {
             if held.contains(piece) {
                 true
             } else {
-                withdrawn.push(*piece);
+                lost.push(*piece);
                 false
             }
         });
@@ -810,9 +823,9 @@ impl RetentionPolicy {
             if !self.pieces.contains(&piece) || self.committed.contains(&piece) {
                 continue;
             }
-            // Under `Whole` the file fits, so every piece of it is shared
-            // as soon as it arrives and none of it is ever reclaimed.
-            if self.shape == Shape::Whole || self.chosen.contains(&piece) {
+            // Under `Whole` the draw is the whole file, so every piece of it
+            // is shared as soon as it arrives and none of it is reclaimed.
+            if self.chosen.contains(&piece) {
                 self.committed.insert(piece);
                 decision.committed.push(piece);
             }
@@ -1246,7 +1259,7 @@ mod tests {
         // Including pieces that arrive later, and only once each.
         let d = p.advance(&[], &held(0..20));
         assert_eq!(d.committed, (12..20).collect::<Vec<_>>());
-        assert!(d.reclaim.is_empty() && d.withdrawn.is_empty());
+        assert!(d.reclaim.is_empty() && d.lost.is_empty());
         assert_eq!(p.advertised().len(), 20);
     }
 
@@ -1422,7 +1435,7 @@ mod tests {
 
         disk.remove(&2);
         let d = p.advance(&[], &disk);
-        assert_eq!(d.withdrawn, vec![2]);
+        assert_eq!(d.lost, vec![2]);
         assert!(!p.is_advertised(2));
         assert!(p.advertised().is_empty());
 
@@ -1431,7 +1444,7 @@ mod tests {
         disk.insert(2);
         let d = p.advance(&[], &disk);
         assert_eq!(d.committed, vec![2]);
-        assert!(d.withdrawn.is_empty() && !d.reclaim.contains(&2));
+        assert!(d.lost.is_empty() && !d.reclaim.contains(&2));
         assert_eq!(*p.advertised(), held([2]));
     }
 
@@ -1508,7 +1521,7 @@ mod tests {
         );
         assert!(
             !p.is_advertised(31) && !p.is_advertised(34),
-            "and their neighbours stay held back"
+            "and their neighbours are not shared"
         );
 
         // Everything on the disk is offered up. The two drawn ones are out
@@ -1526,23 +1539,19 @@ mod tests {
         assert_eq!(*p.advertised(), held([32, 33, 42]));
     }
 
-    /// **A capacity that shrinks under the set does not drop what it
-    /// announced out of the draw.**
+    /// **A capacity that shrinks under the set does not touch the draw.**
     ///
     /// [`RetentionPolicy::observe`] runs at the top of every pass and
-    /// re-draws whenever the capacity moves, which a stated bitrate and a
-    /// moving budget between them make often enough to matter.
-    /// Lowest-rank-`count` is nested in `count`, so a shrink drops the
-    /// unchosen tail of the draw -- and a piece we have already announced is
-    /// in that tail as easily as any other. `advance` would not reclaim it,
-    /// because it tests the committed set first, but the moment the disk
-    /// loses the piece behind our back it leaves the committed set and the
-    /// draw no longer says to put it back: we withdraw a piece we announced
-    /// and then refuse to announce it again with the bytes in hand. So the
-    /// re-draw adopts whatever is committed, whatever the capacity says.
+    /// re-shapes whenever the readers move, which a stated bitrate makes
+    /// often enough to matter. A draw that followed the capacity down would
+    /// drop pieces we have announced -- a withdrawal -- and one that
+    /// followed it up would share pieces nobody sized the read-ahead
+    /// against. So the draw is the one made when the policy was built, and
+    /// a piece of it the disk loses and gets back is announced again.
     #[test]
     fn a_capacity_that_shrinks_under_the_set_keeps_what_it_announced_in_the_draw() {
         let mut p = policy(30, 500);
+        let drawn = p.draw().clone();
         let mut disk: BTreeSet<u32> = BTreeSet::new();
         play(&mut p, &mut disk, (0..300).step_by(3));
         let announced = p.advertised().clone();
@@ -1563,12 +1572,17 @@ mod tests {
             announced,
             "a capacity that shrank took a piece back"
         );
+        assert_eq!(*p.draw(), drawn, "a capacity that shrank redrew the set");
 
         // The disk loses one of them behind our back and gets it back.
         let lost = *announced.iter().next_back().expect("something announced");
         disk.remove(&lost);
         let d = p.advance(&[], &disk);
-        assert_eq!(d.withdrawn, vec![lost], "the lost piece is withdrawn");
+        assert_eq!(
+            d.lost,
+            vec![lost],
+            "the lost piece leaves the committed set"
+        );
         disk.insert(lost);
         let d = p.advance(&[], &disk);
         assert!(
@@ -1583,11 +1597,11 @@ mod tests {
 
     /// **And so does the carry onto a smaller budget.**
     ///
-    /// [`RetentionPolicy::carry_into`] adopts the whole committed set, over
-    /// the new capacity and all, because there is no un-have. The draw the
-    /// new policy was built with knows nothing about it -- it is a fresh
-    /// `choose` at the smaller capacity -- so it adopts it too, for the same
-    /// reason [`RetentionPolicy::observe`] does.
+    /// [`RetentionPolicy::carry_into`] adopts the whole draw and the whole
+    /// committed set, over the new capacity and all, because there is no
+    /// un-have. The draw the new policy was built with -- a fresh `choose`
+    /// at the smaller capacity -- is not the one that was announced, and is
+    /// dropped for it.
     #[test]
     fn a_budget_that_shrinks_carries_what_was_announced_into_the_new_draw() {
         let mut p = policy(30, 500);
@@ -1598,12 +1612,14 @@ mod tests {
 
         // The volume filled: a tenth of the budget, under the same file.
         let mut next = policy(3, 500);
+        assert_ne!(next.draw(), p.draw(), "the smaller budget draws its own");
         p.carry_into(&mut next);
         assert_eq!(*next.advertised(), announced, "the carry lost a piece");
+        assert_eq!(next.draw(), p.draw(), "the carry redrew the set");
 
         let lost = *announced.iter().next_back().expect("something announced");
         disk.remove(&lost);
-        assert_eq!(next.advance(&[], &disk).withdrawn, vec![lost]);
+        assert_eq!(next.advance(&[], &disk).lost, vec![lost]);
         disk.insert(lost);
         let d = next.advance(&[], &disk);
         assert!(
@@ -1614,6 +1630,39 @@ mod tests {
             next.advertised().contains(&lost),
             "the carried policy will not announce again what it carried"
         );
+    }
+
+    /// **The draw is made once, and nothing grows it.**
+    ///
+    /// A bigger budget published under a stream, or a seek that brings in
+    /// pieces the old draw did not have, must not share more than the
+    /// viewer's first open agreed to: a rise carried onto a roomier policy
+    /// keeps the draw it had, and a policy handed a draw shares exactly it.
+    #[test]
+    fn a_draw_does_not_grow_with_the_budget_or_a_seek() {
+        let tight = policy(6, 500);
+        let drawn = tight.draw().clone();
+        assert_eq!(drawn.len(), 3);
+
+        let mut roomy = policy(60, 500);
+        assert!(
+            roomy.draw().len() > drawn.len(),
+            "the bigger budget draws more"
+        );
+        tight.carry_into(&mut roomy);
+        assert_eq!(*roomy.draw(), drawn, "a budget that rose grew the draw");
+
+        // A seek anywhere commits only what the draw holds.
+        let disk: BTreeSet<u32> = (200..260).collect();
+        let d = roomy.advance(&[], &disk);
+        assert!(d.committed.iter().all(|piece| drawn.contains(piece)));
+
+        // And a draw handed in is the whole of what is shared.
+        let mut fresh = policy(60, 500);
+        fresh.adopt_draw(&drawn);
+        assert_eq!(*fresh.draw(), drawn);
+        let d = fresh.advance(&[], &(0..500).collect());
+        assert_eq!(d.committed, drawn.iter().copied().collect::<Vec<_>>());
     }
 
     /// **Two clients over one file keep different pieces.**
@@ -1709,7 +1758,7 @@ mod tests {
             second.committed.is_empty(),
             "already committed, and a commit is a transition"
         );
-        assert!(second.withdrawn.is_empty());
+        assert!(second.lost.is_empty());
     }
 
     #[test]

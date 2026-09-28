@@ -4281,6 +4281,393 @@ fn archive_member_url(base: &str, info_hash: &str, member: &str) -> String {
     format!("{base}/zip/stream/torrent:{info_hash}%2Ffixture.zip/{member}")
 }
 
+/// **A film played out of an archive in a torrent shares nothing.**
+///
+/// The archive's file is read through a translated source
+/// (`sources::torrent`), which opens its readers on the torrent the way a
+/// stream does -- registered, bounded -- and is not the viewer's playback
+/// stream. Drawn as one, the file would share itself whole under a budget
+/// that covers it (the default); a RAR set read across its volumes would
+/// leave a play session nobody shares at every boundary, whose end stops
+/// the torrent under the film. So the file's sharing row promises nothing,
+/// and the torrent is still in the swarm once the member has been played.
+///
+/// The pin set is known, as for any test of what playing does to a
+/// torrent; the read follows the add at once.
+#[test]
+fn a_film_played_out_of_an_archive_in_a_torrent_shares_nothing() -> anyhow::Result<()> {
+    const MEMBER_LEN: usize = 64 * 1024;
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let (handle, base, info_hash) = archive_member_server(
+        config_dir.path(),
+        cache_dir.path(),
+        src.path(),
+        "film.bin",
+        MEMBER_LEN,
+        None,
+        offline_config(),
+    )?;
+    let played = reqwest::blocking::Client::new()
+        .get(archive_member_url(&base, &info_hash, "film.bin"))
+        .send()?
+        .error_for_status()?
+        .bytes()?;
+    assert_eq!(played.as_ref(), member_payload(MEMBER_LEN).as_slice());
+
+    let stats = stats_after_check(&handle, &info_hash)?;
+    let idx = file_index(&stats, "fixture.zip");
+    let numbers = handle
+        .stream_numbers(&format!("{base}/{info_hash}/{idx}"))?
+        .expect("the archive's torrent is held");
+    assert!(
+        numbers.window.is_some(),
+        "the archive's file was never opened as a stream"
+    );
+    assert_eq!(
+        numbers.sharing.and_then(|sharing| sharing.committed_bytes),
+        None,
+        "the archive's file shares something"
+    );
+    assert!(
+        !swarm_paused(&handle, &info_hash)?,
+        "the torrent left the swarm while its archive was played"
+    );
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// **An archive read beside the film, in the same torrent, takes nothing
+/// from the film.**
+///
+/// The film has been played through and its reads have closed -- a seek
+/// closes them all for a moment, and so does the end of a body -- when a
+/// member of an archive in the same torrent is read. The archive's source
+/// registers an unshared stream, which never takes the liveness cell from
+/// the file the viewer's player opened: registered as a player's stream,
+/// it took the cell, the film's play session ended with its draw still
+/// announced, and the torrent was stopped and the film's bytes deleted --
+/// under a film the viewer had only paused or seeked in. Here the player
+/// states no length and the default budget covers the film, so the film's
+/// draw is the whole film from its first open.
+#[test]
+fn an_archive_read_beside_the_film_takes_nothing_from_it() -> anyhow::Result<()> {
+    const MEMBER_LEN: usize = 64 * 1024;
+    const FILM_LEN: usize = 128 * 1024;
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let content = src.path().join("Release");
+    std::fs::create_dir_all(&content)?;
+    write_payload(&content.join("film.bin"), FILM_LEN);
+    std::fs::write(
+        content.join("fixture.zip"),
+        member_zip("extra.bin", MEMBER_LEN, async_zip::Compression::Stored),
+    )?;
+    let film = std::fs::read(content.join("film.bin"))?;
+    let (torrent, info_hash) = real_torrent(&content);
+    let cache_root = resolved(&cache_dir.path().join("cache"));
+    stream_server::pretend_volume_space(&cache_root, u64::MAX);
+    let handle = stream_server::start(ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_root.clone()),
+        ..offline_config()
+    })?;
+    seed_piece_store(&cache_root, &torrent, &content);
+    let base = format!("http://{}", handle.http_addr());
+    bearer_client(&handle)?
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
+        .send()?
+        .error_for_status()?;
+    let stats = stats_after_check(&handle, &info_hash)?;
+    let film_idx = file_index(&stats, "film.bin");
+    let film_url = format!("{base}/{info_hash}/{film_idx}");
+
+    let anonymous = reqwest::blocking::Client::new();
+    // The player's request: it carries the player token.
+    let played = anonymous
+        .get(format!("{film_url}?p=tv.1"))
+        .send()?
+        .error_for_status()?
+        .bytes()?;
+    assert_eq!(played.as_ref(), film.as_slice());
+    let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
+    while handle.background_traffic()?.playing {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the film's read closed and its stream stayed registered"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let shared = handle
+        .stream_numbers(&film_url)?
+        .and_then(|numbers| numbers.sharing)
+        .and_then(|sharing| sharing.committed_bytes);
+    assert!(shared.is_some(), "the film's play session shares nothing");
+
+    let member = anonymous
+        .get(archive_member_url(&base, &info_hash, "extra.bin"))
+        .send()?
+        .error_for_status()?
+        .bytes()?;
+    assert_eq!(member.as_ref(), member_payload(MEMBER_LEN).as_slice());
+    assert_eq!(
+        handle
+            .stream_numbers(&film_url)?
+            .and_then(|numbers| numbers.sharing)
+            .and_then(|sharing| sharing.committed_bytes),
+        shared,
+        "the archive's read ended the film's play session"
+    );
+    assert!(!swarm_paused(&handle, &info_hash)?);
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// **Only the player's own request shares anything.** The same film,
+/// fetched twice: by a client that sends no player token -- another app on
+/// the HTTP routes, a subtitle fetch, a probe -- and then by the app's
+/// player, whose request carries `p=`. Under the default budget, which
+/// covers the film, a player's open shares all of it at once; the other
+/// request shares none of it, however much of it was read.
+///
+/// The film is asked for the moment it is added, as the other tests of
+/// what playing does are: under the pin record a torrent nobody plays is
+/// emptied by the next tick.
+#[test]
+fn only_the_players_request_shares_anything() -> anyhow::Result<()> {
+    const FILM_LEN: usize = 128 * 1024;
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let content = src.path().join("Film");
+    std::fs::create_dir_all(&content)?;
+    write_payload(&content.join("film.bin"), FILM_LEN);
+    let film = std::fs::read(content.join("film.bin"))?;
+    let (torrent, info_hash) = real_torrent(&content);
+    let cache_root = resolved(&cache_dir.path().join("cache"));
+    stream_server::pretend_volume_space(&cache_root, u64::MAX);
+    let handle = stream_server::start(ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_root.clone()),
+        ..offline_config()
+    })?;
+    seed_piece_store(&cache_root, &torrent, &content);
+    let base = format!("http://{}", handle.http_addr());
+    bearer_client(&handle)?
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
+        .send()?
+        .error_for_status()?;
+    let film_url = format!("{base}/{info_hash}/0");
+    let committed = || -> anyhow::Result<Option<u64>> {
+        Ok(handle
+            .stream_numbers(&film_url)?
+            .and_then(|numbers| numbers.sharing)
+            .and_then(|sharing| sharing.committed_bytes))
+    };
+    let anonymous = reqwest::blocking::Client::new();
+    let read = anonymous
+        .get(&film_url)
+        .send()?
+        .error_for_status()?
+        .bytes()?;
+    assert_eq!(read.as_ref(), film.as_slice());
+    assert_eq!(committed()?, None, "a request with no player token shared");
+
+    let read = anonymous
+        .get(format!("{film_url}?p=tv.1"))
+        .send()?
+        .error_for_status()?
+        .bytes()?;
+    assert_eq!(read.as_ref(), film.as_slice());
+    assert_eq!(
+        committed()?,
+        Some(FILM_LEN as u64),
+        "the player's request shares the film"
+    );
+    assert_eq!(
+        handle.play_session_of("tv.1"),
+        Some(enginefs::retention::sessions::Played::Torrent {
+            info_hash: info_hash.clone(),
+            file_idx: 0,
+            shares: true,
+        })
+    );
+
+    // The player goes on to a proxied stream: its session leaves the film,
+    // whether or not the origin answers.
+    let origin = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+    let _ = anonymous
+        .get(format!(
+            "{base}/proxy/d={}&p=tv.2/film.mkv",
+            urlencoding::encode(&format!("http://{origin}"))
+        ))
+        .send()?;
+    assert_eq!(
+        handle.play_session_of("tv.2"),
+        Some(enginefs::retention::sessions::Played::Elsewhere)
+    );
+
+    // The first screen's player, still reconnecting, asks for the film
+    // again: an older screen of the same viewer, which moves nothing.
+    anonymous
+        .get(format!("{film_url}?p=tv.1"))
+        .send()?
+        .error_for_status()?
+        .bytes()?;
+    assert_eq!(
+        handle.play_session_of("tv.2"),
+        Some(enginefs::retention::sessions::Played::Elsewhere),
+        "an older screen's request moved the viewer's session"
+    );
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// **An older screen's request is served and moves nothing.** The viewer
+/// watches episode one on screen `tv.1`, then episode two on `tv.2`; the
+/// first screen's player, still tearing down, asks for episode one again.
+/// It gets its bytes, and the liveness cell stays on episode two -- moved
+/// there, episode two would be slack under a viewer who is watching it,
+/// and its read-ahead the next tick's to give back.
+#[test]
+fn an_older_screens_request_is_served_and_leaves_the_cell_where_it_is() -> anyhow::Result<()> {
+    const EPISODE_LEN: usize = 64 * 1024;
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let content = src.path().join("Show");
+    std::fs::create_dir_all(&content)?;
+    write_payload(&content.join("e1.bin"), EPISODE_LEN);
+    write_payload(&content.join("e2.bin"), EPISODE_LEN);
+    let (torrent, info_hash) = real_torrent(&content);
+    let cache_root = resolved(&cache_dir.path().join("cache"));
+    stream_server::pretend_volume_space(&cache_root, u64::MAX);
+    let handle = stream_server::start(ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_root.clone()),
+        ..offline_config()
+    })?;
+    seed_piece_store(&cache_root, &torrent, &content);
+    let base = format!("http://{}", handle.http_addr());
+    bearer_client(&handle)?
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
+        .send()?
+        .error_for_status()?;
+    // Episode one is kept as a download: left by the viewer, it would
+    // otherwise be taken off the disk before the older screen asks, and
+    // there is nothing offline to fetch it back from.
+    handle.pin_download(&info_hash, 0, &[])?;
+    let (engine, _runtime) = handle.engine_for_tests();
+    let anonymous = reqwest::blocking::Client::new();
+    let read = |file_idx: usize, token: &str| -> anyhow::Result<usize> {
+        Ok(anonymous
+            .get(format!("{base}/{info_hash}/{file_idx}?p={token}"))
+            .send()?
+            .error_for_status()?
+            .bytes()
+            .map_err(|error| anyhow::anyhow!("file {file_idx} for {token}: {error:#}"))?
+            .len())
+    };
+    assert_eq!(read(0, "tv.1")?, EPISODE_LEN);
+    assert_eq!(read(1, "tv.2")?, EPISODE_LEN);
+    assert!(engine.live().is_torrent_file(&info_hash, 1));
+
+    assert_eq!(
+        read(0, "tv.1")?,
+        EPISODE_LEN,
+        "the older screen's request is served"
+    );
+    assert!(
+        engine.live().is_torrent_file(&info_hash, 1),
+        "the older screen's request moved the liveness cell: {:?}",
+        engine.live().reading()
+    );
+    assert_eq!(
+        handle.play_session_of("tv.2"),
+        Some(enginefs::retention::sessions::Played::Torrent {
+            info_hash: info_hash.clone(),
+            file_idx: 1,
+            shares: true,
+        }),
+        "or the viewer's session"
+    );
+
+    drop(engine);
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// **Archive playback shares nothing, the player's request included.** The
+/// player is handed the archive's own file first (`p=` and all), fails to
+/// recognise it, and the app has its member served out of it by the
+/// archive route. That request is the player's, and it moves the player's
+/// play session -- but it draws nothing: the archive is never what plays.
+#[test]
+fn an_archive_the_player_opens_shares_nothing() -> anyhow::Result<()> {
+    const MEMBER_LEN: usize = 64 * 1024;
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let (handle, base, info_hash) = archive_member_server(
+        config_dir.path(),
+        cache_dir.path(),
+        src.path(),
+        "film.bin",
+        MEMBER_LEN,
+        None,
+        offline_config(),
+    )?;
+    let archive_url = format!("{base}/{info_hash}/0");
+    let anonymous = reqwest::blocking::Client::new();
+    anonymous
+        .get(format!("{archive_url}?p=tv.1"))
+        .send()?
+        .error_for_status()?
+        .bytes()?;
+    let played = anonymous
+        .get(archive_member_url(&base, &info_hash, "film.bin"))
+        .send()?
+        .error_for_status()?
+        .bytes()?;
+    assert_eq!(played.as_ref(), member_payload(MEMBER_LEN).as_slice());
+    assert_eq!(
+        handle.play_session_of("tv.1"),
+        Some(enginefs::retention::sessions::Played::Torrent {
+            info_hash: info_hash.clone(),
+            file_idx: 0,
+            shares: false,
+        }),
+        "the player's session is on the archive, and shares nothing"
+    );
+    assert_eq!(
+        handle
+            .stream_numbers(&archive_url)?
+            .and_then(|numbers| numbers.sharing)
+            .and_then(|sharing| sharing.committed_bytes),
+        None,
+        "the archive the player opened shares something"
+    );
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
 /// Whether the reconciler has this torrent stopped, as the server reports it:
 /// `swarmPaused` is `run_state() == Paused` read off librqbit, not anything
 /// the route under test writes.
@@ -4943,6 +5330,15 @@ fn head_on_the_torrent_left(budget: std::time::Duration) -> anyhow::Result<Optio
         offline_config(),
     )?;
     let client = bearer_client(&handle)?;
+    // A cache too small to hold a stream's read-ahead and a shared set
+    // beside it, so X's play session shares nothing: leaving X then ends no
+    // announcement, and nothing stops it but the timer -- the one state in
+    // which the HEAD's guard could be what stops it. A session that shared
+    // something is stopped by the switch itself, before its bytes go -- and
+    // under the default budget, which covers X, its session shares X whole
+    // from its first open, so the switch to Y is what would stop it, as the
+    // sharing rule says it must.
+    handle.update_settings(serde_json::json!({ "cacheSize": 32 * 1024 }))?;
 
     let other_content = src.path().join("Other");
     std::fs::create_dir_all(&other_content)?;
@@ -6207,7 +6603,11 @@ fn buffer_profile_is_a_setting_and_a_stream_query_override() -> anyhow::Result<(
         cache_dir.path(),
         src.path(),
         None,
-        offline_config(),
+        // Reads the seeded bytes and is about no retention: under the empty pin
+        // record a reconciler tick landing before the first request -- the
+        // torrent is then one nobody plays -- takes every seeded piece, and
+        // the requests park on pieces no peer will bring (`fixture_pins`).
+        seeded_fixture_config(),
     )?;
     let client = bearer_client(&handle)?;
 
@@ -6530,6 +6930,82 @@ fn an_embedder_that_has_pinned_nothing_keeps_no_torrent_nobody_plays() -> anyhow
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// **Shutdown takes what the play session fetched, with the torrent out of
+/// the swarm first, and the next start takes what is left.**
+///
+/// The film is being played when the server is shut down -- the liveness
+/// cell is on it, so no pass has taken a byte of it -- and the shutdown
+/// stops every torrent before it deletes the files a stream opened: there
+/// is no un-Have, and a peer still connected could ask for a piece that is
+/// going. What a shutdown cannot finish is the next start's: the launch
+/// sweep takes the directory of every torrent nobody pinned.
+#[test]
+fn shutdown_takes_what_the_play_session_fetched_and_the_next_start_the_rest() -> anyhow::Result<()>
+{
+    const PIECE: u64 = 16 * 1024;
+    const PIECES: u64 = 8;
+
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let cache_root = resolved(&cache_dir.path().join("cache"));
+    stream_server::pretend_volume_space(&cache_root, u64::MAX);
+
+    let content = src.path().join("Film");
+    std::fs::create_dir_all(&content)?;
+    write_payload(&content.join("film.bin"), (PIECE * PIECES) as usize);
+    let payload = std::fs::read(content.join("film.bin"))?;
+    let (torrent, info_hash) = real_torrent(&content);
+    let config = || stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_root.clone()),
+        ..offline_config()
+    };
+
+    let handle = stream_server::start(config())?;
+    seed_piece_store(&cache_root, &torrent, &content);
+    let base = format!("http://{}", handle.http_addr());
+    let client = bearer_client(&handle)?;
+    client
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
+        .send()?
+        .error_for_status()?;
+    let stats = stats_after_check(&handle, &info_hash)?;
+    let idx = file_index(&stats, "film.bin");
+    // The viewer plays the film through; the cell stays on it.
+    let played = reqwest::blocking::Client::new()
+        .get(format!("{base}/{info_hash}/{idx}"))
+        .send()?
+        .error_for_status()?
+        .bytes()?;
+    assert_eq!(played.as_ref(), payload.as_slice());
+    assert_eq!(
+        pieces_held(&cache_root, &info_hash) as u64,
+        PIECES,
+        "the film being played lost pieces before the shutdown"
+    );
+
+    handle.shutdown()?;
+    handle.join()?;
+    assert_eq!(
+        pieces_held(&cache_root, &info_hash),
+        0,
+        "the shutdown left the play session's pieces on the disk"
+    );
+
+    // The next start: the sweep takes the torrent nobody pinned.
+    let handle = stream_server::start(config())?;
+    assert!(
+        !cache_root.join(".pieces").join(&info_hash).exists(),
+        "the next start left the unpinned torrent's directory"
+    );
     handle.shutdown()?;
     handle.join()?;
     Ok(())

@@ -64,7 +64,8 @@ use std::time::{Duration, Instant};
 use crate::piece_store::{Buffering, RetentionPolicy, Share};
 use crate::retention::RetentionBudget;
 use crate::retention::owner::{
-    Backing, Claim, Door, Install, InstallOutcome, Mode, Outcome, Reader, Retention, Trigger,
+    Backing, Claim, Door, Install, InstallOutcome, Mode, Opener, Outcome, Reader, Retention,
+    Trigger,
 };
 
 pub(crate) const PIECE: u64 = 1000;
@@ -167,7 +168,9 @@ pub(crate) struct FakeBacking<S: Side> {
     /// what it is asking for and what may go is decided here, so a
     /// scenario measures the policy rather than a stand-in for it.
     pub(crate) detector: parking_lot::Mutex<crate::retention::streams::Streams>,
-    pub(crate) advertised: parking_lot::Mutex<Vec<(Range<u32>, bool)>>,
+    /// Every range the owner advertised, in order. There is no other
+    /// direction: [`Backing::advertise`] only adds.
+    pub(crate) advertised: parking_lot::Mutex<Vec<Range<u32>>>,
     pub(crate) fail_advertise: AtomicBool,
     pub(crate) fail_held: AtomicBool,
     /// How many listings were asked for.
@@ -176,10 +179,24 @@ pub(crate) struct FakeBacking<S: Side> {
     /// What [`Backing::is_live`] answers: the entity the fake is
     /// playing right now.
     pub(crate) is_live: AtomicBool,
-    /// What [`Backing::epoch`] answers: moved by a test to say that the
-    /// backend threw away everything it was told about what to hold
-    /// back, as a restart out of an error does.
-    pub(crate) epoch: AtomicU64,
+    /// The one entity the fake's liveness cell names, beside
+    /// [`Self::is_live`], which names them all: what a test of which file's
+    /// play session draws sets ([`play`]).
+    pub(crate) playing: parking_lot::Mutex<Option<usize>>,
+    /// **Whether the fake torrent is in the swarm** -- live, with peers
+    /// that may have been told of what it advertises. On by default for the
+    /// torrent side, off for the proxy's, which has no swarm. What
+    /// [`Backing::announced_in_swarm`] reads, and what the invariant in
+    /// [`Backing::reclaim`] holds every unlink to: **no piece this fake has
+    /// been told to advertise leaves the disk while it is in the swarm.** A
+    /// test of what a torrent does once it has left the swarm -- the
+    /// torrent's `EndShares` -- turns it off.
+    pub(crate) in_swarm: AtomicBool,
+    /// **Every breach of that rule the fake saw**, recorded where it was
+    /// seen -- which may be a pass spawned on a task nobody awaits -- and
+    /// asserted on the test's own task when its [`Checked`] hold drops, or
+    /// at the end of a [`Scenario`]'s run.
+    pub(crate) violations: parking_lot::Mutex<Vec<String>>,
     /// The runs each `reclaim` call was handed.
     pub(crate) reclaims: parking_lot::Mutex<Vec<Vec<Range<u32>>>>,
     /// The extent of every `want_all` call, in order.
@@ -259,7 +276,9 @@ impl<S: Side> FakeBacking<S> {
             listings: AtomicU64::new(0),
             keeps_everything: AtomicBool::new(false),
             is_live: AtomicBool::new(false),
-            epoch: AtomicU64::new(1),
+            playing: parking_lot::Mutex::new(None),
+            in_swarm: AtomicBool::new(S::SHARE == Share::Half),
+            violations: parking_lot::Mutex::new(Vec::new()),
             reclaims: parking_lot::Mutex::new(Vec::new()),
             wanted_all: parking_lot::Mutex::new(Vec::new()),
             wanted: parking_lot::Mutex::new(Vec::new()),
@@ -283,6 +302,51 @@ impl<S: Side> FakeBacking<S> {
 
     pub(crate) fn holds(&self, pieces: impl IntoIterator<Item = u32>) {
         self.held.lock().extend(pieces);
+    }
+
+    /// Whether the owner has advertised `piece`.
+    pub(crate) fn advertises(&self, piece: u32) -> bool {
+        self.advertised
+            .lock()
+            .iter()
+            .any(|range| range.contains(&piece))
+    }
+
+    /// Every piece the owner has advertised, ascending.
+    pub(crate) fn advertised_pieces(&self) -> Vec<u32> {
+        self.advertised
+            .lock()
+            .iter()
+            .flat_map(|range| range.clone())
+            .collect::<BTreeSet<u32>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// **The rule, as an assertion**: a piece leaving the disk while the
+    /// fake is in the swarm must not be one it was told to advertise --
+    /// there is no un-Have, and a peer that was told may still ask for it.
+    ///
+    /// Recorded before it panics, so a breach on a task whose panic nobody
+    /// reads still fails the test ([`Self::assert_kept_the_rule`]).
+    pub(crate) fn assert_not_announced(&self, piece: u32) {
+        if self.in_swarm.load(Ordering::SeqCst) && self.advertises(piece) {
+            let breach = format!(
+                "piece {piece} was advertised and left the disk while the torrent was in the swarm"
+            );
+            self.violations.lock().push(breach.clone());
+            panic!("{breach}");
+        }
+    }
+
+    /// Fail unless every unlink this fake saw kept the sharing rule. What a
+    /// test's [`Checked`] hold asks when it drops.
+    pub(crate) fn assert_kept_the_rule(&self) {
+        let violations = self.violations.lock();
+        assert!(
+            violations.is_empty(),
+            "the sharing rule was broken: {violations:?}"
+        );
     }
 
     pub(crate) fn on_disk(&self) -> Vec<u32> {
@@ -486,8 +550,8 @@ impl<S: Side> Backing for FakeBacking<S> {
         self.keeps_everything.load(Ordering::SeqCst)
     }
 
-    fn is_live(&self, _key: &usize) -> bool {
-        self.is_live.load(Ordering::SeqCst)
+    fn is_live(&self, key: &usize) -> bool {
+        self.is_live.load(Ordering::SeqCst) || *self.playing.lock() == Some(*key)
     }
 
     async fn held(&self, _store: &(), _domain: &FakeDomain) -> Option<BTreeSet<u32>> {
@@ -499,7 +563,7 @@ impl<S: Side> Backing for FakeBacking<S> {
         Some(self.held.lock().clone())
     }
 
-    async fn advertise(&self, pieces: Range<u32>, on: bool) -> anyhow::Result<()> {
+    async fn advertise(&self, pieces: Range<u32>) -> anyhow::Result<()> {
         if let Some(hook) = self.on_advertise.lock().as_ref() {
             hook();
         }
@@ -507,12 +571,12 @@ impl<S: Side> Backing for FakeBacking<S> {
         if self.fail_advertise.load(Ordering::SeqCst) {
             anyhow::bail!("the backend would not change what it advertises");
         }
-        self.advertised.lock().push((pieces, on));
+        self.advertised.lock().push(pieces);
         Ok(())
     }
 
-    fn epoch(&self, _store: &()) -> u64 {
-        self.epoch.load(Ordering::SeqCst)
+    async fn announced_in_swarm(&self, pieces: &[u32]) -> bool {
+        self.in_swarm.load(Ordering::SeqCst) && pieces.iter().any(|piece| self.advertises(*piece))
     }
 
     async fn alone(&self, _domain: &FakeDomain, pieces: &[u32]) -> Vec<u32> {
@@ -625,6 +689,9 @@ impl<S: Side> Backing for FakeBacking<S> {
             asked.push(run.clone());
             for index in run {
                 if !door.refuses(index) && self.held.lock().remove(&index) {
+                    // The invariant every scenario keeps: what a peer may
+                    // have been told of stays until the swarm is left.
+                    self.assert_not_announced(index);
                     // As the torrent's `drop_pieces(.., LeaveDropped)`: a
                     // piece the pass takes is neither had nor wanted, so
                     // the swarm does not put it straight back. Left
@@ -647,27 +714,87 @@ impl<S: Side> Backing for FakeBacking<S> {
 pub(crate) type Proxy = FakeBacking<ProxySide>;
 pub(crate) type Torrent = FakeBacking<TorrentSide>;
 
+/// **A test's own hold on a fake backing, which checks the sharing rule
+/// when the test ends** ([`FakeBacking::assert_kept_the_rule`]).
+///
+/// Dropped with the test's other locals, on the test's own task, so a
+/// breach the fake recorded on a pass spawned elsewhere -- whose panic a
+/// `JoinHandle` nobody awaited would have swallowed -- fails the test
+/// anyway. Derefs to the `Arc`, so `backing.clone()` is the backing for a
+/// hook or an owner, and every knob reads as before.
+pub(crate) struct Checked<S: Side>(pub(crate) Arc<FakeBacking<S>>);
+
+impl<S: Side> std::ops::Deref for Checked<S> {
+    type Target = Arc<FakeBacking<S>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<S: Side> Drop for Checked<S> {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            self.0.assert_kept_the_rule();
+        }
+    }
+}
+
 /// An eight-piece entity under a budget of four pieces: the proxy
 /// shape gives the whole budget to the window, so the window is four
 /// pieces and the stride is one.
-pub(crate) fn proxy() -> (Arc<Proxy>, Arc<Retention<Proxy>>, Arc<RetentionBudget>) {
+pub(crate) fn proxy() -> (
+    Checked<ProxySide>,
+    Arc<Retention<Proxy>>,
+    Arc<RetentionBudget>,
+) {
     let backing = Proxy::new([domain(0, 0..8)]);
     backing.holds(0..8);
     let budget = Arc::new(RetentionBudget::default());
     budget.set(Some(4 * PIECE), None);
     let owner = Retention::new(backing.clone(), budget.clone());
-    (backing, owner, budget)
+    (Checked(backing), owner, budget)
 }
 
 /// Two eight-piece files under a budget of four pieces: the torrent
 /// shape splits it two and two.
-pub(crate) fn torrent() -> (Arc<Torrent>, Arc<Retention<Torrent>>, Arc<RetentionBudget>) {
+pub(crate) fn torrent() -> (
+    Checked<TorrentSide>,
+    Arc<Retention<Torrent>>,
+    Arc<RetentionBudget>,
+) {
     let backing = Torrent::new([domain(0, 0..8), domain(1, 8..16)]);
     backing.holds(0..16);
     let budget = Arc::new(RetentionBudget::default());
     budget.set(Some(4 * PIECE), None);
     let owner = Retention::new(backing.clone(), budget.clone());
-    (backing, owner, budget)
+    (Checked(backing), owner, budget)
+}
+
+/// The length of the film [`play`] states: a thousand seconds.
+pub(crate) const FILM_LENGTH: Duration = Duration::from_secs(1000);
+
+/// **The viewer plays `key`**: the fake's liveness cell names it, and the
+/// player opens it with the film's length already stated, so its play
+/// session's draw is decided at this very open ([`Opener::Player`]) -- the
+/// state every test of what a draw does starts from. What the open asks
+/// of the cache is nothing beyond its readers', as [`Retention::install`].
+pub(crate) async fn play(
+    owner: &Arc<Retention<Torrent>>,
+    backing: &Torrent,
+    key: usize,
+) -> InstallOutcome {
+    *backing.playing.lock() = Some(key);
+    let domain = backing
+        .domains
+        .lock()
+        .get(&key)
+        .cloned()
+        .expect("a file of the fake");
+    owner.entity(key, domain);
+    owner.note_duration(&key, FILM_LENGTH);
+    owner
+        .install_opening(key, key, Buffering::default(), Opener::Player)
+        .await
 }
 
 /// Run a pass to its end in a task of its own, so the test can be
@@ -993,6 +1120,7 @@ impl Scenario {
             self.now = *at;
             self.beat(step);
         }
+        self.backing.assert_kept_the_rule();
         self.log
     }
 

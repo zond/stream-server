@@ -64,6 +64,20 @@ pub enum Decision {
     /// Not ours: whatever state it is in, this reconcile has no opinion and
     /// must issue no call.
     Leave,
+    /// The torrent advertises pieces nobody shares any more
+    /// ([`Conditions::shares_to_end`]): stop it -- it leaves the swarm, its
+    /// peers are disconnected -- then take the ended play session's bytes
+    /// and make its advertised set again from what is still shared
+    /// (`Engine::end_shares`), and only then decide again, which starts it
+    /// once more if it is still wanted: the same torrent's next episode, a
+    /// download.
+    ///
+    /// Its own decision because it is two calls and a deletion between
+    /// them, made under the hash's reconcile lock so that nothing starts
+    /// the torrent in between. There is no un-Have in BitTorrent: an
+    /// announcement ends only with the torrent leaving the swarm, so this
+    /// is the one way a play session's announced pieces are deleted.
+    EndShares,
 }
 
 /// What made a decision be taken now. It changes two things -- which
@@ -150,6 +164,12 @@ pub struct Conditions {
     pub has_metadata: bool,
     /// The torrent has everything it wants, so it writes nothing.
     pub finished: bool,
+    /// The torrent advertises a piece no play session or download of it
+    /// shares any more -- the draw of a file the viewer left, a download
+    /// since unpinned (`Engine::shares_to_end`). Read from the backend's
+    /// advertised set and the retention owner's draws, now; nothing
+    /// remembers that a session ended.
+    pub shares_to_end: bool,
     /// Free bytes on the volume the torrent writes to, or `None` when the
     /// probe failed. `None` is "unknown", never "full".
     pub available: Option<u64>,
@@ -209,19 +229,27 @@ pub struct Conditions {
 ///    eviction having happened: a device that gained a gigabyte by any
 ///    other means gets its torrent back, and a pass that freed a byte does
 ///    not restart one onto a volume still under the floor.
-/// 4. **No metadata -> [`Decision::Run`].** A resolving magnet must stay
+/// 4. **Shares to end -> [`Decision::EndShares`].** A play session is
+///    over -- playback moved to another file of this torrent, or to another
+///    torrent -- or a download was unpinned, and what it announced has to
+///    end. It ends only by the torrent leaving the swarm, so the torrent is
+///    stopped before anything of it is deleted, whatever else holds: above
+///    `playing` and `pinned`, which decide only whether it starts again
+///    afterwards, and above the free-space arm, which would stop it anyway.
+///    Only a settled `Live` or `Paused` torrent reaches it.
+/// 5. **No metadata -> [`Decision::Run`].** A resolving magnet must stay
 ///    connected to the swarm: the thing it is fetching is the info
 ///    dictionary, it writes no file data while it does, and stopping it is
 ///    how you make a magnet that never resolves. Above the free-space arm
 ///    for that reason -- it cannot fill a disk.
-/// 5. **Writing, and the volume is under the line -> [`Decision::Stop`].**
+/// 6. **Writing, and the volume is under the line -> [`Decision::Stop`].**
 ///    Above `playing`, which is the point: librqbit writes the file it
 ///    wants straight to `ENOSPC` and calls that a fatal torrent error, so a
 ///    stream that is playing is exactly the torrent that will run the
 ///    volume to zero. A finished torrent writes nothing and so is never
 ///    stopped by this arm. Which line, and what an unreadable probe means,
 ///    is `line` and [`volume_is_short`].
-/// 6. **An unreadable volume, and the torrent still has data to fetch ->
+/// 7. **An unreadable volume, and the torrent still has data to fetch ->
 ///    [`Decision::Leave`] for the timer, [`Decision::Run`] for a
 ///    playback.** An unreadable volume is not a full one. The timer has no
 ///    opinion -- it asks again in two seconds, and a probe that has started
@@ -229,7 +257,7 @@ pub struct Conditions {
 ///    user who is waiting gets their stream, since refusing to start a
 ///    torrent because `statvfs` failed would make an unreadable volume look
 ///    like a server that plays nothing.
-/// 7. **Playing or pinned -> [`Decision::Run`], otherwise
+/// 8. **Playing or pinned -> [`Decision::Run`], otherwise
 ///    [`Decision::Stop`].** Someone is watching it, or someone asked for it
 ///    offline; and if neither, a running torrent is fetching a film nobody
 ///    is watching, into a cache whose next pass will delete every byte of
@@ -292,6 +320,9 @@ pub fn verdict(conditions: &Conditions, trigger: Trigger) -> Verdict {
     }
     if !conditions.settled {
         return arm(Decision::Stop);
+    }
+    if conditions.shares_to_end {
+        return arm(Decision::EndShares);
     }
     if !conditions.has_metadata {
         return arm(Decision::Run);
@@ -776,6 +807,73 @@ mod tests {
             available: Some(u64::MAX),
             floor: CACHE_FREE_SPACE_FLOOR,
             out_of_space: false,
+            shares_to_end: false,
+        }
+    }
+
+    /// **What a play session announced ends with the torrent leaving the
+    /// swarm, before anything of it is deleted -- whatever else wants the
+    /// torrent.** Playing and pinned decide only whether it starts again
+    /// afterwards; the free-space arm would stop it anyway. A torrent that is
+    /// not settled, or is in error, is in no swarm to leave, and keeps the
+    /// answer it had.
+    #[test]
+    fn shares_to_end_stop_the_torrent_first_whatever_wants_it() {
+        for run_state in [RunState::Live, RunState::Paused] {
+            for (playing, pinned) in [(true, false), (false, true), (true, true), (false, false)] {
+                for available in [Some(u64::MAX), Some(0), None] {
+                    let ended = Conditions {
+                        run_state,
+                        playing,
+                        pinned,
+                        available,
+                        shares_to_end: true,
+                        ..healthy()
+                    };
+                    for trigger in [Trigger::Timer, Trigger::PlaybackStart] {
+                        assert_eq!(
+                            desired(&ended, trigger),
+                            Decision::EndShares,
+                            "{ended:?} under {trigger:?}"
+                        );
+                    }
+                }
+            }
+        }
+        let not_in_a_swarm = [
+            (
+                Conditions {
+                    settled: false,
+                    shares_to_end: true,
+                    ..healthy()
+                },
+                Decision::Stop,
+            ),
+            (
+                Conditions {
+                    run_state: RunState::Initializing {
+                        pause_requested: false,
+                    },
+                    shares_to_end: true,
+                    ..healthy()
+                },
+                Decision::Stop,
+            ),
+            (
+                Conditions {
+                    run_state: RunState::Error,
+                    shares_to_end: true,
+                    ..healthy()
+                },
+                Decision::Leave,
+            ),
+        ];
+        for (conditions, expected) in not_in_a_swarm {
+            assert_eq!(
+                desired(&conditions, Trigger::Timer),
+                expected,
+                "{conditions:?}"
+            );
         }
     }
 
@@ -1133,7 +1231,7 @@ mod tests {
                 );
                 observed = match decision {
                     Decision::Run | Decision::RestartFromError => RunState::Live,
-                    Decision::Stop => RunState::Paused,
+                    Decision::Stop | Decision::EndShares => RunState::Paused,
                     Decision::Leave => observed,
                 };
                 decisions.push(decision);

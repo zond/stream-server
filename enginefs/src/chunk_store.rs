@@ -496,13 +496,11 @@ impl ChunkDir {
     /// `EMFILE` on a television that has run out of descriptors, a
     /// permission it lost -- holds whatever it held, and the answer is that
     /// there is no answer. Reporting it as empty would tell the retention
-    /// policy that every committed piece of a file had left the disk: it
-    /// would withdraw the lot from what we announce -- after peers have
-    /// already been told, and there is no un-Have -- and, the next tick,
-    /// with the listing back and the pieces outside the window and no
-    /// longer committed, reclaim them. One transient directory error would
-    /// then break, for every piece of the file, the promise the whole
-    /// design rests on: what we announce is what nothing will ever reclaim.
+    /// policy that every committed piece of a file had left the disk, and
+    /// the proxy's owner would unlink its record of them. One transient
+    /// directory error would then break, for every piece of the file, the
+    /// promise the whole design rests on: what we keep is what the disk
+    /// holds.
     pub fn held_in_bucket(&self, bucket: u64) -> io::Result<HashSet<u64>> {
         let mut held = HashSet::new();
         let entries = match self.read_dir(&self.dir.join(bucket.to_string())) {

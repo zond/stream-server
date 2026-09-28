@@ -7,24 +7,29 @@
 //! runs the pass that feeds it the playhead a reader actually reached. This
 //! module is the torrent's half of the wiring under both -- the budget cell
 //! the server publishes into, the bell that says the volume is running low,
-//! and the three calls that make a policy's answers true --
+//! and the calls that make a policy's answers true --
 //!
-//! * the window is **held back** from what we announce
-//!   ([`crate::backend::TorrentHandle::set_pieces_advertised`]), before the
-//!   reader opens and so before any of its pieces exist, because there is no
-//!   un-Have in BitTorrent and a piece announced once cannot be unannounced;
-//! * a piece the window **releases** is committed, and only then advertised;
+//! * **nothing is announced that nothing chose**: the session runs under the
+//!   fork's `explicit_piece_advertising`, so a torrent -- added, restored,
+//!   restarted out of an error -- advertises nothing until told;
+//! * a play session's **draw** is decided once, before its reader opens,
+//!   sized against the stream's real read-ahead (nothing, if the budget
+//!   cannot hold both), and advertised then
+//!   ([`crate::backend::TorrentHandle::set_pieces_advertised`]): the backend
+//!   announces each piece of it as it completes, and nothing else of the
+//!   file; a pinned download is advertised whole;
 //! * everything else the torrent holds of that file is **reclaimed**, which
 //!   is the backend forgetting it and the store unlinking it, in that order
 //!   and under one claim ([`take_claimed`]).
 //!
-//! So while a file is being played, the only pieces of it a peer is told
-//! about are ones nothing will reclaim while it is -- what
-//! [`crate::piece_store::policy::RetentionPolicy::advertised`] says, and no
-//! more: once nobody plays the file it is slack, and the pass takes the
-//! committed half too. It holds the whole file back from what we announce
-//! before it unlinks anything, so a piece is never deleted while announced
-//! -- performable because the fork's have-bit is not itself an announcement.
+//! **An announcement is never taken back.** There is no un-Have in
+//! BitTorrent. While a file is being played, the only pieces of it a peer
+//! is told about are its draw's, which nothing reclaims; once nobody plays
+//! it, its play session is over, and what it announced ends only with the
+//! torrent leaving the swarm: the reconciler stops the torrent first, then
+//! the session's bytes go and the advertised set is made again from what is
+//! still shared (`Engine::end_shares`), and the torrent starts again if it
+//! is still wanted -- the same torrent's next episode, a download.
 //!
 //! # What decides the budget, and what a missing one means
 //!
@@ -39,12 +44,14 @@
 //! than a placeholder**: nothing has told this process a budget yet. It is
 //! not zero, which would say the cache may hold nothing, and it is not a
 //! number this process invented from a disk reading of its own, which would
-//! be a claim about a cap nobody set. Unknown means no policy is installed,
-//! so a stream that starts before the first publication holds what it holds
-//! and announces all of it -- exactly what this server did before any of
-//! this existed. `cache_budget::start` states the cap before the router
-//! serves its first request, so nothing but a test ever sees the gap.
+//! be a claim about a cap nobody set. Unknown means no policy is installed
+//! and nothing is shared: a stream that starts before the first publication
+//! holds what it holds, and its play session shares nothing, since there is
+//! no budget to size a shared set against. `cache_budget::start` states the
+//! cap before the router serves its first request, so nothing but a test
+//! ever sees the gap.
 
+use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,6 +74,8 @@ pub(crate) mod scenario;
 /// cache rather than about an implementation.
 #[cfg(test)]
 mod scenarios;
+pub mod sessions;
+pub mod sniff;
 pub mod streams;
 pub mod trace;
 
@@ -75,14 +84,14 @@ pub mod trace;
 pub enum CacheBudget {
     /// Nothing has told this process a budget. **An absence, not a
     /// number**: nothing has published one yet, so there is nothing to be
-    /// right or wrong about. Nothing is held back and nothing is
-    /// reclaimed under it.
+    /// right or wrong about. Nothing is shared and nothing is reclaimed
+    /// under it.
     #[default]
     Unknown,
     /// There is no cap: the operator set no `cacheSize` and the volume's
     /// free space could not be read. Nothing to bound, so -- as under
-    /// [`Self::Unknown`] -- no policy is installed, and everything we hold
-    /// is announced.
+    /// [`Self::Unknown`] -- no policy is installed, and a play session
+    /// shares nothing: there is no budget to size a shared set against.
     Unbounded,
     /// This many bytes for everything under the torrent-data root.
     Bytes(u64),
@@ -205,8 +214,8 @@ pub(crate) fn playhead_piece(span: &FilePieceSpan, piece_length: u64, offset_in_
 }
 
 /// One reading of one file's retention state: the file's pieces, every
-/// reader inside it, and -- where a policy stands -- how much of it is
-/// committed.
+/// reader inside it, and -- where the play session shares a set -- how much
+/// of it is committed.
 ///
 /// A value rather than a borrow of the owner's state, because the question
 /// it exists to answer -- [`Self::window`] -- is finished against the
@@ -230,10 +239,22 @@ pub struct PolicyReading {
     /// Where playback is by the detector's own account, for the window
     /// when no reader is live: bytes only, since nothing is eating them.
     fallback: PiecePosition,
-    /// How many pieces the policy has committed, or `None` where no policy
-    /// stands: the budget covers the file, none has been published, or a
-    /// pin keeps everything.
-    committed: Option<usize>,
+    /// What the play session has committed, or `None` where it has promised
+    /// nothing: no draw decided yet, none published, or a pin (which shares
+    /// the file whole on its own account, not the session's).
+    committed: Option<Committed>,
+}
+
+/// What a play session has committed: the pieces of its draw we hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Committed {
+    /// A policy stands and has counted them: this many pieces.
+    Counted(usize),
+    /// No policy stands -- the budget covers the file -- and the draw is
+    /// every piece of it, all shared and all kept for the session, the
+    /// read-ahead's with the rest. Counted against the held set when the
+    /// reading is finished.
+    Drawn(BTreeSet<u32>),
 }
 
 /// A byte position in piece space: the piece and the offset into it, and
@@ -263,7 +284,7 @@ impl PolicyReading {
         film_rate: Option<u64>,
         readers: Vec<PieceReader>,
         fallback: PiecePosition,
-        committed: Option<usize>,
+        committed: Option<Committed>,
     ) -> Self {
         Self {
             pieces,
@@ -275,15 +296,19 @@ impl PolicyReading {
         }
     }
 
-    /// Bytes the policy has committed: pieces we have advertised and
-    /// promised never to reclaim. `None` where no policy stands, which has
-    /// promised nothing whatever it announces.
+    /// Bytes the play session has committed: pieces of its draw we hold,
+    /// which are announced and are not reclaimed while the torrent is in the
+    /// swarm. Under a budget that covers the file that is every piece of it
+    /// we hold, counted in `held`. `None` where nothing has been promised.
     ///
     /// Piece count times piece length, so the last piece of a file counts
     /// whole.
-    pub fn committed_bytes(&self) -> Option<u64> {
-        self.committed
-            .map(|committed| (committed as u64).saturating_mul(self.piece_length))
+    pub fn committed_bytes(&self, held: &HeldSnapshot) -> Option<u64> {
+        let pieces = match self.committed.as_ref()? {
+            Committed::Counted(count) => *count,
+            Committed::Drawn(draw) => draw.iter().filter(|piece| held.contains(**piece)).count(),
+        };
+        Some((pieces as u64).saturating_mul(self.piece_length))
     }
 
     /// What the store holds around the reader that will run out first, in
@@ -506,9 +531,11 @@ pub struct TorrentStreamNumbers {
     /// been inside the file in this process, so there is no playhead to
     /// split at.
     pub window: Option<CacheWindow>,
-    /// Bytes advertised and promised never to be reclaimed, or `None`
-    /// where no policy is installed: nothing has then been promised,
-    /// whatever is announced.
+    /// Bytes of the play session's draw we hold -- announced, and not
+    /// reclaimed while the torrent is in the swarm. Under a budget that
+    /// covers the file the draw is the whole file, so this is every byte of
+    /// it we hold. `None` where the session has promised nothing: no draw
+    /// decided yet, or a pin, which shares the file whole on its own.
     pub committed_bytes: Option<u64>,
     /// What this torrent has fetched and sent since it was added, in this
     /// process, or `None` where the backend has no counters to read: a
@@ -534,12 +561,13 @@ pub struct TorrentStreamNumbers {
 /// What one retention pass did, for the log and for the tests.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionPass {
-    /// Pieces that joined the committed set and are now advertised.
+    /// Pieces of a play session's draw found held and committed.
     pub committed: usize,
     /// Pieces the store gave back.
     pub reclaimed: usize,
-    /// Pieces we had advertised and no longer hold, so no longer announce.
-    pub withdrawn: usize,
+    /// Committed pieces the disk no longer holds. Nothing is withdrawn for
+    /// them: the backend announces only what it has.
+    pub lost: usize,
 }
 
 /// The pieces of `reclaim` no other file the torrent still wants has a byte
@@ -716,11 +744,28 @@ pub(crate) async fn unlink(
     store: &Arc<StoreRegistry>,
     info_hash: &str,
     pieces: Vec<u32>,
-    claim: crate::backend::DroppedFilePieces,
+    #[cfg_attr(not(test), allow(unused_mut))] mut claim: crate::backend::DroppedFilePieces,
 ) -> usize {
+    // A test backend's witness: what is on the disk of these pieces now is
+    // what the unlink below takes, and it is told on this task, so what it
+    // asserts fails whoever awaited the unlink.
+    #[cfg(test)]
+    let witness = claim.take_witness().map(|witness| {
+        let doomed: Vec<u32> = store
+            .held(info_hash)
+            .map(|held| {
+                pieces
+                    .iter()
+                    .copied()
+                    .filter(|piece| held.contains(*piece))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (witness, doomed)
+    });
     let store = Arc::clone(store);
     let hash = info_hash.to_string();
-    tokio::task::spawn_blocking(move || {
+    let freed = tokio::task::spawn_blocking(move || {
         let freed = match store.delete(&hash, &pieces) {
             DeleteOutcome::Registered { unlinked } => unlinked,
             DeleteOutcome::Refused => {
@@ -748,7 +793,14 @@ pub(crate) async fn unlink(
     .await
     // The pool would not answer, so this process cannot say what left the
     // disk. Zero is the answer that claims nothing.
-    .unwrap_or(0)
+    .unwrap_or(0);
+    #[cfg(test)]
+    if let Some((witness, doomed)) = witness
+        && freed > 0
+    {
+        witness(&doomed);
+    }
+    freed
 }
 
 /// The parts of `run` that `window` does not cover: at most the pieces
@@ -771,7 +823,7 @@ pub(crate) fn outside(run: Range<u32>, window: &Range<u32>) -> Vec<Range<u32>> {
 
 /// Scattered piece indices as the fewest contiguous ranges that cover them.
 ///
-/// The backend takes a range at a time -- both the hold-back set and the
+/// The backend takes a range at a time -- both the advertised set and the
 /// want-set do -- and a reclaim of two hundred consecutive pieces should be
 /// one call and not two hundred locks on the torrent.
 pub(crate) fn runs(pieces: &[u32]) -> Vec<Range<u32>> {

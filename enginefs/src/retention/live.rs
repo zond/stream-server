@@ -44,6 +44,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::retention::sessions::PlaySessions;
+
 /// The one entity being played.
 ///
 /// A torrent's liveness is per *file*, not per torrent: two files of one
@@ -80,11 +82,22 @@ pub struct Switch {
 /// the one that makes the first tick after a restart stop every unpinned
 /// torrent.
 #[derive(Debug)]
-pub struct Live(tokio::sync::watch::Sender<Option<LiveEntity>>);
+pub struct Live {
+    cell: tokio::sync::watch::Sender<Option<LiveEntity>>,
+    /// **Which files the viewer's players are playing**, which is not this
+    /// cell: the cell follows every stream a request opens, and decides
+    /// windows and runs; the sessions follow only the player's own `p=`
+    /// requests, and decide what is shared ([`PlaySessions`]). Here so that
+    /// everything that holds the cell holds them too.
+    sessions: PlaySessions,
+}
 
 impl Default for Live {
     fn default() -> Self {
-        Self(tokio::sync::watch::Sender::new(None))
+        Self {
+            cell: tokio::sync::watch::Sender::new(None),
+            sessions: PlaySessions::default(),
+        }
     }
 }
 
@@ -92,6 +105,11 @@ impl Live {
     /// Nothing is playing.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The play sessions: which files the viewer's players are playing.
+    pub fn sessions(&self) -> &PlaySessions {
+        &self.sessions
     }
 
     /// The server saw a stream open on `to`.
@@ -108,7 +126,7 @@ impl Live {
     /// woken for it.
     pub fn open(&self, to: LiveEntity, keep_current: bool) -> Option<Switch> {
         let mut switch = None;
-        self.0.send_if_modified(|current| {
+        self.cell.send_if_modified(|current| {
             if keep_current || current.as_ref() == Some(&to) {
                 return false;
             }
@@ -128,7 +146,7 @@ impl Live {
     /// newer than the reading this was decided from, and it stands.
     pub fn hand_on(&self, from: &LiveEntity, to: LiveEntity) -> Option<Switch> {
         let mut switch = None;
-        self.0.send_if_modified(|current| {
+        self.cell.send_if_modified(|current| {
             if current.as_ref() != Some(from) || *from == to {
                 return false;
             }
@@ -142,11 +160,25 @@ impl Live {
         switch
     }
 
+    /// **`entity` is being deleted**: the cell stops naming it, if it does,
+    /// and names nothing. What an explicit delete of a download asks, once
+    /// no read of the file is open, so the torrent is not kept running for
+    /// a file that is gone.
+    pub fn forget(&self, entity: &LiveEntity) -> bool {
+        self.cell.send_if_modified(|current| {
+            if current.as_ref() != Some(entity) {
+                return false;
+            }
+            *current = None;
+            true
+        })
+    }
+
     /// A copy of the value, for a caller that will ask several questions of
     /// one reading -- a reconciler tick hands the same copy to its ladder
     /// and to its retention pass, so the two cannot disagree.
     pub fn reading(&self) -> Reading {
-        Reading(self.0.borrow().clone())
+        Reading(self.cell.borrow().clone())
     }
 
     /// Whether `file_idx` of `info_hash` is the entity being played, off
@@ -154,7 +186,7 @@ impl Live {
     /// run, from a blocking thread.
     pub fn is_torrent_file(&self, info_hash: &str, file_idx: usize) -> bool {
         matches!(
-            &*self.0.borrow(),
+            &*self.cell.borrow(),
             Some(LiveEntity::Torrent { info_hash: hash, file_idx: idx })
                 if hash == info_hash && *idx == file_idx
         )
@@ -163,7 +195,7 @@ impl Live {
     /// Whether any file of `info_hash` is the entity being played.
     pub fn is_torrent(&self, info_hash: &str) -> bool {
         matches!(
-            &*self.0.borrow(),
+            &*self.cell.borrow(),
             Some(LiveEntity::Torrent { info_hash: hash, .. }) if hash == info_hash
         )
     }
@@ -175,7 +207,7 @@ impl Live {
     /// be an allocation per unlink.
     pub fn is_proxy(&self, dir: &Path) -> bool {
         matches!(
-            &*self.0.borrow(),
+            &*self.cell.borrow(),
             Some(LiveEntity::Proxy { dir: playing }) if playing == dir
         )
     }
@@ -183,7 +215,7 @@ impl Live {
     /// A receiver that is woken every time the value really changes: what a
     /// task drops the predecessor's slack from.
     pub fn changed(&self) -> tokio::sync::watch::Receiver<Option<LiveEntity>> {
-        self.0.subscribe()
+        self.cell.subscribe()
     }
 }
 

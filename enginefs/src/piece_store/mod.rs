@@ -68,8 +68,8 @@
 //! the directory, and every unlink of a registered torrent's piece goes
 //! through the registered store. [`sweep`] reconciles the store against the
 //! session at launch. What drives [`policy`] against a real torrent -- the playhead, the
-//! hold-back, the reclaim, and the claim that keeps a delete atomic with the
-//! have-set -- is [`crate::retention`].
+//! draw a play session advertises, the reclaim, and the claim that keeps a
+//! delete atomic with the have-set -- is [`crate::retention`].
 //!
 //! Two things about the chunk store are *parameters* an adapter sets, and
 //! this one sets both differently from `/proxy`. Its staged copy is
@@ -159,17 +159,18 @@
 //! initial-check reads are nobody's traffic.
 //!
 //! **Settled: a have-bit that is not an announcement.** [`policy`] decides
-//! that only the committed set is advertised and that a window piece is held
-//! and readable and *not* announced. `ManagedTorrent::set_pieces_advertised`
-//! is the fork's third state, independent of both the have-set and the
-//! reclaim want-set: a suppression set on the chunk tracker, settable before
-//! a piece is downloaded, which is the only ordering under which no Have
-//! ever goes out for a window piece. Without it, `have` implies announced on
-//! both paths -- the `have` broadcast and the handshake bitfield, which
-//! serialises `get_have_pieces()` whole -- and a window piece has to be
-//! `have` for the stream to read it, while `drop_pieces` gives *not* have,
-//! not wanted, not advertised. [`crate::retention`] is the wiring that
-//! performs the policy.
+//! that only a play session's draw is advertised and that a window piece is
+//! held and readable and *not* announced. The fork's advertised set is the
+//! third state, independent of both the have-set and the reclaim want-set:
+//! under `explicit_piece_advertising` a torrent announces a piece -- in the
+//! handshake bitfield, by a Have -- only when it has it *and* something
+//! advertised it (`ManagedTorrent::set_pieces_advertised`), from the moment
+//! the torrent exists, and serves a request only for such a piece. Without
+//! it, `have` implies announced on both paths, and a window piece has to be
+//! `have` for the stream to read it. The set lives beside the torrent, not in
+//! its chunk tracker, so a restart out of an error keeps it, and a live
+//! torrent refuses to take an announcement back. [`crate::retention`] is the
+//! wiring that performs the policy.
 //!
 //! All three are exercised rather than assumed. The storage is driven through
 //! a real librqbit session's own initial check below, and through a real

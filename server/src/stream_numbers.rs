@@ -61,8 +61,10 @@
 //! * **no [`StreamNumbers::sharing`]** -- a proxied response is not seeded.
 //!   There is no swarm, so there is no committed set and no ratio, and the
 //!   row is absent rather than a line of zeroes;
-//! * **no [`Sharing::committed_bytes`]** -- a torrent with no policy has
-//!   promised nothing, whatever it announces;
+//! * **no [`Sharing::committed_bytes`]** -- the play session has promised
+//!   nothing: no draw decided yet (it waits for the film's length), or a
+//!   pin, which shares the file whole on its own. Under a budget that
+//!   covers the file it is not absent: the draw is the whole file;
 //! * **no [`Sharing::transfer`]** -- the backend has no counters to read
 //!   for this torrent, which for librqbit is any torrent that is not live:
 //!   paused, still checking, stopped for space, in error. A torrent that
@@ -96,8 +98,10 @@ pub struct StreamNumbers {
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Sharing {
-    /// Bytes advertised and promised never to be reclaimed -- the retention
-    /// policy's committed set. `None` where no policy is installed.
+    /// Bytes of the play session's draw we hold -- announced, and not
+    /// reclaimed while the torrent is in the swarm; every byte of the file
+    /// held, under a budget that covers it. `None` where the session has
+    /// promised nothing: see the module docs.
     pub committed_bytes: Option<u64>,
     /// What the torrent has moved this session, or `None` where the backend
     /// has no counters to read: see [`Transfer`].
@@ -161,7 +165,7 @@ pub struct Transfer {
 }
 
 impl Sharing {
-    /// The sharing row for a torrent whose policy has committed
+    /// The sharing row for a torrent whose play session has committed
     /// `committed_bytes`, whose backend reports `transfer` and whose
     /// engine has had `refused_reclaims` refused. Always a row: the count
     /// is always known, so a torrent always has something to draw.

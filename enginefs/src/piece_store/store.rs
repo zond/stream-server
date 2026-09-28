@@ -190,22 +190,6 @@ pub(super) struct Inner {
     /// is reading every piece it means to claim, and nothing outside this
     /// store may unlink one.
     checking: AtomicBool,
-    /// Which store of this torrent's this is: handed out by the registry
-    /// when the store registers, and unchanged by a later seed of the same
-    /// store ([`StoreRegistry::insert`]).
-    ///
-    /// A torrent restarted out of an error runs `init` again on a **fresh**
-    /// store -- librqbit builds one through the factory for the
-    /// initializing state -- and rebuilds its chunk tracker behind it,
-    /// forgetting every hold-back it was told. The two go together: the
-    /// tracker that was told what to hold back is the one beside the store
-    /// that was registered then. So a reader that remembers the epoch it
-    /// asserted its hold-back under can tell that it has been forgotten,
-    /// which is the whole of what this is for. Counted per store it could
-    /// not: the fresh store's first seed would report the same number the
-    /// errored one's did. A store no registry knows counts its own seeds --
-    /// nothing reads it, and there is nobody to be told apart from.
-    epoch: AtomicU64,
     /// The handles most recently opened -- see the type doc. Empty on a
     /// store that has just been created or taken.
     handles: OpenChunks,
@@ -579,7 +563,6 @@ impl PieceStore {
                 held,
                 seeded: AtomicBool::new(false),
                 checking: AtomicBool::new(false),
-                epoch: AtomicU64::new(0),
                 handles: OpenChunks::new(),
                 committer: Mutex::new(None),
                 failed_commit: Mutex::new(None),
@@ -664,13 +647,6 @@ impl PieceStore {
     /// just claimed and the torrent then advertises without having.
     pub fn is_checking(&self) -> bool {
         self.inner.is_checking()
-    }
-
-    /// Which store of this torrent's this is. Moves on a restart out of
-    /// error, which is when librqbit forgets every hold-back it was told --
-    /// see [`Inner::epoch`].
-    pub fn epoch(&self) -> u64 {
-        self.inner.epoch()
     }
 
     /// Accept a written, hash-checked piece as complete: readable from the
@@ -844,6 +820,29 @@ impl Inner {
         self.staged_over_held.load(Ordering::Relaxed)
     }
 
+    /// The `len` bytes at `offset` of file `file_id`, read from pieces this
+    /// store holds, or `None` when any piece they lie in is not held, the
+    /// range is not the file's, or a read fails. Blocking I/O: the caller is
+    /// off the reactor.
+    pub(super) fn read_held(&self, file_id: usize, offset: u64, len: u64) -> Option<Vec<u8>> {
+        let held = self.held()?;
+        let mut buf = vec![0u8; usize::try_from(len).ok()?];
+        let mut filled = 0usize;
+        for segment in self.layout.segments(file_id, offset, len).ok()? {
+            if !held.contains(segment.piece) {
+                return None;
+            }
+            let part = segment.len as usize;
+            let target = &mut buf[filled..filled + part];
+            self.retrying_a_stale_handle(segment.piece, |file| {
+                pread_exact_at(file, segment.offset_in_piece, target)
+            })
+            .ok()?;
+            filled += part;
+        }
+        Some(buf)
+    }
+
     pub(super) fn held(&self) -> Option<HeldSnapshot> {
         if !self.seeded.load(Ordering::Acquire) {
             return None;
@@ -878,16 +877,6 @@ impl Inner {
             .filter_map(|path| std::fs::metadata(path).ok())
             .map(|metadata| crate::chunk_store::occupied_bytes(&metadata))
             .sum()
-    }
-
-    pub(super) fn epoch(&self) -> u64 {
-        self.epoch.load(Ordering::Acquire)
-    }
-
-    /// Which store of its torrent's this one is, as the registry numbers
-    /// them. Written there and nowhere else -- see [`Self::epoch`].
-    pub(super) fn set_epoch(&self, epoch: u64) {
-        self.epoch.store(epoch, Ordering::Release);
     }
 
     fn piece_path(&self, piece: u32) -> PathBuf {
@@ -1288,13 +1277,6 @@ impl Inner {
         self.held.seed(complete);
         self.seeded.store(true, Ordering::Release);
         self.checking.store(true, Ordering::Release);
-        // A store no registry knows counts its own seeds: there is nobody
-        // for it to be told apart from. Every other store's epoch is the
-        // registry's to hand out, at the registration below -- see
-        // [`Self::epoch`].
-        if self.registration.is_none() {
-            self.epoch.fetch_add(1, Ordering::AcqRel);
-        }
         Ok(())
     }
 
@@ -4029,8 +4011,8 @@ mod tests {
             "nor did the staged half of the walk land"
         );
         assert!(
-            store.epoch() == 0 && !store.is_checking(),
-            "a seed that did not land began no check and moved no epoch"
+            !store.is_checking(),
+            "a seed that did not land began no check"
         );
 
         store.seed_from_disk().unwrap();
@@ -4158,29 +4140,19 @@ mod tests {
 
     /// `init` is where a check begins and `take` is where it ends -- the
     /// initializing state takes the storage into the paused one when it has
-    /// read everything it means to claim.
-    ///
-    /// The epoch moving with each seed here is an **unregistered** store's:
-    /// it counts its own, because there is nobody for it to be told apart
-    /// from. Every store a reader ever sees is numbered by the registry at
-    /// its registration and keeps that number across a re-seed, which is
-    /// what makes it answer the question it is asked -- whether the chunk
-    /// tracker that was told what to hold back is still the one beside the
-    /// store. A restart out of an error answers no with a *fresh* store;
-    /// see [`StoreRegistry::insert`].
+    /// read everything it means to claim -- and a seed again, as a restart
+    /// out of an error seeds, begins another.
     #[test]
-    fn init_begins_a_check_that_take_ends_and_moves_the_epoch() {
+    fn init_begins_a_check_that_take_ends() {
         let tmp = tempfile::tempdir().unwrap();
         let store = open_store(tmp.path(), PIECE_LENGTH, &SPECS);
         assert!(
             !store.is_checking(),
             "nothing checks a store nothing has seeded"
         );
-        assert_eq!(store.epoch(), 0);
 
         store.seed_from_disk().unwrap();
         assert!(store.is_checking(), "from init the check may be reading");
-        assert_eq!(store.epoch(), 1);
 
         let successor = store.take().unwrap();
         assert!(
@@ -4189,15 +4161,8 @@ mod tests {
         );
         drop(successor);
 
-        // Seeding again. In production a restart out of error seeds a
-        // fresh store, which the registry numbers; this one is registered
-        // nowhere, so it counts.
+        // Seeding again.
         store.seed_from_disk().unwrap();
-        assert_eq!(
-            store.epoch(),
-            2,
-            "an unregistered store counts its own seeds"
-        );
         assert!(store.is_checking());
     }
 

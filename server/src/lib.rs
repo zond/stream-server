@@ -952,6 +952,15 @@ impl ServerHandle {
         self.state.proxy_streams.live()
     }
 
+    /// What the player `token`'s play session is on, or `None` for a token
+    /// no request has carried: a probe for the tests of which requests move
+    /// a play session (`enginefs::retention::sessions`), and nothing a
+    /// client decides anything from.
+    #[doc(hidden)]
+    pub fn play_session_of(&self, token: &str) -> Option<enginefs::retention::sessions::Played> {
+        self.state.engine.live().sessions().of(token)
+    }
+
     /// Start or stop the LAN media listener (see [`crate::lan_media`]): a
     /// second HTTP listener on [`ServerConfig::lan_media_addr`] serving
     /// [`lan_media_routes`] and nothing else, for handing the bytes of what
@@ -1492,6 +1501,8 @@ pub async fn run(
     // See `diagnostics::dht_health`.
     background_tasks.push(diagnostics::dht_health::start(state.engine.clone()));
 
+    // Held for the shutdown below, which ends every play session.
+    let engine_at_shutdown = state.engine.clone();
     let app = build_router(state.clone());
 
     // The LAN media listener is deliberately not started here. It exists for
@@ -1565,6 +1576,22 @@ pub async fn run(
         task.abort();
     }
     lan_media.stop().await;
+    // Best effort, and bounded: every torrent leaves the swarm and then
+    // every play session's bytes go. What does not finish -- a slow disk, a
+    // host that kills the process first -- the next start's launch sweep
+    // takes.
+    if tokio::time::timeout(
+        cfg.graceful_shutdown_timeout,
+        engine_at_shutdown.end_every_session(),
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!(
+            timeout_secs = cfg.graceful_shutdown_timeout.as_secs(),
+            "ending the play sessions at shutdown took too long; the next start's sweep takes what is left"
+        );
+    }
 
     Ok(shutdown_source)
 }

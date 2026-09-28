@@ -76,13 +76,13 @@
 //!
 //! # Two differences from the torrent's wiring, and both are the adapter's
 //!
-//! * **Nothing is held back and nothing is announced.** A torrent's window
-//!   has to be kept out of what we advertise, because there is no un-Have in
-//!   BitTorrent and a piece announced once is announced forever. A proxied
-//!   response is not seeded: there is no peer, so there is nothing to hold
-//!   back from, no committed set to fill and nothing to withdraw. The policy
-//!   says that with [`Share::Nothing`] -- the whole budget is window -- and
-//!   not with a case of its own.
+//! * **Nothing is announced.** A torrent shares a play session's draw and
+//!   nothing else, because there is no un-Have in BitTorrent and a piece
+//!   announced once stays announced until the torrent leaves the swarm. A
+//!   proxied response is not seeded: there is no peer, so there is nothing to
+//!   advertise and no committed set to fill. The policy says that with
+//!   [`Share::Nothing`] -- the whole budget is window -- and not with a case
+//!   of its own.
 //! * **The reclaim needs no interlock with a have-set.** A torrent's piece
 //!   file may only be unlinked after librqbit has forgotten the piece, under
 //!   the claim `enginefs::retention::take_claimed` holds, or the torrent
@@ -929,7 +929,7 @@ impl Backing for ProxyBacking {
         }
     }
 
-    async fn advertise(&self, _pieces: Range<u32>, _on: bool) -> anyhow::Result<()> {
+    async fn advertise(&self, _pieces: Range<u32>) -> anyhow::Result<()> {
         debug_assert!(false, "a Share::Nothing policy has nothing to advertise");
         Ok(())
     }

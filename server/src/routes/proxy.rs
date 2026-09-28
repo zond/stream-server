@@ -1540,6 +1540,14 @@ async fn proxy(
         )
             .into_response();
     }
+    // The player plays a proxied stream now: its play session is off any
+    // torrent file it was on, and what that shared ends as any left
+    // session's does (`enginefs::retention::sessions`).
+    if let Some(token) = player_token.as_deref() {
+        state
+            .engine
+            .note_player(token, enginefs::retention::sessions::Played::Elsewhere);
+    }
 
     let ranged = headers.contains_key(header::RANGE);
     // Needed before the lookup, not after it: it is an input to the playlist

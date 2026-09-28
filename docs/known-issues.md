@@ -20,18 +20,19 @@ carried in below.
 
 ## Open
 
-- **Sharing does not yet follow the rule "publish once, never withdraw"**
-  (zond, 2026-09-28: share only the committed set chosen before playing,
-  announce each piece as it lands, never take an announcement back). Today
-  a slack pass withdraws and deletes the committed set of a file the
-  viewer leaves while peers are still connected; a torrent announces
-  pieces before its hold-back is installed (and again after a restart from
-  error); the committed draw is re-derived each pass and sized before the
-  reader's lookahead is known; a Whole-to-Split change withdraws a file.
-  Rework pending two decisions (what ends sharing on a switch; a same-
-  torrent episode's committed set against the next episode's budget).
 - **The piece-commit failure paths are unmeasured on a device** -- see
   *Readable before durable* below.
+- **An archive read across the volumes of a torrent deletes the volumes it
+  has read** (found 2026-09-28, not fixed). Each volume's translated source
+  registers a stream on its own file (`sources::torrent`), and a volume
+  whose reader has not delivered a byte yet is not an aside: the liveness
+  cell moves from volume to volume, and the switch's slack drop takes the
+  bytes of the volume the body just left -- and of the index reads done
+  across all of them. Online they are fetched again from the swarm; with no
+  peer the read parks (a known pin set, seeded, offline: 17 pieces held
+  before the first range, 1 after). The RAR tests run under an unknown pin
+  set, which keeps everything, so none of them sees it. Archive playback
+  shares nothing, so none of this can stop the torrent.
 - **A stale-looking name, kept on purpose**:
   `enginefs/src/retention/scenario.rs`'s `CONTAINER_METADATA_LOOKAHEAD` and
   `PLAYBACK_LOOKAHEAD` keep the field's numbers under the names of constants
@@ -77,13 +78,14 @@ flushes, the queue fills and the two are the same: the backpressure is
 the old cost, as intended.
 
 **The case that is not clean: a commit that fails after the completion
-returned.** librqbit has set its have-bit by then, and may have announced
-the piece -- directly, or through retention's committed set, which counts
-held pieces -- and there is no un-have. What the store does
-(`Inner::fail_commit`):
+returned.** librqbit has set its have-bit by then, and has announced the
+piece if it is in a play session's draw or a download -- and there is no
+un-have. What the store does (`Inner::fail_commit`):
 
-- clears the held bit, so retention withdraws the piece from what new
-  peers are told and never reclaims or commits it again;
+- clears the held bit, so retention counts the piece lost from its
+  committed set and never reclaims it; nothing withdraws the
+  announcement, which ends when the torrent errors (below) and so leaves
+  the swarm;
 - after a failed **flush**, removes the staged copy: Linux marks the pages
   clean after a failed `fsync`, so a read after eviction would be served
   whatever the device holds, and a `MissingPiece` is better than zeros
@@ -238,6 +240,23 @@ process.
 
 ## Closed, one line each
 
+- 2026-09-28 -- **Sharing did not follow the rule "publish once, never
+  withdraw"** (zond, 2026-09-28): a play session -- one per player token,
+  started and moved only by a request carrying it (`p=`), never by an
+  aside or an archive's translated source -- now shares a set drawn once,
+  against the stream's real read-ahead (it waits for the player to state
+  the film's length), a download is
+  shared whole, nothing is announced that nothing chose (rqbit's
+  `explicit_piece_advertising`, which keeps the set across a restart from
+  error), nothing is ever withdrawn from a live torrent, and a session's
+  announced pieces are deleted only after its torrent is stopped
+  (`Decision::EndShares`: stop, rebuild, start, then delete) -- and, while
+  the torrent is played, only the one player on it moving does that; an
+  unpin without a delete, or another player's move, waits. A delete does
+  not: it is an explicit request and happens at once, whatever the sharing
+  setting and whoever's session is on the torrent, waiting only for a read
+  of that very file (a cast) to end.
+  See [Sharing](storage.md#sharing).
 - 2026-09-28 -- **Whether a tight budget should leave the sharing draw
   room**: no. zond: if it is impossible to share and play, stop sharing --
   the lookahead floor wins and the committed set yields to nothing.

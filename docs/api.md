@@ -21,7 +21,7 @@ The reference for both of the server's surfaces: the HTTP routes, which exist fo
 
 | Method | Path | Access | Consumer |
 |---|---|---|---|
-| GET, HEAD | `/{infoHash}/{fileIdx}` | OPEN | players -- the stream URL stremio-core builds (`?tr=…`, `?f=…` as documented under [Startup phases](stats.md#startup-phases-in-statsjson), plus `?buffer=` -- see [Buffer profiles](settings.md#buffer-profiles)) |
+| GET, HEAD | `/{infoHash}/{fileIdx}` | OPEN | players -- the stream URL stremio-core builds (`?tr=…`, `?f=…` as documented under [Startup phases](stats.md#startup-phases-in-statsjson), plus `?buffer=` -- see [Buffer profiles](settings.md#buffer-profiles) -- and `?p=`, the app's player token (`<viewer>.<screen>`), which makes the request the viewer's playback and the only kind whose play session shares anything: see [Sharing](storage.md#sharing)) |
 | GET, HEAD | `/stream/{infoHash}/{fileIdx}` | OPEN | players (alias of the above) |
 | GET, POST | `/{rar\|zip\|7zip\|tar\|tgz\|iso}/create`, `/{…}/create/{key}` | OPEN | players -- archive session creation via `?lz=` (stremio-core builds these URLs) |
 | GET | `/{rar\|zip\|7zip\|tar\|tgz\|iso}/stream`, `/{…}/stream/{key}`, `/{…}/stream/{key}/{*file}` | OPEN | players -- archive member bytes |

@@ -566,7 +566,8 @@ pub(crate) struct TorrentBacking<H: TorrentHandle> {
 }
 
 /// **What hears that a piece of this torrent is ours**, and hands it to the
-/// retention owner to commit and announce.
+/// retention owner to commit. librqbit has announced it already if it is a
+/// piece of the draw, which was advertised before it arrived.
 ///
 /// The piece store calls this from librqbit's completion path, where it may
 /// not block and may do no I/O, so all it does here is spawn: the commit
@@ -598,7 +599,7 @@ impl<H: TorrentHandle> crate::piece_store::PieceCompleted for CommitOnCompletion
                 tracing::trace!(
                     info_hash = %self.info_hash,
                     piece,
-                    "a drawn piece was announced as it completed"
+                    "a drawn piece was committed as it completed"
                 );
             }
         });
@@ -606,6 +607,24 @@ impl<H: TorrentHandle> crate::piece_store::PieceCompleted for CommitOnCompletion
 }
 
 impl<H: TorrentHandle> TorrentBacking<H> {
+    /// What this torrent announces now, if it is in the swarm: every piece
+    /// it advertises, whichever file's session drew it -- a neighbour's
+    /// boundary piece among them -- while it is live, and nothing while it
+    /// is not. Read at the instant a run is acted on, so a torrent started
+    /// under a pass that began on it paused is asked again: no piece in it
+    /// leaves the have-set or the disk while a peer may have been told of it.
+    async fn announced_now(&self) -> BTreeSet<u32> {
+        if self.handle.run_state() != crate::backend::RunState::Live {
+            return BTreeSet::new();
+        }
+        self.handle
+            .advertised_pieces()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    }
+
     /// Stop wanting `run` (`AfterRelease::LeaveDropped`), unlink what
     /// arrived under the drop that nothing keeps, and want again whatever a
     /// neighbour pinned under it. One run of [`Self::want`].
@@ -616,10 +635,24 @@ impl<H: TorrentHandle> TorrentBacking<H> {
         door: &Door<Self>,
         run: Range<u32>,
     ) {
-        {
+        // Less what the torrent announces **and holds**: a piece a peer may
+        // have been told of stays had. An advertised piece not held yet is
+        // not kept wanted -- the shared set is never fetched for the swarm;
+        // it is announced when the viewer's own window brings it in.
+        let announced = self.announced_now().await;
+        let held_now = store.held(&self.info_hash);
+        let announced_held = |piece: &u32| {
+            announced.contains(piece) && held_now.as_ref().is_some_and(|held| held.contains(*piece))
+        };
+        let parts = crate::retention::runs(
+            &run.clone()
+                .filter(|piece| !announced_held(piece))
+                .collect::<Vec<_>>(),
+        );
+        for part in parts {
             match self
                 .handle
-                .drop_pieces(run.clone(), crate::backend::AfterRelease::LeaveDropped)
+                .drop_pieces(part.clone(), crate::backend::AfterRelease::LeaveDropped)
                 .await
             {
                 Ok(Some(claim)) => {
@@ -627,9 +660,12 @@ impl<H: TorrentHandle> TorrentBacking<H> {
                     // with this file, as it does at the reclaim's door.
                     let pinned =
                         pinned_spans(&self.handle, &self.pinned, Some(domain.file_idx)).await;
+                    // And what arrived under the drop and is announced --
+                    // advertised, complete a moment ago -- stays on the disk.
+                    let announced = self.announced_now().await;
                     let arrived: Vec<u32> = match (store.held(&self.info_hash), !door.shut()) {
                         (Some(now), true) => {
-                            let now = now.in_range(run.clone());
+                            let now = now.in_range(part.clone());
                             claim
                                 .pieces()
                                 .iter()
@@ -638,6 +674,7 @@ impl<H: TorrentHandle> TorrentBacking<H> {
                                     now.contains(piece)
                                         && !door.refuses(*piece)
                                         && !pinned.iter().any(|span| span.contains(piece))
+                                        && !announced.contains(piece)
                                 })
                                 .collect()
                         }
@@ -661,17 +698,17 @@ impl<H: TorrentHandle> TorrentBacking<H> {
                 Ok(None) => {}
                 Err(error) => tracing::warn!(
                     info_hash = %self.info_hash,
-                    first = run.start,
-                    end = run.end,
+                    first = part.start,
+                    end = part.end,
                     error = %format!("{error:#}"),
                     "could not stop wanting the pieces outside the window; the swarm will fill them"
                 ),
             }
-            // Outside the match: a pin that landed under the drop has to be
-            // wanted again whether or not anything arrived under it, and
-            // whether or not the backend handed back a claim.
-            self.rewant_pins_crossed_by(&run, domain).await;
         }
+        // Outside the loop: a pin that landed under the drop has to be
+        // wanted again whether or not anything arrived under it, and
+        // whether or not the backend handed back a claim.
+        self.rewant_pins_crossed_by(&run, domain).await;
     }
 
     /// Want again whatever a neighbour pinned **since this run was
@@ -692,14 +729,13 @@ impl<H: TorrentHandle> TorrentBacking<H> {
     /// **neither had nor wanted**: a pinned download one piece short of
     /// done, for as long as nothing re-wants it.
     ///
-    /// **Something does today, and that is the reason this exists.** The
-    /// heal is the retention owner's pin exit calling `want_whole`, which
-    /// is conditional on the clear (`Retention::release_to_pin`), and the
-    /// state it would not heal is unreachable only because a fresh entity
-    /// is seeded `held_back = true` (`State::held_back`) -- a default that
-    /// is there for an unrelated reason and does not know it is holding
-    /// this up. A correctness property of pinned downloads should not rest
-    /// on a default three modules away that no test ties to it.
+    /// **Something may heal it, and that is not enough.** The retention
+    /// owner's pin exit calls `want_whole`, but only when it forgets a
+    /// policy or finds a slack pass had taken pieces
+    /// (`Retention::release_to_pin`); a pin that lands under a run of a
+    /// live pass it passes over neither. A correctness property of pinned
+    /// downloads should not rest on which of the owner's exits happens to
+    /// run next.
     ///
     /// So the run is checked against the pins once more after it has been
     /// acted on, and anything a pin has since claimed is wanted again. The
@@ -760,8 +796,9 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
     /// The swarm fills the cache whether or not anyone reads, so the pass
     /// runs on the reconciler's tick and not on a delivered byte.
     const TRIGGER: Trigger = Trigger::External;
-    /// Before the reader opens, so the hold-back precedes the pieces: there
-    /// is no un-Have in BitTorrent.
+    /// Before the reader opens, so what the play session shares is drawn
+    /// against the read-ahead the reader will be granted, and advertised
+    /// before a piece of it arrives.
     const INSTALL: Install = Install::OnOpen;
 
     /// What the backend says the file is, now. `None` is a torrent with no
@@ -933,6 +970,22 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         self.live.is_torrent_file(&self.info_hash, *file_idx)
     }
 
+    /// Whether a viewer's player-token session is on this file and shares
+    /// it ([`crate::retention::sessions::PlaySessions::covers`]).
+    fn plays(&self, file_idx: &usize) -> bool {
+        self.live.sessions().covers(&self.info_hash, *file_idx)
+    }
+
+    /// The file's first bytes, once the store holds them, against the
+    /// archive signatures ([`crate::retention::sniff`]).
+    async fn content_shares(&self, domain: &FileDomain) -> Option<bool> {
+        let head = self
+            .handle
+            .read_file_head(domain.file_idx, crate::retention::sniff::HEAD_BYTES)
+            .await?;
+        Some(!crate::retention::sniff::is_archive(&head))
+    }
+
     /// The registered store's held set inside this file's extent -- a copy
     /// of the store's atomic words, no listing and no suspension. `None`
     /// is a torrent with no registered store: one the session holds in
@@ -944,62 +997,30 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
             .map(|held| held.in_range(Self::extent(domain)))
     }
 
-    /// A hold-back leaves a pinned file's pieces announced. The piece an
-    /// unpinned file shares with a pinned neighbour is in its extent, which
-    /// its policy holds back when it is installed and its slack pass holds
-    /// back again on every tick; nothing takes that piece, since it is the
-    /// pinned file's ([`Self::alone`]), so the entity never empties and
-    /// nothing ever lifted the hold-back. The pinned file was kept whole and
-    /// one piece of it was announced to nobody for as long as the pin stood.
-    ///
-    /// Given back after the hold-back, from a reading of the pin set taken
-    /// after it: a pin that landed while the hold-back was being made is
-    /// seen, and one that lands later is seen by the next hold-back -- at
-    /// the latest the slack pass the file gets once nobody plays it, which
-    /// holds back again on every tick. A hold-back of a pinned span has no
-    /// reclaim behind it to protect, because every reclaim reads the pin
-    /// set again after this and leaves the span alone. Refused, the give
-    /// back is logged and the hold-back still stands as asked: the caller's
-    /// deletions depend on that, not on this.
-    async fn advertise(&self, pieces: Range<u32>, on: bool) -> anyhow::Result<()> {
-        self.handle
-            .set_pieces_advertised(pieces.clone(), on)
-            .await?;
-        if on {
-            return Ok(());
-        }
-        for span in pinned_spans(&self.handle, &self.pinned, None).await {
-            let shared = pieces.start.max(span.start)..pieces.end.min(span.end);
-            if shared.is_empty() {
-                continue;
-            }
-            if let Err(error) = self
-                .handle
-                .set_pieces_advertised(shared.clone(), true)
-                .await
-            {
-                tracing::warn!(
-                    info_hash = %self.info_hash,
-                    first = shared.start,
-                    end = shared.end,
-                    error = %format!("{error:#}"),
-                    "could not announce a pinned file's pieces a neighbour held back; the next hold-back tries again"
-                );
-            }
-        }
+    /// Advertise `pieces` of this torrent: the play session's draw, which
+    /// librqbit announces piece by piece as each completes, and nothing
+    /// else of the file. There is no other direction: nothing here takes an
+    /// announcement back (see [`TorrentHandle::set_pieces_advertised`]).
+    async fn advertise(&self, pieces: Range<u32>) -> anyhow::Result<()> {
+        self.handle.set_pieces_advertised(pieces, true).await?;
         Ok(())
     }
 
-    /// Which seed of this torrent's piece store is in force. It moves when
-    /// a restart out of an error builds a fresh store, which is the same
-    /// act that builds librqbit a fresh chunk tracker and loses every
-    /// hold-back the tracker carried.
-    ///
-    /// 0 for a torrent with no registered store: one held in Error, whose
-    /// pass concluded nothing over an unknown held set a step earlier, and
-    /// which announces nothing either way.
-    fn epoch(&self, store: &Arc<StoreRegistry>) -> u64 {
-        store.epoch(&self.info_hash).unwrap_or(0)
+    /// Whether the torrent is in the swarm -- live, peers connected -- and
+    /// advertises one of `pieces`. Two readings of the backend's own state,
+    /// made now: its run state and its advertised set. A backend that keeps
+    /// no advertised set announces everything it has, so a live one counts
+    /// as announcing all of them.
+    async fn announced_in_swarm(&self, pieces: &[u32]) -> bool {
+        if pieces.is_empty() || self.handle.run_state() != crate::backend::RunState::Live {
+            return false;
+        }
+        match self.handle.advertised_pieces().await {
+            None => true,
+            Some(advertised) => pieces
+                .iter()
+                .any(|piece| advertised.binary_search(piece).is_ok()),
+        }
     }
 
     /// The boundary rule, and a pinned neighbour's pieces on top of it.
@@ -1127,13 +1148,14 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
     /// The reclaim, asking the door before every part of every run.
     ///
     /// **The door, asked at the instant of each unlink and not a moment
-    /// before it.** The decision was measured before two awaited backend
-    /// calls per committed and withdrawn run and a `file_wants`, and
+    /// before it.** The decision was measured before the want-set's backend
+    /// calls and a `file_wants`, and
     /// neither of the two things it measured against is behind a lock the
     /// pass holds: the reader's note writes the playhead on every delivered
     /// byte and `pin_download` writes the pin set, and the turn stops
-    /// neither. A piece becoming announced under the pass is not the door's
-    /// to catch: every advertise is made under this file's turn, which the
+    /// neither. A piece of this file's draw becoming announced under the
+    /// pass is not the door's to catch: the draw is advertised only under
+    /// this file's turn, and held in the published set, which the
     /// pass holds throughout.
     ///
     /// [`Door::shut`] answers `true` for a pin taken since the pass began,
@@ -1218,9 +1240,16 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
             // as one bit per piece (`crate::retention::exempt`). A pinned
             // neighbour's span is the other half, and it is a listing away
             // rather than a bit, so it stays a range check.
+            // And what the torrent announces now, asked per run: a piece of
+            // another file's draw on this file's boundary, and anything
+            // advertised by a torrent started since the pass began.
+            let announced = self.announced_now().await;
             let mut parts: Vec<Range<u32>> = Vec::new();
             for piece in run.clone() {
-                if door.refuses(piece) || pinned.iter().any(|span| span.contains(&piece)) {
+                if door.refuses(piece)
+                    || pinned.iter().any(|span| span.contains(&piece))
+                    || announced.contains(&piece)
+                {
                     continue;
                 }
                 match parts.last_mut() {
@@ -1292,9 +1321,9 @@ async fn pinned_spans<H: TorrentHandle>(
 /// thing that does is [`Backing::want_all`], reached through
 /// [`Retention::install`] -- which is what an open would do, so this does
 /// what an open would: install, once, and let the pin exit of the passes
-/// do the rest. Under a pin the install holds nothing back, gives back
-/// whatever the forgotten entity or `reclaim_rest` was holding back, and
-/// wants the whole file. Once, because the entity it makes stays -- a
+/// do the rest. Under a pin the install wants the whole file; what the pin
+/// shares is advertised whole by the engine (`Engine::advertise_shares`).
+/// Once, because the entity it makes stays -- a
 /// pinned entity's passes take the pin exit and never forget it -- and a
 /// file it makes no entity for (no metadata yet) is asked again next tick.
 async fn adopt_pins<H: TorrentHandle>(
@@ -1375,6 +1404,9 @@ pub struct Engine<H: TorrentHandle> {
     ///
     /// [`crate::BackendEngineFS::start_if_stopped`]: crate::BackendEngineFS
     last_transition_at: AtomicU64,
+    /// Files whose explicit delete waits for the read open on them to end
+    /// ([`Self::wait_to_delete`]): in practice a cast in progress.
+    deletes_waiting: parking_lot::Mutex<BTreeSet<usize>>,
     /// Files pinned as offline downloads (`BackendEngineFS::pin_download`).
     /// While non-empty the engine is exempt from idle removal and the
     /// reconciler runs it; the handle keeps its own copy for the
@@ -1546,6 +1578,7 @@ impl<H: TorrentHandle> Engine<H> {
             active_streams: Arc::new(AtomicUsize::new(0)),
             settled: AtomicBool::new(true),
             last_transition_at: AtomicU64::new(NEVER_MOVED),
+            deletes_waiting: parking_lot::Mutex::new(BTreeSet::new()),
             pinned_files,
             pins_unknown,
             volumes,
@@ -1608,6 +1641,15 @@ impl<H: TorrentHandle> Engine<H> {
     /// Record that the reconciler has just started or stopped this torrent.
     pub(crate) fn record_transition(&self, now: u64) {
         self.last_transition_at.store(now, Ordering::Relaxed);
+    }
+
+    /// Put back the last transition [`Self::last_transition_at`] read, so
+    /// the moves an end of shares made -- a stop and the start after it --
+    /// cost the torrent no dwell: the dwell is for the ladder changing its
+    /// mind, and an end of shares is not that.
+    pub(crate) fn restore_transition(&self, at: Option<u64>) {
+        self.last_transition_at
+            .store(at.unwrap_or(NEVER_MOVED), Ordering::Relaxed);
     }
 
     /// Whether the reconciler is holding this torrent stopped for want of
@@ -1885,15 +1927,20 @@ impl<H: TorrentHandle> Engine<H> {
     /// **No policy is not an absence here.** A torrent nothing is bounding
     /// -- the budget covers the file, no budget has been published yet, or
     /// a pin keeps everything -- still has a run on the disk round its
-    /// playhead; what it lacks is a committed set, which the reading then
-    /// has no size for ([`crate::retention::PolicyReading::committed_bytes`]).
+    /// playhead. What it has committed is its play session's draw: under a
+    /// budget that covers the file the draw is the whole file, and what is
+    /// committed is every piece of it we hold, the read-ahead's included;
+    /// with no draw decided, or under a pin, nothing has been promised and
+    /// the reading has no size for it
+    /// ([`crate::retention::PolicyReading::committed_bytes`]).
     ///
     /// One copy-out of the owner's state and no I/O: the reading is finished
     /// against a listing of the store, which the caller takes for itself
     /// (see [`crate::retention::PolicyReading::window`]) rather than under
     /// any lock. A pass in flight has the policy in its cell like any other
-    /// moment, so the committed count is the live one -- a pass parked in
-    /// its advertise has already committed the piece it is announcing.
+    /// moment, so the committed count is the live one; a drawn piece that
+    /// completed a moment ago is committed by its completion
+    /// ([`Retention::commit_completed`]), not by the next pass.
     ///
     /// Every reader of the file goes in, placed to the byte, with the
     /// film's own rate beside them; which of them the window is about is
@@ -1907,7 +1954,7 @@ impl<H: TorrentHandle> Engine<H> {
         file_idx: usize,
         now: Instant,
     ) -> Option<crate::retention::PolicyReading> {
-        use crate::retention::{PiecePosition, PieceReader};
+        use crate::retention::{Committed, PiecePosition, PieceReader};
         let holding = self.retention.holding(&file_idx)?;
         let piece_length = holding.domain.piece_length;
         let span_offset = holding.domain.span.offset;
@@ -1941,27 +1988,62 @@ impl<H: TorrentHandle> Engine<H> {
             self.retention.bitrate(&file_idx),
             readers,
             fallback,
-            holding.installed.map(|installed| installed.committed.len()),
+            match holding.installed {
+                Some(installed) => Some(Committed::Counted(installed.committed.len())),
+                // A pin shares the whole file on its own account; the play
+                // session promised nothing of it.
+                None if self.pinned_files.read().contains(&file_idx) => None,
+                // Nothing installed: the budget covers the file, whose draw
+                // is then the whole of it. No draw yet, or an empty one -- no
+                // budget published, no cap -- is nothing promised.
+                None => self
+                    .retention
+                    .draw_of(&file_idx)
+                    .filter(|draw| !draw.is_empty())
+                    .map(Committed::Drawn),
+            },
         ))
     }
 
-    /// Install (or keep) the retention policy for a file about to be
-    /// streamed, and hold its pieces back from what we announce.
-    ///
-    /// **Before the reader opens**, which is the only ordering that keeps a
-    /// Have from ever going out for a window piece: there is no un-Have in
-    /// BitTorrent, so a piece announced once is announced to every peer
-    /// that was connected. Held back before the pieces exist, which
-    /// librqbit allows and which is what makes "we never advertise what we
-    /// might reclaim" true rather than nearly true.
-    ///
-    /// The owner's [`Retention::install`]: every other file's policy is
-    /// given back first, a pinned file gets no policy (a pin is a
-    /// retention property), a policy that already describes this file under
-    /// this budget is kept untouched, and a hold-back the backend refuses
-    /// installs nothing.
+    /// [`Self::begin_retention_opening`] for a player's open that states no
+    /// read-ahead of its own.
+    #[cfg(test)]
     pub(crate) async fn begin_retention(&self, file_idx: usize) {
-        let outcome = self.retention.install(file_idx, file_idx).await;
+        self.begin_retention_opening(
+            file_idx,
+            crate::piece_store::Buffering::default(),
+            crate::retention::owner::Opener::Player,
+        )
+        .await;
+    }
+
+    /// Install (or keep) the retention policy for a file about to be
+    /// streamed by a reader that will ask `opening` of the cache, opened by
+    /// `opener`.
+    ///
+    /// **Before the reader opens**, and with its read-ahead in hand. What
+    /// the play session shares -- the draw ([`Retention::install_opening`])
+    /// -- is made once, for the viewer's playback stream alone, sized
+    /// against the stream's real read-ahead (nothing, if the budget cannot
+    /// hold both), and advertised before a piece of it is announced: here
+    /// if the film's rate is known already, and otherwise by the pass that
+    /// finds it known. Nothing the torrent was not told to advertise is
+    /// announced at all: the session runs under the fork's
+    /// `explicit_piece_advertising`.
+    ///
+    /// A pinned file gets no policy (a pin is a retention property), and a
+    /// policy that already describes this file under this budget is kept
+    /// untouched.
+    pub(crate) async fn begin_retention_opening(
+        &self,
+        file_idx: usize,
+        opening: crate::piece_store::Buffering,
+        opener: crate::retention::owner::Opener,
+    ) {
+        let outcome = self
+            .retention
+            .install_opening(file_idx, file_idx, opening, opener)
+            .await;
         tracing::debug!(
             info_hash = %self.info_hash,
             file_idx,
@@ -1972,7 +2054,7 @@ impl<H: TorrentHandle> Engine<H> {
 
     /// How far ahead of `start_offset` a reader of `file_idx` opened there
     /// may fetch, from one reading of the owner ([`Retention::reach`]) taken
-    /// after [`Self::begin_retention`]: the bytes from `start_offset` to the
+    /// after [`Self::begin_retention_opening`]: the bytes from `start_offset` to the
     /// start of the last piece the window reaches ahead of it, or `None`
     /// when nothing bounds the file.
     ///
@@ -2153,7 +2235,7 @@ impl<H: TorrentHandle> Engine<H> {
     /// The file's turn from the first line of its pass to the last
     /// ([`Retention::turn`] then [`Retention::pass`]), and released before
     /// the next file's is taken (rule 4 of the owner: no two turns at once).
-    /// A second pass queues behind this one and a [`Self::begin_retention`]
+    /// A second pass queues behind this one and a [`Self::begin_retention_opening`]
     /// that arrives meanwhile waits its turn. The policy stays in its cell throughout; a pass that
     /// dies at an await drops the turn like any other local and the next
     /// tick's pass runs.
@@ -2183,6 +2265,10 @@ impl<H: TorrentHandle> Engine<H> {
             &self.info_hash,
         )
         .await;
+        // What this torrent shares and does not advertise yet -- a pin, a
+        // draw whose advertise was refused -- advertised; never anything
+        // taken back.
+        self.advertise_shares().await;
         let mut total = self.pass_over(store, &self.files_to_pass(live)).await;
         // And the files nothing has opened in this process. They have no
         // entity, so no pass walks them and no window is drawn round them;
@@ -2260,7 +2346,7 @@ impl<H: TorrentHandle> Engine<H> {
             let total = total.get_or_insert_default();
             total.committed += concluded.committed;
             total.reclaimed += concluded.reclaimed;
-            total.withdrawn += concluded.withdrawn;
+            total.lost += concluded.lost;
         }
         total
     }
@@ -2286,11 +2372,14 @@ impl<H: TorrentHandle> Engine<H> {
     /// is taken while the pin set is unknown, which reads as every file
     /// pinned.
     ///
-    /// Held back before it is unlinked, run by run, like every other
-    /// deletion here: there is no un-Have. And the liveness cell is read
-    /// again before every run rather than carried in from the caller's
-    /// reading -- a viewer who opens this torrent again mid-delete stops it
-    /// where it stands, and the entity their open installs keeps the rest.
+    /// Nothing a peer may have been told of goes while the torrent is in
+    /// the swarm: a piece it advertises is left for [`Self::end_shares`],
+    /// once the torrent has stopped. Everything else here was never
+    /// advertised -- no entity drew it, and no pin covers it -- so it goes
+    /// whether the torrent runs or not. And the liveness cell is read again
+    /// before every run rather than carried in from the caller's reading --
+    /// a viewer who opens this torrent again mid-delete stops it where it
+    /// stands, and the entity their open installs keeps the rest.
     ///
     /// One at a time per engine (`rest`): the tick and the switch task both
     /// call it, and two of them offering librqbit the same run would have
@@ -2312,10 +2401,24 @@ impl<H: TorrentHandle> Engine<H> {
             .into_iter()
             .map(|(_, holding)| holding.extent)
             .collect();
+        // Read once, before the runs: nothing makes a piece outside every
+        // entity advertised but a pin, and the pin set is read again before
+        // every run below.
+        let announced: BTreeSet<u32> = if self.handle.run_state() == crate::backend::RunState::Live
+        {
+            match self.handle.advertised_pieces().await {
+                Some(advertised) => advertised.into_iter().collect(),
+                None => return 0,
+            }
+        } else {
+            BTreeSet::new()
+        };
         let outside: Vec<u32> = held
             .all()
             .into_iter()
-            .filter(|piece| !extents.iter().any(|extent| extent.contains(piece)))
+            .filter(|piece| {
+                !extents.iter().any(|extent| extent.contains(piece)) && !announced.contains(piece)
+            })
             .collect();
         let mut freed = 0;
         let mut pending: VecDeque<Range<u32>> = crate::retention::runs(&outside).into();
@@ -2340,19 +2443,276 @@ impl<H: TorrentHandle> Engine<H> {
                 }
                 continue;
             }
-            if let Err(error) = self.handle.set_pieces_advertised(run.clone(), false).await {
+            freed += crate::retention::release(&self.handle, store, &self.info_hash, run).await;
+        }
+        freed
+    }
+
+    /// What this torrent should be advertising now: every pinned file
+    /// whole -- a download is shared whole, finished or not -- and the draw
+    /// of every file a viewer's play session is on
+    /// ([`crate::retention::sessions::PlaySessions::covers`]). Nothing else:
+    /// a file the viewer's player left shares nothing, whatever still reads
+    /// it, and nothing while the pin set is unknown names a download.
+    async fn shares_now(&self) -> BTreeSet<u32> {
+        let mut shares: BTreeSet<u32> = BTreeSet::new();
+        for span in pinned_spans(&self.handle, &self.pinned_files, None).await {
+            shares.extend(span);
+        }
+        let sessions = self.live.sessions();
+        for (file_idx, draw) in self.retention.draws() {
+            if sessions.covers(&self.info_hash, file_idx) {
+                shares.extend(draw);
+            }
+        }
+        shares
+    }
+
+    /// **A delete of `file_idx` asked while a read of that file is open**:
+    /// it happens as soon as the read ends
+    /// ([`crate::BackendEngineFS`]'s waiting deletes, asked when a stream
+    /// ends and at every tick). Only the file's own read defers it.
+    pub(crate) fn wait_to_delete(&self, file_idx: usize) {
+        self.deletes_waiting.lock().insert(file_idx);
+    }
+
+    /// The waiting deletes whose file no read is open on any more, taken:
+    /// each is the caller's to run now. A file pinned again meanwhile is
+    /// taken too and not returned -- the viewer asked for it back.
+    pub(crate) fn take_due_deletes(&self) -> Vec<usize> {
+        let pinned = self.pinned_files.read().clone();
+        let mut waiting = self.deletes_waiting.lock();
+        let due: Vec<usize> = waiting
+            .iter()
+            .copied()
+            .filter(|file_idx| {
+                pinned.contains(file_idx) || self.retention.readers_of(file_idx) == 0
+            })
+            .collect();
+        for file_idx in &due {
+            waiting.remove(file_idx);
+        }
+        due.into_iter()
+            .filter(|file_idx| !pinned.contains(file_idx))
+            .collect()
+    }
+
+    /// **Whether this torrent advertises something no play session or
+    /// download of it shares any more, and it is time to end it** -- the
+    /// draw of a file the viewer's player left, a download since unpinned.
+    /// Such an announcement ends only with the torrent leaving the swarm, so
+    /// this is what the reconciler reads to stop it first
+    /// ([`crate::reconcile::Conditions::shares_to_end`]).
+    ///
+    /// **While the torrent is played, only a player moving ends anything**,
+    /// and only when the stop interrupts nobody but that player: the draw
+    /// of a file a play session left while it was the only session on the
+    /// torrent -- its next episode -- ends at once
+    /// ([`crate::retention::sessions::PlaySessions::may_end_now`]). Anything
+    /// else -- a file another player's session left while this one plays
+    /// on, an unpin, what a restart left advertised -- would stop a film for
+    /// a reason its viewer did not give, so it waits until no session is on
+    /// the torrent and no read of it is delivering, and ends then, or at
+    /// shutdown, or at the next start.
+    ///
+    /// Recomputed from readings made now -- the backend's advertised set,
+    /// then what is shared -- and never stored. In that order: a draw is
+    /// recorded before it is advertised, so an advertise this reading sees
+    /// is one whose record the second reading sees too.
+    pub(crate) async fn shares_to_end(&self) -> bool {
+        let Some(advertised) = self.handle.advertised_pieces().await else {
+            return false;
+        };
+        if advertised.is_empty() {
+            return false;
+        }
+        let shares = self.shares_now().await;
+        let unshared: Vec<u32> = advertised
+            .into_iter()
+            .filter(|piece| !shares.contains(piece))
+            .collect();
+        if unshared.is_empty() {
+            return false;
+        }
+        let sessions = self.live.sessions();
+        // Played: a viewer's session is on it -- playing, or paused on the
+        // board -- or a read of it is open, which a stop would cut. Not the
+        // liveness cell alone: it stays on a torrent after its last read has
+        // closed, and that is nobody playing.
+        let played = self.retention.readers() > 0 || sessions.on_torrent(&self.info_hash);
+        if !played {
+            return true;
+        }
+        // Played: only the draws the one player on the torrent left.
+        let left: BTreeSet<u32> = self
+            .retention
+            .draws()
+            .into_iter()
+            .filter(|(file_idx, _)| {
+                !sessions.covers(&self.info_hash, *file_idx)
+                    && sessions.may_end_now(&self.info_hash, *file_idx)
+            })
+            .flat_map(|(_, draw)| draw)
+            .collect();
+        unshared.iter().any(|piece| left.contains(piece))
+    }
+
+    /// **End what this torrent shares that no play session or download
+    /// shares any more, now that it has left the swarm**: its advertised set
+    /// made again from what is shared now ([`Self::advertise_afresh`]). The
+    /// reconciler's `EndShares`, with the torrent stopped by it a moment
+    /// before and nothing able to start it meanwhile (the hash's reconcile
+    /// lock is held); refused on a torrent that is not `Paused`, because
+    /// withdrawing an announcement from a live one is what this exists
+    /// never to do.
+    ///
+    /// **The bytes are not taken here.** The torrent starts again at once
+    /// if it is wanted -- the viewer's next episode is waiting on it -- and
+    /// what the ended sessions held is taken after that
+    /// ([`Self::drop_slack`]): no longer advertised, it may go with the
+    /// torrent live, and the stop is only as long as the set's rebuild.
+    pub(crate) async fn end_shares(&self) -> anyhow::Result<()> {
+        let run_state = self.handle.run_state();
+        if run_state != crate::backend::RunState::Paused {
+            anyhow::bail!("not ending shares of a torrent that is {run_state:?}, not paused");
+        }
+        self.advertise_afresh().await?;
+        self.live.sessions().ended(&self.info_hash);
+        Ok(())
+    }
+
+    /// What [`Self::end_shares`] does: the advertised set of a torrent out
+    /// of the swarm cleared, and made again from what is shared now
+    /// ([`Self::shares_now`]) -- read after the clear, so a draw an open
+    /// recorded meanwhile is in it. Refused on a torrent that is live.
+    ///
+    /// One call per run of the set: the fork's advertise takes a range, and
+    /// on a torrent with no peers each call is a bitfield edit under its
+    /// lock and nothing sent. A random draw of a few dozen pieces is a few
+    /// dozen calls; there is no batch call in the fork to fold them into.
+    ///
+    /// Also what a restart out of an error is preceded by: the fork keeps a
+    /// torrent's advertised set across that restart, so the draw of a play
+    /// session that ended while it was in error would be announced again by
+    /// the torrent coming back ([`crate::BackendEngineFS`]'s
+    /// `RestartFromError`). In error it has no peers, so the set may change.
+    pub(crate) async fn advertise_afresh(&self) -> anyhow::Result<()> {
+        let run_state = self.handle.run_state();
+        if !matches!(
+            run_state,
+            crate::backend::RunState::Paused | crate::backend::RunState::Error
+        ) {
+            anyhow::bail!("not clearing what a {run_state:?} torrent advertises");
+        }
+        self.handle
+            .set_pieces_advertised(0..u32::MAX, false)
+            .await
+            .context("clearing a stopped torrent's advertised set")?;
+        let shares = self.shares_now().await;
+        for run in crate::retention::runs(&shares.into_iter().collect::<Vec<_>>()) {
+            self.handle
+                .set_pieces_advertised(run, true)
+                .await
+                .context("advertising what a stopped torrent still shares")?;
+        }
+        Ok(())
+    }
+
+    /// Every piece a play session of this torrent drew, shared now or not,
+    /// and every piece a pin covers: what a start may announce and nothing
+    /// more ([`TorrentHandle::check_start`]).
+    #[cfg(test)]
+    pub(crate) async fn drawn_or_pinned(&self) -> BTreeSet<u32> {
+        let mut shares: BTreeSet<u32> = BTreeSet::new();
+        for span in pinned_spans(&self.handle, &self.pinned_files, None).await {
+            shares.extend(span);
+        }
+        for (_, draw) in self.retention.draws() {
+            shares.extend(draw);
+        }
+        shares
+    }
+
+    /// Whether this torrent advertises anything nothing shares now, whoever
+    /// is playing it: what a restart out of an error must not carry back
+    /// into the swarm ([`Self::advertise_afresh`]), and what an explicit
+    /// delete of a download ends at once
+    /// ([`crate::BackendEngineFS`]'s `reconcile_hash_ending_shares`).
+    pub(crate) async fn advertises_unshared(&self) -> bool {
+        let Some(advertised) = self.handle.advertised_pieces().await else {
+            return false;
+        };
+        if advertised.is_empty() {
+            return false;
+        }
+        let shares = self.shares_now().await;
+        advertised.iter().any(|piece| !shares.contains(piece))
+    }
+
+    /// **Shutdown's end of every play session**, on a torrent that has left
+    /// the swarm: the bytes of every file a stream opened in this process
+    /// -- every entity -- go, except what a pin covers, and how many is
+    /// answered. Refused on a torrent that is not `Paused`, and while the
+    /// pin set is unknown, which keeps everything. What no play session
+    /// touched is not this call's: it is the launch sweep's, or the next
+    /// start's ticks'. Best effort by design: whatever this cannot take, the
+    /// next start takes ([`crate::piece_store::sweep`]).
+    pub(crate) async fn end_every_session(&self, store: &Arc<StoreRegistry>) -> usize {
+        if self.handle.run_state() != crate::backend::RunState::Paused || self.pins_unknown.is_set()
+        {
+            return 0;
+        }
+        let Some(held) = store.held(&self.info_hash) else {
+            return 0;
+        };
+        let extents: Vec<Range<u32>> = self
+            .retention
+            .holdings()
+            .into_iter()
+            .map(|(_, holding)| holding.extent)
+            .collect();
+        let pinned = pinned_spans(&self.handle, &self.pinned_files, None).await;
+        let played: Vec<u32> = held
+            .all()
+            .into_iter()
+            .filter(|piece| {
+                extents.iter().any(|extent| extent.contains(piece))
+                    && !pinned.iter().any(|span| span.contains(piece))
+            })
+            .collect();
+        let mut freed = 0;
+        for run in crate::retention::runs(&played) {
+            freed += crate::retention::release(&self.handle, store, &self.info_hash, run).await;
+        }
+        freed
+    }
+
+    /// Advertise whatever this torrent shares now that the backend does not
+    /// advertise yet: a pin just taken, a draw whose advertise the backend
+    /// refused. Only ever adds -- what the backend advertises beyond it is
+    /// [`Self::end_shares`]'s, with the torrent stopped. A no-op on a
+    /// backend that keeps no advertised set.
+    pub(crate) async fn advertise_shares(&self) {
+        let Some(advertised) = self.handle.advertised_pieces().await else {
+            return;
+        };
+        let shares = self.shares_now().await;
+        let missing: Vec<u32> = shares
+            .into_iter()
+            .filter(|piece| advertised.binary_search(piece).is_err())
+            .collect();
+        for run in crate::retention::runs(&missing) {
+            if let Err(error) = self.handle.set_pieces_advertised(run.clone(), true).await {
                 tracing::warn!(
                     info_hash = %self.info_hash,
                     first = run.start,
                     end = run.end,
                     error = %format!("{error:#}"),
-                    "could not hold a slack torrent's pieces back from what we announce; leaving their bytes"
+                    "could not advertise what this torrent shares; the next tick tries again"
                 );
-                continue;
+                return;
             }
-            freed += crate::retention::release(&self.handle, store, &self.info_hash, run).await;
         }
-        freed
     }
 
     /// Every policy standing on this torrent, as a value; see [`Standing`].
@@ -2464,6 +2824,12 @@ impl<H: TorrentHandle> Engine<H> {
     ///
     /// `buffer` is the viewer's read-ahead choice, which sizes the reader's
     /// playback window (see `priorities::BufferProfile`).
+    ///
+    /// **The open of the current screen of a viewer's player, on a file
+    /// its session shares** ([`crate::retention::owner::Opener::Player`]):
+    /// the one open whose play session draws, and only while that session
+    /// is on the file ([`crate::retention::sessions`]). Every other open goes
+    /// through [`Self::try_get_file_unshared`].
     pub async fn try_get_file_with_intent(
         self: &Arc<Self>,
         file_idx: usize,
@@ -2471,6 +2837,51 @@ impl<H: TorrentHandle> Engine<H> {
         priority: u8,
         intent: Fetching,
         buffer: BufferProfile,
+    ) -> Result<FileHandle<H>, GetFileError> {
+        self.open_file(
+            file_idx,
+            start_offset,
+            priority,
+            intent,
+            buffer,
+            crate::retention::owner::Opener::Player,
+        )
+        .await
+    }
+
+    /// [`Self::try_get_file_with_intent`] for an open that is not the
+    /// current screen of a viewer's player on a file it shares: a request
+    /// without a player token, one from an older screen of the viewer, one
+    /// for an archive the app plays through a translated source, and every
+    /// read a translated source makes. Bounded and fetched like any stream,
+    /// and it **draws nothing** ([`crate::retention::owner::Opener::Unshared`]).
+    pub async fn try_get_file_unshared(
+        self: &Arc<Self>,
+        file_idx: usize,
+        start_offset: u64,
+        priority: u8,
+        intent: Fetching,
+        buffer: BufferProfile,
+    ) -> Result<FileHandle<H>, GetFileError> {
+        self.open_file(
+            file_idx,
+            start_offset,
+            priority,
+            intent,
+            buffer,
+            crate::retention::owner::Opener::Unshared,
+        )
+        .await
+    }
+
+    async fn open_file(
+        self: &Arc<Self>,
+        file_idx: usize,
+        start_offset: u64,
+        priority: u8,
+        intent: Fetching,
+        buffer: BufferProfile,
+        opener: crate::retention::owner::Opener,
     ) -> Result<FileHandle<H>, GetFileError> {
         let startup = Instant::now();
         tracing::debug!(
@@ -2525,11 +2936,33 @@ impl<H: TorrentHandle> Engine<H> {
             );
         }
 
-        // Before the reader, and it has to be before: the policy's window
-        // pieces are held back from what we announce, and a piece held back
-        // only after it completes has already had its Have go out. See
-        // [`Self::begin_retention`].
-        self.begin_retention(file_idx).await;
+        // What this stream will read ahead, as far as it can be known before
+        // the policy bounds it: the film's bitrate times the seconds the
+        // viewer asked for, or the intent's constant before the player has
+        // said how long the film is, never past the whole cache. The policy
+        // is sized so that this fits beside what the play session shares.
+        let asked_lookahead = self
+            .retention
+            .bitrate(&file_idx)
+            .map(|rate| rate.saturating_mul(buffer.window_seconds()))
+            .unwrap_or_else(|| priorities::librqbit_stream_lookahead_bytes(intent))
+            .min(self.retention.cap().unwrap_or(u64::MAX))
+            .max(1);
+        // Before the reader, and it has to be before: the policy is sized
+        // beside the read-ahead above, and so is the play session's shared
+        // set, whenever it is drawn. See [`Self::begin_retention_opening`].
+        self.begin_retention_opening(
+            file_idx,
+            crate::piece_store::Buffering {
+                lookahead_bytes: asked_lookahead,
+                window_seconds: Some(buffer.window_seconds()),
+                committed_seconds: Some(crate::backend::priorities::COMMITTED_SECONDS),
+                bytes_per_second: None,
+                seed: 0,
+            },
+            opener,
+        )
+        .await;
         let bound = self.fetch_bound(file_idx, start_offset);
         // **How many seconds of film, not how a range looked.**
         //
@@ -2548,19 +2981,14 @@ impl<H: TorrentHandle> Engine<H> {
         // stream is about to read -- so the disk would sit over budget by
         // the lookahead for the stream's life. At least one byte: librqbit
         // refuses a stream that reads nothing ahead.
+        // And never further than the whole cache may hold (in
+        // `asked_lookahead`): past that the pass cannot keep what the stream
+        // pulls, and the backend will not forget a piece a live stream is
+        // reading ahead over.
         let lookahead_bytes = bound
             .forward_bytes
             .unwrap_or(u64::MAX)
-            .min(
-                self.retention
-                    .bitrate(&file_idx)
-                    .map(|rate| rate.saturating_mul(buffer.window_seconds()))
-                    .unwrap_or_else(|| priorities::librqbit_stream_lookahead_bytes(intent)),
-            )
-            // And never further than the whole cache may hold: past that
-            // the pass cannot keep what the stream pulls, and the backend
-            // will not forget a piece a live stream is reading ahead over.
-            .min(self.retention.cap().unwrap_or(u64::MAX))
+            .min(asked_lookahead)
             .max(1);
 
         let opening = crate::files::Opening {
@@ -2621,10 +3049,26 @@ mod pin_tests {
 
     /// The least a handle can be for the owner to install on it: two files
     /// of eight pieces, live, recording every range it is asked to want
-    /// again.
-    #[derive(Clone)]
+    /// again -- and holding every test to the sharing rule the lib fake
+    /// does: an advertised set that starts empty, and a breach recorded for
+    /// any withdrawal asked of it while live, which it always is
+    /// ([`Self::assert_kept_the_rule`], at the end of every test here that
+    /// reaches an owner).
+    #[derive(Clone, Default)]
     struct PinnedHandle {
         reselected: Arc<parking_lot::Mutex<Vec<Range<u32>>>>,
+        advertised: Arc<parking_lot::Mutex<BTreeSet<u32>>>,
+        violations: Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+
+    impl PinnedHandle {
+        fn assert_kept_the_rule(&self) {
+            let violations = self.violations.lock();
+            assert!(
+                violations.is_empty(),
+                "the sharing rule was broken: {violations:?}"
+            );
+        }
     }
 
     #[async_trait::async_trait]
@@ -2685,6 +3129,32 @@ mod pin_tests {
             self.reselected.lock().push(pieces.clone());
             Ok((pieces.end - pieces.start) as usize)
         }
+
+        async fn set_pieces_advertised(
+            &self,
+            pieces: Range<u32>,
+            advertised: bool,
+        ) -> anyhow::Result<usize> {
+            if !advertised {
+                // Live, always: nothing may ask it to withdraw.
+                let breach = format!("asked to stop advertising {pieces:?} while live");
+                self.violations.lock().push(breach.clone());
+                panic!("{breach}");
+            }
+            let mut set = self.advertised.lock();
+            Ok(pieces
+                .take_while(|piece| *piece < 16)
+                .filter(|piece| set.insert(*piece))
+                .count())
+        }
+
+        async fn advertised_pieces(&self) -> Option<Vec<u32>> {
+            Some(self.advertised.lock().iter().copied().collect())
+        }
+
+        async fn read_file_head(&self, _file_idx: usize, len: u64) -> Option<Vec<u8>> {
+            Some(vec![0; len.min(8 * PIECE) as usize])
+        }
     }
 
     fn owner(
@@ -2726,9 +3196,7 @@ mod pin_tests {
     fn the_committed_set_is_not_offered_for_reclaim() {
         let streams: Arc<parking_lot::Mutex<crate::retention::streams::Streams>> = Arc::default();
         let backing = TorrentBacking {
-            handle: PinnedHandle {
-                reselected: Arc::default(),
-            },
+            handle: PinnedHandle::default(),
             info_hash: "pinned".to_string(),
             live: Arc::new(Live::new()),
             pinned: Arc::default(),
@@ -2785,9 +3253,7 @@ mod pin_tests {
     #[test]
     fn the_disk_settles_at_the_cap_with_the_committed_set_counted_once() {
         let backing = TorrentBacking {
-            handle: PinnedHandle {
-                reselected: Arc::default(),
-            },
+            handle: PinnedHandle::default(),
             info_hash: "pinned".to_string(),
             live: Arc::new(Live::new()),
             pinned: Arc::default(),
@@ -2838,9 +3304,7 @@ mod pin_tests {
 
         let streams: Arc<parking_lot::Mutex<crate::retention::streams::Streams>> = Arc::default();
         let backing = TorrentBacking {
-            handle: PinnedHandle {
-                reselected: Arc::default(),
-            },
+            handle: PinnedHandle::default(),
             info_hash: "pinned".to_string(),
             live: Arc::new(Live::new()),
             pinned: Arc::default(),
@@ -2940,9 +3404,7 @@ mod pin_tests {
             let streams: Arc<parking_lot::Mutex<crate::retention::streams::Streams>> =
                 Arc::default();
             let backing = TorrentBacking {
-                handle: PinnedHandle {
-                    reselected: Arc::default(),
-                },
+                handle: PinnedHandle::default(),
                 info_hash: "pinned".to_string(),
                 live: Arc::new(Live::new()),
                 pinned: Arc::default(),
@@ -3013,9 +3475,7 @@ mod pin_tests {
 
         let streams: Arc<parking_lot::Mutex<crate::retention::streams::Streams>> = Arc::default();
         let backing = TorrentBacking {
-            handle: PinnedHandle {
-                reselected: Arc::default(),
-            },
+            handle: PinnedHandle::default(),
             info_hash: "pinned".to_string(),
             live: Arc::new(Live::new()),
             pinned: Arc::default(),
@@ -3085,14 +3545,13 @@ mod pin_tests {
     /// says so.
     #[tokio::test]
     async fn a_file_the_backend_cannot_place_is_refused_by_drop_file_pieces() {
-        let handle = PinnedHandle {
-            reselected: Arc::default(),
-        };
+        let handle = PinnedHandle::default();
         assert!(
             handle.drop_file_pieces(0).await.unwrap().is_none(),
             "a file it places goes to drop_pieces, which keeps no have-set here"
         );
         assert!(handle.drop_file_pieces(2).await.is_err());
+        handle.assert_kept_the_rule();
     }
 
     /// **A pinned file with no entity is wanted whole, once.**
@@ -3108,9 +3567,7 @@ mod pin_tests {
     /// and the entity it leaves is what stops it doing so again.
     #[tokio::test]
     async fn a_pinned_file_with_no_entity_is_wanted_whole_once() {
-        let handle = PinnedHandle {
-            reselected: Arc::default(),
-        };
+        let handle = PinnedHandle::default();
         let pinned = Arc::new(parking_lot::RwLock::new(BTreeSet::new()));
         let owner = owner(handle.clone(), pinned.clone());
 
@@ -3139,5 +3596,6 @@ mod pin_tests {
             vec![8..16],
             "once: the entity it made is what every later tick's pass reaches it through"
         );
+        handle.assert_kept_the_rule();
     }
 }

@@ -1150,6 +1150,12 @@ impl LibrqbitBackend {
                 // restart, and `PieceStoreFactory` makes that promise
                 // precisely because it is installed here.
                 default_storage_factory: Some(storage.clone_box()),
+                // Announce nothing a play session or a download did not
+                // choose: every torrent -- added, restored, restarted out
+                // of an error -- starts advertising nothing, and a live one
+                // never takes an announcement back. See
+                // `TorrentHandle::set_pieces_advertised`.
+                explicit_piece_advertising: true,
                 ..Default::default()
             };
             match Session::new_with_opts(download_dir.to_path_buf(), session_opts).await {
@@ -1265,6 +1271,8 @@ impl LibrqbitBackend {
                 .default_storage
                 .as_ref()
                 .map(librqbit::storage::StorageFactory::clone_box),
+            // As the shipped session: see `new_with_settings`.
+            explicit_piece_advertising: true,
             ..Default::default()
         };
         // Same question, same factory, as `new_with_settings` asks.
@@ -1757,6 +1765,10 @@ pub struct LibrqbitHandle {
     stream_positions: StreamPositions,
     /// Backend-wide swarm-scrape cache (see [`SwarmScraper`]).
     swarm_scraper: Arc<SwarmScraper>,
+    /// The registry the session's piece stores report to, when the default
+    /// storage is the piece store: what [`TorrentHandle::read_file_head`]
+    /// reads held bytes through.
+    store_registry: Option<Arc<crate::piece_store::StoreRegistry>>,
 }
 
 /// Put `trackers` into a magnet link as `tr=` params.
@@ -1895,6 +1907,7 @@ impl LibrqbitBackend {
             reported_errors: self.reported_errors.clone(),
             stream_positions: self.stream_positions.clone(),
             swarm_scraper: self.swarm_scraper.clone(),
+            store_registry: self.store_registry.clone(),
         }
     }
 
@@ -2776,6 +2789,23 @@ impl TorrentHandle for LibrqbitHandle {
     /// first or last piece with a neighbour. The last piece of the
     /// *torrent* may be short, so the byte count is clamped against the
     /// torrent's own length rather than assumed to be a whole multiple.
+    /// Off the piece store's held pieces, on the blocking pool: nothing is
+    /// fetched, and a head not wholly held yet is `None`.
+    async fn read_file_head(&self, file_idx: usize, len: u64) -> Option<Vec<u8>> {
+        let registry = self.store_registry.clone()?;
+        let length = self
+            .handle
+            .with_metadata(|m| m.file_infos.get(file_idx).map(|file| file.len))
+            .ok()
+            .flatten()?;
+        let len = len.min(length);
+        let info_hash = self.info_hash.clone();
+        tokio::task::spawn_blocking(move || registry.read_held(&info_hash, file_idx, 0, len))
+            .await
+            .ok()
+            .flatten()
+    }
+
     async fn file_pieces(&self, file_idx: usize) -> Option<crate::backend::FilePieceSpan> {
         self.handle
             .with_metadata(|m| {
@@ -2898,10 +2928,11 @@ impl TorrentHandle for LibrqbitHandle {
             .context("librqbit could not want the pieces again")
     }
 
-    /// librqbit's own hold-back set, which is what makes the retention
-    /// policy's "only what is committed is advertised" expressible at all:
-    /// a suppression bitfield on the chunk tracker, independent of both the
-    /// have-set and the reclaim want-set.
+    /// The fork's advertised set, which is what makes "share only the
+    /// committed set" expressible at all: under `explicit_piece_advertising`
+    /// a torrent announces and serves only what this named, it keeps the
+    /// set across a restart out of an error, and it refuses to take back an
+    /// announcement while it is live.
     async fn set_pieces_advertised(
         &self,
         pieces: std::ops::Range<u32>,
@@ -2910,6 +2941,10 @@ impl TorrentHandle for LibrqbitHandle {
         self.handle
             .set_pieces_advertised(pieces, advertised)
             .context("librqbit could not change what the torrent announces")
+    }
+
+    async fn advertised_pieces(&self) -> Option<Vec<u32>> {
+        self.handle.advertised_pieces()
     }
 
     /// The engine's primary multi-file switching hook
@@ -3702,6 +3737,45 @@ mod tests {
             assert!(!row.note.is_empty(), "{} says why", row.setting);
             assert!(!row.note.contains("  "), "{}: {:?}", row.setting, row.note);
         }
+    }
+
+    /// **The shipped session announces nothing that nothing chose.** It runs
+    /// under the fork's `explicit_piece_advertising`, so a torrent added to
+    /// it advertises no piece until a play session or a download names one
+    /// -- where without the option every piece it has would be announced
+    /// from the moment it is added.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_shipped_session_advertises_nothing_until_told() {
+        use crate::backend::TorrentHandle;
+        let tmp = tempfile::tempdir().unwrap();
+        let (backend, _) = LibrqbitBackend::new_with_settings(
+            tmp.path().to_path_buf(),
+            TorrentListenPort::Ephemeral,
+            Vec::new(),
+            BootstrapResolvers::offline(),
+            SessionTuning::from_settings(
+                &TorrentSpeedProfile::default(),
+                &TorrentPrivacyConfig {
+                    bt_enable_dht: false,
+                    ..TorrentPrivacyConfig::default()
+                },
+            ),
+        )
+        .await
+        .expect("session");
+        let payload = tmp.path().join("payload.bin");
+        write_payload(&payload, 16 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+        let handle = backend
+            .add_torrent(TorrentSource::Bytes(torrent_bytes), Vec::new())
+            .await
+            .expect("add torrent");
+        assert_eq!(handle.advertised_pieces().await, Some(Vec::new()));
+        handle
+            .set_pieces_advertised(0..1, true)
+            .await
+            .expect("advertise");
+        assert_eq!(handle.advertised_pieces().await, Some(vec![0]));
     }
 
     /// The session opens the way the settings say: no DHT, the peer limit
@@ -4963,6 +5037,7 @@ mod tests {
             .expect("add torrent");
         let handle = LibrqbitHandle {
             swarm_scraper: SwarmScraper::with_transport(Arc::new(StubTrackers)),
+            store_registry: None,
             ..handle.clone()
         };
 
@@ -5063,6 +5138,7 @@ mod tests {
             stream_positions: Default::default(),
             reported_errors: Default::default(),
             swarm_scraper: SwarmScraper::disabled(),
+            store_registry: None,
         };
 
         // Bounded poll: the initial peer reaches the peer list once the
@@ -7873,6 +7949,7 @@ mod tests {
             reported_errors: backend.reported_errors.clone(),
             stream_positions: backend.stream_positions.clone(),
             swarm_scraper: backend.swarm_scraper.clone(),
+            store_registry: backend.store_registry.clone(),
         };
 
         let mut stats = handle.stats().await;
@@ -9148,8 +9225,9 @@ mod tests {
 
     /// **The freshness half of the budget.** Before any cache pass has run,
     /// this process has not been told a budget -- and "not told" is not
-    /// "nothing". Nothing is held back, nothing is reclaimed, and the
-    /// torrent behaves exactly as it did before the policy was wired.
+    /// "nothing". Nothing is reclaimed, and nothing is shared: there is no
+    /// budget to size a shared set against, so the play session draws
+    /// nothing and the torrent announces nothing.
     ///
     /// The failure this rules out is the one this codebase keeps having to
     /// delete: a value invented at startup and read back as an
@@ -9217,18 +9295,25 @@ mod tests {
             pieces,
             "every piece is still here: an unknown budget bounds nothing"
         );
+        assert_eq!(
+            engine.handle.advertised_pieces().await,
+            Some(Vec::new()),
+            "and shares nothing: every piece is ours and none is announced"
+        );
     }
 
-    /// **The citizenship half.** A peer is never told about a piece we
-    /// later reclaim.
+    /// **The citizenship half.** A peer is told about the play session's
+    /// draw and nothing else, is never told about a piece we reclaim while
+    /// the torrent is in the swarm, and a switch away stops the torrent
+    /// before its bytes go.
     ///
     /// A leecher with no way to find anything but this server downloads
     /// what it is offered while the stream runs and the policy reclaims
     /// behind the playhead. Whatever the leecher ends up holding, it holds
-    /// because we announced it -- and every one of those pieces is still on
-    /// our disk when the stream is over. There is no un-Have in BitTorrent,
-    /// so a piece announced and then reclaimed is a peer that asks for
-    /// bytes we have thrown away.
+    /// because we announced it -- so every one of those pieces is one of the
+    /// draw, and still on our disk when the stream is over. There is no
+    /// un-Have in BitTorrent, so a piece announced and then reclaimed is a
+    /// peer that asks for bytes we have thrown away.
     ///
     /// Both sides are read off a disk: the leecher runs on a piece store of
     /// its own, so the pieces it received are a directory listing rather
@@ -9298,6 +9383,25 @@ mod tests {
             .await
             .expect("leecher add");
 
+        // The viewer plays the film: the cell names it, the player opens it,
+        // and then says how long it is -- twelve minutes, so ninety seconds
+        // of it, the read-ahead a later open is granted, is eight megabytes.
+        efs.live().open(
+            crate::retention::live::LiveEntity::Torrent {
+                info_hash: hash.clone(),
+                file_idx: 0,
+            },
+            false,
+        );
+        // And the player's session is on it (`p=`).
+        efs.note_player(
+            "tv.1",
+            crate::retention::sessions::Played::Torrent {
+                info_hash: hash.clone(),
+                file_idx: 0,
+                shares: true,
+            },
+        );
         let mut reader = engine
             .try_get_file_with_intent(
                 0,
@@ -9308,16 +9412,40 @@ mod tests {
             )
             .await
             .expect("reader");
+        efs.on_duration(&hash, 0, Duration::from_secs(12 * 60))
+            .await;
+        // The film's first bytes, so the play session can tell it is not an
+        // archive, and a pass that draws.
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut done = 0usize;
+        let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
+        while done < 1024 * 1024 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stream stalled at {done} bytes"
+            );
+            let n = reader.read(&mut buf).await.expect("read");
+            assert_ne!(n, 0, "the stream ended early at {done}");
+            done += n;
+        }
+        efs.reconcile_tick().await;
 
-        // Half the budget is the committed set, and the committed set is
-        // the whole of what a peer is ever offered.
-        let committed_pieces = (budget / RETENTION_PIECE / 2) as usize;
+        // The draw the play session made once the film's rate was known,
+        // against the stream's real read-ahead, is the whole of what a peer
+        // is ever offered.
+        let draw: std::collections::BTreeSet<u32> = engine
+            .retention
+            .draws()
+            .into_iter()
+            .find(|(file_idx, _)| *file_idx == 0)
+            .map(|(_, draw)| draw)
+            .expect("the open drew what the session shares");
+        let committed_pieces = draw.len();
+        assert!(committed_pieces > 0, "the budget left nothing to share");
         // Every piece the peer has taken off us at any point in the run.
         // Taken as we go, so a piece it got early and we reclaimed later
         // cannot slip past by the peer having dropped it too.
         let mut told = std::collections::BTreeSet::new();
-        let mut buf = vec![0u8; 64 * 1024];
-        let mut done = 0usize;
         let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
         while done < file_bytes {
             assert!(
@@ -9334,8 +9462,8 @@ mod tests {
         }
         // Then let the peer take what it is still being offered. The
         // playhead has stopped, so the policy's answer is fixed from here:
-        // the committed half stays advertised and stays on the disk, and
-        // the window stays held back. The reader is deliberately still
+        // the draw stays advertised and stays on the disk, and the window is
+        // announced to nobody. The reader is deliberately still
         // open -- dropping it would end the playback the ladder reads, and
         // this is about what a peer sees, not about idleness.
         let settle = std::time::Instant::now() + TEST_WAIT_BOUND;
@@ -9359,25 +9487,21 @@ mod tests {
             "we announced {} pieces we then reclaimed: {broken:?}",
             broken.len()
         );
+        let outside: Vec<u32> = told.iter().copied().filter(|p| !draw.contains(p)).collect();
         assert!(
-            told.len() < (file_bytes as u64 / RETENTION_PIECE) as usize,
-            "the peer was offered the whole torrent, so nothing was ever held back"
+            outside.is_empty(),
+            "the peer got {} pieces no play session chose to share: {outside:?}",
+            outside.len()
         );
 
-        // **And the switch.** The viewer opens something else, so the file
-        // they left is slack and every byte of it goes -- the committed
-        // half included, because what a switch ends is the sharing as well
-        // as the keeping.
-        //
-        // What is asserted here is that end state, in a real session. The
-        // *order* it happens in -- the whole extent held back from what we
-        // announce before a single unlink -- cannot be read from out here,
-        // because a peer cannot take a piece we have already deleted
-        // whichever way round the two calls go: the hold-back's absence
-        // would show as a peer's *request* failing, not as a piece it
-        // gains. That ordering is asserted where it is visible, on the
-        // recorder, by `a_switch_to_the_next_file_makes_the_first_slack_
-        // and_takes_its_bytes`.
+        // **And the switch.** The viewer opens something else, so the play
+        // session is over and every byte of it goes -- the draw included,
+        // because what a switch ends is the sharing as well as the keeping
+        // -- with the torrent out of the swarm first. The fork refuses to
+        // drop an announced piece of a live torrent under
+        // `explicit_piece_advertising`, so a disk that empties is one
+        // emptied after the stop; the recorder's side of the same order is
+        // `a_switch_to_another_torrent_stops_the_one_left_before_its_bytes_go`.
         efs.live().open(
             crate::retention::live::LiveEntity::Proxy {
                 dir: tmp.path().join("elsewhere"),
@@ -9399,9 +9523,10 @@ mod tests {
         }
         // And this is why the order matters: the peer still holds what we
         // told it about, and there is no un-Have. Every one of those pieces
-        // is one we have now deleted, so from here what protects the peer
-        // from asking us for bytes we do not have is the withdrawal that
-        // went out before the first unlink.
+        // is one we have now deleted, so what protects the peer from asking
+        // us for bytes we do not have is that the torrent left the swarm
+        // before they went -- and stays out of it, since nobody plays it.
+        assert_eq!(engine.handle.run_state(), RunState::Paused);
         assert!(
             !on_disk(&leecher_store, &hash).is_empty(),
             "the peer kept what we announced to it, as a peer does"
@@ -9526,8 +9651,9 @@ mod tests {
     /// after `run_state` says Error by however long they take, so the test
     /// waits for the registration rather than reading it at the state
     /// change. The registry then answers "no store" for the hash, which a
-    /// pass concludes nothing over -- never an empty set, which would
-    /// withdraw every committed piece from what we announce. The restart is
+    /// pass concludes nothing over -- never an empty set, which would count
+    /// every committed piece lost off a disk that still holds it. The
+    /// restart is
     /// `Session::unpause`'s Error arm: `create_and_init` again, on the
     /// reactor under the torrent's own lock, and the fresh store's seed
     /// registers there -- one map insert, no call back into the torrent --
@@ -9564,7 +9690,7 @@ mod tests {
             .expect("add");
         let hash = engine.info_hash.clone();
         engine.handle.handle.wait_until_initialized().await.unwrap();
-        assert_eq!(registry.epoch(&hash), Some(1), "one init, one seed");
+        assert!(registry.is_registered(&hash), "one init, one seed");
         let _seeder = seeder_dialling(&content, &torrent_bytes, client_addr).await;
 
         // Fetch the first megabyte, so the bucket exists and holds pieces.
@@ -9657,7 +9783,7 @@ mod tests {
             registry.held(&hash).is_none(),
             "a torrent in Error holds no storage, so the hash has no store: unknown, not empty"
         );
-        assert_eq!(registry.epoch(&hash), None);
+        assert!(!registry.is_registered(&hash));
         assert!(
             !on_disk(&store, &hash).is_empty(),
             "while the pieces themselves are still on the disk"
@@ -9681,42 +9807,26 @@ mod tests {
             "and its seed is what the re-check found on the disk"
         );
         assert!(held.count() > 0);
-        assert_eq!(
-            registry.epoch(&hash),
-            Some(2),
-            "a seed the registry numbered, not one the store counted for itself: \
-             it is read to tell a rebuilt tracker from the one that was told \
-             what to hold back, and a fresh store counting its own inits would \
-             report the 1 the errored one reported"
-        );
     }
 
-    /// **A restart out of an error announces the window again, and the next
-    /// pass holds it back again.**
+    /// **A restart out of an error advertises exactly what it advertised
+    /// before: the play session's draw, no less and no more.**
     ///
-    /// librqbit builds a fresh chunk tracker for the re-check, and the
-    /// hold-back lives in the tracker: everything the disk holds is
-    /// announced in the handshake bitfield as the torrent comes back, the
-    /// window's uncommitted pieces included. Nothing in this process
-    /// ordered that and nothing can refuse it -- the seed that would notice
-    /// runs on the reactor under librqbit's own lock, where the call that
-    /// holds pieces back is refused -- so the next pass compares the
-    /// registry's epoch with the one its hold-back went out under and
-    /// issues it again.
+    /// librqbit builds a fresh chunk tracker for the re-check. The fork's
+    /// advertised set is not in it -- it lives beside the torrent, under
+    /// `explicit_piece_advertising` -- so the torrent comes back announcing
+    /// the draw's pieces it still has, which peers were told of, and nothing
+    /// the window holds, which nobody was. Nothing here re-issues anything:
+    /// the owner's draw is what the session advertised, and the backend's
+    /// set is read back and compared with it.
     ///
     /// The viewer is still playing the file throughout, so the entity the
-    /// pass runs on is the one the install put a policy in, not one a fresh
-    /// open re-asserted: an open would hold the range back itself, and
-    /// prove nothing.
-    ///
-    /// What is measured is what librqbit would announce: asking it to hold
-    /// the file back again reports how many pieces really changed, which is
-    /// the committed half alone when the pass has done its work and the
-    /// whole file when nothing did. Unix only, for the same reason as the
-    /// test above: the error is an unwritable directory.
+    /// pass runs on is the one the install drew for, not one a fresh open
+    /// re-asserted. Unix only, for the same reason as the test above: the
+    /// error is an unwritable directory.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_restart_out_of_error_has_its_hold_back_issued_again_by_the_next_pass() {
+    async fn a_restart_out_of_error_keeps_advertising_the_draw_and_nothing_else() {
         use crate::backend::TorrentHandle;
         use std::os::unix::fs::PermissionsExt;
         use tokio::io::AsyncReadExt;
@@ -9725,14 +9835,20 @@ mod tests {
         let content = tmp.path().join("content");
         tokio::fs::create_dir_all(&content).await.unwrap();
         let payload = content.join("movie.bin");
-        write_payload(&payload, RETENTION_FILE_BYTES).await;
+        // Twice the other retention tests' film, under a budget that holds
+        // the stream's read-ahead -- 32 MiB before the player has said how
+        // long the film is, 129 pieces -- and a shared set beside it: 192
+        // pieces of budget leave 63 to draw. Under their 16 MiB the
+        // read-ahead is the whole cache, and a session that cannot share and
+        // play shares nothing.
+        write_payload(&payload, 2 * RETENTION_FILE_BYTES).await;
         let (torrent_bytes, _) =
             make_torrent_with_piece_length(&payload, RETENTION_PIECE as u32).await;
 
         let client_dir = tmp.path().join("client");
         let (efs, client_addr) = streaming_engine_fs(&client_dir).await;
         let store = efs.piece_store();
-        efs.set_cache_budget(Some(RETENTION_BUDGET));
+        efs.set_cache_budget(Some(3 * RETENTION_BUDGET));
 
         let engine = efs
             .add_torrent(TorrentSource::Bytes(torrent_bytes.clone()), None)
@@ -9749,6 +9865,15 @@ mod tests {
             },
             false,
         );
+        // And the player's session is on it (`p=`).
+        efs.note_player(
+            "tv.1",
+            crate::retention::sessions::Played::Torrent {
+                info_hash: hash.clone(),
+                file_idx: 0,
+                shares: true,
+            },
+        );
         let _seeder = seeder_dialling(&content, &torrent_bytes, client_addr).await;
 
         let mut reader = engine
@@ -9761,6 +9886,11 @@ mod tests {
             )
             .await
             .expect("reader");
+        // The player says how long the film is -- four minutes, so ninety
+        // seconds of it is 24 MiB: inside the open's read-ahead, and room
+        // for the 63 pieces above in the committed set's time cap -- and
+        // the first pass draws.
+        efs.on_duration(&hash, 0, Duration::from_secs(4 * 60)).await;
         let mut buf = vec![0u8; 64 * 1024];
         let mut done = 0usize;
         let deadline = std::time::Instant::now() + TEST_WAIT_BOUND;
@@ -9778,7 +9908,7 @@ mod tests {
         let committed_before = committed_of(&engine).await;
         assert!(
             !committed_before.is_empty(),
-            "nothing was committed, so the re-issue has nothing to leave announced"
+            "nothing was committed, so nothing was announced before the error"
         );
 
         // The bucket will take no new file. A process that ignores the mode
@@ -9809,26 +9939,32 @@ mod tests {
         engine.handle.handle.wait_until_initialized().await.unwrap();
         efs.reconcile_tick().await;
 
-        let policy = engine
-            .standing()
-            .await
-            .policies
+        let draw: Vec<u32> = engine
+            .retention
+            .draws()
             .into_iter()
-            .find(|policy| policy.file_idx == 0)
-            .expect("the policy the install put in stands across the restart");
-        let pieces = policy.view.pieces.clone();
-        let announced = engine
+            .find(|(file_idx, _)| *file_idx == 0)
+            .map(|(_, draw)| draw.into_iter().collect())
+            .expect("the draw the install made stands across the restart");
+        assert!(!draw.is_empty(), "the budget drew nothing to share");
+        let advertised = engine
             .handle
-            .set_pieces_advertised(pieces.clone(), false)
+            .advertised_pieces()
             .await
-            .expect("hold the file back");
+            .expect("the fork keeps an advertised set");
         assert_eq!(
-            announced,
-            policy.view.committed.len(),
-            "{announced} of the {} pieces of the file were still announced after the \
-             restart; only the {} committed ones should have been",
-            pieces.end - pieces.start,
-            policy.view.committed.len()
+            advertised, draw,
+            "the restart changed what the torrent advertises"
+        );
+        assert!(
+            committed_before
+                .iter()
+                .all(|piece| advertised.binary_search(piece).is_ok()),
+            "a piece announced before the error is not announced after it"
+        );
+        assert!(
+            !engine.shares_to_end().await,
+            "and nothing it advertises is a share to end"
         );
     }
 

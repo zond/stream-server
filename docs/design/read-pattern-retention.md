@@ -494,6 +494,26 @@ pass's stride -- what was its `window` is no longer one, and is named
 `unshared` since `ff1605b`: the part of the budget the sharing draw may
 not have.
 
+**What is shared, and how it ends** (2026-09-28). The committed set is no
+longer re-derived: a viewer's play session -- one per viewer, moved only by
+the player's own `p=<viewer>.<screen>` requests from its newest screen, never by a subtitle beside it or an
+archive's translated source -- draws it once, as soon as the
+read-ahead its readers are granted is known: the film's bitrate times the
+viewer's seconds, which needs the length the player states after its first
+open (or, if none comes, ten seconds of playback and the opens' own
+numbers). Nothing when the budget cannot hold both. It is advertised then,
+and the fork's `explicit_piece_advertising` announces each piece of it as it
+completes and nothing else of the torrent. Every later policy of the
+session adopts the draw; a seek or a budget that moves grows or shrinks
+nothing, and nothing is ever withdrawn. When playback moves to anything
+else, the play session's announced pieces end only once the torrent has
+left the swarm: the reconciler's `EndShares` stops it, the advertised set
+is made again from what is still shared, the torrent starts again if it is
+still wanted, and then the session's bytes go. Nothing but the one player on
+a torrent moving stops it: an unpin, or another player's move, waits for
+no player to be on it.
+See [Sharing](../storage.md#sharing).
+
 **Measured, not claimed.** The disk peaks at 71 pieces of a 64-piece budget
 on the torrent -- a stream's own lookahead is never taken, and what the
 fill wrote since the last pass is on the disk when a reading is taken. On

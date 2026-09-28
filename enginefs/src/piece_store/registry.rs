@@ -34,7 +34,6 @@
 //! [`PieceStore::held`]: super::PieceStore::held
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use parking_lot::Mutex;
@@ -64,11 +63,6 @@ pub struct StoreRegistry {
     /// store a restart out of error builds is watched by the same engine
     /// without re-registering.
     watchers: Mutex<HashMap<String, Weak<dyn PieceCompleted>>>,
-    /// The last epoch handed out, to any store under this root. One counter
-    /// rather than one per hash because it is only ever compared with
-    /// itself, and a hash that has had two stores is what it exists to
-    /// tell apart -- see [`Self::insert`].
-    epochs: AtomicU64,
 }
 
 /// Told when a piece of one torrent has been accepted: whole, hash-checked,
@@ -116,7 +110,6 @@ impl StoreRegistry {
             root,
             by_hash: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
-            epochs: AtomicU64::new(0),
         }
     }
 
@@ -169,6 +162,19 @@ impl StoreRegistry {
     /// tick without a directory walk.
     pub fn held(&self, info_hash: &str) -> Option<HeldSnapshot> {
         self.live(info_hash)?.held()
+    }
+
+    /// The `len` bytes at `offset` of file `file_id` of `info_hash`, read
+    /// from the pieces its live store holds, or `None` when there is no such
+    /// store or a piece they lie in is not held. Blocking I/O.
+    pub fn read_held(
+        &self,
+        info_hash: &str,
+        file_id: usize,
+        offset: u64,
+        len: u64,
+    ) -> Option<Vec<u8>> {
+        self.live(info_hash)?.read_held(file_id, offset, len)
     }
 
     /// How many times a staged copy has been opened over a piece the store
@@ -294,20 +300,6 @@ impl StoreRegistry {
             .is_some_and(|inner| inner.is_checking())
     }
 
-    /// Which store of `info_hash`'s the live one is, or `None` for a hash
-    /// with no store.
-    ///
-    /// It moves when a fresh store registers over an older one, which is
-    /// what a restart out of error does -- and a restart out of error is
-    /// when librqbit rebuilds the chunk tracker and forgets every hold-back
-    /// it was told. That is the whole of what this is read for, so it must
-    /// move across the *fresh* store rather than count the seeds of each:
-    /// a per-store count starts over with the store, and a reader comparing
-    /// it would be told nothing had happened. See [`Self::insert`].
-    pub fn epoch(&self, info_hash: &str) -> Option<u64> {
-        self.live(info_hash).map(|inner| inner.epoch())
-    }
-
     /// How many hashes have an entry, live or not: the probe for the tests
     /// that pin what a store's drop does to the map.
     #[cfg(test)]
@@ -340,24 +332,9 @@ impl StoreRegistry {
     /// there: a restart out of error builds a fresh store while the old
     /// one's registration may not have gone yet, and the newest is the one
     /// librqbit reads and writes.
-    ///
-    /// A store the hash has not had before takes an epoch here, and one
-    /// that is already the registered store keeps the one it has: the epoch
-    /// names the store, not the seed ([`Inner::epoch`]), and a store that
-    /// seeds again is the same store with the same chunk tracker beside it
-    /// -- what it holds may have changed, but nothing has forgotten what we
-    /// held back. Assigned under the map lock, so the number a reader gets
-    /// with a registration is the one that registration was given.
     pub(super) fn insert(&self, info_hash: &str, inner: &Arc<Inner>) {
         let mut by_hash = self.by_hash.lock();
-        let key = info_hash.to_ascii_lowercase();
-        let already = by_hash
-            .get(&key)
-            .is_some_and(|weak| Weak::as_ptr(weak) == Arc::as_ptr(inner));
-        if !already {
-            inner.set_epoch(self.epochs.fetch_add(1, Ordering::Relaxed) + 1);
-        }
-        by_hash.insert(key, Arc::downgrade(inner));
+        by_hash.insert(info_hash.to_ascii_lowercase(), Arc::downgrade(inner));
     }
 
     /// Drop the registration for `info_hash` if it still points at
@@ -479,7 +456,6 @@ mod tests {
         assert_eq!(registry.delete(HASH, &[0]), DeleteOutcome::Unregistered);
         assert!(!registry.checking(HASH));
         assert!(!registry.is_registered(HASH));
-        assert_eq!(registry.epoch(HASH), None);
 
         std::fs::create_dir_all(store.dir()).unwrap();
         write_piece(&store, 1);
@@ -490,7 +466,6 @@ mod tests {
             "seeded, and so registered, with what the seed found"
         );
         assert!(registry.is_registered(HASH));
-        assert_eq!(registry.epoch(HASH), Some(1));
 
         // The delete fallback: a fresh store over the same hash, no init.
         let fallback = store_under(&registry);
@@ -539,13 +514,6 @@ mod tests {
             first.held().unwrap().in_range(0..4),
             BTreeSet::from([0]),
             "the first store is a different Inner and knows nothing of the second's completion"
-        );
-        assert_eq!(
-            registry.epoch(HASH),
-            Some(2),
-            "the second seed, though it is the fresh store's first: what the \
-             epoch is asked is whether the hold-back survived, and a number \
-             each store counted for itself would say yes here"
         );
 
         drop(first);
@@ -663,7 +631,6 @@ mod tests {
             Some(BTreeSet::from([2]))
         );
         assert!(registry.is_registered(&upper));
-        assert_eq!(registry.epoch(&upper), Some(1));
         assert_eq!(
             registry.delete(&upper, &[2]),
             DeleteOutcome::Registered { unlinked: 1 }

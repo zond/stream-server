@@ -218,8 +218,10 @@ impl TorrentFileSource {
                     format!("no torrent {} in this engine", self.info_hash),
                 )
             })?;
+        // **Unshared.** A translated source's read is not a player's: it
+        // draws nothing -- archive playback shares nothing.
         let handle = torrent
-            .try_get_file_with_intent(
+            .try_get_file_unshared(
                 self.file_idx,
                 offset,
                 PLAYBACK_PRIORITY,
