@@ -309,17 +309,61 @@ fn an_unknown_pin_set_never_stops_a_torrent_nobody_reads() -> anyhow::Result<()>
     );
     // The other half of what `PinsUnknown` does: `reclaim_rest` breaks
     // before it takes anything, so every piece that arrived is still on the
-    // disk. Fetched is read first, so the store has had at least as long to
-    // land it; the slack is bytes the seeder has counted out that no
-    // completed piece has been made of yet -- a megabyte of it, generously.
+    // disk.
+    //
+    // "Arrived" is the seeder's count, and that count runs ahead of the
+    // store by more than one reading can allow for. It grows when the
+    // seeder's socket accepts a block, not when the server has read it,
+    // and the server keeps librqbit's whole request window outstanding --
+    // 128 blocks, eight pieces. Every piece is synced to the disk before
+    // the store holds it, so a disk busy with someone else's writes lets
+    // that window fill: measured under fsync pressure, the store trailed
+    // the count by up to eight pieces at the instant of reading and caught
+    // up within a few seconds, never having lost one. So the count is read
+    // once, the flow is left running, and the store is given until
+    // [`WAIT_BOUND`] to make pieces of everything counted -- all but the
+    // four this check has always allowed for.
     let fetched = watch.seeder.uploaded();
-    let held = pieces_held(&watch.cache_root, &watch.info_hash);
+    let landed = pieces_complete(&watch.cache_root, &watch.info_hash);
+    let deadline = std::time::Instant::now() + WAIT_BOUND;
+    let mut held = pieces_held(&watch.cache_root, &watch.info_hash);
+    while (held as u64 + 4) < fetched / PIECE as u64 {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "an unknown pin set let a pass take pieces it fetched: {fetched} fetched, \
+             {held} held after {WAIT_BOUND:?}"
+        );
+        std::thread::sleep(POLL);
+        held = pieces_held(&watch.cache_root, &watch.info_hash);
+    }
     println!("unknown pin set: {fetched} bytes fetched, {held} pieces held");
+    // And the count alone could be made up by pieces that arrived while it
+    // was being waited for, so the pieces themselves are asked about too:
+    // every one that had landed when the count was read is still there.
+    let taken: Vec<u32> = landed
+        .difference(&pieces_complete(&watch.cache_root, &watch.info_hash))
+        .copied()
+        .collect();
     anyhow::ensure!(
-        held as u64 + 4 >= fetched / PIECE as u64,
-        "an unknown pin set let a pass take pieces it fetched: {fetched} fetched, {held} held"
+        taken.is_empty(),
+        "an unknown pin set let a pass take pieces it fetched: {taken:?} were held and are gone"
     );
     watch.finish()
+}
+
+/// The pieces the store holds a complete copy of, by index -- which pieces,
+/// where [`pieces_held`] says how many.
+fn pieces_complete(
+    cache_root: &std::path::Path,
+    info_hash: &str,
+) -> std::collections::BTreeSet<u32> {
+    torrent_fixtures::piece_store(cache_root)
+        .stat(info_hash)
+        .pieces
+        .into_iter()
+        .filter(|piece| piece.complete.is_some())
+        .filter_map(|piece| u32::try_from(piece.index).ok())
+        .collect()
 }
 
 /// A second librqbit session with the whole torrent, listening, dialling

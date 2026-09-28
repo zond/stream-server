@@ -20,19 +20,16 @@ carried in below.
 
 ## Open
 
-- **Whether a tight budget should leave the sharing draw room** (review
-  2026-09-19 #100, left open by its fix `b8f5027`): on the fixture of
-  `a_restart_out_of_error_has_its_hold_back_issued_again_by_the_next_pass`,
-  `shape_for` gives the whole budget to the lookahead, so nothing is
-  committed for sharing. A question about the policy, not a defect.
-- **`an_unknown_pin_set_never_stops_a_torrent_nobody_reads` flakes**
-  (server/tests/reader_less_fetch.rs, only under the full
-  `cargo test -p server --no-default-features` run; it has not failed
-  alone). Three failures: 2026-09-26 and 2026-09-27 "let a pass take
-  pieces it fetched" (a slack pass reclaiming a reader-less torrent's
-  pieces while the pin set is unknown), and 2026-09-27 "stopped a torrent
-  nobody reads" (nothing fetched in the last 4 s). Not hunted yet; the
-  first failure predates the rqbit changes it has been seen beside.
+- **Sharing does not yet follow the rule "publish once, never withdraw"**
+  (zond, 2026-09-28: share only the committed set chosen before playing,
+  announce each piece as it lands, never take an announcement back). Today
+  a slack pass withdraws and deletes the committed set of a file the
+  viewer leaves while peers are still connected; a torrent announces
+  pieces before its hold-back is installed (and again after a restart from
+  error); the committed draw is re-derived each pass and sized before the
+  reader's lookahead is known; a Whole-to-Split change withdraws a file.
+  Rework pending two decisions (what ends sharing on a switch; a same-
+  torrent episode's committed set against the next episode's budget).
 - **The piece-commit failure paths are unmeasured on a device** -- see
   *Readable before durable* below.
 - **A stale-looking name, kept on purpose**:
@@ -241,6 +238,21 @@ process.
 
 ## Closed, one line each
 
+- 2026-09-28 -- **Whether a tight budget should leave the sharing draw
+  room**: no. zond: if it is impossible to share and play, stop sharing --
+  the lookahead floor wins and the committed set yields to nothing.
+- 2026-09-28 -- **`an_unknown_pin_set_never_stops_a_torrent_nobody_reads`
+  flaked** (server/tests/reader_less_fetch.rs): the test's own reading, not
+  a pass. The seeder counts a block when its socket takes it, the server
+  keeps librqbit's 128-block request window outstanding, and every piece is
+  synced before the store holds it, so under disk pressure the store trailed
+  the count by up to eight pieces against a slack of four. The
+  pre-`8085194` "stopped" failure was not reproduced; that version read a
+  stop from zero bytes in a 4 s tail, and the same pressure slowed the tail
+  to 2.3 MB, so it is most likely the same stall. Reproduced 37 of 72 runs under 40 busy loops and 8 fsync
+  writers; the store never lost a piece. The test now waits (bounded) for
+  the store to catch up with the count and checks the pieces that had
+  landed are all still there: 0 of 72, and 0 of 36 under 16 writers.
 - 2026-09-20 -- **A proxied play-through counted as dozens of consumers,
   settling the cache over its cap** (review 2026-09-19 #100): a read that
   begins where its own reader's last read ended is that reader carrying on,
