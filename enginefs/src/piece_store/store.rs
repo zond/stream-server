@@ -63,7 +63,7 @@ pub struct MissingPiece {
 /// # One store, several handles
 ///
 /// This type is a handle. Everything a torrent's store knows lives in one
-/// shared `Inner`, and librqbit's [`TorrentStorage::take`] -- how it
+/// shared [`Inner`], and librqbit's [`TorrentStorage::take`] -- how it
 /// pauses a torrent, and how the initial check hands over to the paused
 /// state -- makes a second handle over the same `Inner` rather than a copy:
 /// copying would let the successor's staged set and removed-file set
@@ -72,7 +72,7 @@ pub struct MissingPiece {
 /// so a completion landing on one handle while the other is about to become
 /// the live one would be a piece the store held and never knew it held.
 /// What a handle owns alone is whether it is
-/// still the data path (`Self::live`): the taken handle refuses reads and
+/// still the data path ([`Self::live`]): the taken handle refuses reads and
 /// writes, and everything addressed by path keeps working on it, because
 /// `Session::delete` deletes through the storage it took.
 ///
@@ -668,7 +668,7 @@ impl PieceStore {
 
     /// Which store of this torrent's this is. Moves on a restart out of
     /// error, which is when librqbit forgets every hold-back it was told --
-    /// see `Inner::epoch`.
+    /// see [`Inner::epoch`].
     pub fn epoch(&self) -> u64 {
         self.inner.epoch()
     }
@@ -684,8 +684,8 @@ impl PieceStore {
     /// done here: the piece is queued for this store's committer thread and
     /// this returns. Until the rename lands the piece is read from its
     /// staged copy, which is the newest copy and the one the hash check has
-    /// just read whole; see `Inner::run_commit` for what the committer
-    /// does and `Inner::fail_commit` for what happens when it cannot.
+    /// just read whole; see [`Inner::run_commit`] for what the committer
+    /// does and [`Inner::fail_commit`] for what happens when it cannot.
     ///
     /// The held set counts the piece from here -- it is on the volume, and
     /// it is what a read gets -- but the durable record does not move until
@@ -2051,7 +2051,7 @@ impl TorrentStorage for PieceStore {
     /// the store's committer, off the path the waiting reader is parked
     /// on. A commit that fails after this returned is raised at the next
     /// write or completion librqbit asks of the store, which is fatal to
-    /// the torrent there (`Inner::fail_commit`); a crash before the rename
+    /// the torrent there ([`Inner::fail_commit`]); a crash before the rename
     /// leaves a staged copy the next `init` does not claim, so the resume
     /// bitfield's bit for it is cleared by [`TorrentStorage::has_piece`].
     fn on_piece_completed(
@@ -2094,7 +2094,7 @@ impl TorrentStorage for PieceStore {
     /// pauses a torrent, and how its initial check hands over to the paused
     /// state when it is done.
     ///
-    /// The successor is another handle over the same `Inner`: it keeps the
+    /// The successor is another handle over the same [`Inner`]: it keeps the
     /// directory, the layout, the record of which files have been removed --
     /// `Session::delete` takes the storage and then deletes *through what it
     /// got back*, so a successor that had forgotten where the pieces are

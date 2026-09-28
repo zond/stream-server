@@ -241,7 +241,7 @@ pub fn initial_window_progress(
     )
 }
 
-/// `initial_window_progress` (test-only) with `landed_bytes(piece)` saying how many
+/// `initial_window_progress` (test builds only) with `landed_bytes(piece)` saying how many
 /// bytes of a piece the window touches have arrived but not yet verified,
 /// for a piece `have_piece` answers `false` for. Clipped to the file's part
 /// of the piece, like a whole piece is.

@@ -226,7 +226,7 @@ fn is_session_artifact(name: &str) -> bool {
 /// stop producing, wearing the clothes of a previous release.
 ///
 /// So it goes, once, at launch: what is not another component's directory
-/// (`NOT_OURS`) and not a session artifact (`is_session_artifact`) is a
+/// ([`NOT_OURS`]) and not a session artifact ([`is_session_artifact`]) is a
 /// previous release's data.
 ///
 /// **It runs where the session's own data lives**, so the exemptions are

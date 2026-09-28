@@ -32,6 +32,13 @@ strip = true
 [workspace.lints.rust]
 warnings = "deny"
 
+# These crates are read with their private items: `cargo doc
+# --document-private-items` is the view the docs are written for, and CI
+# builds it with every warning denied, so a link to a private item is
+# checked there. The public view would only turn those links into text.
+[workspace.lints.rustdoc]
+private_intra_doc_links = "allow"
+
 [workspace.lints.clippy]
 correctness = { level = "deny", priority = -1 }
 suspicious = { level = "deny", priority = -1 }

@@ -6,7 +6,7 @@
 //! what we have committed for sharing and what the session has moved. Both
 //! rows are readings of a store, and there are two stores: the piece store
 //! keyed by info hash ([`enginefs::piece_store`]) and the proxy cache keyed
-//! by entity (`crate::proxy_cache`). This module is the one interface over
+//! by entity ([`crate::proxy_cache`]). This module is the one interface over
 //! them.
 //!
 //! # One call, and the URL is what dispatches it
@@ -17,7 +17,7 @@
 //! `/{infoHash}/{fileIdx}` (or `/stream/{infoHash}/{fileIdx}`), a proxied one
 //! is `/proxy/?d=...`, and both of those shapes are this crate's own routes.
 //! `{fileIdx}` includes `-1`, the auto-select this server's own stream and
-//! stats routes resolve with the `f=` filters: see `StreamFile`.
+//! stats routes resolve with the `f=` filters: see [`StreamFile`].
 //! Each implementation recognises its own and no other, which is why a URL
 //! **neither** recognises is not an error: it is a stream this server does not
 //! hold -- a file:// path, another server's URL, an addon's direct link the
@@ -230,10 +230,10 @@ fn base() -> Url {
 #[async_trait::async_trait]
 impl StreamStore for EngineFS {
     /// `/{infoHash}/{fileIdx}` and its `/stream/` alias -- the two paths
-    /// `crate::stream_routes` serves a torrent's bytes on.
+    /// [`crate::stream_routes`] serves a torrent's bytes on.
     ///
     /// `None` for a hash no engine exists for, and for a `-1` that names
-    /// no file of it (see `StreamFile`, which is where `-1` is resolved).
+    /// no file of it (see [`StreamFile`], which is where `-1` is resolved).
     /// **A peek**: it creates no engine and starts no magnet add, and it
     /// does not count as a poll, so a panel asking every second cannot keep
     /// a torrent out of the idle sweep by looking at it.

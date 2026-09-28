@@ -8,7 +8,7 @@
 //! server is not it: it keeps no record of its own.
 //!
 //! **The embedder is the authority.** It hands the set in at startup
-//! (`crate::BackendEngineFS::boot`), because the one client that pins --
+//! ([`crate::BackendEngineFS::boot`]), because the one client that pins --
 //! the app this is embedded in -- already keeps that list as the downloads
 //! the user asked for, and two records of one fact are two records that can
 //! disagree. Its list is the one the user sees and the one they act on; a
@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// What the embedder says is pinned: info hash to the file indices of that
 /// torrent it wants kept. Lowercase hashes are what every reader compares
-/// against, and `crate::BackendEngineFS::boot` lowercases on the way in.
+/// against, and [`crate::BackendEngineFS::boot`] lowercases on the way in.
 pub type PinSet = BTreeMap<String, Vec<usize>>;
 
 /// The process-wide "the pin set is unknown" condition, set once at boot

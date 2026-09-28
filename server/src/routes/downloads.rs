@@ -62,7 +62,7 @@ pub struct DownloadInfo {
     /// engine's error for a failed magnet add or a torrent the backend put
     /// in an error state (a client-safe message either way -- the
     /// backend's own text names server paths and stays in the log),
-    /// `DORMANT_DOWNLOAD_ERROR` for a pin whose torrent the backend does
+    /// [`DORMANT_DOWNLOAD_ERROR`] for a pin whose torrent the backend does
     /// not have. `null` for a healthy download.
     pub error: Option<String>,
 }

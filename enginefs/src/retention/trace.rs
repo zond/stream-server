@@ -125,7 +125,7 @@ pub fn name<K: Debug>(key: &K, backing: Option<&Backing>) -> String {
 }
 
 /// One line for one pass over the entity called `name` ([`name`]), at most
-/// one per `INTERVAL` as of `now` -- the pass's own clock, never read here.
+/// one per [`INTERVAL`] as of `now` -- the pass's own clock, never read here.
 pub fn pass(name: &str, now: Instant, sample: Pass<'_>) {
     let held = sample.held_behind + sample.held_ahead;
     let (fetched, verified) = sample

@@ -127,7 +127,7 @@ pub struct ServerSettings {
     /// else for a download to be.
     ///
     /// Set through `POST /settings` with an absolute path
-    /// (`prepare_torrent_data_root`: trimmed, created if missing, must be
+    /// ([`prepare_torrent_data_root`]: trimmed, created if missing, must be
     /// writable). It is the one validated setting -- a path that cannot be
     /// used, or a value that is not a string, fails the whole update rather
     /// than being ignored. Unset in the settings file, it is

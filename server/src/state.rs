@@ -12,8 +12,8 @@ pub struct AppState {
     pub engine: Arc<EngineFS>,
     pub settings: Arc<RwLock<ServerSettings>>,
     /// `settings.json` on disk and the one way anything writes it (see
-    /// `SettingsFile`). Shared with the tracker refresher's
-    /// `TrackerStorageBridge`, which is built before this state is.
+    /// [`SettingsFile`]). Shared with the tracker refresher's
+    /// [`TrackerStorageBridge`], which is built before this state is.
     pub settings_file: Arc<SettingsFile>,
     pub base_url: String,
     pub http_addr: SocketAddr,
@@ -130,7 +130,7 @@ impl AppState {
         }
     }
 
-    /// Put the live settings on disk -- see `SettingsFile::save`.
+    /// Put the live settings on disk -- see [`SettingsFile::save`].
     pub async fn save_settings(&self) -> anyhow::Result<()> {
         self.settings_file.save(&self.settings).await
     }

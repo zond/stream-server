@@ -5,7 +5,7 @@
 //! cache. Everything between a fetched file and the player is a
 //! translation of byte ranges, and a translation stores nothing. So the
 //! one thing an archive, a disc image or a nested container is ever given
-//! is a `ByteSource`: something it can ask for bytes `a..b` of, which
+//! is a [`ByteSource`](crate::sources::ByteSource): something it can ask for bytes `a..b` of, which
 //! answers out of whatever store already holds them and fetches exactly the
 //! rest. A format that cannot say which bytes of the underlying file a
 //! member is made of is refused rather than extracted; see
@@ -14,18 +14,18 @@
 //! What is here is the seam itself and the two sources a fetcher exists
 //! for:
 //!
-//! * `ByteSource`, with `ReadHint` -- the two ways bytes are asked for,
+//! * [`ByteSource`](crate::sources::ByteSource), with [`ReadHint`](crate::sources::ReadHint) -- the two ways bytes are asked for,
 //!   an index read and a body read, which are different enough that a
 //!   source does different things for them;
-//! * `MemberView` -- several extents of several sources as one file, which
+//! * [`MemberView`](crate::sources::MemberView) -- several extents of several sources as one file, which
 //!   is what a member of a container is. It is a `ByteSource` too, so a
 //!   translator can sit on another translator's member;
-//! * `torrent::TorrentFileSource` over a torrent's file,
-//!   `proxy::ProxySource` over an HTTP entity through `/proxy`'s cache,
-//!   and `drive::DriveSource` over a file in a paired Google Drive --
+//! * [`torrent::TorrentFileSource`](crate::sources::torrent::TorrentFileSource) over a torrent's file,
+//!   [`proxy::ProxySource`](crate::sources::proxy::ProxySource) over an HTTP entity through `/proxy`'s cache,
+//!   and [`drive::DriveSource`](crate::sources::drive::DriveSource) over a file in a paired Google Drive --
 //!   which is the second of those with a header supplier that renews its
 //!   own access token, since a film outlives one;
-//! * `testing` -- a source over a `Vec<u8>` and a wrapper that counts what
+//! * `testing` (test builds only) -- a source over a `Vec<u8>` and a wrapper that counts what
 //!   was asked of the one underneath, which is how a test proves that
 //!   reading an index read no more than the index.
 

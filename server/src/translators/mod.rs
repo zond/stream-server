@@ -1,15 +1,15 @@
 //! **What a container says about the bytes inside it.**
 //!
 //! A translator reads a container's own index -- a ZIP's central
-//! directory, a TAR's headers -- off a `ByteSource` and says, for every
+//! directory, a TAR's headers -- off a [`ByteSource`](crate::sources::ByteSource) and says, for every
 //! member, either *which byte ranges of which sources hold it* or *why it
 //! cannot be served that way*. It decodes nothing, writes nothing and
 //! reads no member's data: an index is headers, directories and trailers,
 //! and the test suite counts the bytes to prove it (`Budget`).
 //!
-//! **A member is `Body::Direct` or it is refused, and there is no third
+//! **A member is [`Body::Direct`](crate::translators::Body::Direct) or it is refused, and there is no third
 //! state.** No "extract it then", no partial decode, no "serve
-//! sequentially but refuse seeks": a compressed film is a `Refusal` with
+//! sequentially but refuse seeks": a compressed film is a [`Refusal`](crate::translators::Refusal) with
 //! a sentence the player shows. That is the decision the whole design
 //! rests on -- only the thing that downloads a file may store it -- and it
 //! is why there is no extraction cache. See
@@ -165,7 +165,7 @@ impl Index {
 /// The design sketch wrote this as an associated function taking the
 /// sources alone. It takes `&self` instead, because that is what makes the
 /// trait object-safe: the route has a format prefix in the URL and needs
-/// *a* translator for it at run time (`crate::routes::archive::Format`),
+/// *a* translator for it at run time ([`crate::routes::archive::Format`]),
 /// which a static method cannot give it. Every implementation is a
 /// zero-sized unit struct, so `&self` costs nothing.
 #[async_trait]

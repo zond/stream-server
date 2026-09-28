@@ -7,8 +7,8 @@
 //! tool will write them for you.
 //!
 //! The readers here are the other half of the bargain the module makes.
-//! `CountingImage` records every range that was read so a test can assert
-//! that the file's own bytes were never among them, and `SparseImage`
+//! [`CountingImage`](crate::images::fixtures::CountingImage) records every range that was read so a test can assert
+//! that the file's own bytes were never among them, and [`SparseImage`](crate::images::fixtures::SparseImage)
 //! reports a length far larger than the bytes it holds, which is how a
 //! multi-gibibyte file is tested in a few kilobytes.
 

@@ -188,7 +188,7 @@ impl StoreRegistry {
     ///
     /// **Only for a caller that has already had the backend forget the
     /// pieces** and is holding that claim across this call -- the interlock
-    /// `crate::retention::take_claimed` imposes, and the one way into the
+    /// [`crate::retention::take_claimed`] imposes, and the one way into the
     /// store's files there is. Refused outright while the store is under its
     /// initial check, asked at this instant and not earlier: the check
     /// reads every piece it means to claim, and a piece unlinked from under
@@ -303,7 +303,7 @@ impl StoreRegistry {
     /// it was told. That is the whole of what this is read for, so it must
     /// move across the *fresh* store rather than count the seeds of each:
     /// a per-store count starts over with the store, and a reader comparing
-    /// it would be told nothing had happened. See `Self::insert`.
+    /// it would be told nothing had happened. See [`Self::insert`].
     pub fn epoch(&self, info_hash: &str) -> Option<u64> {
         self.live(info_hash).map(|inner| inner.epoch())
     }

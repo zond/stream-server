@@ -61,7 +61,7 @@
 //! displaced by time passing.
 //!
 //! "Least recently used" is an ordering, and it is kept as one -- a
-//! monotonic counter stamped on the map's own uses (`Usage`) -- rather
+//! monotonic counter stamped on the map's own uses ([`Usage`]) -- rather
 //! than as an instant that could be compared against a duration.
 
 use super::{Body, Index, Member};

@@ -193,11 +193,11 @@ pub struct ServerConfig {
     /// fixed, forwardable port sets [`TorrentListenPort::Fixed`] itself.
     pub torrent_listen_port: TorrentListenPort,
     /// Where the LAN media listener binds when it runs: a second HTTP
-    /// listener serving `lan_media_routes` and nothing else, so a
+    /// listener serving [`lan_media_routes`] and nothing else, so a
     /// Chromecast or other receiver on the local network can fetch the bytes
     /// of what this device is playing while the control API -- and every
     /// route that creates or fetches anything -- stays on the loopback
-    /// listener only (see `crate::lan_media`).
+    /// listener only (see [`crate::lan_media`]).
     ///
     /// `None` -- the default -- means there is no LAN listener at all and
     /// [`ServerHandle::set_lan_media`] has nothing to start. `Some(addr)`
@@ -404,7 +404,7 @@ impl ServerHandle {
     /// addon that names no file leaves the choice to this server, so the
     /// file the length is about is the one the stream route resolved it
     /// to, by the same rule (`routes::compat::resolve_file_idx`, through
-    /// `stream_numbers::StreamFile`). Reported against the addon's index
+    /// [`stream_numbers::StreamFile`]). Reported against the addon's index
     /// instead, a length for such a stream never arrived at all -- and
     /// those are most streams.
     pub async fn note_duration(
@@ -818,7 +818,7 @@ impl ServerHandle {
     /// demuxer has already ended its own read, so the close finds nothing
     /// live and answers 0, which is the outcome to want. Zero is an ordinary
     /// answer anyway -- the player may already have finished -- and closing
-    /// twice is harmless. See `crate::proxy_streams` for what this does
+    /// twice is harmless. See [`crate::proxy_streams`] for what this does
     /// not end: a demuxer wedged on something other than the read.
     pub fn close_proxy_streams(&self, token: &str) -> usize {
         self.state.proxy_streams.close(token)
@@ -952,9 +952,9 @@ impl ServerHandle {
         self.state.proxy_streams.live()
     }
 
-    /// Start or stop the LAN media listener (see `crate::lan_media`): a
+    /// Start or stop the LAN media listener (see [`crate::lan_media`]): a
     /// second HTTP listener on [`ServerConfig::lan_media_addr`] serving
-    /// `lan_media_routes` and nothing else, for handing the bytes of what
+    /// [`lan_media_routes`] and nothing else, for handing the bytes of what
     /// this device already plays to a Chromecast or other receiver on the
     /// local network. Returns the address it is bound to afterwards --
     /// `Some` after a successful start, `None` after a stop.
@@ -973,7 +973,7 @@ impl ServerHandle {
     /// free, so nothing new can reach the LAN surface -- but a response that
     /// was already streaming keeps running to its end on its own connection
     /// task. Stopping ends new fetches, not the fetch in progress; see
-    /// `lan_media::LanMedia::stop` for why, and for what stopping the bytes
+    /// [`lan_media::LanMedia::stop`] for why, and for what stopping the bytes
     /// too would cost. The loopback listener and every request in flight on
     /// it are untouched.
     pub fn set_lan_media(&self, enabled: bool) -> anyhow::Result<Option<SocketAddr>> {

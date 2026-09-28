@@ -12,9 +12,9 @@
 //!   the piece store's rule that `None` is "nobody told me" and not an empty
 //!   set), the launch sweep keeps what it names, and the retention owner
 //!   answers `keeps_everything` from it
-//!   (`crate::proxy_retention::ProxyRetention::set_pins`).
+//!   ([`crate::proxy_retention::ProxyRetention::set_pins`]).
 //! * **A filler** -- something that fetches the bytes when no player is
-//!   asking for them (`Filler`). It is a quiet reader over the same
+//!   asking for them ([`Filler`]). It is a quiet reader over the same
 //!   `ProxySource` a player would read through, walked from the first byte
 //!   to the last: a range the disk holds is served from the disk and a hole
 //!   is one narrowed, conditional fetch that lands in the cache, which is
