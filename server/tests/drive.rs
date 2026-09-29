@@ -272,6 +272,7 @@ fn fixture_on(
         resolve_dht_bootstrap_names: false,
         use_public_trackers: false,
         enable_local_service_discovery: false,
+        enable_dht: false,
         drive_refresh_endpoint: Some(refresh),
         drive_api_base: Some(api_base),
         ..stream_server::ServerConfig::default()
@@ -518,6 +519,7 @@ fn a_build_with_no_pairing_service_refuses_by_name() -> anyhow::Result<()> {
         resolve_dht_bootstrap_names: false,
         use_public_trackers: false,
         enable_local_service_discovery: false,
+        enable_dht: false,
         ..stream_server::ServerConfig::default()
     })?;
     let error = handle

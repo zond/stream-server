@@ -119,6 +119,7 @@ fn no_debug_line_carries_a_callers_credentials() -> anyhow::Result<()> {
         resolve_dht_bootstrap_names: false,
         use_public_trackers: false,
         enable_local_service_discovery: false,
+        enable_dht: false,
         pins: Some(Default::default()),
         proxy_pins: Some(Vec::new()),
         ..stream_server::ServerConfig::default()

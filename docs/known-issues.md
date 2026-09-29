@@ -22,11 +22,6 @@ carried in below.
 
 - **The piece-commit failure paths are unmeasured on a device** -- see
   *Readable before durable* below.
-- **xtremio's downloads test is not hermetic** (found 2026-09-29): its
-  embedded server announces the test infohash to the public trackers and
-  the DHT, and real peers dial in. The test passes regardless, but it
-  reaches the internet; the test server should start with public trackers,
-  DHT, LSD and UPnP off.
 - **A stale-looking name, kept on purpose**:
   `enginefs/src/retention/scenario.rs`'s `CONTAINER_METADATA_LOOKAHEAD` and
   `PLAYBACK_LOOKAHEAD` keep the field's numbers under the names of constants
@@ -234,6 +229,13 @@ process.
 
 ## Closed, one line each
 
+- 2026-09-29 -- **Offline tests reached the DHT**: `resolve_dht_bootstrap_names`
+  off stopped only this server's own resolution, and librqbit resolved the
+  bootstrap names itself and joined, so strangers looked a test's info hash
+  up and dialled in (xtremio's downloads test, and this repository's own
+  offline configs). `ServerConfig::enable_dht` is the default for
+  `btEnableDht`, off in every offline test config. Test:
+  `a_test_does_not_announce_itself_on_the_local_network`.
 - 2026-09-29 -- **A delete could say it freed nothing when it did**: the
   pieces held were counted after the pin came off, and a tick in between
   (the torrent stopped, the unpinned file's pieces taken as slack) left

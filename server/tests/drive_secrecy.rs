@@ -91,6 +91,7 @@ fn a_drive_grant_never_reaches_the_log() -> anyhow::Result<()> {
         resolve_dht_bootstrap_names: false,
         use_public_trackers: false,
         enable_local_service_discovery: false,
+        enable_dht: false,
         drive_refresh_endpoint: Some(url::Url::parse(&format!("http://{service}/refresh"))?),
         ..stream_server::ServerConfig::default()
     })?;

@@ -241,6 +241,16 @@ pub struct ServerConfig {
     /// settings report goes on describing what the session actually does.
     /// Defaults to `true`; tests set it false.
     pub enable_local_service_discovery: bool,
+    /// The default for `btEnableDht`, the way
+    /// [`Self::enable_local_service_discovery`] is `btEnableLsd`'s.
+    ///
+    /// [`Self::resolve_dht_bootstrap_names`] off does not keep the DHT off
+    /// the network: it stops this server's own resolution, and librqbit
+    /// then resolves the bootstrap names itself and joins the DHT, so a
+    /// test's info hash was looked up by strangers and they dialled in. An
+    /// embedder that must make no outbound connection -- a test -- turns
+    /// this off. Defaults to `true`.
+    pub enable_dht: bool,
     /// Where this embedder's Google Drive pairing service is: the `POST`
     /// that turns a refresh token into an access token, because the OAuth
     /// client secret lives there and never on the device (see
@@ -281,6 +291,7 @@ impl Default for ServerConfig {
             resolve_dht_bootstrap_names: true,
             use_public_trackers: true,
             enable_local_service_discovery: true,
+            enable_dht: true,
             drive_refresh_endpoint: None,
             drive_api_base: None,
         }
@@ -1274,6 +1285,7 @@ pub async fn run(
         // starts on a config directory of its own, so the default is the
         // whole story there.
         bt_enable_lsd: cfg.enable_local_service_discovery,
+        bt_enable_dht: cfg.enable_dht,
         ..routes::system::ServerSettings::default()
     };
 

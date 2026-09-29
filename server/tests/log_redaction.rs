@@ -66,6 +66,7 @@ fn a_caller_supplied_url_is_logged_as_its_origin_only() -> anyhow::Result<()> {
         init_logging: true,
         resolve_dht_bootstrap_names: false,
         use_public_trackers: false,
+        enable_dht: false,
         pins: Some(Default::default()),
         ..stream_server::ServerConfig::default()
     })?;

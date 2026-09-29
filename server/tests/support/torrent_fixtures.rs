@@ -34,6 +34,7 @@ pub fn offline_config() -> ServerConfig {
         // concurrent runs of a fixture built from the same bytes (the same
         // info hash) find each other and feed each other pieces.
         enable_local_service_discovery: false,
+        enable_dht: false,
         // An embedder that keeps a pin record and has nothing in it yet.
         // `None` is not the same thing -- it is "nobody said", which keeps
         // every torrent's data and reports it all as pinned -- and it has a

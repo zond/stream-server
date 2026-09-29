@@ -67,6 +67,13 @@ fn a_test_does_not_announce_itself_on_the_local_network() -> anyhow::Result<()> 
         !handle.settings()?.bt_enable_lsd,
         "the offline config left local service discovery on"
     );
+    // Nor on the DHT: with the bootstrap names left to librqbit, it
+    // resolved them itself and joined, and strangers looked the test's info
+    // hash up and dialled in.
+    assert!(
+        !handle.settings()?.bt_enable_dht,
+        "the offline config left the DHT on"
+    );
 
     handle.shutdown()?;
     Ok(())
@@ -78,6 +85,7 @@ fn a_test_does_not_announce_itself_on_the_local_network() -> anyhow::Result<()> 
 #[test]
 fn the_stock_config_resolves_dht_bootstrap_names() {
     assert!(ServerConfig::default().resolve_dht_bootstrap_names);
+    assert!(ServerConfig::default().enable_dht);
     assert!(ServerConfig::default().use_public_trackers);
     // A viewer on a home network is exactly who local discovery is for:
     // the other device playing the same film is one multicast away, and no
@@ -1000,8 +1008,9 @@ fn post_settings_reports_which_bt_settings_took_effect() -> anyhow::Result<()> {
             "btDownloadSpeedHardLimit": 1_000_000.0,
             "btMaxConnections": 400,
             // Session-start: read once when the session opened, so a change
-            // waits for the next start.
-            "btEnableDht": false,
+            // waits for the next start. On, because the offline config
+            // starts it off (`ServerConfig::enable_dht`).
+            "btEnableDht": true,
         }))
         .send()?
         .error_for_status()?
