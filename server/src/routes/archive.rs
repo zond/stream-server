@@ -852,6 +852,16 @@ async fn session_for(
         tracing::warn!(%info_hash, archive = path, %refusal, "the set is not all there");
         Box::new(refusal_response(&refusal))
     })?;
+    // Held before the first volume opens: the opens below are what would
+    // move the live entity, and the hold is what makes an open of the
+    // second volume beside the first rather than a move off it.
+    let hold = (paths.len() > 1).then(|| {
+        let files = paths
+            .iter()
+            .filter_map(|volume| siblings.iter().position(|name| name == volume))
+            .collect();
+        state.engine.live().hold_set(info_hash, files)
+    });
     let mut sources: Vec<Arc<dyn ByteSource>> = Vec::with_capacity(paths.len());
     for volume in &paths {
         let source = TorrentFileSource::open(state.engine.clone(), info_hash, volume)
@@ -881,6 +891,7 @@ async fn session_for(
             SessionSources::Torrent {
                 info_hash: info_hash.to_string(),
                 paths,
+                hold,
             },
             index,
             None,
@@ -896,7 +907,9 @@ async fn sources_for(
 ) -> Result<Vec<Arc<dyn ByteSource>>, Box<Response>> {
     match session.sources() {
         SessionSources::Held(sources) => Ok(sources.clone()),
-        SessionSources::Torrent { info_hash, paths } => {
+        SessionSources::Torrent {
+            info_hash, paths, ..
+        } => {
             // Every volume, in the order the index was read in: an
             // `Extent`'s `source` indexes this list.
             let mut sources: Vec<Arc<dyn ByteSource>> = Vec::with_capacity(paths.len());

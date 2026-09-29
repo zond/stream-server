@@ -43,6 +43,7 @@
 //! `String` per ask would be an allocation per unlink.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::retention::sessions::PlaySessions;
 
@@ -90,6 +91,9 @@ pub struct Live {
     /// requests, and decide what is shared ([`PlaySessions`]). Here so that
     /// everything that holds the cell holds them too.
     sessions: PlaySessions,
+    /// **Files of one torrent that are one thing to watch**: the volumes of
+    /// a RAR set, read by one archive session ([`Live::hold_set`]).
+    sets: VolumeSets,
 }
 
 impl Default for Live {
@@ -97,6 +101,29 @@ impl Default for Live {
         Self {
             cell: tokio::sync::watch::Sender::new(None),
             sessions: PlaySessions::default(),
+            sets: VolumeSets::default(),
+        }
+    }
+}
+
+/// The volume sets held now, each under the id its hold removes it by.
+#[derive(Debug, Default)]
+struct VolumeSets {
+    next: std::sync::atomic::AtomicU64,
+    held: std::sync::Mutex<Vec<(u64, String, Vec<usize>)>>,
+}
+
+/// One volume set held for as long as this lives ([`Live::hold_set`]).
+#[derive(Debug)]
+pub struct SetHold {
+    live: Arc<Live>,
+    id: u64,
+}
+
+impl Drop for SetHold {
+    fn drop(&mut self) {
+        if let Ok(mut held) = self.live.sets.held.lock() {
+            held.retain(|(id, _, _)| *id != self.id);
         }
     }
 }
@@ -110,6 +137,47 @@ impl Live {
     /// The play sessions: which files the viewer's players are playing.
     pub fn sessions(&self) -> &PlaySessions {
         &self.sessions
+    }
+
+    /// Holds `files` of `info_hash` as **one thing to watch** until the
+    /// returned hold is dropped: the volumes of an archive read across
+    /// them, which a player sees as one film.
+    ///
+    /// Without it each volume is an entity of its own, and an archive
+    /// session opens every one of them -- to read the index, and again for
+    /// each body -- so the cell moved on every open, and every move's slack
+    /// pass took the volumes it had just left and the ones about to be
+    /// read, index reads and all. With it, an open of one volume while
+    /// another of the set is live is no move ([`Self::together`], the
+    /// caller's aside rule), and every volume of the live set is live to
+    /// the retention passes: each keeps its window around wherever its
+    /// reads are, and none is slack while the set is being watched.
+    pub fn hold_set(self: &Arc<Self>, info_hash: &str, files: Vec<usize>) -> SetHold {
+        let id = self
+            .sets
+            .next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut held) = self.sets.held.lock() {
+            held.push((id, info_hash.to_lowercase(), files));
+        }
+        SetHold {
+            live: self.clone(),
+            id,
+        }
+    }
+
+    /// Whether `a` and `b` of `info_hash` are in one held set: two volumes
+    /// of one archive being read as one film. A file is together with
+    /// itself.
+    pub fn together(&self, info_hash: &str, a: usize, b: usize) -> bool {
+        if a == b {
+            return true;
+        }
+        self.sets.held.lock().is_ok_and(|held| {
+            held.iter().any(|(_, hash, files)| {
+                hash == info_hash && files.contains(&a) && files.contains(&b)
+            })
+        })
     }
 
     /// The server saw a stream open on `to`.

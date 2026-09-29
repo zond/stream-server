@@ -2187,7 +2187,12 @@ impl<H: TorrentHandle> Engine<H> {
         // and delete under the stream. See
         // [`Retention::readers_and_opens_of`].
         let (readers, opens) = self.retention.readers_and_opens_of(&file_idx);
-        if live.file_of(&self.info_hash) == Some(file_idx) || readers > 0 {
+        // A volume of the archive being watched is live with the rest of
+        // its set ([`Live::hold_set`]), read or not.
+        let in_live_set = live
+            .file_of(&self.info_hash)
+            .is_some_and(|playing| self.live.together(&self.info_hash, playing, file_idx));
+        if in_live_set || readers > 0 {
             Mode::Live
         } else {
             // The count of opens this reading was taken beside, so the pass

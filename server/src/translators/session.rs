@@ -453,6 +453,12 @@ pub enum SessionSources {
     Torrent {
         info_hash: String,
         paths: Vec<String>,
+        /// The volumes held as **one thing to watch** for the session's
+        /// life (`enginefs::retention::live::Live::hold_set`): without it
+        /// every volume open moved the live entity and each move's slack
+        /// pass took the volumes around it. `None` for a set of one file,
+        /// which needs no holding.
+        hold: Option<enginefs::retention::live::SetHold>,
     },
 }
 
@@ -697,6 +703,7 @@ mod tests {
             SessionSources::Torrent {
                 info_hash: info_hash.to_string(),
                 paths: vec!["film.part1.rar".into(), "film.part2.rar".into()],
+                hold: None,
             },
             Index {
                 members: Vec::new(),

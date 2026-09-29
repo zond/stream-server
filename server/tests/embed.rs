@@ -5039,26 +5039,21 @@ fn a_stored_film_across_three_rar_volumes_in_a_torrent_is_served_by_range() -> a
 /// go of never comes back and a read of it parks.
 ///
 /// Each volume of the set is a `TorrentFileSource` that registers a stream
-/// on its own file, and so moves the liveness cell to itself; the switch's
-/// slack drop then passes over every other volume's entity as slack. What a
-/// correct server does is keep what the archive's reads have touched while
-/// the archive is the thing being read: the index read across all three
-/// volumes, and the member bytes on both sides of a boundary.
-///
-/// Measured 2026-09-29 against 3ac90f6: 17 pieces seeded, 1 left (the
-/// piece the first and second volumes share) before the body delivered a
-/// byte, and the range itself then parked. The index's sources are dropped
-/// once it is read (`routes::archive::session_for`) and `sources_for` opens
-/// every volume again for the body, in order; each open moves the cell
-/// past a volume with no reader yet (`EngineFS::switch_to`), and the
-/// switch task's `Engine::drop_slack` takes it as slack.
+/// on its own file. Before the session held its volumes as one set
+/// (`Live::hold_set`), each of those opens moved the liveness cell to
+/// itself and the switch's slack drop passed over every other volume as
+/// slack: measured 2026-09-29 against 3ac90f6, 17 pieces seeded and 1 left
+/// (the piece the first and second volumes share) before the body delivered
+/// a byte, and the range itself then parked. What a correct server does is
+/// keep what the archive's reads have touched while the archive is the
+/// thing being read: the index read across all three volumes, and the
+/// member bytes on both sides of a boundary.
 ///
 /// The one window this spends, `SETTLE`, is the one the "nothing is taken"
 /// claim is measured over: two reconcile intervals, so a tick's pass and the
 /// switch's both fall inside it.
 #[cfg(feature = "rar")]
 #[test]
-#[ignore = "known issue: an archive read across the volumes of a torrent deletes the volumes it has read (docs/known-issues.md)"]
 fn a_rar_set_read_across_its_volumes_keeps_the_volumes_it_read() -> anyhow::Result<()> {
     const PIECE: u64 = 16 * 1024;
     const SETTLE: std::time::Duration =

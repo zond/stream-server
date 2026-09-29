@@ -3757,6 +3757,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     async fn switch_to(&self, info_hash: &str, file_idx: usize) -> Option<usize> {
         let engine = self.peek_engine(info_hash).await;
         let beside = match self.live.reading().file_of(info_hash) {
+            // Another volume of the archive being watched: one film, so no
+            // move -- whether or not a read of the live volume is open.
+            Some(playing) if self.live.together(info_hash, playing, file_idx) => {
+                (playing != file_idx).then_some(playing)
+            }
             Some(playing) if playing != file_idx => engine
                 .is_some_and(|engine| engine.retention.readers_of(&playing) > 0)
                 .then_some(playing),
@@ -18286,6 +18291,53 @@ mod tests {
                 *counters.last_hot_file.lock().unwrap()
             ),
             (Some(1), None)
+        );
+    }
+
+    /// **The volumes of an archive being read are one film.** An open of
+    /// another volume of a held set is no move, with no read of the live
+    /// volume open -- which is exactly the state between an archive
+    /// session's index reads and its body -- and keeps the live volume in
+    /// the want-set beside it. Without the set the same open is a move, and
+    /// every move's slack pass took the volumes around it. Once the set is
+    /// let go (the session ended), the rule is the ordinary one again.
+    #[tokio::test]
+    async fn a_volume_of_a_held_set_opens_beside_the_live_one() {
+        let (enginefs, counters) = test_enginefs_with_file_count(3);
+        let hold = enginefs.live().hold_set(TEST_HASH, vec![0, 1]);
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        enginefs.on_stream_end(TEST_HASH, 0).await;
+
+        enginefs.on_stream_start(TEST_HASH, 1).await;
+        assert_eq!(
+            enginefs.live().reading().file_of(TEST_HASH),
+            Some(0),
+            "the second volume took the cell off the first"
+        );
+        assert_eq!(
+            (
+                *counters.last_active_file.lock().unwrap(),
+                *counters.last_hot_file.lock().unwrap()
+            ),
+            (Some(0), Some(1)),
+            "the second volume's selection left the first out"
+        );
+        enginefs.on_stream_end(TEST_HASH, 1).await;
+
+        // A file outside the set is still a move.
+        enginefs.on_stream_start(TEST_HASH, 2).await;
+        assert_eq!(enginefs.live().reading().file_of(TEST_HASH), Some(2));
+        enginefs.on_stream_end(TEST_HASH, 2).await;
+
+        drop(hold);
+        assert!(!enginefs.live().together(TEST_HASH, 0, 1));
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        enginefs.on_stream_end(TEST_HASH, 0).await;
+        enginefs.on_stream_start(TEST_HASH, 1).await;
+        assert_eq!(
+            enginefs.live().reading().file_of(TEST_HASH),
+            Some(1),
+            "a set let go holds nothing together"
         );
     }
 
