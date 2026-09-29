@@ -4876,6 +4876,23 @@ fn rar_set_server(
     src: &std::path::Path,
     keep: &[usize],
 ) -> anyhow::Result<(ServerHandle, String, String)> {
+    // What this test is about is which bytes a member maps to, not
+    // retention, and it asks for three volumes' worth of ranges: it needs
+    // the pin set unknown, or it is racing a two-second timer
+    // (`fixture_pins`).
+    rar_set_server_under(config_dir, cache_dir, src, keep, seeded_fixture_config())
+}
+
+/// [`rar_set_server`] under `config`: what a test about retention starts,
+/// with the pin set it is about.
+#[cfg(feature = "rar")]
+fn rar_set_server_under(
+    config_dir: &std::path::Path,
+    cache_dir: &std::path::Path,
+    src: &std::path::Path,
+    keep: &[usize],
+    config: ServerConfig,
+) -> anyhow::Result<(ServerHandle, String, String)> {
     let film = rar_fixtures::signposted(RAR_SET_FILM_LEN);
     let volumes = rar_fixtures::rar5_volumes(&[(RAR_SET_MEMBER, &film[..])], RAR_SET_VOLUME_BYTES);
     assert_eq!(volumes.len(), 3, "the fixture is a three-volume set");
@@ -4896,11 +4913,7 @@ fn rar_set_server(
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.join("config")),
         cache_dir: Some(cache_root.clone()),
-        // What this test is about is which bytes a member maps to, not
-        // retention, and it asks for three volumes' worth of ranges: it
-        // needs the pin set unknown, or it is racing a two-second timer
-        // (`fixture_pins`).
-        ..seeded_fixture_config()
+        ..config
     })?;
     // After the start, never before (see `seed_piece_store_pieces`).
     seed_piece_store(&cache_root, &torrent, &content);
@@ -5011,6 +5024,146 @@ fn a_stored_film_across_three_rar_volumes_in_a_torrent_is_served_by_range() -> a
         "the translated path wrote under the cache root: {:?}",
         archive_extractions(&cache_root)
     );
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// **Reading a RAR set across its volumes keeps the volumes it has read.**
+///
+/// The same three-volume set as above, under a **known** pin set that names
+/// nothing -- what xtremio publishes -- instead of the unknown one every
+/// other RAR test runs under, which keeps every byte whatever retention
+/// decides (`fixture_pins`). Seeded and offline, so a piece the server lets
+/// go of never comes back and a read of it parks.
+///
+/// Each volume of the set is a `TorrentFileSource` that registers a stream
+/// on its own file, and so moves the liveness cell to itself; the switch's
+/// slack drop then passes over every other volume's entity as slack. What a
+/// correct server does is keep what the archive's reads have touched while
+/// the archive is the thing being read: the index read across all three
+/// volumes, and the member bytes on both sides of a boundary.
+///
+/// Measured 2026-09-29 against 3ac90f6: 17 pieces seeded, 1 left (the
+/// piece the first and second volumes share) before the body delivered a
+/// byte, and the range itself then parked. The index's sources are dropped
+/// once it is read (`routes::archive::session_for`) and `sources_for` opens
+/// every volume again for the body, in order; each open moves the cell
+/// past a volume with no reader yet (`EngineFS::switch_to`), and the
+/// switch task's `Engine::drop_slack` takes it as slack.
+///
+/// The one window this spends, `SETTLE`, is the one the "nothing is taken"
+/// claim is measured over: two reconcile intervals, so a tick's pass and the
+/// switch's both fall inside it.
+#[cfg(feature = "rar")]
+#[test]
+#[ignore = "known issue: an archive read across the volumes of a torrent deletes the volumes it has read (docs/known-issues.md)"]
+fn a_rar_set_read_across_its_volumes_keeps_the_volumes_it_read() -> anyhow::Result<()> {
+    const PIECE: u64 = 16 * 1024;
+    const SETTLE: std::time::Duration =
+        std::time::Duration::from_secs(2 * enginefs::reconcile::RECONCILE_INTERVAL.as_secs() + 1);
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let (handle, base, info_hash) = rar_set_server_under(
+        config_dir.path(),
+        cache_dir.path(),
+        src.path(),
+        &[1, 2, 3],
+        offline_config(),
+    )?;
+    let cache_root = resolved(&cache_dir.path().join("cache"));
+    let film = rar_fixtures::signposted(RAR_SET_FILM_LEN);
+    let member = format!("{base}/rar/stream/torrent:{info_hash}%2Ffilm.part1.rar/{RAR_SET_MEMBER}");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    // Which pieces each volume sits on, for the report.
+    let stats = serde_json::to_value(handle.engine_stats(&info_hash, &[])?)?;
+    let volume_pieces: Vec<(String, std::ops::Range<u64>)> = (1..=3)
+        .map(|number| {
+            let name = format!("film.part{number}.rar");
+            let idx = file_index(&stats, &name);
+            let offset = stats["files"][idx]["offset"].as_u64().expect("offset");
+            let length = stats["files"][idx]["length"].as_u64().expect("length");
+            (name, offset / PIECE..(offset + length).div_ceil(PIECE))
+        })
+        .collect();
+    let held_now = || held_piece_indices(&cache_root, &info_hash);
+    let seeded = held_now();
+    eprintln!("volumes: {volume_pieces:?}");
+    eprintln!("seeded: {} pieces {seeded:?}", seeded.len());
+
+    // A range across the boundary between the first volume and the second:
+    // the index is read across all three to open it, then the member's
+    // bytes on both sides of the boundary.
+    let boundary = RAR_SET_VOLUME_BYTES;
+    let (from, to) = (boundary - 2048, boundary + 2047);
+    let across = client
+        .get(&member)
+        .header(reqwest::header::RANGE, format!("bytes={from}-{to}"))
+        .send()
+        .and_then(|response| {
+            let status = response.status();
+            response.bytes().map(|bytes| (status, bytes))
+        });
+    eprintln!(
+        "after the range across the boundary ({:?}): {:?}",
+        across
+            .as_ref()
+            .map(|(status, bytes)| (*status, bytes.len())),
+        held_now()
+    );
+
+    // The window the claim is measured over (see the doc comment).
+    let deadline = std::time::Instant::now() + SETTLE;
+    while std::time::Instant::now() < deadline && held_now() == seeded {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let after = held_now();
+    eprintln!("{SETTLE:?} later: {} pieces {after:?}", after.len());
+    let gone: Vec<u64> = seeded
+        .iter()
+        .copied()
+        .filter(|piece| !after.contains(piece))
+        .collect();
+    let gone_by_volume: Vec<(String, Vec<u64>)> = volume_pieces
+        .iter()
+        .map(|(name, range)| {
+            (
+                name.clone(),
+                gone.iter()
+                    .copied()
+                    .filter(|piece| range.contains(piece))
+                    .collect(),
+            )
+        })
+        .collect();
+
+    // And the head of the member again, which is in the first volume: with
+    // no peer, a piece that went is a read that parks.
+    let head = client
+        .get(&member)
+        .header(reqwest::header::RANGE, "bytes=1024-5119")
+        .send()
+        .and_then(|response| response.bytes());
+    eprintln!(
+        "the head again: {:?}",
+        head.as_ref().map(|bytes| bytes.len())
+    );
+
+    assert!(
+        gone.is_empty(),
+        "reading the set took {} of its {} seeded pieces off the disk, by volume: {gone_by_volume:?}",
+        gone.len(),
+        seeded.len()
+    );
+    let (status, bytes) = across?;
+    assert_eq!(status, reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(bytes.as_ref(), &film[from..=to]);
+    assert_eq!(head?.as_ref(), &film[1024..5120]);
 
     handle.shutdown()?;
     handle.join()?;
