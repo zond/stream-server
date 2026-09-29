@@ -1369,6 +1369,10 @@ pub enum TorrentListenPort {
     /// port it was not asked to.
     #[default]
     Ephemeral,
+    /// Port 0 on **127.0.0.1 alone**: a listener nothing off this machine
+    /// can reach. For a test, whose made-up torrents have no business being
+    /// served to the LAN; the other two bind every interface.
+    Loopback,
 }
 
 impl TorrentListenPort {
@@ -1376,7 +1380,16 @@ impl TorrentListenPort {
     pub fn candidates(&self) -> Vec<u16> {
         match self {
             Self::Fixed(range) => range.clone().collect(),
-            Self::Ephemeral => vec![0],
+            Self::Ephemeral | Self::Loopback => vec![0],
+        }
+    }
+
+    /// The address the listener binds: loopback for [`Self::Loopback`],
+    /// every interface (IPv6 and, dual-stack, IPv4) otherwise.
+    pub fn bind_ip(&self) -> std::net::IpAddr {
+        match self {
+            Self::Loopback => std::net::Ipv4Addr::LOCALHOST.into(),
+            Self::Fixed(_) | Self::Ephemeral => std::net::Ipv6Addr::UNSPECIFIED.into(),
         }
     }
 

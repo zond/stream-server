@@ -120,6 +120,7 @@ fn no_debug_line_carries_a_callers_credentials() -> anyhow::Result<()> {
         use_public_trackers: false,
         enable_local_service_discovery: false,
         enable_dht: false,
+        torrent_listen_port: stream_server::TorrentListenPort::Loopback,
         pins: Some(Default::default()),
         proxy_pins: Some(Vec::new()),
         ..stream_server::ServerConfig::default()

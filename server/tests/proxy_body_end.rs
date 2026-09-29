@@ -271,6 +271,7 @@ fn every_proxied_body_says_what_left_the_server() -> anyhow::Result<()> {
         resolve_dht_bootstrap_names: false,
         use_public_trackers: false,
         enable_dht: false,
+        torrent_listen_port: stream_server::TorrentListenPort::Loopback,
         pins: Some(Default::default()),
         ..stream_server::ServerConfig::default()
     })?;

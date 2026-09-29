@@ -1078,7 +1078,7 @@ impl LibrqbitBackend {
         for port in listen_port.candidates() {
             let session_opts = librqbit::SessionOptions {
                 listen: Some(librqbit::ListenerOptions {
-                    listen_addr: (std::net::Ipv6Addr::UNSPECIFIED, port).into(),
+                    listen_addr: (listen_port.bind_ip(), port).into(),
                     // Only for a fixed, repeatable port -- see
                     // `TorrentListenPort::wants_upnp_forwarding`. An
                     // ephemeral listener would ask the router for a

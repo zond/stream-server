@@ -22,6 +22,7 @@ fn a_second_start_in_one_process_rotates_nothing() -> anyhow::Result<()> {
         use_public_trackers: false,
         enable_local_service_discovery: false,
         enable_dht: false,
+        torrent_listen_port: stream_server::TorrentListenPort::Loopback,
         pins: Some(Default::default()),
         ..ServerConfig::default()
     };

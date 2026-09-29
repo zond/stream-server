@@ -35,6 +35,8 @@ pub fn offline_config() -> ServerConfig {
         // info hash) find each other and feed each other pieces.
         enable_local_service_discovery: false,
         enable_dht: false,
+        // Nor reachable: the torrent listener on loopback alone.
+        torrent_listen_port: enginefs::backend::TorrentListenPort::Loopback,
         // An embedder that keeps a pin record and has nothing in it yet.
         // `None` is not the same thing -- it is "nobody said", which keeps
         // every torrent's data and reports it all as pinned -- and it has a

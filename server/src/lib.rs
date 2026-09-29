@@ -190,7 +190,9 @@ pub struct ServerConfig {
     /// The port librqbit's incoming BitTorrent listener binds.
     /// [`TorrentListenPort::Ephemeral`] by default, so any number of
     /// embedded servers (and the tests) coexist; an embedder that needs a
-    /// fixed, forwardable port sets [`TorrentListenPort::Fixed`] itself.
+    /// fixed, forwardable port sets [`TorrentListenPort::Fixed`] itself, and
+    /// one that must not be reachable off the machine -- a test --
+    /// [`TorrentListenPort::Loopback`].
     pub torrent_listen_port: TorrentListenPort,
     /// Where the LAN media listener binds when it runs: a second HTTP
     /// listener serving [`lan_media_routes`] and nothing else, so a

@@ -92,6 +92,7 @@ fn a_drive_grant_never_reaches_the_log() -> anyhow::Result<()> {
         use_public_trackers: false,
         enable_local_service_discovery: false,
         enable_dht: false,
+        torrent_listen_port: stream_server::TorrentListenPort::Loopback,
         drive_refresh_endpoint: Some(url::Url::parse(&format!("http://{service}/refresh"))?),
         ..stream_server::ServerConfig::default()
     })?;

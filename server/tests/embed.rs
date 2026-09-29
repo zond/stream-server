@@ -74,6 +74,13 @@ fn a_test_does_not_announce_itself_on_the_local_network() -> anyhow::Result<()> 
         !handle.settings()?.bt_enable_dht,
         "the offline config left the DHT on"
     );
+    // And nothing off this machine can connect to it: the torrent listener
+    // is on loopback, not every interface.
+    let listening = handle.torrent_listen_addr().expect("the session listens");
+    assert!(
+        listening.ip().is_loopback(),
+        "the offline config's torrent listener is reachable off the machine: {listening}"
+    );
 
     handle.shutdown()?;
     Ok(())
