@@ -52,6 +52,20 @@ carried in below.
   the first), leaves every volume of a live session out of the slack pass
   whether or not a reader is open yet, stops the index-then-body reopen
   churn, and keeps the index reads inside the session's window.
+- **A delete can say it freed nothing when it did** (found 2026-09-29, 1 in
+  60 runs of xtremio's `offline_downloads_lifecycle` under load, not
+  fixed). `unpin_download_locked` takes the pin off first and
+  `delete_download_data` then stops the torrent; a retention pass in
+  between reclaims the now-unpinned file's pieces as slack, the delete's
+  own `drop_file_pieces` finds none left, and the answer is
+  `deletedFiles: false` though the bytes are gone. A fix credits pieces a
+  concurrent pass reclaimed during the delete, or holds the pass off while
+  a delete runs.
+- **xtremio's downloads test is not hermetic** (found 2026-09-29): its
+  embedded server announces the test infohash to the public trackers and
+  the DHT, and real peers dial in. The test passes regardless, but it
+  reaches the internet; the test server should start with public trackers,
+  DHT, LSD and UPnP off.
 - **A stale-looking name, kept on purpose**:
   `enginefs/src/retention/scenario.rs`'s `CONTAINER_METADATA_LOOKAHEAD` and
   `PLAYBACK_LOOKAHEAD` keep the field's numbers under the names of constants
