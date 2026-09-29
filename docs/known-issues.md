@@ -33,6 +33,25 @@ carried in below.
   before the first range, 1 after). The RAR tests run under an unknown pin
   set, which keeps everything, so none of them sees it. Archive playback
   shares nothing, so none of this can stop the torrent.
+  **Verified 2026-09-29, and worse than written:** the pieces go before the
+  body has delivered a byte, so offline even the *first* range parks, and
+  every volume goes, the next one included. The test is
+  `a_rar_set_read_across_its_volumes_keeps_the_volumes_it_read`
+  (`server/tests/embed.rs`, ignored until fixed): three volumes, pieces
+  0..=16 seeded under a known pin set; after one read across the 1/2
+  boundary only piece 6 (shared with the live volume) is left, and both
+  reads time out. Under an unknown pin set it passes. The path:
+  `routes/archive.rs` `session_for` opens a `TorrentFileSource` per volume
+  for the index and drops them, then `sources_for` opens every volume again;
+  each open moves the liveness cell (`EngineFS::switch_to` holds the cell
+  only for a file with a reader, and a fresh source has none until its first
+  read), and each move's slack pass (`drop_slack_on_switch_and_bell` ->
+  `Engine::drop_slack`, `mode_of`) releases every volume that is neither the
+  cell's nor read. A fix makes a volume set one live entity while a session
+  reads it (the cell names the set, or later volumes register as asides of
+  the first), leaves every volume of a live session out of the slack pass
+  whether or not a reader is open yet, stops the index-then-body reopen
+  churn, and keeps the index reads inside the session's window.
 - **A stale-looking name, kept on purpose**:
   `enginefs/src/retention/scenario.rs`'s `CONTAINER_METADATA_LOOKAHEAD` and
   `PLAYBACK_LOOKAHEAD` keep the field's numbers under the names of constants
