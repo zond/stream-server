@@ -22,15 +22,6 @@ carried in below.
 
 - **The piece-commit failure paths are unmeasured on a device** -- see
   *Readable before durable* below.
-- **A delete can say it freed nothing when it did** (found 2026-09-29, 1 in
-  60 runs of xtremio's `offline_downloads_lifecycle` under load, not
-  fixed). `unpin_download_locked` takes the pin off first and
-  `delete_download_data` then stops the torrent; a retention pass in
-  between reclaims the now-unpinned file's pieces as slack, the delete's
-  own `drop_file_pieces` finds none left, and the answer is
-  `deletedFiles: false` though the bytes are gone. A fix credits pieces a
-  concurrent pass reclaimed during the delete, or holds the pass off while
-  a delete runs.
 - **xtremio's downloads test is not hermetic** (found 2026-09-29): its
   embedded server announces the test infohash to the public trackers and
   the DHT, and real peers dial in. The test passes regardless, but it
@@ -243,6 +234,11 @@ process.
 
 ## Closed, one line each
 
+- 2026-09-29 -- **A delete could say it freed nothing when it did**: the
+  pieces held were counted after the pin came off, and a tick in between
+  (the torrent stopped, the unpinned file's pieces taken as slack) left
+  nothing to count as leaving. Counted before the pin comes off now. Test:
+  `a_delete_counts_the_pieces_a_tick_took_after_the_pin_came_off`.
 - 2026-09-29 -- **An archive read across the volumes of a torrent deleted
   the volumes it had read**: every volume open moved the live entity and
   each move's slack pass took the volumes around it, so offline even the

@@ -4323,6 +4323,17 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 });
             }
         }
+        // What the store holds of the file **before the pin comes off**:
+        // from the next line on the file is unpinned, and every await between
+        // here and the delete below is a moment a retention pass may take its
+        // pieces as slack. Counted any later, bytes that left through such a
+        // pass were not counted as leaving, and a delete that freed the disk
+        // answered that it had not.
+        let held_at_unpin = if delete_files {
+            self.held_of_file(&engine, file_idx).await
+        } else {
+            0
+        };
         let was_pinned = engine.pinned_files.write().remove(&file_idx);
         engine.handle.unpin_file(file_idx).await?;
         // **A delete is an explicit request, and it happens now** -- whatever
@@ -4396,7 +4407,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 .await;
         }
         let deleted_files = if delete_files {
-            self.delete_download_data(&engine, file_idx, drops_torrent)
+            self.delete_download_data(&engine, file_idx, drops_torrent, held_at_unpin)
                 .await
         } else {
             false
@@ -4682,11 +4693,26 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// pieces: the claim is where their indices come from, and taking
     /// pieces a backend still believes it has is the corruption this whole
     /// dance exists to avoid.
+    /// How many pieces of `file_idx` the store holds now.
+    async fn held_of_file(&self, engine: &Arc<Engine<B::Handle>>, file_idx: usize) -> usize {
+        engine
+            .handle
+            .file_pieces(file_idx)
+            .await
+            .and_then(|span| {
+                self.registry
+                    .held(&engine.info_hash)
+                    .map(|held| held.in_range(span.pieces).len())
+            })
+            .unwrap_or(0)
+    }
+
     async fn delete_download_data(
         &self,
         engine: &Arc<Engine<B::Handle>>,
         file_idx: usize,
         whole_torrent: bool,
+        held_at_unpin: usize,
     ) -> bool {
         if !whole_torrent {
             let Some(path) = engine.handle.file_path(file_idx).await else {
@@ -4697,24 +4723,16 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 );
                 return false;
             };
-            // What the store holds of the file now, to say afterwards
-            // whether bytes really left: some of them may go through the
-            // reconcile below rather than through this call's own drop.
+            // What the store held of the file when the pin came off, to say
+            // afterwards whether bytes really left: some of them may go
+            // through a pass or the reconcile below rather than through this
+            // call's own drop ([`Self::held_of_file`]).
             let span = engine
                 .handle
                 .file_pieces(file_idx)
                 .await
                 .map(|span| span.pieces);
-            let held_of_file = || {
-                span.clone()
-                    .and_then(|span| {
-                        self.registry
-                            .held(&engine.info_hash)
-                            .map(|held| held.in_range(span).len())
-                    })
-                    .unwrap_or(0)
-            };
-            let held_before = held_of_file();
+            let held_before = held_at_unpin;
             // **What the torrent announced of the file ends before a byte of
             // it goes.** The pin is gone, so the download's pieces are
             // advertised and shared by nothing: the reconciler's `EndShares`
@@ -4833,7 +4851,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 // take them: the backend still believes it has them.
                 None => 0,
             };
-            let deleted = file_removed || pieces_freed > 0 || held_of_file() < held_before;
+            let deleted = file_removed
+                || pieces_freed > 0
+                || self.held_of_file(engine, file_idx).await < held_before;
             if deleted {
                 tracing::info!(
                     info_hash = %engine.info_hash,
@@ -5631,6 +5651,15 @@ mod tests {
             )>,
         >,
         unpin_file: AtomicUsize,
+        /// Test knob: park the first `unpin_file` call, as [`Self::pin_gate`]
+        /// parks a pin -- the moment the pin is off and the delete has not
+        /// begun, which a tick can fall into.
+        unpin_gate: Mutex<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                tokio::sync::oneshot::Receiver<()>,
+            )>,
+        >,
         /// The ranges `drop_pieces` was asked to forget and what each was
         /// to do afterwards, in order -- every reclaim must ask before it
         /// removes a byte, and the per-file delete must ask for the
@@ -6259,6 +6288,12 @@ mod tests {
         async fn unpin_file(&self, file_idx: usize) -> Result<()> {
             self.counters.unpin_file.fetch_add(1, Ordering::SeqCst);
             self.counters.pinned.lock().unwrap().remove(&file_idx);
+            // See `FakeCounters::unpin_gate`.
+            let gate = self.counters.unpin_gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
             Ok(())
         }
 
@@ -18117,6 +18152,60 @@ mod tests {
             counters.start_torrent.load(Ordering::SeqCst),
             1,
             "and it rejoined for the download still pinned"
+        );
+    }
+
+    /// **A delete says it freed the disk when a tick freed it first.**
+    ///
+    /// The pin comes off before the delete begins, and in between the file
+    /// is unpinned on a torrent nobody plays: a reconciler tick that lands
+    /// there stops the torrent and its retention pass takes the file's
+    /// pieces as slack. The delete's own drop then finds none left. Counted
+    /// from after the pin came off, that read as "nothing left the disk",
+    /// and a viewer's delete that freed the space answered that it had not.
+    #[tokio::test]
+    async fn a_delete_counts_the_pieces_a_tick_took_after_the_pin_came_off() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        *counters.output_folder.lock().unwrap() = Some(fake_engine_root().join("placed"));
+        nothing_torrent_is_playing(&enginefs);
+        enginefs
+            .apply_pins(Some(crate::piece_store::PinSet::from([(
+                TEST_HASH.to_string(),
+                vec![0usize, 1],
+            )])))
+            .await;
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in 0u32..8 {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+
+        let (entered_tx, entered) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        *counters.unpin_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        // The delete and the tick on one task, the tick run once the
+        // delete is parked in the gap.
+        let deleting = enginefs.unpin_download(TEST_HASH, 0, true);
+        let ticking = async {
+            entered.await.expect("the unpin reached the backend");
+            enginefs.reconcile_tick().await;
+            assert!(
+                (0u32..4).all(|piece| !bucket.join(piece.to_string()).exists()),
+                "the tick took the unpinned file's pieces"
+            );
+            release.send(()).unwrap();
+        };
+        let (outcome, ()) = tokio::join!(deleting, ticking);
+        let outcome = outcome.expect("the unpin");
+        assert!(
+            outcome.unpinned && outcome.deleted_files,
+            "the disk came back, and the delete said it had not: {outcome:?}"
         );
     }
 
