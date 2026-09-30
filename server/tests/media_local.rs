@@ -270,6 +270,14 @@ fn function<'a>(source: &'a str, name: &str) -> &'a str {
     &source[start..start + len]
 }
 
+/// A source file's text with `\n` line endings whatever the checkout's:
+/// a Windows runner checks out CRLF, and the scans below look for `\n}\n`.
+fn source_of(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .expect("a source file")
+        .replace("\r\n", "\n")
+}
+
 /// Every `.rs` file under `dir`.
 fn rust_files(dir: &Path, into: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("a source directory") {
@@ -302,14 +310,9 @@ fn no_http_route_takes_a_media_spec() {
     files.push(src.join("lan_media.rs"));
     let mut texts: Vec<(String, String)> = files
         .iter()
-        .map(|path| {
-            (
-                path.display().to_string(),
-                std::fs::read_to_string(path).expect("a source file"),
-            )
-        })
+        .map(|path| (path.display().to_string(), source_of(path)))
         .collect();
-    let lib = std::fs::read_to_string(src.join("lib.rs")).expect("lib.rs");
+    let lib = source_of(&src.join("lib.rs"));
     for router in [
         "build_router",
         "media_router",
