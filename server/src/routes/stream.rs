@@ -94,12 +94,28 @@ fn spawn_stream_progress_log(
     })
 }
 
+/// Who reads a registered stream, which decides what its end line can
+/// honestly say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Consumer {
+    /// An HTTP response body: the line reports what the body delivered
+    /// against the range the response promised (`http_stream_end`).
+    Http,
+    /// A blocking reader over FFI (`crate::media::MediaReader`): there is
+    /// no response, no promised length and no body to count, so the line
+    /// says the reader closed and how long it was open
+    /// (`reader_stream_end`), and the reader's own close line says what
+    /// it delivered.
+    Reader,
+}
+
 /// Guard that calls on_stream_end when dropped.
 struct StreamLifecycleGuard {
     engine: Arc<enginefs::EngineFS>,
     info_hash: String,
     file_idx: usize,
     stream_id: u64,
+    consumer: Consumer,
     notified: bool,
     started: Instant,
     /// Bytes the range asked for; 0 until the body is built.
@@ -137,6 +153,7 @@ impl StreamLifecycleGuard {
         file_idx: usize,
         stream_id: u64,
         stale: bool,
+        consumer: Consumer,
     ) -> Self {
         // Unreconciled: the route asks the reconciler once, after its disk
         // gate ([`EngineFS::focus_torrent`]), because that is the reading
@@ -153,7 +170,7 @@ impl StreamLifecycleGuard {
                     .await
             }
         }
-        Self::new(engine.clone(), info_hash, file_idx, stream_id)
+        Self::new(engine.clone(), info_hash, file_idx, stream_id, consumer)
     }
 
     fn new(
@@ -161,6 +178,7 @@ impl StreamLifecycleGuard {
         info_hash: String,
         file_idx: usize,
         stream_id: u64,
+        consumer: Consumer,
     ) -> Self {
         crate::diagnostics::logging::direct_stream_started();
         let progress_log =
@@ -170,6 +188,7 @@ impl StreamLifecycleGuard {
             info_hash,
             file_idx,
             stream_id,
+            consumer,
             notified: false,
             started: Instant::now(),
             requested_len: 0,
@@ -200,18 +219,31 @@ impl StreamLifecycleGuard {
         // moment that length is met, so a range delivered whole records no
         // end at all and every completed playback was filed here as a
         // `client-disconnect` (see [`util::BodyProgress::outcome_of`]).
-        tracing::info!(
-            stream_id,
-            info_hash = %info_hash,
-            file_idx,
-            bytes_sent = self.progress.bytes_sent,
-            requested_len = self.requested_len,
-            duration_ms = self.started.elapsed().as_millis() as u64,
-            reason = self.progress.outcome_of(self.requested_len).as_str(),
-            error = self.progress.error.as_deref().unwrap_or(""),
-            stage = "http_stream_end",
-            "stream ended"
-        );
+        match self.consumer {
+            Consumer::Http => tracing::info!(
+                stream_id,
+                info_hash = %info_hash,
+                file_idx,
+                bytes_sent = self.progress.bytes_sent,
+                requested_len = self.requested_len,
+                duration_ms = self.started.elapsed().as_millis() as u64,
+                reason = self.progress.outcome_of(self.requested_len).as_str(),
+                error = self.progress.error.as_deref().unwrap_or(""),
+                stage = "http_stream_end",
+                "stream ended"
+            ),
+            // No body, so no bytes sent, no promised length and no reason
+            // read off them: a reader's line with HTTP's numbers in it said
+            // `requested_len=0` and a disconnect for every playback.
+            Consumer::Reader => tracing::info!(
+                stream_id,
+                info_hash = %info_hash,
+                file_idx,
+                duration_ms = self.started.elapsed().as_millis() as u64,
+                stage = "reader_stream_end",
+                "stream reader closed"
+            ),
+        }
 
         tokio::spawn(async move {
             engine.on_stream_end(&info_hash, file_idx).await;
@@ -401,7 +433,7 @@ impl PlaybackQuery {
 ///
 /// **Archive playback shares nothing**: a play session on one of these draws
 /// nothing ([`enginefs::retention::sessions::Played::Torrent`]'s `shares`).
-fn played_through_a_translator(name: &str) -> bool {
+pub(crate) fn played_through_a_translator(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     let Some((_, extension)) = lower.rsplit_once('.') else {
         return false;
@@ -433,7 +465,7 @@ fn playback_intent_for_request(is_download: bool) -> Fetching {
 /// routes use, because the two disagree where a player cares: `mime_guess`
 /// calls `.ts` `video/vnd.dlna.mpeg-tts` and `.opus` `audio/ogg`, and knows
 /// no `.eac3`.
-fn content_type_for_name(name: &str) -> &'static str {
+pub(crate) fn content_type_for_name(name: &str) -> &'static str {
     let extension = name
         .rsplit_once('.')
         .map(|(_, extension)| extension.to_ascii_lowercase())
@@ -463,7 +495,7 @@ fn content_type_for_name(name: &str) -> &'static str {
 /// because the conditions behind it (`ensure_download_disk_ready`'s own
 /// message, the engine's reason for a stop) name the cache root, and no
 /// response may carry a path.
-const INSUFFICIENT_DISK_SPACE_BODY: &str =
+pub(crate) const INSUFFICIENT_DISK_SPACE_BODY: &str =
     "Insufficient disk space for this stream; free some space and retry";
 
 /// Free space a test has declared for a root and everything under it,
@@ -862,6 +894,8 @@ pub(crate) struct TorrentOpen<'a> {
     /// `None` for an open nobody's player asked for -- a subtitle, a side
     /// file, another client -- which moves no session and shares nothing.
     pub(crate) player: Option<Player<'a>>,
+    /// What reads the stream: what its end line says.
+    pub(crate) consumer: Consumer,
 }
 
 /// Why [`open_torrent_stream`] opened nothing. The route answers each with
@@ -949,6 +983,19 @@ impl TorrentStream {
         }
     }
 
+    /// The read-ahead choice the next [`Self::open_at`] is made with.
+    pub(crate) fn buffer(&self) -> BufferProfile {
+        self.buffer
+    }
+
+    /// Make the next [`Self::open_at`] with `buffer`: the viewer changed
+    /// their read-ahead choice mid-playback, and the lookahead is worked
+    /// out at an open, so it takes effect at the next one (a seek) and not
+    /// in the handle already reading.
+    pub(crate) fn set_buffer(&mut self, buffer: BufferProfile) {
+        self.buffer = buffer;
+    }
+
     /// The guard that ends the stream, for a caller that hands it on (the
     /// route, to its response body) and opens nothing more.
     fn into_lifecycle(self) -> StreamLifecycleGuard {
@@ -980,6 +1027,7 @@ pub(crate) async fn open_torrent_stream(
         intent,
         buffer,
         player,
+        consumer,
     } = open;
     // --- Stream Lifecycle: registered before the disk gate. ---
     // Registration and the guard that ends it, with no await between them,
@@ -1022,6 +1070,7 @@ pub(crate) async fn open_torrent_stream(
         idx,
         stream_id,
         stale,
+        consumer,
     )
     .await;
     let stream = TorrentStream {
@@ -1366,6 +1415,7 @@ async fn stream_video_with(
             token,
             shares: !played_through_a_translator(&name),
         }),
+        consumer: Consumer::Http,
     })
     .await;
     let (stream, mut file) = match opened {

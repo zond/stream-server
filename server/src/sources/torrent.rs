@@ -40,7 +40,8 @@
 
 use super::{ByteSource, ReadHint, SeekableReader, read_filling};
 use crate::routes::stream::{
-    PLAYER_PRIORITY, Player, TorrentOpen, TorrentStream, next_stream_id, open_torrent_stream,
+    Consumer, PLAYER_PRIORITY, Player, TorrentOpen, TorrentStream, next_stream_id,
+    open_torrent_stream,
 };
 use enginefs::backend::TorrentHandle;
 use enginefs::backend::priorities::{BufferProfile, Fetching};
@@ -66,6 +67,10 @@ pub struct Play {
 /// it registered once the first read made one.
 struct Played {
     play: Play,
+    /// The read-ahead choice the first open is made with: `play.buffer`
+    /// until [`TorrentSource::set_buffer`] says otherwise. After the first
+    /// open the stream holds its own (`TorrentStream::set_buffer`).
+    buffer: std::sync::Mutex<BufferProfile>,
     /// Whose slack the disk gate drops beside the torrents'.
     proxy_cache: Arc<crate::proxy_cache::ProxyCache>,
     /// `None` until the first reader: the open is the route's, and the
@@ -112,7 +117,31 @@ impl TorrentSource {
                     format!("{path_in_torrent} is not a file of torrent {info_hash}"),
                 )
             })?;
-        let file = Self::file(&info_hash, file_idx, &files)?;
+        Self::aside_in(engine, info_hash, file_idx, &files).await
+    }
+
+    /// File `file_idx` of the torrent `info_hash`, as an aside: what
+    /// [`Self::open`] makes once it has found the file by its path, and
+    /// what a reader over an id without a play makes by index
+    /// (`crate::media`).
+    pub(crate) async fn aside(
+        engine: Arc<enginefs::EngineFS>,
+        info_hash: &str,
+        file_idx: usize,
+    ) -> io::Result<Self> {
+        let info_hash = info_hash.to_lowercase();
+        let files = Self::files(&engine, &info_hash).await?;
+        Self::aside_in(engine, info_hash, file_idx, &files).await
+    }
+
+    /// [`Self::aside`] over the file list already in hand.
+    async fn aside_in(
+        engine: Arc<enginefs::EngineFS>,
+        info_hash: String,
+        file_idx: usize,
+        files: &[enginefs::backend::BackendFileInfo],
+    ) -> io::Result<Self> {
+        let file = Self::file(&info_hash, file_idx, files)?;
         let (len, name) = (file.length, file.name.clone());
         // Before any reader, and it has to be before: what the reconciler
         // is being told is that a read is about to start, and the
@@ -160,12 +189,46 @@ impl TorrentSource {
             info_hash,
             file_idx,
             play: Some(Played {
+                buffer: std::sync::Mutex::new(play.buffer),
                 play,
                 proxy_cache: state.proxy_cache.clone(),
                 stream: tokio::sync::Mutex::new(None),
             }),
             index_reader: tokio::sync::Mutex::new(None),
         })
+    }
+
+    /// Make the next open with `buffer`: the viewer's read-ahead choice,
+    /// changed mid-playback. The lookahead is worked out at an open, so it
+    /// takes effect at the next one -- a seek -- and never in a handle
+    /// already reading. Nothing for an aside, whose reads are opened at
+    /// the default whatever a viewer chose.
+    pub(crate) async fn set_buffer(&self, buffer: BufferProfile) {
+        let Some(played) = &self.play else {
+            return;
+        };
+        *played
+            .buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = buffer;
+        if let Some(stream) = played.stream.lock().await.as_mut() {
+            stream.set_buffer(buffer);
+        }
+    }
+
+    /// The read-ahead choice the stream's opens are made with, once the
+    /// first one has been; `None` for an aside or a played source not yet
+    /// opened. What a test of [`Self::set_buffer`] can read, since what the
+    /// profile changes -- how far ahead the engine fetches -- is not a
+    /// number this crate is shown.
+    pub(crate) async fn buffer_in_use(&self) -> Option<BufferProfile> {
+        let played = self.play.as_ref()?;
+        played
+            .stream
+            .lock()
+            .await
+            .as_ref()
+            .map(TorrentStream::buffer)
     }
 
     /// The names of the torrent's files, in the torrent's own order --
@@ -266,6 +329,11 @@ impl TorrentSource {
             let handle = stream.open_at(offset).await.map_err(io::Error::other)?;
             return Ok(Box::new(handle));
         }
+        // Read out before the open: the guard is not held across an await.
+        let buffer = *played
+            .buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (opened, handle) = open_torrent_stream(TorrentOpen {
             engine_fs: &self.engine,
             proxy_cache: &played.proxy_cache,
@@ -275,11 +343,15 @@ impl TorrentSource {
             stream_id: next_stream_id(),
             offset,
             intent: Fetching::Streaming,
-            buffer: played.play.buffer,
+            buffer,
             player: Some(Player {
                 token: &played.play.token,
                 shares: played.play.shares,
             }),
+            // A played source is read by a reader, never by a response
+            // body: its end line says so rather than reporting a body that
+            // never existed.
+            consumer: Consumer::Reader,
         })
         .await?;
         *stream = Some(opened);

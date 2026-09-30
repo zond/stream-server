@@ -45,6 +45,10 @@ pub struct AppState {
     /// layer down inside each source's `DriveCredential`. Nothing but the
     /// header supplier can reach it and nothing here can print it.
     pub drive_files: crate::translators::session::Sessions<crate::routes::drive::DriveSession>,
+    /// Every media id `ServerHandle::register` has issued and not let go,
+    /// and what resolving each found (`crate::media`). Memory only: a
+    /// restart forgets them, and the app registers at open.
+    pub(crate) media: crate::media::registry::Registry,
     /// Where a Drive file's two services are, or `None` for a server whose
     /// embedder named no pairing service -- which is every server but the
     /// app's, and which refuses a create rather than guessing
@@ -119,6 +123,7 @@ impl AppState {
             drive_files: crate::translators::session::Sessions::new(
                 crate::translators::session::SESSION_CAP,
             ),
+            media: crate::media::registry::Registry::new(),
             drive: None,
             proxy_streams: Arc::new(crate::proxy_streams::ProxyStreams::new()),
             proxy_cache,

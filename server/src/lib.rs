@@ -20,6 +20,10 @@ pub use routes::downloads::{DownloadInfo, ProxyDownloadRequest};
 // call the method but not write down the result of -- and `DriveError`
 // with them, because `DriveOpenError::Drive` carries one and an embedder
 // that cannot name it cannot construct or match the case that matters.
+pub use media::{
+    Canceller, GrantSupplier, MediaId, MediaReader, MediaSpec, MemberInfo, PlayToken, Refusal,
+    Resolved,
+};
 pub use routes::drive::{DriveFileOpened, DriveOpenError};
 #[doc(hidden)]
 pub use routes::stream::{pretend_available_space, pretend_available_space_readings};
@@ -114,6 +118,10 @@ pub mod images;
 // strings, rather than keeping a second copy of them that drifts.
 pub use diagnostics::logging::{PROXY_TRACE_TARGET, RETENTION_TRACE_TARGET, log_filter};
 mod lan_media;
+/// Playable things by id and the blocking reader over them: what the app's
+/// in-process player reads (`docs/design/media-pipeline.md` §2.3, §2.4).
+/// The module docs state who owns what.
+pub mod media;
 mod proxy_cache;
 pub mod proxy_downloads;
 mod proxy_retention;
@@ -478,6 +486,114 @@ impl ServerHandle {
     /// See [`enginefs::EngineFS::on_player_stalled`].
     pub async fn note_player_stalled(&self, info_hash: &str) {
         self.state.engine.on_player_stalled(info_hash).await;
+    }
+
+    /// **Register something to play and get its id.** Parses `spec` and
+    /// records it; no I/O, so it answers at once, and a URL whose shape is
+    /// none of this server's is registered all the same -- every
+    /// [`Self::resolve`] of it answers why. The id is 128 random bits,
+    /// names nothing by itself, and is forgotten by a restart or once
+    /// [`media::MEDIA_ID_CAP`] newer ones have been registered while no
+    /// reader held it. See [`media`].
+    ///
+    /// The one error is the OS failing to hand out random bytes.
+    pub fn register(&self, spec: MediaSpec) -> anyhow::Result<MediaId> {
+        self.state.media.register(spec)
+    }
+
+    /// **Find out what an id is**: add or find the torrent and choose its
+    /// file (`-1` and `f=` as the stream route chooses), probe a link's
+    /// origin, renew a Drive grant -- the I/O `register` does not do,
+    /// which for a magnet whose metadata is not here yet is a wait of up to
+    /// `enginefs::METADATA_RESOLVE_TIMEOUT`. The answer is kept on the id,
+    /// so the next ask is a lookup. A link whose host answers a range with
+    /// the whole file is not a refusal: it resolves `in_process: false`
+    /// with the `/proxy` URL a player can read it forward through.
+    pub fn resolve(&self, id: &MediaId) -> Result<Resolved, Refusal> {
+        let state = self.state.clone();
+        let id = id.clone();
+        self.block_on_server(async move { state.media.resolve(&state, &id).await })
+            .unwrap_or(Err(Refusal::ServerStopped))
+    }
+
+    /// **Open a blocking reader over an id**, resolving it first if nothing
+    /// has. With `play`, its reads are the viewer's playback: the play
+    /// session moves to the file, and a torrent file shares unless it is
+    /// an archive (decided here, as the stream route decides it for
+    /// `p=`). Without one they are an aside, which moves nothing and shares
+    /// nothing. The stream is registered before this returns. A reader
+    /// holds no `ServerHandle`: stopping the server under it makes its
+    /// calls answer an error. See [`media::reader`].
+    pub fn open_reader(
+        &self,
+        id: &MediaId,
+        play: Option<PlayToken>,
+    ) -> Result<MediaReader, Refusal> {
+        let state = self.state.clone();
+        let id = id.clone();
+        self.block_on_server(async move { state.media.open_reader(&state, &id, play).await })
+            .unwrap_or(Err(Refusal::ServerStopped))
+    }
+
+    /// **Change the viewer's read-ahead choice for an id** mid-playback.
+    /// The lookahead is worked out when a torrent file is opened, so a
+    /// reader open on the id takes it at its next reopen -- its next seek
+    /// -- and never in the handle already reading. Nothing for an id that
+    /// is not a torrent played with a [`PlayToken`].
+    pub fn set_buffer(
+        &self,
+        id: &MediaId,
+        buffer: enginefs::backend::priorities::BufferProfile,
+    ) -> Result<(), Refusal> {
+        self.state.media.set_buffer(id, buffer)
+    }
+
+    /// [`Self::stream_numbers`] for what `id` resolved to. `None` for an id
+    /// not resolved yet, as for a URL this server does not hold. Resolves
+    /// nothing.
+    pub fn media_stream_numbers(
+        &self,
+        id: &MediaId,
+    ) -> anyhow::Result<Option<stream_numbers::StreamNumbers>> {
+        let state = self.state.clone();
+        let id = id.clone();
+        self.block_on_server(async move { state.media.stream_numbers(&state, &id).await })
+    }
+
+    /// [`Self::note_duration`] for the torrent file `id` resolved to; a
+    /// no-op for anything else, and for an id not resolved yet.
+    pub fn note_media_duration(
+        &self,
+        id: &MediaId,
+        duration: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        let Some((info_hash, file_idx)) = self.state.media.torrent_file(id) else {
+            return Ok(());
+        };
+        let engine = self.state.engine.clone();
+        self.block_on_server(
+            async move { engine.on_duration(&info_hash, file_idx, duration).await },
+        )
+    }
+
+    /// [`Self::note_player_opened`] for the torrent `id` resolved to; a
+    /// no-op for anything else.
+    pub fn note_media_player_opened(&self, id: &MediaId) -> anyhow::Result<()> {
+        let Some((info_hash, _)) = self.state.media.torrent_file(id) else {
+            return Ok(());
+        };
+        let engine = self.state.engine.clone();
+        self.block_on_server(async move { engine.on_player_opened(&info_hash).await })
+    }
+
+    /// [`Self::note_player_stalled`] for the torrent `id` resolved to; a
+    /// no-op for anything else.
+    pub fn note_media_player_stalled(&self, id: &MediaId) -> anyhow::Result<()> {
+        let Some((info_hash, _)) = self.state.media.torrent_file(id) else {
+            return Ok(());
+        };
+        let engine = self.state.engine.clone();
+        self.block_on_server(async move { engine.on_player_stalled(&info_hash).await })
     }
 
     /// Whether this server is using the connection while nothing is playing

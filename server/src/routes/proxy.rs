@@ -1185,6 +1185,17 @@ pub(crate) struct ProxyParams {
 }
 
 impl ProxyParams {
+    /// `h=`: what the origin is sent in place of what would otherwise be
+    /// forwarded under those names.
+    pub(crate) fn request_headers(&self) -> &BTreeMap<String, String> {
+        &self.request_headers
+    }
+
+    /// `r=`: what the player is told in place of what the origin said.
+    pub(crate) fn response_headers(&self) -> &BTreeMap<String, String> {
+        &self.response_headers
+    }
+
     /// Reads the four parameters out of one `application/x-www-form-
     /// urlencoded` string, whether it came off the path segment or the
     /// query. Anything else in it belongs to the target and is ignored

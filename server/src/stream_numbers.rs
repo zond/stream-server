@@ -267,20 +267,26 @@ impl StreamStore for ProxyCache {
     ///
     /// Never a [`StreamNumbers::sharing`]: a proxied response is not seeded.
     async fn stream_numbers(&self, url: &Url) -> Option<StreamNumbers> {
-        let target = proxied_target(url)?;
-        // Off the reactor: the first ask of an entity seeds its held set
-        // from a listing of its chunk directories.
-        let retention = self.retention().clone();
-        let window = tokio::task::spawn_blocking(move || {
-            retention.window(target.as_str(), std::time::Instant::now())
-        })
-        .await
-        .ok()??;
-        Some(StreamNumbers {
-            window: Some(window),
-            sharing: None,
-        })
+        proxied_numbers(self, proxied_target(url)?).await
     }
+}
+
+/// The numbers for the entity the proxy cache files under `target`: what a
+/// `/proxy` URL names, or a Drive file's media URL (`crate::media`, which
+/// holds a Drive file by id rather than by a URL of this server's).
+pub(crate) async fn proxied_numbers(cache: &ProxyCache, target: Url) -> Option<StreamNumbers> {
+    // Off the reactor: the first ask of an entity seeds its held set from a
+    // listing of its chunk directories.
+    let retention = cache.retention().clone();
+    let window = tokio::task::spawn_blocking(move || {
+        retention.window(target.as_str(), std::time::Instant::now())
+    })
+    .await
+    .ok()??;
+    Some(StreamNumbers {
+        window: Some(window),
+        sharing: None,
+    })
 }
 
 /// The origin a `/proxy` URL names, or `None` for a path of any other shape.
@@ -304,7 +310,7 @@ fn proxied_target(url: &Url) -> Option<Url> {
 /// The hash is spelled as the routes and the registry spell it: forty hex
 /// digits, matched case-insensitively and answered in lower case, which is
 /// how the engine registry is keyed.
-fn torrent_stream(url: &Url) -> Option<(String, StreamFile)> {
+pub(crate) fn torrent_stream(url: &Url) -> Option<(String, StreamFile)> {
     let mut segments: Vec<&str> = url.path_segments()?.collect();
     if segments.first() == Some(&"stream") {
         segments.remove(0);

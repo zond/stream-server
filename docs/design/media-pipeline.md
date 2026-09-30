@@ -659,7 +659,11 @@ A. **Server: one torrent source, ids, the reader task.** (L.) Factor the
    with an error; a torrent reader with a play moves the session and draws,
    without one it does neither (the lib fake's `violations` guard holds);
    a single-container member with a play draws, a multi-volume one does
-   not (2.8).
+   not (2.8). *(Second slice done: `server/src/media/` -- the registry,
+   the reader task and the handle methods, over torrent, `/proxy` and
+   Drive ids; an archive `/create` and `/ftp` register and resolve
+   `notYet`. A played reader's stream ends with its own log line,
+   `reader_stream_end`, not the route's. Member sharing is the third.)*
 
 A2. **Play sessions understand sets.** (M.) `Played::Torrent` over a set of
    files, mirroring `Live::hold_set`; a move inside the set ends nothing;
