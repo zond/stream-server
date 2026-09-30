@@ -11,7 +11,11 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use stream_server::{LocalFile, MediaReader, MediaSpec, PlayToken, Refusal, ServerConfig};
+// `Refusal` is named only by the pipe test, which is Unix-only (a pipe fd
+// is a Unix thing); Windows would see an unused import under `-D warnings`.
+#[cfg(unix)]
+use stream_server::Refusal;
+use stream_server::{LocalFile, MediaReader, MediaSpec, PlayToken, ServerConfig};
 
 #[path = "support/torrent_fixtures.rs"]
 mod torrent_fixtures;
