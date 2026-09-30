@@ -83,6 +83,8 @@ Implementations, in order of need:
   a player wants a player's lookahead, not the 256 MiB a download reads
   ahead. A source registers the torrent stream
   (`TorrentMemberStream`) for as long as it is held, as the route does now.
+  *(Both since replaced by `TorrentSource`, whose open is the stream
+  route's; see [media-pipeline.md](media-pipeline.md) §2.2.)*
 * **`ProxySource { entry: proxy_cache::Entry, client, total, validator, content_type }`.**
   Built by one `HEAD` (or a `GET` of `bytes=0-0`) through the proxy's own
   request builder, which is how it learns `total`, the validator and

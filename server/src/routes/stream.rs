@@ -588,8 +588,8 @@ fn ensure_download_disk_ready(root: &FsPath) -> Result<(), String> {
 
 /// The disk gate the stream route runs before it streams to disk, and what
 /// happens when the disk is not ready: both cache owners give back their
-/// slack, the volume is read again, and a `507` if it is still short. `Err`
-/// is the status and body to answer.
+/// slack, the volume is read again, and a `507` if it is still short
+/// ([`TorrentOpenError::InsufficientDiskSpace`], which the route answers).
 ///
 /// **There is no memory-only fallback.** librqbit sessions always persist to
 /// disk and this server has no memory-only storage anywhere, so a disk that
@@ -613,14 +613,14 @@ fn ensure_download_disk_ready(root: &FsPath) -> Result<(), String> {
 /// the whole of the storage policy in one sentence, and it is why this gate
 /// has no eviction in it any more.
 async fn ensure_disk_ready_or_refuse(
-    state: &AppState,
-    engine_fs: &EngineFS,
+    proxy_cache: &Arc<crate::proxy_cache::ProxyCache>,
+    engine_fs: &Arc<EngineFS>,
     engine: &Arc<Engine<LibrqbitHandle>>,
     stream_id: u64,
     info_hash: &str,
     file_idx: usize,
     wants_to_write: bool,
-) -> Result<(), (StatusCode, &'static str)> {
+) -> Result<(), TorrentOpenError> {
     // A torrent that has everything it wants writes nothing, so a volume
     // with no room on it is not about this request: refusing to serve bytes
     // that are already on the disk because the disk is full would take a
@@ -661,11 +661,11 @@ async fn ensure_disk_ready_or_refuse(
     let deleted = free_the_slack_within(
         SLACK_DROP_BOUND,
         {
-            let engine = state.engine.clone();
+            let engine = engine_fs.clone();
             async move { engine.drop_slack().await }
         },
         {
-            let proxy = state.proxy_cache.clone();
+            let proxy = proxy_cache.clone();
             async move { proxy.retention().drop_slack().await }
         },
     )
@@ -691,10 +691,7 @@ async fn ensure_disk_ready_or_refuse(
         file_idx,
         "disk still not ready once the slack was gone; refusing the stream"
     );
-    Err((
-        StatusCode::INSUFFICIENT_STORAGE,
-        INSUFFICIENT_DISK_SPACE_BODY,
-    ))
+    Err(TorrentOpenError::InsufficientDiskSpace)
 }
 
 /// The gate's two questions, in the order they cost, and the first
@@ -817,6 +814,257 @@ async fn engine_for_request(
             (StatusCode::NOT_FOUND, "Unknown torrent".to_string())
         }),
     }
+}
+
+/// A number for a stream's log lines, unique in this process: what ties a
+/// stream's request, progress and end lines together.
+pub(crate) fn next_stream_id() -> u64 {
+    NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// A player's read, at the ordinary priority. The server's own reads (the
+/// probes that pass 255 to skip the playback preparation) never come
+/// through a player's open, and no request header may ask for that; 0 is a
+/// background fetch, which this is not either.
+pub(crate) const PLAYER_PRIORITY: u8 = 1;
+
+/// The viewer's player behind an open: `p=` on the route, a
+/// [`crate::sources::torrent::Play`] on a source.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Player<'a> {
+    /// The player token, `<viewer>.<screen>`, as `p=` carries it.
+    pub(crate) token: &'a str,
+    /// Whether this file may share at all: false for a file played through
+    /// a translator (`played_through_a_translator`) -- archive playback
+    /// shares nothing.
+    pub(crate) shares: bool,
+}
+
+/// What the caller of [`open_torrent_stream`] has resolved before the open:
+/// the engine and the file in it, where the read starts, what it is for,
+/// and whose it is.
+pub(crate) struct TorrentOpen<'a> {
+    pub(crate) engine_fs: &'a Arc<EngineFS>,
+    /// Whose slack the disk gate drops beside the torrents'.
+    pub(crate) proxy_cache: &'a Arc<crate::proxy_cache::ProxyCache>,
+    pub(crate) engine: &'a Arc<Engine<LibrqbitHandle>>,
+    /// Lowercase.
+    pub(crate) info_hash: &'a str,
+    pub(crate) file_idx: usize,
+    /// For the log lines ([`next_stream_id`]).
+    pub(crate) stream_id: u64,
+    /// Where the read is about to be: the engine prioritises the swarm
+    /// around it. The handle still starts at the top of the file; the
+    /// caller seeks it.
+    pub(crate) offset: u64,
+    pub(crate) intent: Fetching,
+    pub(crate) buffer: BufferProfile,
+    /// `None` for an open nobody's player asked for -- a subtitle, a side
+    /// file, another client -- which moves no session and shares nothing.
+    pub(crate) player: Option<Player<'a>>,
+}
+
+/// Why [`open_torrent_stream`] opened nothing. The route answers each with
+/// its own HTTP status; a source answers them as `io::Error`s.
+#[derive(Debug)]
+pub(crate) enum TorrentOpenError {
+    /// The disk gate refused: the volume is short of the floor even with
+    /// both cache owners' slack given back. The route's `507`.
+    InsufficientDiskSpace,
+    /// The engine could not open a reader on the file
+    /// (`stream_open_failure_status` says which status each case is).
+    Open(GetFileError),
+}
+
+impl std::fmt::Display for TorrentOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InsufficientDiskSpace => f.write_str(INSUFFICIENT_DISK_SPACE_BODY),
+            Self::Open(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for TorrentOpenError {}
+
+impl From<TorrentOpenError> for std::io::Error {
+    fn from(error: TorrentOpenError) -> Self {
+        match error {
+            TorrentOpenError::InsufficientDiskSpace => {
+                std::io::Error::new(std::io::ErrorKind::StorageFull, error)
+            }
+            TorrentOpenError::Open(error) => std::io::Error::other(error),
+        }
+    }
+}
+
+/// A stream [`open_torrent_stream`] registered, and how to open its file
+/// again: the registration and the play session belong to this, not to a
+/// file handle, so a seek -- a new handle at a new offset, [`Self::open_at`]
+/// -- neither moves the session nor ends the stream. Dropped, it ends the
+/// stream (`StreamLifecycleGuard`).
+pub(crate) struct TorrentStream {
+    lifecycle: StreamLifecycleGuard,
+    engine: Arc<Engine<LibrqbitHandle>>,
+    file_idx: usize,
+    intent: Fetching,
+    buffer: BufferProfile,
+    /// Whether this open's reads are the viewer's playback of a file its
+    /// session shares: the one open whose play session may draw.
+    shared: bool,
+}
+
+impl TorrentStream {
+    /// A reader on the stream's file, the engine told the read is about to
+    /// be at `offset`.
+    ///
+    /// The current screen of the viewer's player, on a file its session
+    /// shares, is the one open whose play session may draw; every other
+    /// open -- no token, an older screen's reconnect, an archive -- draws
+    /// nothing.
+    pub(crate) async fn open_at(
+        &self,
+        offset: u64,
+    ) -> Result<enginefs::files::FileHandle<LibrqbitHandle>, GetFileError> {
+        if self.shared {
+            self.engine
+                .try_get_file_with_intent(
+                    self.file_idx,
+                    offset,
+                    PLAYER_PRIORITY,
+                    self.intent,
+                    self.buffer,
+                )
+                .await
+        } else {
+            self.engine
+                .try_get_file_unshared(
+                    self.file_idx,
+                    offset,
+                    PLAYER_PRIORITY,
+                    self.intent,
+                    self.buffer,
+                )
+                .await
+        }
+    }
+
+    /// The guard that ends the stream, for a caller that hands it on (the
+    /// route, to its response body) and opens nothing more.
+    fn into_lifecycle(self) -> StreamLifecycleGuard {
+        self.lifecycle
+    }
+}
+
+/// **The one open of a torrent file for reading**: what the stream route
+/// does between resolving the file and building the body, and what a
+/// [`crate::sources::torrent::TorrentSource`] with a play does at its first
+/// read. In order, each for the reason written beside it: the player's
+/// session moved, the stream registered, the disk gate, the focus, the
+/// reader.
+///
+/// The stream is registered before the gate and ended by the returned
+/// [`TorrentStream`]'s drop -- including when this returns an error, which
+/// drops it here.
+pub(crate) async fn open_torrent_stream(
+    open: TorrentOpen<'_>,
+) -> Result<(TorrentStream, enginefs::files::FileHandle<LibrqbitHandle>), TorrentOpenError> {
+    let TorrentOpen {
+        engine_fs,
+        proxy_cache,
+        engine,
+        info_hash,
+        file_idx: idx,
+        stream_id,
+        offset,
+        intent,
+        buffer,
+        player,
+    } = open;
+    // --- Stream Lifecycle: registered before the disk gate. ---
+    // Registration and the guard that ends it, with no await between them,
+    // so a cancelled request never leaves a stream registered that nothing
+    // is holding. See `StreamLifecycleGuard::start`.
+    //
+    // **Before the gate, and that is the point.** Registering the stream
+    // is what makes the file the viewer just left slack, and a slack entity
+    // is bytes this server is about to give back. Asking "is there room?"
+    // first would ask it of a volume still holding the previous film, so a
+    // switch on a full disk would answer `507` for space that is already
+    // ours -- and refusing before registering would leave nothing
+    // registered, so the next attempt would ask the same stale question. A
+    // refused request still moves the live entity, which is right: the
+    // viewer really has left the old one.
+    // **The player's own request moves its play session**, and nothing else
+    // does. Before the stream registers, so the reconcile this request
+    // makes sees the move: the next episode of the same torrent ends what
+    // the last one shared at once (stop, the advertised set made again,
+    // start), before this reader waits on a byte.
+    //
+    // An older screen's request is served and moves nothing: not the
+    // session, and not the liveness cell either.
+    let shares = player.is_some_and(|player| player.shares);
+    let heard = player.map(|player| {
+        engine_fs.note_player(
+            player.token,
+            enginefs::retention::sessions::Played::Torrent {
+                info_hash: info_hash.to_string(),
+                file_idx: idx,
+                shares,
+            },
+        )
+    });
+    let stale = heard == Some(enginefs::retention::sessions::Heard::Stale);
+    let players = heard.is_some() && !stale && shares;
+    let lifecycle = StreamLifecycleGuard::start(
+        engine_fs.clone(),
+        info_hash.to_string(),
+        idx,
+        stream_id,
+        stale,
+    )
+    .await;
+    let stream = TorrentStream {
+        lifecycle,
+        engine: engine.clone(),
+        file_idx: idx,
+        intent,
+        buffer,
+        shared: players,
+    };
+    ensure_disk_ready_or_refuse(
+        proxy_cache,
+        engine_fs,
+        engine,
+        stream_id,
+        info_hash,
+        idx,
+        !engine.handle.is_finished().await,
+    )
+    .await?;
+
+    // No selection here: `on_stream_start` made it, and a second one per
+    // request was a second librqbit update -- a recompute over every piece
+    // and a persistence write -- for the same set. Planned from this
+    // request alone it would also drop the film an aside open (a subtitle)
+    // is fetched beside, which `on_stream_start` keeps selected.
+    engine_fs.focus_torrent(info_hash).await;
+
+    // Await the async get_file
+    tracing::debug!(
+        stream_id,
+        info_hash = %info_hash,
+        file_idx = idx,
+        start_offset = offset,
+        intent = ?intent,
+        buffer = buffer.as_str(),
+        "stream_video calling get_file"
+    );
+    let file = stream
+        .open_at(offset)
+        .await
+        .map_err(TorrentOpenError::Open)?;
+    Ok((stream, file))
 }
 
 pub async fn head_stream_video(
@@ -986,7 +1234,7 @@ async fn stream_video_with(
 ) -> Response {
     let request_start = Instant::now();
     let info_hash = info_hash.to_lowercase();
-    let stream_id = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
+    let stream_id = next_stream_id();
     let query = PlaybackQuery::parse(query_str.as_deref());
     let is_download = query.download;
     let engine_fs = state.engine.clone();
@@ -1060,62 +1308,6 @@ async fn stream_video_with(
     };
     let (start, end, is_partial) = (framing.start, framing.end, framing.partial);
     let requested_content_length = framing.content_length(size);
-    // --- Stream Lifecycle: registered before the disk gate. ---
-    // Registration and the guard that ends it, with no await between them,
-    // so a cancelled request never leaves a stream registered that nothing
-    // is holding. See `StreamLifecycleGuard::start`.
-    //
-    // **Before the gate, and that is the point.** Registering the stream
-    // is what makes the file the viewer just left slack, and a slack entity
-    // is bytes this server is about to give back. Asking "is there room?"
-    // first would ask it of a volume still holding the previous film, so a
-    // switch on a full disk would answer `507` for space that is already
-    // ours -- and refusing before registering would leave nothing
-    // registered, so the next attempt would ask the same stale question. A
-    // refused request still moves the live entity, which is right: the
-    // viewer really has left the old one.
-    // **The player's own request moves its play session**, and nothing else
-    // does. Before the stream registers, so the reconcile this request
-    // makes sees the move: the next episode of the same torrent ends what
-    // the last one shared at once (stop, the advertised set made again,
-    // start), before this reader waits on a byte.
-    //
-    // An older screen's request is served and moves nothing: not the
-    // session, and not the liveness cell either.
-    let shares = !played_through_a_translator(&name);
-    let heard = query.player_token.as_deref().map(|token| {
-        engine_fs.note_player(
-            token,
-            enginefs::retention::sessions::Played::Torrent {
-                info_hash: info_hash.clone(),
-                file_idx: idx,
-                shares,
-            },
-        )
-    });
-    let stale = heard == Some(enginefs::retention::sessions::Heard::Stale);
-    let players = heard.is_some() && !stale && shares;
-    let lifecycle =
-        StreamLifecycleGuard::start(engine_fs.clone(), info_hash.clone(), idx, stream_id, stale)
-            .await;
-    if let Err(refusal) = ensure_disk_ready_or_refuse(
-        &state,
-        &engine_fs,
-        &engine,
-        stream_id,
-        &info_hash,
-        idx,
-        !engine.handle.is_finished().await,
-    )
-    .await
-    {
-        return refusal.into_response();
-    }
-    let start_offset_hint = start;
-    // A player's read, at the ordinary priority. The server's own reads
-    // (the probes that pass 255 to skip the playback preparation) never
-    // come through this route, and no request header may ask for that.
-    let priority: u8 = 1;
     let playback_intent = playback_intent_for_request(is_download);
     // **Always on, unlike the retention trace.** What the player actually
     // asked for, before anything here interprets it: two lines per range
@@ -1157,53 +1349,39 @@ async fn stream_video_with(
             "playback request without Range; treating as direct initial, not full download"
         );
     }
-
-    // No selection here: `on_stream_start` made it, and a second one per
-    // request was a second librqbit update -- a recompute over every piece
-    // and a persistence write -- for the same set. Planned from this
-    // request alone it would also drop the film an aside open (a subtitle)
-    // is fetched beside, which `on_stream_start` keeps selected.
-    engine_fs.focus_torrent(&info_hash).await;
-
-    // Await the async get_file
-    tracing::debug!(
+    // The open itself -- play session, registration, disk gate, focus and
+    // the reader -- is the one every torrent reader shares
+    // (`open_torrent_stream`); what is left here is the HTTP around it.
+    let opened = open_torrent_stream(TorrentOpen {
+        engine_fs: &engine_fs,
+        proxy_cache: &state.proxy_cache,
+        engine: &engine,
+        info_hash: &info_hash,
+        file_idx: idx,
         stream_id,
-        info_hash = %info_hash,
-        file_idx = idx,
-        start_offset = start_offset_hint,
-        intent = ?playback_intent,
-        buffer = buffer_profile.as_str(),
-        "stream_video calling get_file"
-    );
-    // The current screen of the viewer's player, on a file its session
-    // shares, is the one open whose play session may draw; every other
-    // open -- no token, an older screen's reconnect, an archive -- draws
-    // nothing.
-    let opened = if players {
-        engine
-            .try_get_file_with_intent(
-                idx,
-                start_offset_hint,
-                priority,
-                playback_intent,
-                buffer_profile,
+        offset: start,
+        intent: playback_intent,
+        buffer: buffer_profile,
+        player: query.player_token.as_deref().map(|token| Player {
+            token,
+            shares: !played_through_a_translator(&name),
+        }),
+    })
+    .await;
+    let (stream, mut file) = match opened {
+        Ok(opened) => opened,
+        Err(TorrentOpenError::InsufficientDiskSpace) => {
+            return (
+                StatusCode::INSUFFICIENT_STORAGE,
+                INSUFFICIENT_DISK_SPACE_BODY,
             )
-            .await
-    } else {
-        engine
-            .try_get_file_unshared(
-                idx,
-                start_offset_hint,
-                priority,
-                playback_intent,
-                buffer_profile,
-            )
-            .await
+                .into_response();
+        }
+        Err(TorrentOpenError::Open(err)) => {
+            return stream_open_failure_response(stream_id, &info_hash, idx, err);
+        }
     };
-    let mut file = match opened {
-        Ok(file) => file,
-        Err(err) => return stream_open_failure_response(stream_id, &info_hash, idx, err),
-    };
+    let lifecycle = stream.into_lifecycle();
     tracing::debug!(
         stream_id,
         info_hash = %info_hash,

@@ -5054,7 +5054,7 @@ fn a_stored_film_across_three_rar_volumes_in_a_torrent_is_served_by_range() -> a
 /// decides (`fixture_pins`). Seeded and offline, so a piece the server lets
 /// go of never comes back and a read of it parks.
 ///
-/// Each volume of the set is a `TorrentFileSource` that registers a stream
+/// Each volume of the set is a `TorrentSource` that registers a stream
 /// on its own file. Before the session held its volumes as one set
 /// (`Live::hold_set`), each of those opens moved the liveness cell to
 /// itself and the switch's slack drop passed over every other volume as
@@ -5334,7 +5334,7 @@ fn an_archive_body_keeps_its_torrent_running_while_it_is_open() -> anyhow::Resul
 /// So there are two claims here, and the second is the one that is easy to
 /// leave out of the code. The first is the switch: the pair of readings
 /// either side of it, which is the policy a viewer can see. The second is
-/// still `TorrentMemberStream::drop`'s spawned `on_stream_end` -- a `Drop`
+/// still an aside `TorrentSource`'s drop, a spawned `on_stream_end` -- a `Drop`
 /// cannot await the async locks itself -- and without it every archive
 /// member ever read leaves a stream registered for the life of the process.
 /// That does not stop the reconciler from doing anything (what it reads
@@ -6862,7 +6862,7 @@ fn buffer_profile_is_a_setting_and_a_stream_query_override() -> anyhow::Result<(
     Ok(())
 }
 
-/// **A `TorrentFileSource` registers its torrent's stream for as long as it
+/// **A `TorrentSource` registers its torrent's stream for as long as it
 /// is held, and a read of it seeks in the piece store** rather than reading
 /// its way to the byte it wants.
 ///
@@ -6887,7 +6887,7 @@ fn buffer_profile_is_a_setting_and_a_stream_query_override() -> anyhow::Result<(
 #[test]
 fn a_torrent_source_registers_its_stream_and_seeks_past_what_it_does_not_need() -> anyhow::Result<()>
 {
-    use stream_server::sources::{ByteSource, TorrentFileSource};
+    use stream_server::sources::{ByteSource, TorrentSource};
 
     const MEMBER: &str = "member.bin";
     const MEMBER_LEN: usize = 512 * 1024;
@@ -6925,7 +6925,7 @@ fn a_torrent_source_registers_its_stream_and_seeks_past_what_it_does_not_need() 
     // The source, opened on the torrent's one file and held for the rest of
     // the test -- which is what a translated session does with it.
     let (engine, runtime) = handle.engine_for_tests();
-    let source = runtime.block_on(TorrentFileSource::open(engine, &info_hash, "fixture.zip"))?;
+    let source = runtime.block_on(TorrentSource::open(engine, &info_hash, "fixture.zip"))?;
     let opened = std::time::Instant::now();
 
     // **Before any read**, which is what makes this about the
@@ -7005,7 +7005,7 @@ fn a_torrent_source_registers_its_stream_and_seeks_past_what_it_does_not_need() 
     );
 
     // On the runtime, because ending the registration is an async call a
-    // `Drop` cannot make itself and so spawns (`TorrentMemberStream`).
+    // `Drop` cannot make itself and so spawns (`TorrentSource`'s drop).
     // And it does end: without that spawn every member ever read would
     // leave a stream registered for the life of the process.
     runtime.block_on(async move { drop(source) });
@@ -7018,6 +7018,285 @@ fn a_torrent_source_registers_its_stream_and_seeks_past_what_it_does_not_need() 
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// A server with one seeded torrent of two whole-piece films, `a.bin` and
+/// `b.bin`, for the [`stream_server::sources::TorrentSource`] tests: the
+/// server, its base URL, the hash, and each film's index (looked up, never
+/// assumed). The tempdirs are the caller's to hold.
+fn two_film_server(
+    config_dir: &std::path::Path,
+    cache_dir: &std::path::Path,
+    src: &std::path::Path,
+    film_len: usize,
+) -> anyhow::Result<(ServerHandle, String, String, usize, usize)> {
+    let content = src.join("Films");
+    std::fs::create_dir_all(&content)?;
+    write_payload(&content.join("a.bin"), film_len);
+    write_payload(&content.join("b.bin"), film_len);
+    let (torrent, info_hash) = real_torrent(&content);
+    let cache_root = resolved(&cache_dir.join("cache"));
+    stream_server::pretend_volume_space(&cache_root, u64::MAX);
+    let handle = stream_server::start(ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.join("config")),
+        cache_dir: Some(cache_root.clone()),
+        ..offline_config()
+    })?;
+    seed_piece_store(&cache_root, &torrent, &content);
+    let base = format!("http://{}", handle.http_addr());
+    bearer_client(&handle)?
+        .post(format!("{base}/create"))
+        .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
+        .send()?
+        .error_for_status()?;
+    let stats = stats_after_check(&handle, &info_hash)?;
+    let a = file_index(&stats, "a.bin");
+    let b = file_index(&stats, "b.bin");
+    Ok((handle, base, info_hash, a, b))
+}
+
+/// A [`stream_server::sources::TorrentSource`] that is dropped inside its
+/// runtime's context however the test ends: its drop spawns (the stream's
+/// end), and a failed assertion unwinding past a bare source would turn
+/// the failure into an abort that hides it.
+struct HeldSource {
+    source: Option<stream_server::sources::TorrentSource>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl std::ops::Deref for HeldSource {
+    type Target = stream_server::sources::TorrentSource;
+    fn deref(&self) -> &Self::Target {
+        self.source.as_ref().expect("held until dropped")
+    }
+}
+
+impl Drop for HeldSource {
+    fn drop(&mut self) {
+        let _entered = self.runtime.enter();
+        drop(self.source.take());
+    }
+}
+
+/// What `source` reads from `offset` to its end, through a reader opened
+/// there -- a body read, as `MemberView` makes one.
+fn read_source_from(
+    runtime: &tokio::runtime::Handle,
+    source: &stream_server::sources::TorrentSource,
+    offset: u64,
+) -> anyhow::Result<Vec<u8>> {
+    use stream_server::sources::{ByteSource, ReadHint};
+    use tokio::io::AsyncReadExt;
+    runtime
+        .block_on(async {
+            tokio::time::timeout(CHECK_WAIT_BOUND, async {
+                let mut reader = source.open(offset, ReadHint::REST).await?;
+                let mut read = Vec::new();
+                reader.read_to_end(&mut read).await?;
+                Ok::<_, std::io::Error>(read)
+            })
+            .await
+        })?
+        .map_err(Into::into)
+}
+
+/// **A `TorrentSource` with a play is the viewer's playback**: its first
+/// read is the stream route's own open, so it moves the viewer's play
+/// session to its file and opens the reader shared -- under the default
+/// budget, which covers the film, the draw is the whole film at once, as
+/// [`only_the_players_request_shares_anything`] has it for a `p=` request.
+///
+/// Nothing before the first read: the open is the route's, and the route's
+/// open is at an offset.
+#[test]
+fn a_torrent_source_with_a_play_moves_the_session_and_shares() -> anyhow::Result<()> {
+    const FILM_LEN: usize = 128 * 1024;
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let (handle, base, info_hash, a, _) =
+        two_film_server(config_dir.path(), cache_dir.path(), src.path(), FILM_LEN)?;
+    let film = std::fs::read(src.path().join("Films").join("a.bin"))?;
+    let film_url = format!("{base}/{info_hash}/{a}");
+    let committed = || -> anyhow::Result<Option<u64>> {
+        Ok(handle
+            .stream_numbers(&film_url)?
+            .and_then(|numbers| numbers.sharing)
+            .and_then(|sharing| sharing.committed_bytes))
+    };
+
+    let (_engine, runtime) = handle.engine_for_tests();
+    let source = handle.played_torrent_source_for_tests(
+        &info_hash,
+        a,
+        stream_server::sources::Play {
+            token: "tv.1".to_string(),
+            buffer: Default::default(),
+            shares: true,
+        },
+    )?;
+    let source = HeldSource {
+        source: Some(source),
+        runtime: runtime.clone(),
+    };
+    assert_eq!(handle.play_session_of("tv.1"), None);
+
+    assert_eq!(read_source_from(&runtime, &source, 0)?, film);
+    assert_eq!(
+        handle.play_session_of("tv.1"),
+        Some(enginefs::retention::sessions::Played::Torrent {
+            info_hash: info_hash.clone(),
+            file_idx: a,
+            shares: true,
+        }),
+        "the played source's open did not move the viewer's session"
+    );
+    assert_eq!(
+        committed()?,
+        Some(FILM_LEN as u64),
+        "the played source's open shares nothing"
+    );
+
+    drop(source);
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// **A `TorrentSource` without a play is an aside**: it reads unshared and
+/// touches no session. The viewer's player is on film `a` (a `p=`
+/// request, which draws the whole film under the default budget); an
+/// aside then reads all of film `b` of the same torrent. The session stays
+/// on `a`, `a`'s draw is what it was, and `b` shares nothing.
+#[test]
+fn a_torrent_source_without_a_play_shares_nothing_and_moves_no_session() -> anyhow::Result<()> {
+    const FILM_LEN: usize = 128 * 1024;
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let (handle, base, info_hash, a, b) =
+        two_film_server(config_dir.path(), cache_dir.path(), src.path(), FILM_LEN)?;
+    let committed = |file_idx: usize| -> anyhow::Result<Option<u64>> {
+        Ok(handle
+            .stream_numbers(&format!("{base}/{info_hash}/{file_idx}"))?
+            .and_then(|numbers| numbers.sharing)
+            .and_then(|sharing| sharing.committed_bytes))
+    };
+    reqwest::blocking::Client::new()
+        .get(format!("{base}/{info_hash}/{a}?p=tv.1"))
+        .send()?
+        .error_for_status()?
+        .bytes()?;
+    let session = Some(enginefs::retention::sessions::Played::Torrent {
+        info_hash: info_hash.clone(),
+        file_idx: a,
+        shares: true,
+    });
+    assert_eq!(handle.play_session_of("tv.1"), session);
+    let shared = committed(a)?;
+    assert_eq!(shared, Some(FILM_LEN as u64));
+
+    let (engine, runtime) = handle.engine_for_tests();
+    let source = runtime.block_on(stream_server::sources::TorrentSource::open(
+        engine, &info_hash, "b.bin",
+    ))?;
+    let source = HeldSource {
+        source: Some(source),
+        runtime: runtime.clone(),
+    };
+    let film_b = std::fs::read(src.path().join("Films").join("b.bin"))?;
+    assert_eq!(read_source_from(&runtime, &source, 0)?, film_b);
+
+    assert_eq!(
+        handle.play_session_of("tv.1"),
+        session,
+        "the aside moved the viewer's session"
+    );
+    assert_eq!(
+        committed(a)?,
+        shared,
+        "the aside changed what the film shares"
+    );
+    assert_eq!(committed(b)?, None, "the aside's file shares something");
+
+    drop(source);
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// **A seek in a played `TorrentSource` is a new handle at the offset, and
+/// nothing else**: the stream registration and the play session are the
+/// source's, made by its first read and held until it is dropped, so a
+/// second reader -- what a seek is -- neither moves the session again nor
+/// registers anew.
+///
+/// The viewer's player goes on from film `a` to film `b` *on the same
+/// screen* (a current request, which moves the session), and then the
+/// source over `a` is read again at an offset. The session stays on `b`:
+/// a reopen that ran the whole open again would put it back on `a`. And
+/// the read answers from the offset, the engine having been told it.
+#[test]
+fn a_seek_in_a_played_torrent_source_reopens_at_the_offset_and_moves_nothing() -> anyhow::Result<()>
+{
+    const FILM_LEN: usize = 128 * 1024;
+    const SEEK_TO: u64 = 80 * 1024;
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let (handle, base, info_hash, a, b) =
+        two_film_server(config_dir.path(), cache_dir.path(), src.path(), FILM_LEN)?;
+    let film_a = std::fs::read(src.path().join("Films").join("a.bin"))?;
+    // Film `a` is kept as a download: left by the viewer, it would
+    // otherwise be taken off the disk before the seek reads it, and there
+    // is nothing offline to fetch it back from.
+    handle.pin_download(&info_hash, a, &[])?;
+
+    let (engine, runtime) = handle.engine_for_tests();
+    let source = handle.played_torrent_source_for_tests(
+        &info_hash,
+        a,
+        stream_server::sources::Play {
+            token: "tv.1".to_string(),
+            buffer: Default::default(),
+            shares: true,
+        },
+    )?;
+    let source = HeldSource {
+        source: Some(source),
+        runtime: runtime.clone(),
+    };
+    assert_eq!(read_source_from(&runtime, &source, 0)?, film_a);
+
+    reqwest::blocking::Client::new()
+        .get(format!("{base}/{info_hash}/{b}?p=tv.1"))
+        .send()?
+        .error_for_status()?
+        .bytes()?;
+    let on_b = Some(enginefs::retention::sessions::Played::Torrent {
+        info_hash: info_hash.clone(),
+        file_idx: b,
+        shares: true,
+    });
+    assert_eq!(handle.play_session_of("tv.1"), on_b);
+
+    assert_eq!(
+        read_source_from(&runtime, &source, SEEK_TO)?,
+        &film_a[SEEK_TO as usize..],
+        "the reopened reader answered from somewhere other than the offset"
+    );
+    assert_eq!(
+        handle.play_session_of("tv.1"),
+        on_b,
+        "the seek moved the viewer's session back: it ran the whole open again"
+    );
+
+    drop(engine);
+    drop(source);
     handle.shutdown()?;
     handle.join()?;
     Ok(())

@@ -329,7 +329,7 @@ impl ServerHandle {
     }
 
     /// This server's torrent engine, and the runtime it runs on, for a
-    /// test that has to reach a `crate::sources::TorrentFileSource` rather
+    /// test that has to reach a `crate::sources::TorrentSource` rather
     /// than go through a route.
     ///
     /// `#[doc(hidden)]` and no part of the embeddable API: an embedder
@@ -340,6 +340,29 @@ impl ServerHandle {
     #[doc(hidden)]
     pub fn engine_for_tests(&self) -> (Arc<enginefs::EngineFS>, tokio::runtime::Handle) {
         (self.state.engine.clone(), self.runtime.clone())
+    }
+
+    /// File `file_idx` of the torrent `info_hash` as a
+    /// [`sources::TorrentSource`] played by `play` -- the source whose
+    /// first read is the stream route's own open -- for a test that has to
+    /// hold one. Read it on [`Self::engine_for_tests`]'s runtime, and drop
+    /// it there.
+    ///
+    /// `#[doc(hidden)]` for the same reason as that one: a played source
+    /// needs the server's state (the disk gate drops the proxy cache's
+    /// slack too), which nothing outside the crate can name.
+    #[doc(hidden)]
+    pub fn played_torrent_source_for_tests(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+        play: sources::Play,
+    ) -> anyhow::Result<sources::TorrentSource> {
+        let state = self.state.clone();
+        let info_hash = info_hash.to_string();
+        Ok(self.block_on_server(async move {
+            sources::TorrentSource::played(&state, &info_hash, file_idx, play).await
+        })??)
     }
 
     pub fn bound_http_addr(&self) -> SocketAddr {

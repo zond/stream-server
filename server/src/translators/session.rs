@@ -434,8 +434,8 @@ pub enum SessionSources {
     /// ordinary archive, the volumes in order for a set -- **opened per
     /// read and dropped with the body**.
     ///
-    /// A `TorrentFileSource` registers a stream on its torrent for as long
-    /// as it lives (`sources::torrent::TorrentMemberStream`), and that
+    /// A `TorrentSource` registers a stream on its torrent for as long
+    /// as it lives (`sources::torrent::TorrentSource`, ended by its drop), and that
     /// registration is what tells this server a player is reading: hold
     /// one for the session's life and the reconciler could never stop a
     /// torrent whose container was once opened -- which, now that a

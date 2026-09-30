@@ -1,7 +1,7 @@
 use crate::routes::compat;
 use crate::routes::util::{self, MediaRange};
 use crate::sources::proxy::ProxySourceError;
-use crate::sources::{ByteSource, ProxySource, TorrentFileSource};
+use crate::sources::{ByteSource, ProxySource, TorrentSource};
 use crate::state::AppState;
 use crate::translators::session::{Lease, SessionSources, TranslatedSession};
 use crate::translators::{Body as MemberBody, Refusal, Translator};
@@ -795,7 +795,7 @@ async fn stream_translated(
 ///
 /// A `torrent:<info hash>/<path>` key names its torrent by a hash, and a
 /// hash is hex whatever its case: the engine folds it before it looks a
-/// torrent up (`TorrentFileSource`), so `torrent:ABC…/film.rar` and
+/// torrent up (`TorrentSource`), so `torrent:ABC…/film.rar` and
 /// `torrent:abc…/film.rar` name one archive -- filed as written, they would
 /// be two sessions over it, each indexing it and each holding a lease. Only
 /// the hash is folded; the path is the torrent's own and its case means
@@ -839,7 +839,7 @@ async fn session_for(
     // the translator's own naming rules say which and in what order
     // (`translators::rar::volume_set`). A format that does not come in
     // sets answers with the one file, which is the trait's default.
-    let siblings = TorrentFileSource::file_names(&state.engine, info_hash)
+    let siblings = TorrentSource::file_names(&state.engine, info_hash)
         .await
         .map_err(|error| {
             tracing::warn!(%info_hash, %error, "no such torrent in this engine");
@@ -864,7 +864,7 @@ async fn session_for(
     });
     let mut sources: Vec<Arc<dyn ByteSource>> = Vec::with_capacity(paths.len());
     for volume in &paths {
-        let source = TorrentFileSource::open(state.engine.clone(), info_hash, volume)
+        let source = TorrentSource::open(state.engine.clone(), info_hash, volume)
             .await
             .map_err(|error| {
                 tracing::warn!(%info_hash, archive = %volume, %error, "no such archive in that torrent");
@@ -914,7 +914,7 @@ async fn sources_for(
             // `Extent`'s `source` indexes this list.
             let mut sources: Vec<Arc<dyn ByteSource>> = Vec::with_capacity(paths.len());
             for path in paths {
-                let source = TorrentFileSource::open(state.engine.clone(), info_hash, path)
+                let source = TorrentSource::open(state.engine.clone(), info_hash, path)
                     .await
                     .map_err(|error| {
                         tracing::warn!(%info_hash, archive = %path, %error, "the torrent this archive is in is gone");

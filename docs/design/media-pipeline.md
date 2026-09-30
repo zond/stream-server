@@ -609,7 +609,8 @@ As each step lands, not beside it:
 
 * **`TorrentFileSource` and `TorrentMemberStream`** (`sources/torrent.rs`, 297
   lines), by step A. `TorrentSource` (2.2) replaces both, and the archive
-  route's `torrent:` form and `file_names` move onto it.
+  route's `torrent:` form and `file_names` move onto it. *(Done, step A's
+  first slice: `routes::stream::open_torrent_stream` is the factored open.)*
 * **`lan_media_routes()` as an allow-list of route groups** -- the function,
   `lan_stream_routes()`, `archive_stream_routes()`, the LAN arms of the
   stream route (`lan_stream_video`, `lan_head_stream_video`,

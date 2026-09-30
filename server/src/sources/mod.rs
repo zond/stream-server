@@ -20,7 +20,7 @@
 //! * [`MemberView`](crate::sources::MemberView) -- several extents of several sources as one file, which
 //!   is what a member of a container is. It is a `ByteSource` too, so a
 //!   translator can sit on another translator's member;
-//! * [`torrent::TorrentFileSource`](crate::sources::torrent::TorrentFileSource) over a torrent's file,
+//! * [`torrent::TorrentSource`](crate::sources::torrent::TorrentSource) over a torrent's file (a player's or an aside),
 //!   [`proxy::ProxySource`](crate::sources::proxy::ProxySource) over an HTTP entity through `/proxy`'s cache,
 //!   and [`drive::DriveSource`](crate::sources::drive::DriveSource) over a file in a paired Google Drive --
 //!   which is the second of those with a header supplier that renews its
@@ -43,7 +43,7 @@ pub mod view;
 
 pub use drive::{DriveError, DrivePairing, DriveSource};
 pub use proxy::ProxySource;
-pub use torrent::TorrentFileSource;
+pub use torrent::{Play, TorrentSource};
 pub use view::{MemberReader, MemberView};
 
 /// A reader over a source's bytes: what [`ByteSource::open`] hands out.
