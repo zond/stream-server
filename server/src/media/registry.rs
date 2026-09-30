@@ -18,13 +18,14 @@
 
 use super::reader::{self, MediaReader, Source};
 use super::{GrantSupplier, MediaId, MediaSpec, PlayToken, Refusal, Resolved};
+use crate::routes::archive::{self, ArchiveCreateRequest, Format};
 use crate::routes::compat;
 use crate::sources::held::HeldSource;
 use crate::sources::local::{LocalFile, LocalSource};
-use crate::sources::{ByteSource, DriveSource, Play, ProxySource, TorrentSource};
+use crate::sources::{ByteSource, DriveSource, Play, ProxySource, ReadHint, TorrentSource};
 use crate::state::AppState;
 use crate::stream_numbers::{StreamFile, StreamNumbers};
-use crate::translators::session::{Lease, Sessions};
+use crate::translators::session::{Lease, SessionSources, Sessions, TranslatedSession};
 use enginefs::backend::TorrentHandle;
 use enginefs::backend::priorities::BufferProfile;
 use std::collections::BTreeMap;
@@ -99,6 +100,35 @@ enum Target {
         file: LocalFile,
         name: Option<String>,
     },
+    /// A member of a container, by the archive routes' own URLs: a
+    /// `/{fmt}/create` (the container behind links) or a
+    /// `/{fmt}/stream/{key}[/member]` (the `torrent:` form, or a session a
+    /// create already made).
+    Member {
+        format: Format,
+        container: Container,
+        /// The member the URL names, or `None` for the one the create's
+        /// rule picks (`routes::archive::chosen_member`).
+        member: Option<String>,
+        /// `fileIdx` and `fileMustInclude` (or `f`) of a `/stream/{key}`
+        /// with no member, as the route's redirect reads them.
+        file_idx: Option<usize>,
+        file_must_include: Vec<String>,
+    },
+}
+
+/// Where a member's container session comes from.
+#[derive(Clone)]
+pub(crate) enum Container {
+    /// A `/{fmt}/create`, its `lz` payload parsed as the route parses it,
+    /// under the key the URL names (`/create/{key}`) or one of the id's own.
+    Create {
+        key: Option<String>,
+        payload: ArchiveCreateRequest,
+    },
+    /// A session key: `torrent:<info hash>/<path>`, which is indexed on
+    /// first use, or one a create made.
+    Key(String),
 }
 
 /// What resolving an id found.
@@ -140,6 +170,24 @@ pub(crate) enum Resolution {
     },
     /// A file on this device, open.
     Local { source: Arc<LocalSource> },
+    /// A member of a container. The session is found again at each open
+    /// ([`member_session`]), not kept here: a session no reader leases is
+    /// the archive map's to let go when the viewer moves on, and made again
+    /// from this -- a key, and for a link-borne container its create.
+    Member {
+        format: Format,
+        /// The session's key in the archive map.
+        key: String,
+        /// The create that makes the session again, for a container behind
+        /// links; `None` for the `torrent:` form, whose key is enough.
+        create: Option<ArchiveCreateRequest>,
+        /// The member's path inside its container.
+        name: String,
+        len: u64,
+        /// The torrent the container is in and its volumes' file indices,
+        /// in set order; `None` for a container behind links.
+        torrent: Option<(String, Vec<usize>)>,
+    },
 }
 
 impl Resolution {
@@ -154,8 +202,11 @@ impl Resolution {
         match self {
             Self::Drive { source, .. } => source.needs_pairing_again(),
             Self::Held { source, .. } => !state.proxy_cache.retention().is_pinned(source.key_dir()),
-            Self::Torrent { .. } | Self::Http { .. } | Self::WillNotRange { .. } => false,
-            Self::Local { .. } => false,
+            Self::Torrent { .. }
+            | Self::Http { .. }
+            | Self::WillNotRange { .. }
+            | Self::Member { .. }
+            | Self::Local { .. } => false,
         }
     }
 
@@ -219,6 +270,36 @@ impl Resolution {
                 in_process: true,
                 proxy_url: None,
             },
+            Self::Member { name, len, .. } => Resolved {
+                name: name.clone(),
+                content_type: mime_guess::from_path(name)
+                    .first_or_octet_stream()
+                    .to_string(),
+                len: *len,
+                member: Some(super::MemberInfo {
+                    name: name.clone(),
+                    len: *len,
+                }),
+                in_process: true,
+                proxy_url: None,
+            },
+        }
+    }
+
+    /// The one torrent file a member's container is, when it is one: what
+    /// its play session is on, and what a player's reports about the film
+    /// are about. `None` for a set, whose play session shares nothing, and
+    /// for a container behind links.
+    fn container_file(&self) -> Option<(String, usize)> {
+        match self {
+            Self::Member {
+                torrent: Some((info_hash, files)),
+                ..
+            } => match files.as_slice() {
+                [file_idx] => Some((info_hash.clone(), *file_idx)),
+                _ => None,
+            },
+            _ => None,
         }
     }
 }
@@ -316,6 +397,11 @@ impl Registry {
             }
             // Nothing is fetched or shared: no numbers to show.
             Resolution::Local { .. } => None,
+            resolution @ Resolution::Member { .. } => {
+                let (info_hash, file_idx) = resolution.container_file()?;
+                crate::stream_numbers::stream_numbers(state, &format!("/{info_hash}/{file_idx}"))
+                    .await
+            }
         }
     }
 
@@ -325,18 +411,35 @@ impl Registry {
         let Some(resolution) = self.peek(id) else {
             return false;
         };
-        let key_dir = match &*resolution {
-            Resolution::Http { source, .. } => source.key_dir(),
-            Resolution::Drive { source, .. } => source.key_dir(),
-            _ => None,
+        let registered = |dir: Option<std::path::PathBuf>| {
+            dir.is_some_and(|dir| state.proxy_cache.retention().has_source(&dir))
         };
-        key_dir.is_some_and(|dir| state.proxy_cache.retention().has_source(&dir))
+        match &*resolution {
+            Resolution::Http { source, .. } => registered(source.key_dir()),
+            Resolution::Drive { source, .. } => registered(source.key_dir()),
+            Resolution::Member { key, .. } => {
+                state
+                    .translated_archives
+                    .get(key)
+                    .is_some_and(|session| match session.sources() {
+                        SessionSources::Held(sources) => {
+                            sources.iter().any(|source| registered(source.key_dir()))
+                        }
+                        SessionSources::Torrent { .. } => false,
+                    })
+            }
+            _ => false,
+        }
     }
 
     /// The torrent file `id` resolved to, for the reports a player makes
     /// about one (`note_duration`, `note_player_opened`,
     /// `note_player_stalled`). `None` for anything else, which those reports
     /// are not about, and for an id not resolved yet.
+    ///
+    /// For a member of a single-file container in a torrent, that file: the
+    /// film's duration is the member's, and the play session's draw divides
+    /// the member's extent by it.
     pub(crate) fn torrent_file(&self, id: &MediaId) -> Option<(String, usize)> {
         match &*self.peek(id)? {
             Resolution::Torrent {
@@ -344,6 +447,7 @@ impl Registry {
                 file_idx,
                 ..
             } => Some((info_hash.clone(), *file_idx)),
+            resolution @ Resolution::Member { .. } => resolution.container_file(),
             _ => None,
         }
     }
@@ -395,9 +499,12 @@ impl Registry {
                             Play {
                                 token: play.token,
                                 buffer: set_buffer.unwrap_or(play.buffer),
-                                // Today's rule, decided here and never by
-                                // the app: archive playback shares nothing.
+                                // Decided here and never by the app: a
+                                // container played as itself shares
+                                // nothing. Its member played through an id
+                                // is the member path below, which does.
                                 shares: !crate::routes::stream::played_through_a_translator(name),
+                                member: None,
                             },
                         )
                         .await
@@ -463,9 +570,167 @@ impl Registry {
                 }
                 Source::Shared(source.clone())
             }
+            Resolution::Member {
+                format,
+                key,
+                create,
+                name,
+                ..
+            } => {
+                let session = member_session(state, *format, key, create.as_ref()).await?;
+                open_member(state, session, name, play, set_buffer).await?
+            }
         };
         reader::open(entry, source).await
     }
+}
+
+/// The session a member's container is in, leased: found under its key, or
+/// made again -- indexed off the torrent's file for the `torrent:` form, the
+/// create run again for a container behind links.
+async fn member_session(
+    state: &AppState,
+    format: Format,
+    key: &str,
+    create: Option<&ArchiveCreateRequest>,
+) -> Result<Lease<TranslatedSession>, Refusal> {
+    let translator = archive::translator_for(format).map_err(Refusal::of_session)?;
+    if let Some(payload) = create {
+        if let Some(session) = state.translated_archives.get(key) {
+            return Ok(session);
+        }
+        return archive::create_session(state, translator.as_ref(), key.to_string(), payload)
+            .await
+            .map(|(session, _)| session)
+            .map_err(Refusal::of_session);
+    }
+    archive::session_for(state, translator.as_ref(), key)
+        .await
+        .map_err(Refusal::of_session)
+}
+
+/// A reader's source over the member `name` of `session`'s container
+/// (`docs/design/media-pipeline.md` §2.8), holding the session's lease for
+/// the reader's life.
+///
+/// **What it shares.** With a play, a member of a **single-file container
+/// in a torrent** is the viewer's playback of that file: its source is
+/// played, with the member's byte extent, so the play session is on the
+/// container file, draws, and draws inside the member. A **multi-volume
+/// set** opens each volume played but sharing nothing -- a play session
+/// names one file and a set's member crosses several (step A2). A
+/// container **behind links** is a proxied entity: the session goes off
+/// every torrent file and what the player reads is read ahead of, as for a
+/// `/proxy` id. Without a play every volume is an aside, and nothing moves.
+async fn open_member(
+    state: &AppState,
+    session: Lease<TranslatedSession>,
+    name: &str,
+    play: Option<PlayToken>,
+    set_buffer: Option<BufferProfile>,
+) -> Result<Source, Refusal> {
+    let member = session
+        .member(name)
+        .ok_or_else(|| Refusal::NoSuchFile(format!("the archive holds no member {name}")))?
+        .clone();
+    let crate::translators::Body::Direct(extents) = &member.body else {
+        let crate::translators::Body::Opaque(refusal) = member.body else {
+            unreachable!("a body is direct or opaque")
+        };
+        return Err(Refusal::Translated(refusal));
+    };
+    let mut sources: Vec<Arc<dyn ByteSource>> = Vec::new();
+    let mut played: Vec<Arc<TorrentSource>> = Vec::new();
+    match session.sources() {
+        SessionSources::Held(held) => {
+            if let Some(play) = &play {
+                state.engine.note_player(
+                    &play.token,
+                    enginefs::retention::sessions::Played::Elsewhere,
+                );
+                for source in held {
+                    read_ahead(state, source);
+                }
+            }
+            sources.extend(
+                held.iter()
+                    .map(|source| source.clone() as Arc<dyn ByteSource>),
+            );
+        }
+        SessionSources::Torrent {
+            info_hash, paths, ..
+        } => {
+            let names = TorrentSource::file_names(&state.engine, info_hash)
+                .await
+                .map_err(|error| Refusal::OpenFailed(error.to_string()))?;
+            // One file: the member's extent in it is where the film is,
+            // and what its session draws inside. A set shares nothing.
+            let single = paths.len() == 1;
+            let extent = single.then(|| extent_of(extents)).flatten();
+            for path in paths {
+                let file_idx = names.iter().position(|name| name == path).ok_or_else(|| {
+                    Refusal::NoSuchFile(format!("the torrent holds no file {path}"))
+                })?;
+                match &play {
+                    Some(play) => {
+                        let source = Arc::new(
+                            TorrentSource::played(
+                                state,
+                                info_hash,
+                                file_idx,
+                                Play {
+                                    token: play.token.clone(),
+                                    buffer: set_buffer.unwrap_or(play.buffer),
+                                    shares: single,
+                                    member: extent.clone(),
+                                },
+                            )
+                            .await
+                            .map_err(|error| Refusal::OpenFailed(error.to_string()))?,
+                        );
+                        played.push(source.clone());
+                        sources.push(source);
+                    }
+                    None => sources.push(Arc::new(
+                        TorrentSource::aside(state.engine.clone(), info_hash, file_idx)
+                            .await
+                            .map_err(|error| Refusal::OpenFailed(error.to_string()))?,
+                    )),
+                }
+            }
+        }
+    }
+    let view = session
+        .view(&member, sources)
+        .map_err(|error| Refusal::OpenFailed(error.to_string()))?;
+    // The viewer's play session moves, and the stream registers, before
+    // the reader is handed over, as a torrent id's does: a view opens its
+    // sources lazily, at its first read, so the first extent's is opened
+    // here.
+    if let Some(first) = extents.first()
+        && let Some(source) = played.get(first.source)
+    {
+        source
+            .open(first.offset, ReadHint::REST)
+            .await
+            .map_err(|error| reader::refusal_of(&error))?;
+    }
+    Ok(Source::Member {
+        view,
+        played,
+        _session: session,
+    })
+}
+
+/// The bytes of its one file a member occupies, first to last: the hull of
+/// its extents, which for a stored member is the one run it is.
+fn extent_of(extents: &[crate::sources::Extent]) -> Option<std::ops::Range<u64>> {
+    let start = extents.iter().map(|extent| extent.offset).min()?;
+    let end = extents
+        .iter()
+        .map(|extent| extent.offset + extent.len)
+        .max()?;
+    (start < end).then_some(start..end)
 }
 
 /// Register `source`'s entity for read-ahead, as `/proxy` does for a
@@ -531,10 +796,11 @@ fn parse(url: &Url) -> Result<Target, Refusal> {
             path_and_query,
         });
     }
-    match url.path_segments().and_then(|mut segments| segments.next()) {
-        Some("rar" | "zip" | "7zip" | "tar" | "tgz" | "iso") => Err(Refusal::NotYet {
-            what: "a file inside an archive",
-        }),
+    let prefix = url.path_segments().and_then(|mut segments| segments.next());
+    if let Some(format) = prefix.and_then(Format::of_prefix) {
+        return parse_member(url, format);
+    }
+    match prefix {
         Some("ftp") => Err(Refusal::NotYet {
             what: "a file on an FTP server",
         }),
@@ -542,8 +808,71 @@ fn parse(url: &Url) -> Result<Target, Refusal> {
     }
 }
 
+/// An archive route's URL: `/{fmt}/create[/{key}]?lz=...` as the route
+/// reads its payload, or `/{fmt}/stream/{key}[/member]` (and
+/// `/{fmt}/stream?key=&file=`) as the stream routes read theirs.
+fn parse_member(url: &Url, format: Format) -> Result<Target, Refusal> {
+    let segments: Vec<String> = url
+        .path_segments()
+        .into_iter()
+        .flatten()
+        .skip(1)
+        .map(|segment| {
+            urlencoding::decode(segment)
+                .map(|decoded| decoded.into_owned())
+                .unwrap_or_else(|_| segment.to_string())
+        })
+        .collect();
+    let query = |name: &str| {
+        url.query_pairs()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.into_owned())
+    };
+    match segments.first().map(String::as_str) {
+        Some("create") => {
+            let payload = archive::parse_create_request(query("lz"), &axum::body::Bytes::new())
+                .map_err(Refusal::BadRequest)?;
+            Ok(Target::Member {
+                format,
+                container: Container::Create {
+                    key: segments.get(1).filter(|key| !key.is_empty()).cloned(),
+                    payload,
+                },
+                member: None,
+                file_idx: None,
+                file_must_include: Vec::new(),
+            })
+        }
+        Some("stream") => {
+            let (key, member) = match segments.get(1).filter(|key| !key.is_empty()) {
+                Some(key) => {
+                    let member = segments[2..].join("/");
+                    (key.clone(), (!member.is_empty()).then_some(member))
+                }
+                None => (
+                    query("key").ok_or(Refusal::UnrecognisedUrl)?,
+                    query("file").filter(|file| !file.is_empty()),
+                ),
+            };
+            let selection = archive::MemberSelection {
+                file_idx: query("fileIdx").and_then(|idx| idx.parse().ok()),
+                file_must_include: query("fileMustInclude").or_else(|| query("f")),
+            };
+            Ok(Target::Member {
+                format,
+                container: Container::Key(key),
+                member,
+                file_idx: selection.file_idx,
+                file_must_include: selection.file_must_include(),
+            })
+        }
+        _ => Err(Refusal::UnrecognisedUrl),
+    }
+}
+
 /// The work `resolve` does, once per id: add or find the torrent and
-/// choose its file; probe the origin; renew the Drive grant.
+/// choose its file; probe the origin; renew the Drive grant; index a
+/// member's container and find the member in it.
 async fn resolve(state: &AppState, target: &Target) -> Result<Resolution, Refusal> {
     match target {
         Target::Torrent {
@@ -683,6 +1012,64 @@ async fn resolve(state: &AppState, target: &Target) -> Result<Resolution, Refusa
                 source: Arc::new(source),
             })
         }
+        Target::Member {
+            format,
+            container,
+            member,
+            file_idx,
+            file_must_include,
+        } => {
+            let (key, create) = match container {
+                Container::Create { key, payload } => (
+                    key.clone()
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    Some(payload.clone()),
+                ),
+                Container::Key(key) => (key.clone(), None),
+            };
+            let session = member_session(state, *format, &key, create.as_ref()).await?;
+            let name = match member {
+                Some(name) => name.clone(),
+                None => archive::chosen_member(&session, *file_idx, file_must_include)
+                    .map_err(Refusal::of_session)?
+                    .ok_or_else(|| {
+                        Refusal::NoSuchFile("the archive holds no member to play".to_string())
+                    })?,
+            };
+            let found = session.member(&name).ok_or_else(|| {
+                Refusal::NoSuchFile(format!("the archive holds no member {name}"))
+            })?;
+            if let crate::translators::Body::Opaque(refusal) = &found.body {
+                return Err(Refusal::Translated(refusal.clone()));
+            }
+            let len = found.len;
+            let torrent = match session.sources() {
+                SessionSources::Held(_) => None,
+                SessionSources::Torrent {
+                    info_hash, paths, ..
+                } => {
+                    let names = TorrentSource::file_names(&state.engine, info_hash)
+                        .await
+                        .map_err(|error| Refusal::NoSuchFile(error.to_string()))?;
+                    let files = paths
+                        .iter()
+                        .map(|path| names.iter().position(|name| name == path))
+                        .collect::<Option<Vec<usize>>>()
+                        .ok_or_else(|| {
+                            Refusal::NoSuchFile("a volume of the archive left its torrent".into())
+                        })?;
+                    Some((info_hash.to_lowercase(), files))
+                }
+            };
+            Ok(Resolution::Member {
+                format: *format,
+                key,
+                create,
+                name,
+                len,
+                torrent,
+            })
+        }
     }
 }
 
@@ -750,26 +1137,119 @@ mod tests {
         assert_eq!(link_name(&target), "The Film.mkv");
     }
 
-    /// Recognised, and refused for now: the archive and FTP forms are a
-    /// later step, and saying so beats calling them unknown.
+    /// Recognised, and refused for now: the FTP form is a later step, and
+    /// saying so beats calling it unknown.
     #[test]
-    fn an_archive_create_and_an_ftp_url_are_not_yet_playable_by_id() {
-        for url in [
-            "http://127.0.0.1:1/rar/create?lz=abc",
-            "http://127.0.0.1:1/zip/create/key",
-            "http://127.0.0.1:1/ftp/ftp%3A%2F%2Fhost%2Ffilm.mkv",
-        ] {
-            assert_eq!(
-                parsed(url).err().map(|refusal| refusal.kind()),
-                Some("notYet"),
-                "{url}"
-            );
-        }
+    fn an_ftp_url_is_not_yet_playable_by_id() {
+        assert_eq!(
+            parsed("http://127.0.0.1:1/ftp/ftp%3A%2F%2Fhost%2Ffilm.mkv")
+                .err()
+                .map(|refusal| refusal.kind()),
+            Some("notYet")
+        );
         assert_eq!(
             parsed("http://127.0.0.1:1/settings")
                 .err()
                 .map(|refusal| refusal.kind()),
             Some("unrecognisedUrl")
         );
+    }
+
+    /// **A player's reports about a member are about its container file**
+    /// -- the one torrent file a single-file container is, where the play
+    /// session draws and the film's duration divides the member's extent
+    /// -- and about nothing for a set, whose session shares nothing, or a
+    /// container behind links.
+    #[test]
+    fn a_members_reports_are_its_single_container_files() {
+        let registry = Registry::new();
+        let member = |torrent: Option<(String, Vec<usize>)>| Resolution::Member {
+            format: Format::Rar,
+            key: "key".to_string(),
+            create: None,
+            name: "film.mkv".to_string(),
+            len: 1,
+            torrent,
+        };
+        let hash = "ab".repeat(20);
+        for (torrent, expected) in [
+            (Some((hash.clone(), vec![3])), Some((hash.clone(), 3))),
+            (Some((hash.clone(), vec![3, 4, 5])), None),
+            (None, None),
+        ] {
+            let id = registry
+                .register(MediaSpec::StreamingUrl(
+                    Url::parse("http://127.0.0.1:1/rar/stream/key/film.mkv").expect("a URL"),
+                ))
+                .expect("registered");
+            let entry = registry.entry(&id).expect("the entry");
+            *entry.resolution.try_lock().expect("nobody resolving") =
+                Some(Arc::new(member(torrent)));
+            drop(entry);
+            assert_eq!(registry.torrent_file(&id), expected);
+        }
+    }
+
+    /// **An archive URL is read as its route reads it**: a `/create`'s
+    /// `lz` payload by the route's own decoder, which refuses a payload it
+    /// cannot decode or a create with none as the route's `400` does; the
+    /// `torrent:` form's key and member path decoded as the stream route's
+    /// path extractor decodes them; and a `/stream/{key}` with no member
+    /// keeps the redirect's `fileIdx` and `f` for the rule to pick with.
+    #[test]
+    fn an_archive_url_is_read_as_its_route_reads_it() {
+        let lz = lz_str::compress_to_encoded_uri_component(
+            r#"{"urls":["https://cdn.example/a.part1.rar","https://cdn.example/a.part2.rar"],"fileIdx":1}"#,
+        );
+        let Ok(Target::Member {
+            format: Format::Rar,
+            container: Container::Create { key: None, payload },
+            member: None,
+            ..
+        }) = parsed(&format!("http://127.0.0.1:1/rar/create?lz={lz}"))
+        else {
+            panic!("not a create");
+        };
+        assert_eq!(payload.urls.len(), 2);
+        assert_eq!(payload.file_idx, Some(1));
+        for url in [
+            "http://127.0.0.1:1/rar/create?lz=abc",
+            "http://127.0.0.1:1/zip/create/key",
+        ] {
+            assert_eq!(
+                parsed(url).err().map(|refusal| refusal.kind()),
+                Some("badRequest"),
+                "{url}"
+            );
+        }
+
+        let hash = "ab".repeat(20);
+        let Ok(Target::Member {
+            format: Format::Zip,
+            container: Container::Key(key),
+            member,
+            ..
+        }) = parsed(&format!(
+            "http://127.0.0.1:1/zip/stream/torrent:{hash}%2FRelease%20One%2Ffixture.zip/videos/the%20film.mkv"
+        ))
+        else {
+            panic!("not a member");
+        };
+        assert_eq!(key, format!("torrent:{hash}/Release One/fixture.zip"));
+        assert_eq!(member.as_deref(), Some("videos/the film.mkv"));
+
+        let Ok(Target::Member {
+            member: None,
+            file_idx,
+            file_must_include,
+            ..
+        }) = parsed(&format!(
+            "http://127.0.0.1:1/iso/stream/torrent:{hash}%2Fdisc.iso?fileIdx=2&f=main,feature"
+        ))
+        else {
+            panic!("not a member");
+        };
+        assert_eq!(file_idx, Some(2));
+        assert_eq!(file_must_include, ["main", "feature"]);
     }
 }

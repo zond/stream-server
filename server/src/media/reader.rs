@@ -17,8 +17,8 @@
 
 use super::Refusal;
 use super::registry::Entry;
-use crate::sources::{ByteSource, ReadHint, SeekableReader, TorrentSource};
-use crate::translators::session::Lease;
+use crate::sources::{ByteSource, MemberView, ReadHint, SeekableReader, TorrentSource};
+use crate::translators::session::{Lease, TranslatedSession};
 use bytes::Bytes;
 use enginefs::backend::priorities::BufferProfile;
 use std::io;
@@ -59,6 +59,16 @@ pub(crate) enum Source {
     /// Shared with the registry entry: a proxied or Drive entity, whose
     /// source holds no registration of its own.
     Shared(Arc<dyn ByteSource>),
+    /// A member of a container: the view over its volumes, the volumes
+    /// opened as the viewer's playback (none for an aside or a container
+    /// behind links), and the lease on the container's session -- held for
+    /// the reader's life, so the session, and a set's volume hold with it,
+    /// is not let go under a reader (§2.4).
+    Member {
+        view: MemberView,
+        played: Vec<Arc<TorrentSource>>,
+        _session: Lease<TranslatedSession>,
+    },
 }
 
 impl Source {
@@ -66,6 +76,7 @@ impl Source {
         match self {
             Self::Torrent(source) => source.as_ref(),
             Self::Shared(source) => source.as_ref(),
+            Self::Member { view, .. } => view,
         }
     }
 
@@ -73,6 +84,17 @@ impl Source {
         match self {
             Self::Torrent(_) => "torrent",
             Self::Shared(_) => "http",
+            Self::Member { .. } => "member",
+        }
+    }
+
+    /// The torrent files this source reads as the viewer's playback, whose
+    /// opens take the viewer's read-ahead choice.
+    fn played(&self) -> Vec<&TorrentSource> {
+        match self {
+            Self::Torrent(source) => vec![source.as_ref()],
+            Self::Member { played, .. } => played.iter().map(AsRef::as_ref).collect(),
+            Self::Shared(_) => Vec::new(),
         }
     }
 
@@ -273,7 +295,7 @@ pub(crate) async fn open(entry: Lease<Entry>, source: Source) -> Result<MediaRea
 
 /// Why an open failed, as a refusal: the disk gate's refusal and a dead
 /// Drive grant as themselves.
-fn refusal_of(error: &io::Error) -> Refusal {
+pub(super) fn refusal_of(error: &io::Error) -> Refusal {
     if error.kind() == io::ErrorKind::StorageFull {
         return Refusal::InsufficientDiskSpace;
     }
@@ -371,13 +393,13 @@ impl Task {
         }
         // The viewer's read-ahead choice, if it has changed: the lookahead
         // is worked out at an open, and this is one.
-        if let Source::Torrent(source) = &self.source {
-            let buffer = *self
-                .entry
-                .buffer
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(buffer) = buffer {
+        let buffer = *self
+            .entry
+            .buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(buffer) = buffer {
+            for source in self.source.played() {
                 source.set_buffer(buffer).await;
             }
         }
@@ -395,11 +417,12 @@ impl Task {
 /// the two pieces rather than the task: the task's reader is not `Sync`,
 /// so a borrow of the whole task cannot be held across the await.
 async fn show_buffer(source: &Source, shown: &Shown) {
-    if let Source::Torrent(source) = source {
-        let buffer = source.buffer_in_use().await;
-        *shown
-            .opened_with
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = buffer;
+    let mut buffer = None;
+    for played in source.played() {
+        buffer = buffer.or(played.buffer_in_use().await);
     }
+    *shown
+        .opened_with
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = buffer;
 }

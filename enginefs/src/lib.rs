@@ -8185,6 +8185,7 @@ mod tests {
             info_hash: info_hash.to_string(),
             file_idx,
             shares: true,
+            member: None,
         }
     }
 
@@ -17577,6 +17578,96 @@ mod tests {
         drop(stream);
     }
 
+    /// A play session on the member at `bytes` of `file_idx` of
+    /// `info_hash`, sharing it: what the member path of a media id tells.
+    fn played_member(
+        info_hash: &str,
+        file_idx: usize,
+        bytes: std::ops::Range<u64>,
+    ) -> crate::retention::sessions::Played {
+        crate::retention::sessions::Played::Torrent {
+            info_hash: info_hash.to_string(),
+            file_idx,
+            shares: true,
+            member: Some(bytes),
+        }
+    }
+
+    /// **A member's play session shares its own extent, and its container
+    /// is not sniffed.** The file's first bytes are not held -- a file
+    /// played as itself would wait for them, and would then draw nothing,
+    /// being an archive -- and the budget covers the file: the draw is
+    /// made at the open, and it is the pieces the member's bytes lie in
+    /// and nothing else of the container.
+    #[tokio::test]
+    async fn a_members_session_draws_its_own_extent_without_sniffing_its_container() {
+        use crate::backend::priorities::{BufferProfile, Fetching};
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.rar".into(), 1000)]);
+        // Pieces of 25 bytes: the member's bytes 110..590 lie in 4..24.
+        counters.pieces_per_file.store(40, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(1_000_000));
+        counters.file_heads.lock().unwrap().insert(0, None);
+        enginefs.note_player(PLAYER, played_member(TEST_HASH, 0, 110..590));
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        let stream = engine
+            .try_get_file_with_intent(0, 110, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("the stream");
+        let extent: std::collections::BTreeSet<u32> = (4..24).collect();
+        assert_eq!(
+            engine.retention.draw_of(&0),
+            Some(extent.clone()),
+            "the member's session drew something other than its extent"
+        );
+        assert_eq!(
+            fake_advertises(&counters),
+            extent.into_iter().collect::<Vec<_>>()
+        );
+        drop(stream);
+    }
+
+    /// **A member's draw is sized from the member's length over the film's
+    /// duration**, never the container's: under a budget too small for the
+    /// member, the committed half is capped by the film's rate, and the
+    /// rate is the member's. Pieces of 250 bytes, a container of 10 000
+    /// bytes, a member of its first 5 000, a film of 1 000 s: the member's
+    /// 5 B/s over the 90 committed seconds buys one piece, where the
+    /// container's 10 B/s would have bought three. The open states no
+    /// read-ahead of its own, so the rate's is the one the draw is sized
+    /// beside.
+    #[tokio::test]
+    async fn a_members_draw_is_sized_from_the_members_rate() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.zip".into(), 10_000)]);
+        counters.pieces_per_file.store(40, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(4_000));
+        enginefs.note_player(PLAYER, played_member(TEST_HASH, 0, 0..5_000));
+        engine
+            .begin_retention_opening(
+                0,
+                crate::piece_store::Buffering {
+                    window_seconds: Some(90),
+                    committed_seconds: Some(crate::backend::priorities::COMMITTED_SECONDS),
+                    ..Default::default()
+                },
+                crate::retention::owner::Opener::Player,
+            )
+            .await;
+        assert_eq!(engine.retention.draw_of(&0), None, "drawn before the rate");
+        engine.told_duration(0, Duration::from_secs(1_000));
+        engine.retention.settle_draw(&0).await;
+        let draw = engine
+            .retention
+            .draw_of(&0)
+            .expect("drawn once the rate is known");
+        assert_eq!(draw.len(), 1, "sized from the container's rate: {draw:?}");
+        assert!(
+            draw.iter().all(|piece| *piece < 20),
+            "drawn outside the member: {draw:?}"
+        );
+    }
+
     /// **A draw whose first bytes were read across a move is not made.**
     /// The play session's draw waits on the file's head; while that read
     /// is parked the viewer's next screen moves its session to another
@@ -17617,6 +17708,52 @@ mod tests {
             "a draw was made for a file the viewer had left"
         );
         assert!(fake_advertises(&counters).is_empty());
+    }
+
+    /// **A draw whose first bytes were read across a move onto a member of
+    /// the file is not made over the file.** The viewer played the file as
+    /// itself, and while its head read is parked the member path puts the
+    /// session on a member of the same file: the draw asked for the whole
+    /// file must not be recorded, and the next decision is the member's.
+    #[tokio::test]
+    async fn a_draw_whose_head_read_straddles_a_move_onto_a_member_is_not_made_over_the_file() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(1_000_000));
+        let (entered, release) = (
+            tokio::sync::oneshot::channel::<()>(),
+            tokio::sync::oneshot::channel::<()>(),
+        );
+        *counters.head_gate.lock().unwrap() = Some((entered.0, release.1));
+        enginefs.note_player(PLAYER, played(TEST_HASH, 0));
+        let open = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.begin_retention(0).await }
+        });
+        tokio::time::timeout(TEST_WAIT_BOUND, entered.1)
+            .await
+            .expect("the draw reads the file's head")
+            .expect("the gate");
+
+        enginefs.note_player("tv.2", played_member(TEST_HASH, 0, 0..1));
+        release.0.send(()).expect("the parked head read");
+        tokio::time::timeout(TEST_WAIT_BOUND, open)
+            .await
+            .expect("the open finishes")
+            .expect("the open task");
+        assert_eq!(
+            engine.retention.draw_of(&0),
+            None,
+            "a draw was made over the file the viewer now plays a member of"
+        );
+        engine.retention.settle_draw(&0).await;
+        assert_eq!(
+            engine.retention.draw_of(&0),
+            Some(std::iter::once(0).collect()),
+            "the member's draw"
+        );
+        assert_eq!(fake_advertises(&counters), vec![0]);
     }
 
     /// **The next episode's reader does not wait on the last episode's

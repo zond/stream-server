@@ -23,6 +23,11 @@ use stream_server::{MediaId, MediaReader, MediaSpec, PlayToken, Refusal, ServerC
 #[path = "support/fixture_pins.rs"]
 mod fixture_pins;
 
+/// The hand-built RAR archives, shared with the translator's own tests.
+#[cfg(feature = "rar")]
+#[path = "support/rar_fixtures.rs"]
+mod rar_fixtures;
+
 /// The offline config, the control client and a real torrent.
 #[path = "support/torrent_fixtures.rs"]
 mod torrent_fixtures;
@@ -104,13 +109,28 @@ impl TorrentFixture {
         film_len: usize,
         keep: impl Fn(usize) -> bool,
     ) -> anyhow::Result<Self> {
+        let files = names
+            .iter()
+            .map(|name| (*name, payload(film_len)))
+            .collect::<Vec<_>>();
+        Self::start_with(config, &files, keep)
+    }
+
+    /// [`Self::start`] over files of the caller's own bytes: an archive, a
+    /// set of volumes.
+    fn start_with(
+        config: ServerConfig,
+        files: &[(&str, Vec<u8>)],
+        keep: impl Fn(usize) -> bool,
+    ) -> anyhow::Result<Self> {
+        let names = files.iter().map(|(name, _)| *name).collect::<Vec<_>>();
         let config_dir = tempfile::tempdir()?;
         let cache_dir = tempfile::tempdir()?;
         let src = tempfile::tempdir()?;
         let content = src.path().join("Films");
         std::fs::create_dir_all(&content)?;
-        for name in names {
-            std::fs::write(content.join(name), payload(film_len))?;
+        for (name, bytes) in files {
+            std::fs::write(content.join(name), bytes)?;
         }
         let (torrent, info_hash) = real_torrent(&content);
         let cache_root = stream_server::resolved_path(&cache_dir.path().join("cache"));
@@ -786,6 +806,7 @@ fn a_reader_with_a_play_moves_the_session_and_draws_and_one_without_does_neither
         info_hash: fixture.info_hash.clone(),
         file_idx: a,
         shares: true,
+        member: None,
     });
 
     let reader = fixture.handle.open_reader(
@@ -1157,4 +1178,271 @@ fn a_drive_id_whose_grant_died_is_resolved_again_with_a_new_grant() -> anyhow::R
     handle.shutdown()?;
     handle.join()?;
     Ok(())
+}
+
+// --- Members of containers --------------------------------------------------
+
+/// Where `member` sits in `container`: the one run a stored member is.
+#[cfg(feature = "rar")]
+fn extent_in(container: &[u8], member: &[u8]) -> std::ops::Range<u64> {
+    let at = container
+        .windows(64)
+        .position(|window| window == &member[..64])
+        .expect("the member's bytes in its container");
+    assert_eq!(&container[at..at + member.len()], member, "stored whole");
+    at as u64..(at + member.len()) as u64
+}
+
+/// The torrent pieces `bytes` of a single-file torrent lie in.
+#[cfg(feature = "rar")]
+fn pieces_of(bytes: &std::ops::Range<u64>) -> std::ops::RangeInclusive<u32> {
+    (bytes.start / PIECE as u64) as u32..=((bytes.end - 1) / PIECE as u64) as u32
+}
+
+/// The `torrent:` form's URL for `member` of the torrent's file `archive`.
+fn member_url(fixture: &TorrentFixture, format: &str, archive: &str, member: &str) -> url::Url {
+    url::Url::parse(&format!(
+        "{}/{format}/stream/torrent:{}%2F{archive}/{member}",
+        fixture.base, fixture.info_hash
+    ))
+    .expect("a member URL")
+}
+
+/// A stored ZIP of `members`, written by the crate the rest of the world
+/// uses.
+fn stored_zip(members: &[(&str, &[u8])]) -> Vec<u8> {
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime to write the fixture with");
+    runtime.block_on(async {
+        let mut writer = async_zip::base::write::ZipFileWriter::with_tokio(Vec::new());
+        for (name, data) in members {
+            writer
+                .write_entry_whole(
+                    async_zip::ZipEntryBuilder::new((*name).into(), async_zip::Compression::Stored)
+                        .build(),
+                    data,
+                )
+                .await
+                .expect("write the member");
+        }
+        writer.close().await.expect("close the zip").into_inner()
+    })
+}
+
+/// **A member of a single-file RAR played through an id shares its own
+/// extent, and only it.** The RAR holds the film and, after it, an extra
+/// five times its size -- so a draw sized from the container, or made
+/// anywhere in it, is a different number and different pieces. The budget
+/// covers the file, so a film's draw is the whole of what it is drawn
+/// over: here the pieces the member lies in, which is what is committed
+/// and what librqbit is told to announce. The play session is on the
+/// container file, sharing, with the member's extent; and a panel asking by
+/// id is told the container file's numbers.
+#[cfg(feature = "rar")]
+#[test]
+fn a_member_of_a_single_file_rar_played_by_id_shares_its_own_extent() -> anyhow::Result<()> {
+    let film = rar_fixtures::signposted(8 * PIECE + 1234);
+    let extra = payload(40 * PIECE);
+    let rar = rar_fixtures::rar5_stored(&[("film.mkv", &film), ("extras.nfo", &extra)]);
+    let extent = extent_in(&rar, &film);
+    let fixture =
+        TorrentFixture::start_with(offline_config(), &[("film.rar", rar.clone())], |_| true)?;
+    let id = fixture.handle.register(MediaSpec::StreamingUrl(member_url(
+        &fixture, "rar", "film.rar", "film.mkv",
+    )))?;
+    let resolved = fixture.handle.resolve(&id)?;
+    assert_eq!(resolved.name, "film.mkv");
+    assert_eq!(resolved.len, film.len() as u64);
+    assert_eq!(
+        resolved.member,
+        Some(stream_server::media::MemberInfo {
+            name: "film.mkv".to_string(),
+            len: film.len() as u64,
+        })
+    );
+
+    let reader = fixture.handle.open_reader(
+        &id,
+        Some(PlayToken {
+            token: "tv.1".to_string(),
+            buffer: Default::default(),
+        }),
+    )?;
+    assert_eq!(
+        fixture.handle.play_session_of("tv.1"),
+        Some(enginefs::retention::sessions::Played::Torrent {
+            info_hash: fixture.info_hash.clone(),
+            file_idx: fixture.index("film.rar"),
+            shares: true,
+            member: Some(extent.clone()),
+        }),
+        "opening the member did not put the session on its container"
+    );
+    let (reader, read) = within("the member reader", move || {
+        let mut reader = reader;
+        let read = read_to_end(&mut reader);
+        (reader, read)
+    })?;
+    assert_eq!(read?, film);
+
+    let pieces = pieces_of(&extent);
+    let member_pieces = u64::from(*pieces.end() - *pieces.start() + 1);
+    let container_pieces = rar.len().div_ceil(PIECE) as u64;
+    assert!(member_pieces < container_pieces);
+    assert_eq!(
+        fixture.committed("film.rar")?,
+        Some(member_pieces * PIECE as u64),
+        "the draw was not the member's pieces (the container has {container_pieces})"
+    );
+    let announced = fixture
+        .handle
+        .advertised_pieces(&fixture.info_hash)?
+        .expect("a torrent this server holds");
+    assert_eq!(
+        announced,
+        pieces.clone().collect::<Vec<_>>(),
+        "announced outside the member's extent"
+    );
+    assert_eq!(
+        fixture.handle.media_stream_numbers(&id)?,
+        fixture
+            .handle
+            .stream_numbers(fixture.url("film.rar").as_str())?
+    );
+
+    // The viewer's read-ahead choice reaches the container's stream at the
+    // next reopen, as a torrent id's does.
+    assert_eq!(reader.opened_with_buffer(), Some(Default::default()));
+    fixture
+        .handle
+        .set_buffer(&id, enginefs::backend::priorities::BufferProfile::Large)?;
+    let reader = within("the member reader's seek", move || {
+        let mut reader = reader;
+        reader.seek(PIECE as u64).map(|_| reader)
+    })??;
+    assert_eq!(
+        reader.opened_with_buffer(),
+        Some(enginefs::backend::priorities::BufferProfile::Large)
+    );
+    drop(reader);
+    fixture.stop()
+}
+
+/// **A member read through an id without a play is an aside**: it reads
+/// the member's bytes through the `torrent:` form, resolves to the member,
+/// and moves no play session and draws nothing -- here with a session
+/// already on another film of the torrent, which it must not take. ZIP, so
+/// the build without RAR runs it too.
+#[test]
+fn a_member_read_by_id_without_a_play_moves_nothing_and_draws_nothing() -> anyhow::Result<()> {
+    let film = payload(6 * PIECE + 77);
+    let extra = payload(20 * PIECE);
+    let zip = stored_zip(&[("film.mkv", &film), ("extras.nfo", &extra)]);
+    let fixture = TorrentFixture::start_with(
+        offline_config(),
+        &[("fixture.zip", zip), ("other.bin", payload(4 * PIECE))],
+        |_| true,
+    )?;
+    let other = fixture.register("other.bin")?;
+    let playing = fixture.handle.open_reader(
+        &other,
+        Some(PlayToken {
+            token: "tv.1".to_string(),
+            buffer: Default::default(),
+        }),
+    )?;
+    let session = fixture.handle.play_session_of("tv.1");
+    assert!(session.is_some());
+
+    let id = fixture.handle.register(MediaSpec::StreamingUrl(member_url(
+        &fixture,
+        "zip",
+        "fixture.zip",
+        "film.mkv",
+    )))?;
+    let resolved = fixture.handle.resolve(&id)?;
+    assert_eq!(
+        resolved.member,
+        Some(stream_server::media::MemberInfo {
+            name: "film.mkv".to_string(),
+            len: film.len() as u64,
+        })
+    );
+    let reader = fixture.handle.open_reader(&id, None)?;
+    let (reader, read) = within("the aside member reader", move || {
+        let mut reader = reader;
+        let read = read_to_end(&mut reader);
+        (reader, read)
+    })?;
+    assert_eq!(read?, film);
+    assert_eq!(
+        fixture.handle.play_session_of("tv.1"),
+        session,
+        "the aside moved the viewer's session"
+    );
+    assert_eq!(
+        fixture.committed("fixture.zip")?,
+        None,
+        "the aside's container draws"
+    );
+    drop((reader, playing));
+    fixture.stop()
+}
+
+/// **A member of a multi-volume RAR set played through an id shares
+/// nothing** -- the exception (the design's §2.8, until step A2): each
+/// volume is opened as the viewer's playback sharing nothing, so the
+/// session is on the torrent and no volume draws, while the film reads
+/// whole across the set. What the set's hold does for the volumes' bytes
+/// is `embed.rs`'s `a_rar_set_read_across_its_volumes_keeps_the_volumes_it_read`.
+#[cfg(feature = "rar")]
+#[test]
+fn a_member_of_a_rar_set_played_by_id_shares_nothing() -> anyhow::Result<()> {
+    let film = rar_fixtures::signposted(9 * PIECE);
+    let volumes = rar_fixtures::rar5_volumes(&[("film.mkv", &film)], 4 * PIECE);
+    let names = rar_fixtures::part_names("film", volumes.len());
+    let files = names
+        .iter()
+        .map(String::as_str)
+        .zip(volumes)
+        .collect::<Vec<_>>();
+    let fixture = TorrentFixture::start_with(offline_config(), &files, |_| true)?;
+    let id = fixture.handle.register(MediaSpec::StreamingUrl(member_url(
+        &fixture, "rar", &names[0], "film.mkv",
+    )))?;
+    assert_eq!(fixture.handle.resolve(&id)?.len, film.len() as u64);
+    let reader = fixture.handle.open_reader(
+        &id,
+        Some(PlayToken {
+            token: "tv.1".to_string(),
+            buffer: Default::default(),
+        }),
+    )?;
+    let (reader, read) = within("the set's member reader", move || {
+        let mut reader = reader;
+        let read = read_to_end(&mut reader);
+        (reader, read)
+    })?;
+    assert_eq!(read?, film);
+    let Some(enginefs::retention::sessions::Played::Torrent {
+        info_hash,
+        shares,
+        member,
+        ..
+    }) = fixture.handle.play_session_of("tv.1")
+    else {
+        panic!("the member's play did not put the session on the torrent");
+    };
+    assert_eq!(info_hash, fixture.info_hash);
+    assert!(!shares, "a volume of the set shares");
+    assert_eq!(member, None);
+    for name in &names {
+        assert_eq!(fixture.committed(name)?, None, "{name} draws");
+    }
+    assert_eq!(
+        fixture.handle.advertised_pieces(&fixture.info_hash)?,
+        Some(Vec::new()),
+        "the set announced something"
+    );
+    drop(reader);
+    fixture.stop()
 }

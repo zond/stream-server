@@ -615,6 +615,28 @@ pub trait Backing: Sized + Send + Sync + 'static {
         self.is_live(key)
     }
 
+    /// **Where in `key` the play session plays**, when it plays a member of
+    /// a container through the member path: the member's byte extent within
+    /// the entity. The draw is then sized from that extent's length and
+    /// made inside it ([`Self::narrowed`]), and [`Self::content_shares`] is
+    /// not asked -- the member path knows the entity is a container and
+    /// which bytes of it are the film. `None` -- the default -- is the
+    /// entity played as itself.
+    ///
+    /// A copy-out read like [`Self::plays`], asked with no owner lock held.
+    fn played_member(&self, _key: &Self::Key) -> Option<Range<u64>> {
+        None
+    }
+
+    /// `domain` narrowed to the pieces holding `bytes` of it (offsets into
+    /// the entity), with those bytes as its length: what a play session
+    /// on a member draws over. `None` when `bytes` is empty or reaches
+    /// past the entity, and for a backing with no members (the default).
+    /// Pure, like [`Self::policy`].
+    fn narrowed(_domain: &Self::Domain, _bytes: Range<u64>) -> Option<Self::Domain> {
+        None
+    }
+
     /// Whether `domain`'s content may be shared at all: `Some(false)` for an
     /// archive or a disc image, which the app plays through a translated
     /// source and which shares nothing; `None` while that cannot be told
@@ -1580,7 +1602,11 @@ impl<B: Backing> Retention<B> {
     ///
     /// **And not before the content is known** ([`Backing::content_shares`]):
     /// the file's first bytes held and not an archive's. An archive's play
-    /// session decides an empty draw.
+    /// session decides an empty draw -- unless the session plays a member of
+    /// it ([`Backing::played_member`]): then the content is not asked, and
+    /// the draw is sized and made over the member's extent alone
+    /// ([`Backing::narrowed`]), its rate the extent's length over the
+    /// stated duration.
     ///
     /// Recorded before it is advertised, so a reading of what the entity
     /// shares ([`Retention::draws`]) that sees the backend's announcement
@@ -1602,9 +1628,14 @@ impl<B: Backing> Retention<B> {
         if self.backing.keeps_everything(&entity.key) || !self.backing.plays(&entity.key) {
             return;
         }
+        // A member played through the member path: the path said what the
+        // file is -- a container -- and which of its bytes are the film.
+        let member = self.backing.played_member(&entity.key);
         // What the file is, asked of its first bytes once they are held --
         // off L2, and once per session: an archive shares nothing, and one
-        // that cannot be told yet waits.
+        // that cannot be told yet waits. Not asked for a member, whose
+        // container would answer "archive" to exactly the question the
+        // member path has already answered.
         let (domain, content) = {
             let state = entity.state.lock();
             if state.draw.is_some() || !state.player_opened {
@@ -1612,9 +1643,10 @@ impl<B: Backing> Retention<B> {
             }
             (state.domain.clone(), state.content)
         };
-        let content = match content {
-            Some(content) => content,
-            None => {
+        let content = match (&member, content) {
+            (Some(_), _) => true,
+            (None, Some(content)) => content,
+            (None, None) => {
                 let Some(content) = self.backing.content_shares(&domain).await else {
                     return;
                 };
@@ -1624,9 +1656,10 @@ impl<B: Backing> Retention<B> {
         };
         // Asked again, off L2 (rule 2) and with no await between it and the
         // record: the head read above can park, and a viewer who moved to
-        // another file meanwhile would have this draw recorded and
-        // advertised for a file no session plays.
-        if !self.backing.plays(&entity.key) {
+        // another file meanwhile -- or from the file to a member of it --
+        // would have this draw recorded and advertised for a file no
+        // session plays, or sized for bytes nobody plays.
+        if !self.backing.plays(&entity.key) || self.backing.played_member(&entity.key) != member {
             return;
         }
         let budget = self.budget.get();
@@ -1645,9 +1678,29 @@ impl<B: Backing> Retention<B> {
                 );
                 return;
             }
-            let buffering = state.draw_buffering(budget);
+            // What the draw is made over: the member's pieces, with its
+            // length, when the session plays a member -- a season in one
+            // container shares the episode being watched, not the
+            // container -- and the entity otherwise.
+            let over = match &member {
+                None => state.domain.clone(),
+                Some(bytes) => match B::narrowed(&state.domain, bytes.clone()) {
+                    Some(over) => over,
+                    None => {
+                        state.adopt_draw(&mut claim.guard, BTreeSet::new());
+                        drop(state);
+                        tracing::warn!(
+                            key = ?entity.key,
+                            ?bytes,
+                            "the played member names no bytes of its file; it shares nothing"
+                        );
+                        return;
+                    }
+                },
+            };
+            let buffering = state.draw_buffering(budget, &over);
             let (sized, refused) = match budget {
-                CacheBudget::Bytes(bytes) => match B::policy(&state.domain, bytes, buffering) {
+                CacheBudget::Bytes(bytes) => match B::policy(&over, bytes, buffering) {
                     Ok(policy) => (Some(policy), None),
                     Err(error) => (None, Some(error)),
                 },
@@ -2897,13 +2950,17 @@ impl<B: Backing> State<B> {
         // measurement this replaced, whose three bytes a second and
         // seventeen bytes a second both collapsed a window onto its floor
         // and stopped playback.
-        asked.bytes_per_second = self
-            .duration
-            .filter(|duration| !duration.is_zero())
-            .and_then(|duration| {
-                Some((B::bytes(&self.domain)? as f64 / duration.as_secs_f64()) as u64)
-            });
+        asked.bytes_per_second = self.rate_over(&self.domain);
         asked
+    }
+
+    /// `domain`'s bytes over the film's stated duration: the entity's own
+    /// rate, or -- for the draw of a play session on a member -- the
+    /// member's, whose film the duration is ([`Backing::narrowed`]).
+    fn rate_over(&self, domain: &B::Domain) -> Option<u64> {
+        self.duration
+            .filter(|duration| !duration.is_zero())
+            .and_then(|duration| Some((B::bytes(domain)? as f64 / duration.as_secs_f64()) as u64))
     }
 
     /// The head a pass for `about` is about: that reader's own head while
@@ -3163,8 +3220,13 @@ impl<B: Backing> State<B> {
     /// rate is known -- the read-ahead a later open is granted, the rate
     /// times the widest seconds the viewer asked for, never past the whole
     /// cache (`Engine::try_get_file_with_intent` asks exactly that).
-    fn draw_buffering(&self, budget: CacheBudget) -> Buffering {
+    ///
+    /// The rate is `over`'s: the entity's own domain, or the member a play
+    /// session plays inside it ([`Backing::narrowed`]), whose length the
+    /// stated duration is the film of.
+    fn draw_buffering(&self, budget: CacheBudget, over: &B::Domain) -> Buffering {
         let mut buffering = self.buffering().widest(self.asked);
+        buffering.bytes_per_second = self.rate_over(over);
         if let (Some(rate), Some(seconds)) = (buffering.bytes_per_second, buffering.window_seconds)
         {
             let granted = match budget {

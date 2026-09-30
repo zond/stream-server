@@ -519,8 +519,10 @@ impl ServerHandle {
     /// **Open a blocking reader over an id**, resolving it first if nothing
     /// has. With `play`, its reads are the viewer's playback: the play
     /// session moves to the file, and a torrent file shares unless it is
-    /// an archive (decided here, as the stream route decides it for
-    /// `p=`). Without one they are an aside, which moves nothing and shares
+    /// an archive played as itself (decided here, as the stream route
+    /// decides it for `p=`); a member of a single-file container in a
+    /// torrent shares its own extent of that file, and a member of a set
+    /// or of a container behind links shares nothing. Without one they are an aside, which moves nothing and shares
     /// nothing. The stream is registered before this returns. A reader
     /// holds no `ServerHandle`: stopping the server under it makes its
     /// calls answer an error. See [`media::reader`].
@@ -1146,6 +1148,20 @@ impl ServerHandle {
     #[doc(hidden)]
     pub fn play_session_of(&self, token: &str) -> Option<enginefs::retention::sessions::Played> {
         self.state.engine.live().sessions().of(token)
+    }
+
+    /// The pieces the torrent `info_hash` has told librqbit to advertise
+    /// (`TorrentHandle::advertised_pieces`), ascending, or `None` for a
+    /// torrent this engine does not hold: a probe for the tests of what a
+    /// play session announces, and nothing a client decides anything from.
+    #[doc(hidden)]
+    pub fn advertised_pieces(&self, info_hash: &str) -> anyhow::Result<Option<Vec<u32>>> {
+        let engine = self.state.engine.clone();
+        let info_hash = info_hash.to_lowercase();
+        self.block_on_server(async move {
+            let torrent = engine.get_engine(&info_hash).await?;
+            enginefs::backend::TorrentHandle::advertised_pieces(&torrent.handle).await
+        })
     }
 
     /// Start or stop the LAN media listener (see [`crate::lan_media`]): a

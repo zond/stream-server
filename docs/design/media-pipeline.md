@@ -502,7 +502,8 @@ draw is made inside that extent, so a season in one ZIP shares the episode
 being watched and not the ZIP. No reported number is scaled to make an
 arithmetic come out; a duration stays a duration. If carrying an extent into
 `retention::sessions` turns out too invasive for step A, the fallback is a
-`note_rate` beside `note_duration` -- never a scaled duration.
+`note_rate` beside `note_duration` -- never a scaled duration. (Built with
+the extent, in step A's third slice: §5.)
 
 **The exception: a multi-volume set keeps sharing nothing.** A play session
 names one file (`Played::Torrent { info_hash, file_idx }`), and a set's
@@ -639,9 +640,13 @@ As each step lands, not beside it:
   URLs and the non-ranging case needs `/proxy`; the rest go when nothing
   calls them, which is a later, separate step with its own grep.
 
-**Untouched**: the retention owner and its policies, the piece store, the
-proxy cache's internals, librqbit and its wiring, the reconciler, the
-liveness cell and the RAR set hold (`Live::hold_set`), and stremio-core.
+**Untouched**: the piece store, the proxy cache's internals, librqbit and
+its wiring, the reconciler, the liveness cell and the RAR set hold
+(`Live::hold_set`), and stremio-core. The retention owner gained one
+thing, by step A's third slice and for 2.8 alone: a play session on a
+member names its extent (`Backing::played_member`), and the draw is made
+over that extent (`Backing::narrowed`) with the content check skipped;
+nothing else about its policies changed.
 
 ## 5. Steps, in order, each shippable
 
@@ -666,7 +671,21 @@ A. **Server: one torrent source, ids, the reader task.** (L.) Factor the
    `notYet`. A played reader's stream ends with its own log line,
    `reader_stream_end`, not the route's. A pinned download that is whole
    resolves off the disk through `sources::held::HeldSource`, with no
-   origin asked. Member sharing is the third.)*
+   origin asked. Third slice done: an archive `/create?lz=` and the
+   `/{fmt}/stream/{key}[/member]` form (`torrent:` included) resolve to
+   the member, their HTTP errors lifted to `Refusal` through one
+   `routes::archive::SessionError`; a reader holds the session's lease for
+   its life. A member of a single-file container in a torrent, read with a
+   play, shares like a film: the play carries the member's byte extent
+   (`Play::member` → `Played::Torrent`'s `member`), the owner reads it
+   through `Backing::played_member`, skips the content check for it, and
+   draws over `Backing::narrowed` -- the member's pieces, the member's
+   length for the rate. A set's volumes open `shares: false`; a container
+   behind links is `Played::Elsewhere` with read-ahead. The HTTP route's
+   `played_through_a_translator` stays. Not done here: the stream's own
+   lookahead grant (`Retention::bitrate`) is still the container's length
+   over the duration; for a single film in a container the difference is
+   the headers, for a season in one ZIP it overstates the read-ahead.)*
 
 A2. **Play sessions understand sets.** (M.) `Played::Torrent` over a set of
    files, mirroring `Live::hold_set`; a move inside the set ends nothing;

@@ -429,7 +429,7 @@ pub enum SessionSources {
     /// Held for the session's life. An HTTP entity read through the proxy
     /// cache owns nothing and registers nothing, so keeping the source is
     /// keeping a URL, a length and a validator.
-    Held(Vec<Arc<dyn ByteSource>>),
+    Held(Vec<Arc<crate::sources::ProxySource>>),
     /// The files of a torrent the container is made of -- one for an
     /// ordinary archive, the volumes in order for a set -- **opened per
     /// read and dropped with the body**.

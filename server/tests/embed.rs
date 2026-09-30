@@ -4528,6 +4528,7 @@ fn only_the_players_request_shares_anything() -> anyhow::Result<()> {
             info_hash: info_hash.clone(),
             file_idx: 0,
             shares: true,
+            member: None,
         })
     );
 
@@ -4630,6 +4631,7 @@ fn an_older_screens_request_is_served_and_leaves_the_cell_where_it_is() -> anyho
             info_hash: info_hash.clone(),
             file_idx: 1,
             shares: true,
+            member: None,
         }),
         "or the viewer's session"
     );
@@ -4679,6 +4681,7 @@ fn an_archive_the_player_opens_shares_nothing() -> anyhow::Result<()> {
             info_hash: info_hash.clone(),
             file_idx: 0,
             shares: false,
+            member: None,
         }),
         "the player's session is on the archive, and shares nothing"
     );
@@ -7137,6 +7140,7 @@ fn a_torrent_source_with_a_play_moves_the_session_and_shares() -> anyhow::Result
             token: "tv.1".to_string(),
             buffer: Default::default(),
             shares: true,
+            member: None,
         },
     )?;
     let source = HeldSource {
@@ -7152,6 +7156,7 @@ fn a_torrent_source_with_a_play_moves_the_session_and_shares() -> anyhow::Result
             info_hash: info_hash.clone(),
             file_idx: a,
             shares: true,
+            member: None,
         }),
         "the played source's open did not move the viewer's session"
     );
@@ -7195,6 +7200,7 @@ fn a_torrent_source_without_a_play_shares_nothing_and_moves_no_session() -> anyh
         info_hash: info_hash.clone(),
         file_idx: a,
         shares: true,
+        member: None,
     });
     assert_eq!(handle.play_session_of("tv.1"), session);
     let shared = committed(a)?;
@@ -7264,6 +7270,7 @@ fn a_seek_in_a_played_torrent_source_reopens_at_the_offset_and_moves_nothing() -
             token: "tv.1".to_string(),
             buffer: Default::default(),
             shares: true,
+            member: None,
         },
     )?;
     let source = HeldSource {
@@ -7281,6 +7288,7 @@ fn a_seek_in_a_played_torrent_source_reopens_at_the_offset_and_moves_nothing() -
         info_hash: info_hash.clone(),
         file_idx: b,
         shares: true,
+        member: None,
     });
     assert_eq!(handle.play_session_of("tv.1"), on_b);
 

@@ -431,8 +431,10 @@ impl PlaybackQuery {
 /// opens such a file, fails to recognise it, and the app routes its member,
 /// so the file itself is never what plays.
 ///
-/// **Archive playback shares nothing**: a play session on one of these draws
-/// nothing ([`enginefs::retention::sessions::Played::Torrent`]'s `shares`).
+/// **A container played by its URL shares nothing**: a play session on one
+/// of these draws nothing ([`enginefs::retention::sessions::Played::Torrent`]'s
+/// `shares`). A member played through a media id is told by the member path
+/// instead, which knows the member's extent (`crate::media`).
 pub(crate) fn played_through_a_translator(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     let Some((_, extension)) = lower.rsplit_once('.') else {
@@ -862,14 +864,19 @@ pub(crate) const PLAYER_PRIORITY: u8 = 1;
 
 /// The viewer's player behind an open: `p=` on the route, a
 /// [`crate::sources::torrent::Play`] on a source.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Player<'a> {
     /// The player token, `<viewer>.<screen>`, as `p=` carries it.
     pub(crate) token: &'a str,
-    /// Whether this file may share at all: false for a file played through
-    /// a translator (`played_through_a_translator`) -- archive playback
-    /// shares nothing.
+    /// Whether this file may share at all: false for a container file the
+    /// HTTP route plays by name (`played_through_a_translator`) and for
+    /// each volume of a multi-volume set.
     pub(crate) shares: bool,
+    /// The member's byte extent in the file, when the file is a
+    /// single-file container whose member a media id plays
+    /// (`enginefs::retention::sessions::Played::Torrent`'s `member`): what
+    /// the session shares is then drawn inside it.
+    pub(crate) member: Option<std::ops::Range<u64>>,
 }
 
 /// What the caller of [`open_torrent_stream`] has resolved before the open:
@@ -1051,7 +1058,7 @@ pub(crate) async fn open_torrent_stream(
     //
     // An older screen's request is served and moves nothing: not the
     // session, and not the liveness cell either.
-    let shares = player.is_some_and(|player| player.shares);
+    let shares = player.as_ref().is_some_and(|player| player.shares);
     let heard = player.map(|player| {
         engine_fs.note_player(
             player.token,
@@ -1059,6 +1066,7 @@ pub(crate) async fn open_torrent_stream(
                 info_hash: info_hash.to_string(),
                 file_idx: idx,
                 shares,
+                member: player.member,
             },
         )
     });
@@ -1414,6 +1422,9 @@ async fn stream_video_with(
         player: query.player_token.as_deref().map(|token| Player {
             token,
             shares: !played_through_a_translator(&name),
+            // The route plays a file as itself: a container named here is
+            // a container, and shares nothing.
+            member: None,
         }),
         consumer: Consumer::Http,
     })

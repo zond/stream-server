@@ -58,9 +58,16 @@ pub struct Play {
     pub token: String,
     /// The viewer's read-ahead choice for this playback.
     pub buffer: BufferProfile,
-    /// Whether the file may share at all: false for a container file,
-    /// whose playback shares nothing.
+    /// Whether the file may share at all: false for a container file
+    /// played by its name and for each volume of a multi-volume set, which
+    /// share nothing.
     pub shares: bool,
+    /// The member's byte extent in this file, when the file is a
+    /// single-file container and what plays is a member of it
+    /// (`crate::media`): the play session's draw is then sized from the
+    /// member's length and made inside it. `None` for the file played as
+    /// itself.
+    pub member: Option<std::ops::Range<u64>>,
 }
 
 /// A [`Play`] and what its open needs beyond the engine, with the stream
@@ -304,7 +311,7 @@ impl TorrentSource {
         let torrent = Self::torrent(&self.engine, &self.info_hash).await?;
         let Some(played) = &self.play else {
             // **Unshared.** An aside's read is not a player's: it draws
-            // nothing -- archive playback shares nothing.
+            // nothing.
             let handle = torrent
                 .try_get_file_unshared(
                     self.file_idx,
@@ -347,6 +354,7 @@ impl TorrentSource {
             player: Some(Player {
                 token: &played.play.token,
                 shares: played.play.shares,
+                member: played.play.member.clone(),
             }),
             // A played source is read by a reader, never by a response
             // body: its end line says so rather than reporting a body that

@@ -976,6 +976,42 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         self.live.sessions().covers(&self.info_hash, *file_idx)
     }
 
+    /// The member extent the sessions sharing this file play in it
+    /// ([`crate::retention::sessions::PlaySessions::member_of`]).
+    fn played_member(&self, file_idx: &usize) -> Option<Range<u64>> {
+        self.live.sessions().member_of(&self.info_hash, *file_idx)
+    }
+
+    /// The pieces holding `bytes` of the file, and those bytes: the same
+    /// file, placed in the torrent where the member lies in it.
+    fn narrowed(domain: &FileDomain, bytes: Range<u64>) -> Option<FileDomain> {
+        let piece = domain.piece_length;
+        // Where the file's pieces end in the torrent: a whole piece each,
+        // except a short last piece at the torrent's end, which is what
+        // `FilePieceSpan::bytes` counts.
+        let span_end = u64::from(domain.span.pieces.start)
+            .checked_mul(piece)?
+            .checked_add(domain.span.bytes)?;
+        let start = domain.span.offset.checked_add(bytes.start)?;
+        let end = domain.span.offset.checked_add(bytes.end)?;
+        if bytes.is_empty() || end > span_end {
+            return None;
+        }
+        let first = u32::try_from(start / piece).ok()?;
+        let last = u32::try_from((end - 1) / piece).ok()?;
+        // What those pieces hold, counted as the file's own span is.
+        let pieces_end = (u64::from(last) + 1).saturating_mul(piece).min(span_end);
+        Some(FileDomain {
+            file_idx: domain.file_idx,
+            span: FilePieceSpan {
+                pieces: first..last + 1,
+                offset: domain.span.offset,
+                bytes: pieces_end - u64::from(first) * domain.piece_length,
+            },
+            piece_length: domain.piece_length,
+        })
+    }
+
     /// The file's first bytes, once the store holds them, against the
     /// archive signatures ([`crate::retention::sniff`]).
     async fn content_shares(&self, domain: &FileDomain) -> Option<bool> {

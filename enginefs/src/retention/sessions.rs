@@ -41,17 +41,27 @@
 //! and when a share ends.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 
 /// What a player token's session is on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Played {
-    /// One file of one torrent. `shares` is false for a file the server
-    /// plays through a translated source -- an archive, whose member is
-    /// served out of its volumes -- which shares nothing.
+    /// One file of one torrent. `shares` is false for a file played in a
+    /// way that shares nothing: a container file played by its URL, whose
+    /// member the player never names, and each volume of a multi-volume
+    /// set.
     Torrent {
         info_hash: String,
         file_idx: usize,
         shares: bool,
+        /// **The member's byte extent within the file**, when what plays
+        /// is a member of a single-file container opened through a media
+        /// id: the member path knows what the file is and where the film
+        /// lies in it. The draw is then sized from this extent's length and
+        /// made inside it, and the file's content is not sniffed -- it is a
+        /// container, and the member path said so. `None` for a file played
+        /// as itself.
+        member: Option<Range<u64>>,
     },
     /// Something that is not a torrent file: a proxied body.
     Elsewhere,
@@ -209,9 +219,35 @@ impl PlaySessions {
     /// session draws, and under which what it drew is still shared.
     pub fn covers(&self, info_hash: &str, file_idx: usize) -> bool {
         self.0.lock().by_viewer.values().any(|session| {
-            matches!(&session.played, Played::Torrent { info_hash: h, file_idx: f, shares: true }
+            matches!(&session.played, Played::Torrent { info_hash: h, file_idx: f, shares: true, .. }
                 if h == info_hash && *f == file_idx)
         })
+    }
+
+    /// **Where in `file_idx` of `info_hash` the sessions sharing it play**:
+    /// the member extent every session covering the file names
+    /// ([`Played::Torrent`]'s `member`). `None` when no session covers the
+    /// file, when one plays the file as itself, or when two name different
+    /// members -- each of which is the file as a whole, sized and sniffed
+    /// as one.
+    pub fn member_of(&self, info_hash: &str, file_idx: usize) -> Option<Range<u64>> {
+        let inner = self.0.lock();
+        let mut members = inner
+            .by_viewer
+            .values()
+            .filter_map(|session| match &session.played {
+                Played::Torrent {
+                    info_hash: h,
+                    file_idx: f,
+                    shares: true,
+                    member,
+                } if h == info_hash && *f == file_idx => Some(member.clone()),
+                _ => None,
+            });
+        let first = members.next()??;
+        members
+            .all(|member| member.as_ref() == Some(&first))
+            .then_some(first)
     }
 
     /// Whether a session is on some file of `info_hash`, sharing or not.
@@ -281,6 +317,7 @@ mod tests {
             info_hash: info_hash.to_string(),
             file_idx,
             shares: true,
+            member: None,
         }
     }
 
@@ -376,12 +413,48 @@ mod tests {
                 info_hash: "t".into(),
                 file_idx: 0,
                 shares: false,
+                member: None,
             },
         );
         assert!(
             !sessions.may_end_now("t", 0),
             "the file being played was marked left"
         );
+    }
+
+    /// **A member's extent is the file's only while every session sharing
+    /// the file names that one member**: a session playing the file as
+    /// itself, or another member, makes it the whole file again, and a
+    /// session that shares nothing names nothing.
+    #[test]
+    fn a_member_extent_is_the_one_every_sharing_session_names() {
+        let member = |bytes: Range<u64>| Played::Torrent {
+            info_hash: "t".into(),
+            file_idx: 0,
+            shares: true,
+            member: Some(bytes),
+        };
+        let sessions = PlaySessions::default();
+        assert_eq!(sessions.member_of("t", 0), None);
+        sessions.play("tv.1", member(100..900));
+        assert_eq!(sessions.member_of("t", 0), Some(100..900));
+        assert_eq!(sessions.member_of("t", 1), None);
+        sessions.play(
+            "phone.1",
+            Played::Torrent {
+                info_hash: "t".into(),
+                file_idx: 0,
+                shares: false,
+                member: None,
+            },
+        );
+        assert_eq!(sessions.member_of("t", 0), Some(100..900));
+        sessions.play("phone.2", member(100..900));
+        assert_eq!(sessions.member_of("t", 0), Some(100..900));
+        sessions.play("phone.3", member(0..50));
+        assert_eq!(sessions.member_of("t", 0), None, "two members");
+        sessions.play("phone.4", file("t", 0));
+        assert_eq!(sessions.member_of("t", 0), None, "the file as itself");
     }
 
     /// An archive's session is on the torrent but shares nothing.
@@ -394,6 +467,7 @@ mod tests {
                 info_hash: "t".into(),
                 file_idx: 0,
                 shares: false,
+                member: None,
             },
         );
         assert!(!sessions.covers("t", 0));

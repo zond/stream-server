@@ -70,6 +70,20 @@ pub enum Format {
 }
 
 impl Format {
+    /// The format a URL's first path segment names, as `crate::archive_prefixes`
+    /// mounts them.
+    pub(crate) fn of_prefix(prefix: &str) -> Option<Self> {
+        match prefix {
+            "rar" => Some(Self::Rar),
+            "zip" => Some(Self::Zip),
+            "7zip" => Some(Self::SevenZ),
+            "tar" => Some(Self::Tar),
+            "tgz" => Some(Self::TarGz),
+            "iso" => Some(Self::Iso),
+            _ => None,
+        }
+    }
+
     /// The translator for this format -- `None` only for RAR in a build
     /// without the `rar` feature, which has no reader for it at all and
     /// answers `rar_disabled_response` instead.
@@ -163,11 +177,12 @@ pub(crate) fn source_error_response(error: &ProxySourceError) -> Response {
     }
 }
 
-#[derive(Debug)]
-struct ArchiveCreateRequest {
-    urls: Vec<String>,
-    file_idx: Option<usize>,
-    file_must_include: Vec<String>,
+/// What a `/create` asks for: the volume list, and which member.
+#[derive(Debug, Clone)]
+pub(crate) struct ArchiveCreateRequest {
+    pub(crate) urls: Vec<String>,
+    pub(crate) file_idx: Option<usize>,
+    pub(crate) file_must_include: Vec<String>,
 }
 
 /// The whole archive API under one format prefix: [`session_router`] and
@@ -239,7 +254,7 @@ fn no_reader_response(message: &str) -> Response {
         .into_response()
 }
 
-fn parse_create_request(
+pub(crate) fn parse_create_request(
     lz: Option<String>,
     body: &axum::body::Bytes,
 ) -> Result<ArchiveCreateRequest, String> {
@@ -363,10 +378,104 @@ async fn create_session_internal(
         Ok(payload) => payload,
         Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
     };
-    let Some(translator) = format.translator() else {
-        return no_translator_response(format);
+    let translator = match translator_for(format) {
+        Ok(translator) => translator,
+        Err(error) => return error.response(),
     };
-    create_translated(&state, translator.as_ref(), key, method, payload).await
+    let (session, selected) =
+        match create_session(&state, translator.as_ref(), key.clone(), &payload).await {
+            Ok(made) => made,
+            Err(error) => return error.response(),
+        };
+    let selected_name = selected
+        .and_then(|at| session.index().members.get(at))
+        .map(|member| member.name.clone());
+    drop(session);
+
+    if method == Method::GET
+        && let Some(file) = selected_name
+    {
+        return Redirect::temporary(&format!(
+            "./stream/{}/{}",
+            urlencoding::encode(&key),
+            encode_path_segments(&file)
+        ))
+        .into_response();
+    }
+    Json(CreateResponse { key }).into_response()
+}
+
+/// Why a container's session could not be had -- made by a `/create`, found
+/// under a key, or indexed off a torrent's file for the `torrent:` form.
+///
+/// **One set of reasons, two framings.** The archive routes answer each with
+/// the status and body they always have ([`Self::response`]); a media id
+/// naming a member is refused with the same reason, typed
+/// (`crate::media::Refusal::of_session`). Neither framing lives in the
+/// other: the work is the same function for both.
+#[derive(Debug)]
+pub(crate) enum SessionError {
+    /// The create's payload, or a URL in it, cannot be taken (`400`, with
+    /// the sentence).
+    BadRequest(String),
+    /// A create under a key another archive's session holds (`409`).
+    KeyInUse,
+    /// A link that cannot be a source: `noRanges`, a `404`, a far end that
+    /// would not answer ([`source_error_response`]).
+    Source(ProxySourceError),
+    /// What the container says: a member or a whole container this server
+    /// will not serve by range (`415`/`422`).
+    Refused(Refusal),
+    /// The create's `fileIdx`/`fileMustInclude` matched no member (`404`).
+    NoMember,
+    /// No session under a key that no create or `torrent:` form can make
+    /// one from (`404`).
+    NoSession,
+    /// A `torrent:` key with no path in it (`400`).
+    BadKey,
+    /// The `torrent:` key names a torrent this engine does not hold, or a
+    /// file it does not have (`404`).
+    NotInTorrent,
+    /// This build has no reader for the format ([`no_translator_response`]).
+    NoReader(Format),
+}
+
+impl SessionError {
+    /// The archive routes' answer, exactly as each has always been.
+    pub(crate) fn response(&self) -> Response {
+        match self {
+            Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message.clone()).into_response(),
+            Self::KeyInUse => (
+                StatusCode::CONFLICT,
+                "That session key is in use for another archive",
+            )
+                .into_response(),
+            Self::Source(error) => source_error_response(error),
+            Self::Refused(refusal) => refusal_response(refusal),
+            Self::NoMember => {
+                (StatusCode::NOT_FOUND, "Failed to select archive file").into_response()
+            }
+            Self::NoSession | Self::NotInTorrent => StatusCode::NOT_FOUND.into_response(),
+            Self::BadKey => StatusCode::BAD_REQUEST.into_response(),
+            Self::NoReader(format) => no_translator_response(*format),
+        }
+    }
+}
+
+/// The translator for `format`, or why this build has none.
+pub(crate) fn translator_for(format: Format) -> Result<Box<dyn Translator>, SessionError> {
+    format.translator().ok_or(SessionError::NoReader(format))
+}
+
+/// The sentence a build with no reader for `format` says, for a client
+/// that is not answered with [`no_translator_response`]'s body.
+pub(crate) fn no_reader_message(format: Format) -> &'static str {
+    #[cfg(not(feature = "rar"))]
+    if format == Format::Rar {
+        return RAR_DISABLED_ERROR;
+    }
+    let _ = format;
+    "this build has no reader for that format"
 }
 
 /// What a format this build has no reader for answers.
@@ -382,7 +491,7 @@ fn no_translator_response(format: Format) -> Response {
         return rar_disabled_response();
     }
     tracing::error!(?format, "this build mounted a format it cannot read");
-    no_reader_response("this build has no reader for that format")
+    no_reader_response(no_reader_message(format))
 }
 
 /// How a set of volumes is named as one session.
@@ -399,7 +508,8 @@ fn set_origin(urls: &[String]) -> String {
 /// `/{zip|tar|rar}/create`: every URL becomes a [`ProxySource`], the
 /// translator indexes them **in the order they were given**, and what is
 /// remembered under the key is the index -- no file, nothing on disk,
-/// nothing to sweep but memory.
+/// nothing to sweep but memory. Answers the session, leased, and the
+/// member the request picked.
 ///
 /// The list is the volume list. For RAR that is the ordinary case: from an
 /// addon, `rarUrls` *is* `.part1.rar`, `.part2.rar`, ... in order, and the
@@ -407,15 +517,19 @@ fn set_origin(urls: &[String]) -> String {
 /// (`docs/design/translated-sources.md` §2.2). A format that does not come in
 /// sets reads `sources[0]` and says so about the rest, which is what every
 /// translator but RAR does.
-async fn create_translated(
+///
+/// The route's `/create` and a media id naming the same URL
+/// (`crate::media`) both make their session here.
+pub(crate) async fn create_session(
     state: &AppState,
     translator: &dyn Translator,
     key: String,
-    method: Method,
-    payload: ArchiveCreateRequest,
-) -> Response {
+    payload: &ArchiveCreateRequest,
+) -> Result<(Lease<TranslatedSession>, Option<usize>), SessionError> {
     let Some(url) = payload.urls.first() else {
-        return (StatusCode::BAD_REQUEST, "No archive URL provided").into_response();
+        return Err(SessionError::BadRequest(
+            "No archive URL provided".to_string(),
+        ));
     };
     // Only what the route is named for: archives at web addresses. This
     // route is open to any loopback caller -- on Android, every app on the
@@ -429,7 +543,9 @@ async fn create_translated(
         .iter()
         .all(|url| url.starts_with("http://") || url.starts_with("https://"))
     {
-        return (StatusCode::BAD_REQUEST, "Failed to resolve archive URL").into_response();
+        return Err(SessionError::BadRequest(
+            "Failed to resolve archive URL".to_string(),
+        ));
     }
     let origin = set_origin(&payload.urls);
     // A key the caller chose (`/{fmt}/create/{key}`) may name a session
@@ -444,11 +560,7 @@ async fn create_translated(
             key = %key,
             "a create under an existing session's key named a different archive; refused"
         );
-        return (
-            StatusCode::CONFLICT,
-            "That session key is in use for another archive",
-        )
-            .into_response();
+        return Err(SessionError::KeyInUse);
     }
 
     // A session that already holds this URL has already probed the origin
@@ -475,7 +587,7 @@ async fn create_translated(
             // `Extent`'s `source` is an index into this list, so a set
             // probed out of order would serve every part of the film from
             // the wrong volume.
-            let mut sources: Vec<Arc<dyn ByteSource>> = Vec::with_capacity(payload.urls.len());
+            let mut sources: Vec<Arc<ProxySource>> = Vec::with_capacity(payload.urls.len());
             for url in &payload.urls {
                 let parsed = match url::Url::parse(url) {
                     Ok(parsed) => parsed,
@@ -485,8 +597,9 @@ async fn create_translated(
                             %error,
                             "the archive URL does not parse"
                         );
-                        return (StatusCode::BAD_REQUEST, "Failed to resolve archive URL")
-                            .into_response();
+                        return Err(SessionError::BadRequest(
+                            "Failed to resolve archive URL".to_string(),
+                        ));
                     }
                 };
                 let source = match ProxySource::open(
@@ -507,12 +620,12 @@ async fn create_translated(
                             %error,
                             "the archive URL cannot be read by range"
                         );
-                        return source_error_response(&error);
+                        return Err(SessionError::Source(error));
                     }
                 };
                 sources.push(Arc::new(source));
             }
-            match translator.index(&sources).await {
+            match translator.index(&as_byte_sources(&sources)).await {
                 Ok(index) => (sources, index),
                 Err(refusal) => {
                     tracing::warn!(
@@ -521,17 +634,14 @@ async fn create_translated(
                         %refusal,
                         "the archive could not be indexed"
                     );
-                    return refusal_response(&refusal);
+                    return Err(SessionError::Refused(refusal));
                 }
             }
         }
     };
     let (sources, index) = indexed;
 
-    let selected = match select_member(&index, &payload) {
-        Ok(selected) => selected,
-        Err(response) => return *response,
-    };
+    let selected = select_member(&index, payload.file_idx, &payload.file_must_include)?;
     // A create that named a member this server will not serve says so now
     // rather than at the first byte: the player has a sentence to show and
     // no session to clean up.
@@ -544,35 +654,30 @@ async fn create_translated(
             %refusal,
             "the selected member cannot be served by range"
         );
-        return refusal_response(refusal);
+        return Err(SessionError::Refused(refusal.clone()));
     }
-    let selected_name = selected
-        .and_then(|at| index.members.get(at))
-        .map(|member| member.name.clone());
-    drop(state.translated_archives.insert(
-        key.clone(),
+    let session = state.translated_archives.insert(
+        key,
         TranslatedSession::new(origin, SessionSources::Held(sources), index, selected),
-    ));
-
-    if method == Method::GET
-        && let Some(file) = selected_name
-    {
-        return Redirect::temporary(&format!(
-            "./stream/{}/{}",
-            urlencoding::encode(&key),
-            encode_path_segments(&file)
-        ))
-        .into_response();
-    }
-    Json(CreateResponse { key }).into_response()
+    );
+    Ok((session, selected))
 }
 
-/// Which member of `index` the request picked, by the `fileIdx` /
+/// Held proxy sources as the sources a translator and a view read.
+fn as_byte_sources(sources: &[Arc<ProxySource>]) -> Vec<Arc<dyn ByteSource>> {
+    sources
+        .iter()
+        .map(|source| source.clone() as Arc<dyn ByteSource>)
+        .collect()
+}
+
+/// Which member of `index` a request picked, by the `fileIdx` /
 /// `fileMustInclude` contract stremio-core's `rarUrls`/`zipUrls` build.
-fn select_member(
+pub(crate) fn select_member(
     index: &crate::translators::Index,
-    request: &ArchiveCreateRequest,
-) -> Result<Option<usize>, Box<Response>> {
+    file_idx: Option<usize>,
+    file_must_include: &[String],
+) -> Result<Option<usize>, SessionError> {
     let files = index
         .members
         .iter()
@@ -586,15 +691,14 @@ fn select_member(
     if files.is_empty() {
         return Ok(None);
     }
-    let requested_idx = request
-        .file_idx
+    let requested_idx = file_idx
         .map(|idx| idx.to_string())
         .unwrap_or_else(|| "-1".to_string());
-    compat::resolve_file_idx(&requested_idx, &files, &request.file_must_include)
+    compat::resolve_file_idx(&requested_idx, &files, file_must_include)
         .map(Some)
         .map_err(|err| {
             tracing::warn!(error = %err, "failed to resolve archive file");
-            Box::new((StatusCode::NOT_FOUND, "Failed to select archive file").into_response())
+            SessionError::NoMember
         })
 }
 
@@ -629,8 +733,9 @@ async fn stream_redirection(
     Path(key): Path<String>,
     Query(selection): Query<MemberSelection>,
 ) -> Response {
-    let Some(translator) = format.translator() else {
-        return no_translator_response(format);
+    let translator = match translator_for(format) {
+        Ok(translator) => translator,
+        Err(error) => return error.response(),
     };
     // **The session first, which for a `torrent:` key is what indexes it.**
     // A container inside a torrent has no `/create` to be made at, and its
@@ -639,31 +744,12 @@ async fn stream_redirection(
     // being told its name first.
     let session = match session_for(&state, translator.as_ref(), &key).await {
         Ok(session) => session,
-        Err(response) => return *response,
+        Err(error) => return error.response(),
     };
-    // A session made by `/create` carries the member its request selected; a
-    // `torrent:` session was just made and carries none, so the same rule
-    // `/create` uses picks one -- `-1` and no filters unless the caller
-    // states them here, which is the contract `/create` has.
-    let selected = match session.selected().map(|member| member.name.clone()) {
-        Some(name) => Some(name),
-        None => {
-            let request = ArchiveCreateRequest {
-                urls: Vec::new(),
-                file_idx: selection.file_idx,
-                file_must_include: selection.file_must_include(),
-            };
-            match select_member(session.index(), &request) {
-                Ok(at) => at.and_then(|at| {
-                    session
-                        .index()
-                        .members
-                        .get(at)
-                        .map(|member| member.name.clone())
-                }),
-                Err(response) => return *response,
-            }
-        }
+    let selected = match chosen_member(&session, selection.file_idx, &selection.file_must_include())
+    {
+        Ok(selected) => selected,
+        Err(error) => return error.response(),
     };
     match selected.as_deref() {
         Some(file) => Redirect::temporary(&format!(
@@ -676,6 +762,30 @@ async fn stream_redirection(
     }
 }
 
+/// The member `session` plays when no member is named: the one its create
+/// selected, or -- for a `torrent:` session, which was made by no create
+/// and carries none -- the one the same rule `/create` uses picks, `-1`
+/// and no filters unless the caller states them, which is the contract
+/// `/create` has.
+pub(crate) fn chosen_member(
+    session: &TranslatedSession,
+    file_idx: Option<usize>,
+    file_must_include: &[String],
+) -> Result<Option<String>, SessionError> {
+    if let Some(member) = session.selected() {
+        return Ok(Some(member.name.clone()));
+    }
+    Ok(
+        select_member(session.index(), file_idx, file_must_include)?.and_then(|at| {
+            session
+                .index()
+                .members
+                .get(at)
+                .map(|member| member.name.clone())
+        }),
+    )
+}
+
 /// Which member a redirect should pick, for a session that has not chosen
 /// one -- the same two things `/create`'s request carries, as query
 /// parameters, so a `torrent:` container can be pointed at a file the way a
@@ -683,14 +793,14 @@ async fn stream_redirection(
 /// its filters; `fileIdx` is `/create`'s.
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-struct MemberSelection {
-    file_idx: Option<usize>,
+pub(crate) struct MemberSelection {
+    pub(crate) file_idx: Option<usize>,
     #[serde(default, alias = "f")]
-    file_must_include: Option<String>,
+    pub(crate) file_must_include: Option<String>,
 }
 
 impl MemberSelection {
-    fn file_must_include(&self) -> Vec<String> {
+    pub(crate) fn file_must_include(&self) -> Vec<String> {
         self.file_must_include
             .iter()
             .flat_map(|value| value.split(','))
@@ -709,8 +819,9 @@ async fn stream_member(
     file: Option<&str>,
     headers: &header::HeaderMap,
 ) -> Response {
-    let Some(translator) = format.translator() else {
-        return no_translator_response(format);
+    let translator = match translator_for(format) {
+        Ok(translator) => translator,
+        Err(error) => return error.response(),
     };
     stream_translated(state, translator.as_ref(), key, file, headers).await
 }
@@ -731,7 +842,7 @@ async fn stream_translated(
 ) -> Response {
     let session = match session_for(state, translator, key).await {
         Ok(session) => session,
-        Err(response) => return *response,
+        Err(error) => return error.response(),
     };
     let Some(member) = (match file {
         Some(file) => session.member(file),
@@ -745,7 +856,7 @@ async fn stream_translated(
     let name = member.name.clone();
     let sources = match sources_for(state, &session).await {
         Ok(sources) => sources,
-        Err(response) => return *response,
+        Err(error) => return error.response(),
     };
     let view = match session.view(member, sources) {
         Ok(view) => view,
@@ -814,12 +925,13 @@ fn canonical_key(key: &str) -> Cow<'_, str> {
 }
 
 /// The session under `key`, leased -- creating it for the `torrent:` form,
-/// which has no `/create` of its own.
-async fn session_for(
+/// which has no `/create` of its own. What the archive routes and a media
+/// id naming a member (`crate::media`) both find a session with.
+pub(crate) async fn session_for(
     state: &AppState,
     translator: &dyn Translator,
     key: &str,
-) -> Result<Lease<TranslatedSession>, Box<Response>> {
+) -> Result<Lease<TranslatedSession>, SessionError> {
     let key = canonical_key(key);
     let key = key.as_ref();
     if let Some(session) = state.translated_archives.get(key) {
@@ -829,10 +941,10 @@ async fn session_for(
     // of a torrent this server already has, and the first request for a
     // member of it is what indexes it.
     let Some(rest) = key.strip_prefix("torrent:") else {
-        return Err(Box::new(StatusCode::NOT_FOUND.into_response()));
+        return Err(SessionError::NoSession);
     };
     let Some((info_hash, path)) = rest.split_once('/') else {
-        return Err(Box::new(StatusCode::BAD_REQUEST.into_response()));
+        return Err(SessionError::BadKey);
     };
     // The named file may be one volume of a set, and for RAR it usually
     // is: the rest of the set is the files beside it in the torrent, and
@@ -843,14 +955,14 @@ async fn session_for(
         .await
         .map_err(|error| {
             tracing::warn!(%info_hash, %error, "no such torrent in this engine");
-            Box::new(StatusCode::NOT_FOUND.into_response())
+            SessionError::NotInTorrent
         })?;
     let paths = translator.volumes(path, &siblings).map_err(|refusal| {
         // A set with a hole in it is `Malformed`, naming the volume it
         // wanted -- `422`, and said at the index rather than as a short
         // read in the middle of a film.
         tracing::warn!(%info_hash, archive = path, %refusal, "the set is not all there");
-        Box::new(refusal_response(&refusal))
+        SessionError::Refused(refusal)
     })?;
     // Held before the first volume opens: the opens below are what would
     // move the live entity, and the hold is what makes an open of the
@@ -868,13 +980,13 @@ async fn session_for(
             .await
             .map_err(|error| {
                 tracing::warn!(%info_hash, archive = %volume, %error, "no such archive in that torrent");
-                Box::new(StatusCode::NOT_FOUND.into_response())
+                SessionError::NotInTorrent
             })?;
         sources.push(Arc::new(source));
     }
     let index = translator.index(&sources).await.map_err(|refusal| {
         tracing::warn!(%info_hash, archive = path, %refusal, "the archive could not be indexed");
-        Box::new(refusal_response(&refusal))
+        SessionError::Refused(refusal)
     })?;
     // The sources are **not** kept: see `SessionSources::Torrent`. The
     // insert leases what it made, so the read that follows cannot find it
@@ -904,9 +1016,9 @@ async fn session_for(
 async fn sources_for(
     state: &AppState,
     session: &TranslatedSession,
-) -> Result<Vec<Arc<dyn ByteSource>>, Box<Response>> {
+) -> Result<Vec<Arc<dyn ByteSource>>, SessionError> {
     match session.sources() {
-        SessionSources::Held(sources) => Ok(sources.clone()),
+        SessionSources::Held(sources) => Ok(as_byte_sources(sources)),
         SessionSources::Torrent {
             info_hash, paths, ..
         } => {
@@ -918,7 +1030,7 @@ async fn sources_for(
                     .await
                     .map_err(|error| {
                         tracing::warn!(%info_hash, archive = %path, %error, "the torrent this archive is in is gone");
-                        Box::new(StatusCode::NOT_FOUND.into_response())
+                        SessionError::NotInTorrent
                     })?;
                 sources.push(Arc::new(source));
             }

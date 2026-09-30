@@ -1312,3 +1312,82 @@ fn a_build_without_rar_refuses_a_rar_archive_as_not_implemented() -> anyhow::Res
     );
     fixture.finish()
 }
+
+/// **A member behind a link resolves and reads by id from the `/create` URL
+/// stremio-core builds**: the `lz` payload read as the route reads it, the
+/// member its rule picks (the largest, as with no `fileIdx`), and the
+/// member's bytes -- at the top, and again after a seek into its middle.
+/// Played, it is a proxied entity like any `/proxy` id: the viewer's
+/// session goes off every torrent file and what it reads is read ahead of.
+/// And a create payload that cannot be decoded is the route's `400`, typed.
+#[test]
+fn an_archive_create_url_resolves_to_its_member_and_reads_it_by_id() -> anyhow::Result<()> {
+    let fixture = fixture()?;
+    let expected = second_content();
+    let payload = serde_json::json!({ "url": fixture.origin.url("/fixture.zip") }).to_string();
+    let lz = lz_str::compress_to_encoded_uri_component(&payload);
+    let url = url::Url::parse(&format!("{}/zip/create?lz={lz}", fixture.base))?;
+    let id = fixture
+        .handle
+        .register(stream_server::MediaSpec::StreamingUrl(url))?;
+    let resolved = fixture.handle.resolve(&id)?;
+    assert_eq!(resolved.name, "videos/second.bin");
+    assert_eq!(resolved.len, expected.len() as u64);
+    assert_eq!(
+        resolved.member,
+        Some(stream_server::media::MemberInfo {
+            name: "videos/second.bin".to_string(),
+            len: expected.len() as u64,
+        })
+    );
+    assert!(!fixture.handle.media_read_ahead_registered(&id));
+
+    let mut reader = fixture.handle.open_reader(
+        &id,
+        Some(stream_server::PlayToken {
+            token: "tv.1".to_string(),
+            buffer: Default::default(),
+        }),
+    )?;
+    assert_eq!(
+        fixture.handle.play_session_of("tv.1"),
+        Some(enginefs::retention::sessions::Played::Elsewhere)
+    );
+    assert!(
+        fixture.handle.media_read_ahead_registered(&id),
+        "the played member's link is not read ahead of"
+    );
+    let mut read = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut buf)? {
+            0 => break,
+            n => read.extend_from_slice(&buf[..n]),
+        }
+    }
+    assert_eq!(read, expected);
+    assert_eq!(reader.seek(100_000)?, 100_000);
+    let mut again = vec![0u8; 4096];
+    let mut filled = 0;
+    while filled < again.len() {
+        let n = reader.read(&mut again[filled..])?;
+        anyhow::ensure!(n > 0, "the member ended early");
+        filled += n;
+    }
+    assert_eq!(again, expected[100_000..104_096]);
+    drop(reader);
+
+    let broken = url::Url::parse(&format!("{}/zip/create?lz=abc", fixture.base))?;
+    let broken = fixture
+        .handle
+        .register(stream_server::MediaSpec::StreamingUrl(broken))?;
+    assert_eq!(
+        fixture
+            .handle
+            .resolve(&broken)
+            .err()
+            .map(|refusal| refusal.kind()),
+        Some("badRequest")
+    );
+    fixture.finish()
+}

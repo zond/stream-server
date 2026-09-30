@@ -9494,6 +9494,7 @@ mod tests {
                 info_hash: hash.clone(),
                 file_idx: 0,
                 shares: true,
+                member: None,
             },
         );
         let mut reader = engine
@@ -9966,6 +9967,7 @@ mod tests {
                 info_hash: hash.clone(),
                 file_idx: 0,
                 shares: true,
+                member: None,
             },
         );
         let _seeder = seeder_dialling(&content, &torrent_bytes, client_addr).await;

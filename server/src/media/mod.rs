@@ -73,10 +73,11 @@ pub type GrantSupplier = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 pub enum MediaSpec {
     /// A URL stremio-core built (`streaming_url`) on this server: a
     /// torrent (`/{infoHash}/{fileIdx}`, `-1` and `f=` and `tr=`
-    /// included), `/proxy` in either spelling. Read by the routes' own
-    /// parsers, so the core stays the one place these URLs are *built*
-    /// and this server the one place they are *read*. An archive
-    /// `/{fmt}/create` and `/ftp` are recognised and refused as
+    /// included), `/proxy` in either spelling, an archive's member by
+    /// `/{fmt}/create?lz=` or `/{fmt}/stream/{key}[/member]` (the
+    /// `torrent:` form included). Read by the routes' own parsers, so the
+    /// core stays the one place these URLs are *built* and this server the
+    /// one place they are *read*. `/ftp` is recognised and refused as
     /// [`Refusal::NotYet`] for now.
     StreamingUrl(Url),
     /// A Google Drive file, and where its grant comes from.
@@ -145,7 +146,9 @@ impl std::fmt::Display for MediaId {
 /// The viewer's player behind a reader: the token `p=` carries today
 /// (`<viewer>.<screen>`) and its read-ahead choice. Whether the file
 /// shares is decided here, not by the app: a torrent file shares unless it
-/// is an archive or a disc image, whose playback shares nothing.
+/// is an archive or a disc image played as itself; a member of a
+/// single-file container in a torrent shares its own extent of it; a
+/// multi-volume set's member, or a container behind links, shares nothing.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlayToken {
     /// `<viewer>.<screen>`, as `p=` carries it.
@@ -155,9 +158,8 @@ pub struct PlayToken {
     pub buffer: BufferProfile,
 }
 
-/// The member a container resolved to. Nothing resolves to one yet (the
-/// sniff is step E of the design); the field is here so the answer's shape
-/// does not change when something does.
+/// The member a container resolved to: what an archive URL names (the
+/// sniff of step E will add containers found by their bytes).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemberInfo {
@@ -179,8 +181,8 @@ pub struct Resolved {
     /// answered a ranged probe with the whole entity, and its length was
     /// not what was being asked.
     pub len: u64,
-    /// The member a container resolved to, when it was one. Always `None`
-    /// until the sniff moves here (the design's step E).
+    /// The member a container resolved to, when it was one: an archive
+    /// URL's member. [`Self::name`] and [`Self::len`] are then the member's.
     pub member: Option<MemberInfo>,
     /// `false` only for an HTTP origin that will not serve ranges: nothing
     /// in this process can seek it, so a player has to be handed
@@ -203,7 +205,7 @@ pub enum Refusal {
     /// A URL whose shape is none of this server's routes.
     UnrecognisedUrl,
     /// A shape this server serves over HTTP that cannot be played by id
-    /// yet: an archive `/create`, `/ftp`.
+    /// yet: `/ftp`.
     NotYet {
         /// What it is, as a sentence's subject ("an archive member").
         what: &'static str,
@@ -220,8 +222,13 @@ pub enum Refusal {
     /// The torrent could not be added or found (a metadata timeout, the
     /// backend refusing it). The engine's own non-leaking sentence.
     TorrentUnavailable(String),
-    /// The torrent has no file by that index, or `-1` matched nothing.
+    /// The torrent has no file by that index, or `-1` matched nothing; an
+    /// archive has no such member, or no session under that key.
     NoSuchFile(String),
+    /// An archive `/create` whose payload cannot be taken: no `lz`, one
+    /// that does not decode, or a URL in it that is not a web address (the
+    /// route's `400`, with its sentence).
+    BadRequest(String),
     /// The origin answered, and not with the resource.
     OriginRefused(String),
     /// The origin could not be reached.
@@ -261,6 +268,7 @@ impl Refusal {
             Self::NoReader(_) => "noReader",
             Self::TorrentUnavailable(_) => "torrentUnavailable",
             Self::NoSuchFile(_) => "noSuchFile",
+            Self::BadRequest(_) => "badRequest",
             Self::OriginRefused(_) => "originRefused",
             Self::Unreachable(_) => "unreachable",
             Self::NoPairingService => "noPairingService",
@@ -296,6 +304,31 @@ impl Refusal {
         }
     }
 
+    /// Why a member's container session could not be had, as the archive
+    /// routes would have answered it -- the same reasons, typed.
+    pub(crate) fn of_session(error: crate::routes::archive::SessionError) -> Self {
+        use crate::routes::archive::SessionError;
+        match error {
+            SessionError::BadRequest(message) => Self::BadRequest(message),
+            SessionError::KeyInUse => {
+                Self::BadRequest("That session key is in use for another archive".to_string())
+            }
+            SessionError::Source(error) => Self::of_probe(error),
+            SessionError::Refused(refusal) => Self::Translated(refusal),
+            SessionError::NoMember => Self::NoSuchFile("Failed to select archive file".to_string()),
+            SessionError::NoSession => {
+                Self::NoSuchFile("this server holds no archive session under that key".to_string())
+            }
+            SessionError::BadKey => Self::UnrecognisedUrl,
+            SessionError::NotInTorrent => {
+                Self::NoSuchFile("the torrent this archive is in holds no such file".to_string())
+            }
+            SessionError::NoReader(format) => {
+                Self::NoReader(crate::routes::archive::no_reader_message(format).to_string())
+            }
+        }
+    }
+
     /// A Drive open's failure, `pairAgain` kept as itself.
     pub(crate) fn of_drive(error: DriveError) -> Self {
         match error {
@@ -320,6 +353,7 @@ impl std::fmt::Display for Refusal {
             Self::NoReader(message)
             | Self::TorrentUnavailable(message)
             | Self::NoSuchFile(message)
+            | Self::BadRequest(message)
             | Self::OriginRefused(message)
             | Self::Unreachable(message)
             | Self::DriveUnreadable(message)
