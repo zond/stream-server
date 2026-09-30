@@ -35,6 +35,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek};
 
 pub mod drive;
+pub(crate) mod held;
 pub mod proxy;
 #[cfg(test)]
 pub mod testing;

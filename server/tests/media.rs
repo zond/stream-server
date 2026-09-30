@@ -13,7 +13,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use stream_server::{MediaId, MediaReader, MediaSpec, PlayToken, Refusal, ServerConfig};
@@ -240,6 +240,8 @@ fn until(what: &str, mut ready: impl FnMut() -> anyhow::Result<bool>) -> anyhow:
 
 /// The refresh token the fake Drive account is reachable by.
 const REFRESH_TOKEN: &str = "refresh-tok-media-7c1e";
+/// A grant that works until the test revokes it ([`Origin::revoked`]).
+const DYING_GRANT: &str = "refresh-tok-media-dying";
 /// Drive's id for the fake file.
 const FILE_ID: &str = "1MediaIdFixtureFile";
 /// The length of every file the origin serves.
@@ -254,6 +256,13 @@ struct Origin {
     addr: SocketAddr,
     /// Requests for a byte of `/film.bin` or the Drive file.
     ranged: Arc<AtomicUsize>,
+    /// Set by [`Origin::kill`]: every connection after it is dropped
+    /// unanswered, and counted in [`Origin::after_death`].
+    dead: Arc<AtomicBool>,
+    after_death: Arc<AtomicUsize>,
+    /// Set to revoke [`DYING_GRANT`]: its refreshes answer `pairAgain` from
+    /// then on.
+    revoked: Arc<AtomicBool>,
 }
 
 impl Origin {
@@ -261,15 +270,45 @@ impl Origin {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let addr = listener.local_addr()?;
         let ranged = Arc::new(AtomicUsize::new(0));
-        let counted = ranged.clone();
+        let dead = Arc::new(AtomicBool::new(false));
+        let after_death = Arc::new(AtomicUsize::new(0));
+        let revoked = Arc::new(AtomicBool::new(false));
+        let (counted, killed, late, gone) = (
+            ranged.clone(),
+            dead.clone(),
+            after_death.clone(),
+            revoked.clone(),
+        );
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { break };
-                let counted = counted.clone();
-                std::thread::spawn(move || serve(stream, &counted));
+                if killed.load(Ordering::SeqCst) {
+                    late.fetch_add(1, Ordering::SeqCst);
+                    drop(stream);
+                    continue;
+                }
+                let (counted, gone) = (counted.clone(), gone.clone());
+                std::thread::spawn(move || serve(stream, &counted, &gone));
             }
         });
-        Ok(Self { addr, ranged })
+        Ok(Self {
+            addr,
+            ranged,
+            dead,
+            after_death,
+            revoked,
+        })
+    }
+
+    /// From now on nothing is served: the network is gone, as far as this
+    /// server can tell.
+    fn kill(&self) {
+        self.dead.store(true, Ordering::SeqCst);
+    }
+
+    /// Connections made to the origin since [`Self::kill`].
+    fn after_death(&self) -> usize {
+        self.after_death.load(Ordering::SeqCst)
     }
 
     fn url(&self, path: &str) -> String {
@@ -277,7 +316,7 @@ impl Origin {
     }
 }
 
-fn serve(mut stream: TcpStream, ranged: &AtomicUsize) {
+fn serve(mut stream: TcpStream, ranged: &AtomicUsize, revoked: &AtomicBool) {
     let Ok(second) = stream.try_clone() else {
         return;
     };
@@ -306,7 +345,17 @@ fn serve(mut stream: TcpStream, ranged: &AtomicUsize) {
         let mut body = vec![0u8; length];
         let _ = std::io::Read::read_exact(&mut reader, &mut body);
         let body = String::from_utf8_lossy(&body);
-        if body.contains(REFRESH_TOKEN) {
+        if body.contains(DYING_GRANT) && !revoked.load(Ordering::SeqCst) {
+            // Sixty seconds is the credential's renew margin, so a token
+            // this short is renewed at every request: the revocation is met
+            // at the next read, not an hour later.
+            respond(
+                &mut stream,
+                "200 OK",
+                "application/json",
+                b"{\"accessToken\":\"access-tok-dying\",\"expiresIn\":60}",
+            );
+        } else if body.contains(REFRESH_TOKEN) {
             respond(
                 &mut stream,
                 "200 OK",
@@ -393,6 +442,8 @@ fn origin_server(
         cache_dir: Some(cache_root),
         drive_refresh_endpoint: Some(url::Url::parse(&origin.url("/refresh"))?),
         drive_api_base: Some(url::Url::parse(&origin.url("/"))?),
+        // An embedder that keeps a proxy pin record, empty at boot.
+        proxy_pins: Some(Vec::new()),
         ..offline_config()
     })?;
     Ok((handle, [config_dir, cache_dir]))
@@ -816,6 +867,27 @@ fn set_buffer_is_taken_at_the_next_reopen() -> anyhow::Result<()> {
         }),
     )?;
     assert_eq!(reader.opened_with_buffer(), Some(BufferProfile::Normal));
+
+    // Set before an open, it outranks the token's buffer, which is only
+    // the initial value: a second id, told `Maximum` first, opens with it.
+    let told_first = fixture.register("film.mkv")?;
+    fixture
+        .handle
+        .set_buffer(&told_first, BufferProfile::Maximum)?;
+    let second = fixture.handle.open_reader(
+        &told_first,
+        Some(PlayToken {
+            token: "tv.2".to_string(),
+            buffer: BufferProfile::Normal,
+        }),
+    )?;
+    assert_eq!(
+        second.opened_with_buffer(),
+        Some(BufferProfile::Maximum),
+        "the token's buffer won over a set_buffer made before the open"
+    );
+    drop(second);
+
     fixture.handle.set_buffer(&id, BufferProfile::Large)?;
     // A seek to where the reader already is -- what mpv makes right after
     // every open -- is no reopen, so it takes nothing either.
@@ -881,6 +953,202 @@ fn an_id_nobody_holds_is_evicted_at_the_cap_and_one_being_read_is_not() -> anyho
     let (reader, head) = within("the held reader", move || {
         let mut reader = reader;
         let head = reader.read(&mut [0u8; 16]);
+        (reader, head)
+    })?;
+    assert!(head? > 0);
+    drop(reader);
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// Polls the downloads listing until the row keyed `key` is complete.
+fn wait_complete(handle: &stream_server::ServerHandle, key: &str) -> anyhow::Result<()> {
+    until("the download completes", || {
+        Ok(handle
+            .downloads()?
+            .iter()
+            .any(|row| row.info_hash == key && row.complete))
+    })
+}
+
+/// **A finished download of a link resolves and reads with the origin
+/// gone.** A `/proxy` id whose link is pinned and whole on the disk is
+/// answered off the disk, and never probes the origin: the network being
+/// gone is the case a download is for. What `open_drive_file` does for a
+/// Drive file with `complete_drive_download`, a media id does for both.
+#[test]
+fn a_finished_link_download_resolves_and_reads_with_the_origin_gone() -> anyhow::Result<()> {
+    const SEEK_TO: u64 = 170_001;
+    let origin = Origin::start()?;
+    let (handle, _dirs) = origin_server(&origin)?;
+    let target = origin.url("/film.bin");
+    let row = handle.pin_proxy_download(stream_server::ProxyDownloadRequest {
+        url: Some(target.clone()),
+        headers: Default::default(),
+        drive_file_id: None,
+        refresh_token: None,
+        name: Some("The Film.mkv".to_string()),
+    })?;
+    wait_complete(&handle, &row.info_hash)?;
+    origin.kill();
+
+    let id = handle.register(MediaSpec::StreamingUrl(proxy_url(&handle, &target)))?;
+    let resolved = handle.resolve(&id)?;
+    assert_eq!(resolved.name, "The Film.mkv");
+    assert_eq!(resolved.len, ORIGIN_LEN as u64);
+    assert!(resolved.in_process);
+    let reader = handle.open_reader(&id, None)?;
+    let (reader, whole, tail) = within("the held reader", move || {
+        let mut reader = reader;
+        let whole = read_to_end(&mut reader);
+        let tail = reader.seek(SEEK_TO).and_then(|_| read_to_end(&mut reader));
+        (reader, whole, tail)
+    })?;
+    let expected = payload(ORIGIN_LEN);
+    assert_eq!(whole?, expected);
+    assert_eq!(tail?, expected[SEEK_TO as usize..]);
+    drop(reader);
+    assert_eq!(origin.after_death(), 0, "the dead origin was asked");
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// **The same for a Drive file**, and without asking for the grant: a
+/// finished download needs none.
+#[test]
+fn a_finished_drive_download_resolves_and_reads_with_drive_gone() -> anyhow::Result<()> {
+    let origin = Origin::start()?;
+    let (handle, _dirs) = origin_server(&origin)?;
+    let row = handle.pin_proxy_download(stream_server::ProxyDownloadRequest {
+        url: None,
+        headers: Default::default(),
+        drive_file_id: Some(FILE_ID.to_string()),
+        refresh_token: Some(REFRESH_TOKEN.to_string()),
+        name: Some("A Film.mkv".to_string()),
+    })?;
+    wait_complete(&handle, &row.info_hash)?;
+    origin.kill();
+
+    let asked = Arc::new(AtomicUsize::new(0));
+    let grant: stream_server::GrantSupplier = {
+        let asked = asked.clone();
+        Arc::new(move || {
+            asked.fetch_add(1, Ordering::SeqCst);
+            Some(REFRESH_TOKEN.to_string())
+        })
+    };
+    let id = handle.register(MediaSpec::Drive {
+        file_id: FILE_ID.to_string(),
+        name: None,
+        grant,
+    })?;
+    let resolved = handle.resolve(&id)?;
+    assert_eq!(resolved.name, "A Film.mkv", "the name it was pinned under");
+    assert_eq!(resolved.len, ORIGIN_LEN as u64);
+    let reader = handle.open_reader(&id, None)?;
+    let (reader, whole) = within("the held Drive reader", move || {
+        let mut reader = reader;
+        let whole = read_to_end(&mut reader);
+        (reader, whole)
+    })?;
+    assert_eq!(whole?, payload(ORIGIN_LEN));
+    drop(reader);
+    assert_eq!(asked.load(Ordering::SeqCst), 0, "the grant was asked for");
+    assert_eq!(origin.after_death(), 0, "the dead Drive was asked");
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// **A played `/proxy` reader turns read-ahead on, and an aside does
+/// not**: without the registration playback still works and nothing is
+/// ever fetched ahead of the player, which no read would notice.
+#[test]
+fn a_played_proxy_reader_registers_read_ahead_and_an_aside_does_not() -> anyhow::Result<()> {
+    let origin = Origin::start()?;
+    let (handle, _dirs) = origin_server(&origin)?;
+    let id = handle.register(MediaSpec::StreamingUrl(proxy_url(
+        &handle,
+        &origin.url("/film.bin"),
+    )))?;
+    let aside = handle.open_reader(&id, None)?;
+    assert!(
+        !handle.media_read_ahead_registered(&id),
+        "an aside turned read-ahead on"
+    );
+    drop(aside);
+    let played = handle.open_reader(
+        &id,
+        Some(PlayToken {
+            token: "tv.1".to_string(),
+            buffer: Default::default(),
+        }),
+    )?;
+    assert!(
+        handle.media_read_ahead_registered(&id),
+        "the played reader did not turn read-ahead on"
+    );
+    drop(played);
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// **A Drive id whose grant has died is resolved again**, with whatever the
+/// supplier holds now, rather than answering with a source that can only
+/// fail. The first grant is revoked after the first resolve; a read meets
+/// the revocation; the next resolve asks the supplier again and gets the
+/// good grant.
+#[test]
+fn a_drive_id_whose_grant_died_is_resolved_again_with_a_new_grant() -> anyhow::Result<()> {
+    let origin = Origin::start()?;
+    let (handle, _dirs) = origin_server(&origin)?;
+    let asked = Arc::new(AtomicUsize::new(0));
+    let grant: stream_server::GrantSupplier = {
+        let asked = asked.clone();
+        Arc::new(move || {
+            let first = asked.fetch_add(1, Ordering::SeqCst) == 0;
+            Some(if first { DYING_GRANT } else { REFRESH_TOKEN }.to_string())
+        })
+    };
+    let id = handle.register(MediaSpec::Drive {
+        file_id: FILE_ID.to_string(),
+        name: None,
+        grant,
+    })?;
+    handle.resolve(&id)?;
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+
+    origin.revoked.store(true, Ordering::SeqCst);
+    let reader = handle.open_reader(&id, None)?;
+    let (reader, read) = within("a read under a revoked grant", move || {
+        let mut reader = reader;
+        let read = reader.read(&mut [0u8; 64]);
+        (reader, read)
+    })?;
+    assert!(
+        read.is_err(),
+        "a read under a revoked grant answered {read:?}"
+    );
+    drop(reader);
+
+    let resolved = handle.resolve(&id)?;
+    assert_eq!(resolved.len, ORIGIN_LEN as u64);
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        2,
+        "the dead grant's resolution was kept rather than made again"
+    );
+    let reader = handle.open_reader(&id, None)?;
+    let (reader, head) = within("a read under the new grant", move || {
+        let mut reader = reader;
+        let head = reader.read(&mut [0u8; 64]);
         (reader, head)
     })?;
     assert!(head? > 0);

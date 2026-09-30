@@ -1587,6 +1587,15 @@ impl ProxyRetention {
             .insert(key_dir, source);
     }
 
+    /// Whether a read-ahead source is registered for `key_dir`
+    /// ([`Self::note_source`]). A probe for the tests of who registers one.
+    pub(crate) fn has_source(&self, key_dir: &Path) -> bool {
+        self.sources
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(key_dir)
+    }
+
     /// Read-ahead for an entity the budget covers whole, driven by a
     /// player's delivered byte (`Reader::note`): the rest of the file from
     /// chunk `from`, the one after the head's, through the source

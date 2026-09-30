@@ -535,17 +535,27 @@ impl ServerHandle {
             .unwrap_or(Err(Refusal::ServerStopped))
     }
 
-    /// **Change the viewer's read-ahead choice for an id** mid-playback.
-    /// The lookahead is worked out when a torrent file is opened, so a
-    /// reader open on the id takes it at its next reopen -- its next seek
-    /// -- and never in the handle already reading. Nothing for an id that
-    /// is not a torrent played with a [`PlayToken`].
+    /// **Change the viewer's read-ahead choice for an id.** It outranks the
+    /// [`PlayToken`]'s buffer, which is only the initial value: set before
+    /// [`Self::open_reader`], the reader opens with it; set after, a reader
+    /// open on the id takes it at its next reopen -- its next seek -- and
+    /// never in the handle already reading, since the lookahead is worked
+    /// out when a torrent file is opened. Nothing for an id that is not a
+    /// torrent played with a [`PlayToken`].
     pub fn set_buffer(
         &self,
         id: &MediaId,
         buffer: enginefs::backend::priorities::BufferProfile,
     ) -> Result<(), Refusal> {
         self.state.media.set_buffer(id, buffer)
+    }
+
+    /// Whether what `id` resolved to has a read-ahead source registered: a
+    /// probe for the test that a played reader turns read-ahead on, and
+    /// nothing a client decides anything from.
+    #[doc(hidden)]
+    pub fn media_read_ahead_registered(&self, id: &MediaId) -> bool {
+        self.state.media.read_ahead_registered(&self.state, id)
     }
 
     /// [`Self::stream_numbers`] for what `id` resolved to. `None` for an id

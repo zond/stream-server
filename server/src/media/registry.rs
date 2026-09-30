@@ -19,6 +19,7 @@
 use super::reader::{self, MediaReader, Source};
 use super::{GrantSupplier, MediaId, MediaSpec, PlayToken, Refusal, Resolved};
 use crate::routes::compat;
+use crate::sources::held::HeldSource;
 use crate::sources::{ByteSource, DriveSource, Play, ProxySource, TorrentSource};
 use crate::state::AppState;
 use crate::stream_numbers::{StreamFile, StreamNumbers};
@@ -56,9 +57,11 @@ pub(crate) struct Entry {
     /// one id one piece of work: the second waits and finds the first's
     /// answer.
     resolution: tokio::sync::Mutex<Option<Arc<Resolution>>>,
-    /// The viewer's read-ahead choice for this id, as the last
-    /// `open_reader` with a play or [`Registry::set_buffer`] stated it. A
-    /// reader applies it at its next reopen.
+    /// The viewer's read-ahead choice for this id, as
+    /// [`Registry::set_buffer`] last stated it; `None` until it has. It
+    /// outranks a [`PlayToken`]'s buffer, which is only the initial value:
+    /// a reader opens with this one when there is one, and applies it at
+    /// every reopen.
     pub(super) buffer: std::sync::Mutex<Option<BufferProfile>>,
 }
 
@@ -120,6 +123,15 @@ pub(crate) enum Resolution {
         media_url: Url,
         name: String,
     },
+    /// A pinned download of the link or the Drive file, whole on the disk:
+    /// read off it, with no origin asked -- what plays it offline.
+    Held {
+        source: Arc<HeldSource>,
+        /// What the proxy cache files the entity's reads under: the link,
+        /// or the Drive file's media URL.
+        target: Url,
+        name: String,
+    },
 }
 
 impl Resolution {
@@ -127,9 +139,13 @@ impl Resolution {
     /// ask should find another: a Drive source whose grant has died holds a
     /// credential that can only fail, and the grant supplier may hold a
     /// new one.
-    fn is_stale(&self) -> bool {
+    ///
+    /// A held download is stale once it is no longer pinned: its bytes are
+    /// no longer kept, and the origin has to be asked again.
+    fn is_stale(&self, state: &AppState) -> bool {
         match self {
             Self::Drive { source, .. } => source.needs_pairing_again(),
+            Self::Held { source, .. } => !state.proxy_cache.retention().is_pinned(source.key_dir()),
             Self::Torrent { .. } | Self::Http { .. } | Self::WillNotRange { .. } => false,
         }
     }
@@ -169,6 +185,14 @@ impl Resolution {
                 member: None,
                 in_process: false,
                 proxy_url: Some(proxy_url.clone()),
+            },
+            Self::Held { source, name, .. } => Resolved {
+                name: name.clone(),
+                content_type: source.content_type().to_string(),
+                len: source.len(),
+                member: None,
+                in_process: true,
+                proxy_url: None,
             },
             Self::Drive { source, name, .. } => Resolved {
                 name: name.clone(),
@@ -264,13 +288,29 @@ impl Registry {
                 crate::stream_numbers::stream_numbers(state, &format!("/{info_hash}/{file_idx}"))
                     .await
             }
-            Resolution::Http { target, .. } | Resolution::WillNotRange { target, .. } => {
+            Resolution::Http { target, .. }
+            | Resolution::WillNotRange { target, .. }
+            | Resolution::Held { target, .. } => {
                 crate::stream_numbers::proxied_numbers(&state.proxy_cache, target.clone()).await
             }
             Resolution::Drive { media_url, .. } => {
                 crate::stream_numbers::proxied_numbers(&state.proxy_cache, media_url.clone()).await
             }
         }
+    }
+
+    /// Whether the entity `id` resolved to has a source registered for
+    /// read-ahead: a probe for the test that a played reader turns it on.
+    pub(crate) fn read_ahead_registered(&self, state: &AppState, id: &MediaId) -> bool {
+        let Some(resolution) = self.peek(id) else {
+            return false;
+        };
+        let key_dir = match &*resolution {
+            Resolution::Http { source, .. } => source.key_dir(),
+            Resolution::Drive { source, .. } => source.key_dir(),
+            _ => None,
+        };
+        key_dir.is_some_and(|dir| state.proxy_cache.retention().has_source(&dir))
     }
 
     /// The torrent file `id` resolved to, for the reports a player makes
@@ -305,12 +345,12 @@ impl Registry {
     ) -> Result<MediaReader, Refusal> {
         let entry = self.entry(id)?;
         let resolution = entry.resolution(state).await?;
-        if let Some(play) = &play {
-            *entry
-                .buffer
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(play.buffer);
-        }
+        // `set_buffer` outranks the token's buffer, which is only where a
+        // playback starts when nobody has said otherwise for this id.
+        let set_buffer = *entry
+            .buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let source = match &*resolution {
             Resolution::Torrent {
                 info_hash,
@@ -334,7 +374,7 @@ impl Registry {
                             *file_idx,
                             Play {
                                 token: play.token,
-                                buffer: play.buffer,
+                                buffer: set_buffer.unwrap_or(play.buffer),
                                 // Today's rule, decided here and never by
                                 // the app: archive playback shares nothing.
                                 shares: !crate::routes::stream::played_through_a_translator(name),
@@ -362,6 +402,16 @@ impl Registry {
                 Source::Shared(source.clone())
             }
             Resolution::WillNotRange { .. } => return Err(Refusal::NoRanges),
+            Resolution::Held { source, .. } => {
+                if let Some(play) = &play {
+                    state.engine.note_player(
+                        &play.token,
+                        enginefs::retention::sessions::Played::Elsewhere,
+                    );
+                }
+                // No read-ahead: every byte is here already.
+                Source::Shared(source.clone())
+            }
             Resolution::Drive { source, .. } => {
                 if let Some(play) = &play {
                     state.engine.note_player(
@@ -402,7 +452,7 @@ impl Entry {
         let target = self.target.as_ref().map_err(Clone::clone)?;
         let mut held = self.resolution.lock().await;
         if let Some(resolution) = held.as_ref()
-            && !resolution.is_stale()
+            && !resolution.is_stale(state)
         {
             return Ok(resolution.clone());
         }
@@ -498,6 +548,21 @@ async fn resolve(state: &AppState, target: &Target) -> Result<Resolution, Refusa
             path_and_query,
         } => {
             let name = link_name(target);
+            // A finished download of this link first, and off the disk: it
+            // plays without the origin, which is what a download is for.
+            let pin = crate::proxy_downloads::ProxyPinKey::Url {
+                target: target.to_string(),
+                headers: request_headers.clone(),
+            };
+            if let Some((source, pinned_name)) =
+                crate::proxy_downloads::held_download(state, &pin).await
+            {
+                return Ok(Resolution::Held {
+                    source: Arc::new(source),
+                    target: target.clone(),
+                    name: pinned_name,
+                });
+            }
             match ProxySource::open(
                 state.proxy_cache.clone(),
                 state.http_addr,
@@ -535,6 +600,25 @@ async fn resolve(state: &AppState, target: &Target) -> Result<Resolution, Refusa
             grant,
         } => {
             let endpoints = state.drive.as_ref().ok_or(Refusal::NoPairingService)?;
+            // A finished download first, off the disk and before the grant
+            // is asked for: it plays on a device with no network, as
+            // `open_drive_file` lets it (`complete_drive_download`).
+            let pin = crate::proxy_downloads::ProxyPinKey::Drive {
+                file_id: file_id.clone(),
+            };
+            if let Some((source, pinned_name)) =
+                crate::proxy_downloads::held_download(state, &pin).await
+            {
+                let target = endpoints
+                    .pairing(file_id, "")
+                    .media_url()
+                    .map_err(Refusal::of_drive)?;
+                return Ok(Resolution::Held {
+                    source: Arc::new(source),
+                    target,
+                    name: name.clone().unwrap_or(pinned_name),
+                });
+            }
             let refresh_token = grant().ok_or(Refusal::NoGrant)?;
             let pairing = endpoints.pairing(file_id, &refresh_token);
             let media_url = pairing.media_url().map_err(Refusal::of_drive)?;

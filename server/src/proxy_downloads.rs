@@ -403,6 +403,31 @@ pub(crate) async fn complete_drive_download(
     })
 }
 
+/// The pinned download `key` names, as a source read off the disk, when it
+/// is whole there -- with the name it was pinned under. `None` for a key
+/// nothing pinned, or a download not complete yet: then the origin has to
+/// be asked. What a media id resolves to first (`crate::media`), so a
+/// finished download plays with the network gone, as
+/// [`complete_drive_download`] lets `open_drive_file` do.
+pub(crate) async fn held_download(
+    state: &crate::AppState,
+    key: &ProxyPinKey,
+) -> Option<(crate::sources::held::HeldSource, String)> {
+    let entry = key.entry(state)?;
+    let dir = entry.dir().to_path_buf();
+    if !state.proxy_cache.retention().is_pinned(&dir) {
+        return None;
+    }
+    let name = state
+        .proxy_downloads
+        .table()
+        .get(&dir)
+        .map(|pinned| pinned.name.clone())
+        .unwrap_or_else(|| key.default_name());
+    let source = crate::sources::held::HeldSource::complete(entry).await?;
+    Some((source, name))
+}
+
 /// Pins a Google Drive file as a download, under the pairing the app
 /// holds: the token renews in Rust for the length of the fill, as it does
 /// for a stream.

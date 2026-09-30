@@ -663,7 +663,9 @@ A. **Server: one torrent source, ids, the reader task.** (L.) Factor the
    the reader task and the handle methods, over torrent, `/proxy` and
    Drive ids; an archive `/create` and `/ftp` register and resolve
    `notYet`. A played reader's stream ends with its own log line,
-   `reader_stream_end`, not the route's. Member sharing is the third.)*
+   `reader_stream_end`, not the route's. A pinned download that is whole
+   resolves off the disk through `sources::held::HeldSource`, with no
+   origin asked. Member sharing is the third.)*
 
 A2. **Play sessions understand sets.** (M.) `Played::Torrent` over a set of
    files, mirroring `Live::hold_set`; a move inside the set ends nothing;
