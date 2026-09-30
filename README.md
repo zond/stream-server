@@ -147,7 +147,7 @@ Two crates, and neither builds a binary: `server` is the library an embedder lin
 | [docs/proxy.md](docs/proxy.md) | `/proxy` (redirects, playlists, credentials, caching, read-ahead), ending a proxied stream, Google Drive |
 | [docs/lan-media.md](docs/lan-media.md) | The media-only listener a cast session turns on |
 | [docs/known-issues.md](docs/known-issues.md) | What is open, and the standing hazards of working in this repo |
-| [docs/design/](docs/design/) | Design notes for built features: [read-pattern retention](docs/design/read-pattern-retention.md), [translated sources](docs/design/translated-sources.md), [generic downloads](docs/design/generic-downloads.md), [thin-swarm redial](docs/design/thin-swarm-redial.md) |
+| [docs/design/](docs/design/) | Design notes for built features: [read-pattern retention](docs/design/read-pattern-retention.md), [translated sources](docs/design/translated-sources.md), [generic downloads](docs/design/generic-downloads.md), [thin-swarm redial](docs/design/thin-swarm-redial.md); proposed: [media pipeline](docs/design/media-pipeline.md) |
 
 ---
 
