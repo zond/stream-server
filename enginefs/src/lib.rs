@@ -6877,6 +6877,29 @@ mod tests {
             std::env::temp_dir().join(format!("enginefs-fake-engine-tests-{}", std::process::id()));
         WIPE.call_once(|| {
             let _ = std::fs::remove_dir_all(&parent);
+            // And every earlier run's, once it is old enough that no test
+            // binary can still be using it: a process never removes its own
+            // at exit, so each run left one behind (227 of them, 264 MB,
+            // when this was found). Hours, not the pid: a pid is reused,
+            // and no run of these tests lasts an hour.
+            let stale = std::time::Duration::from_secs(6 * 60 * 60);
+            if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let is_ours = name
+                        .to_str()
+                        .is_some_and(|name| name.starts_with("enginefs-fake-engine-tests-"));
+                    let old = entry
+                        .metadata()
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age > stale);
+                    if is_ours && old {
+                        let _ = std::fs::remove_dir_all(entry.path());
+                    }
+                }
+            }
         });
         let root = parent.join(ROOTS.fetch_add(1, Ordering::SeqCst).to_string());
         std::fs::create_dir_all(root.join("downloads")).unwrap();

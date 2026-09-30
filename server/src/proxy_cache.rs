@@ -334,10 +334,25 @@ struct FloorReading {
 
 impl VolumeFloor {
     fn new(root: PathBuf) -> Self {
-        Self::with_probe(
-            root,
-            Box::new(|path: &Path| crate::cache_budget::available_space(path)),
-        )
+        Self::with_probe(root, Self::host_probe())
+    }
+
+    /// The volume's real free space.
+    #[cfg(not(test))]
+    fn host_probe() -> VolumeProbe {
+        Box::new(|path: &Path| crate::cache_budget::available_space(path))
+    }
+
+    /// **In unit tests, a volume with room to spare** rather than the one
+    /// the test runs on. A test about keys, entities or retention wrote
+    /// chunks under the real floor, so every one of them failed on a host
+    /// whose disk was nearly full -- a failure about the machine, reported
+    /// as one about the cache. A test *about* the floor says what the volume
+    /// holds ([`ProxyCache::with_volume_probe`]); the integration tests, a
+    /// separate build, still read the real disk.
+    #[cfg(test)]
+    fn host_probe() -> VolumeProbe {
+        Box::new(|_: &Path| Some(1 << 40))
     }
 
     fn with_probe(root: PathBuf, probe: VolumeProbe) -> Self {
