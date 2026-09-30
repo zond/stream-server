@@ -21,8 +21,8 @@ pub use routes::downloads::{DownloadInfo, ProxyDownloadRequest};
 // with them, because `DriveOpenError::Drive` carries one and an embedder
 // that cannot name it cannot construct or match the case that matters.
 pub use media::{
-    Canceller, GrantSupplier, MediaId, MediaReader, MediaSpec, MemberInfo, PlayToken, Refusal,
-    Resolved,
+    Canceller, GrantSupplier, LocalFile, MediaId, MediaReader, MediaSpec, MemberInfo, PlayToken,
+    Refusal, Resolved,
 };
 pub use routes::drive::{DriveFileOpened, DriveOpenError};
 #[doc(hidden)]

@@ -186,8 +186,9 @@ pub enum MediaSpec {
     /// A Google Drive file, and where its grant comes from (the server
     /// keeps no refresh token; xtremio's `ServerState::drive_grant` does).
     Drive { file_id: String, name: Option<String>, grant: GrantSupplier },
-    /// A file on this device (step B).
-    Local(LocalFile),
+    /// A file on this device (step B); an fd has no name, so the app
+    /// gives one.
+    Local { file: LocalFile, name: Option<String> },
 }
 
 pub enum LocalFile { Path(PathBuf), Fd(OwnedFd) }
@@ -683,7 +684,15 @@ A'. **App: mpv on `xtremio://<id>`.** (L.) The vendored media_kit patch
 B. **Local source.** (S.) A path, or on Android an fd from
    `ParcelFileDescriptor.detachFd()`. A pipe fd from a cloud SAF provider is
    not seekable; `resolve` refuses it (`lseek` fails) with a sentence rather
-   than streaming it forward-only.
+   than streaming it forward-only. *(Done: `server/src/sources/local.rs`,
+   `MediaSpec::Local { file: LocalFile, name }`. Every read is positional
+   (`pread`/`seek_read`), since a `dup` of a handed-over fd shares its
+   offset and two readers of one id would move each other. A play on a
+   local id puts the session on `Played::Elsewhere`, as a `p=` `/proxy`
+   play does, so a torrent played before goes slack. The pipe refusal is
+   `Refusal::NotSeekable`. `server/tests/media_local.rs` holds the tests,
+   including that no route names a `MediaSpec` and none can deserialize
+   one. Pins of a local id are step D's question.)*
 
 C. **Publish and the cast route.** (M.) 2.7 whole: tokens, `/cast/{token}`,
    the body wrapper, `set_lan_media(false)` unpublishing, `log_path`, the

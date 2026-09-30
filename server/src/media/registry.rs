@@ -20,6 +20,7 @@ use super::reader::{self, MediaReader, Source};
 use super::{GrantSupplier, MediaId, MediaSpec, PlayToken, Refusal, Resolved};
 use crate::routes::compat;
 use crate::sources::held::HeldSource;
+use crate::sources::local::{LocalFile, LocalSource};
 use crate::sources::{ByteSource, DriveSource, Play, ProxySource, TorrentSource};
 use crate::state::AppState;
 use crate::stream_numbers::{StreamFile, StreamNumbers};
@@ -93,6 +94,11 @@ enum Target {
         name: Option<String>,
         grant: GrantSupplier,
     },
+    /// A file on this device, not opened until `resolve`.
+    Local {
+        file: LocalFile,
+        name: Option<String>,
+    },
 }
 
 /// What resolving an id found.
@@ -132,6 +138,8 @@ pub(crate) enum Resolution {
         target: Url,
         name: String,
     },
+    /// A file on this device, open.
+    Local { source: Arc<LocalSource> },
 }
 
 impl Resolution {
@@ -147,6 +155,7 @@ impl Resolution {
             Self::Drive { source, .. } => source.needs_pairing_again(),
             Self::Held { source, .. } => !state.proxy_cache.retention().is_pinned(source.key_dir()),
             Self::Torrent { .. } | Self::Http { .. } | Self::WillNotRange { .. } => false,
+            Self::Local { .. } => false,
         }
     }
 
@@ -202,6 +211,14 @@ impl Resolution {
                 in_process: true,
                 proxy_url: None,
             },
+            Self::Local { source } => Resolved {
+                name: source.name().to_string(),
+                content_type: source.content_type().to_string(),
+                len: source.len(),
+                member: None,
+                in_process: true,
+                proxy_url: None,
+            },
         }
     }
 }
@@ -227,6 +244,7 @@ impl Registry {
                 name,
                 grant,
             }),
+            MediaSpec::Local { file, name } => Ok(Target::Local { file, name }),
         };
         drop(self.entries.insert(
             id.as_str().to_string(),
@@ -296,6 +314,8 @@ impl Registry {
             Resolution::Drive { media_url, .. } => {
                 crate::stream_numbers::proxied_numbers(&state.proxy_cache, media_url.clone()).await
             }
+            // Nothing is fetched or shared: no numbers to show.
+            Resolution::Local { .. } => None,
         }
     }
 
@@ -426,6 +446,20 @@ impl Registry {
                         .proxy_cache
                         .retention()
                         .note_source(key_dir, Arc::new(source.filling_source()));
+                }
+                Source::Shared(source.clone())
+            }
+            Resolution::Local { source } => {
+                // The viewer's player is on a file of this device's now,
+                // which is no torrent file: its session goes to
+                // `Elsewhere`, as a `p=` request through `/proxy` puts it,
+                // so a torrent it played before is left and goes slack.
+                // Nothing is read ahead: every byte is here.
+                if let Some(play) = &play {
+                    state.engine.note_player(
+                        &play.token,
+                        enginefs::retention::sessions::Played::Elsewhere,
+                    );
                 }
                 Source::Shared(source.clone())
             }
@@ -633,6 +667,20 @@ async fn resolve(state: &AppState, target: &Target) -> Result<Resolution, Refusa
                 source: Arc::new(source.named(name.clone())),
                 media_url,
                 name,
+            })
+        }
+        Target::Local { file, name } => {
+            // The I/O `register` did not do: open it, prove it seeks, read
+            // its length.
+            let name = name
+                .clone()
+                .or_else(|| file.file_name())
+                .unwrap_or_else(|| "a file on this device".to_string());
+            let source = LocalSource::open(file, name)
+                .await
+                .map_err(Refusal::of_local)?;
+            Ok(Resolution::Local {
+                source: Arc::new(source),
             })
         }
     }

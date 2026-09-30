@@ -55,6 +55,8 @@ pub use reader::{Canceller, Command, MediaReader};
 pub use registry::MEDIA_ID_CAP;
 
 use crate::sources::drive::DriveError;
+use crate::sources::local::LocalError;
+pub use crate::sources::local::LocalFile;
 use crate::sources::proxy::ProxySourceError;
 use enginefs::backend::priorities::BufferProfile;
 use std::sync::Arc;
@@ -85,6 +87,21 @@ pub enum MediaSpec {
         name: Option<String>,
         /// The refresh token, asked for at each resolve.
         grant: GrantSupplier,
+    },
+    /// A file on this device: a path, or an fd the app hands over (on
+    /// Android, `ParcelFileDescriptor.detachFd()`). **Only ever named
+    /// here**, through [`crate::ServerHandle::register`]: no HTTP route
+    /// resolves an id and nothing deserializes a `MediaSpec`, so no URL
+    /// and no request body can name a file on this device. Resolving it
+    /// opens it, proves it can seek -- a pipe is refused, never streamed
+    /// forward -- and reads its length.
+    Local {
+        /// The file.
+        file: LocalFile,
+        /// What to call it. A path's file name when `None`; an fd has
+        /// no name of its own, so the app should say. Its extension is
+        /// where the content type comes from.
+        name: Option<String>,
     },
 }
 
@@ -223,6 +240,10 @@ pub enum Refusal {
     InsufficientDiskSpace,
     /// The file could not be opened for reading.
     OpenFailed(String),
+    /// A file on this device that reads only forwards (a pipe, as a cloud
+    /// provider may hand out): playing needs a seek, so it is refused
+    /// rather than streamed forward.
+    NotSeekable,
     /// The server has stopped, or is stopping.
     ServerStopped,
 }
@@ -248,6 +269,7 @@ impl Refusal {
             Self::DriveUnreadable(_) => "driveUnreadable",
             Self::InsufficientDiskSpace => "insufficientDiskSpace",
             Self::OpenFailed(_) => "openFailed",
+            Self::NotSeekable => "notSeekable",
             Self::ServerStopped => "serverStopped",
         }
     }
@@ -262,6 +284,15 @@ impl Refusal {
             ProxySourceError::Fetch(_) | ProxySourceError::Credentials(_) => {
                 Self::Unreachable(error.to_string())
             }
+        }
+    }
+
+    /// A local file's refusal: a pipe as itself, anything else a failed
+    /// open with its sentence.
+    pub(crate) fn of_local(error: LocalError) -> Self {
+        match error {
+            LocalError::NotSeekable => Self::NotSeekable,
+            error => Self::OpenFailed(error.to_string()),
         }
     }
 
@@ -303,6 +334,7 @@ impl std::fmt::Display for Refusal {
             Self::InsufficientDiskSpace => {
                 f.write_str(crate::routes::stream::INSUFFICIENT_DISK_SPACE_BODY)
             }
+            Self::NotSeekable => write!(f, "{}", LocalError::NotSeekable),
             Self::ServerStopped => f.write_str("the server has stopped"),
         }
     }
