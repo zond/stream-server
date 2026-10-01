@@ -246,19 +246,78 @@ pub enum MagnetAddError {
 
 impl MagnetAddError {
     /// What an HTTP client may be told about this failure. The timeout
-    /// message is its own `Display` (it names only the info hash and the
-    /// bound); every other variant collapses to a fixed string, because the
+    /// and a cancelled add are their own `Display` (they name only the info
+    /// hash and the bound); every other variant collapses to a fixed string, because the
     /// backend error chain can carry absolute download-dir paths and a task
     /// failure the panic payload. Those belong in the server log -- log the
     /// error itself (`%error`) at the call site -- never in a response body.
     pub fn client_message(&self) -> String {
         match self {
-            Self::MetadataTimeout { .. } => self.to_string(),
-            Self::Backend { .. } | Self::TaskFailed { .. } | Self::Cancelled { .. } => {
+            // A wait names only the info hash: a client shows it while it
+            // asks again, and "refused" there would say it had stopped.
+            Self::MetadataTimeout { .. } | Self::Cancelled { .. } => self.to_string(),
+            Self::Backend { .. } | Self::TaskFailed { .. } => {
                 "backend refused the torrent; see server logs".to_string()
             }
         }
     }
+
+    /// What this failure means for whoever asked: ask again later, or stop.
+    ///
+    /// A swarm that has not handed over the info dictionary is
+    /// [`MagnetAddFailure::Waiting`]: the timeout, an add cancelled under
+    /// its asker (its entry swept), and librqbit running out of peer
+    /// sources mid-resolve ([`PEER_SOURCES_EXHAUSTED`]) all end in a fresh
+    /// add when asked again, and a swarm that comes back answers it. A
+    /// backend error whose chain holds an out-of-space I/O error is
+    /// [`MagnetAddFailure::DiskFull`]. Everything else the backend said is
+    /// [`MagnetAddFailure::Refused`] -- a link librqbit cannot parse, an
+    /// info dictionary that does not validate (a file index out of range,
+    /// a path that escapes the folder), a storage or persistence error, no
+    /// peer source configured at all -- and so is a task that died: asking
+    /// again gets the same answer.
+    pub fn failure(&self) -> MagnetAddFailure {
+        match self {
+            Self::MetadataTimeout { .. } | Self::Cancelled { .. } => MagnetAddFailure::Waiting,
+            Self::TaskFailed { .. } => MagnetAddFailure::Refused,
+            Self::Backend { error, .. } => {
+                let disk_full = error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::StorageFull)
+                });
+                if disk_full {
+                    MagnetAddFailure::DiskFull
+                } else if error
+                    .chain()
+                    .any(|cause| cause.to_string().contains(PEER_SOURCES_EXHAUSTED))
+                {
+                    MagnetAddFailure::Waiting
+                } else {
+                    MagnetAddFailure::Refused
+                }
+            }
+        }
+    }
+}
+
+/// librqbit's sentence when a magnet's peer stream ends before any peer
+/// sent the info dictionary (`Session::resolve_magnet`). It has no type of
+/// its own, so it is matched by text; a test against the pinned rqbit
+/// source would be a test of their copy, so the match is pinned here and
+/// re-checked by hand at every rqbit bump.
+pub const PEER_SOURCES_EXHAUSTED: &str = "input address stream exhausted";
+
+/// [`MagnetAddError::failure`]: the three answers a failed add can be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MagnetAddFailure {
+    /// The swarm did not answer, or the add was let go: ask again, a live
+    /// swarm will answer.
+    Waiting,
+    /// The volume is full.
+    DiskFull,
+    /// The backend refused the torrent; asking again gets the same answer.
+    Refused,
 }
 
 /// Outcome of a magnet add shared between every waiter.
@@ -12208,6 +12267,68 @@ mod tests {
             file_count: 2,
         };
         assert_eq!(missing.client_message(), missing.to_string());
+    }
+
+    /// A dead swarm is waited for, a full disk is a full disk, and what the
+    /// backend refused is refused -- the chains as librqbit and
+    /// `add_torrent_placed` build them.
+    #[test]
+    fn a_failed_add_says_whether_to_wait() {
+        let backend = |error: anyhow::Error| MagnetAddError::Backend {
+            info_hash: "abc".into(),
+            error: Arc::new(error.context("Failed to add torrent to librqbit")),
+        };
+        assert_eq!(
+            MagnetAddError::MetadataTimeout {
+                info_hash: "abc".into(),
+                timeout: METADATA_RESOLVE_TIMEOUT,
+            }
+            .failure(),
+            MagnetAddFailure::Waiting
+        );
+        assert_eq!(
+            MagnetAddError::Cancelled {
+                info_hash: "abc".into()
+            }
+            .failure(),
+            MagnetAddFailure::Waiting
+        );
+        assert_eq!(
+            backend(anyhow::anyhow!(
+                "input address stream exhausted, no way to discover torrent metainfo"
+            ))
+            .failure(),
+            MagnetAddFailure::Waiting
+        );
+
+        let full = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::StorageFull))
+            .context("error creating directory /home/user/x");
+        assert_eq!(backend(full).failure(), MagnetAddFailure::DiskFull);
+        let denied =
+            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                .context("error creating directory /home/user/x");
+        assert_eq!(backend(denied).failure(), MagnetAddFailure::Refused);
+
+        for refused in [
+            "provided path is not a valid magnet URL",
+            "no known way to resolve peers (no DHT, no trackers, no initial_peers)",
+            "path traversal in torrent name detected",
+            "piece_reclaim needs a storage that can release single pieces",
+        ] {
+            assert_eq!(
+                backend(anyhow::anyhow!(refused)).failure(),
+                MagnetAddFailure::Refused,
+                "{refused}"
+            );
+        }
+        assert_eq!(
+            MagnetAddError::TaskFailed {
+                info_hash: "abc".into(),
+                reason: "panicked".into(),
+            }
+            .failure(),
+            MagnetAddFailure::Refused
+        );
     }
 
     // --- pinned offline downloads ---

@@ -599,9 +599,7 @@ impl Registry {
                 // engine since the resolve, and the stream route asks on
                 // every request for the same reason.
                 if let Ok(Target::Torrent { query, .. }) = &entry.target {
-                    compat::get_or_create_engine(&state.engine, info_hash, query.as_deref())
-                        .await
-                        .map_err(|error| Refusal::TorrentUnavailable(error.client_message()))?;
+                    torrent_engine(state, info_hash, query.as_deref()).await?;
                 }
                 let source = match play {
                     Some(play) => {
@@ -1043,6 +1041,22 @@ fn parse_member(url: &Url, format: Format) -> Result<Target, Refusal> {
     }
 }
 
+/// A media id's torrent, found or added (with the URL's `tr=`), or why
+/// not as the refusal a client switches on ([`Refusal::of_magnet_add`]):
+/// wait for a swarm that has not answered, stop on one the backend refused.
+async fn torrent_engine(
+    state: &AppState,
+    info_hash: &str,
+    query: Option<&str>,
+) -> Result<Arc<enginefs::engine::Engine<enginefs::backend::librqbit::LibrqbitHandle>>, Refusal> {
+    compat::get_or_create_engine(&state.engine, info_hash, query)
+        .await
+        .map_err(|error| {
+            tracing::warn!(info_hash, %error, "a media id's torrent could not be added");
+            Refusal::of_magnet_add(&error)
+        })
+}
+
 /// The work `resolve` does, once per id: add or find the torrent and
 /// choose its file; probe the origin; renew the Drive grant; index a
 /// member's container and find the member in it.
@@ -1053,12 +1067,7 @@ async fn resolve(state: &AppState, target: &Target) -> Result<Resolution, Refusa
             file,
             query,
         } => {
-            let engine = compat::get_or_create_engine(&state.engine, info_hash, query.as_deref())
-                .await
-                .map_err(|error| {
-                    tracing::warn!(info_hash, %error, "a media id's torrent could not be added");
-                    Refusal::TorrentUnavailable(error.client_message())
-                })?;
+            let engine = torrent_engine(state, info_hash, query.as_deref()).await?;
             let files = engine.handle.get_files().await;
             let candidates = compat::candidates(&files);
             let (requested, filters) = match file {

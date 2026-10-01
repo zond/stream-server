@@ -230,9 +230,14 @@ pub enum Refusal {
     NoRanges,
     /// A build with no reader for the format (`501 noReader`).
     NoReader(String),
-    /// The torrent could not be added or found (a metadata timeout, the
-    /// backend refusing it). The engine's own non-leaking sentence.
+    /// The torrent is not here yet: its swarm did not hand over the info
+    /// dictionary in time (or the add was let go), and asking again starts
+    /// a fresh add -- a client waits on this one. The engine's own
+    /// non-leaking sentence.
     TorrentUnavailable(String),
+    /// The backend refused the torrent: asking again gets the same answer,
+    /// so a client stops here. The engine's own non-leaking sentence.
+    TorrentRefused(String),
     /// The torrent has no file by that index, or `-1` matched nothing; an
     /// archive has no such member, or no session under that key.
     NoSuchFile(String),
@@ -278,6 +283,7 @@ impl Refusal {
             Self::NoRanges => "noRanges",
             Self::NoReader(_) => "noReader",
             Self::TorrentUnavailable(_) => "torrentUnavailable",
+            Self::TorrentRefused(_) => "torrentRefused",
             Self::NoSuchFile(_) => "noSuchFile",
             Self::BadRequest(_) => "badRequest",
             Self::OriginRefused(_) => "originRefused",
@@ -303,6 +309,18 @@ impl Refusal {
             ProxySourceError::Fetch(_) | ProxySourceError::Credentials(_) => {
                 Self::Unreachable(error.to_string())
             }
+        }
+    }
+
+    /// A torrent add's failure: a swarm that has not answered is waited
+    /// for (`torrentUnavailable`), a full disk is `insufficientDiskSpace`,
+    /// and anything the backend refused is `torrentRefused`
+    /// ([`enginefs::MagnetAddError::failure`]).
+    pub(crate) fn of_magnet_add(error: &enginefs::MagnetAddError) -> Self {
+        match error.failure() {
+            enginefs::MagnetAddFailure::Waiting => Self::TorrentUnavailable(error.client_message()),
+            enginefs::MagnetAddFailure::DiskFull => Self::InsufficientDiskSpace,
+            enginefs::MagnetAddFailure::Refused => Self::TorrentRefused(error.client_message()),
         }
     }
 
@@ -363,6 +381,7 @@ impl std::fmt::Display for Refusal {
             Self::NoRanges => write!(f, "{}", ProxySourceError::WillNotRange),
             Self::NoReader(message)
             | Self::TorrentUnavailable(message)
+            | Self::TorrentRefused(message)
             | Self::NoSuchFile(message)
             | Self::BadRequest(message)
             | Self::OriginRefused(message)
@@ -444,3 +463,58 @@ impl std::fmt::Display for PinError {
 }
 
 impl std::error::Error for PinError {}
+
+#[cfg(test)]
+mod tests {
+    use super::Refusal;
+    use enginefs::MagnetAddError;
+    use std::sync::Arc;
+
+    /// Each answer a failed add can be, as the kind a client switches on:
+    /// the timeout is a wait (`torrentUnavailable`, with the engine's
+    /// sentence), a full disk is the disk gate's own refusal, and a backend
+    /// refusal is `torrentRefused`.
+    #[test]
+    fn a_failed_add_is_the_refusal_a_client_switches_on() {
+        let timeout = MagnetAddError::MetadataTimeout {
+            info_hash: "abc".into(),
+            timeout: std::time::Duration::from_secs(90),
+        };
+        assert_eq!(
+            Refusal::of_magnet_add(&timeout),
+            Refusal::TorrentUnavailable(timeout.client_message())
+        );
+        assert_eq!(
+            Refusal::of_magnet_add(&timeout).kind(),
+            "torrentUnavailable"
+        );
+        let cancelled = MagnetAddError::Cancelled {
+            info_hash: "abc".into(),
+        };
+        assert_eq!(
+            Refusal::of_magnet_add(&cancelled),
+            Refusal::TorrentUnavailable("magnet add for abc was cancelled".into())
+        );
+
+        let backend = |error: anyhow::Error| MagnetAddError::Backend {
+            info_hash: "abc".into(),
+            error: Arc::new(error),
+        };
+        let full = backend(
+            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::StorageFull))
+                .context("writing /home/user/cache/piece"),
+        );
+        assert_eq!(
+            Refusal::of_magnet_add(&full),
+            Refusal::InsufficientDiskSpace
+        );
+
+        let refused = backend(anyhow::anyhow!("error decoding torrent at /home/user/x"));
+        let refusal = Refusal::of_magnet_add(&refused);
+        assert_eq!(refusal.kind(), "torrentRefused");
+        assert_eq!(
+            refusal,
+            Refusal::TorrentRefused("backend refused the torrent; see server logs".into())
+        );
+    }
+}

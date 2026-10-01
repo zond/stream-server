@@ -984,6 +984,50 @@ fn an_id_nobody_holds_is_evicted_at_the_cap_and_one_being_read_is_not() -> anyho
     Ok(())
 }
 
+/// **A torrent the backend refuses is `torrentRefused`, not a wait.** With
+/// no DHT, no tracker and no local discovery, librqbit refuses a magnet at
+/// once ("no known way to resolve peers"): asking again gets the same
+/// answer, so the kind is the one a player stops on, never the
+/// `torrentUnavailable` of a swarm that has not answered yet. The reader
+/// is refused the same way, and the sentence leaks nothing of the cause.
+#[test]
+fn a_torrent_the_backend_refuses_is_refused_not_unavailable() -> anyhow::Result<()> {
+    let origin = Origin::start()?;
+    let (handle, _dirs) = origin_server(&origin)?;
+    let url = url::Url::parse(&format!(
+        "http://{}/{}/0",
+        handle.http_addr(),
+        "0123456789abcdef0123456789abcdef01234567"
+    ))?;
+    let id = handle.register(MediaSpec::StreamingUrl(url))?;
+
+    let refusal = handle.resolve(&id).err();
+    assert_eq!(
+        refusal,
+        Some(Refusal::TorrentRefused(
+            "backend refused the torrent; see server logs".to_string()
+        ))
+    );
+    let refusal = refusal.expect("refused");
+    assert_eq!(refusal.kind(), "torrentRefused");
+    assert_eq!(
+        serde_json::to_value(&refusal)?,
+        serde_json::json!({
+            "refused": "torrentRefused",
+            "message": "backend refused the torrent; see server logs",
+        })
+    );
+    assert_eq!(
+        handle.open_reader(&id, None).err(),
+        Some(refusal),
+        "the reader resolves the same way"
+    );
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
 /// Polls the downloads listing until the row keyed `key` is complete.
 fn wait_complete(handle: &stream_server::ServerHandle, key: &str) -> anyhow::Result<()> {
     until("the download completes", || {
