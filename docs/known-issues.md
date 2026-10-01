@@ -26,6 +26,28 @@ carried in below.
   `enginefs/src/retention/scenario.rs`'s `CONTAINER_METADATA_LOOKAHEAD` and
   `PLAYBACK_LOOKAHEAD` keep the field's numbers under the names of constants
   that no longer exist -- a scenario stays the measurement it was taken from.
+- **Deleting one volume while its set plays keeps its pieces advertised
+  until the set is left** (review of `1d0d109`, 2026-10-01, H3). The set's
+  draw is recorded on every volume, so the delete's `end_play_session` on
+  the deleted volume leaves the union recorded on the others, which still
+  count as shared (`Engine::shares_now`): the deleted volume's pieces stay
+  in the advertised set -- announced and no longer held -- until the
+  viewer leaves the set and `EndShares` rebuilds it. Nothing breaks (an
+  advertised piece not held is announced to nobody), but the delete does
+  not end what the deleted file shared, as it does for a film. Not fixed.
+- **A set's draw advertised by a sibling can still land between the
+  door's reading and an unlink** (2026-10-01, what is left of review H1).
+  The door now refuses every piece of a recorded draw of a played entity
+  (`Door::drawn`, read after the advertised set), and a draw is recorded
+  before it is advertised, so a pass that reads after the record keeps the
+  piece; a sibling that records and advertises in the instant between that
+  reading and the backend's release is the window a neighbour's boundary
+  piece has always had at `announced_now`.
+- **A session that keeps a file but stops sharing it leaves nothing**
+  (`PlaySessions::play`, "only `shares` changed"): a member played through
+  an id and then the same container by its URL (`shares: false`) keeps the
+  member's draw advertised until no session is on the torrent. Only a
+  client on the HTTP routes does that; the app plays members by id.
 
 ### Readable before durable (2026-09-19)
 
@@ -228,6 +250,20 @@ process.
 
 
 ## Closed, one line each
+
+- 2026-10-01 -- **Review of the member-sharing commits (`39a9105`,
+  `1d0d109`)**, fixed on `review-fixes`. B1: a move to another member of
+  the same container kept the first member's draw (a draw now records what
+  it was made for, `DrawnFor`; a new member on the same file is a move);
+  test `a_move_to_another_member_of_the_same_container_ends_the_first_members_draw`.
+  H4, which fell out with it: a set -> own-volume move kept the union; test
+  `a_move_off_a_set_onto_one_of_its_volumes_ends_the_sets_draw`. B2: a
+  single-file member's duration gave the container a container-length
+  stream rate; test `a_members_duration_gives_the_container_no_stream_rate`.
+  H1: a sibling's advertise of the union could race a volume's unlink; test
+  `a_volume_unlinks_nothing_of_a_sets_draw_a_sibling_has_yet_to_advertise`.
+  H2: a volume adopted any sibling's draw, a stale empty one included; test
+  `a_volume_adopts_only_a_draw_made_for_its_set`. H3 is open above.
 
 - 2026-09-29 -- **Offline tests reached the DHT**: `resolve_dht_bootstrap_names`
   off stopped only this server's own resolution, and librqbit resolved the
