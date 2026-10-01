@@ -60,11 +60,14 @@
 //!   generations of one resource apart**, and it is what keeps chunks of two
 //!   of them out of one directory and out of one body. Length and type say
 //!   nothing about a URL whose content was replaced by content of the same
-//!   size -- which is why a response the origin will identify by neither
-//!   `ETag` nor `Last-Modified` is not kept at all
-//!   (`routes::proxy::cacheable_entity`). What the origin says is the whole
-//!   of the evidence, and it is the whole of what is claimed here: an origin
-//!   that serves new bytes under an old validator is being untruthful, and
+//!   size. It is the strongest identity there is for the entity
+//!   (`routes::proxy::entity_identity`): what the source that opened it
+//!   knows (a Drive file's checksum), else the origin's `ETag` or
+//!   `Last-Modified`, else **the length alone** -- every entity is kept, and
+//!   one whose origin names nothing is told from its next generation only
+//!   when the length changes. What the evidence says is the whole of what is
+//!   claimed here: an origin that serves new bytes under an old validator,
+//!   or a same-length file under no validator, is served as it was, and
 //!   nothing in this module can catch that.
 //! * `<bucket>` is `<chunk> / 1000`, the chunk store's own bucketing
 //!   ([`enginefs::chunk_store::CHUNKS_PER_DIRECTORY`]): exFAT and FAT32 scan
@@ -644,8 +647,8 @@ impl ProxyCache {
     /// open: the entity directory *under* the key is named for the
     /// origin's own validator, a fill that finds a different one drops
     /// what was held of the old generation ([`remove_other_entities`]),
-    /// and an origin that names no validator at all is read and never kept
-    /// (`routes::proxy::cacheable_entity`). A vouch is about identity, and
+    /// and the source that vouched checks the generation again at every
+    /// open (`ProxySource::retire_stale`). A vouch is about identity, and
     /// the validator is about generation; the two are separate and both
     /// are needed.
     ///
@@ -926,30 +929,12 @@ impl Entry {
         // every request to the origin until a fill can take the old one.
         // Without it the key would hold the old entity alone, and a lookup
         // would serve bytes the origin has just said are not this resource.
-        let stale = self.dir.clone();
-        let fresh = dir.clone();
         let ticket = self.work.start();
-        let retention = self.retention.clone();
+        let this = self.clone();
+        let fresh = dir.clone();
         tokio::task::spawn_blocking(move || {
             let _ticket = ticket;
-            let (freed, left) = remove_other_entities(
-                &stale,
-                &fresh,
-                |entity| retention.readers_of(entity) > 0,
-                |entity| retention.forget(entity),
-            );
-            retention.uncounted(freed);
-            if left > 0 {
-                if let Err(error) = std::fs::create_dir_all(&fresh) {
-                    tracing::debug!(path = %fresh.display(), %error, "could not open a proxy cache entry");
-                }
-            } else {
-                // A key whose old entity went and whose new one has no chunk
-                // yet is an empty directory. `rmdir` refuses it the moment a
-                // chunk write has made the entity, and a write whose bucket
-                // this took in between makes it again.
-                let _ = std::fs::remove_dir(&stale);
-            }
+            this.retire_others_than(&fresh);
         });
         let dir = ChunkDir::new(dir);
         let reader = self
@@ -965,6 +950,48 @@ impl Entry {
             offset: body_start,
             collecting: None,
             buffer: Vec::new(),
+        }
+    }
+
+    /// Removes every entity under this key but the one named `current`
+    /// (an [`entity_dir_name`]): what an open does once the origin -- or
+    /// what the source knows of it -- has said which generation of the
+    /// resource is the one there now (`ProxySource::retire_stale`). The
+    /// same removal a fill makes when it finds a new entity, made before
+    /// anything reads rather than after the first byte arrives, so a whole
+    /// stale entity is never served as a hit. Blocking.
+    pub(crate) fn retire_others(&self, current: &str) {
+        self.retire_others_than(&self.dir.join(current));
+    }
+
+    /// [`Self::retire_others`] and [`Self::fill`]'s removal, by the entity
+    /// directory that stays.
+    ///
+    /// An entity a body is still reading is left standing (see
+    /// [`remove_other_entities`]); `fresh` is then made, so that the key
+    /// holds two entities and every lookup goes to the origin until a fill
+    /// can take the old one. Without it the key would hold the old entity
+    /// alone, and a lookup would serve bytes the origin has just said are
+    /// not this resource.
+    fn retire_others_than(&self, fresh: &Path) {
+        let retention = &self.retention;
+        let (freed, left) = remove_other_entities(
+            &self.dir,
+            fresh,
+            |entity| retention.readers_of(entity) > 0,
+            |entity| retention.forget(entity),
+        );
+        retention.uncounted(freed);
+        if left > 0 {
+            if let Err(error) = std::fs::create_dir_all(fresh) {
+                tracing::debug!(path = %fresh.display(), %error, "could not open a proxy cache entry");
+            }
+        } else {
+            // A key whose old entity went and whose new one has no chunk
+            // yet is an empty directory. `rmdir` refuses it the moment a
+            // chunk write has made the entity, and a write whose bucket
+            // this took in between makes it again.
+            let _ = std::fs::remove_dir(&self.dir);
         }
     }
 
@@ -1080,9 +1107,10 @@ fn encode_field(value: &str) -> String {
 }
 
 /// The three fields back, and `None` for a name that is not three fields or
-/// whose validator is empty. An entity with no validator is one nothing could
-/// tell a later generation of the resource from, and nothing writes one -- so
-/// a directory claiming to be one is not read as an entity at all.
+/// whose validator is empty. Every entity is filed under an identity -- its
+/// length, when nothing better (`routes::proxy::entity_identity`) -- so
+/// nothing writes an empty one, and a directory claiming to be one is not
+/// read as an entity at all.
 fn parse_entity_dir_name(name: &str) -> Option<(u64, String, String)> {
     let mut fields = name.split('_');
     let total: u64 = fields.next()?.parse().ok()?;
@@ -1260,13 +1288,14 @@ pub struct Cached {
     pub total: u64,
     /// What the origin labelled the entity, empty when it said nothing.
     pub content_type: String,
-    /// How the origin identified the entity, as
-    /// `routes::proxy::EntityValidator` files it -- the header it came in and
-    /// its value. Never empty: a response the origin would identify by
-    /// neither `ETag` nor `Last-Modified` is not kept.
+    /// The identity the entity is filed under
+    /// (`routes::proxy::entity_identity`): `etag:..` or `last-modified:..`
+    /// as the origin named it, `source:..` as its opener supplied it, or
+    /// `length:..`. Never empty.
     ///
     /// It is what says that this and a fresh `206` are parts of one entity,
-    /// and it is the `If-Range` the narrowed fetch asks under.
+    /// and -- the origin's two only -- the `If-Range` the narrowed fetch
+    /// asks under.
     pub validator: String,
     /// The first byte the request asked for, clamped into the entity.
     pub first: u64,
@@ -1815,9 +1844,8 @@ mod tests {
     );
 
     /// How an origin identified the entity these tests store, as
-    /// `routes::proxy::EntityValidator` files it. Every entity has one --
-    /// a response the origin will identify by neither `ETag` nor
-    /// `Last-Modified` is not kept at all.
+    /// `routes::proxy::EntityValidator` files it. Every entity has an
+    /// identity; these use the origin's.
     const VALIDATOR: &str = "etag:\"v1\"";
 
     fn entry_of(cache: &ProxyCache, target: &str) -> Entry {
@@ -3432,9 +3460,9 @@ mod tests {
                 "{name}"
             );
         }
-        // An entity with no validator is one nothing could tell a later
-        // generation of the resource from, and nothing writes one -- so a
-        // directory claiming to be one is not read as an entity at all.
+        // Nothing writes an entity with an empty identity -- one with no
+        // validator is filed under its length -- so a directory claiming
+        // to be one is not read as an entity at all.
         assert_eq!(
             parse_entity_dir_name(&entity_dir_name(4096, "video/mp4", "")),
             None

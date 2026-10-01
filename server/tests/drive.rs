@@ -25,7 +25,18 @@ const FILE_LENGTH: usize = 2 * 1024 * 1024;
 /// The film's bytes: a pattern, so a range can be checked to have come
 /// from the offset it claims rather than merely to be the right length.
 fn byte_at(offset: usize) -> u8 {
-    (offset.wrapping_mul(11) % 251) as u8
+    byte_of(0, offset)
+}
+
+/// The same, for a generation of the film: what Drive serves after the
+/// file was replaced by one of the same length (see [`Fake::replace`]).
+fn byte_of(generation: usize, offset: usize) -> u8 {
+    ((offset.wrapping_mul(11) % 251) as u8).wrapping_add(generation as u8)
+}
+
+/// The checksum Drive's metadata states for a generation of the film.
+fn md5_of(generation: usize) -> String {
+    format!("{generation:032x}")
 }
 
 /// How the fake pairing service answers a refresh.
@@ -47,12 +58,22 @@ enum Refreshes {
 
 /// One loopback listener standing in for both Google and the pairing
 /// service, the same way `sources::drive`'s own tests do it: `/refresh`
-/// mints tokens, `/drive/v3/files/...` serves ranges to whoever holds one.
+/// mints tokens, `/drive/v3/files/{id}?alt=media` serves ranges to whoever
+/// holds one, and `/drive/v3/files/{id}` without it answers the file's
+/// metadata.
+///
+/// **Its media responses name no validator**, as Drive's do not (measured
+/// on a phone, 2026-10-01): no `ETag`, no `Last-Modified`. The
+/// `Cache-Control: private, max-age=0` is what Google's APIs send elsewhere
+/// and is assumed, not measured, here. An earlier fake sent an `ETag`,
+/// which is how a Drive file that was never kept passed every test here.
 struct Fake {
     addr: SocketAddr,
     refreshes: Arc<AtomicUsize>,
     /// Every `Range` the film was asked for, in order.
     ranges: Arc<Mutex<Vec<String>>>,
+    /// Which generation of the film Drive holds now.
+    generation: Arc<AtomicUsize>,
 }
 
 impl Fake {
@@ -62,20 +83,28 @@ impl Fake {
         let refreshes = Arc::new(AtomicUsize::new(0));
         let issued = Arc::new(Mutex::new(Vec::<String>::new()));
         let ranges = Arc::new(Mutex::new(Vec::<String>::new()));
+        let generation = Arc::new(AtomicUsize::new(0));
         let fake = Fake {
             addr,
             refreshes: refreshes.clone(),
             ranges: ranges.clone(),
+            generation: generation.clone(),
         };
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { break };
-                let (refreshes, issued, ranges) =
-                    (refreshes.clone(), issued.clone(), ranges.clone());
+                let (refreshes, issued, ranges, generation) = (
+                    refreshes.clone(),
+                    issued.clone(),
+                    ranges.clone(),
+                    generation.clone(),
+                );
                 // A thread per connection: a player's opening is several
                 // reads at once and a serial fake would turn the test's
                 // question into a queue.
-                std::thread::spawn(move || serve(stream, mode, &refreshes, &issued, &ranges));
+                std::thread::spawn(move || {
+                    serve(stream, mode, &refreshes, &issued, &ranges, &generation)
+                });
             }
         });
         Ok(fake)
@@ -97,6 +126,21 @@ impl Fake {
     fn ranges(&self) -> Vec<String> {
         self.ranges.lock().expect("the ranges").clone()
     }
+
+    /// The reads of the film's bytes so far, less the one-byte probes an
+    /// open makes: what a read the disk answered does not add to.
+    fn reads(&self) -> usize {
+        self.ranges()
+            .iter()
+            .filter(|range| *range != "bytes=0-0")
+            .count()
+    }
+
+    /// The file is replaced in Drive by another of the same length: other
+    /// bytes, another checksum, the same id.
+    fn replace(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 fn serve(
@@ -105,6 +149,7 @@ fn serve(
     refreshes: &AtomicUsize,
     issued: &Mutex<Vec<String>>,
     ranges: &Mutex<Vec<String>>,
+    generation: &AtomicUsize,
 ) {
     let Ok(second) = stream.try_clone() else {
         return;
@@ -193,6 +238,20 @@ fn serve(
         );
         return;
     }
+    let generation = generation.load(Ordering::SeqCst);
+    if !request_line.contains("alt=media") {
+        respond(
+            &mut stream,
+            "200 OK",
+            format!(
+                "{{\"md5Checksum\":\"{}\",\"version\":\"{}\",\"size\":\"{FILE_LENGTH}\"}}",
+                md5_of(generation),
+                generation + 1
+            )
+            .as_bytes(),
+        );
+        return;
+    }
     if let Some(header) = range.as_deref() {
         ranges.lock().expect("the ranges").push(header.to_string());
     }
@@ -211,9 +270,12 @@ fn serve(
         }
         None => (0, FILE_LENGTH - 1),
     };
-    let body: Vec<u8> = (first..=last).map(byte_at).collect();
+    let body: Vec<u8> = (first..=last)
+        .map(|offset| byte_of(generation, offset))
+        .collect();
     let head = format!(
-        "HTTP/1.1 206 Partial Content\r\nContent-Type: video/x-matroska\r\nETag: \"the-film\"\r\n\
+        "HTTP/1.1 206 Partial Content\r\nContent-Type: video/x-matroska\r\n\
+         Cache-Control: private, max-age=0, must-revalidate, no-transform\r\n\
          Accept-Ranges: bytes\r\nContent-Range: bytes {first}-{last}/{FILE_LENGTH}\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -779,6 +841,92 @@ fn a_playing_drive_file_is_read_ahead_of() -> anyhow::Result<()> {
         ahead.iter().all(|range| range.starts_with("bytes=")
             && range.ends_with(&format!("-{}", FILE_LENGTH - 1))),
         "the rest of the file, to its end: {ahead:?}"
+    );
+    Ok(())
+}
+
+/// **A Drive file is kept, though Drive names no validator for it**, under
+/// the checksum its metadata states -- the bug a phone found on
+/// 2026-10-01: Drive's media responses carry no `ETag`, nothing was kept,
+/// and a download sat at "0 B of 0 B" with its filler at the end.
+///
+/// Three claims, each against the fake that answers as Drive does:
+///
+/// 1. a download fills to complete;
+/// 2. a stream of a file that is not downloaded is read once from Drive,
+///    and a second open of it reads the disk;
+/// 3. the file replaced in Drive by another **of the same length** -- which
+///    the length alone could never tell -- is a new checksum at the next
+///    open: what was kept of the old one is not served, and goes.
+#[test]
+fn a_drive_file_naming_no_validator_is_kept_under_its_checksum() -> anyhow::Result<()> {
+    let fake = Fake::start(Refreshes::Yes)?;
+    let fixture = fixture(&fake)?;
+
+    // 1. The download completes.
+    let row = fixture.download(REFRESH_TOKEN)?;
+    let done = fixture.wait_complete(&row.info_hash)?;
+    assert_eq!(done.downloaded, FILE_LENGTH as u64);
+
+    // Let it go, keeping its bytes, so the next open is a stream's and goes
+    // through Drive rather than off the finished download.
+    let key = row.info_hash.clone();
+    let unpinned = fixture.handle.unpin_proxy_download(&key, false)?;
+    assert!(unpinned.unpinned);
+    let entities = |fixture: &Fixture| -> anyhow::Result<Vec<String>> {
+        let dir = fixture
+            ._cache
+            .path()
+            .join("cache")
+            .join(enginefs::CACHE_DIR_NAME)
+            .join(".proxy")
+            .join(&key);
+        let mut names = Vec::new();
+        // No key directory is no generation: what a retire leaves until
+        // the next chunk is written.
+        let Ok(listing) = std::fs::read_dir(&dir) else {
+            return Ok(names);
+        };
+        for entry in listing {
+            names.push(entry?.file_name().to_string_lossy().into_owned());
+        }
+        names.sort();
+        Ok(names)
+    };
+    let kept = entities(&fixture)?;
+    assert_eq!(kept.len(), 1, "one generation is kept: {kept:?}");
+    assert!(
+        kept[0].contains(&md5_of(0)),
+        "filed under Drive's checksum: {kept:?}"
+    );
+
+    // 2. An open of the file as a stream reads what the download kept.
+    let reads = fake.reads();
+    let opened = fixture.create(REFRESH_TOKEN)?;
+    let url = opened["url"].as_str().expect("a stream URL").to_string();
+    let response = fixture.get(&url, Some("bytes=0-"))?;
+    let expected: Vec<u8> = (0..FILE_LENGTH).map(byte_at).collect();
+    assert_eq!(response.bytes()?.as_ref(), expected.as_slice());
+    assert_eq!(fake.reads(), reads, "a kept file was read from Drive again");
+
+    // 3. Replaced in Drive, the same length: the next open names a new
+    // checksum, and what is served is the new file.
+    fake.replace();
+    let opened = fixture.create(REFRESH_TOKEN)?;
+    let url = opened["url"].as_str().expect("a stream URL").to_string();
+    let response = fixture.get(&url, Some("bytes=0-1023"))?;
+    let replaced: Vec<u8> = (0..1024).map(|offset| byte_of(1, offset)).collect();
+    assert_eq!(
+        response.bytes()?.as_ref(),
+        replaced.as_slice(),
+        "the old file's kept bytes were served for the new one"
+    );
+    assert!(
+        !entities(&fixture)?
+            .iter()
+            .any(|name| name.contains(&md5_of(0))),
+        "the old generation is gone: {:?}",
+        entities(&fixture)?
     );
     Ok(())
 }

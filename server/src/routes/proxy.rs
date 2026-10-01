@@ -776,7 +776,12 @@ fn finalize_response(builder: Builder, body: axum::body::Body) -> Response {
 ///
 /// **This header was read nowhere in this file before the cache existed.**
 /// The rule is being introduced, not inherited.
-fn origin_forbids_caching(res_headers: &HeaderMap) -> bool {
+///
+/// A source that opened the entity itself (`checked_at_open`, see
+/// [`SourceIdentity`]) answers the last three: it holds the grant the copy
+/// is private to, and it checks the entity again at every open. Only
+/// `no-store` is a refusal then.
+fn origin_forbids_caching(res_headers: &HeaderMap, checked_at_open: bool) -> bool {
     let Some(value) = res_headers
         .get(header::CACHE_CONTROL)
         .and_then(|value| value.to_str().ok())
@@ -785,8 +790,13 @@ fn origin_forbids_caching(res_headers: &HeaderMap) -> bool {
     };
     value.split(',').any(|directive| {
         let directive = directive.trim();
-        directive.eq_ignore_ascii_case("no-store")
-            || directive.eq_ignore_ascii_case("no-cache")
+        if directive.eq_ignore_ascii_case("no-store") {
+            return true;
+        }
+        if checked_at_open {
+            return false;
+        }
+        directive.eq_ignore_ascii_case("no-cache")
             || directive.eq_ignore_ascii_case("private")
             || directive.split_once('=').is_some_and(|(name, seconds)| {
                 name.trim().eq_ignore_ascii_case("max-age")
@@ -864,6 +874,65 @@ impl EntityValidator {
     }
 }
 
+/// **What an entity is filed and compared under**: the strongest identity
+/// there is for it, and never none -- every entity the other rules let
+/// through is kept.
+///
+/// In order:
+///
+/// 1. what the source that opened it knows of it beyond any one response
+///    (`supplied`): a Drive file's `md5Checksum`, or its `version` and
+///    `modifiedTime` (`crate::sources::DriveSource`), filed `source:..`;
+/// 2. the origin's own [`EntityValidator`];
+/// 3. its length alone, filed `length:<bytes>`.
+///
+/// The last is weak and is chosen knowingly: a resource replaced by one of
+/// the same length under a URL that names neither validator is served as it
+/// was. Refusing to keep it instead -- the old rule -- protected against
+/// that by never keeping a byte of an origin that names neither, which is
+/// most of the ones a viewer downloads from (Google Drive among them), and
+/// nobody downloading a film wants that trade. A length that differs is
+/// still a different entity: a new directory, the old one dropped by the
+/// fill or the open that finds it ([`crate::proxy_cache::Entry::retire_others`]).
+///
+/// An identity that will not make a directory name (an origin's tag past
+/// [`crate::proxy_cache::can_be_filed`]'s bound) gives way to the next one
+/// down, so an outlandish `ETag` costs its strength and not the keeping.
+/// Only `etag:` and `last-modified:` read back through
+/// [`EntityValidator::from_filed`], so the other two are never sent as an
+/// `If-Range` the origin could not know, nor stated on a hit as a header
+/// the origin never wrote.
+fn entity_identity(
+    res_headers: &HeaderMap,
+    total: u64,
+    content_type: &str,
+    supplied: Option<&str>,
+) -> String {
+    supplied
+        .map(|value| format!("source:{value}"))
+        .into_iter()
+        .chain(EntityValidator::of(res_headers).map(|validator| validator.filed()))
+        .find(|identity| crate::proxy_cache::can_be_filed(total, content_type, identity))
+        .unwrap_or_else(|| format!("length:{total}"))
+}
+
+/// What a source that opened an entity itself -- a [`crate::sources::ProxySource`]
+/// that vouched for its URL ([`crate::sources::proxy::Vouch`]) -- tells the
+/// cache about it, beyond what any one response says.
+///
+/// Its presence is the statement that the source **checks the entity again
+/// at every open** and retires a generation that no longer matches
+/// ([`crate::proxy_cache::Entry::retire_others`]), which is what lets a
+/// response's own `Cache-Control: private`, `no-cache` or `max-age=0` be
+/// answered by the source rather than refuse the keeping: "one client's
+/// copy" is what a grant's holder keeps, and "revalidate first" is what the
+/// open does. `no-store` is still a refusal.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SourceIdentity<'a> {
+    /// The identity it supplies, if it has one (see [`entity_identity`]).
+    pub(crate) supplied: Option<&'a str>,
+}
+
 /// The entity a response describes and the offset its body starts at, when
 /// this is a response [`crate::proxy_cache`] may keep, and `None` for every
 /// response it may not.
@@ -885,23 +954,21 @@ impl EntityValidator {
 /// * **an entity whose length the origin will not state, or states as
 ///   zero.** There is nothing to file the chunks under, no `Content-Range` a
 ///   hit could write, and no chunk in an entity of no bytes;
-/// * **an entity the origin will not identify.** No `ETag` and no
-///   `Last-Modified` (see [`EntityValidator`]) and there is nothing that
-///   could ever tell a second generation of this resource from the one being
-///   stored -- not on the way in, where chunks of both would land in one
-///   directory, and not on the way out, where a cached head would be joined
-///   to a stranger's tail. Neither mistake is one the player, this route or
-///   the store could find out about afterwards, so the response is not kept;
-/// * **an entity whose length, type and validator will not make a directory
-///   name.** See [`crate::proxy_cache::can_be_filed`];
+/// * **an entity whose type will not make a directory name.** See
+///   [`crate::proxy_cache::can_be_filed`];
 /// * **`Cache-Control`.** See [`origin_forbids_caching`].
+///
+/// **An origin that names no validator is not on the list.** The entity is
+/// filed under the strongest identity there is for it, its length when
+/// nothing better ([`entity_identity`]).
 fn cacheable_entity(
     status: StatusCode,
     res_headers: &HeaderMap,
     is_playlist: bool,
     encoded_body: bool,
+    source: Option<SourceIdentity<'_>>,
 ) -> Option<CacheableEntity> {
-    if is_playlist || encoded_body || origin_forbids_caching(res_headers) {
+    if is_playlist || encoded_body || origin_forbids_caching(res_headers, source.is_some()) {
         return None;
     }
     let (first, total) = match status {
@@ -936,15 +1003,18 @@ fn cacheable_entity(
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    let validator = EntityValidator::of(res_headers)?;
-    crate::proxy_cache::can_be_filed(total, &content_type, &validator.filed()).then_some(
-        CacheableEntity {
-            first,
-            total,
-            content_type,
-            validator,
-        },
-    )
+    let validator = entity_identity(
+        res_headers,
+        total,
+        &content_type,
+        source.and_then(|source| source.supplied),
+    );
+    crate::proxy_cache::can_be_filed(total, &content_type, &validator).then_some(CacheableEntity {
+        first,
+        total,
+        content_type,
+        validator,
+    })
 }
 
 /// What a `206` to a ranged probe says about the entity behind it, for a
@@ -963,17 +1033,18 @@ pub(crate) fn probed_entity(status: StatusCode, res_headers: &HeaderMap) -> Opti
         .get(header::CONTENT_RANGE)
         .and_then(|value| value.to_str().ok())
         .and_then(parse_content_range)?;
+    let content_type = res_headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
     Some(ProbedEntity {
         total,
-        content_type: res_headers
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_string(),
-        // The same validator the store files by and the narrowed fetch
-        // asks `If-Range` under, so a source and the route describe one
-        // entity the same way.
-        validator: EntityValidator::of(res_headers).map(|validator| validator.filed()),
+        // The same identity the store files by, so a source and the route
+        // describe one entity the same way. A source that knows better
+        // replaces it (`ProxySource::identified_as`).
+        validator: entity_identity(res_headers, total, &content_type, None),
+        content_type,
     })
 }
 
@@ -981,7 +1052,8 @@ pub(crate) fn probed_entity(status: StatusCode, res_headers: &HeaderMap) -> Opti
 pub(crate) struct ProbedEntity {
     pub(crate) total: u64,
     pub(crate) content_type: String,
-    pub(crate) validator: Option<String>,
+    /// The identity it is filed under: see [`entity_identity`].
+    pub(crate) validator: String,
 }
 
 /// What [`cacheable_entity`] found: the entity, and where in it this body
@@ -992,7 +1064,8 @@ pub(crate) struct CacheableEntity {
     first: u64,
     total: u64,
     content_type: String,
-    validator: EntityValidator,
+    /// Filed: see [`entity_identity`].
+    validator: String,
 }
 
 /// What the stitch reads of a cached head: the fields the entity is filed
@@ -1031,6 +1104,7 @@ fn stitch_refusal(
     res_headers: &HeaderMap,
     is_playlist: bool,
     encoded_body: bool,
+    supplied: Option<&str>,
 ) -> Option<&'static str> {
     if status != StatusCode::PARTIAL_CONTENT {
         // Including the `200` an origin answers when it ignored the narrowed
@@ -1050,8 +1124,20 @@ fn stitch_refusal(
     if encoded_body {
         return Some("the origin answered under a content coding the cached head is not in");
     }
-    if !EntityValidator::of(res_headers)
-        .is_some_and(|validator| validator.filed() == cached.validator)
+    // The tail's identity by the same rule the head was filed by, so a
+    // head kept under its length alone joins a tail of the same length --
+    // and of a length that is not the head's, it does not.
+    let tail_total = res_headers
+        .get(header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_content_range)
+        .map_or(0, |(_, _, total)| total);
+    if entity_identity(
+        res_headers,
+        tail_total,
+        &origin_content_type(res_headers),
+        supplied,
+    ) != cached.validator
     {
         return Some("the origin named a different entity than the cached head is filed under");
     }
@@ -1586,6 +1672,7 @@ async fn proxy(
         &headers,
         &params.request_headers,
         forced_content_type.as_deref(),
+        None,
     )
     .await
     {
@@ -1658,7 +1745,7 @@ async fn proxy(
             ProbedEntity {
                 total: cacheable.total,
                 content_type: cacheable.content_type.clone(),
-                validator: Some(cacheable.validator.filed()),
+                validator: cacheable.validator.clone(),
             },
         );
         state.proxy_cache.retention().note_source(
@@ -2322,7 +2409,7 @@ pub(crate) fn cache_filling(
             entry.fill(
                 entity.total,
                 &entity.content_type,
-                &entity.validator.filed(),
+                &entity.validator,
                 entity.first,
             ),
         )),
@@ -2371,6 +2458,11 @@ pub(crate) fn with_cached_head(
 /// The lookup lists one directory per thousand chunks of the range -- a
 /// few `getdents` for a cached film, still filesystem reads -- so it goes
 /// to the blocking pool rather than onto the reactor.
+///
+/// `source` is what a source that opened the entity itself knows of it
+/// ([`SourceIdentity`]): `None` from the route, which is relaying a
+/// stranger's request and knows nothing past the response.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn cache_assisted_range(
     cache_entry: Option<crate::proxy_cache::Entry>,
     self_addr: std::net::SocketAddr,
@@ -2379,6 +2471,7 @@ pub(crate) async fn cache_assisted_range(
     player_headers: &HeaderMap,
     request_header_overrides: &BTreeMap<String, String>,
     forced_content_type: Option<&str>,
+    source: Option<SourceIdentity<'_>>,
 ) -> Result<RangeAnswer, FetchFailure> {
     let (cache_entry, cached) = match cache_entry {
         Some(entry) => {
@@ -2805,7 +2898,7 @@ pub(crate) async fn cache_assisted_range(
     // second opinion about the same body.
     let cacheable = cache_entry
         .as_ref()
-        .and_then(|_| cacheable_entity(status, &res_headers, is_playlist, encoded_body));
+        .and_then(|_| cacheable_entity(status, &res_headers, is_playlist, encoded_body, source));
 
     // Whether the cached head may go in front of what the origin just sent.
     // What has to hold is that the two are parts of **one entity**, adjacent
@@ -2863,6 +2956,7 @@ pub(crate) async fn cache_assisted_range(
                 &res_headers,
                 is_playlist,
                 encoded_body,
+                source.and_then(|source| source.supplied),
             ) {
                 None => Some(cached),
                 // Which of the conditions failed, said in the log rather than
@@ -2952,6 +3046,7 @@ mod tests {
                 &tail(content_type),
                 false,
                 false,
+                None,
             )
         };
         assert_eq!(
@@ -2984,6 +3079,7 @@ mod tests {
                 ]),
                 false,
                 false,
+                None,
             )
             .is_some_and(|reason| reason.contains("different entity"))
         );
@@ -2998,6 +3094,7 @@ mod tests {
                 ]),
                 false,
                 false,
+                None,
             )
             .is_some_and(|reason| reason.contains("content-range"))
         );
@@ -3035,6 +3132,120 @@ mod tests {
         assert_ne!(
             validated(&[("etag", date)]),
             validated(&[("last-modified", date)])
+        );
+    }
+
+    /// **Every entity is kept, under the strongest identity there is**: what
+    /// the source supplied, else the origin's validator, else the length
+    /// alone. Only the origin's two read back as a header, so neither of
+    /// the others is ever sent as an `If-Range` or stated on a hit.
+    #[test]
+    fn an_entity_with_no_validator_is_kept_by_its_length() {
+        let tagged = headers(&[("etag", "\"v1\"")]);
+        let bare = headers(&[("content-type", "video/mp4")]);
+        assert_eq!(
+            entity_identity(&bare, 1000, "video/mp4", None),
+            "length:1000"
+        );
+        assert_eq!(
+            entity_identity(&tagged, 1000, "video/mp4", None),
+            "etag:\"v1\""
+        );
+        assert_eq!(
+            entity_identity(&tagged, 1000, "video/mp4", Some("md5:ab")),
+            "source:md5:ab",
+            "what the source knows outranks what one response says"
+        );
+        assert_eq!(
+            entity_identity(&bare, 1000, "video/mp4", Some(&"x".repeat(300))),
+            "length:1000",
+            "an identity too long to file gives way, and the entity is still kept"
+        );
+        for filed in ["length:1000", "source:md5:ab"] {
+            assert_eq!(EntityValidator::from_filed(filed), None);
+        }
+
+        // A bare `206` is kept now: the old rule refused it outright.
+        let bare_range = headers(&[
+            ("content-type", "video/mp4"),
+            ("content-range", "bytes 0-499/1000"),
+        ]);
+        let kept = cacheable_entity(StatusCode::PARTIAL_CONTENT, &bare_range, false, false, None)
+            .expect("a response naming no validator is kept");
+        assert_eq!(kept.validator, "length:1000");
+
+        // And its tail joins it while the length agrees, and not otherwise.
+        let head = StitchHead {
+            total: 1000,
+            held_to: 499,
+            content_type: "video/mp4",
+            validator: "length:1000",
+        };
+        let tail =
+            |range: &str| headers(&[("content-type", "video/mp4"), ("content-range", range)]);
+        let refusal = |range: &str| {
+            stitch_refusal(
+                StitchHead { ..head },
+                StatusCode::PARTIAL_CONTENT,
+                &tail(range),
+                false,
+                false,
+                None,
+            )
+        };
+        assert_eq!(refusal("bytes 500-999/1000"), None);
+        assert!(
+            refusal("bytes 500-999/2000").is_some(),
+            "a different length is a different entity"
+        );
+    }
+
+    /// **A source that checks the entity at its open answers `private`,
+    /// `no-cache` and `max-age=0` itself**; `no-store` is still a refusal,
+    /// and a relayed response with none of that standing is refused as
+    /// before. What Drive's media responses carry is the first kind.
+    #[test]
+    fn a_checking_source_keeps_what_the_origin_called_private() {
+        let drive_like = headers(&[
+            ("content-type", "video/x-matroska"),
+            ("content-range", "bytes 0-499/1000"),
+            (
+                "cache-control",
+                "private, max-age=0, must-revalidate, no-transform",
+            ),
+        ]);
+        let checking = Some(SourceIdentity {
+            supplied: Some("md5:ab"),
+        });
+        assert!(
+            cacheable_entity(StatusCode::PARTIAL_CONTENT, &drive_like, false, false, None)
+                .is_none(),
+            "a relay keeps nothing an origin called private"
+        );
+        let kept = cacheable_entity(
+            StatusCode::PARTIAL_CONTENT,
+            &drive_like,
+            false,
+            false,
+            checking,
+        )
+        .expect("the checking source keeps it");
+        assert_eq!(kept.validator, "source:md5:ab");
+        let no_store = headers(&[
+            ("content-type", "video/x-matroska"),
+            ("content-range", "bytes 0-499/1000"),
+            ("cache-control", "no-store"),
+        ]);
+        assert!(
+            cacheable_entity(
+                StatusCode::PARTIAL_CONTENT,
+                &no_store,
+                false,
+                false,
+                checking
+            )
+            .is_none(),
+            "no-store is a refusal whoever asks"
         );
     }
 

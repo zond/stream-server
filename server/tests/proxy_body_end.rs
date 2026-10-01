@@ -118,7 +118,8 @@ impl Origin {
         Ok(Self { addr, requests })
     }
 
-    /// [`SHORT_LEN`] bytes, named by no validator, so nothing of it is kept.
+    /// [`SHORT_LEN`] bytes as a `200` that does not say it answers ranges,
+    /// so nothing of it is kept.
     fn whole(socket: &mut TcpStream) {
         let body: Vec<u8> = (0..SHORT_LEN).map(byte_at).collect();
         let _ = socket.write_all(

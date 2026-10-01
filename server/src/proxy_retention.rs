@@ -2337,7 +2337,7 @@ mod tests {
             crate::routes::proxy::ProbedEntity {
                 total,
                 content_type: "video/mp4".to_string(),
-                validator: None,
+                validator: format!("length:{total}"),
             },
         );
         retention.note_source(key_dir.clone(), Arc::new(source.for_filling()));
@@ -2401,7 +2401,7 @@ mod tests {
                 crate::routes::proxy::ProbedEntity {
                     total,
                     content_type: "video/mp4".to_string(),
-                    validator: Some(validator.to_string()),
+                    validator: validator.to_string(),
                 },
             );
             Arc::new(source.for_filling())

@@ -234,13 +234,102 @@ impl DrivePairing {
 
     /// Where this file's bytes are asked for.
     pub(crate) fn media_url(&self) -> Result<Url, DriveError> {
+        let mut url = self.file_url()?;
+        url.set_query(Some("alt=media"));
+        Ok(url)
+    }
+
+    /// Where what Drive knows about this file's current content is asked
+    /// for: the fields [`DriveMetadata`] reads, and nothing else.
+    pub(crate) fn metadata_url(&self) -> Result<Url, DriveError> {
+        let mut url = self.file_url()?;
+        url.set_query(Some("fields=md5Checksum,version,modifiedTime,size"));
+        Ok(url)
+    }
+
+    fn file_url(&self) -> Result<Url, DriveError> {
         let mut url = self.api_base.clone();
         url.path_segments_mut()
             .map_err(|()| DriveError::Unreachable("the Drive API base cannot be a base".into()))?
             .pop_if_empty()
             .extend(["drive", "v3", "files", &self.file_id]);
-        url.set_query(Some("alt=media"));
         Ok(url)
+    }
+}
+
+/// How long the metadata request may take before the open goes on without
+/// it. As long as a refresh: one small JSON answer from the same API.
+const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The most of a metadata answer that is read: four short fields.
+const MAX_METADATA_BODY: usize = 16 * 1024;
+
+/// What Drive says about a file's current content, as `files/{id}` answers
+/// it for the fields [`DrivePairing::metadata_url`] asks. Every field is
+/// optional -- a Google-native document has no `md5Checksum` -- and the
+/// 64-bit ones arrive as JSON strings, which is how the API writes an
+/// `int64`; a number is taken too.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DriveMetadata {
+    #[serde(default)]
+    md5_checksum: Option<serde_json::Value>,
+    #[serde(default)]
+    version: Option<serde_json::Value>,
+    #[serde(default)]
+    modified_time: Option<serde_json::Value>,
+    #[serde(default)]
+    size: Option<serde_json::Value>,
+}
+
+impl DriveMetadata {
+    /// **The identity a Drive file is kept under**, from what Drive says of
+    /// its content, or `None` when it says nothing that could name one.
+    ///
+    /// Drive's `files/{id}?alt=media` names neither an `ETag` nor a
+    /// `Last-Modified` (measured on a phone, 2026-10-01), so without this a
+    /// Drive file would be kept under its length alone, and a file replaced
+    /// in Drive by one of the same size would be served as it was. In
+    /// order of strength:
+    ///
+    /// * `md5Checksum` -- the content's own hash; every uploaded file has
+    ///   one, `md5:<hex>`;
+    /// * `version` and `modifiedTime` -- Drive bumps the first on every
+    ///   change to the file, the second on every change to its content;
+    ///   with the length, `version:..;modified:..;size:..`. What a file
+    ///   without a checksum has (a Google-native document, never a video).
+    ///
+    /// `probed_total` is the length the probe of the bytes found. A
+    /// metadata `size` that disagrees with it is a file that changed
+    /// between the two requests, so neither answer can say which generation
+    /// the bytes are of: `None`, and the open goes on under the response's
+    /// own identity.
+    pub(crate) fn identity(&self, probed_total: u64) -> Option<String> {
+        let text = |field: &Option<serde_json::Value>| {
+            match field.as_ref()? {
+                serde_json::Value::String(text) => Some(text.trim().to_string()),
+                serde_json::Value::Number(number) => Some(number.to_string()),
+                _ => None,
+            }
+            .filter(|text| !text.is_empty())
+        };
+        if let Some(size) = text(&self.size)
+            && size.parse::<u64>().ok() != Some(probed_total)
+        {
+            return None;
+        }
+        if let Some(md5) = text(&self.md5_checksum) {
+            return Some(format!("md5:{}", md5.to_ascii_lowercase()));
+        }
+        let (version, modified) = (text(&self.version), text(&self.modified_time));
+        if version.is_none() && modified.is_none() {
+            return None;
+        }
+        Some(format!(
+            "version:{};modified:{};size:{probed_total}",
+            version.unwrap_or_default(),
+            modified.unwrap_or_default()
+        ))
     }
 }
 
@@ -404,6 +493,31 @@ impl DriveCredential {
     }
 }
 
+/// What Drive says of the file's content now, or `None` when it could not
+/// be asked or did not answer with it. Never a failure of the open: the
+/// bytes read the same without it, and are kept under the response's own
+/// identity -- for Drive, the length.
+async fn fetch_metadata(credential: &DriveCredential, url: Url) -> Option<DriveMetadata> {
+    let bearer = credential.bearer().await.ok()?;
+    let client = crate::routes::proxy::http_client()?;
+    let response = client
+        .get(url)
+        .bearer_auth(bearer)
+        .timeout(METADATA_TIMEOUT)
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        tracing::debug!(status = %response.status(), "Drive's file metadata was refused");
+        return None;
+    }
+    // Capped as a refresh answer is: the far end is somebody else's.
+    let body = enginefs::http_client::read_capped(response, MAX_METADATA_BODY)
+        .await
+        .ok()?;
+    serde_json::from_slice(&body).ok()
+}
+
 #[async_trait::async_trait]
 impl OwnGrant for DriveCredential {
     async fn headers(&self) -> io::Result<BTreeMap<String, String>> {
@@ -450,21 +564,22 @@ impl OwnGrant for DriveCredential {
 /// # The generation, which is a separate question
 ///
 /// A vouch says the URL names the file. It does not say *which version* of
-/// it, and the cache never revalidates -- so a file edited in Drive under
-/// the same id must not be served from the old bytes. That is the entity
-/// directory's job, not the key's: it is named for the origin's own
-/// validator, a fill that finds a different one drops what was held of the
-/// old generation, and **an origin that names neither `ETag` nor
-/// `Last-Modified` is read and never kept at all**
-/// (`routes::proxy::cacheable_entity`).
+/// it, so a file edited in Drive under the same id must not be served from
+/// the old bytes. That is the entity directory's job, not the key's: it is
+/// named for the entity's identity (`routes::proxy::entity_identity`), and
+/// whatever is kept under another identity is dropped.
 ///
-/// Which of those Drive does is the one thing here that has not been
-/// measured against the real API, and it is deliberately not guessed:
-/// [`Self::validator`] answers it per file at open, and a file opened
-/// without one logs that it will not be kept. If Drive turns out to name
-/// nothing, the honest fix is to make this source supply a validator from
-/// the file's own `md5Checksum`/`modifiedTime` metadata -- one extra JSON
-/// call at open -- rather than to keep bytes nothing can date.
+/// **Drive's media responses name no validator** -- no `ETag`, no
+/// `Last-Modified` (measured on a phone, 2026-10-01) -- so this source
+/// supplies one from what Drive says of the file: one `files/{id}` request
+/// at open for `md5Checksum`, `version`, `modifiedTime` and `size`
+/// ([`DriveMetadata::identity`]), every read filed and compared under it
+/// ([`ProxySource::identified_as`]), and the open retiring what is kept of
+/// any other generation ([`ProxySource::retire_stale`]) -- so each open is
+/// the revalidation. A file Drive says nothing useful about is kept by its
+/// length. A finished download is the exception: it opens off the disk
+/// with no request at all (`proxy_downloads::held_download`), which is
+/// what makes it play offline, and so is what it was when it finished.
 pub struct DriveSource {
     inner: ProxySource,
     credential: Arc<DriveCredential>,
@@ -501,6 +616,7 @@ impl DriveSource {
         pairing: DrivePairing,
     ) -> Result<Self, DriveError> {
         let url = pairing.media_url()?;
+        let pairing_metadata_url = pairing.metadata_url();
         let credential = Arc::new(DriveCredential::new(
             pairing.refresh_endpoint,
             pairing.refresh_token,
@@ -508,7 +624,7 @@ impl DriveSource {
             pairing.expires_in,
         ));
         credential.bearer().await?;
-        let inner = ProxySource::open(
+        let inner = ProxySource::probe(
             cache,
             self_addr,
             url,
@@ -526,16 +642,29 @@ impl DriveSource {
             },
         )
         .await?;
-        if inner.validator().is_none() {
-            // Not a failure -- the file reads perfectly well -- but the
-            // one operational fact worth knowing, because it decides
-            // whether the vouch buys anything at all. See the note on
-            // [`DriveSource`].
-            tracing::info!(
-                origin = %ByteSource::describe(&inner),
-                "Drive named no validator for this file, so nothing of it will be kept"
-            );
-        }
+        // Which generation of the file this is, by Drive's own word, and
+        // then whatever is kept of any other generation goes: this open is
+        // the revalidation. Without the metadata -- a failed request, or a
+        // file that changed between the two -- the bytes are kept under
+        // the response's own identity, which for Drive is the length.
+        let identity = match pairing_metadata_url {
+            Ok(url) => fetch_metadata(&credential, url)
+                .await
+                .and_then(|metadata| metadata.identity(ByteSource::len(&inner))),
+            Err(_) => None,
+        };
+        let inner = match identity {
+            Some(identity) => inner.identified_as(identity),
+            None => {
+                tracing::info!(
+                    origin = %ByteSource::describe(&inner),
+                    "Drive said nothing of this file's content that names it; it is kept by its \
+                     length"
+                );
+                inner
+            }
+        };
+        inner.retire_stale().await;
         Ok(Self {
             inner,
             credential,
@@ -559,10 +688,10 @@ impl DriveSource {
         self.inner.content_type()
     }
 
-    /// How Drive identifies this generation of the file, or `None` for a
-    /// response that identified it by nothing -- in which case nothing of
-    /// it is kept. See the caching note on [`DriveSource`].
-    pub fn validator(&self) -> Option<&str> {
+    /// The identity this generation of the file is kept under: Drive's
+    /// checksum (`source:md5:..`) or version, else the length. See the
+    /// caching note on [`DriveSource`].
+    pub fn validator(&self) -> &str {
         self.inner.validator()
     }
 
@@ -639,6 +768,11 @@ mod tests {
     const FIRST_ACCESS_TOKEN: &str = "access-tok-0001-never-log-me";
 
     const FILE_LENGTH: usize = 512 * 1024;
+
+    /// The checksum the fake's metadata states for the film. Drive's media
+    /// responses name no validator -- this fake's do not either, as the
+    /// real ones do not -- so this is what the film is kept under.
+    const FILM_MD5: &str = "0123456789ABCDEF0123456789abcdef";
 
     /// The film's bytes: a pattern, so a range can be checked to have come
     /// from the offset it claims and not merely to be the right length.
@@ -845,6 +979,13 @@ mod tests {
             );
             return;
         }
+        // What Drive says of the file: its checksum, as the real API
+        // answers `files/{id}?fields=..`. Not a read of the bytes.
+        if !request_line.contains("alt=media") {
+            let json = format!("{{\"md5Checksum\":\"{FILM_MD5}\",\"size\":\"{FILE_LENGTH}\"}}");
+            respond(&mut stream, "200 OK", "application/json", json.as_bytes());
+            return;
+        }
         let (first, last) = match range.as_deref() {
             Some(header) => {
                 let (first, last) = header
@@ -866,8 +1007,9 @@ mod tests {
         reads.fetch_add(1, Ordering::SeqCst);
         let body: Vec<u8> = (first..=last).map(byte_at).collect();
         let head = format!(
-            "HTTP/1.1 206 Partial Content\r\nContent-Type: video/x-matroska\r\nETag: \
-             \"the-film\"\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {first}-{last}/\
+            "HTTP/1.1 206 Partial Content\r\nContent-Type: video/x-matroska\r\n\
+             Cache-Control: private, max-age=0, must-revalidate, no-transform\r\n\
+             Accept-Ranges: bytes\r\nContent-Range: bytes {first}-{last}/\
              {FILE_LENGTH}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
@@ -1246,6 +1388,58 @@ mod tests {
         assert!(!source.describe().contains("a-file-id"));
     }
 
+    fn metadata(json: &str) -> DriveMetadata {
+        serde_json::from_str(json).expect("a metadata answer")
+    }
+
+    /// **What a Drive file is kept under**, from what Drive says of it:
+    /// the checksum when there is one, lowercased so one hash is one
+    /// spelling; else the version and modification time with the length;
+    /// else nothing. Drive writes `int64` fields as strings; a number is
+    /// taken too.
+    #[test]
+    fn a_drive_file_is_identified_by_its_checksum_else_its_version() {
+        assert_eq!(
+            metadata(r#"{"md5Checksum":"ABCdef","version":"7","size":"10"}"#).identity(10),
+            Some("md5:abcdef".to_string()),
+            "the checksum wins over the version"
+        );
+        assert_eq!(
+            metadata(r#"{"version":"7","modifiedTime":"2026-10-01T10:00:00.000Z","size":"10"}"#)
+                .identity(10),
+            Some("version:7;modified:2026-10-01T10:00:00.000Z;size:10".to_string()),
+            "no checksum (a Google-native document): the version and time, with the length"
+        );
+        assert_eq!(
+            metadata(r#"{"version":7,"size":10}"#).identity(10),
+            Some("version:7;modified:;size:10".to_string()),
+            "numbers are read as the strings Drive usually sends"
+        );
+        assert_eq!(
+            metadata(r#"{"size":"10"}"#).identity(10),
+            None,
+            "a length alone is not an identity Drive gave"
+        );
+        assert_eq!(metadata(r#"{"md5Checksum":"  "}"#).identity(10), None);
+        assert_eq!(metadata("{}").identity(10), None);
+    }
+
+    /// **A metadata length that is not the bytes' length names nothing**:
+    /// the file changed between the metadata and the probe, so which
+    /// generation the bytes are of is not known, and the checksum is not
+    /// filed over them.
+    #[test]
+    fn a_checksum_for_another_length_is_not_taken() {
+        let changed = metadata(r#"{"md5Checksum":"abc","size":"11"}"#);
+        assert_eq!(changed.identity(10), None);
+        assert_eq!(changed.identity(11), Some("md5:abc".to_string()));
+        assert_eq!(
+            metadata(r#"{"md5Checksum":"abc"}"#).identity(10),
+            Some("md5:abc".to_string()),
+            "no stated size is no disagreement"
+        );
+    }
+
     /// **A vouched read is kept, and the key is the URL with no token in
     /// it.** Both halves matter. The first is the point of vouching at
     /// all: a second read of a range is the disk's, so a backward seek is
@@ -1262,8 +1456,8 @@ mod tests {
             .expect("a paired file");
         assert_eq!(
             source.validator(),
-            Some("etag:\"the-film\""),
-            "without a validator nothing would be filed at all"
+            "source:md5:0123456789abcdef0123456789abcdef",
+            "the film is filed under the checksum Drive's metadata states, lowercased"
         );
 
         // A whole chunk, so what is read fills one and is committed.

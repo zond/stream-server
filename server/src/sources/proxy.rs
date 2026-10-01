@@ -220,11 +220,15 @@ struct Entity {
     player_headers: HeaderMap,
     total: u64,
     content_type: String,
-    /// How the origin identified the entity, as the store files it.
-    /// `None` for an origin that identified it by neither `ETag` nor
-    /// `Last-Modified` -- readable, but never kept, since nothing could
-    /// tell a later generation of it from this one.
-    validator: Option<String>,
+    /// The identity the entity is filed under
+    /// (`routes::proxy::entity_identity`): what the source supplied, else
+    /// the origin's validator, else its length alone. Always one: every
+    /// entity is kept.
+    validator: String,
+    /// What the source that opened this knows of the entity beyond any
+    /// response ([`ProxySource::identified_as`]): a Drive file's checksum.
+    /// Every ranged read files and compares under it.
+    supplied: Option<String>,
     /// What a log may say about this source: the origin and nothing else.
     describe: String,
     /// Readers are quiet -- not viewers. See [`ProxySource::for_filling`].
@@ -238,7 +242,25 @@ struct Entity {
 }
 
 impl ProxySource {
-    /// Probe `url` and open it as a source, or say why it cannot be one.
+    /// Probe `url` and open it as a source, or say why it cannot be one --
+    /// and **retire what the cache holds of any other generation of it**
+    /// ([`Self::retire_stale`]): the probe has just said what the entity is
+    /// now, and bytes of one it no longer is must not be served.
+    pub(crate) async fn open(
+        cache: Arc<crate::proxy_cache::ProxyCache>,
+        self_addr: SocketAddr,
+        url: Url,
+        credentials: impl Into<Credentials>,
+    ) -> Result<Self, ProxySourceError> {
+        let source = Self::probe(cache, self_addr, url, credentials).await?;
+        source.retire_stale().await;
+        Ok(source)
+    }
+
+    /// The probe [`Self::open`] makes, without the retiring: for a caller
+    /// that learns more about the entity before it can say which generation
+    /// is current ([`super::DriveSource`], whose metadata names it), and
+    /// retires then.
     ///
     /// The probe is one `GET` of `bytes=0-0` through the proxy's own
     /// request builder -- its redirect chain, its credential rule, its
@@ -255,7 +277,7 @@ impl ProxySource {
     /// `pub(crate)` rather than `pub` because a `ProxyCache` is not part
     /// of the embeddable API; `routes::archive` builds one of these per
     /// URL a `/{fmt}/create` names.
-    pub(crate) async fn open(
+    pub(crate) async fn probe(
         cache: Arc<crate::proxy_cache::ProxyCache>,
         self_addr: SocketAddr,
         url: Url,
@@ -275,6 +297,7 @@ impl ProxySource {
             &url,
             &probe,
             &request_headers,
+            None,
             None,
         )
         .await?;
@@ -311,7 +334,6 @@ impl ProxySource {
             tracing::debug!(
                 origin = %crate::routes::util::log_origin(url.as_str()),
                 vouched_by,
-                validator = entity.validator.is_some(),
                 "an authorised read is cached under its URL"
             );
         }
@@ -351,6 +373,7 @@ impl ProxySource {
                 total: entity.total,
                 content_type: entity.content_type,
                 validator: entity.validator,
+                supplied: None,
                 quiet: false,
                 fetched: None,
             }),
@@ -371,19 +394,60 @@ impl ProxySource {
 
     /// Whether the entity directory `entity` is the one this source's reads
     /// are filed under: its name is this source's length, type and
-    /// validator. A source with no validator files nothing, so fills none.
+    /// identity.
     pub(crate) fn fills(&self, entity: &std::path::Path) -> bool {
-        let entity_name = entity.file_name().and_then(|name| name.to_str());
-        match (&self.entity.validator, entity_name) {
-            (Some(validator), Some(name)) => {
-                name == crate::proxy_cache::entity_dir_name(
-                    self.entity.total,
-                    &self.entity.content_type,
-                    validator,
-                )
-            }
-            _ => false,
+        entity.file_name().and_then(|name| name.to_str())
+            == Some(&crate::proxy_cache::entity_dir_name(
+                self.entity.total,
+                &self.entity.content_type,
+                &self.entity.validator,
+            ))
+    }
+
+    /// This source, its entity identified by what its opener knows of it
+    /// beyond any response: `supplied` is filed as the entity's identity
+    /// (`routes::proxy::entity_identity`), every read files and compares
+    /// under it, and the cache's `Cache-Control` refusals are the
+    /// opener's to answer (`routes::proxy::SourceIdentity`). Only for a
+    /// source that vouched for its URL, which is the one kind that knows
+    /// anything past a response; anything else is returned unchanged.
+    pub(crate) fn identified_as(self, supplied: String) -> Self {
+        if !self.entity.vouched() {
+            return self;
         }
+        let validator = format!("source:{supplied}");
+        if !crate::proxy_cache::can_be_filed(
+            self.entity.total,
+            &self.entity.content_type,
+            &validator,
+        ) {
+            return self;
+        }
+        Self {
+            entity: Arc::new(Entity {
+                validator,
+                supplied: Some(supplied),
+                ..(*self.entity).clone()
+            }),
+        }
+    }
+
+    /// Retire every generation the cache holds under this source's key
+    /// but the one it is reading now
+    /// ([`crate::proxy_cache::Entry::retire_others`]). What makes an
+    /// open the revalidation: a file changed at the origin is a different
+    /// entity -- a different identity, or a different length -- and what
+    /// was kept of the old one goes before anything reads it.
+    pub(crate) async fn retire_stale(&self) {
+        let Some(entry) = self.entity.entry() else {
+            return;
+        };
+        let current = crate::proxy_cache::entity_dir_name(
+            self.entity.total,
+            &self.entity.content_type,
+            &self.entity.validator,
+        );
+        let _ = tokio::task::spawn_blocking(move || entry.retire_others(&current)).await;
     }
 
     /// This source with every reader it opens **quiet**: a download's
@@ -422,10 +486,11 @@ impl ProxySource {
         &self.entity.content_type
     }
 
-    /// How the origin identifies the entity, as the store files it, or
-    /// `None` for one that identifies it by nothing.
-    pub fn validator(&self) -> Option<&str> {
-        self.entity.validator.as_deref()
+    /// The identity the entity is filed under: what the opener supplied
+    /// (`source:..`), else the origin's validator (`etag:..`,
+    /// `last-modified:..`), else its length (`length:..`).
+    pub fn validator(&self) -> &str {
+        &self.entity.validator
     }
 }
 
@@ -442,6 +507,28 @@ impl Credentials {
 }
 
 impl Entity {
+    /// Whether this entity's opener vouched for its URL: the one kind of
+    /// source that knows anything of the entity past a response.
+    fn vouched(&self) -> bool {
+        matches!(
+            self.credentials,
+            Credentials::Own {
+                vouch: Vouch::UrlIdentifiesBytes { .. },
+                ..
+            }
+        )
+    }
+
+    /// What this source tells the cache past the response
+    /// (`routes::proxy::SourceIdentity`): present for a vouched source,
+    /// which checks the entity again at every open.
+    fn identity(&self) -> Option<crate::routes::proxy::SourceIdentity<'_>> {
+        self.vouched()
+            .then_some(crate::routes::proxy::SourceIdentity {
+                supplied: self.supplied.as_deref(),
+            })
+    }
+
     /// The cache entry these reads go through.
     ///
     /// For a caller's `h=`: **the very same entry `/proxy` would use for
@@ -513,6 +600,7 @@ impl Entity {
             &headers,
             &request_headers,
             None,
+            self.identity(),
         )
         .await
         .map_err(FetchFailure::into_io_error)?;
@@ -884,6 +972,168 @@ mod tests {
         (dir, Arc::new(cache))
     }
 
+    /// An origin that names **no validator** -- no `ETag`, no
+    /// `Last-Modified` -- serving a body as long as `length` says at the
+    /// moment it is asked, its bytes depending on that length: replacing
+    /// the file is storing another length. Answers what it was asked
+    /// for, counted.
+    fn bare_origin(length: Arc<AtomicUsize>) -> (Url, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("a loopback port");
+        let addr = listener.local_addr().expect("the bound address");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = requests.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                counted.fetch_add(1, Ordering::SeqCst);
+                let total = length.load(Ordering::SeqCst);
+                let mut reader = BufReader::new(stream.try_clone().expect("a second handle"));
+                let mut range = None;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    if line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("range: ") {
+                        range = Some(value.trim().to_string());
+                    }
+                }
+                let (first, last) = range
+                    .as_deref()
+                    .and_then(|header| header.trim_start_matches("bytes=").split_once('-'))
+                    .map(|(first, last)| {
+                        (
+                            first.parse::<usize>().unwrap_or(0),
+                            last.parse::<usize>().unwrap_or(total - 1).min(total - 1),
+                        )
+                    })
+                    .unwrap_or((0, total - 1));
+                let body: Vec<u8> = (first..=last).map(|at| bare_byte(total, at)).collect();
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\n\
+                     Accept-Ranges: bytes\r\nContent-Range: bytes {first}-{last}/{total}\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        (
+            Url::parse(&format!("http://{addr}/film.mp4")).expect("a literal URL"),
+            requests,
+        )
+    }
+
+    /// The bare origin's byte at `offset` of a file `total` long.
+    fn bare_byte(total: usize, offset: usize) -> u8 {
+        ((offset % 251) as u8).wrapping_add((total % 13) as u8)
+    }
+
+    /// **An origin naming no validator is kept, under its length**, and
+    /// a second read is the disk's. Then the file is replaced by one of
+    /// another length: the next open retires what was kept, and what is
+    /// read is the new file -- not the old one's chunk, which a lookup
+    /// would otherwise answer whole.
+    #[tokio::test]
+    async fn an_origin_naming_no_validator_is_kept_and_a_new_length_retires_it() {
+        let chunk = crate::proxy_cache::CHUNK_BYTES as usize;
+        let length = Arc::new(AtomicUsize::new(4 * chunk));
+        let (url, asked) = bare_origin(length.clone());
+        let (_root, cache) = cache();
+        let source = ProxySource::open(cache.clone(), SELF_ADDR, url.clone(), BTreeMap::new())
+            .await
+            .expect("an origin that ranges");
+        assert_eq!(source.validator(), format!("length:{}", 4 * chunk));
+
+        let mut first = vec![0u8; chunk];
+        assert_eq!(source.read_at(0, &mut first).await.unwrap(), chunk);
+        cache.settled().await;
+        let before = asked.load(Ordering::SeqCst);
+        let mut again = vec![0u8; chunk];
+        assert_eq!(source.read_at(0, &mut again).await.unwrap(), chunk);
+        assert_eq!(again, first);
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            before,
+            "a file naming no validator was not kept"
+        );
+
+        length.store(5 * chunk, Ordering::SeqCst);
+        let replaced = ProxySource::open(cache.clone(), SELF_ADDR, url, BTreeMap::new())
+            .await
+            .expect("an origin that ranges");
+        assert_eq!(replaced.validator(), format!("length:{}", 5 * chunk));
+        let mut now = vec![0u8; chunk];
+        assert_eq!(replaced.read_at(0, &mut now).await.unwrap(), chunk);
+        assert_eq!(
+            now,
+            (0..chunk)
+                .map(|at| bare_byte(5 * chunk, at))
+                .collect::<Vec<_>>(),
+            "the replaced file's old bytes were served"
+        );
+    }
+
+    /// A grant that mints nothing: what a vouched source needs to exist.
+    struct NoHeaders;
+
+    #[async_trait::async_trait]
+    impl OwnGrant for NoHeaders {
+        async fn headers(&self) -> io::Result<BTreeMap<String, String>> {
+            Ok(BTreeMap::new())
+        }
+    }
+
+    /// **What an opener supplies is the identity, when it can be filed**:
+    /// one too long for a directory name leaves the response's own in
+    /// place, since the reads -- which file by the same rule
+    /// (`routes::proxy::entity_identity`) -- would fall back to it too, and
+    /// a source naming one entity while its reads fill another would retire
+    /// its own bytes at every open. And only a vouched source takes one.
+    #[tokio::test]
+    async fn a_supplied_identity_is_taken_only_where_it_can_be_filed() {
+        let chunk = crate::proxy_cache::CHUNK_BYTES as usize;
+        let (url, _asked) = bare_origin(Arc::new(AtomicUsize::new(chunk)));
+        let (_root, cache) = cache();
+        let vouched = ProxySource::probe(
+            cache.clone(),
+            SELF_ADDR,
+            url.clone(),
+            Credentials::Own {
+                grant: Arc::new(NoHeaders),
+                vouch: Vouch::UrlIdentifiesBytes { vouched_by: "test" },
+            },
+        )
+        .await
+        .expect("an origin that ranges");
+        let length = format!("length:{chunk}");
+        assert_eq!(
+            vouched
+                .clone()
+                .identified_as("md5:ab".to_string())
+                .validator(),
+            "source:md5:ab"
+        );
+        assert_eq!(
+            vouched.identified_as("x".repeat(300)).validator(),
+            length,
+            "an identity too long to file is not taken"
+        );
+        let relayed = ProxySource::probe(cache, SELF_ADDR, url, BTreeMap::new())
+            .await
+            .expect("an origin that ranges");
+        assert_eq!(
+            relayed.identified_as("md5:ab".to_string()).validator(),
+            length,
+            "a relayed source knows nothing past the response"
+        );
+    }
+
     /// **A second read of a range is the disk's**, and the origin is asked
     /// once -- which is the whole of why a member is read through the
     /// proxy cache rather than beside it.
@@ -896,7 +1146,7 @@ mod tests {
             .expect("an origin that ranges");
         assert_eq!(super::ByteSource::len(&source), ORIGIN_LENGTH as u64);
         assert_eq!(source.content_type(), "application/zip");
-        assert_eq!(source.validator(), Some("etag:\"the-archive\""));
+        assert_eq!(source.validator(), "etag:\"the-archive\"");
         // The probe, and nothing else yet.
         let probed = origin.asked();
         assert_eq!(probed, 1);

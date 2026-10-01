@@ -86,11 +86,11 @@ struct Origin {
 
 const ORIGIN_LENGTH: usize = 1024 * 1024;
 
-/// How the default origin identifies its entity. A response the origin will
-/// identify by neither `ETag` nor `Last-Modified` is not one the cache keeps
-/// -- nothing could ever tell a second generation of it from the first -- so
-/// an origin whose bytes these tests expect to find in the store has to say
-/// which entity they are of, the way a real one does.
+/// How the default origin identifies its entity, the way most real ones do.
+/// One that names neither `ETag` nor `Last-Modified` is kept too, under its
+/// length alone (`routes::proxy::entity_identity`); these tests exercise
+/// the stronger identity, which is the one a stitch and an `If-Range` can
+/// use.
 const ORIGIN_ETAG: &str = "\"the-movie\"";
 
 impl Origin {
@@ -1351,9 +1351,11 @@ fn a_body_that_stops_mid_chunk_leaves_no_chunk_to_serve() -> anyhow::Result<()> 
 /// store that never revalidates cannot honour `no-cache` or a `max-age` of
 /// zero any other way; an origin that has not said it answers ranges must not
 /// have one answered out of the cache later; a body under a content coding is
-/// not the body the framing headers a hit writes would describe; and an
-/// entity the origin will not identify is one no later read could tell a
-/// second generation of from the first.
+/// not the body the framing headers a hit writes would describe.
+///
+/// **An entity the origin names no validator for is not on the list**: it
+/// is kept under its length (`routes::proxy::entity_identity`), and the
+/// test says so with the same pair the refusals use.
 #[test]
 fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
     let fixture = fixture_with(Origin::start_with(
@@ -1457,7 +1459,6 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
         ("fragment", "playlist"),
         ("whole", "no-ranges"),
         ("whole", "no-length"),
-        ("whole", "no-validator"),
     ] {
         // Three chunks in a fragment a byte short of the entity, four in a
         // whole one.
@@ -1489,6 +1490,28 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
             "{defect} control caches its chunks and nothing else"
         );
     }
+
+    // No validator is not a defect: the response is kept, under its
+    // length, and a hit on it states no validator the origin never wrote.
+    settled(&fixture);
+    let before = cached_entities(&fixture);
+    let response = client.get(proxied("/whole/no-validator/film.mp4")).send()?;
+    assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
+    fixture.origin.next_request();
+    let entity = wait_for_new_entity(&fixture, &before, 4);
+    assert_eq!(
+        cached_chunks_by_entity(&fixture).get(&entity).copied(),
+        Some(4),
+        "a response naming no validator is kept whole"
+    );
+    let hit = client.get(proxied("/whole/no-validator/film.mp4")).send()?;
+    assert_eq!(header(hit.headers(), "etag"), None);
+    assert_eq!(header(hit.headers(), "last-modified"), None);
+    assert_eq!(hit.bytes()?.len(), ORIGIN_LENGTH);
+    assert!(
+        fixture.origin.was_asked_for_nothing_more(),
+        "and a second read of it is the disk's"
+    );
 
     // The `long-type` rule has no case here and cannot have one. A content
     // type past what one directory name holds is refused

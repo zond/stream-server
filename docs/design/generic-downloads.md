@@ -33,7 +33,10 @@ HTTP streams, which they lacked.
 ## 1. What the two sides share
 
 The proxy cache (`proxy_cache`, `proxy_retention`, `sources::*`) keeps one
-file per 256 KiB chunk under `<key-sha256>/<validator>/`, and the same
+file per 256 KiB chunk under `<key-sha256>/<validator>/` (since 2026-10-01
+the entity's *identity*, never absent: a Drive file's checksum, else the
+origin's validator, else its length -- Drive names no validator, and under
+the old rule a Drive download kept nothing; see `docs/proxy.md`), and the same
 retention owner that runs torrents runs it through `ProxyBacking`: same
 budget, same window, same pass. What the torrent side had and the proxy
 side lacked was a fetcher when nobody reads, a pin, and a claim that
