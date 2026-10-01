@@ -17,6 +17,7 @@
 //! then is [`Refusal::UnknownId`] -- which costs the app one `register`.
 
 use super::reader::{self, MediaReader, Source};
+use super::sniff::{self, Sniffed};
 use super::{GrantSupplier, MediaId, MediaSpec, PlayToken, Refusal, Resolved};
 use crate::routes::archive::{self, ArchiveCreateRequest, Format};
 use crate::routes::compat;
@@ -46,6 +47,10 @@ pub const MEDIA_ID_CAP: usize = 64;
 #[derive(Clone)]
 pub(crate) struct Registry {
     entries: Sessions<Entry>,
+    /// How long `resolve` waits for a file's head before answering it
+    /// unsniffed: [`sniff::SNIFF_BOUND`], or what a test set
+    /// ([`Registry::set_sniff_bound`]). Milliseconds.
+    sniff_bound: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// One id: what it names, parsed at registration, and what resolving it
@@ -132,6 +137,10 @@ pub(crate) enum Container {
 }
 
 /// What resolving an id found.
+///
+/// A plain file's `sniffed` says whether its head was read and found to be
+/// no container's (`super::sniff`); one whose head was a container's is a
+/// [`Resolution::Member`] instead.
 pub(crate) enum Resolution {
     Torrent {
         /// Lowercase.
@@ -139,6 +148,7 @@ pub(crate) enum Resolution {
         file_idx: usize,
         name: String,
         len: u64,
+        sniffed: bool,
     },
     /// An origin that serves ranges, probed.
     Http {
@@ -146,6 +156,7 @@ pub(crate) enum Resolution {
         target: Url,
         name: String,
         content_type: String,
+        sniffed: bool,
     },
     /// An origin that answered a ranged probe with the whole entity.
     WillNotRange {
@@ -158,6 +169,7 @@ pub(crate) enum Resolution {
         source: Arc<DriveSource>,
         media_url: Url,
         name: String,
+        sniffed: bool,
     },
     /// A pinned download of the link or the Drive file, whole on the disk:
     /// read off it, with no origin asked -- what plays it offline.
@@ -167,9 +179,13 @@ pub(crate) enum Resolution {
         /// or the Drive file's media URL.
         target: Url,
         name: String,
+        sniffed: bool,
     },
     /// A file on this device, open.
-    Local { source: Arc<LocalSource> },
+    Local {
+        source: Arc<LocalSource>,
+        sniffed: bool,
+    },
     /// A member of a container. The session is found again at each open
     /// ([`member_session`]), not kept here: a session no reader leases is
     /// the archive map's to let go when the viewer moves on, and made again
@@ -187,6 +203,11 @@ pub(crate) enum Resolution {
         /// The torrent the container is in and its volumes' file indices,
         /// in set order; `None` for a container behind links.
         torrent: Option<(String, Vec<usize>)>,
+        /// The link, Drive file or file on this device the container was
+        /// found in by its first bytes, which makes the session again;
+        /// `None` for an archive URL and for a torrent's file, whose key
+        /// is enough.
+        sniffed_in: Option<Sniffed>,
     },
 }
 
@@ -202,6 +223,10 @@ impl Resolution {
         match self {
             Self::Drive { source, .. } => source.needs_pairing_again(),
             Self::Held { source, .. } => !state.proxy_cache.retention().is_pinned(source.key_dir()),
+            Self::Member {
+                sniffed_in: Some(sniffed),
+                ..
+            } => sniffed.is_stale(state),
             Self::Torrent { .. }
             | Self::Http { .. }
             | Self::WillNotRange { .. }
@@ -212,18 +237,22 @@ impl Resolution {
 
     fn resolved(&self) -> Resolved {
         match self {
-            Self::Torrent { name, len, .. } => Resolved {
+            Self::Torrent {
+                name, len, sniffed, ..
+            } => Resolved {
                 name: name.clone(),
                 content_type: crate::routes::stream::content_type_for_name(name).to_string(),
                 len: *len,
                 member: None,
                 in_process: true,
                 proxy_url: None,
+                sniffed: *sniffed,
             },
             Self::Http {
                 source,
                 name,
                 content_type,
+                sniffed,
                 ..
             } => Resolved {
                 name: name.clone(),
@@ -232,6 +261,7 @@ impl Resolution {
                 member: None,
                 in_process: true,
                 proxy_url: None,
+                sniffed: *sniffed,
             },
             Self::WillNotRange {
                 proxy_url,
@@ -245,30 +275,45 @@ impl Resolution {
                 member: None,
                 in_process: false,
                 proxy_url: Some(proxy_url.clone()),
+                // Nothing here can read its head without reading it all.
+                sniffed: false,
             },
-            Self::Held { source, name, .. } => Resolved {
+            Self::Held {
+                source,
+                name,
+                sniffed,
+                ..
+            } => Resolved {
                 name: name.clone(),
                 content_type: source.content_type().to_string(),
                 len: source.len(),
                 member: None,
                 in_process: true,
                 proxy_url: None,
+                sniffed: *sniffed,
             },
-            Self::Drive { source, name, .. } => Resolved {
+            Self::Drive {
+                source,
+                name,
+                sniffed,
+                ..
+            } => Resolved {
                 name: name.clone(),
                 content_type: source.content_type().to_string(),
                 len: source.len(),
                 member: None,
                 in_process: true,
                 proxy_url: None,
+                sniffed: *sniffed,
             },
-            Self::Local { source } => Resolved {
+            Self::Local { source, sniffed } => Resolved {
                 name: source.name().to_string(),
                 content_type: source.content_type().to_string(),
                 len: source.len(),
                 member: None,
                 in_process: true,
                 proxy_url: None,
+                sniffed: *sniffed,
             },
             Self::Member { name, len, .. } => Resolved {
                 name: name.clone(),
@@ -282,6 +327,8 @@ impl Resolution {
                 }),
                 in_process: true,
                 proxy_url: None,
+                // The URL named the container, or its head did.
+                sniffed: true,
             },
         }
     }
@@ -321,7 +368,28 @@ impl Registry {
     pub(crate) fn new() -> Self {
         Self {
             entries: Sessions::new(MEDIA_ID_CAP),
+            sniff_bound: Arc::new(std::sync::atomic::AtomicU64::new(
+                sniff::SNIFF_BOUND.as_millis() as u64,
+            )),
         }
+    }
+
+    /// How long `resolve` waits for a file's head before it answers the
+    /// file unsniffed.
+    pub(crate) fn sniff_bound(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.sniff_bound.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Wait `bound` for a head instead: a test's, so a head that never
+    /// comes is proven not to hold a resolve without spending the real
+    /// bound.
+    pub(crate) fn set_sniff_bound(&self, bound: std::time::Duration) {
+        self.sniff_bound.store(
+            bound.as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Parse `spec` and record it under a fresh id. No I/O.
@@ -438,7 +506,7 @@ impl Registry {
                         SessionSources::Held(sources) => {
                             sources.iter().any(|source| registered(source.key_dir()))
                         }
-                        SessionSources::Torrent { .. } => false,
+                        SessionSources::Torrent { .. } | SessionSources::Kept(_) => false,
                     })
             }
             _ => false,
@@ -598,7 +666,7 @@ impl Registry {
                 }
                 Source::Shared(source.clone())
             }
-            Resolution::Local { source } => {
+            Resolution::Local { source, .. } => {
                 // The viewer's player is on a file of this device's now,
                 // which is no torrent file: its session goes to
                 // `Elsewhere`, as a `p=` request through `/proxy` puts it,
@@ -617,9 +685,12 @@ impl Registry {
                 key,
                 create,
                 name,
+                sniffed_in,
                 ..
             } => {
-                let session = member_session(state, *format, key, create.as_ref()).await?;
+                let session =
+                    member_session(state, *format, key, create.as_ref(), sniffed_in.as_ref())
+                        .await?;
                 open_member(state, session, name, play, set_buffer).await?
             }
         };
@@ -629,13 +700,21 @@ impl Registry {
 
 /// The session a member's container is in, leased: found under its key, or
 /// made again -- indexed off the torrent's file for the `torrent:` form, the
-/// create run again for a container behind links.
+/// create run again for a container behind links, the file a sniff found it
+/// in indexed again.
 async fn member_session(
     state: &AppState,
     format: Format,
     key: &str,
     create: Option<&ArchiveCreateRequest>,
+    sniffed_in: Option<&Sniffed>,
 ) -> Result<Lease<TranslatedSession>, Refusal> {
+    if let Some(sniffed) = sniffed_in {
+        if let Some(session) = state.translated_archives.get(key) {
+            return Ok(session);
+        }
+        return sniffed.index_again(state, format, key).await;
+    }
     let translator = archive::translator_for(format).map_err(Refusal::of_session)?;
     if let Some(payload) = create {
         if let Some(session) = state.translated_archives.get(key) {
@@ -700,6 +779,18 @@ async fn open_member(
                 held.iter()
                     .map(|source| source.clone() as Arc<dyn ByteSource>),
             );
+        }
+        SessionSources::Kept(kept) => {
+            // On this device already: the player is off every torrent
+            // file, as for the file played as itself, and nothing is read
+            // ahead of.
+            if let Some(play) = &play {
+                state.engine.note_player(
+                    &play.token,
+                    enginefs::retention::sessions::Played::Elsewhere,
+                );
+            }
+            sources.extend(kept.iter().cloned());
         }
         SessionSources::Torrent {
             info_hash, paths, ..
@@ -976,11 +1067,45 @@ async fn resolve(state: &AppState, target: &Target) -> Result<Resolution, Refusa
             let file = files
                 .get(file_idx)
                 .ok_or_else(|| Refusal::NoSuchFile("File not found".to_string()))?;
-            Ok(Resolution::Torrent {
+            let plain = |sniffed| Resolution::Torrent {
                 info_hash: info_hash.clone(),
                 file_idx,
                 name: file.name.clone(),
                 len: file.length,
+                sniffed,
+            };
+            // The container sniff: the file's head off the store, or
+            // fetched within the bound -- and a head not here in time is
+            // the file as itself, so the player can start on it.
+            let Some(head) =
+                sniff::torrent_head(state, info_hash, file_idx, state.media.sniff_bound()).await
+            else {
+                return Ok(plain(false));
+            };
+            let formats = sniff::formats(&head);
+            if formats.is_empty() {
+                return Ok(plain(true));
+            }
+            // By the file's name, as the `torrent:` form is made: a RAR's
+            // other volumes are its siblings by the naming rules.
+            let (format, key, session) =
+                sniff::torrent_session(state, info_hash, &file.name, &formats).await?;
+            let name = chosen_member(&session, None, &[])?;
+            let (len, torrent) = member_in(state, &session, &name).await?;
+            tracing::info!(
+                info_hash,
+                file_idx,
+                ?format,
+                "a media id's torrent file is a container, by its head"
+            );
+            Ok(Resolution::Member {
+                format,
+                key,
+                create: None,
+                name,
+                len,
+                torrent,
+                sniffed_in: None,
             })
         }
         Target::Proxy {
@@ -999,11 +1124,16 @@ async fn resolve(state: &AppState, target: &Target) -> Result<Resolution, Refusa
             if let Some((source, pinned_name)) =
                 crate::proxy_downloads::held_download(state, &pin).await
             {
-                return Ok(Resolution::Held {
-                    source: Arc::new(source),
-                    target: target.clone(),
-                    name: pinned_name,
-                });
+                let source = Arc::new(source);
+                return match sniffed_file(state, Sniffed::Held(source.clone())).await? {
+                    Sniff::Member(member) => Ok(member),
+                    Sniff::Plain { sniffed } => Ok(Resolution::Held {
+                        source,
+                        target: target.clone(),
+                        name: pinned_name,
+                        sniffed,
+                    }),
+                };
             }
             match ProxySource::open(
                 state.proxy_cache.clone(),
@@ -1013,14 +1143,21 @@ async fn resolve(state: &AppState, target: &Target) -> Result<Resolution, Refusa
             )
             .await
             {
-                Ok(source) => Ok(Resolution::Http {
-                    content_type: content_type
-                        .clone()
-                        .unwrap_or_else(|| source.content_type().to_string()),
-                    source: Arc::new(source),
-                    target: target.clone(),
-                    name,
-                }),
+                Ok(source) => {
+                    let source = Arc::new(source);
+                    match sniffed_file(state, Sniffed::Link(source.clone())).await? {
+                        Sniff::Member(member) => Ok(member),
+                        Sniff::Plain { sniffed } => Ok(Resolution::Http {
+                            content_type: content_type
+                                .clone()
+                                .unwrap_or_else(|| source.content_type().to_string()),
+                            source,
+                            target: target.clone(),
+                            name,
+                            sniffed,
+                        }),
+                    }
+                }
                 Err(crate::sources::proxy::ProxySourceError::WillNotRange) => {
                     Ok(Resolution::WillNotRange {
                         target: target.clone(),
@@ -1055,11 +1192,16 @@ async fn resolve(state: &AppState, target: &Target) -> Result<Resolution, Refusa
                     .pairing(file_id, "")
                     .media_url()
                     .map_err(Refusal::of_drive)?;
-                return Ok(Resolution::Held {
-                    source: Arc::new(source),
-                    target,
-                    name: name.clone().unwrap_or(pinned_name),
-                });
+                let source = Arc::new(source);
+                return match sniffed_file(state, Sniffed::Held(source.clone())).await? {
+                    Sniff::Member(member) => Ok(member),
+                    Sniff::Plain { sniffed } => Ok(Resolution::Held {
+                        source,
+                        target,
+                        name: name.clone().unwrap_or(pinned_name),
+                        sniffed,
+                    }),
+                };
             }
             let refresh_token = grant().ok_or(Refusal::NoGrant)?;
             let pairing = endpoints.pairing(file_id, &refresh_token);
@@ -1071,11 +1213,16 @@ async fn resolve(state: &AppState, target: &Target) -> Result<Resolution, Refusa
                 .clone()
                 .unwrap_or_else(|| "Google Drive file".to_string());
             tracing::info!(file = %file_id, length = source.len(), "a media id's Drive file resolved");
-            Ok(Resolution::Drive {
-                source: Arc::new(source.named(name.clone())),
-                media_url,
-                name,
-            })
+            let source = Arc::new(source.named(name.clone()));
+            match sniffed_file(state, Sniffed::Drive(source.clone())).await? {
+                Sniff::Member(member) => Ok(member),
+                Sniff::Plain { sniffed } => Ok(Resolution::Drive {
+                    source,
+                    media_url,
+                    name,
+                    sniffed,
+                }),
+            }
         }
         Target::Local { file, name } => {
             // The I/O `register` did not do: open it, prove it seeks, read
@@ -1084,12 +1231,15 @@ async fn resolve(state: &AppState, target: &Target) -> Result<Resolution, Refusa
                 .clone()
                 .or_else(|| file.file_name())
                 .unwrap_or_else(|| "a file on this device".to_string());
-            let source = LocalSource::open(file, name)
-                .await
-                .map_err(Refusal::of_local)?;
-            Ok(Resolution::Local {
-                source: Arc::new(source),
-            })
+            let source = Arc::new(
+                LocalSource::open(file, name)
+                    .await
+                    .map_err(Refusal::of_local)?,
+            );
+            match sniffed_file(state, Sniffed::Local(source.clone())).await? {
+                Sniff::Member(member) => Ok(member),
+                Sniff::Plain { sniffed } => Ok(Resolution::Local { source, sniffed }),
+            }
         }
         Target::Member {
             format,
@@ -1106,40 +1256,12 @@ async fn resolve(state: &AppState, target: &Target) -> Result<Resolution, Refusa
                 ),
                 Container::Key(key) => (key.clone(), None),
             };
-            let session = member_session(state, *format, &key, create.as_ref()).await?;
+            let session = member_session(state, *format, &key, create.as_ref(), None).await?;
             let name = match member {
                 Some(name) => name.clone(),
-                None => archive::chosen_member(&session, *file_idx, file_must_include)
-                    .map_err(Refusal::of_session)?
-                    .ok_or_else(|| {
-                        Refusal::NoSuchFile("the archive holds no member to play".to_string())
-                    })?,
+                None => chosen_member(&session, *file_idx, file_must_include)?,
             };
-            let found = session.member(&name).ok_or_else(|| {
-                Refusal::NoSuchFile(format!("the archive holds no member {name}"))
-            })?;
-            if let crate::translators::Body::Opaque(refusal) = &found.body {
-                return Err(Refusal::Translated(refusal.clone()));
-            }
-            let len = found.len;
-            let torrent = match session.sources() {
-                SessionSources::Held(_) => None,
-                SessionSources::Torrent {
-                    info_hash, paths, ..
-                } => {
-                    let names = TorrentSource::file_names(&state.engine, info_hash)
-                        .await
-                        .map_err(|error| Refusal::NoSuchFile(error.to_string()))?;
-                    let files = paths
-                        .iter()
-                        .map(|path| names.iter().position(|name| name == path))
-                        .collect::<Option<Vec<usize>>>()
-                        .ok_or_else(|| {
-                            Refusal::NoSuchFile("a volume of the archive left its torrent".into())
-                        })?;
-                    Some((info_hash.to_lowercase(), files))
-                }
-            };
+            let (len, torrent) = member_in(state, &session, &name).await?;
             Ok(Resolution::Member {
                 format: *format,
                 key,
@@ -1147,9 +1269,100 @@ async fn resolve(state: &AppState, target: &Target) -> Result<Resolution, Refusa
                 name,
                 len,
                 torrent,
+                sniffed_in: None,
             })
         }
     }
+}
+
+/// The member `session`'s container plays with none named: the rule
+/// `/create` picks by (`routes::archive::chosen_member`).
+fn chosen_member(
+    session: &TranslatedSession,
+    file_idx: Option<usize>,
+    file_must_include: &[String],
+) -> Result<String, Refusal> {
+    archive::chosen_member(session, file_idx, file_must_include)
+        .map_err(Refusal::of_session)?
+        .ok_or_else(|| Refusal::NoSuchFile("the archive holds no member to play".to_string()))
+}
+
+/// The member `name` of `session`'s container, refused if it cannot be
+/// served by range: its length, and the torrent the container is in with
+/// its volumes' file indices, when it is in one.
+async fn member_in(
+    state: &AppState,
+    session: &TranslatedSession,
+    name: &str,
+) -> Result<(u64, Option<(String, Vec<usize>)>), Refusal> {
+    let found = session
+        .member(name)
+        .ok_or_else(|| Refusal::NoSuchFile(format!("the archive holds no member {name}")))?;
+    if let crate::translators::Body::Opaque(refusal) = &found.body {
+        return Err(Refusal::Translated(refusal.clone()));
+    }
+    let torrent = match session.sources() {
+        SessionSources::Held(_) | SessionSources::Kept(_) => None,
+        SessionSources::Torrent {
+            info_hash, paths, ..
+        } => {
+            let names = TorrentSource::file_names(&state.engine, info_hash)
+                .await
+                .map_err(|error| Refusal::NoSuchFile(error.to_string()))?;
+            let files = paths
+                .iter()
+                .map(|path| names.iter().position(|name| name == path))
+                .collect::<Option<Vec<usize>>>()
+                .ok_or_else(|| {
+                    Refusal::NoSuchFile("a volume of the archive left its torrent".into())
+                })?;
+            Some((info_hash.to_lowercase(), files))
+        }
+    };
+    Ok((found.len, torrent))
+}
+
+/// What a sniff of a file that is not a torrent's found.
+enum Sniff {
+    /// The container it holds, as the member an archive URL would name.
+    Member(Resolution),
+    /// No container: `sniffed` is whether its head was read at all.
+    Plain { sniffed: bool },
+}
+
+/// Read the head of the link, Drive file or file on this device
+/// `sniffed` names, within the bound, and on a container's signature
+/// answer its member -- or the first translator's refusal when none of
+/// those it names indexes it.
+async fn sniffed_file(state: &AppState, sniffed: Sniffed) -> Result<Sniff, Refusal> {
+    let source = sniffed.source();
+    let Some(head) = sniff::head_of(source.as_ref(), state.media.sniff_bound()).await else {
+        return Ok(Sniff::Plain { sniffed: false });
+    };
+    let formats = sniff::formats(&head);
+    if formats.is_empty() {
+        return Ok(Sniff::Plain { sniffed: true });
+    }
+    // One volume: a set behind links or Drive needs its volume list
+    // stated, and nothing supplies one yet -- the first volume alone is
+    // what the translator is handed, and its refusal is the answer.
+    let (format, key, session) = sniffed.index(state, &formats).await?;
+    let name = chosen_member(&session, None, &[])?;
+    let (len, torrent) = member_in(state, &session, &name).await?;
+    tracing::info!(
+        source = %source.describe(),
+        ?format,
+        "a media id's file is a container, by its head"
+    );
+    Ok(Sniff::Member(Resolution::Member {
+        format,
+        key,
+        create: None,
+        name,
+        len,
+        torrent,
+        sniffed_in: Some(sniffed),
+    }))
 }
 
 /// What to call a link: its last path segment, decoded, or its host.
@@ -1218,15 +1431,37 @@ impl Registry {
             ]),
             Target::Torrent { query, .. } => {
                 let resolution = entry.resolution(state).await.map_err(PinError::Refused)?;
+                let trackers = compat::parse_trackers(query.as_deref());
                 let Resolution::Torrent {
                     info_hash,
                     file_idx,
                     ..
                 } = &*resolution
                 else {
-                    unreachable!("a torrent target resolves to a torrent");
+                    // A file whose head is a container's resolves to its
+                    // member, and pins what a member pins: every volume.
+                    let mut rows = Vec::new();
+                    for volume in member_volumes(state, &resolution).await? {
+                        let Volume::Torrent {
+                            info_hash,
+                            file_idx,
+                        } = volume
+                        else {
+                            unreachable!("a torrent's container is in the torrent");
+                        };
+                        rows.push(
+                            crate::routes::downloads::pin_download(
+                                state,
+                                &info_hash,
+                                file_idx,
+                                trackers.clone(),
+                            )
+                            .await
+                            .map_err(PinError::Torrent)?,
+                        );
+                    }
+                    return Ok(rows);
                 };
-                let trackers = compat::parse_trackers(query.as_deref());
                 let row =
                     crate::routes::downloads::pin_download(state, info_hash, *file_idx, trackers)
                         .await
@@ -1311,12 +1546,25 @@ impl Registry {
                 .await
             }
             // An index needs no resolve: an unpin must not add a torrent
-            // the session does not hold (a dormant pin's) to learn it.
+            // the session does not hold (a dormant pin's) to learn it --
+            // unless a resolve already found the file a container's, whose
+            // pin was every volume.
             Target::Torrent {
                 info_hash,
                 file: StreamFile::Index(file_idx),
                 ..
-            } => torrent(info_hash.clone(), *file_idx).await,
+            } if !matches!(
+                entry
+                    .resolution
+                    .try_lock()
+                    .ok()
+                    .and_then(|held| held.clone())
+                    .as_deref(),
+                Some(Resolution::Member { .. })
+            ) =>
+            {
+                torrent(info_hash.clone(), *file_idx).await
+            }
             Target::Torrent { .. } | Target::Member { .. } => {
                 let resolution = entry.resolution(state).await.map_err(PinError::Refused)?;
                 let volumes = match &*resolution {
@@ -1378,6 +1626,7 @@ async fn member_volumes(
         key,
         create,
         torrent,
+        sniffed_in,
         ..
     } = resolution
     else {
@@ -1407,7 +1656,7 @@ async fn member_volumes(
             })
             .collect();
     }
-    let session = member_session(state, *format, key, None)
+    let session = member_session(state, *format, key, None, sniffed_in.as_ref())
         .await
         .map_err(super::PinError::Refused)?;
     Ok(match session.sources() {
@@ -1415,6 +1664,8 @@ async fn member_volumes(
             .iter()
             .map(|source| Volume::Link(source.url().clone()))
             .collect(),
+        // On this device already: nothing to download.
+        SessionSources::Kept(_) => return Err(super::PinError::NothingToDownload),
         SessionSources::Torrent { .. } => {
             unreachable!("a member in a torrent resolves with its torrent's files")
         }
@@ -1519,6 +1770,7 @@ mod tests {
             name: "film.mkv".to_string(),
             len: 1,
             torrent,
+            sniffed_in: None,
         };
         let hash = "ab".repeat(20);
         for (torrent, expected) in [
@@ -1569,6 +1821,7 @@ mod tests {
                     name: "film.mkv".to_string(),
                     len: 1,
                     torrent,
+                    sniffed_in: None,
                 }));
             drop(entry);
             assert_eq!(registry.set_files(&id), expected);

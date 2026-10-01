@@ -647,6 +647,15 @@ impl ServerHandle {
         self.state.media.read_ahead_registered(&self.state, id)
     }
 
+    /// How long `resolve` waits for a file's head before it answers the
+    /// file unsniffed (`docs/design/media-pipeline.md` §2.9), set short: a
+    /// test's, so a head that never comes is proven not to hold a resolve
+    /// without spending the real bound. Not part of the embeddable API.
+    #[doc(hidden)]
+    pub fn set_media_sniff_bound(&self, bound: Duration) {
+        self.state.media.set_sniff_bound(bound);
+    }
+
     /// [`Self::stream_numbers`] for what `id` resolved to. `None` for an id
     /// not resolved yet, as for a URL this server does not hold. Resolves
     /// nothing.

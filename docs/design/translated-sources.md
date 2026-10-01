@@ -502,6 +502,8 @@ never kept beside it.
    server's own sentence. A torrent whose selected file is an archive or
    an image goes the same way through the `torrent:` form. `StreamKind.archive`
    already exists for addon-declared archives; this is the sniffed case.
+   *(Moving into the server: a media id's `resolve` now does this sniff
+   itself and answers the member -- `docs/design/media-pipeline.md` §2.9.)*
 
 ## 6. Decisions taken here, for zond to overrule
 

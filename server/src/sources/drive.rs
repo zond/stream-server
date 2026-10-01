@@ -587,6 +587,13 @@ impl DriveSource {
     pub(crate) fn key_dir(&self) -> Option<std::path::PathBuf> {
         self.inner.key_dir()
     }
+
+    /// The proxy source underneath, as a viewer reads it: what a session
+    /// over a container found in this file holds (`crate::media`), with
+    /// the same renewing credential.
+    pub(crate) fn proxy_source(&self) -> ProxySource {
+        self.inner.clone()
+    }
 }
 
 #[async_trait::async_trait]

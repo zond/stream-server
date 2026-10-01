@@ -418,6 +418,7 @@ impl TranslatedSession {
     pub fn is_live(&self, reading: &Reading) -> bool {
         match &self.sources {
             SessionSources::Held(sources) => sources.iter().any(|source| source.is_live(reading)),
+            SessionSources::Kept(sources) => sources.iter().any(|source| source.is_live(reading)),
             SessionSources::Torrent { info_hash, .. } => reading.is_torrent(info_hash),
         }
     }
@@ -430,6 +431,11 @@ pub enum SessionSources {
     /// cache owns nothing and registers nothing, so keeping the source is
     /// keeping a URL, a length and a validator.
     Held(Vec<Arc<crate::sources::ProxySource>>),
+    /// Bytes already on this device, held for the session's life: a file
+    /// of it, or a download the proxy cache holds whole -- what a sniff in
+    /// `resolve` found a container in (`crate::media`). Nothing to fetch
+    /// and nothing to read ahead of.
+    Kept(Vec<Arc<dyn ByteSource>>),
     /// The files of a torrent the container is made of -- one for an
     /// ordinary archive, the volumes in order for a set -- **opened per
     /// read and dropped with the body**.

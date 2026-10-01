@@ -210,6 +210,9 @@ pub struct Resolved {
     pub member: Option<MemberInfo>,
     /// `false` only for an HTTP origin that will not range (2.5).
     pub in_process: bool,
+    /// Whether the server looked for a container (2.9); `false` when it
+    /// could not read the head in time.
+    pub sniffed: bool,
 }
 ```
 
@@ -576,6 +579,30 @@ volume list, which is a `MediaSpec` field when something supplies one.
 The app's `archive_sniff.dart` fail-then-sniff path stays as the fallback
 until the server's sniff has shipped, and is then deleted.
 
+*(Done -- `server/src/media/sniff.rs`, called from `registry::resolve`.)*
+The signatures are `enginefs::retention::sniff::containers`, one list with
+the sharing check's `is_archive`, which gained one: `MZ`, an executable,
+since a self-extracting ZIP is one and only the ZIP reader's end record at
+the tail can say. Each hit names its translator, tried in the order 7z,
+RAR, ZIP, TAR, ISO; none indexing is the first one's refusal. A torrent
+file's session is the `torrent:` form's (`session_for` under
+`torrent:<hash>/<name>`, so a RAR set is its siblings); a link, Drive file,
+held download or local file gets a session over that one source under a
+fresh key, and the id keeps the source (`Resolution::Member`'s
+`sniffed_in`) to index it again once the archive map lets the session go.
+A local file or held download is a new `SessionSources::Kept` (bytes on
+this device: no read-ahead, the session `Elsewhere` on a play); a link or
+Drive file is `Held`, as a create's is. The head is read through the
+resolved source -- for a torrent an aside, which registers a stream so a
+stopped torrent starts -- within `SNIFF_BOUND` (ten seconds, the stream
+route's `SLACK_DROP_BOUND`), and a head not here by then answers the plain
+file with `Resolved::sniffed: false`; the answer is kept, so a later look
+is a new `register`. A torrent id that resolved to a member pins and
+unpins every volume, also by an index URL once resolved. Not done: an
+explicit volume list for a set behind links or Drive (a `MediaSpec`
+field when something supplies one); until then such a set resolves to
+the RAR translator's missing-volume refusal.
+
 ### 2.10 Renditions (step F): transcode for a receiver, on demand, no disk
 
 For a receiver that cannot decode the original (the per-model table; on
@@ -791,7 +818,11 @@ D. **Pins by id; one pin set; the directory.** (S-M.) `pin(id)`,
    `phase: "buffering"`, `complete: false`, no error.)*
 
 E. **The sniff in `resolve`.** (S; M more for explicit volume lists on URL
-   and Drive sets.) 2.9, then the app's fallback deleted.
+   and Drive sets.) 2.9, then the app's fallback deleted. *(Server half
+   done: `server/src/media/sniff.rs`, `Resolved::sniffed`,
+   `server/tests/media_sniff.rs`; the HTTP routes are unchanged and the
+   app's fallback stays until A' slice 2. The explicit volume list for
+   link and Drive sets is not done.)*
 
 F. **Renditions.** (Server route M; Kotlin producer L.) Its own design note
    first (2.10).

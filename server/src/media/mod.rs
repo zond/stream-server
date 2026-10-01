@@ -50,6 +50,7 @@
 
 pub mod reader;
 pub mod registry;
+mod sniff;
 
 pub use reader::{Canceller, Command, MediaReader};
 pub use registry::MEDIA_ID_CAP;
@@ -158,8 +159,9 @@ pub struct PlayToken {
     pub buffer: BufferProfile,
 }
 
-/// The member a container resolved to: what an archive URL names (the
-/// sniff of step E will add containers found by their bytes).
+/// The member a container resolved to: what an archive URL names, or a
+/// plain file's container found by its first bytes (the sniff in
+/// `resolve`, `docs/design/media-pipeline.md` §2.9).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemberInfo {
@@ -182,8 +184,17 @@ pub struct Resolved {
     /// not what was being asked.
     pub len: u64,
     /// The member a container resolved to, when it was one: an archive
-    /// URL's member. [`Self::name`] and [`Self::len`] are then the member's.
+    /// URL's member, or the one a torrent file, a link, a Drive file or a
+    /// file on this device was found to hold by its first bytes.
+    /// [`Self::name`] and [`Self::len`] are then the member's.
     pub member: Option<MemberInfo>,
+    /// Whether the server has settled what this is: it read the file's
+    /// head and asked it for a container signature, or the URL named the
+    /// container. `false` when it could not look -- a torrent whose first
+    /// pieces were not here within the bound, an origin that will not
+    /// range -- and the file is answered as itself; asking again needs a
+    /// new [`crate::ServerHandle::register`], since the answer is kept.
+    pub sniffed: bool,
     /// `false` only for an HTTP origin that will not serve ranges: nothing
     /// in this process can seek it, so a player has to be handed
     /// [`Self::proxy_url`] and read it forward itself. Not a refusal.

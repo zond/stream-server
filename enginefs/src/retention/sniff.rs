@@ -17,6 +17,13 @@
 //! be) and TAR (a POSIX or GNU `ustar` header whose checksum adds up: the
 //! magic alone is six bytes a film could carry by chance, and the checksum
 //! is what a tar header always has and a film's bytes do not).
+//!
+//! And one the app never routed: a Windows executable (`MZ`), which is
+//! what a self-extracting ZIP starts with -- its end record is at the tail
+//! like any ZIP's, and the stub in front of it is no film. The server's
+//! `resolve` sniffs with [`containers`] and asks each named translator in
+//! turn, which verifies its own format; a hit nothing indexes is a
+//! refusal there, never a film.
 
 /// How many leading bytes [`is_archive`] needs to see all it can: an ISO
 /// 9660 or UDF image carries its signature at the start of sector 16,
@@ -31,13 +38,49 @@ const TAR_HEADER: usize = 512;
 /// Whether `head` -- a file's first bytes, all of them for a file shorter
 /// than [`HEAD_BYTES`] -- begins an archive or a disc image.
 pub fn is_archive(head: &[u8]) -> bool {
+    !containers(head).is_empty()
+}
+
+/// A kind of container a head's signature names: which reader to ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Container {
+    SevenZ,
+    /// RAR 1.5 to 5; a later volume of a set carries the same signature.
+    Rar,
+    /// A ZIP's local header (or its empty-archive or spanned marker), or
+    /// a Windows executable, which a self-extracting ZIP is: only its end
+    /// record, at the tail, says which.
+    Zip,
+    Tar,
+    /// ISO 9660 (`CD001`) or UDF (`BEA01`).
+    DiscImage,
+}
+
+/// Every container `head` carries the signature of, in the order a reader
+/// is tried: 7z, RAR, ZIP, TAR, disc image. Empty for a film.
+pub fn containers(head: &[u8]) -> Vec<Container> {
     let at = |offset: usize, bytes: &[u8]| head.get(offset..offset + bytes.len()) == Some(bytes);
-    at(0, b"Rar!\x1a\x07")
-        || (at(0, b"PK") && (at(2, &[0x03, 0x04]) || at(2, &[0x05, 0x06]) || at(2, &[0x07, 0x08])))
-        || at(0, &[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C])
-        || at(DESCRIPTOR_AT, b"CD001")
-        || at(DESCRIPTOR_AT, b"BEA01")
-        || is_tar(head)
+    [
+        (
+            Container::SevenZ,
+            at(0, &[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C]),
+        ),
+        (Container::Rar, at(0, b"Rar!\x1a\x07")),
+        (
+            Container::Zip,
+            (at(0, b"PK")
+                && (at(2, &[0x03, 0x04]) || at(2, &[0x05, 0x06]) || at(2, &[0x07, 0x08])))
+                || at(0, b"MZ"),
+        ),
+        (Container::Tar, is_tar(head)),
+        (
+            Container::DiscImage,
+            at(DESCRIPTOR_AT, b"CD001") || at(DESCRIPTOR_AT, b"BEA01"),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(container, carried)| carried.then_some(container))
+    .collect()
 }
 
 /// Whether `head` begins with a tar header: the POSIX magic (`ustar\0`) or
@@ -114,6 +157,7 @@ mod tests {
             with(0, b"PK\x05\x06"),
             with(0, b"PK\x07\x08"),
             with(0, &[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C]),
+            with(0, b"MZ"),
             with(DESCRIPTOR_AT, b"CD001"),
             with(DESCRIPTOR_AT, b"BEA01"),
             tar(b"ustar\x0000"),
@@ -147,5 +191,27 @@ mod tests {
         ] {
             assert!(!is_archive(&head), "{:?}", head.get(..8));
         }
+    }
+
+    /// **Each signature names its reader**, so `resolve` asks the one
+    /// translator that can say whether it is right; an executable is a
+    /// self-extracting ZIP until the ZIP reader says otherwise.
+    #[test]
+    fn a_signature_names_the_container_to_try() {
+        for (head, expected) in [
+            (
+                with(0, &[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C]),
+                Container::SevenZ,
+            ),
+            (with(0, b"Rar!\x1a\x07\x01\x00"), Container::Rar),
+            (with(0, b"PK\x03\x04"), Container::Zip),
+            (with(0, b"MZ"), Container::Zip),
+            (tar(b"ustar\x0000"), Container::Tar),
+            (with(DESCRIPTOR_AT, b"CD001"), Container::DiscImage),
+            (with(DESCRIPTOR_AT, b"BEA01"), Container::DiscImage),
+        ] {
+            assert_eq!(containers(&head), [expected], "{:?}", &head[..8]);
+        }
+        assert!(containers(&with(0, &[0x1A, 0x45, 0xDF, 0xA3])).is_empty());
     }
 }

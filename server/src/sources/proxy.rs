@@ -182,7 +182,9 @@ pub(crate) trait OwnGrant: Send + Sync {
     async fn headers(&self) -> io::Result<BTreeMap<String, String>>;
 }
 
-/// One HTTP entity, read by range through the proxy cache.
+/// One HTTP entity, read by range through the proxy cache. A clone is the
+/// same entity, read the same way.
+#[derive(Clone)]
 pub struct ProxySource {
     entity: Arc<Entity>,
 }

@@ -1020,6 +1020,7 @@ async fn sources_for(
 ) -> Result<Vec<Arc<dyn ByteSource>>, SessionError> {
     match session.sources() {
         SessionSources::Held(sources) => Ok(as_byte_sources(sources)),
+        SessionSources::Kept(sources) => Ok(sources.clone()),
         SessionSources::Torrent {
             info_hash, paths, ..
         } => {
