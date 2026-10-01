@@ -43,8 +43,9 @@
 //! **Renditions** (`docs/design/renditions.md`, `crate::rendition`) are
 //! publications too ([`crate::ServerHandle::publish_rendition`]), with the
 //! same token rules and the same cut, and an HLS stream under
-//! `/cast/{token}/hls/`: `index.m3u8`, `init.mp4` and `{n}.m4s`, each
-//! ranged by the same framing, each segment in memory. A plain
+//! `/cast/{token}/hls/`: `index.m3u8` (the master playlist), `media.m3u8`,
+//! `init.mp4` and `{n}.m4s`, each ranged by the same framing, each segment
+//! in memory. A plain
 //! publication has no `hls/` (`404`); a rendition's token serves its
 //! `hls/` and, like a plain one, the source as it is at `/cast/{token}`.
 
@@ -325,7 +326,7 @@ fn not_served(reason: NotServed) -> Response {
     }
 }
 
-/// One file of a rendition's HLS stream: the playlist, the init segment or
+/// One file of a rendition's HLS stream: a playlist, the init segment or
 /// a media segment, whole and in memory, framed by `MediaRange`.
 async fn serve_hls(
     state: &AppState,
@@ -342,6 +343,12 @@ async fn serve_hls(
         return StatusCode::NOT_FOUND.into_response();
     };
     let (bytes, content_type, media) = if file == "index.m3u8" {
+        (
+            rendition.master(state).await,
+            "application/vnd.apple.mpegurl",
+            false,
+        )
+    } else if file == crate::rendition::MEDIA_PLAYLIST {
         (
             Ok(rendition.playlist()),
             "application/vnd.apple.mpegurl",

@@ -523,7 +523,7 @@ sentence.
 
 | Route | Answers |
 |---|---|
-| `GET/HEAD /cast/{token}/hls/index.m3u8` | The playlist, `application/vnd.apple.mpegurl`. Written at publish; never waits. |
+| `GET/HEAD /cast/{token}/hls/index.m3u8` | The playlist, `application/vnd.apple.mpegurl`. Written at publish; never waits. *(F2: the master playlist, waiting for the codecs; the media playlist moved to `media.m3u8`. See F2 below.)* |
 | `GET/HEAD /cast/{token}/hls/init.mp4` | The init segment, `video/mp4`. Waits for the first run's formats. |
 | `GET/HEAD /cast/{token}/hls/{n}.m4s` | Segment `n`, `video/mp4`, ranged by `MediaRange` over the whole segment in memory. `404` past the last; `503` with `{refused, message}` once the rendition has failed. |
 
@@ -695,6 +695,27 @@ F2. **Kotlin producer, repackage only, end to end on the phone** (M). The
    today is refused. This step is where the unverified JNI facts get
    verified (§9), and where the empty-segment question for copied video
    gets a measured answer on real files.
+
+   *(Built in xtremio as a Rust producer over libavformat from the
+   vendored libmpv (F1½), not Kotlin over JNI: `rust/src/libav.rs`,
+   `rust/src/rendition.rs`. First run on zond's TV, 2026-10-01: the
+   decision chose the rendition, the receiver fetched the playlist,
+   `init.mp4` and segment 0 whole, then gave up ("idle (error)") without
+   asking for segment 1. Reproduced on a desktop with the Shaka Player the
+   Cast receiver framework loads by default (4.15.56, `use_shaka_for_hls`
+   defaults to true; CAF's own Shaka configuration):
+   `MEDIA_SOURCE_OPERATION_FAILED` (3014) on the first append. Handed a
+   media playlist alone, that Shaka probes the init segment and types the
+   SourceBuffer of the muxed stream from its video codec only
+   (`MediaSourceEngine.getRealInfo_`), changes the buffer to video alone,
+   and the muxed init segment no longer fits. Behind a master playlist the
+   same Shaka takes the variant as muxed and plays the stream through and
+   seeks (current Shaka, 5.2, plays either). So `index.m3u8` is now a
+   master playlist naming one variant with its `CODECS`, `RESOLUTION` and
+   `BANDWIDTH`, and the media playlist is `media.m3u8`; muxed fMP4 HLS
+   stands (§6's question), separate audio and video playlists are not
+   needed. The master waits for the first run's formats, as `init.mp4`
+   does.)*
 
 F3. **Audio to stereo AAC** (M). `MediaCodec` decode when the phone has a
    decoder, libavcodec from `libmpv.so` otherwise (2.6), downmix,

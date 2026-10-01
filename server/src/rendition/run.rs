@@ -263,6 +263,7 @@ async fn drive(
         Ok(reader) => reader,
         Err(refusal) => return Outcome::Failed(refusal.to_string()),
     };
+    rendition.note_source_len(reader.len());
     let reader_waits = reader.waits();
     let _cancel_reader = CancelOnDrop(reader.canceller());
     let (tx, mut rx) = mpsc::channel(SINK_CAPACITY);

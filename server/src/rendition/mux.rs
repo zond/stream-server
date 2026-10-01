@@ -385,6 +385,94 @@ pub(crate) fn hvcc(csd0: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+// --- Codec strings ----------------------------------------------------------------
+
+/// The RFC 6381 codec string of a video format, as an HLS `CODECS`
+/// attribute names it: `avc1.PPCCLL` from the SPS's profile, constraint
+/// and level bytes; `hvc1.` and the profile, compatibility, tier, level and
+/// constraint fields of the HEVC SPS (ISO/IEC 14496-15 Annex E).
+fn video_codec(format: &TrackFormat) -> Result<String, String> {
+    match format {
+        TrackFormat::H264 { csd0, csd1, .. } => {
+            let sps = annex_b_units(csd0)
+                .into_iter()
+                .chain(annex_b_units(csd1))
+                .find(|unit| unit.len() >= 4 && unit[0] & 0x1f == 7)
+                .ok_or("the video's codec configuration carries no H.264 sequence parameter set")?;
+            Ok(format!("avc1.{:02X}{:02X}{:02X}", sps[1], sps[2], sps[3]))
+        }
+        TrackFormat::Hevc { csd0, .. } => {
+            let sps = annex_b_units(csd0)
+                .into_iter()
+                .find(|unit| unit.len() >= 2 && (unit[0] >> 1) & 0x3f == 33)
+                .ok_or("the video's codec configuration carries no HEVC sequence parameter set")?;
+            let parsed = parse_hevc_sps(sps)
+                .ok_or("the video's HEVC sequence parameter set cannot be read")?;
+            let general = parsed.general;
+            let space = ["", "A", "B", "C"][usize::from(general[0] >> 6)];
+            let tier = if general[0] & 0x20 != 0 { 'H' } else { 'L' };
+            let compatibility =
+                u32::from_be_bytes([general[1], general[2], general[3], general[4]]).reverse_bits();
+            let mut out = format!(
+                "hvc1.{space}{}.{compatibility:X}.{tier}{}",
+                general[0] & 0x1f,
+                general[11]
+            );
+            let constraints = &general[5..11];
+            let kept = constraints
+                .iter()
+                .rposition(|byte| *byte != 0)
+                .map_or(0, |last| last + 1);
+            for byte in &constraints[..kept] {
+                out.push_str(&format!(".{byte:X}"));
+            }
+            Ok(out)
+        }
+        TrackFormat::Aac { .. } => Err("a sound format is not a picture".to_string()),
+    }
+}
+
+/// `mp4a.40.N`, N the AudioSpecificConfig's audio object type.
+fn audio_codec(format: &TrackFormat) -> Result<String, String> {
+    let TrackFormat::Aac { csd0, .. } = format else {
+        return Err("a picture format is not a sound".to_string());
+    };
+    let first = *csd0
+        .first()
+        .ok_or("the sound's AAC codec configuration is empty")?;
+    let mut object = first >> 3;
+    if object == 31 {
+        let second = *csd0
+            .get(1)
+            .ok_or("the sound's AAC codec configuration is cut short")?;
+        object = 32 + (((first & 0x07) << 3) | (second >> 5));
+    }
+    Ok(format!("mp4a.40.{object}"))
+}
+
+/// The `CODECS` attribute of the one variant a rendition has: the video's
+/// codec string, then the sound's.
+pub(crate) fn codecs(formats: &Formats) -> Result<String, String> {
+    let mut parts = Vec::with_capacity(2);
+    if let Some(video) = &formats.video {
+        parts.push(video_codec(video)?);
+    }
+    if let Some(audio) = &formats.audio {
+        parts.push(audio_codec(audio)?);
+    }
+    Ok(parts.join(","))
+}
+
+/// The picture's size, for `RESOLUTION`, when there is a picture.
+pub(crate) fn resolution(formats: &Formats) -> Option<(u32, u32)> {
+    match formats.video.as_ref()? {
+        TrackFormat::H264 { width, height, .. } | TrackFormat::Hevc { width, height, .. } => {
+            Some((*width, *height))
+        }
+        TrackFormat::Aac { .. } => None,
+    }
+}
+
 /// An MPEG-4 descriptor: tag, a length in the one-byte form when it fits
 /// and the four-byte form otherwise, body.
 fn descriptor(tag: u8, body: &[u8]) -> Vec<u8> {
@@ -866,6 +954,50 @@ mod tests {
             key,
             data: Bytes::from_static(&[0, 0, 0, 1, 0x41, 0xaa]),
         }
+    }
+
+    /// **Codec strings as HLS names them**: H.264's profile, constraint and
+    /// level bytes; HEVC's fields in ISO/IEC 14496-15 Annex E's order, the
+    /// compatibility flags bit-reversed and trailing zero constraint bytes
+    /// dropped; AAC's object type, the escape included.
+    #[test]
+    fn codec_strings_are_read_from_the_codec_configuration() {
+        let aac = |csd0: &'static [u8]| TrackFormat::Aac {
+            sample_rate: 48_000,
+            channels: 2,
+            csd0: Bytes::from_static(csd0),
+        };
+        let h264 = Formats {
+            video: Some(TrackFormat::H264 {
+                width: 320,
+                height: 240,
+                csd0: Bytes::from_static(X264_SPS),
+                csd1: Bytes::from_static(X264_PPS),
+            }),
+            audio: Some(aac(&[0x11, 0x90])),
+        };
+        assert_eq!(codecs(&h264).unwrap(), "avc1.64000D,mp4a.40.2");
+        // Main, constraint_set1, level 4.0: each byte where it belongs.
+        let main = TrackFormat::H264 {
+            width: 1920,
+            height: 1080,
+            csd0: Bytes::from_static(&[0, 0, 0, 1, 0x67, 0x4d, 0x40, 0x28, 0xec]),
+            csd1: Bytes::from_static(X264_PPS),
+        };
+        assert_eq!(video_codec(&main).unwrap(), "avc1.4D4028");
+        assert_eq!(resolution(&h264), Some((320, 240)));
+        let hevc = Formats {
+            video: Some(TrackFormat::Hevc {
+                width: 320,
+                height: 240,
+                csd0: Bytes::from_static(X265_CSD),
+            }),
+            audio: None,
+        };
+        assert_eq!(codecs(&hevc).unwrap(), "hvc1.1.6.L60.90");
+        // HE-AAC v2 (29), and an object type past 30 behind the escape.
+        assert_eq!(audio_codec(&aac(&[0xeb, 0x09])).unwrap(), "mp4a.40.29");
+        assert_eq!(audio_codec(&aac(&[0xf8, 0x20])).unwrap(), "mp4a.40.33");
     }
 
     /// Decode order I P B B: the decode times are the presentation times

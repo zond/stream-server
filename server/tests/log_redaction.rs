@@ -193,7 +193,7 @@ fn a_caller_supplied_url_is_logged_as_its_origin_only() -> anyhow::Result<()> {
         None,
     )?;
     let hls = format!("http://{lan}/cast/{}/hls", rendition.as_str());
-    for file in ["index.m3u8", "init.mp4", "0.m4s"] {
+    for file in ["index.m3u8", "media.m3u8", "init.mp4", "0.m4s"] {
         assert_eq!(
             client.get(format!("{hls}/{file}")).send()?.status(),
             reqwest::StatusCode::OK,

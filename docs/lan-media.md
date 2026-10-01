@@ -64,14 +64,15 @@ it is refused with `noProducer` until the embedder has called
 
 | Path | Answers |
 |---|---|
-| `GET`/`HEAD /cast/{token}/hls/index.m3u8` | The playlist, `application/vnd.apple.mpegurl`: VOD, `#EXT-X-MAP` naming `init.mp4`, `ceil(duration / T)` entries `0.m4s`, `1.m4s`, ... (relative, so it names no host), `#EXT-X-ENDLIST`. Written at publish; never waits |
+| `GET`/`HEAD /cast/{token}/hls/index.m3u8` | The master playlist, `application/vnd.apple.mpegurl`: one muxed variant, `#EXT-X-STREAM-INF` with `BANDWIDTH` (the source's average rate), `CODECS` (RFC 6381, from the first run's formats: `avc1.PPCCLL` or `hvc1.…`, `mp4a.40.N`) and `RESOLUTION`, naming `media.m3u8`. Waits for the first run's formats, as `init.mp4` does. The Cast receiver's Shaka Player (4.15) needs it: handed the media playlist alone, it types a muxed stream's buffer as video from the init segment and fails the first append (`MEDIA_SOURCE_OPERATION_FAILED`) |
+| `GET`/`HEAD /cast/{token}/hls/media.m3u8` | The media playlist, `application/vnd.apple.mpegurl`: VOD, `#EXT-X-MAP` naming `init.mp4`, `ceil(duration / T)` entries `0.m4s`, `1.m4s`, ... (relative, so it names no host), `#EXT-X-ENDLIST`. Written at publish; never waits |
 | `GET`/`HEAD /cast/{token}/hls/init.mp4` | The init segment (`ftyp` + `moov`), `video/mp4`. Waits for the first run's track formats, starting that run at the spec's `startMs` if none is live |
 | `GET`/`HEAD /cast/{token}/hls/{n}.m4s` | Segment `n` (`styp` + `moof` + `mdat`), `video/mp4`, whole and in memory, ranged like any file (`206` and `Content-Range` for a `Range`). Waits while it is produced; `404` past the last segment; `503` `{"refused":"renditionFailed","message":...}` once the rendition has failed, and `503` `{"refused":"unpublished"}` for a request the unpublish woke |
 
 A plain token has no `hls/` (`404`); a rendition's token serves its
 `hls/` and, like a plain one, the source as it is at `/cast/{token}`. A
 `GET` of `init.mp4` or a segment counts as a body
-(`lan_media_bodies_served`); the playlist does not. Segment `n` is cut at
+(`lan_media_bodies_served`); a playlist does not. Segment `n` is cut at
 the first video sync sample at or after `n x T` and holds the audio whose
 time falls in `[n x T, (n+1) x T)`. Production runs at most two segments
 past the last request and then waits; a request far from where the run is

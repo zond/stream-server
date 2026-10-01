@@ -333,14 +333,14 @@ fn expected(knobs: &Knobs, n: i64) -> (Vec<i64>, Vec<i64>) {
 
 // --- The playlist and the init segment -------------------------------------------
 
-/// **The playlist is written up front**: VOD, the init segment named,
-/// `ceil(d / T)` entries named relatively, the last one the remainder, and
-/// the end -- with no run started for it.
+/// **The media playlist is written up front**: VOD, the init segment
+/// named, `ceil(d / T)` entries named relatively, the last one the
+/// remainder, and the end -- with no run started for it.
 #[test]
 fn the_playlist_has_one_entry_per_segment_and_ends() -> anyhow::Result<()> {
     let fixture = Fixture::quick(Knobs::default())?;
     let token = fixture.publish(13_500, 0)?;
-    let response = fixture.get(&token, "index.m3u8");
+    let response = fixture.get(&token, "media.m3u8");
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(
         response.headers()["content-type"],
@@ -375,6 +375,42 @@ fn the_playlist_has_one_entry_per_segment_and_ends() -> anyhow::Result<()> {
     assert_eq!(lines.last(), Some(&"#EXT-X-ENDLIST"));
     assert_eq!(fixture.probe(&token).runs_started, 0, "nothing ran for it");
     assert_eq!(fixture.handle.rendition_state(&token), RenditionState::Idle);
+    Ok(())
+}
+
+/// **The master playlist names the one variant's codecs**, read from the
+/// first run's formats -- so it starts that run and waits for them, as
+/// `init.mp4` does -- with its size and the source's average rate, and
+/// names the media playlist. Without it the Cast receiver's Shaka Player
+/// (4.15) types a muxed stream's buffer from the init segment as video
+/// alone and fails the first append.
+#[test]
+fn the_master_playlist_names_the_codecs_of_the_first_run() -> anyhow::Result<()> {
+    let fixture = Fixture::quick(Knobs::default())?;
+    let token = fixture.publish(60_000, 0)?;
+    let response = fixture.get(&token, "index.m3u8");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/vnd.apple.mpegurl"
+    );
+    // The test producer's x264 SPS (High, level 1.3) and AAC-LC; the file
+    // is 1 MiB over 60 s: 1 048 576 x 8 bits / 60 s, rounded up.
+    let bandwidth = 139_811;
+    assert_eq!(
+        response.text()?,
+        format!(
+            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n\
+             #EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS=\"avc1.64000D,mp4a.40.2\",\
+             RESOLUTION=320x240\nmedia.m3u8\n"
+        )
+    );
+    assert_eq!(
+        fixture.probe(&token).runs_started,
+        1,
+        "it ran for the codecs"
+    );
+    assert!(fixture.probe(&token).init, "and froze them, once");
     Ok(())
 }
 
@@ -959,7 +995,7 @@ fn a_range_of_a_segment_is_a_206() -> anyhow::Result<()> {
 fn a_plain_publication_has_no_hls() -> anyhow::Result<()> {
     let fixture = Fixture::quick(Knobs::default())?;
     let plain = fixture.handle.publish(&fixture.id, None)?;
-    for file in ["index.m3u8", "init.mp4", "0.m4s"] {
+    for file in ["index.m3u8", "media.m3u8", "init.mp4", "0.m4s"] {
         assert_eq!(
             fixture.get(&plain, file).status(),
             reqwest::StatusCode::NOT_FOUND,
@@ -967,10 +1003,13 @@ fn a_plain_publication_has_no_hls() -> anyhow::Result<()> {
         );
     }
     let token = fixture.publish(10_000, 0)?;
-    assert_eq!(
-        fixture.get(&token, "index.m3u8").status(),
-        reqwest::StatusCode::OK
-    );
+    for file in ["index.m3u8", "media.m3u8"] {
+        assert_eq!(
+            fixture.get(&token, file).status(),
+            reqwest::StatusCode::OK,
+            "{file}"
+        );
+    }
     let as_is = reqwest::blocking::get(format!("{}/cast/{}", fixture.lan, token.as_str()))?;
     assert_eq!(as_is.status(), reqwest::StatusCode::OK);
     assert_eq!(as_is.bytes()?.len(), 1 << 20);
@@ -1038,5 +1077,6 @@ fn dump_for_ffprobe() -> anyhow::Result<()> {
     }
     std::fs::write(dir.join("all.mp4"), &all)?;
     std::fs::write(dir.join("index.m3u8"), fixture.bytes(&token, "index.m3u8"))?;
+    std::fs::write(dir.join("media.m3u8"), fixture.bytes(&token, "media.m3u8"))?;
     Ok(())
 }
