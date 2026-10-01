@@ -661,11 +661,21 @@ impl ServerHandle {
 
     /// [`Self::note_duration`] for the torrent file `id` resolved to; a
     /// no-op for anything else, and for an id not resolved yet.
+    ///
+    /// For a member across a multi-volume set, told to every volume for the
+    /// set's draw alone ([`enginefs::EngineFS::on_set_duration`]): a
+    /// volume's length over the film's duration is no rate of anything.
     pub fn note_media_duration(
         &self,
         id: &MediaId,
         duration: std::time::Duration,
     ) -> anyhow::Result<()> {
+        if let Some((info_hash, files)) = self.state.media.set_files(id) {
+            let engine = self.state.engine.clone();
+            return self.block_on_server(async move {
+                engine.on_set_duration(&info_hash, &files, duration).await
+            });
+        }
         let Some((info_hash, file_idx)) = self.state.media.torrent_file(id) else {
             return Ok(());
         };

@@ -288,8 +288,21 @@ impl Resolution {
 
     /// The one torrent file a member's container is, when it is one: what
     /// its play session is on, and what a player's reports about the film
-    /// are about. `None` for a set, whose play session shares nothing, and
-    /// for a container behind links.
+    /// are about. `None` for a set ([`Self::set_files`]) and for a
+    /// container behind links.
+    /// The torrent files of a member's multi-volume set, when it is one:
+    /// what its play session is on, and what the film's duration is told
+    /// to, for the set's draw ([`enginefs::EngineFS::on_set_duration`]).
+    fn set_files(&self) -> Option<(String, Vec<usize>)> {
+        match self {
+            Self::Member {
+                torrent: Some((info_hash, files)),
+                ..
+            } if files.len() > 1 => Some((info_hash.clone(), files.clone())),
+            _ => None,
+        }
+    }
+
     fn container_file(&self) -> Option<(String, usize)> {
         match self {
             Self::Member {
@@ -450,6 +463,13 @@ impl Registry {
             resolution @ Resolution::Member { .. } => resolution.container_file(),
             _ => None,
         }
+    }
+
+    /// The torrent files of the multi-volume set whose member `id`
+    /// resolved to, for the film's duration (`note_media_duration`). `None`
+    /// for anything else, and for an id not resolved yet.
+    pub(crate) fn set_files(&self, id: &MediaId) -> Option<(String, Vec<usize>)> {
+        self.peek(id)?.set_files()
     }
 
     /// A reader over what `id` names, resolving it first if nothing has.
@@ -638,10 +658,12 @@ async fn member_session(
 /// **What it shares.** With a play, a member of a **single-file container
 /// in a torrent** is the viewer's playback of that file: its source is
 /// played, with the member's byte extent, so the play session is on the
-/// container file, draws, and draws inside the member. A **multi-volume
-/// set** opens each volume played but sharing nothing -- a play session
-/// names one file and a set's member crosses several (step A2). A
-/// container **behind links** is a proxied entity: the session goes off
+/// container file, draws, and draws inside the member. A member of a
+/// **multi-volume set** is played across it: every volume is opened
+/// played, sharing, with the member's bytes in each, so the play session is
+/// on the set -- one thing played, which the reader crossing a volume
+/// boundary does not move -- and the set draws once, over the member's
+/// bytes in all of its volumes. A container **behind links** is a proxied entity: the session goes off
 /// every torrent file and what the player reads is read ahead of, as for a
 /// `/proxy` id. Without a play every volume is an aside, and nothing moves.
 async fn open_member(
@@ -685,14 +707,21 @@ async fn open_member(
             let names = TorrentSource::file_names(&state.engine, info_hash)
                 .await
                 .map_err(|error| Refusal::OpenFailed(error.to_string()))?;
-            // One file: the member's extent in it is where the film is,
-            // and what its session draws inside. A set shares nothing.
-            let single = paths.len() == 1;
-            let extent = single.then(|| extent_of(extents)).flatten();
-            for path in paths {
-                let file_idx = names.iter().position(|name| name == path).ok_or_else(|| {
-                    Refusal::NoSuchFile(format!("the torrent holds no file {path}"))
-                })?;
+            let files = paths
+                .iter()
+                .map(|path| {
+                    names.iter().position(|name| name == path).ok_or_else(|| {
+                        Refusal::NoSuchFile(format!("the torrent holds no file {path}"))
+                    })
+                })
+                .collect::<Result<Vec<usize>, Refusal>>()?;
+            // Where the film is, and what its session draws inside: its
+            // extent in the one file, or its bytes in every volume of a set.
+            let extent = match files.as_slice() {
+                [_] => extent_of(extents).map(crate::sources::MemberExtent::In),
+                _ => volumes_of(extents, &files).map(crate::sources::MemberExtent::Across),
+            };
+            for file_idx in files {
                 match &play {
                     Some(play) => {
                         let source = Arc::new(
@@ -703,7 +732,7 @@ async fn open_member(
                                 Play {
                                     token: play.token.clone(),
                                     buffer: set_buffer.unwrap_or(play.buffer),
-                                    shares: single,
+                                    shares: true,
                                     member: extent.clone(),
                                 },
                             )
@@ -753,6 +782,34 @@ fn extent_of(extents: &[crate::sources::Extent]) -> Option<std::ops::Range<u64>>
         .map(|extent| extent.offset + extent.len)
         .max()?;
     (start < end).then_some(start..end)
+}
+
+/// The bytes of each volume a member occupies, in the member's order: the
+/// hull of its extents in each file `sources` names (`files[source]`), one
+/// volume per file. `None` for a member with no bytes.
+fn volumes_of(
+    extents: &[crate::sources::Extent],
+    files: &[usize],
+) -> Option<Vec<enginefs::retention::sessions::Volume>> {
+    let mut volumes: Vec<enginefs::retention::sessions::Volume> = Vec::new();
+    for extent in extents.iter().filter(|extent| extent.len > 0) {
+        let file_idx = *files.get(extent.source)?;
+        let bytes = extent.offset..extent.offset + extent.len;
+        match volumes
+            .iter_mut()
+            .find(|volume| volume.file_idx == file_idx)
+        {
+            Some(volume) => {
+                volume.member =
+                    volume.member.start.min(bytes.start)..volume.member.end.max(bytes.end);
+            }
+            None => volumes.push(enginefs::retention::sessions::Volume {
+                file_idx,
+                member: bytes,
+            }),
+        }
+    }
+    (!volumes.is_empty()).then_some(volumes)
 }
 
 /// Register `source`'s entity for read-ahead, as `/proxy` does for a
@@ -1450,8 +1507,8 @@ mod tests {
     /// **A player's reports about a member are about its container file**
     /// -- the one torrent file a single-file container is, where the play
     /// session draws and the film's duration divides the member's extent
-    /// -- and about nothing for a set, whose session shares nothing, or a
-    /// container behind links.
+    /// -- and about nothing for a set (`a_sets_duration_is_its_volumes`) or
+    /// a container behind links.
     #[test]
     fn a_members_reports_are_its_single_container_files() {
         let registry = Registry::new();
@@ -1479,6 +1536,42 @@ mod tests {
                 Some(Arc::new(member(torrent)));
             drop(entry);
             assert_eq!(registry.torrent_file(&id), expected);
+        }
+    }
+
+    /// **The film's duration for a member across a set is told to every
+    /// volume of the set** (`ServerHandle::note_media_duration`), for the
+    /// set's draw: the set's files, and nothing for a single-file container
+    /// or a container behind links.
+    #[test]
+    fn a_sets_duration_is_its_volumes() {
+        let registry = Registry::new();
+        let hash = "ab".repeat(20);
+        for (torrent, expected) in [
+            (
+                Some((hash.clone(), vec![3, 4, 5])),
+                Some((hash.clone(), vec![3, 4, 5])),
+            ),
+            (Some((hash.clone(), vec![3])), None),
+            (None, None),
+        ] {
+            let id = registry
+                .register(MediaSpec::StreamingUrl(
+                    Url::parse("http://127.0.0.1:1/rar/stream/key/film.mkv").expect("a URL"),
+                ))
+                .expect("registered");
+            let entry = registry.entry(&id).expect("the entry");
+            *entry.resolution.try_lock().expect("nobody resolving") =
+                Some(Arc::new(Resolution::Member {
+                    format: Format::Rar,
+                    key: "key".to_string(),
+                    create: None,
+                    name: "film.mkv".to_string(),
+                    len: 1,
+                    torrent,
+                }));
+            drop(entry);
+            assert_eq!(registry.set_files(&id), expected);
         }
     }
 

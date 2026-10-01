@@ -59,15 +59,29 @@ pub struct Play {
     /// The viewer's read-ahead choice for this playback.
     pub buffer: BufferProfile,
     /// Whether the file may share at all: false for a container file
-    /// played by its name and for each volume of a multi-volume set, which
-    /// share nothing.
+    /// played by its name, which shares nothing.
     pub shares: bool,
-    /// The member's byte extent in this file, when the file is a
-    /// single-file container and what plays is a member of it
-    /// (`crate::media`): the play session's draw is then sized from the
-    /// member's length and made inside it. `None` for the file played as
-    /// itself.
-    pub member: Option<std::ops::Range<u64>>,
+    /// Where the member being played lies, when what plays is a member of
+    /// a container (`crate::media`): its byte extent in this file, or its
+    /// bytes in every volume of a set. The play session's draw is then
+    /// sized from the member's length and made inside it. `None` for the
+    /// file played as itself.
+    pub member: Option<MemberExtent>,
+}
+
+/// Where a member a media id plays lies in the torrent ([`Play::member`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemberExtent {
+    /// Its byte extent in the one file that is its container: the play
+    /// session is on that file, sharing the member's pieces
+    /// (`enginefs::retention::sessions::Played::Torrent`'s `member`).
+    In(std::ops::Range<u64>),
+    /// Its bytes in each volume of a multi-volume set, in the member's
+    /// order: the play session is on the set, one thing played whichever
+    /// volume the reader is in, sharing the member's pieces of all of them
+    /// (`enginefs::retention::sessions::Played::Set`). Played with
+    /// [`Play::shares`] true: a set's session shares.
+    Across(Vec<enginefs::retention::sessions::Volume>),
 }
 
 /// A [`Play`] and what its open needs beyond the engine, with the stream

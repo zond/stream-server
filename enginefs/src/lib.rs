@@ -3610,6 +3610,22 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
     }
 
+    /// **How long the film of a member across a set is** -- a film in a
+    /// multi-volume RAR set, `files` its volumes -- for the set's draw
+    /// alone: its rate is the member's length over this, and no volume's
+    /// own stream takes a rate from it, a volume being a fraction of the
+    /// film ([`crate::retention::owner::Retention::note_set_duration`]).
+    pub async fn on_set_duration(
+        &self,
+        info_hash: &str,
+        files: &[usize],
+        duration: std::time::Duration,
+    ) {
+        if let Some(engine) = self.peek_engine(info_hash).await {
+            engine.told_set_duration(files, duration);
+        }
+    }
+
     /// **A player opened on the torrent**: what it goes on to report about
     /// buffering is this video's, not the last one's. See
     /// [`crate::retention::deadline`] for what the reports size.
@@ -16445,6 +16461,220 @@ mod tests {
         assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 0);
         assert!(engine.retention.draws().is_empty(), "a volume drew");
         assert!(fake_advertises(&counters).is_empty());
+    }
+
+    /// A play session on the member whose bytes in each of `volumes` --
+    /// files of `info_hash`, in the member's order -- are given beside it:
+    /// what the member path of a media id tells for a multi-volume set.
+    fn played_set(
+        info_hash: &str,
+        volumes: &[(usize, std::ops::Range<u64>)],
+    ) -> crate::retention::sessions::Played {
+        crate::retention::sessions::Played::Set {
+            info_hash: info_hash.to_string(),
+            volumes: volumes
+                .iter()
+                .map(|(file_idx, member)| crate::retention::sessions::Volume {
+                    file_idx: *file_idx,
+                    member: member.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// **A member played across a set's volumes shares like a film: one
+    /// draw, made once over the member's bytes in every volume, and the
+    /// reader crossing into the next volume ends nothing.**
+    ///
+    /// Two volumes of a thousand bytes and a third file beside them, pieces
+    /// of twenty-five bytes. The member is bytes 110.. of the first volume
+    /// (pieces 4..40) and ..640 from 50 of the second (pieces 42..66):
+    /// under a budget that covers it, the draw is exactly those pieces --
+    /// not the volumes' headers (0..4, 40..42), not the rest of the second
+    /// volume, not the file beside. It is made at the first volume's open,
+    /// and advertised then; the second volume's open -- the player's next
+    /// request, naming the same set -- moves nothing, adopts the draw,
+    /// advertises nothing more, and no reconcile stops the torrent.
+    #[tokio::test]
+    async fn a_member_played_across_its_volumes_draws_once_and_crossing_a_volume_ends_nothing() {
+        use crate::backend::priorities::{BufferProfile, Fetching};
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("film.part1.rar".into(), 1000),
+            ("film.part2.rar".into(), 1000),
+            ("other.mkv".into(), 1000),
+        ]);
+        counters.pieces_per_file.store(40, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(1_000_000));
+        let set = played_set(TEST_HASH, &[(0, 110..1000), (1, 50..640)]);
+        // What the member's session holds while the set is read.
+        let _hold = enginefs.live().hold_set(TEST_HASH, vec![0, 1]);
+
+        enginefs.note_player(PLAYER, set.clone());
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        enginefs.focus_torrent(TEST_HASH).await;
+        let first = engine
+            .try_get_file_with_intent(0, 110, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("the first volume");
+        engine.test_read_at(0, 110);
+        let member: std::collections::BTreeSet<u32> = (4..40).chain(42..66).collect();
+        assert_eq!(
+            engine.retention.draw_of(&0),
+            Some(member.clone()),
+            "the set's draw is not the member's pieces of both volumes"
+        );
+        assert_eq!(
+            fake_advertises(&counters),
+            member.iter().copied().collect::<Vec<_>>()
+        );
+        let advertises = counters.advertised.lock().unwrap().len();
+
+        // The reader crosses into the second volume.
+        assert_eq!(
+            enginefs.note_player(PLAYER, set.clone()),
+            crate::retention::sessions::Heard::Current { moved: false },
+            "the next volume of the set moved the session"
+        );
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 1).await;
+        enginefs.focus_torrent(TEST_HASH).await;
+        let second = engine
+            .try_get_file_with_intent(1, 50, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("the second volume");
+        engine.test_read_at(1, 50);
+        assert_eq!(
+            engine.retention.draw_of(&1),
+            Some(member.clone()),
+            "the second volume did not adopt the set's draw"
+        );
+        assert!(
+            !engine.shares_to_end().await,
+            "the crossing left a share to end"
+        );
+        for _ in 0..2 {
+            enginefs.reconcile_tick().await;
+        }
+        assert_eq!(
+            counters.stop_torrent.load(Ordering::SeqCst),
+            0,
+            "the torrent left the swarm at the volume boundary"
+        );
+        assert_eq!(engine.handle.run_state(), RunState::Live);
+        assert_eq!(
+            counters.advertised.lock().unwrap().len(),
+            advertises,
+            "the set was advertised again"
+        );
+        assert_eq!(
+            fake_advertises(&counters),
+            member.iter().copied().collect::<Vec<_>>()
+        );
+        drop((first, second));
+    }
+
+    /// **Leaving a played set ends what it shared, as leaving a film does**:
+    /// the viewer's next screen plays another file of the torrent, every
+    /// volume of the set is left at once, and the move ends the set's draw
+    /// -- the torrent stopped, its advertised set made again without it,
+    /// started again for the next film.
+    #[tokio::test]
+    async fn a_move_off_a_played_set_ends_what_it_shared_as_a_films_would() {
+        use crate::backend::priorities::{BufferProfile, Fetching};
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("film.part1.rar".into(), 1000),
+            ("film.part2.rar".into(), 1000),
+            ("other.mkv".into(), 1000),
+        ]);
+        counters.pieces_per_file.store(40, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(1_000_000));
+        let hold = enginefs.live().hold_set(TEST_HASH, vec![0, 1]);
+        enginefs.note_player(
+            PLAYER,
+            played_set(TEST_HASH, &[(0, 110..1000), (1, 50..640)]),
+        );
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        enginefs.focus_torrent(TEST_HASH).await;
+        let first = engine
+            .try_get_file_with_intent(0, 110, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("the first volume");
+        assert!(
+            !fake_advertises(&counters).is_empty(),
+            "the set drew nothing"
+        );
+        drop(first);
+        drop(hold);
+        enginefs.on_stream_end(TEST_HASH, 0).await;
+
+        // The next film, on the viewer's next screen.
+        enginefs.note_player("tv.2", played(TEST_HASH, 2));
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 2).await;
+        enginefs.focus_torrent(TEST_HASH).await;
+        assert_eq!(
+            counters.stop_torrent.load(Ordering::SeqCst),
+            1,
+            "the move did not end what the set shared"
+        );
+        assert_eq!(engine.handle.run_state(), RunState::Live);
+        assert!(
+            fake_advertises(&counters).iter().all(|piece| *piece >= 80),
+            "the set's draw is still announced: {:?}",
+            fake_advertises(&counters)
+        );
+    }
+
+    /// **A set's draw is sized from the member's whole length over the
+    /// film's duration, and the duration gives no volume a rate of its
+    /// own.** Pieces of 250 bytes, two volumes of 20 000 bytes, the member
+    /// their last 1 000 and first 9 000 bytes, a film of 1 000 s: the
+    /// member's 10 B/s over the 90 committed seconds buys three pieces,
+    /// where the first volume's own bytes of it would buy none and the
+    /// volume's length two and a bit times that. The volume's stream keeps
+    /// no rate: a volume's length over the film's duration is the film's
+    /// rate divided by the number of volumes.
+    #[tokio::test]
+    async fn a_sets_draw_is_sized_from_the_members_length_and_no_volume_takes_its_rate() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("film.part1.rar".into(), 20_000),
+            ("film.part2.rar".into(), 20_000),
+        ]);
+        counters.pieces_per_file.store(80, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(4_000));
+        enginefs.note_player(
+            PLAYER,
+            played_set(TEST_HASH, &[(0, 19_000..20_000), (1, 0..9_000)]),
+        );
+        engine
+            .begin_retention_opening(
+                0,
+                crate::piece_store::Buffering {
+                    window_seconds: Some(90),
+                    committed_seconds: Some(crate::backend::priorities::COMMITTED_SECONDS),
+                    ..Default::default()
+                },
+                crate::retention::owner::Opener::Player,
+            )
+            .await;
+        assert_eq!(engine.retention.draw_of(&0), None, "drawn before the rate");
+        engine.told_set_duration(&[0, 1], Duration::from_secs(1_000));
+        assert_eq!(
+            engine.retention.bitrate(&0),
+            None,
+            "the volume took a rate from the set's duration"
+        );
+        engine.retention.settle_draw(&0).await;
+        let draw = engine
+            .retention
+            .draw_of(&0)
+            .expect("drawn once the set's rate is known");
+        assert_eq!(draw.len(), 3, "not sized from the member's rate: {draw:?}");
+        assert!(
+            draw.iter().all(|piece| (76..116).contains(piece)),
+            "drawn outside the member: {draw:?}"
+        );
     }
 
     /// **The draw waits for the film's rate, and is sized beside the

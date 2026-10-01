@@ -6,7 +6,7 @@ use crate::piece_store::{HeldSnapshot, RetentionPolicy, Share, StoreRegistry};
 use crate::retention::live::{Live, Reading};
 use crate::retention::owner::{Backing, Door, Install, Mode, Retention, Trigger};
 use anyhow::Context;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -1012,6 +1012,67 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
         })
     }
 
+    /// The set the sessions sharing this file play a member across
+    /// ([`crate::retention::sessions::PlaySessions::set_of`]), by file.
+    fn played_set(&self, file_idx: &usize) -> Option<Vec<(usize, Range<u64>)>> {
+        let volumes = self.live.sessions().set_of(&self.info_hash, *file_idx)?;
+        Some(
+            volumes
+                .into_iter()
+                .map(|volume| (volume.file_idx, volume.member))
+                .collect(),
+        )
+    }
+
+    /// What a volume of a played set is in the torrent now, as an open
+    /// would resolve it.
+    async fn domain_of(&self, file_idx: &usize) -> Option<FileDomain> {
+        self.resolve(*file_idx).await
+    }
+
+    /// The pieces of every part, each counted once, as one run of the bytes
+    /// they hold: a whole piece each, except the torrent's short last piece
+    /// -- counted as [`Self::narrowed`] and `FilePieceSpan::bytes` count it,
+    /// from where each part's own pieces end. The joined domain is placed
+    /// at no file of its own (`span.offset` 0, the first part's index):
+    /// it sizes a draw and is never read from.
+    fn joined(parts: &[FileDomain]) -> Option<(FileDomain, Vec<u32>)> {
+        let piece_length = parts.first()?.piece_length;
+        let mut sizes: BTreeMap<u32, u64> = BTreeMap::new();
+        for part in parts {
+            if part.piece_length != piece_length {
+                return None;
+            }
+            let span_end = u64::from(part.span.pieces.start)
+                .checked_mul(piece_length)?
+                .checked_add(part.span.bytes)?;
+            for piece in part.span.pieces.clone() {
+                let start = u64::from(piece).checked_mul(piece_length)?;
+                let size = start
+                    .saturating_add(piece_length)
+                    .min(span_end)
+                    .saturating_sub(start);
+                let entry = sizes.entry(piece).or_insert(0);
+                *entry = (*entry).max(size);
+            }
+        }
+        let bytes = sizes.values().sum();
+        let pieces: Vec<u32> = sizes.into_keys().collect();
+        let count = u32::try_from(pieces.len()).ok()?;
+        Some((
+            FileDomain {
+                file_idx: parts[0].file_idx,
+                span: FilePieceSpan {
+                    pieces: 0..count,
+                    offset: 0,
+                    bytes,
+                },
+                piece_length,
+            },
+            pieces,
+        ))
+    }
+
     /// The file's first bytes, once the store holds them, against the
     /// archive signatures ([`crate::retention::sniff`]).
     async fn content_shares(&self, domain: &FileDomain) -> Option<bool> {
@@ -1919,6 +1980,15 @@ impl<H: TorrentHandle> Engine<H> {
         self.retention.note_duration(&file_idx, duration);
     }
 
+    /// The film of a member across a set of this torrent's files lasts
+    /// `duration`: told to every volume, for the set's draw alone
+    /// ([`crate::retention::owner::Retention::note_set_duration`]).
+    pub fn told_set_duration(&self, files: &[usize], duration: std::time::Duration) {
+        for file_idx in files {
+            self.retention.note_set_duration(file_idx, duration);
+        }
+    }
+
     /// A player opened on this torrent: its stalls start from none. What
     /// sizes how deep the backend splits the lookahead, with the film's
     /// rate and the backend's own timing; see
@@ -2019,7 +2089,7 @@ impl<H: TorrentHandle> Engine<H> {
                 .collect()
         };
         Some(crate::retention::PolicyReading::new(
-            holding.extent,
+            holding.extent.clone(),
             piece_length,
             self.retention.bitrate(&file_idx),
             readers,
@@ -2032,9 +2102,16 @@ impl<H: TorrentHandle> Engine<H> {
                 // Nothing installed: the budget covers the file, whose draw
                 // is then the whole of it. No draw yet, or an empty one -- no
                 // budget published, no cap -- is nothing promised.
+                // A set's draw is recorded on every volume: this file's
+                // pieces of it are what it promised.
                 None => self
                     .retention
                     .draw_of(&file_idx)
+                    .map(|draw| {
+                        draw.into_iter()
+                            .filter(|piece| holding.extent.contains(piece))
+                            .collect::<BTreeSet<u32>>()
+                    })
                     .filter(|draw| !draw.is_empty())
                     .map(Committed::Drawn),
             },

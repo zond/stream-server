@@ -48,7 +48,7 @@ pub mod view;
 pub use drive::{DriveError, DrivePairing, DriveSource};
 pub use local::{LocalFile, LocalSource};
 pub use proxy::ProxySource;
-pub use torrent::{Play, TorrentSource};
+pub use torrent::{MemberExtent, Play, TorrentSource};
 pub use view::{MemberReader, MemberView};
 
 /// A reader over a source's bytes: what [`ByteSource::open`] hands out.

@@ -839,14 +839,15 @@ pub(crate) struct Player<'a> {
     /// The player token, `<viewer>.<screen>`, as `p=` carries it.
     pub(crate) token: &'a str,
     /// Whether this file may share at all: false for a container file the
-    /// HTTP route plays by name (`played_through_a_translator`) and for
-    /// each volume of a multi-volume set.
+    /// HTTP route plays by name (`played_through_a_translator`).
     pub(crate) shares: bool,
-    /// The member's byte extent in the file, when the file is a
-    /// single-file container whose member a media id plays
-    /// (`enginefs::retention::sessions::Played::Torrent`'s `member`): what
-    /// the session shares is then drawn inside it.
-    pub(crate) member: Option<std::ops::Range<u64>>,
+    /// Where the member a media id plays lies: its byte extent in this
+    /// file, a single-file container
+    /// (`enginefs::retention::sessions::Played::Torrent`'s `member`), or
+    /// its bytes in every volume of a set this file is one of
+    /// (`enginefs::retention::sessions::Played::Set`). What the session
+    /// shares is then drawn inside it.
+    pub(crate) member: Option<crate::sources::MemberExtent>,
 }
 
 /// What the caller of [`open_torrent_stream`] has resolved before the open:
@@ -1028,17 +1029,34 @@ pub(crate) async fn open_torrent_stream(
     //
     // An older screen's request is served and moves nothing: not the
     // session, and not the liveness cell either.
+    //
+    // A volume of a set names the set, the same value whichever volume
+    // this is: the reader crossing into the next volume moves nothing.
     let shares = player.as_ref().is_some_and(|player| player.shares);
     let heard = player.map(|player| {
-        engine_fs.note_player(
-            player.token,
-            enginefs::retention::sessions::Played::Torrent {
+        let played = match player.member {
+            Some(crate::sources::MemberExtent::Across(volumes)) => {
+                enginefs::retention::sessions::Played::Set {
+                    info_hash: info_hash.to_string(),
+                    volumes,
+                }
+            }
+            Some(crate::sources::MemberExtent::In(member)) => {
+                enginefs::retention::sessions::Played::Torrent {
+                    info_hash: info_hash.to_string(),
+                    file_idx: idx,
+                    shares,
+                    member: Some(member),
+                }
+            }
+            None => enginefs::retention::sessions::Played::Torrent {
                 info_hash: info_hash.to_string(),
                 file_idx: idx,
                 shares,
-                member: player.member,
+                member: None,
             },
-        )
+        };
+        engine_fs.note_player(player.token, played)
     });
     let stale = heard == Some(enginefs::retention::sessions::Heard::Stale);
     let players = heard.is_some() && !stale && shares;

@@ -481,8 +481,8 @@ bodies" would have turned the first diagnosis into the second.
 ### 2.8 What sharing does for an archive member
 
 **After step A, a member the viewer plays shares like a film, with one
-arithmetic caveat and one exception.** This reverses a stated rule, so it
-is spelled out.
+arithmetic caveat; after step A2, a member across a multi-volume set does
+too.** This reverses a stated rule, so it is spelled out.
 
 Today the rule is not an accident of member readers lacking a token; it is
 enforced by name and by content (§1). For a member played through an id
@@ -519,18 +519,38 @@ arithmetic come out; a duration stays a duration. If carrying an extent into
 `note_rate` beside `note_duration` -- never a scaled duration. (Built with
 the extent, in step A's third slice: §5.)
 
-**The exception: a multi-volume set keeps sharing nothing.** A play session
-names one file (`Played::Torrent { info_hash, file_idx }`), and a set's
-member crosses files. Moving the session at each volume boundary would be
-"a player moving", which ends what the previous file shared -- stop, rebuild
-the advertised set, start -- at every volume, every few hundred MiB. The
-liveness cell already has sets (`Live::hold_set`); play sessions do not.
-Until they do, a member whose extents span more than one source opens its
-volumes with `shares: false`. **The follow-up is named, not open**: play
-sessions gain a set the way the cell did -- `Played::Torrent` names a set of
-files, moving within the set is not "a player moving", and the draw is made
-over the set's files within the member's extent. That is step A2 below,
-after A has landed, and is what makes a RAR set share like a film.
+**What was the exception: a multi-volume set** (step A2, done). A play
+session used to name one file (`Played::Torrent { info_hash, file_idx }`),
+and a set's member crosses files: moving the session at each volume
+boundary would have been "a player moving", which ends what the previous
+file shared -- stop, rebuild the advertised set, start -- at every volume,
+every few hundred MiB. So until A2 a set's volumes opened `shares: false`.
+Now play sessions have sets the way the liveness cell did
+(`Live::hold_set`): `Played::Set { info_hash, volumes }`, each volume a
+file and the member's bytes in it, in the member's order. Per-volume
+extents rather than one range over the concatenation, because the member's
+bytes in each volume start after that volume's headers: a range over the
+concatenation needs the boundaries and header lengths beside it to say
+which bytes of which file are the film, which is the per-volume ranges
+again. Every volume opens played and sharing and names the same set, so the
+reader crossing a boundary is no move and ends nothing; a move off the set
+leaves every volume at once (each marked for `may_end_now`), and its draw
+ends as a film's does. The draw is made once over the set
+(`Backing::played_set`): the first volume due narrows each volume to the
+member's bytes, joins their pieces into one index space
+(`Backing::joined`; another file may lie between two volumes, so the
+union is mapped back through a list), sizes and draws there, records the
+whole draw and advertises the union; every later volume finds the draw on
+a sibling and adopts it -- one at a time under `Retention::set_draws`, so
+two volumes due together cannot both draw. Each volume's policy keeps its
+own pieces of it. The rate is the member's bytes over the film's duration,
+which the app's report for a set's id tells every volume for the draw
+alone (`EngineFS::on_set_duration`, `State::set_duration`): a volume's
+length over the film's duration is the film's rate divided by the number of
+volumes, and a read-ahead sized from it would starve the player, so no
+volume's stream takes a rate from it. The torrent-wide rules need nothing
+new: `announced_now`, `announced_in_swarm` and `reclaim_rest` read the
+advertised set, which holds the union.
 
 ### 2.9 The container sniff moves into `resolve`
 
@@ -683,7 +703,7 @@ A. **Server: one torrent source, ids, the reader task.** (L.) Factor the
    with an error; a torrent reader with a play moves the session and draws,
    without one it does neither (the lib fake's `violations` guard holds);
    a single-container member with a play draws, a multi-volume one does
-   not (2.8). *(Second slice done: `server/src/media/` -- the registry,
+   not (2.8; it does since A2). *(Second slice done: `server/src/media/` -- the registry,
    the reader task and the handle methods, over torrent, `/proxy` and
    Drive ids; an archive `/create` and `/ftp` register and resolve
    `notYet`. A played reader's stream ends with its own log line,
@@ -698,8 +718,8 @@ A. **Server: one torrent source, ids, the reader task.** (L.) Factor the
    (`Play::member` → `Played::Torrent`'s `member`), the owner reads it
    through `Backing::played_member`, skips the content check for it, and
    draws over `Backing::narrowed` -- the member's pieces, the member's
-   length for the rate. A set's volumes open `shares: false`; a container
-   behind links is `Played::Elsewhere` with read-ahead. The HTTP route's
+   length for the rate. A set's volumes opened `shares: false` (until
+   A2); a container behind links is `Played::Elsewhere` with read-ahead. The HTTP route's
    `played_through_a_translator` stays. Not done here: the stream's own
    lookahead grant (`Retention::bitrate`) is still the container's length
    over the duration; for a single film in a container the difference is
@@ -709,7 +729,17 @@ A2. **Play sessions understand sets.** (M.) `Played::Torrent` over a set of
    files, mirroring `Live::hold_set`; a move inside the set ends nothing;
    the draw spans the set within the member's extent. Removes 2.8's
    exception. Tests: a two-volume member with a play draws once and the
-   torrent is not stopped at the boundary.
+   torrent is not stopped at the boundary. *(Done: `Played::Set` and
+   `sessions::Volume`, `PlaySessions::set_of`; `Backing::played_set`,
+   `domain_of`, `joined` and `Retention::set_draws` in the owner;
+   `MemberExtent::Across` from `open_member`, every volume played with
+   `shares: true`; the film's duration for a set's id goes to its volumes
+   for the draw alone (`EngineFS::on_set_duration`). The HTTP route's
+   `played_through_a_translator` and the liveness cell's `hold_set` stay.
+   Left: a delete of one volume while its set plays ends that volume's
+   record of the draw but not its siblings', so that volume's drawn pieces
+   stay advertised (not held) until the set is left; the stream's own
+   read-ahead for a volume still has no rate.)*
 
 A'. **App: mpv on `xtremio://<id>`.** (L.) The vendored media_kit patch
    (2.5); the `stream_cb` shim in xtremio's crate over `MediaReader`; torrent,

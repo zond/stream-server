@@ -1667,22 +1667,29 @@ fn a_member_read_by_id_without_a_play_moves_nothing_and_draws_nothing() -> anyho
     fixture.stop()
 }
 
-/// **A member of a multi-volume RAR set played through an id shares
-/// nothing** -- the exception (the design's §2.8, until step A2): each
-/// volume is opened as the viewer's playback sharing nothing, so the
-/// session is on the torrent and no volume draws, while the film reads
-/// whole across the set. What the set's hold does for the volumes' bytes
-/// is `embed.rs`'s `a_rar_set_read_across_its_volumes_keeps_the_volumes_it_read`.
+/// **A member of a multi-volume RAR set played through an id shares like a
+/// film** (the design's §2.8, step A2): every volume is opened as the
+/// viewer's playback, sharing, so the play session is on the set -- each
+/// volume with the member's bytes in it -- and the set draws once, over
+/// those bytes in all of its volumes. The set holds the film across three
+/// volumes and an extra after it across two more; the budget covers it, so
+/// what is announced is exactly the pieces the film's bytes lie in, in
+/// every volume it crosses, and nothing of the extra's volumes beyond the
+/// piece the two share. Each volume the film crosses commits its own
+/// pieces of that draw. What the set's hold does for the volumes' bytes is
+/// `embed.rs`'s `a_rar_set_read_across_its_volumes_keeps_the_volumes_it_read`.
 #[cfg(feature = "rar")]
 #[test]
-fn a_member_of_a_rar_set_played_by_id_shares_nothing() -> anyhow::Result<()> {
+fn a_member_of_a_rar_set_played_by_id_shares_its_bytes_in_every_volume() -> anyhow::Result<()> {
     let film = rar_fixtures::signposted(9 * PIECE);
-    let volumes = rar_fixtures::rar5_volumes(&[("film.mkv", &film)], 4 * PIECE);
+    let extra = payload(8 * PIECE);
+    let volumes =
+        rar_fixtures::rar5_volumes(&[("film.mkv", &film), ("extras.nfo", &extra)], 4 * PIECE);
     let names = rar_fixtures::part_names("film", volumes.len());
     let files = names
         .iter()
         .map(String::as_str)
-        .zip(volumes)
+        .zip(volumes.clone())
         .collect::<Vec<_>>();
     let fixture = TorrentFixture::start_with(offline_config(), &files, |_| true)?;
     let id = fixture.handle.register(MediaSpec::StreamingUrl(member_url(
@@ -1702,26 +1709,94 @@ fn a_member_of_a_rar_set_played_by_id_shares_nothing() -> anyhow::Result<()> {
         (reader, read)
     })?;
     assert_eq!(read?, film);
-    let Some(enginefs::retention::sessions::Played::Torrent {
+    let Some(enginefs::retention::sessions::Played::Set {
         info_hash,
-        shares,
-        member,
-        ..
+        volumes: played,
     }) = fixture.handle.play_session_of("tv.1")
     else {
-        panic!("the member's play did not put the session on the torrent");
+        panic!(
+            "the member's play did not put the session on the set: {:?}",
+            fixture.handle.play_session_of("tv.1")
+        );
     };
     assert_eq!(info_hash, fixture.info_hash);
-    assert!(!shares, "a volume of the set shares");
-    assert_eq!(member, None);
-    for name in &names {
-        assert_eq!(fixture.committed(name)?, None, "{name} draws");
-    }
+
+    // The volumes named are the film's, in its order, and their bytes are
+    // the film: nothing of a header, nothing of the extra.
+    let data = |file_idx: usize| -> &[u8] {
+        let at = names
+            .iter()
+            .position(|name| fixture.index(name) == file_idx)
+            .expect("a volume of the fixture");
+        &volumes[at]
+    };
     assert_eq!(
-        fixture.handle.advertised_pieces(&fixture.info_hash)?,
-        Some(Vec::new()),
-        "the set announced something"
+        played
+            .iter()
+            .map(|volume| volume.file_idx)
+            .collect::<Vec<_>>(),
+        names[..3]
+            .iter()
+            .map(|name| fixture.index(name))
+            .collect::<Vec<_>>(),
+        "not the film's three volumes, in order"
     );
+    let named: Vec<u8> = played
+        .iter()
+        .flat_map(|volume| {
+            data(volume.file_idx)[volume.member.start as usize..volume.member.end as usize].to_vec()
+        })
+        .collect();
+    assert!(
+        named == film,
+        "the volumes' extents are not the film's bytes"
+    );
+
+    // Where each volume lies in the torrent, in the metainfo's order.
+    let offset = |file_idx: usize| -> u64 {
+        names
+            .iter()
+            .zip(&volumes)
+            .filter(|(name, _)| fixture.index(name) < file_idx)
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum()
+    };
+    let span = |file_idx: usize, bytes: &std::ops::Range<u64>| {
+        pieces_of(&(offset(file_idx) + bytes.start..offset(file_idx) + bytes.end))
+    };
+    let member: std::collections::BTreeSet<u32> = played
+        .iter()
+        .flat_map(|volume| span(volume.file_idx, &volume.member))
+        .collect();
+    let total = volumes.iter().map(Vec::len).sum::<usize>().div_ceil(PIECE) as u32;
+    assert!(
+        (member.len() as u32) < total - 2,
+        "the film's pieces are the torrent's: {member:?} of {total}"
+    );
+    let announced = fixture
+        .handle
+        .advertised_pieces(&fixture.info_hash)?
+        .expect("a torrent this server holds");
+    assert_eq!(
+        announced,
+        member.iter().copied().collect::<Vec<_>>(),
+        "announced other than the film's pieces of its volumes"
+    );
+    for volume in &played {
+        let name = names
+            .iter()
+            .find(|name| fixture.index(name) == volume.file_idx)
+            .expect("a volume of the fixture");
+        let len = data(volume.file_idx).len() as u64;
+        let own = span(volume.file_idx, &(0..len))
+            .filter(|piece| member.contains(piece))
+            .count() as u64;
+        assert_eq!(
+            fixture.committed(name)?,
+            Some(own * PIECE as u64),
+            "{name} does not commit its own pieces of the set's draw"
+        );
+    }
     drop(reader);
     fixture.stop()
 }

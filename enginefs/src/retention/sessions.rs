@@ -48,8 +48,7 @@ use std::ops::Range;
 pub enum Played {
     /// One file of one torrent. `shares` is false for a file played in a
     /// way that shares nothing: a container file played by its URL, whose
-    /// member the player never names, and each volume of a multi-volume
-    /// set.
+    /// member the player never names.
     Torrent {
         info_hash: String,
         file_idx: usize,
@@ -63,19 +62,74 @@ pub enum Played {
         /// as itself.
         member: Option<Range<u64>>,
     },
+    /// **A member of a multi-volume set** (`film.part1.rar`,
+    /// `film.part2.rar`, ...) played through a media id: every volume it
+    /// lies in, in the member's order, each with the member's bytes in it.
+    /// It shares, like a film: the set is **one thing played**, so a
+    /// request for any of its volumes names this same value and moves
+    /// nothing -- the reader crossing from one volume into the next is no
+    /// player moving -- and leaving it leaves every volume at once. The
+    /// draw is made once over the member's bytes in all of them.
+    ///
+    /// Per-volume extents and not one range over the volumes' concatenation:
+    /// the member's bytes in each volume start after that volume's own
+    /// headers, so a range over the concatenation would need each volume's
+    /// boundaries and header lengths beside it to say which bytes of which
+    /// file are the film -- the per-volume ranges again, in a costlier form.
+    /// And per volume is what every reader of it asks: which files the
+    /// session is on, and which pieces of each the member lies in.
+    Set {
+        info_hash: String,
+        volumes: Vec<Volume>,
+    },
     /// Something that is not a torrent file: a proxied body.
     Elsewhere,
 }
 
+/// One volume of a set a member is played across ([`Played::Set`]): the
+/// file, and the member's bytes in it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Volume {
+    pub file_idx: usize,
+    pub member: Range<u64>,
+}
+
 impl Played {
-    fn torrent(&self) -> Option<(&str, usize)> {
+    /// The torrent this is on, if it is on one.
+    fn info_hash(&self) -> Option<&str> {
+        match self {
+            Self::Torrent { info_hash, .. } | Self::Set { info_hash, .. } => {
+                Some(info_hash.as_str())
+            }
+            Self::Elsewhere => None,
+        }
+    }
+
+    /// The files of its torrent this is on: one, or a set's volumes.
+    fn files(&self) -> Vec<usize> {
+        match self {
+            Self::Torrent { file_idx, .. } => vec![*file_idx],
+            Self::Set { volumes, .. } => volumes.iter().map(|volume| volume.file_idx).collect(),
+            Self::Elsewhere => Vec::new(),
+        }
+    }
+
+    /// Whether this is on `file_idx` of `info_hash`, sharing or not.
+    fn on_file(&self, info_hash: &str, file_idx: usize) -> bool {
+        self.info_hash() == Some(info_hash) && self.files().contains(&file_idx)
+    }
+
+    /// Whether this is on `file_idx` of `info_hash` and shares it.
+    fn shares_file(&self, info_hash: &str, file_idx: usize) -> bool {
         match self {
             Self::Torrent {
-                info_hash,
-                file_idx,
+                info_hash: h,
+                file_idx: f,
+                shares,
                 ..
-            } => Some((info_hash.as_str(), *file_idx)),
-            Self::Elsewhere => None,
+            } => *shares && h == info_hash && *f == file_idx,
+            Self::Set { .. } => self.on_file(info_hash, file_idx),
+            Self::Elsewhere => false,
         }
     }
 }
@@ -125,7 +179,7 @@ struct Session {
 
 impl Session {
     fn on_torrent(&self, info_hash: &str) -> bool {
-        self.played.torrent().is_some_and(|(h, _)| h == info_hash)
+        self.played.info_hash() == Some(info_hash)
     }
 }
 
@@ -170,8 +224,10 @@ impl PlaySessions {
         {
             return Heard::Stale;
         }
-        if let Some((hash, file)) = played.torrent() {
-            inner.left_alone.remove(&(hash.to_string(), file));
+        if let Some(hash) = played.info_hash() {
+            for file in played.files() {
+                inner.left_alone.remove(&(hash.to_string(), file));
+            }
         }
         let previous = inner.by_viewer.insert(
             token.viewer.clone(),
@@ -186,19 +242,25 @@ impl PlaySessions {
         if previous.played == played {
             return Heard::Current { moved: false };
         }
-        match (previous.played.torrent(), played.torrent()) {
-            // The same file, only `shares` changed: nothing was left.
-            (Some(left), Some(now)) if left == now => {}
-            (Some((hash, file)), _) => {
-                let others = inner
-                    .by_viewer
-                    .iter()
-                    .any(|(viewer, session)| *viewer != token.viewer && session.on_torrent(hash));
-                if !others {
+        // What it left: every file it was on that it is not on now. The
+        // same file with only `shares` changed leaves nothing, and a set
+        // left leaves every volume of it.
+        if let Some(hash) = previous.played.info_hash() {
+            let left: Vec<usize> = previous
+                .played
+                .files()
+                .into_iter()
+                .filter(|file| !played.on_file(hash, *file))
+                .collect();
+            let others = inner
+                .by_viewer
+                .iter()
+                .any(|(viewer, session)| *viewer != token.viewer && session.on_torrent(hash));
+            if !others {
+                for file in left {
                     inner.left_alone.insert((hash.to_string(), file));
                 }
             }
-            (None, _) => {}
         }
         Self::prune(&mut inner);
         Heard::Current { moved: true }
@@ -216,12 +278,14 @@ impl PlaySessions {
 
     /// Whether a session is on `file_idx` of `info_hash` and shares it: the
     /// one condition under which that file's play
-    /// session draws, and under which what it drew is still shared.
+    /// session draws, and under which what it drew is still shared. Every
+    /// volume of a set a session plays a member across is covered.
     pub fn covers(&self, info_hash: &str, file_idx: usize) -> bool {
-        self.0.lock().by_viewer.values().any(|session| {
-            matches!(&session.played, Played::Torrent { info_hash: h, file_idx: f, shares: true, .. }
-                if h == info_hash && *f == file_idx)
-        })
+        self.0
+            .lock()
+            .by_viewer
+            .values()
+            .any(|session| session.played.shares_file(info_hash, file_idx))
     }
 
     /// **Where in `file_idx` of `info_hash` the sessions sharing it play**:
@@ -229,25 +293,43 @@ impl PlaySessions {
     /// ([`Played::Torrent`]'s `member`). `None` when no session covers the
     /// file, when one plays the file as itself, or when two name different
     /// members -- each of which is the file as a whole, sized and sniffed
-    /// as one.
+    /// as one. A session playing a set the file is a volume of names no
+    /// member of the file alone ([`Self::set_of`] is its question).
     pub fn member_of(&self, info_hash: &str, file_idx: usize) -> Option<Range<u64>> {
         let inner = self.0.lock();
         let mut members = inner
             .by_viewer
             .values()
-            .filter_map(|session| match &session.played {
-                Played::Torrent {
-                    info_hash: h,
-                    file_idx: f,
-                    shares: true,
-                    member,
-                } if h == info_hash && *f == file_idx => Some(member.clone()),
-                _ => None,
+            .filter(|session| session.played.shares_file(info_hash, file_idx))
+            .map(|session| match &session.played {
+                Played::Torrent { member, .. } => member.clone(),
+                Played::Set { .. } | Played::Elsewhere => None,
             });
         let first = members.next()??;
         members
             .all(|member| member.as_ref() == Some(&first))
             .then_some(first)
+    }
+
+    /// **The set the sessions sharing `file_idx` of `info_hash` play a
+    /// member across** ([`Played::Set`]): its volumes, in the member's
+    /// order, each with the member's bytes in it. `None` when no session
+    /// covers the file, and when a session covering it plays anything else
+    /// -- the file as itself, a member of it alone, another set -- under
+    /// which the file is sized and sniffed as itself, as two members are
+    /// ([`Self::member_of`]).
+    pub fn set_of(&self, info_hash: &str, file_idx: usize) -> Option<Vec<Volume>> {
+        let inner = self.0.lock();
+        let mut sets = inner
+            .by_viewer
+            .values()
+            .filter(|session| session.played.shares_file(info_hash, file_idx))
+            .map(|session| match &session.played {
+                Played::Set { volumes, .. } => Some(volumes),
+                Played::Torrent { .. } | Played::Elsewhere => None,
+            });
+        let first = sets.next()??;
+        sets.all(|set| set == Some(first)).then(|| first.clone())
     }
 
     /// Whether a session is on some file of `info_hash`, sharing or not.
@@ -265,7 +347,7 @@ impl PlaySessions {
             .lock()
             .by_viewer
             .values()
-            .any(|session| session.played.torrent() == Some((info_hash, file_idx)))
+            .any(|session| session.played.on_file(info_hash, file_idx))
     }
 
     /// Whether what `file_idx` of `info_hash` shared may end now, with its
@@ -472,5 +554,89 @@ mod tests {
         );
         assert!(!sessions.covers("t", 0));
         assert!(sessions.on_torrent("t"));
+    }
+
+    fn set(info_hash: &str, volumes: &[(usize, Range<u64>)]) -> Played {
+        Played::Set {
+            info_hash: info_hash.into(),
+            volumes: volumes
+                .iter()
+                .map(|(file_idx, member)| Volume {
+                    file_idx: *file_idx,
+                    member: member.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// **A set is one thing played**: it covers every volume, the same set
+    /// asked for again -- the reader in its next volume -- moves nothing and
+    /// leaves nothing, and leaving it leaves every volume at once, as
+    /// leaving a film leaves the film.
+    #[test]
+    fn a_set_is_one_thing_played_and_leaving_it_leaves_every_volume() {
+        let sessions = PlaySessions::default();
+        let film = set("t", &[(0, 100..1000), (1, 0..600)]);
+        assert_eq!(sessions.play("tv.1", film.clone()), CURRENT);
+        assert!(sessions.covers("t", 0) && sessions.covers("t", 1));
+        assert!(!sessions.covers("t", 2));
+        assert!(sessions.on_file("t", 1) && !sessions.on_file("t", 2));
+        // The reader crosses into the second volume.
+        assert_eq!(sessions.play("tv.1", film.clone()), SAME);
+        assert!(!sessions.may_end_now("t", 0) && !sessions.may_end_now("t", 1));
+        assert_eq!(sessions.entries(), (1, 0));
+
+        // The next episode, a file of the same torrent.
+        assert_eq!(sessions.play("tv.2", file("t", 2)), CURRENT);
+        assert!(
+            sessions.may_end_now("t", 0),
+            "the first volume was not left"
+        );
+        assert!(
+            sessions.may_end_now("t", 1),
+            "the second volume was not left"
+        );
+        assert!(!sessions.covers("t", 0) && !sessions.covers("t", 1));
+    }
+
+    /// **The set every session sharing a file names, or none**: a set's
+    /// volume names no member of its own ([`PlaySessions::member_of`]), and
+    /// a second session playing anything else of the file -- the file as
+    /// itself, or another set -- makes it the file as a whole.
+    #[test]
+    fn a_set_is_the_one_every_sharing_session_names() {
+        let sessions = PlaySessions::default();
+        let film = set("t", &[(0, 100..1000), (1, 0..600)]);
+        assert_eq!(sessions.set_of("t", 0), None);
+        sessions.play("tv.1", film.clone());
+        let Played::Set { volumes, .. } = &film else {
+            unreachable!()
+        };
+        assert_eq!(sessions.set_of("t", 0).as_ref(), Some(volumes));
+        assert_eq!(sessions.set_of("t", 1).as_ref(), Some(volumes));
+        assert_eq!(sessions.set_of("t", 2), None);
+        assert_eq!(sessions.member_of("t", 0), None);
+        sessions.play("phone.1", film.clone());
+        assert_eq!(sessions.set_of("t", 1).as_ref(), Some(volumes));
+        sessions.play("phone.2", file("t", 1));
+        assert_eq!(sessions.set_of("t", 1), None, "the file as itself");
+        assert_eq!(sessions.set_of("t", 0).as_ref(), Some(volumes));
+        sessions.play("phone.3", set("t", &[(0, 0..50), (1, 0..10)]));
+        assert_eq!(sessions.set_of("t", 0), None, "two sets");
+
+        // A set beside a member of one of its volumes: neither is the file's.
+        let sessions = PlaySessions::default();
+        sessions.play("tv.1", film.clone());
+        sessions.play(
+            "phone.1",
+            Played::Torrent {
+                info_hash: "t".into(),
+                file_idx: 0,
+                shares: true,
+                member: Some(100..1000),
+            },
+        );
+        assert_eq!(sessions.member_of("t", 0), None, "a set and a member");
+        assert_eq!(sessions.set_of("t", 0), None, "a set and a member");
     }
 }

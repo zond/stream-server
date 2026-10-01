@@ -47,6 +47,12 @@
 //!   ever held across an await.
 //! * **X** -- locks outside the owner: `pinned_files`, [`RetentionBudget`],
 //!   the liveness cell, librqbit's own, the filesystem.
+//! * **S** [`Retention::set_draws`] (`parking_lot::Mutex`) -- one set's
+//!   draw decided at a time ([`Backing::played_set`]). Taken under T, with
+//!   no owner lock held, and held with no await: under it L1 to copy the
+//!   set's entities out, each sibling's L2 alone and released, then the
+//!   deciding entity's own L2. Outermost of the three; nothing takes it
+//!   under L1 or L2.
 //!
 //! 1. L1 → L2 only, and only inside [`Retention::holdings`],
 //!    [`Retention::forget_empty`] and `drawn_in`, which take L1 and read
@@ -79,7 +85,10 @@
 //! 4. T is per entity and never nested: every party takes one turn, does
 //!    its work and releases it before taking another, and nothing here
 //!    touches two entities in one act -- what makes a sibling slack is the
-//!    liveness value ([`crate::retention::live`]), not an install.
+//!    liveness value ([`crate::retention::live`]), not an install. The one
+//!    reading across entities is a set's draw (under S): a volume adopts
+//!    the draw a sibling already holds, read under the sibling's L2 and
+//!    copied out, and writes only its own state.
 //! 5. Writes to `installed`, `windows`, `stride` and the in-place advance of
 //!    the policy require `&mut Turn`, so "written only under the turn" is a
 //!    type -- with one documented exception: [`State::install_now`]
@@ -637,6 +646,43 @@ pub trait Backing: Sized + Send + Sync + 'static {
         None
     }
 
+    /// **The set `key` is a volume of, when the play session plays a member
+    /// across several entities** -- a film in a multi-volume RAR set inside
+    /// a torrent: every entity the member lies in, in the member's order,
+    /// each with the member's bytes in it. One thing played: the draw is
+    /// made once, over every volume's bytes of the member ([`Self::joined`]),
+    /// by whichever volume's play session is due first, and every other
+    /// volume adopts it rather than drawing again. [`Self::content_shares`]
+    /// is not asked, as for [`Self::played_member`]. `None` -- the default
+    /// -- is no set.
+    ///
+    /// A copy-out read like [`Self::plays`], asked with no owner lock held.
+    fn played_set(&self, _key: &Self::Key) -> Option<Vec<(Self::Key, Range<u64>)>> {
+        None
+    }
+
+    /// What `key` is now, for a volume of a played set no stream has opened
+    /// yet: the draw is made over the whole set at once, and a volume the
+    /// reader has not reached has no entity to read a domain from. `None`
+    /// -- the default -- is a backing with no sets, or an entity that
+    /// cannot be named now.
+    fn domain_of(&self, _key: &Self::Key) -> impl Future<Output = Option<Self::Domain>> + Send {
+        async { None }
+    }
+
+    /// **One domain over the pieces of all of `parts`** (each one
+    /// [`Self::narrowed`] to a volume's bytes of the member), for sizing a
+    /// set's draw: the union of their pieces, counted once each, as one run
+    /// `0..n` of the length they hold -- and that union in order, which is
+    /// what index `i` of the joined domain stands for. The parts' pieces
+    /// need not be one run in the entity's index space (another file may
+    /// lie between two volumes), so the draw is made over the joined index
+    /// space and mapped back through the list. `None` for no parts and for
+    /// a backing with no sets (the default). Pure, like [`Self::policy`].
+    fn joined(_parts: &[Self::Domain]) -> Option<(Self::Domain, Vec<u32>)> {
+        None
+    }
+
     /// Whether `domain`'s content may be shared at all: `Some(false)` for an
     /// archive or a disc image, which the app plays through a translated
     /// source and which shares nothing; `None` while that cannot be told
@@ -777,6 +823,11 @@ pub struct Retention<B: Backing> {
     /// L1. The entities by key. Held for lookup, insert, prune and
     /// iterate-for-holdings only.
     entities: parking_lot::Mutex<HashMap<B::Key, Arc<Entity<B>>>>,
+    /// S. **One set's draw decided at a time** ([`Backing::played_set`]):
+    /// the volumes of a set read whether a sibling has drawn and record
+    /// their own draw as one step under it, so two volumes due together
+    /// cannot both find nothing drawn and draw twice. Protects no memory.
+    set_draws: parking_lot::Mutex<()>,
     /// Names the next reader; compared for equality only, so it may wrap.
     next_reader: AtomicU64,
     /// The one place a test can be *inside* a pass: run after the snapshot
@@ -885,6 +936,14 @@ struct State<B: Backing> {
     /// which sizes the window exactly, and leaves where it is to the reads,
     /// which for a receiver are plainly sequential.
     duration: Option<std::time::Duration>,
+    /// **How long the film of a member this entity is a volume of is**
+    /// ([`Retention::note_set_duration`]): what the set's draw divides the
+    /// member's length by ([`Backing::played_set`]). Never this entity's
+    /// own rate, as [`Self::duration`] is: a volume's length over the
+    /// film's duration is the film's rate divided by the number of volumes,
+    /// and a read-ahead sized from it would starve the player. A property
+    /// of the film, kept like [`Self::duration`].
+    set_duration: Option<std::time::Duration>,
     /// **What this entity shares for the rest of its play session**: the
     /// draw decided once the viewer's playback stream's read-ahead was known
     /// ([`Retention::decide_draw_if_due`], [`RetentionPolicy::draw`]) -- the
@@ -1182,6 +1241,7 @@ impl<B: Backing> Retention<B> {
             backing,
             budget,
             entities: parking_lot::Mutex::new(HashMap::new()),
+            set_draws: parking_lot::Mutex::new(()),
             next_reader: AtomicU64::new(0),
             #[cfg(any(test, feature = "test-hooks"))]
             hook: parking_lot::Mutex::new(None),
@@ -1235,6 +1295,7 @@ impl<B: Backing> Retention<B> {
                         last_position: None,
                         consumed_at: None,
                         duration: None,
+                        set_duration: None,
                         draw: None,
                         player_opened: false,
                         asked: Buffering::default(),
@@ -1369,6 +1430,20 @@ impl<B: Backing> Retention<B> {
             return;
         };
         entity.state.lock().duration = Some(duration);
+    }
+
+    /// **How long the film of a member across a set is**, told to one of
+    /// its volumes ([`State::set_duration`]): the rate the set's draw is
+    /// sized with, and nothing else -- the volume's own stream keeps no rate
+    /// from it. L2 only, like [`Self::note_duration`].
+    pub fn note_set_duration(&self, key: &B::Key, duration: std::time::Duration) {
+        if duration.is_zero() {
+            return;
+        }
+        let Some(entity) = self.lookup(key) else {
+            return;
+        };
+        entity.state.lock().set_duration = Some(duration);
     }
 
     /// [`Self::install_opening`] for an open that asks nothing of the cache
@@ -1608,6 +1683,17 @@ impl<B: Backing> Retention<B> {
     /// ([`Backing::narrowed`]), its rate the extent's length over the
     /// stated duration.
     ///
+    /// **A member across a set is drawn once for the set**
+    /// ([`Backing::played_set`]): the volume whose session is due first
+    /// draws over every volume's bytes of the member ([`Backing::joined`]),
+    /// sized from the member's whole length (its rate that length over the
+    /// set's duration, [`State::set_duration`]), records the whole draw and
+    /// advertises it; every other volume, at its own open or pass, finds
+    /// that draw on a sibling and adopts it -- nothing drawn or advertised
+    /// again. Each volume's policy keeps its own pieces of it
+    /// ([`RetentionPolicy::adopt_draw`]); the record is the set's, on every
+    /// volume, so what is shared is the union whichever volume is asked.
+    ///
     /// Recorded before it is advertised, so a reading of what the entity
     /// shares ([`Retention::draws`]) that sees the backend's announcement
     /// also sees the record of it; adopted by the standing policy at once,
@@ -1631,6 +1717,8 @@ impl<B: Backing> Retention<B> {
         // A member played through the member path: the path said what the
         // file is -- a container -- and which of its bytes are the film.
         let member = self.backing.played_member(&entity.key);
+        // Or a member across a set this file is one volume of.
+        let set = self.backing.played_set(&entity.key);
         // What the file is, asked of its first bytes once they are held --
         // off L2, and once per session: an archive shares nothing, and one
         // that cannot be told yet waits. Not asked for a member, whose
@@ -1643,10 +1731,10 @@ impl<B: Backing> Retention<B> {
             }
             (state.domain.clone(), state.content)
         };
-        let content = match (&member, content) {
-            (Some(_), _) => true,
-            (None, Some(content)) => content,
-            (None, None) => {
+        let content = match (member.is_some() || set.is_some(), content) {
+            (true, _) => true,
+            (false, Some(content)) => content,
+            (false, None) => {
                 let Some(content) = self.backing.content_shares(&domain).await else {
                     return;
                 };
@@ -1654,16 +1742,34 @@ impl<B: Backing> Retention<B> {
                 content
             }
         };
+        // What a set's draw is made over, found before the record: the
+        // volumes the reader has not reached have no entity, and what they
+        // are is asked of the backing, off every owner lock.
+        let joined = match &set {
+            None => None,
+            Some(parts) => Some(self.joined_set(entity, &domain, parts).await),
+        };
         // Asked again, off L2 (rule 2) and with no await between it and the
         // record: the head read above can park, and a viewer who moved to
         // another file meanwhile -- or from the file to a member of it --
         // would have this draw recorded and advertised for a file no
         // session plays, or sized for bytes nobody plays.
-        if !self.backing.plays(&entity.key) || self.backing.played_member(&entity.key) != member {
+        if !self.backing.plays(&entity.key)
+            || self.backing.played_member(&entity.key) != member
+            || self.backing.played_set(&entity.key) != set
+        {
             return;
         }
         let budget = self.budget.get();
+        // A set's volumes decide one at a time (S, before L2), and a volume
+        // whose sibling has drawn adopts that draw: copied out of the
+        // sibling's state under its own L2, released before this one's is
+        // taken.
         let (draw, refused) = {
+            let _set_turn = set.as_ref().map(|_| self.set_draws.lock());
+            let drawn_by_a_sibling = set
+                .as_ref()
+                .and_then(|parts| self.sibling_draw(&entity.key, parts));
             let mut state = entity.state.lock();
             if state.draw.is_some() || !state.player_opened {
                 return;
@@ -1678,14 +1784,33 @@ impl<B: Backing> Retention<B> {
                 );
                 return;
             }
+            if let Some(draw) = drawn_by_a_sibling {
+                // The set's draw, made and advertised by the volume that
+                // was due first: this volume keeps its pieces of it, and
+                // nothing is drawn or advertised again.
+                state.adopt_draw(&mut claim.guard, draw);
+                return;
+            }
             // What the draw is made over: the member's pieces, with its
             // length, when the session plays a member -- a season in one
             // container shares the episode being watched, not the
-            // container -- and the entity otherwise.
-            let over = match &member {
-                None => state.domain.clone(),
-                Some(bytes) => match B::narrowed(&state.domain, bytes.clone()) {
-                    Some(over) => over,
+            // container -- the pieces of every volume's bytes of it when it
+            // plays a member across a set, and the entity otherwise.
+            let (over, map) = match (&member, joined) {
+                (_, Some(Some((over, map)))) => (over, Some(map)),
+                (_, Some(None)) => {
+                    state.adopt_draw(&mut claim.guard, BTreeSet::new());
+                    drop(state);
+                    tracing::warn!(
+                        key = ?entity.key,
+                        ?set,
+                        "the played set names no bytes of its volumes; it shares nothing"
+                    );
+                    return;
+                }
+                (None, None) => (state.domain.clone(), None),
+                (Some(bytes), None) => match B::narrowed(&state.domain, bytes.clone()) {
+                    Some(over) => (over, None),
                     None => {
                         state.adopt_draw(&mut claim.guard, BTreeSet::new());
                         drop(state);
@@ -1698,7 +1823,7 @@ impl<B: Backing> Retention<B> {
                     }
                 },
             };
-            let buffering = state.draw_buffering(budget, &over);
+            let buffering = state.draw_buffering(budget, &over, map.is_some());
             let (sized, refused) = match budget {
                 CacheBudget::Bytes(bytes) => match B::policy(&over, bytes, buffering) {
                     Ok(policy) => (Some(policy), None),
@@ -1717,9 +1842,18 @@ impl<B: Backing> Retention<B> {
             if !due {
                 return;
             }
-            let draw = sized
+            let draw: BTreeSet<u32> = sized
                 .map(|policy| policy.draw().clone())
                 .unwrap_or_default();
+            // A set's draw is made in the joined index space: each index
+            // there is the piece the list says.
+            let draw = match &map {
+                None => draw,
+                Some(map) => draw
+                    .into_iter()
+                    .filter_map(|index| map.get(index as usize).copied())
+                    .collect(),
+            };
             state.adopt_draw(&mut claim.guard, draw.clone());
             (draw, refused)
         };
@@ -1733,6 +1867,7 @@ impl<B: Backing> Retention<B> {
         tracing::debug!(
             key = ?entity.key,
             pieces = draw.len(),
+            set = set.is_some(),
             "the play session's shared set is drawn"
         );
         for run in runs(&draw.iter().copied().collect::<Vec<_>>()) {
@@ -1747,6 +1882,48 @@ impl<B: Backing> Retention<B> {
                 break;
             }
         }
+    }
+
+    /// **The domain a set's draw is made over** ([`Backing::joined`]): each
+    /// volume's domain -- `entity`'s own (`domain`), a sibling's from its
+    /// entity, or, for a volume no stream has opened yet, the backing's
+    /// ([`Backing::domain_of`]) -- narrowed to the member's bytes in it,
+    /// and the lot joined. `None` when a volume cannot be named or its
+    /// bytes lie outside it: the set then shares nothing. No owner lock is
+    /// held across the backing's await (rule 2).
+    async fn joined_set(
+        &self,
+        entity: &Entity<B>,
+        domain: &B::Domain,
+        parts: &[(B::Key, Range<u64>)],
+    ) -> Option<(B::Domain, Vec<u32>)> {
+        let mut narrowed = Vec::with_capacity(parts.len());
+        for (key, bytes) in parts {
+            let volume = if *key == entity.key {
+                domain.clone()
+            } else {
+                let known = self
+                    .lookup(key)
+                    .map(|sibling| sibling.state.lock().domain.clone());
+                match known {
+                    Some(volume) => volume,
+                    None => self.backing.domain_of(key).await?,
+                }
+            };
+            narrowed.push(B::narrowed(&volume, bytes.clone())?);
+        }
+        B::joined(&narrowed)
+    }
+
+    /// The draw a sibling volume of `key`'s set has made, if one has: read
+    /// under S, the sibling's entity copied out of L1 and its L2 taken
+    /// alone, one at a time.
+    fn sibling_draw(&self, key: &B::Key, parts: &[(B::Key, Range<u64>)]) -> Option<BTreeSet<u32>> {
+        parts
+            .iter()
+            .filter(|(sibling, _)| sibling != key)
+            .filter_map(|(sibling, _)| self.lookup(sibling))
+            .find_map(|sibling| sibling.state.lock().draw.clone())
     }
 
     /// Put `next` in place of the standing policy, which it has already
@@ -3223,10 +3400,18 @@ impl<B: Backing> State<B> {
     ///
     /// The rate is `over`'s: the entity's own domain, or the member a play
     /// session plays inside it ([`Backing::narrowed`]), whose length the
-    /// stated duration is the film of.
-    fn draw_buffering(&self, budget: CacheBudget, over: &B::Domain) -> Buffering {
+    /// stated duration is the film of -- or, for a member across a `set`,
+    /// the member's bytes in every volume ([`Backing::joined`]) over the
+    /// set's duration ([`State::set_duration`]).
+    fn draw_buffering(&self, budget: CacheBudget, over: &B::Domain, set: bool) -> Buffering {
         let mut buffering = self.buffering().widest(self.asked);
-        buffering.bytes_per_second = self.rate_over(over);
+        buffering.bytes_per_second = if set {
+            self.set_duration
+                .filter(|duration| !duration.is_zero())
+                .and_then(|duration| Some((B::bytes(over)? as f64 / duration.as_secs_f64()) as u64))
+        } else {
+            self.rate_over(over)
+        };
         if let (Some(rate), Some(seconds)) = (buffering.bytes_per_second, buffering.window_seconds)
         {
             let granted = match budget {
