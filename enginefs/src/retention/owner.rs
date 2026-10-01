@@ -1952,15 +1952,26 @@ impl<B: Backing> Retention<B> {
         B::joined(&narrowed)
     }
 
-    /// The draw a sibling volume of `key`'s set has made, if one has: read
-    /// under S, the sibling's entity copied out of L1 and its L2 taken
-    /// alone, one at a time.
+    /// The draw a sibling volume of `key`'s set has made **for this set**,
+    /// if one has: read under S, the sibling's entity copied out of L1 and
+    /// its L2 taken alone, one at a time. A sibling's draw made for anything
+    /// else -- the volume played by its URL, whose sniff found an archive
+    /// and drew nothing, or another set -- is not the set's, and adopting
+    /// it would have the set share that instead.
     fn sibling_draw(&self, key: &B::Key, parts: &[(B::Key, Range<u64>)]) -> Option<BTreeSet<u32>> {
         parts
             .iter()
             .filter(|(sibling, _)| sibling != key)
             .filter_map(|(sibling, _)| self.lookup(sibling))
-            .find_map(|sibling| sibling.state.lock().draw.clone())
+            .find_map(|sibling| {
+                let state = sibling.state.lock();
+                let for_this_set = state
+                    .drawn_for
+                    .as_ref()
+                    .and_then(|made_for| made_for.set.as_deref())
+                    == Some(parts);
+                for_this_set.then(|| state.draw.clone()).flatten()
+            })
     }
 
     /// Put `next` in place of the standing policy, which it has already

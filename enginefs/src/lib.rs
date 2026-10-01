@@ -16626,6 +16626,77 @@ mod tests {
         );
     }
 
+    /// **A volume adopts only a draw made for its set.** The second volume
+    /// was played by its URL first, as itself: its first bytes are a RAR's,
+    /// so that session drew nothing -- an empty draw, made for the file as
+    /// itself. When the set plays, the first volume due must not take that
+    /// for the set's draw and share nothing: it draws the union, and the
+    /// second volume, opened in the set, adopts the union in place of its
+    /// own empty draw, advertising nothing more.
+    #[tokio::test]
+    async fn a_volume_adopts_only_a_draw_made_for_its_set() {
+        use crate::backend::priorities::{BufferProfile, Fetching};
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("film.part1.rar".into(), 1000),
+            ("film.part2.rar".into(), 1000),
+        ]);
+        counters.pieces_per_file.store(40, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(1_000_000));
+        let mut head = vec![0u8; 1000];
+        head[..7].copy_from_slice(b"Rar!\x1a\x07\x00");
+        counters.file_heads.lock().unwrap().insert(1, Some(head));
+        enginefs.note_player(PLAYER, played(TEST_HASH, 1));
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 1).await;
+        enginefs.focus_torrent(TEST_HASH).await;
+        let by_url = engine
+            .try_get_file_with_intent(1, 0, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("the second volume by its URL");
+        assert_eq!(
+            engine.retention.draw_of(&1),
+            Some(std::collections::BTreeSet::new()),
+            "the volume played as itself drew something"
+        );
+        drop(by_url);
+
+        enginefs.note_player(
+            "tv.2",
+            played_set(TEST_HASH, &[(0, 110..1000), (1, 50..640)]),
+        );
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        let first = engine
+            .try_get_file_with_intent(0, 110, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("the first volume");
+        let union: std::collections::BTreeSet<u32> = (4..40).chain(42..66).collect();
+        assert_eq!(
+            engine.retention.draw_of(&0),
+            Some(union.clone()),
+            "the set took the volume's empty draw made by its URL"
+        );
+        assert_eq!(
+            fake_advertises(&counters),
+            union.iter().copied().collect::<Vec<_>>()
+        );
+        let advertises = counters.advertised.lock().unwrap().len();
+        let second = engine
+            .try_get_file_with_intent(1, 50, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("the second volume in the set");
+        assert_eq!(
+            engine.retention.draw_of(&1),
+            Some(union),
+            "the second volume kept its own empty draw"
+        );
+        assert_eq!(
+            counters.advertised.lock().unwrap().len(),
+            advertises,
+            "the second volume advertised again"
+        );
+        drop((first, second));
+    }
+
     /// **A move off a set onto one of its own volumes is a move**: the
     /// union was drawn for the set, and the volume played as itself -- the
     /// player's next screen naming the first volume's URL -- shares none of
