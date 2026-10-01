@@ -451,8 +451,19 @@ fn audio_entry(sample_rate: u32, channels: u32, config: &[u8]) -> Vec<u8> {
     bx(b"mp4a", &[&head, &esds(config)])
 }
 
+/// The film's length on the movie clock (milliseconds) for the 32-bit
+/// fields of `mvhd` and `tkhd`: some 49 days fit.
+fn movie_duration(duration_ms: u64) -> u32 {
+    u32::try_from(duration_ms).unwrap_or(u32::MAX - 1)
+}
+
 /// One track's `trak`.
-fn trak(track_id: u32, timescale: u32, format: &TrackFormat) -> Result<Vec<u8>, String> {
+fn trak(
+    track_id: u32,
+    timescale: u32,
+    format: &TrackFormat,
+    duration_ms: u64,
+) -> Result<Vec<u8>, String> {
     let (entry, handler, width, height, audio) = match format {
         TrackFormat::H264 {
             width,
@@ -500,7 +511,7 @@ fn trak(track_id: u32, timescale: u32, format: &TrackFormat) -> Result<Vec<u8>, 
     tkhd.extend_from_slice(&0u32.to_be_bytes()); // modification
     tkhd.extend_from_slice(&track_id.to_be_bytes());
     tkhd.extend_from_slice(&0u32.to_be_bytes()); // reserved
-    tkhd.extend_from_slice(&0u32.to_be_bytes()); // duration
+    tkhd.extend_from_slice(&movie_duration(duration_ms).to_be_bytes()); // duration, ms
     tkhd.extend_from_slice(&[0; 8]); // reserved
     tkhd.extend_from_slice(&0u16.to_be_bytes()); // layer
     tkhd.extend_from_slice(&0u16.to_be_bytes()); // alternate_group
@@ -512,13 +523,15 @@ fn trak(track_id: u32, timescale: u32, format: &TrackFormat) -> Result<Vec<u8>, 
     let tkhd = full(b"tkhd", 0, 3, &[&tkhd]);
 
     let mut mdhd = Vec::with_capacity(20);
-    mdhd.extend_from_slice(&0u32.to_be_bytes());
-    mdhd.extend_from_slice(&0u32.to_be_bytes());
+    // Version 1: a 64-bit duration, since a film at 90 kHz passes 32 bits
+    // after thirteen hours.
+    mdhd.extend_from_slice(&0u64.to_be_bytes()); // creation
+    mdhd.extend_from_slice(&0u64.to_be_bytes()); // modification
     mdhd.extend_from_slice(&timescale.to_be_bytes());
-    mdhd.extend_from_slice(&0u32.to_be_bytes()); // duration
+    mdhd.extend_from_slice(&ticks(duration_ms as i64 * 1000, timescale).to_be_bytes());
     mdhd.extend_from_slice(&0x55c4u16.to_be_bytes()); // 'und'
     mdhd.extend_from_slice(&0u16.to_be_bytes());
-    let mdhd = full(b"mdhd", 0, 0, &[&mdhd]);
+    let mdhd = full(b"mdhd", 1, 0, &[&mdhd]);
 
     let name: &[u8] = if audio {
         b"SoundHandler\0"
@@ -580,7 +593,7 @@ pub(crate) fn init_segment(formats: &Formats, duration_ms: u64) -> Result<Bytes,
     mvhd.extend_from_slice(&0u32.to_be_bytes());
     mvhd.extend_from_slice(&0u32.to_be_bytes());
     mvhd.extend_from_slice(&1000u32.to_be_bytes()); // timescale: ms
-    mvhd.extend_from_slice(&0u32.to_be_bytes()); // duration: in mehd
+    mvhd.extend_from_slice(&movie_duration(duration_ms).to_be_bytes()); // duration, ms
     mvhd.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // rate
     mvhd.extend_from_slice(&0x0100u16.to_be_bytes()); // volume
     mvhd.extend_from_slice(&[0; 10]);
@@ -593,7 +606,7 @@ pub(crate) fn init_segment(formats: &Formats, duration_ms: u64) -> Result<Bytes,
     let mut mvex: Vec<Vec<u8>> = vec![mehd];
     let mut traks = Vec::new();
     if let Some(video) = &formats.video {
-        traks.push(trak(VIDEO_TRACK, VIDEO_TIMESCALE, video)?);
+        traks.push(trak(VIDEO_TRACK, VIDEO_TIMESCALE, video, duration_ms)?);
         mvex.push(trex(VIDEO_TRACK));
     }
     if let Some(audio) = &formats.audio {
@@ -601,6 +614,7 @@ pub(crate) fn init_segment(formats: &Formats, duration_ms: u64) -> Result<Bytes,
             formats.audio_track_id(),
             formats.audio_timescale(),
             audio,
+            duration_ms,
         )?);
         mvex.push(trex(formats.audio_track_id()));
     }

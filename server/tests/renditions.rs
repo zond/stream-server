@@ -398,6 +398,37 @@ fn the_init_segment_carries_the_producers_codec_configuration() -> anyhow::Resul
     Ok(())
 }
 
+/// **The init segment says how long the film is**, in the box a player
+/// reads it from: each track's `mdhd` (version 1, on the track's clock) --
+/// Chrome's MP4 demuxer (ffmpeg's) takes a fragmented file's duration from
+/// there and nowhere else, and without it a receiver's `duration` is only
+/// what has arrived -- and `mvhd` and `tkhd` on the movie clock.
+#[test]
+fn the_init_segment_says_how_long_the_film_is() -> anyhow::Result<()> {
+    let fixture = Fixture::quick(Knobs::default())?;
+    let token = fixture.publish(60_000, 0)?;
+    let init = fixture.init(&token);
+    let moov = Boxes::find(&init, "moov");
+    let mvhd = Boxes::find(moov, "mvhd");
+    assert_eq!(u32_at(mvhd, 12), 1000, "the movie clock is in ms");
+    assert_eq!(u32_at(mvhd, 16), 60_000);
+    let traks: Vec<&[u8]> = Boxes::of(moov)
+        .into_iter()
+        .filter(|(kind, _)| kind == "trak")
+        .map(|(_, body)| body)
+        .collect();
+    for (trak, timescale) in traks.iter().zip([90_000u64, 48_000]) {
+        let tkhd = Boxes::find(trak, "tkhd");
+        assert_eq!(u32_at(tkhd, 20), 60_000, "tkhd, on the movie clock");
+        let mdhd = Boxes::path(trak, &["mdia", "mdhd"]);
+        assert_eq!(mdhd[0], 1, "a 64-bit mdhd");
+        assert_eq!(u64::from(u32_at(mdhd, 20)), timescale);
+        let duration = u64::from_be_bytes(mdhd[24..32].try_into().unwrap());
+        assert_eq!(duration, 60 * timescale, "mdhd, on the track's own clock");
+    }
+    Ok(())
+}
+
 // --- The cut rule ----------------------------------------------------------------
 
 /// **Segment N starts at the first key at or after N x T** -- its `tfdt`
