@@ -3749,6 +3749,22 @@ fn start_lan_media(handle: &ServerHandle) -> anyhow::Result<std::net::SocketAddr
         .ok_or_else(|| anyhow::anyhow!("set_lan_media(true) answered with no address"))
 }
 
+/// Publish the fixture's film for a cast the way the app does -- registered
+/// by the streaming URL stremio-core builds, published with no play -- and
+/// answer the path the receiver is handed, `/cast/<token>`.
+fn cast_path(
+    handle: &ServerHandle,
+    base: &str,
+    info_hash: &str,
+    idx: usize,
+) -> anyhow::Result<String> {
+    let id = handle.register(stream_server::MediaSpec::StreamingUrl(
+        stream_server::Url::parse(&format!("{base}/{info_hash}/{idx}"))?,
+    ))?;
+    let token = handle.publish(&id, None)?;
+    Ok(format!("/cast/{}", token.as_str()))
+}
+
 /// The whole free-space loop, inside a real server: the reconciler `run()`
 /// starts stops a torrent that is writing when its volume falls under the
 /// floor, the statistics say so, and it runs again when the space comes
@@ -5998,7 +6014,7 @@ fn stats_json_reports_the_piece_the_open_reader_waits_for() -> anyhow::Result<()
     Ok(())
 }
 
-/// The LAN media listener hands out media bytes and nothing else.
+/// The LAN media listener serves published cast tokens and nothing else.
 ///
 /// It exists so a Chromecast can fetch a stream from a server that otherwise
 /// binds loopback only. What it must NOT expose is the control API: the
@@ -6006,19 +6022,16 @@ fn stats_json_reports_the_piece_the_open_reader_waits_for() -> anyhow::Result<()
 /// unknown path there -- `404`, never the `401` that would tell the LAN the
 /// route exists and only a token is missing. The loopback listener keeps
 /// serving both, and range and HEAD requests -- what a receiver actually
-/// issues -- work through the LAN listener too.
+/// issues -- work on a published token.
 ///
-/// It must also NOT expose anything a stranger on the network could make
-/// this device *do*: `/proxy` and `/ftp` fetch an arbitrary caller-supplied
-/// remote URL; the archive `/create` routes download an archive from a
-/// caller-named URL; and the loopback stream route's first request for a hash starts a torrent
-/// with the caller's trackers. All of that is loopback only. The LAN gets the
-/// byte-serving halves alone -- a torrent that exists, a member of an
-/// archive session loopback already created -- and an unknown torrent
-/// there is a `404` that starts nothing. The `/local-addon` stub is not on
-/// the LAN either: no receiver calls it.
+/// Nor any other media route: the torrent routes (whose first request
+/// starts a torrent with the caller's trackers on loopback), the archive
+/// routes, `/proxy`, `/ftp`, `/drive/stream`, `/downloads/.../stream` and
+/// the `/local-addon` stub are all `404` on the LAN, every method -- the
+/// paths that used to be on it included. What a receiver reads is
+/// `/cast/{token}`, for an id the app published.
 #[test]
-fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> {
+fn lan_media_listener_serves_published_tokens_and_nothing_else() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
     let src = tempfile::tempdir()?;
@@ -6039,6 +6052,7 @@ fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> 
         "the LAN media listener is a second socket, not a rebind of the first"
     );
     let lan = format!("http://{lan_addr}");
+    let cast = cast_path(&handle, &base, &info_hash, idx)?;
 
     let anonymous = reqwest::blocking::Client::new();
     let with_token = bearer_client(&handle)?;
@@ -6076,197 +6090,92 @@ fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> 
             "{path}"
         );
     }
-    // `POST /settings` is not a route on the LAN listener either -- the
-    // fallback answers whatever the method.
-    assert_eq!(
-        anonymous
-            .post(format!("{lan}/settings"))
-            .json(&serde_json::json!({ "cacheSize": 1.0 }))
-            .send()?
-            .status(),
-        reqwest::StatusCode::NOT_FOUND
-    );
-    // `POST /{infoHash}/create` collides with the two-segment media route's
-    // pattern, so it answers as that route would (`405`, GET and HEAD only)
-    // rather than 404 -- but it still never reaches the control handler, and
-    // no engine is created.
-    assert_eq!(
-        anonymous
-            .post(format!("{lan}/{info_hash}/create"))
-            .send()?
-            .status(),
-        reqwest::StatusCode::METHOD_NOT_ALLOWED
-    );
 
-    // `/proxy` and `/ftp` are open on the loopback listener too -- players
-    // cannot attach headers, same as every other media route -- but neither
-    // serves bytes *from this server*: each fetches an arbitrary
-    // caller-supplied remote URL (`/proxy` via `reqwest`, `/ftp` via
-    // `suppaftp`), which makes it an open proxy rather
-    // than "media bytes". The
-    // LAN listener's allow-list (`lan_media_routes`) excludes both. The
-    // requests below are malformed just enough to prove the routing
-    // decision (an invalid target URL, a missing `lz` parameter) without
-    // either handler ever reaching out over the network.
-    for path in ["/proxy/not-a-url", "/ftp/movie.mkv"] {
-        let response = anonymous.get(format!("{lan}{path}")).send()?;
+    // Every other route, and every path the LAN used to serve, is a `404`
+    // there whatever the method: nothing collides with a pattern any more,
+    // since the one pattern is `/cast/{token}`. The torrent paths would
+    // start a torrent with the caller's trackers on loopback; `/proxy` and
+    // `/ftp` fetch a caller-named URL; the archive creates download one.
+    let unknown = "00112233445566778899aabbccddeeff00112233";
+    let attacker_tracker = urlencoding::encode("udp://attacker.invalid:6969/announce");
+    let mut old_paths = vec![
+        format!("/{info_hash}/{idx}"),
+        format!("/stream/{info_hash}/{idx}"),
+        format!("/{unknown}/0?tr={attacker_tracker}"),
+        format!("/stream/{unknown}/0?tr={attacker_tracker}"),
+        format!("/{info_hash}/create"),
+        "/proxy/not-a-url".to_string(),
+        "/proxy/?d=http%3A%2F%2F127.0.0.1%3A9%2Ffilm.mkv".to_string(),
+        "/ftp/movie.mkv".to_string(),
+        "/drive/stream/some-key".to_string(),
+        "/downloads/some-key/stream".to_string(),
+        "/local-addon/manifest.json".to_string(),
+    ];
+    for prefix in ["/rar", "/zip", "/7zip", "/tar", "/tgz", "/iso"] {
+        old_paths.push(format!("{prefix}/create"));
+        old_paths.push(format!("{prefix}/create/some-key"));
+        old_paths.push(format!("{prefix}/stream"));
+        old_paths.push(format!("{prefix}/stream/no-such-session/movie.mkv"));
+        old_paths.push(format!(
+            "{prefix}/stream/torrent:{info_hash}%2FMovie%2Fmovie.bin/movie.bin"
+        ));
+    }
+    for path in &old_paths {
+        for method in [
+            reqwest::Method::GET,
+            reqwest::Method::HEAD,
+            reqwest::Method::POST,
+        ] {
+            assert_eq!(
+                anonymous
+                    .request(method.clone(), format!("{lan}{path}"))
+                    .send()?
+                    .status(),
+                reqwest::StatusCode::NOT_FOUND,
+                "{method} {path} on the LAN listener"
+            );
+        }
+    }
+    // The loopback listener still has them: the torrent route serves, and
+    // `/proxy` and an archive create are real routes refusing a bad payload.
+    assert_eq!(
+        anonymous
+            .get(format!("{base}/{info_hash}/{idx}"))
+            .send()?
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    for path in ["/proxy/not-a-url", "/ftp/movie.mkv", "/rar/create"] {
         assert_eq!(
-            response.status(),
-            reqwest::StatusCode::NOT_FOUND,
-            "{path} must not exist on the LAN listener -- it is an open proxy, not media bytes"
-        );
-        let response = anonymous.get(format!("{base}{path}")).send()?;
-        assert_eq!(
-            response.status(),
+            anonymous.get(format!("{base}{path}")).send()?.status(),
             reqwest::StatusCode::BAD_REQUEST,
             "{path} is a real route on the loopback listener"
         );
     }
-
-    // The archive session-create routes fetch a caller-named URL (an
-    // archive to download whole), so they are loopback only: a real route there (a
-    // `400` for the missing payload) and absent from the LAN. `GET` on the
-    // LAN is the two-segment collision answered by the LAN stream handler
-    // looking `"rar"` up as an info hash and finding nothing; the keyed
-    // form has three segments and reaches the fallback; `POST` is a method
-    // the stream route does not take.
-    for prefix in ["/rar", "/zip", "/7zip", "/tar", "/tgz", "/iso"] {
-        let create = format!("{prefix}/create");
-        assert_eq!(
-            anonymous.get(format!("{base}{create}")).send()?.status(),
-            reqwest::StatusCode::BAD_REQUEST,
-            "{create} is a real route on the loopback listener"
-        );
-        assert_eq!(
-            anonymous.get(format!("{lan}{create}")).send()?.status(),
-            reqwest::StatusCode::NOT_FOUND,
-            "{create} must not exist on the LAN listener"
-        );
-        assert_eq!(
-            anonymous
-                .get(format!("{lan}{create}/some-key"))
-                .send()?
-                .status(),
-            reqwest::StatusCode::NOT_FOUND,
-            "{create}/some-key must not exist on the LAN listener"
-        );
-        assert_eq!(
-            anonymous
-                .post(format!("{lan}{create}"))
-                .json(&serde_json::json!({ "urls": ["http://127.0.0.1:9/x.zip"] }))
-                .send()?
-                .status(),
-            reqwest::StatusCode::METHOD_NOT_ALLOWED,
-            "POST {create} must not reach a handler on the LAN listener"
-        );
-        // The byte-serving half of the same prefix *is* on the LAN: a
-        // request with no session key is refused by the route itself, on
-        // both listeners alike, and a key nobody created is a `404` that
-        // opened nothing -- except under `/rar` in a build without the
-        // `rar` feature, which has no RAR reader at all and says so
-        // (`501`) before it looks anything up. Either answer is the route
-        // being there and nothing being opened, which is what this is
-        // about.
-        let missing_session = if cfg!(feature = "rar") || prefix != "/rar" {
-            reqwest::StatusCode::NOT_FOUND
-        } else {
-            reqwest::StatusCode::NOT_IMPLEMENTED
-        };
-        let stream = format!("{prefix}/stream");
-        for origin in [&lan, &base] {
-            assert_eq!(
-                anonymous.get(format!("{origin}{stream}")).send()?.status(),
-                reqwest::StatusCode::BAD_REQUEST,
-                "{origin}{stream} is a real route on both listeners"
-            );
-            assert_eq!(
-                anonymous
-                    .get(format!("{origin}{stream}/no-such-session/movie.mkv"))
-                    .send()?
-                    .status(),
-                missing_session,
-                "{origin}{stream}/no-such-session/movie.mkv"
-            );
-        }
-    }
-    // The `/local-addon` stub is loopback only too -- not a hazard, just
-    // nothing a receiver asks for, and the allow-list is what a receiver
-    // needs rather than what is harmless.
-    let manifest: serde_json::Value = anonymous
-        .get(format!("{base}/local-addon/manifest.json"))
-        .send()?
-        .error_for_status()?
-        .json()?;
-    assert_eq!(manifest["id"], "org.stremio.local");
-    assert_eq!(
-        anonymous
-            .get(format!("{lan}/local-addon/manifest.json"))
-            .send()?
-            .status(),
-        reqwest::StatusCode::NOT_FOUND
-    );
-
-    // A torrent this server does not have is a `404` on the LAN, at once,
-    // and nothing is started: on loopback the same request would create the
-    // torrent with the caller's `tr=` trackers and wait up to the metadata
-    // timeout for a swarm that does not exist. The stats poll afterwards
-    // starts its own registry add for the hash -- that is what a stats poll
-    // does -- so what it proves is that the LAN request left no add of its
-    // own behind: the attacker's tracker is in no source list.
-    let unknown = "00112233445566778899aabbccddeeff00112233";
-    let attacker_tracker = "udp://attacker.invalid:6969/announce";
-    let prompt = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
-    for method in [reqwest::Method::GET, reqwest::Method::HEAD] {
-        let response = prompt
-            .request(
-                method.clone(),
-                format!(
-                    "{lan}/{unknown}/0?tr={}",
-                    urlencoding::encode(attacker_tracker)
-                ),
-            )
-            .send()?;
-        assert_eq!(
-            response.status(),
-            reqwest::StatusCode::NOT_FOUND,
-            "{method} for an unknown torrent on the LAN listener"
-        );
-    }
-    let response = prompt
-        .get(format!(
-            "{lan}/stream/{unknown}/0?tr={}",
-            urlencoding::encode(attacker_tracker)
-        ))
-        .send()?;
-    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    // And the LAN's torrent paths started nothing: the stats poll starts
+    // its own registry add for the hash -- that is what a stats poll does
+    // -- so what it proves is that no LAN request left an add of its own
+    // behind carrying the attacker's tracker.
     let stats: serde_json::Value = serde_json::to_value(handle.engine_stats(unknown, &[])?)?;
     let sources = stats["sources"].to_string();
     assert!(
         !sources.contains("attacker.invalid"),
-        "the LAN request started an add carrying its own tracker: {stats}"
+        "a LAN request started an add carrying its own tracker: {stats}"
     );
 
-    // Media bytes, on both listeners, from the same engine.
-    for origin in [&lan, &base] {
-        let response = anonymous
-            .get(format!("{origin}/{info_hash}/{idx}"))
-            .send()?
-            .error_for_status()?;
+    // The bytes, from the cast token on the LAN and the torrent route on
+    // loopback, from the same engine.
+    for url in [format!("{lan}{cast}"), format!("{base}/{info_hash}/{idx}")] {
+        let response = anonymous.get(&url).send()?.error_for_status()?;
         assert_eq!(response.status(), reqwest::StatusCode::OK);
-        assert_eq!(
-            header_value(&response, "accept-ranges"),
-            "bytes",
-            "{origin}"
-        );
-        assert_eq!(response.bytes()?.as_ref(), payload.as_slice(), "{origin}");
+        assert_eq!(header_value(&response, "accept-ranges"), "bytes", "{url}");
+        assert_eq!(response.bytes()?.as_ref(), payload.as_slice(), "{url}");
     }
 
     // A receiver seeks with byte ranges, so the LAN listener has to answer
     // `206` with a `Content-Range` and exactly the requested bytes.
     let response = anonymous
-        .get(format!("{lan}/{info_hash}/{idx}"))
+        .get(format!("{lan}{cast}"))
         .header(reqwest::header::RANGE, "bytes=1024-2047")
         .send()?;
     assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
@@ -6279,7 +6188,7 @@ fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> 
 
     // And it probes with HEAD first: the headers, no body.
     let response = anonymous
-        .head(format!("{lan}/{info_hash}/{idx}"))
+        .head(format!("{lan}{cast}"))
         .send()?
         .error_for_status()?;
     assert_eq!(
@@ -6292,7 +6201,7 @@ fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> 
     // CORS reaches the LAN listener as well -- a receiver preflights the
     // media request before it fetches a byte.
     let response = anonymous
-        .request(reqwest::Method::OPTIONS, format!("{lan}/{info_hash}/{idx}"))
+        .request(reqwest::Method::OPTIONS, format!("{lan}{cast}"))
         .header(reqwest::header::ORIGIN, "https://example.org")
         .header("access-control-request-method", "GET")
         .header("access-control-request-headers", "range")
@@ -6307,7 +6216,7 @@ fn lan_media_listener_serves_media_but_no_control_route() -> anyhow::Result<()> 
     // one to.
     assert!(!allowed.contains("authorization"), "{allowed:?}");
     let response = anonymous
-        .get(format!("{lan}/{info_hash}/{idx}"))
+        .get(format!("{lan}{cast}"))
         .header(reqwest::header::ORIGIN, "https://example.org")
         .header(reqwest::header::RANGE, "bytes=0-15")
         .send()?;
@@ -6414,6 +6323,7 @@ fn set_lan_media_toggles_the_listener_and_the_setting_can_forbid_it() -> anyhow:
         Some(started),
         "starting an already-running listener is a no-op"
     );
+    let cast = cast_path(&handle, &base, &info_hash, idx)?;
 
     // Stop: the socket is gone when the call returns, and so is the URL.
     assert_eq!(handle.set_lan_media(false)?, None);
@@ -6423,7 +6333,7 @@ fn set_lan_media_toggles_the_listener_and_the_setting_can_forbid_it() -> anyhow:
     let refused = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?
-        .get(format!("http://{started}/{info_hash}/{idx}"))
+        .get(format!("http://{started}{cast}"))
         .send();
     assert!(
         refused.is_err(),
@@ -6431,12 +6341,22 @@ fn set_lan_media_toggles_the_listener_and_the_setting_can_forbid_it() -> anyhow:
     );
 
     // Still permitted, it comes back -- on a fresh OS-assigned port -- and
-    // serves media again.
+    // serves media again, under a new publication: the stop unpublished
+    // the old one.
     let restarted = handle.set_lan_media(true)?.expect("bound");
     assert!(handle.lan_media_running());
     assert_eq!(handle.lan_media_addr(), Some(restarted));
+    assert_eq!(
+        reqwest::blocking::Client::new()
+            .get(format!("http://{restarted}{cast}"))
+            .send()?
+            .status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "a token outlived the stop that unpublished it"
+    );
+    let cast = cast_path(&handle, &base, &info_hash, idx)?;
     let response = reqwest::blocking::Client::new()
-        .get(format!("http://{restarted}/{info_hash}/{idx}"))
+        .get(format!("http://{restarted}{cast}"))
         .send()?
         .error_for_status()?;
     assert_eq!(response.bytes()?.as_ref(), payload.as_slice());
@@ -6594,8 +6514,9 @@ fn a_configured_lan_media_address_binds_nothing_until_a_cast_asks() -> anyhow::R
         .set_lan_media(true)?
         .expect("bound once the port is free");
     assert_eq!(bound, contested);
+    let cast = cast_path(&handle, &base, &info_hash, idx)?;
     let response = reqwest::blocking::Client::new()
-        .get(format!("http://{bound}/{info_hash}/{idx}"))
+        .get(format!("http://{bound}{cast}"))
         .send()?
         .error_for_status()?;
     assert_eq!(response.bytes()?.as_ref(), payload.as_slice());
@@ -6619,6 +6540,10 @@ fn a_configured_lan_media_address_binds_nothing_until_a_cast_asks() -> anyhow::R
 /// what casting to a second receiver mid-session does -- and so does a stop,
 /// or the previous cast would answer for this one. Only the LAN listener
 /// counts; loopback traffic is this host's own client, not a receiver.
+///
+/// Beside it, the bodies count: a `/cast` `GET` that began sending bytes,
+/// never a `HEAD` or a `404`. Requests with no body is the third reading --
+/// the receiver reached this device and was served nothing.
 #[test]
 fn the_lan_listener_counts_the_requests_that_reach_it() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -6634,12 +6559,14 @@ fn the_lan_listener_counts_the_requests_that_reach_it() -> anyhow::Result<()> {
     let lan_addr = start_lan_media(&handle)?;
     let lan = format!("http://{lan_addr}");
     let anonymous = reqwest::blocking::Client::new();
+    let cast = cast_path(&handle, &base, &info_hash, idx)?;
 
     assert_eq!(
         handle.lan_media_requests_served(),
         0,
         "a listener nothing has fetched from yet"
     );
+    assert_eq!(handle.lan_media_bodies_served(), 0);
 
     // Loopback is not the LAN listener, however much it is served.
     anonymous
@@ -6654,22 +6581,25 @@ fn the_lan_listener_counts_the_requests_that_reach_it() -> anyhow::Result<()> {
 
     // What a receiver actually does: probe with HEAD, then read a range.
     // The count is bumped when the request arrives, so it is already up to
-    // date by the time the response is in hand -- nothing to wait for.
+    // date by the time the response is in hand -- nothing to wait for. A
+    // `HEAD` is no body; the `GET` is.
     anonymous
-        .head(format!("{lan}/{info_hash}/{idx}"))
+        .head(format!("{lan}{cast}"))
         .send()?
         .error_for_status()?;
     assert_eq!(handle.lan_media_requests_served(), 1);
+    assert_eq!(handle.lan_media_bodies_served(), 0, "a HEAD began a body");
     let response = anonymous
-        .get(format!("{lan}/{info_hash}/{idx}"))
+        .get(format!("{lan}{cast}"))
         .header(reqwest::header::RANGE, "bytes=0-15")
         .send()?;
     assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
     assert_eq!(response.bytes()?.as_ref(), &payload[0..16]);
     assert_eq!(handle.lan_media_requests_served(), 2);
+    assert_eq!(handle.lan_media_bodies_served(), 1);
 
     // A request the fallback answers still reached us, which is the whole
-    // question the count exists to answer.
+    // question the count exists to answer -- and served nothing.
     assert_eq!(
         anonymous
             .get(format!("{lan}/no-such-route"))
@@ -6678,6 +6608,7 @@ fn the_lan_listener_counts_the_requests_that_reach_it() -> anyhow::Result<()> {
         reqwest::StatusCode::NOT_FOUND
     );
     assert_eq!(handle.lan_media_requests_served(), 3);
+    assert_eq!(handle.lan_media_bodies_served(), 1);
 
     // Tapping a second receiver starts a cast on a listener that is already
     // bound, and the question that cast asks is about itself: the first
@@ -6692,11 +6623,14 @@ fn the_lan_listener_counts_the_requests_that_reach_it() -> anyhow::Result<()> {
         0,
         "a start resets the count whether or not it had to bind"
     );
+    assert_eq!(handle.lan_media_bodies_served(), 0);
     anonymous
-        .head(format!("{lan}/{info_hash}/{idx}"))
+        .get(format!("{lan}{cast}"))
         .send()?
-        .error_for_status()?;
+        .error_for_status()?
+        .bytes()?;
     assert_eq!(handle.lan_media_requests_served(), 1);
+    assert_eq!(handle.lan_media_bodies_served(), 1);
 
     // Nothing is listening once a stop returns, so nothing can have reached
     // us: a count left standing would report a receiver fetching from a
@@ -6708,6 +6642,7 @@ fn the_lan_listener_counts_the_requests_that_reach_it() -> anyhow::Result<()> {
         0,
         "zero whenever nothing is listening"
     );
+    assert_eq!(handle.lan_media_bodies_served(), 0);
 
     // A new session starts from nothing, so a cast that is never fetched
     // from reads zero however busy the one before it was.
@@ -6717,9 +6652,10 @@ fn the_lan_listener_counts_the_requests_that_reach_it() -> anyhow::Result<()> {
         0,
         "the count belongs to the session, not to the process"
     );
+    let cast = cast_path(&handle, &base, &info_hash, idx)?;
     assert_eq!(
         anonymous
-            .get(format!("http://{restarted}/{info_hash}/{idx}"))
+            .get(format!("http://{restarted}{cast}"))
             .send()?
             .error_for_status()?
             .bytes()?

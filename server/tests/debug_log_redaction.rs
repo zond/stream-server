@@ -123,6 +123,7 @@ fn no_debug_line_carries_a_callers_credentials() -> anyhow::Result<()> {
         torrent_listen_port: stream_server::TorrentListenPort::Loopback,
         pins: Some(Default::default()),
         proxy_pins: Some(Vec::new()),
+        lan_media_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
         ..stream_server::ServerConfig::default()
     })?;
     let base = format!("http://{}", handle.http_addr());
@@ -169,9 +170,38 @@ fn no_debug_line_carries_a_callers_credentials() -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_millis(50));
     }
 
+    // A cast token, which is a URL into this device for as long as it is
+    // published: a body served under it, and a request after it is gone.
+    handle.update_settings(serde_json::json!({ "lanMediaEnabled": true }))?;
+    let lan = handle
+        .set_lan_media(true)?
+        .ok_or_else(|| anyhow::anyhow!("the LAN listener answered with no address"))?;
+    let id = handle.register(stream_server::MediaSpec::StreamingUrl(
+        stream_server::Url::parse(&format!("{base}/proxy/d={}/film.mp4", encode(&origin)))?,
+    ))?;
+    let token = handle.publish(&id, None)?;
+    let cast = format!("http://{lan}/cast/{}", token.as_str());
+    let response = client
+        .get(&cast)
+        .header(reqwest::header::RANGE, "bytes=0-1023")
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.bytes()?.len(), 1024);
+    assert!(handle.unpublish(&token));
+    assert_eq!(
+        client.get(&cast).send()?.status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+
     handle.shutdown()?;
     handle.join()?;
     let text = captured.text();
+    assert!(
+        text.contains("cast_body_start") && text.contains("cast unpublished"),
+        "the cast lines this test is about were written"
+    );
+    let line = text.lines().find(|line| line.contains(token.as_str()));
+    assert!(line.is_none(), "a cast token was logged: {line:?}");
     assert!(
         text.contains("FTP transfer failed")
             && text.contains("Skipping invalid custom request header")

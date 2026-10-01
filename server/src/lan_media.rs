@@ -8,15 +8,14 @@
 //! downloads, engine stats and the torrent session.
 //!
 //! So this is a whole second listener rather than a wider bind on the first
-//! one. It serves `crate::lan_media_routes` alone: the byte-serving routes,
-//! over torrents and archive sessions the loopback side has already created,
-//! and nothing that a stranger on the network could make this device *do* --
-//! no route that fetches a caller-named URL, none that starts a torrent, and
-//! no control route at any level, not even behind the bearer middleware, so
-//! an unknown-path `404` is the strongest answer the LAN can get out of them
-//! and there is no token to guess, leak or brute-force. Both listeners share
-//! one [`AppState`], so a stream the LAN pulls uses the same engines, piece
-//! cache and settings as one the loopback listener serves.
+//! one, and it serves **published cast tokens and nothing else**
+//! (`crate::cast`): `/cast/{token}` for each id the app published, every
+//! other path a `404`. No route that fetches a caller-named URL, none that
+//! starts a torrent, none that names a file, and no control route at any
+//! level, not even behind the bearer middleware, so there is no bearer
+//! token to guess, leak or brute-force. Both listeners share one
+//! [`AppState`], so a cast body uses the same engines, piece cache and
+//! settings as the app's own player.
 //!
 //! It is off unless an embedder configures [`ServerConfig::lan_media_addr`],
 //! and [`ServerHandle::set_lan_media`] starts and stops it at runtime so it
@@ -58,6 +57,12 @@ pub struct LanMedia {
     /// written under that lock, read without it. See
     /// [`LanMedia::bound_addr`].
     bound: std::sync::Mutex<Option<SocketAddr>>,
+    /// Cast bodies begun since the cast session began -- see
+    /// [`LanMedia::bodies_served`]. Reset where [`Self::requests`] is.
+    bodies: AtomicU64,
+    /// The published cast tokens (`crate::cast`): what the listener
+    /// serves, and all of it. A stop unpublishes every one.
+    casts: crate::cast::Casts,
 }
 
 struct Running {
@@ -72,6 +77,8 @@ impl LanMedia {
             running: tokio::sync::Mutex::new(None),
             requests: AtomicU64::new(0),
             bound: std::sync::Mutex::new(None),
+            bodies: AtomicU64::new(0),
+            casts: crate::cast::Casts::default(),
         }
     }
 
@@ -91,7 +98,7 @@ impl LanMedia {
         *self.bound.lock().unwrap_or_else(|e| e.into_inner()) = bound;
     }
 
-    /// Bind the listener and start serving media routes on it. Idempotent:
+    /// Bind the listener and start serving cast tokens on it. Idempotent:
     /// an already-running listener is left alone and its address returned.
     /// The request count is reset either way -- see below.
     ///
@@ -119,6 +126,7 @@ impl LanMedia {
         // mid-session starts a cast on a listener that is already up, and
         // that cast is the one being asked about.
         self.requests.store(0, Ordering::Relaxed);
+        self.bodies.store(0, Ordering::Relaxed);
         if let Some(running) = running.as_ref() {
             return Ok(running.bound);
         }
@@ -145,42 +153,34 @@ impl LanMedia {
         });
         tracing::info!(
             %bound,
-            "LAN media listener started; media routes only, no control API"
+            "LAN media listener started; published cast tokens only, no control API"
         );
         *running = Some(Running { bound, task });
         self.publish_bound(Some(bound));
         Ok(bound)
     }
 
-    /// Stop the listener. A no-op when it is not running.
+    /// Stop the listener and unpublish every cast token. A no-op for the
+    /// listener when it is not running.
     ///
-    /// **This closes the door, not the connections already through it.** The
-    /// serving task owns the `TcpListener` and the accept loop, so aborting
-    /// and awaiting it closes the socket: by the time this returns the port
-    /// is free -- it rebinds immediately -- nothing new is accepted, and a
-    /// connection sitting idle on keep-alive is closed without serving
-    /// another request.
+    /// **The door closes and the bytes stop.** The serving task owns the
+    /// `TcpListener` and the accept loop, so aborting and awaiting it closes
+    /// the socket: by the time this returns the port is free -- it rebinds
+    /// immediately -- nothing new is accepted, and a connection sitting idle
+    /// on keep-alive is closed without serving another request.
     ///
-    /// A response that is *already* streaming is not cut. axum spawns every
-    /// accepted connection into a task of its own, and dropping the serve
-    /// future signals those tasks rather than owning them: each answers by
-    /// calling hyper's `graceful_shutdown`, which stops the connection taking
-    /// further requests and then lets the response in flight run to its end.
-    /// So a receiver mid-file keeps being fed, by this process, through an
-    /// interface this call has otherwise shut, until it has the whole thing
-    /// or hangs up. That is measured behaviour on axum 0.8, not an inference
-    /// from the API.
+    /// A response already streaming is cut by the unpublish, not by the
+    /// abort. axum spawns every accepted connection into a task of its own,
+    /// and dropping the serve future only asks those to shut down
+    /// gracefully, which would let the response in flight run to its end
+    /// (measured on axum 0.8). Every body this listener serves is a cast
+    /// body, and every cast body polls its token's cut before each chunk
+    /// (`crate::cast`), so unpublishing every token ends every body: it
+    /// yields an error at its next poll and hyper drops the connection.
     ///
-    /// The call is still not a drain, and that is the point of the abort: it
-    /// returns as soon as the accept loop is gone instead of waiting out a
-    /// movie-length response, so ending a cast session -- or the operator
-    /// revoking `lanMediaEnabled` -- never blocks on a receiver's download.
-    /// What it does not do is stop the bytes, and nothing else here does
-    /// either: cutting a stream in progress would mean holding each
-    /// connection's task and aborting it, which needs the listener built on
-    /// `hyper_util`'s connection builder by hand (axum's `serve` hands out no
-    /// such handle) or every media body wrapped in a cancellation token.
-    /// Neither is a reordering of this function.
+    /// The call is still not a drain: it returns as soon as the accept loop
+    /// is gone instead of waiting for a receiver, so ending a cast session
+    /// -- or the operator revoking `lanMediaEnabled` -- never blocks.
     ///
     /// Nothing here touches the loopback listener: it owns a different socket
     /// and a different `axum::serve` future, and requests in flight on it --
@@ -189,8 +189,13 @@ impl LanMedia {
     /// modified.
     pub async fn stop(&self) {
         let mut running = self.running.lock().await;
+        // Every token first, and after the bound address is gone: a publish
+        // asks for that address under the casts' lock, so one racing this
+        // stop either sees the listener down or is unpublished here. The
+        // unpublish cuts every body being served, so the bytes stop too.
+        self.publish_bound(None);
+        self.casts.unpublish_all();
         if let Some(running) = running.take() {
-            self.publish_bound(None);
             running.task.abort();
             // Awaiting the aborted task is what makes the stop observable:
             // the task owns the `TcpListener`, so the port is only released
@@ -210,6 +215,31 @@ impl LanMedia {
         // Unconditional, running listener or not, so the count reads zero
         // whenever nothing is listening.
         self.requests.store(0, Ordering::Relaxed);
+        self.bodies.store(0, Ordering::Relaxed);
+    }
+
+    /// The published cast tokens. A publish asks [`Self::bound_addr`]
+    /// under their lock (`Casts::publish`): refused while the listener is
+    /// not running, since a token with nothing to serve it would hold its
+    /// id until the next stop.
+    pub(crate) fn casts(&self) -> &crate::cast::Casts {
+        &self.casts
+    }
+
+    /// Count one cast response beginning a body. Called by the `/cast`
+    /// route when it hands a `GET` its bytes -- not for a `HEAD`, a `404`
+    /// or a refusal.
+    pub(crate) fn record_body(&self) {
+        self.bodies.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many cast responses have begun a body since the current cast
+    /// session began; reset as [`Self::requests_served`] is. Beside that
+    /// count it tells a receiver that reached this device but was served
+    /// nothing (a token it was not given, a refusal) from one that is
+    /// reading.
+    pub fn bodies_served(&self) -> u64 {
+        self.bodies.load(Ordering::Relaxed)
     }
 
     /// Count one request arriving on the listener. Called by the tracing

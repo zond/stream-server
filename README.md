@@ -31,7 +31,7 @@ Stremio's own server, and the upstream fork, exist to serve a web-based player: 
 | **Remote streams** | `/proxy` caches in 256 KiB chunks, is bounded by the same retention, and reads ahead of a player exactly as a torrent stream is -- see [Proxied remote streams](docs/proxy.md#proxied-remote-streams) | Relayed, nothing kept |
 | **Google Drive** | A paired account's files as byte sources, the grant spent inside the server, downloadable and playable offline -- see [Google Drive files](docs/proxy.md#google-drive-files) | -- |
 | **Archives** | ZIP, 7Z, TAR, RAR and ISO 9660/UDF read as byte ranges of wherever the archive lives -- nothing downloaded, nothing extracted; a member that would have to be decoded is refused with a sentence -- see [Archive members](docs/api.md#archive-members) | Extracted through native readers |
-| **Casting** | A second, media-only listener a cast session turns on and off -- see [LAN media listener](docs/lan-media.md) | SSDP discovery and a casting API |
+| **Casting** | A second listener a cast session turns on and off, serving only the ids the app published for it, each under a random token that unpublishing (or the listener's stop) cuts mid-body -- see [LAN media listener](docs/lan-media.md) | SSDP discovery and a casting API |
 | **Startup honesty** | `phase`, the in-flight piece, tracker scrapes of the swarm, DHT health -- see [Startup phases](docs/stats.md#startup-phases-in-statsjson) | Progress percentages |
 | **Thin swarms** | A proven peer of a starving torrent is re-dialled on a flat 60 s -- see [thin-swarm redial](docs/design/thin-swarm-redial.md) | -- |
 
@@ -81,7 +81,7 @@ let token = handle.auth_token().map(str::to_string); // control-route bearer
 
 **The app does not speak HTTP to this server.** It calls `ServerHandle` methods, in-process, over FFI. HTTP exists for exactly two callers, and `build_router()` (`server/src/lib.rs`) is split along that line:
 
-- **Players fetch media by URL** -- mpv, or a Chromecast receiver through the [LAN media listener](docs/lan-media.md). They cannot attach a header, so the **media routes are open**: torrent streams, archive members, `/proxy`, `/drive/stream`, `/ftp`, a finished download's `/downloads/{key}/stream`, and the `/local-addon` stub stremio-core's default profile asks for.
+- **Players fetch media by URL** -- mpv, or a Chromecast receiver through the [LAN media listener](docs/lan-media.md), which serves `/cast/{token}` for the ids the app published and nothing else. They cannot attach a header, so the **media routes are open**: torrent streams, archive members, `/proxy`, `/drive/stream`, `/ftp`, a finished download's `/downloads/{key}/stream`, and the `/local-addon` stub stremio-core's default profile asks for.
 - **stremio-core's `StreamingServer` model speaks Stremio's streaming-server protocol** through the app's `Env::fetch`, which attaches the bearer. Those paths -- `/settings`, `/create`, `/{infoHash}/create`, `/{infoHash}/{fileIdx}/stats.json`, `/network-info`, `/device-info`, `/get-https`, `/casting`, `/casting/{devID}/player` -- are the whole of the **control routes**, and every one requires `Authorization: Bearer <token>`, in the header only.
 
 **There is no third caller, and no control route is added.** A new capability is a `ServerHandle` method; a new byte-serving URL for a player is a media route; a path joins the control routes only when the stremio-core fork starts calling it, which is a change to that fork first. The control routes that mirrored the embed API are gone ([Removed routes](docs/api.md#removed-routes)).
@@ -145,7 +145,7 @@ Two crates, and neither builds a binary: `server` is the library an embedder lin
 | [docs/settings.md](docs/settings.md) | Every settings key, the buffer profiles, the `bt*` torrent settings |
 | [docs/storage.md](docs/storage.md) | Offline downloads, what bounds the cache, cache usage and cleaning |
 | [docs/proxy.md](docs/proxy.md) | `/proxy` (redirects, playlists, credentials, caching, read-ahead), ending a proxied stream, Google Drive |
-| [docs/lan-media.md](docs/lan-media.md) | The media-only listener a cast session turns on |
+| [docs/lan-media.md](docs/lan-media.md) | The listener a cast session turns on: published tokens, and nothing else |
 | [docs/known-issues.md](docs/known-issues.md) | What is open, and the standing hazards of working in this repo |
 | [docs/design/](docs/design/) | Design notes for built features: [read-pattern retention](docs/design/read-pattern-retention.md), [translated sources](docs/design/translated-sources.md), [generic downloads](docs/design/generic-downloads.md), [thin-swarm redial](docs/design/thin-swarm-redial.md); proposed: [media pipeline](docs/design/media-pipeline.md) |
 

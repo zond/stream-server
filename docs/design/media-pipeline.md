@@ -42,6 +42,11 @@ deleted as each lands.
 | Archive the app sniffed (a debrid `.rar`, a torrent whose file is a `.zip` or `.iso`) | mpv fails, `archive_sniff.dart` reads the first `0x8006` bytes, `archive_route.dart` posts `/{fmt}/create` (or the `torrent:` key form) and replays on the member URL. | The member URL is on `archive_stream_routes()`, which the LAN mounts. Works, sharing nothing. |
 | Local file (SAF, Downloads folder) | Not offered by the server. | -- |
 
+*(Since step C the "Cast" column is history: every row with an id casts by
+publishing it (`ServerHandle::publish`, §2.7), served under one token
+route; only an origin that will not range is refused there, `501`
+`noRanges`, since nothing on the device can seek it for a receiver.)*
+
 So four casts `404` today (URL, Drive, URL/Drive download, addon-declared
 archive), and the app's watchdog cannot tell: `LanMedia::record_request`
 counts every request that reaches the listener, **including the ones answered
@@ -421,9 +426,18 @@ it again from nothing.
 
 ```rust
 pub struct CastToken(String);            // 128 random bits, hex; never an id
-fn publish(&self, id: &MediaId) -> anyhow::Result<CastToken>;
-fn unpublish(&self, token: &CastToken);
+fn publish(&self, id: &MediaId, play: Option<PlayToken>) -> anyhow::Result<CastToken>;
+fn unpublish(&self, token: &CastToken) -> bool;
 ```
+
+*(Done, step C: `server/src/cast.rs`. The body is read on the runtime
+through `Registry::open_source` -- `open_reader`'s open without the reader
+task -- and `ByteSource::open` at the range's start; `CastBody` holds the
+source and the id's lease and polls the token's cut before every chunk.
+Publishing is refused while the listener is not running, so a token never
+outlives the stop that would have unpublished it; the publication's lease
+keeps the id from eviction. A link whose host will not range is `501`
+`noRanges` on the route.)*
 
 The LAN listener mounts **one** route, `GET/HEAD /cast/{token}`, which
 serves the id the token was published for with the shared range framing
@@ -590,7 +604,7 @@ capability is a method, never a control route):
 | `resolve(&MediaId) -> Result<Resolved, Refusal>` | Adds/finds, probes, sniffs; cached on the entry. |
 | `open_reader(&MediaId, Option<PlayToken>) -> Result<MediaReader, Refusal>` | 2.4. Blocking calls on the reader; never an async API across FFI. |
 | `set_buffer(&MediaId, BufferProfile)` | Applies to the reader's next open. |
-| `publish(&MediaId) -> CastToken` / `unpublish(&CastToken)` | 2.7. |
+| `publish(&MediaId, Option<PlayToken>) -> Result<CastToken>` / `unpublish(&CastToken) -> bool` | 2.7. *(Done, step C.)* |
 | `pin(&MediaId) -> Result<DownloadInfo, PinError>` / `unpin(&MediaId, bool) -> UnpinOutcome` | 2.6. |
 | `stream_numbers`, `note_duration`, `note_player_opened`, `note_player_stalled`, `close_streams` | As today, keyed by id. |
 
@@ -624,7 +638,11 @@ As each step lands, not beside it:
   construction. About ten tests (`embed.rs`'s LAN group,
   `log_redaction.rs`) and the LAN passages of README, AGENTS.md,
   `docs/api.md`, `docs/lan-media.md`, `docs/proxy.md`, `docs/settings.md` and
-  translated-sources' §3 change with it.
+  translated-sources' §3 change with it. *(Done, step C: the three
+  functions, the LAN handlers and `EngineAccess` are gone -- the loopback
+  stream route's `engine_for_request` only creates -- and every old LAN path
+  is `404` there, `embed.rs`'s
+  `lan_media_listener_serves_published_tokens_and_nothing_else`.)*
 * **The remote-streaming-server case.** Dead already (`pin_to_embedded`);
   the app's leftovers go in their own PR, and nothing here re-grows one.
 * **The app's URL rewriting for mpv**, once A' lands: `proxiedThroughServer`
@@ -717,7 +735,11 @@ C. **Publish and the cast route.** (M.) 2.7 whole: tokens, `/cast/{token}`,
    the body wrapper, `set_lan_media(false)` unpublishing, `log_path`, the
    bodies count and the app's three-way check. Deletes the allow-list.
    Tests: each of §1's cases casts; an unknown token is `404`; `unpublish`
-   ends a body mid-stream; no token reaches a log line.
+   ends a body mid-stream; no token reaches a log line. *(Done:
+   `server/src/cast.rs`, `ServerHandle::{publish, unpublish,
+   lan_media_bodies_served}`, `server/tests/cast.rs`; the three-way reading
+   is in `docs/lan-media.md`. Left for the app: publishing per cast instead
+   of rebuilding a URL on the LAN base, and the three-way check.)*
 
 D. **Pins by id; one pin set; the directory.** (S-M.) `pin(id)`,
    `PinKey`, the rename, the boot delete, `NOT_OURS`, and the held-nothing

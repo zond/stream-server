@@ -1,6 +1,6 @@
 # LAN media listener
 
-The second, media-only listener a cast session turns on so a receiver on the local network can fetch what this device already has.
+The second listener a cast session turns on so a receiver on the local network can fetch what the app published for it -- by token, and nothing else.
 
 A cast receiver is not on loopback. `ServerConfig::default()` binds
 `127.0.0.1` only, so a Chromecast cannot fetch a byte from it -- casting is
@@ -8,15 +8,46 @@ blocked before the media is even prepared. Widening that bind is not the fix:
 it would put `/settings`, the stats route and `/create` on the local
 network behind nothing but a bearer token.
 
-So there is a **second listener** instead, and it serves media routes only.
+So there is a **second listener** instead, and it serves **published cast
+tokens and nothing else**.
 
 | | |
 |---|---|
-| **What it exposes** | An explicit allow-list (`lan_media_routes()` in [`server/src/lib.rs`](../server/src/lib.rs)), not `media_router()` itself: exactly what a cast receiver needs, which is the bytes of something this device already has. `/{infoHash}/{fileIdx}` and `/stream/…` over torrents that exist -- an unknown hash is a `404` and `tr=` is ignored, where on loopback the same request would create the torrent with the caller's trackers -- and the archive `/{fmt}/stream/…` routes over sessions loopback already created. `/proxy`, `/ftp`, every `/create` and the `/local-addon` stub are deliberately absent -- see below |
-| **What it does not** | The control router is **not mounted on it at all**, not even behind the bearer middleware. A control path there is a path this listener does not serve, and never the `401` that would confirm the route exists and only a token is missing: `404` for a path nothing matches, and, where a two-segment one (`/{infoHash}/create`) collides with the `/{infoHash}/{fileIdx}` pattern, the `405` that route answers a method it does not take with, or on a `GET`/`HEAD` its own `404` for a hash this server does not hold. There is no token on that listener to guess, leak or brute-force. `/proxy` and `/ftp` are likewise unmounted and answer the same way |
+| **What it exposes** | One route, `GET`/`HEAD` `/cast/{token}` ([`server/src/cast.rs`](../server/src/cast.rs)). The app publishes a media id for a cast (`ServerHandle::publish(&MediaId, Option<PlayToken>) -> CastToken`) and hands the receiver `<lan_media_base_url>/cast/<token>`; the route serves what the id resolves to -- a torrent file, a link through `/proxy`'s cache, a Google Drive file, a finished download, a member of an archive -- with the range framing every media route shares (`200`/`206`/`416`, `Content-Range`, `HEAD`, the DLNA headers). An unknown token is a `404`. A link whose origin will not serve ranges is refused (`501`, `{"refused":"noRanges"}`): nothing here can seek it for a receiver |
+| **What it does not** | Every other path is a `404`, every method: the control router is **not mounted at all** (a control path answers `404`, never the `401` that would confirm the route exists and only a bearer token is missing), and neither is any loopback media route -- not the torrent routes, the archive routes, `/proxy`, `/ftp`, `/drive/stream`, `/downloads/{key}/stream` or `/local-addon` |
 | **Where it binds** | `ServerConfig::lan_media_addr: Option<SocketAddr>` -- `None` by default, so nothing changes unless an embedder asks for it. `Some(0.0.0.0:0)` lets the OS pick the port |
 | **When it runs** | `ServerHandle::set_lan_media(true)` starts it, `set_lan_media(false)` stops it -- meant to bracket a cast session, so the LAN surface exists only while something is casting. Nothing is bound at startup, whatever the configuration: a port already in use fails the cast that asked for the listener, never the server |
-| **How it is switched off entirely** | The `lanMediaEnabled` setting (`POST /settings`, **`false` by default**). While it is false, `set_lan_media(true)` is refused; setting it back to false also stops a listener that is already running |
+| **How it is switched off entirely** | The `lanMediaEnabled` setting (`POST /settings`, **`false` by default**). While it is false, `set_lan_media(true)` is refused; setting it back to false also stops a listener that is already running, which unpublishes every token |
+
+## Tokens
+
+A cast token is **128 random bits, hex, never derived from the id**: a
+receiver that saw one learns nothing about another, or about the id. Tokens
+live in memory only.
+
+* **Publishing needs the listener running** (`set_lan_media(true)` first),
+  and an id this server holds (`register` issued it and it has not been let
+  go). The publication **holds the id** as an open reader does, so the id
+  is not evicted while it is cast.
+* **With a play token**, the receiver's reads are the viewer's playback --
+  the same rules `open_reader` applies: the play session moves to the file,
+  and it shares as the app's own player's would. Each `GET` opens the id's
+  source as a reader does; a torrent's stream registers at the open and
+  ends when the body is dropped. Without a play token the reads are an
+  aside, which moves no session and shares nothing.
+* **`unpublish(&CastToken)` cuts the bytes.** Nothing more is served under
+  the token (`404`), and every body being served under it ends at once:
+  each cast body polls its token's cut before every chunk, so even a body
+  parked on a piece nobody has is woken, and it ends with an **error** --
+  the connection is dropped, and the receiver reads a broken source rather
+  than a file that ended early.
+* **Stopping the listener unpublishes every token** -- `set_lan_media(false)`,
+  the `lanMediaEnabled` veto revoked, the server's own stop -- so it stops
+  the bytes too, not only new fetches.
+* **A token is never logged.** `/cast/<token>` is written as `/cast` in
+  every request line and span (`routes::util::log_path`, beside `/proxy`
+  and `/ftp`), and `CastToken`'s `Debug` prints no token: a token in a log
+  file is a URL into this device for as long as it is published.
 
 `ServerHandle::lan_media_base_url(for_peer)` builds the URL to hand a receiver:
 the host is the local interface that shares `for_peer`'s subnet, taken from the
@@ -50,48 +81,56 @@ routable address is cellular is still offered it rather than nothing.
 listener reports on itself. Every answer `lan_media_base_url` gives is logged
 at INFO -- the peer, the interface picked and the URL -- as is each of the ways
 it can answer `None`, and so is every request that reaches the listener
-(method, path, peer). `ServerHandle::lan_media_requests_served()` is the same
-arrival count as a number: it starts at zero on every start -- whether or not
-a listener was already running, since starting a cast to a second receiver
-mid-session asks about that cast and not the one before it -- counts each
-request the listener receives (a `404` from the fallbacks included -- the
-receiver still got here), never carries over from the previous session, and
-is back to zero once the listener has been stopped.
+(method, path with the token elided, peer). Two counts read the same
+session from the outside, both reset by every start (whether or not a
+listener was already running, since starting a cast to a second receiver
+mid-session asks about that cast and not the one before it) and by every
+stop, and never carried over:
 
-A receiver told an address it cannot route to reports no error at all, because
-a TCP connect to an unroutable host hangs rather than failing; from the sofa
-that is indistinguishable from buffering. A count still at zero well after a
-load is what tells the two apart, and it is worth different words: nothing
-reached this device, so the address was wrong -- as opposed to a non-zero count,
-where the receiver fetched the stream and the problem is the media. The
-addresses in those log lines are private ones on the user's own LAN, and the
-one thing that is secret, the bearer token, is never on this listener at all.
+* `ServerHandle::lan_media_requests_served()` -- every request the listener
+  receives, a `404` included: the receiver got here.
+* `ServerHandle::lan_media_bodies_served()` -- every `/cast` `GET` that began
+  sending bytes; never a `HEAD`, an unknown token's `404` or a refusal.
 
-**Stopping closes the door, not the connections already through it.**
-`set_lan_media(false)` aborts the serving task and awaits it, so by the time
-the call returns the listener socket is closed and the port is free (it
-rebinds immediately): nothing new is accepted, and a connection idling on
-keep-alive is closed without serving another request. A response that is
-*already* streaming is **not** cut -- axum spawns each accepted connection into
-its own task, and dropping the serve future asks those to shut down
-gracefully, which finishes the response in flight -- so a receiver mid-file
-keeps being fed until it has the whole thing or hangs up. The call is still
-not a drain, which is the point: it returns at once rather than waiting out a
-movie-length response, so ending a cast session or revoking `lanMediaEnabled`
-never blocks. But it is not a kill switch for bytes already on the wire, and
-the server has none; stopping the LAN listener stops new fetches. The loopback
+A receiver told an address it cannot route to reports no error at all,
+because a TCP connect to an unroutable host hangs rather than failing; from
+the sofa that is indistinguishable from buffering. So the app's check, some
+seconds after the receiver was told to load, has **three readings**:
+
+| Requests | Bodies | Reading | What to do |
+|---|---|---|---|
+| 0 | 0 | Nothing reached this device: the address is wrong (another interface, a client-isolated Wi-Fi, a firewall). | End the session and say the receiver cannot reach this device. |
+| > 0 | 0 | The receiver reached this device and was served nothing: a token it was not given, or an id that would not open (the refusal is in the log). | End the session and say so -- the network is fine. |
+| > 0 | > 0 | The network and the server did their part. | Leave it to the media. |
+
+The addresses in those log lines are private ones on the user's own LAN;
+the bearer token is never on this listener, and a cast token is never in a
+log line.
+
+**Stopping closes the door and stops the bytes.**
+`set_lan_media(false)` unpublishes every token -- which cuts every cast body
+in flight -- then aborts the serving task and awaits it, so by the time the
+call returns the listener socket is closed and the port is free (it rebinds
+immediately), nothing new is accepted, and a connection idling on
+keep-alive is closed without serving another request. The call is not a
+drain: it returns at once rather than waiting for a receiver, so ending a
+cast session or revoking `lanMediaEnabled` never blocks. The loopback
 listener owns a different socket and a different serve future; it and every
 request in flight on it are untouched.
 
-**The trade-off, stated plainly.** While the listener is up, *anyone* on the
-same network can fetch media from this server: the media routes are open by
-design (players cannot attach headers), so there is no authentication on that
-port at all. Anyone who can guess or observe an info hash can pull that file
-out of the piece cache. That is why it is off by default, why it is meant to
-be held open only for the length of a cast session, and why `lanMediaEnabled`
-exists as an operator veto that no embedder call can override.
-
-**Nothing a stranger could make this device *do* is on it.** The test of a route belonging on the LAN is that it serves bytes the loopback side has already arranged and cannot be made to arrange anything. `/proxy` and `/ftp` fail it outright -- each fetches a caller-named remote URL, which makes it an open proxy for whoever can reach it -- and so do the archive `/create` routes, which fetch an index from a caller-named URL, and the loopback stream route's first request for an info hash, which starts a torrent with the caller's trackers on this device's disk and connection (the LAN's stream route only looks a hash up, `EngineAccess::ExistingOnly`). That is tolerable on loopback -- which is not "only this app": every app on the device reaches it, and so does every page a browser on it has open, which is why loopback answers no CORS -- but not on a listener the whole LAN can reach. (A host that binds the main listener to `0.0.0.0` makes them reachable anyway -- see the [README](../README.md#quick-start).) The consequence is deliberate: a stream stremio-core plays *through* `/proxy` (an addon stream that needs request headers a player cannot attach) cannot be cast from this listener. Casting it needs another path -- the client resolving it itself, or an addon that hands out a header-free URL -- and the server does not paper over the gap by widening the LAN surface.
+**The trade-off, stated plainly.** While a token is published, *anyone* on
+the same network who learns the URL can fetch that one file: a receiver
+cannot attach a header, so there is no authentication on that port beyond
+the token itself. What they cannot do is anything else -- guess another
+token, walk a Drive account or the piece cache by info hash, or make this
+device fetch, add or open anything: there is no route on this listener that
+names a torrent, a URL or a file, so a stranger can only read what the app
+chose to cast, for as long as it chose to. That is why the listener is off
+by default, why it is meant to be held open only for the length of a cast
+session, and why `lanMediaEnabled` exists as an operator veto that no
+embedder call can override. (A host that binds the *main* listener to
+`0.0.0.0` exposes its routes anyway -- see the
+[README](../README.md#quick-start).)
 
 CORS is set up for what a receiver needs (`lan_cors_layer` in
 `server/src/lib.rs`): any origin and method; `Accept`, `Accept-Encoding`,

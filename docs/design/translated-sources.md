@@ -362,9 +362,10 @@ Nothing the client sends changes.
   `{ "refused": "<Refusal>", "message": "<one sentence>" }`; the player
   shows the message (xtremio's `archive_sniff` already has the place for it).
 * `GET/HEAD /{fmt}/stream/{key}/{member}`: `MemberView` + the shared range
-  framing. Same on the LAN listener (`archive_stream_routes`): a Cast
-  receiver reads a member of a session loopback created, and since the
-  session holds no file this is unchanged.
+  framing, on loopback. A Cast receiver no longer reads this route: the
+  LAN listener serves published cast tokens and nothing else
+  (`docs/design/media-pipeline.md` §2.7), and a member is cast by
+  publishing its media id, whose body is the same view and framing.
 * The `torrent:` key form (`torrent:<hash>/<path in torrent>`): the source
   is `TorrentFileSource`, the format is the path's suffix, sibling volumes
   are found in the torrent's file list; otherwise identical. `iso` joins

@@ -195,7 +195,8 @@ pub fn router(format: Format) -> Router<AppState> {
 /// volume list, from wherever the caller names -- reads its index off it
 /// and remembers that, with the member chosen, under a key. Loopback only:
 /// it reaches out to a caller-named address, which is why the LAN listener
-/// never mounts this half (see `crate::lan_media_routes`).
+/// never mounts any of this: it serves published cast tokens alone
+/// (`crate::cast`).
 pub fn session_router(format: Format) -> Router<AppState> {
     Router::new()
         .route(
@@ -213,7 +214,7 @@ pub fn session_router(format: Format) -> Router<AppState> {
 
 /// The byte-serving half: a member read out of a session [`session_router`]
 /// already created. Nothing here fetches, opens or names anything -- an
-/// unknown key is a `404` -- which is what lets the LAN listener mount it.
+/// unknown key is a `404`.
 pub fn stream_router(format: Format) -> Router<AppState> {
     Router::new()
         .route("/stream", get(stream_content_query))

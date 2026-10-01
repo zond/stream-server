@@ -467,6 +467,28 @@ impl Registry {
         id: &MediaId,
         play: Option<PlayToken>,
     ) -> Result<MediaReader, Refusal> {
+        let (entry, source) = self.open_source(state, id, play).await?;
+        reader::open(entry, source).await
+    }
+
+    /// A lease on `id`'s entry, so it is not evicted while it is held: what
+    /// a published cast holds for as long as it is published
+    /// (`crate::cast`), as an open reader does.
+    pub(crate) fn lease(&self, id: &MediaId) -> Result<Lease<Entry>, Refusal> {
+        self.entry(id)
+    }
+
+    /// The source a reader over `id` reads, resolving it first if nothing
+    /// has, with the lease on its entry: [`Self::open_reader`]'s open
+    /// without the reader task, for a caller that reads it on the runtime
+    /// itself -- a cast body (`crate::cast`). The same play rules, and the
+    /// stream registered by the source's first open, ended by its drop.
+    pub(crate) async fn open_source(
+        &self,
+        state: &AppState,
+        id: &MediaId,
+        play: Option<PlayToken>,
+    ) -> Result<(Lease<Entry>, Source), Refusal> {
         let entry = self.entry(id)?;
         let resolution = entry.resolution(state).await?;
         // `set_buffer` outranks the token's buffer, which is only where a
@@ -581,7 +603,7 @@ impl Registry {
                 open_member(state, session, name, play, set_buffer).await?
             }
         };
-        reader::open(entry, source).await
+        Ok((entry, source))
     }
 }
 

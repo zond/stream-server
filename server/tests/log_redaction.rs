@@ -113,8 +113,9 @@ fn a_caller_supplied_url_is_logged_as_its_origin_only() -> anyhow::Result<()> {
         .send()?;
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
     // And one whose *path* carries the target: `/proxy` is not mounted on
-    // the LAN media listener, so a request for it there is unhandled -- and
-    // that path is the Core spelling, target and `h=` headers included.
+    // the LAN media listener (it serves `/cast/{token}` alone), so a request
+    // for it there is unhandled -- and that path is the Core spelling,
+    // target and `h=` headers included.
     handle.update_settings(serde_json::json!({ "lanMediaEnabled": true }))?;
     let lan = handle
         .set_lan_media(true)?
@@ -126,6 +127,41 @@ fn a_caller_supplied_url_is_logged_as_its_origin_only() -> anyhow::Result<()> {
         ))
         .send()?;
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // A cast token is a URL into this device for as long as it is
+    // published: requested on the LAN listener -- answered (the id's origin
+    // is dead, so a refusal), with a method the route does not take,
+    // unpublished -- it must reach no line, and neither may an unknown one.
+    let id = handle.register(stream_server::MediaSpec::StreamingUrl(
+        stream_server::Url::parse(&format!("{base}/proxy/?d={encoded}"))?,
+    ))?;
+    let token = handle.publish(&id, None)?;
+    let cast = format!("http://{lan}/cast/{}", token.as_str());
+    assert_eq!(
+        client.get(&cast).send()?.status(),
+        reqwest::StatusCode::BAD_GATEWAY
+    );
+    assert_eq!(
+        client.head(&cast).send()?.status(),
+        reqwest::StatusCode::BAD_GATEWAY
+    );
+    assert_eq!(
+        client.post(&cast).send()?.status(),
+        reqwest::StatusCode::METHOD_NOT_ALLOWED
+    );
+    assert!(handle.unpublish(&token));
+    assert_eq!(
+        client.get(&cast).send()?.status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    let unknown = "0123456789abcdef0123456789abcdef";
+    assert_eq!(
+        client
+            .get(format!("http://{lan}/cast/{unknown}"))
+            .send()?
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
 
     // An archive create, whose download is logged at INFO and whose failure
     // at ERROR.
@@ -152,6 +188,20 @@ fn a_caller_supplied_url_is_logged_as_its_origin_only() -> anyhow::Result<()> {
         logs.contains("\"path\":\"/proxy\""),
         "the request span names the route it was: {logs}"
     );
+    assert!(
+        logs.contains("\"path\":\"/cast\""),
+        "and the LAN request span names the cast route: {logs}"
+    );
+    for token in [token.as_str(), unknown] {
+        assert!(
+            !logs.contains(token),
+            "a cast token reached the log files: {}",
+            logs.lines()
+                .filter(|line| line.contains(token))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
     assert!(
         logs.contains("http://127.0.0.1:1\""),
         "and the archive's origin is what a field report is read for: {logs}"

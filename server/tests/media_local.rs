@@ -299,7 +299,11 @@ fn rust_files(dir: &Path, into: &mut Vec<PathBuf>) {
 ///   extractor can take one -- a compile-time check;
 /// * no handler under `routes/`, nothing in the LAN listener, and none of
 ///   the router builders in `lib.rs` names `MediaSpec`, `LocalFile`, a
-///   `MediaId` or the registry (`.media.`), comments aside.
+///   `MediaId` or the registry (`.media.`), comments aside;
+/// * the one route that does reach the registry, the LAN listener's
+///   `/cast/{token}` (`cast.rs`), names no `MediaSpec` or `LocalFile`,
+///   makes no `MediaId` and registers nothing: it reaches the registry only
+///   by the id the app published (`publication.id`).
 #[test]
 fn no_http_route_takes_a_media_spec() {
     <MediaSpec as NotFromABody<_>>::check();
@@ -316,7 +320,7 @@ fn no_http_route_takes_a_media_spec() {
     for router in [
         "build_router",
         "media_router",
-        "lan_media_routes",
+        "build_lan_media_router",
         "control_router",
     ] {
         texts.push((
@@ -340,5 +344,38 @@ fn no_http_route_takes_a_media_spec() {
                 );
             }
         }
+    }
+
+    let cast = source_of(&src.join("cast.rs"));
+    let mut code = String::new();
+    for (number, line) in cast.lines().enumerate() {
+        let line_code = line.split("//").next().unwrap_or_default();
+        for needle in ["MediaSpec", "LocalFile", "MediaId::from", "register("] {
+            assert!(
+                !line_code.contains(needle),
+                "cast.rs:{}: the cast route names `{needle}`: {line}",
+                number + 1
+            );
+        }
+        code.extend(line_code.chars().filter(|c| !c.is_whitespace()));
+    }
+    // Every call into the registry, its arguments included, names the
+    // published id and nothing else.
+    let calls: Vec<&str> = code
+        .match_indices(".media.")
+        .map(|(at, _)| {
+            let call = &code[at..];
+            &call[..call.find(".await").unwrap_or(call.len())]
+        })
+        .collect();
+    assert!(
+        !calls.is_empty(),
+        "the cast route no longer reaches the registry"
+    );
+    for call in calls {
+        assert!(
+            call.contains("&publication.id"),
+            "the cast route reaches the registry by something other than a published id: {call}"
+        );
     }
 }

@@ -62,12 +62,10 @@
 //!
 //! # Not on the LAN listener
 //!
-//! [`stream_routes`] is deliberately absent from `crate::lan_media_routes`.
-//! The bytes are one account's private file, fetched with this device's
-//! grant; a cast receiver is an unauthenticated stranger on the network,
-//! and the rule that listener is built on is that a group is added by name
-//! before it serves it. Nothing about casting a Drive file is designed
-//! yet, so the safe default holds.
+//! [`stream_routes`] is loopback only, like every route: the LAN listener
+//! serves published cast tokens and nothing else (`crate::cast`). A Drive
+//! file is cast by publishing its media id, so the receiver sees one file
+//! under a random token, never a Drive route it could walk.
 
 use crate::routes::archive::media_body;
 use crate::routes::util::{self, MediaRange};

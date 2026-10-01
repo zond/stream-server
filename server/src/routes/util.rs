@@ -160,16 +160,18 @@ pub(crate) fn log_origin(url: &str) -> String {
         .unwrap_or_else(|_| "<unparsed>".to_string())
 }
 
-/// The path of a request as a log may carry it: everything under `/proxy`
-/// and `/ftp` is elided to the route itself.
+/// The path of a request as a log may carry it: everything under `/proxy`,
+/// `/ftp` and `/cast` is elided to the route itself.
 ///
 /// `/proxy` takes its target in the *path* as well as the query (the Core
 /// format is `/proxy/d=<url>&h=<header>/<name>`), so a request span built
 /// from `uri.path()` carried the proxied URL and the caller's `h=` headers
 /// -- `Authorization` among them -- into every line written under that
-/// span. `/ftp` spells its target the same way.
+/// span. `/ftp` spells its target the same way. A `/cast/<token>` path is
+/// a URL into this device for as long as the token is published
+/// (`crate::cast`), and anyone on the LAN who read it could fetch the film.
 pub(crate) fn log_path(path: &str) -> &str {
-    for route in ["/proxy", "/ftp"] {
+    for route in ["/proxy", "/ftp", "/cast"] {
         if path == route || path.starts_with(&format!("{route}/")) {
             return route;
         }
@@ -387,7 +389,7 @@ mod log_redaction_tests {
     /// And a request span may not carry `/proxy`'s target, which lives in
     /// the path as well as the query.
     #[test]
-    fn log_path_elides_the_proxy_and_ftp_targets() {
+    fn log_path_elides_the_proxy_and_ftp_targets_and_the_cast_token() {
         assert_eq!(
             log_path(
                 "/proxy/d=https%3A%2F%2Fcdn.example%2Ffilm.mkv&h=Authorization%3ABearer%20x/film.mkv"
@@ -400,8 +402,11 @@ mod log_redaction_tests {
             log_path("/ftp/ftp%3A%2F%2Fuser%3Apass%40host%2Ffilm.mkv"),
             "/ftp"
         );
+        assert_eq!(log_path("/cast/00112233445566778899aabbccddeeff"), "/cast");
+        assert_eq!(log_path("/cast/0011/hls/master.m3u8"), "/cast");
         assert_eq!(log_path("/settings"), "/settings");
         assert_eq!(log_path("/proxying/x"), "/proxying/x");
+        assert_eq!(log_path("/castle/x"), "/castle/x");
     }
 }
 

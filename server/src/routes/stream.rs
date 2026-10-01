@@ -798,56 +798,26 @@ async fn free_the_slack_within(
     }
 }
 
-/// How a stream request may come by its torrent -- the one thing that
-/// differs between the two listeners serving these handlers.
+/// The engine a stream request is about: an existing one, or one created
+/// from the info hash with the request's `tr=` trackers -- a stream URL is
+/// how stremio-core starts a torrent at all. The error is the status and
+/// body to answer instead.
 ///
-/// On loopback a stream URL is how stremio-core starts a torrent at all:
-/// the first `GET /{infoHash}/{fileIdx}` for a hash creates the engine,
-/// with the request's `tr=` trackers, and everything downstream (stats
-/// polls, the pin route) is built on that. The LAN media listener exists
-/// for a receiver to fetch what this device is already playing, and a
-/// receiver has no business naming torrents: with the creating behaviour
-/// mounted there, anyone on the network could start a download, with their
-/// own trackers, on this device's disk and connection, unauthenticated.
-/// The LAN variant therefore answers only for a torrent the server already
-/// has and ignores `tr=` outright -- trackers only count on creation, and
-/// it never creates.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EngineAccess {
-    /// An existing engine, or one created from the info hash with the
-    /// request's trackers -- the loopback listener.
-    CreateIfMissing,
-    /// An existing engine or nothing -- the LAN media listener. An unknown
-    /// hash is a `404`, and no magnet add is started or joined.
-    ExistingOnly,
-}
-
-/// The engine a stream request is about, by [`EngineAccess`]; the error is
-/// the status and body to answer instead.
+/// Loopback only: the LAN listener serves published cast tokens and no
+/// stream route (`crate::cast`), so nothing on the network can make this
+/// device start a torrent.
 async fn engine_for_request(
     engine_fs: &EngineFS,
-    access: EngineAccess,
     info_hash: &str,
     query_str: Option<&str>,
     handler: &'static str,
 ) -> Result<Arc<Engine<LibrqbitHandle>>, (StatusCode, String)> {
-    match access {
-        EngineAccess::CreateIfMissing => {
-            compat::get_or_create_engine(engine_fs, info_hash, query_str)
-                .await
-                .map_err(|error| {
-                    tracing::error!(info_hash, error = %error, "{handler} failed to create engine");
-                    compat::engine_creation_failure(&error)
-                })
-        }
-        EngineAccess::ExistingOnly => engine_fs.get_engine(info_hash).await.ok_or_else(|| {
-            tracing::info!(
-                info_hash,
-                "{handler}: LAN media request for a torrent this server does not have"
-            );
-            (StatusCode::NOT_FOUND, "Unknown torrent".to_string())
-        }),
-    }
+    compat::get_or_create_engine(engine_fs, info_hash, query_str)
+        .await
+        .map_err(|error| {
+            tracing::error!(info_hash, error = %error, "{handler} failed to create engine");
+            compat::engine_creation_failure(&error)
+        })
 }
 
 /// A number for a stream's log lines, unique in this process: what ties a
@@ -1130,44 +1100,6 @@ pub async fn head_stream_video(
     Path((info_hash, requested_idx)): Path<(String, String)>,
     RawQuery(query_str): RawQuery,
 ) -> Response {
-    head_stream_video_with(
-        state,
-        headers,
-        info_hash,
-        requested_idx,
-        query_str,
-        EngineAccess::CreateIfMissing,
-    )
-    .await
-}
-
-/// [`head_stream_video`] as the LAN media listener mounts it: existing
-/// torrents only (see [`EngineAccess::ExistingOnly`]).
-pub async fn lan_head_stream_video(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((info_hash, requested_idx)): Path<(String, String)>,
-    RawQuery(query_str): RawQuery,
-) -> Response {
-    head_stream_video_with(
-        state,
-        headers,
-        info_hash,
-        requested_idx,
-        query_str,
-        EngineAccess::ExistingOnly,
-    )
-    .await
-}
-
-async fn head_stream_video_with(
-    state: AppState,
-    headers: HeaderMap,
-    info_hash: String,
-    requested_idx: String,
-    query_str: Option<String>,
-    access: EngineAccess,
-) -> Response {
     let request_start = Instant::now();
     let info_hash = info_hash.to_lowercase();
     let query = PlaybackQuery::parse(query_str.as_deref());
@@ -1176,7 +1108,6 @@ async fn head_stream_video_with(
 
     let engine = match engine_for_request(
         &engine_fs,
-        access,
         &info_hash,
         query_str.as_deref(),
         "head_stream_video",
@@ -1251,44 +1182,6 @@ pub async fn stream_video(
     Path((info_hash, requested_idx)): Path<(String, String)>,
     RawQuery(query_str): RawQuery,
 ) -> Response {
-    stream_video_with(
-        state,
-        headers,
-        info_hash,
-        requested_idx,
-        query_str,
-        EngineAccess::CreateIfMissing,
-    )
-    .await
-}
-
-/// [`stream_video`] as the LAN media listener mounts it: existing torrents
-/// only (see [`EngineAccess::ExistingOnly`]).
-pub async fn lan_stream_video(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((info_hash, requested_idx)): Path<(String, String)>,
-    RawQuery(query_str): RawQuery,
-) -> Response {
-    stream_video_with(
-        state,
-        headers,
-        info_hash,
-        requested_idx,
-        query_str,
-        EngineAccess::ExistingOnly,
-    )
-    .await
-}
-
-async fn stream_video_with(
-    state: AppState,
-    headers: HeaderMap,
-    info_hash: String,
-    requested_idx: String,
-    query_str: Option<String>,
-    access: EngineAccess,
-) -> Response {
     let request_start = Instant::now();
     let info_hash = info_hash.to_lowercase();
     let stream_id = next_stream_id();
@@ -1307,7 +1200,6 @@ async fn stream_video_with(
     // with the request's trackers.
     let engine = match engine_for_request(
         &engine_fs,
-        access,
         &info_hash,
         query_str.as_deref(),
         "stream_video",

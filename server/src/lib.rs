@@ -20,6 +20,8 @@ pub use routes::downloads::{DownloadInfo, ProxyDownloadRequest};
 // call the method but not write down the result of -- and `DriveError`
 // with them, because `DriveOpenError::Drive` carries one and an embedder
 // that cannot name it cannot construct or match the case that matters.
+/// What [`ServerHandle::publish`] answers: the last segment of a cast URL.
+pub use cast::CastToken;
 pub use media::{
     Canceller, GrantSupplier, LocalFile, MediaId, MediaReader, MediaSpec, MemberInfo, PlayToken,
     Refusal, Resolved,
@@ -106,6 +108,9 @@ const LEGACY_ARCHIVE_SCRATCH_DIR: &str = ".archives";
 mod auth;
 mod cache_budget;
 mod cache_cleaner;
+/// Cast by published token: the one route the LAN media listener serves
+/// (`docs/design/media-pipeline.md` §2.7).
+pub mod cast;
 mod devices;
 mod diagnostics;
 pub mod images;
@@ -203,11 +208,11 @@ pub struct ServerConfig {
     /// [`TorrentListenPort::Loopback`].
     pub torrent_listen_port: TorrentListenPort,
     /// Where the LAN media listener binds when it runs: a second HTTP
-    /// listener serving [`lan_media_routes`] and nothing else, so a
-    /// Chromecast or other receiver on the local network can fetch the bytes
-    /// of what this device is playing while the control API -- and every
-    /// route that creates or fetches anything -- stays on the loopback
-    /// listener only (see [`crate::lan_media`]).
+    /// listener serving `/cast/{token}` and nothing else -- the ids the app
+    /// published with [`ServerHandle::publish`] -- so a Chromecast or other
+    /// receiver on the local network can fetch the bytes of what this
+    /// device casts while the control API and every other route stays on
+    /// the loopback listener only (see [`crate::lan_media`], [`crate::cast`]).
     ///
     /// `None` -- the default -- means there is no LAN listener at all and
     /// [`ServerHandle::set_lan_media`] has nothing to start. `Some(addr)`
@@ -1166,9 +1171,9 @@ impl ServerHandle {
 
     /// Start or stop the LAN media listener (see [`crate::lan_media`]): a
     /// second HTTP listener on [`ServerConfig::lan_media_addr`] serving
-    /// [`lan_media_routes`] and nothing else, for handing the bytes of what
-    /// this device already plays to a Chromecast or other receiver on the
-    /// local network. Returns the address it is bound to afterwards --
+    /// `/cast/{token}` and nothing else -- the ids published with
+    /// [`Self::publish`] -- for handing the bytes of what this device casts
+    /// to a Chromecast or other receiver on the local network. Returns the address it is bound to afterwards --
     /// `Some` after a successful start, `None` after a stop.
     ///
     /// Meant to be called around a cast session, so the LAN surface exists
@@ -1180,14 +1185,12 @@ impl ServerHandle {
     /// when [`ServerConfig::lan_media_addr`] is unset, or when the bind
     /// fails.
     ///
-    /// `set_lan_media(false)` **aborts** the listener rather than draining
-    /// it: when it returns, the listener socket is closed and the port is
-    /// free, so nothing new can reach the LAN surface -- but a response that
-    /// was already streaming keeps running to its end on its own connection
-    /// task. Stopping ends new fetches, not the fetch in progress; see
-    /// [`lan_media::LanMedia::stop`] for why, and for what stopping the bytes
-    /// too would cost. The loopback listener and every request in flight on
-    /// it are untouched.
+    /// `set_lan_media(false)` **unpublishes every cast token and aborts**
+    /// the listener rather than draining it: when it returns, every body
+    /// being served under a token has been cut (it ends with an error at
+    /// its next poll), the listener socket is closed and the port is free.
+    /// The loopback listener and every request in flight on it are
+    /// untouched.
     pub fn set_lan_media(&self, enabled: bool) -> anyhow::Result<Option<SocketAddr>> {
         let state = self.state.clone();
         self.block_on_server(async move {
@@ -1236,6 +1239,53 @@ impl ServerHandle {
     /// Cheap: one relaxed atomic load, no runtime hop, safe to poll.
     pub fn lan_media_requests_served(&self) -> u64 {
         self.state.lan_media.requests_served()
+    }
+
+    /// How many `/cast` responses have begun a body since the current cast
+    /// session began: reset where [`Self::lan_media_requests_served`] is,
+    /// and counted when a `GET` under a published token starts sending
+    /// bytes -- never for a `HEAD`, an unknown token's `404` or a refusal.
+    ///
+    /// Beside the requests count it gives three readings where there were
+    /// two: no requests (the receiver cannot reach the address), requests
+    /// but no body (it reached this device and was served nothing -- a
+    /// token it was not given, an id that would not open), bodies (the
+    /// network and the server did their part; the rest is the media).
+    ///
+    /// Cheap: one relaxed atomic load, no runtime hop, safe to poll.
+    pub fn lan_media_bodies_served(&self) -> u64 {
+        self.state.lan_media.bodies_served()
+    }
+
+    /// **Publish an id for a cast**: the token the receiver's URL ends in,
+    /// `<lan_media_base_url>/cast/<token>`, which serves what `id`
+    /// resolves to with ranges and `HEAD`. 128 random bits, never derived
+    /// from the id; in memory only.
+    ///
+    /// With `play`, the receiver's reads are the viewer's playback, as a
+    /// reader opened with it would be ([`Self::open_reader`]): the play
+    /// session moves to the file and it shares by the same rules. Without
+    /// one they are an aside.
+    ///
+    /// The publication holds the id, so it is not evicted while cast.
+    /// Refused while the LAN listener is not running
+    /// ([`Self::set_lan_media`]), and for an id this server does not hold.
+    /// [`Self::unpublish`] ends it; so does stopping the listener, for every
+    /// token at once.
+    pub fn publish(&self, id: &MediaId, play: Option<PlayToken>) -> anyhow::Result<CastToken> {
+        let lease = self.state.media.lease(id)?;
+        let lan_media = &self.state.lan_media;
+        lan_media
+            .casts()
+            .publish(|| lan_media.bound_addr().is_some(), lease, id.clone(), play)
+    }
+
+    /// **Unpublish a cast token**: nothing more is served under it, and a
+    /// body being served under it ends now, with an error the receiver
+    /// reads as a broken source. Its id is let go. Whether the token was
+    /// published.
+    pub fn unpublish(&self, token: &CastToken) -> bool {
+        self.state.lan_media.casts().unpublish(token)
     }
 
     /// The base URL to hand a receiver at `for_peer` (e.g.
@@ -2014,32 +2064,21 @@ fn lan_cors_layer() -> CorsLayer {
 }
 
 /// The router the LAN media listener serves (see [`crate::lan_media`]):
-/// [`lan_media_routes`] and the two unhandled-request fallbacks, with the
-/// tracing layer the loopback router carries and the CORS layer it does not
-/// ([`lan_cors_layer`]: a Cast receiver is a browser media element).
+/// `/cast/{token}` ([`cast::router`]) and the two unhandled-request
+/// fallbacks, with the tracing layer the loopback router carries and the
+/// CORS layer it does not ([`lan_cors_layer`]: a Cast receiver is a browser
+/// media element).
 ///
-/// [`control_router`] is deliberately absent -- not merged and left behind the
-/// bearer middleware, but *not mounted at all*. A control path on this
-/// listener is an unknown path: it answers `404`, never `401`, so the LAN
-/// cannot even learn which control routes exist, let alone reach settings,
-/// downloads, stats or the torrent session with a guessed or leaked token.
-///
-/// Two-segment paths that are not media -- `/{infoHash}/create`,
-/// `/proxy/x`, `/ftp/x`, `/rar/create` -- collide with the
-/// `/{infoHash}/{fileIdx}` pattern and are answered by that route: `405`
-/// for a method it does not take, and for a `GET` or `HEAD` the LAN stream
-/// handler's `404`, because it looks the first segment up as an info hash
-/// among the torrents that exist and creates nothing (see
-/// [`routes::stream::EngineAccess`]). Nothing about the collision needs
-/// shadowing: there is no doomed magnet add to pre-empt when the handler
-/// cannot start one.
-///
-/// This is deliberately *not* [`media_router`] minus a couple of routes --
-/// see [`lan_media_routes`] for why.
+/// **The LAN listener serves published tokens and nothing else.** Not
+/// [`media_router`], not a subset of it, and not [`control_router`] at any
+/// level: every other path on this listener is a `404` (a control path
+/// included, never the `401` that would say a token would help), so the
+/// network can reach exactly what the app published, for as long as it is
+/// published, and cannot make this device fetch, add or open anything.
 fn build_lan_media_router(state: AppState) -> Router {
     let lan_media = state.lan_media.clone();
     Router::new()
-        .merge(lan_media_routes())
+        .merge(cast::router())
         .fallback(fallback_handler)
         .method_not_allowed_fallback(method_not_allowed_handler)
         .layer(
@@ -2095,23 +2134,6 @@ fn stream_routes() -> Router<AppState> {
         )
 }
 
-/// [`stream_routes`] as the LAN media listener mounts them: the same two
-/// paths, over torrents this server already has, and nothing else. An
-/// unknown hash is a `404` and `tr=` is ignored, so a LAN peer can fetch
-/// what this device is playing but cannot make it start anything -- see
-/// [`routes::stream::EngineAccess`].
-fn lan_stream_routes() -> Router<AppState> {
-    Router::new()
-        .route(
-            "/stream/{infoHash}/{fileIdx}",
-            get(routes::stream::lan_stream_video).head(routes::stream::lan_head_stream_video),
-        )
-        .route(
-            "/{infoHash}/{fileIdx}",
-            get(routes::stream::lan_stream_video).head(routes::stream::lan_head_stream_video),
-        )
-}
-
 /// The archive formats' prefixes, each mounting `router` for the format it
 /// names -- which is what picks the translator (`routes::archive::Format`).
 fn archive_prefixes(
@@ -2132,12 +2154,6 @@ fn archive_prefixes(
 /// of it (`routes::archive::stream_router`).
 fn archive_routes() -> Router<AppState> {
     archive_prefixes(routes::archive::router)
-}
-
-/// The byte-serving half of [`archive_routes`] alone: members of a session
-/// the loopback listener already created.
-fn archive_stream_routes() -> Router<AppState> {
-    archive_prefixes(routes::archive::stream_router)
 }
 
 /// The `/local-addon` stub (see `routes::local_addon`): not media bytes, but
@@ -2162,8 +2178,8 @@ fn local_addon_routes() -> Router<AppState> {
 /// fine on the loopback listener -- only this host's own stremio-core can
 /// reach it -- but not on the LAN one. The archive `/create` routes and the
 /// torrent-creating first request of [`stream_routes`] are the same
-/// kind of thing in a smaller way. See [`lan_media_routes`], which is the
-/// allow-list that keeps all of them off the LAN.
+/// kind of thing in a smaller way. None of them is on the LAN: that
+/// listener serves `/cast/{token}` alone ([`build_lan_media_router`]).
 fn media_router() -> Router<AppState> {
     Router::new()
         .merge(stream_routes())
@@ -2177,37 +2193,6 @@ fn media_router() -> Router<AppState> {
         // player fetch it.
         .merge(routes::drive::stream_routes())
         .merge(local_addon_routes())
-}
-
-/// The LAN media listener's route allow-list (see [`crate::lan_media`]):
-/// exactly what a cast receiver needs, which is the bytes of something this
-/// device is already playing, and nothing else.
-///
-/// The test of a route belonging here is that it serves bytes the loopback
-/// side has already arranged and cannot be made to arrange anything: the
-/// receiver is an unauthenticated stranger on the network, so whatever it
-/// can reach, anyone on the network can. That rules out every route that
-/// fetches a caller-named URL (`/proxy`, `/ftp`, the archive `/create`s,
-/// which download an archive), every route that starts a torrent (the
-/// loopback [`stream_routes`], whose first request for a hash creates it
-/// with the caller's trackers -- the LAN gets [`lan_stream_routes`], which
-/// only look one up), and the `/local-addon` stub, which no receiver calls.
-/// What is left is byte-serving over sessions and torrents that exist:
-/// [`lan_stream_routes`] and [`archive_stream_routes`].
-///
-/// Deliberately spelled as *what is safe*, not as [`media_router`] minus the
-/// hazardous routes: a plain `media_router() - proxy - ftp` reads correctly
-/// today, but it means a route added to [`media_router`] for some other
-/// reason is on the LAN by default, and an author who never touches this
-/// function has no reason to notice. A new group must be added *here* by
-/// name before the LAN listener serves it -- the silent default is
-/// exclusion, not inclusion -- and it must pass the test above. Keep it this
-/// way; see the `AGENTS.md` "Routes" entry for the same rule stated for
-/// `media_router` vs. `control_router`.
-fn lan_media_routes() -> Router<AppState> {
-    Router::new()
-        .merge(lan_stream_routes())
-        .merge(archive_stream_routes())
 }
 
 /// What `POST /create` may weigh: a hex-encoded `.torrent` in a JSON
@@ -2248,7 +2233,7 @@ const MAX_CREATE_BODY: usize = 32 * 1024 * 1024;
 /// path it did not call before, which is a change to the core fork first.
 /// Every route here requires `Authorization: Bearer <token>` (see `auth`),
 /// header only, and none is mounted on the LAN listener
-/// ([`lan_media_routes`]).
+/// ([`build_lan_media_router`]).
 fn control_router() -> Router<AppState> {
     Router::new()
         .route("/network-info", get(routes::system::network_info))

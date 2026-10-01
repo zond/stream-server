@@ -72,7 +72,9 @@ pub(crate) enum Source {
 }
 
 impl Source {
-    fn bytes(&self) -> &dyn ByteSource {
+    /// The bytes: what a reader task opens, and what a cast body opens at
+    /// its range (`crate::cast`).
+    pub(crate) fn bytes(&self) -> &dyn ByteSource {
         match self {
             Self::Torrent(source) => source.as_ref(),
             Self::Shared(source) => source.as_ref(),
@@ -80,7 +82,7 @@ impl Source {
         }
     }
 
-    fn kind(&self) -> &'static str {
+    pub(crate) fn kind(&self) -> &'static str {
         match self {
             Self::Torrent(_) => "torrent",
             Self::Shared(_) => "http",
@@ -295,7 +297,7 @@ pub(crate) async fn open(entry: Lease<Entry>, source: Source) -> Result<MediaRea
 
 /// Why an open failed, as a refusal: the disk gate's refusal and a dead
 /// Drive grant as themselves.
-pub(super) fn refusal_of(error: &io::Error) -> Refusal {
+pub(crate) fn refusal_of(error: &io::Error) -> Refusal {
     if error.kind() == io::ErrorKind::StorageFull {
         return Refusal::InsufficientDiskSpace;
     }
