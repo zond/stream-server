@@ -55,7 +55,8 @@
 //!   under L1 or L2.
 //!
 //! 1. L1 → L2 only, and only inside [`Retention::holdings`],
-//!    [`Retention::forget_empty`] and `drawn_in`, which take L1 and read
+//!    [`Retention::forget_empty`], `drawn_in`, [`Retention::draws`],
+//!    [`Retention::draws_for`] and [`Door::drawn`], which take L1 and read
 //!    each entity's L2 under it; never L2 → L1. An entity holds its own `Arc` and never
 //!    reaches the map. (Every other reader of the map --
 //!    [`Retention::readers`], `lookup`, `entity` -- copies the `Arc`s out
@@ -283,6 +284,9 @@ pub struct DrawnFor<K> {
     pub member: Option<Range<u64>>,
     pub set: Option<Vec<(K, Range<u64>)>>,
 }
+
+/// L1: the entities by key ([`Retention::entities`]).
+type Entities<B> = parking_lot::Mutex<HashMap<<B as Backing>::Key, Arc<Entity<B>>>>;
 
 /// One entity's draw as [`Retention::draws_for`] lists it: the key, the
 /// pieces and what they were drawn for.
@@ -843,7 +847,10 @@ pub struct Retention<B: Backing> {
     budget: Arc<RetentionBudget>,
     /// L1. The entities by key. Held for lookup, insert, prune and
     /// iterate-for-holdings only.
-    entities: parking_lot::Mutex<HashMap<B::Key, Arc<Entity<B>>>>,
+    ///
+    /// Shared with every [`Door`], which reads the draws recorded in it at
+    /// the unlink ([`Door::drawn`]).
+    entities: Arc<Entities<B>>,
     /// S. **One set's draw decided at a time** ([`Backing::played_set`]):
     /// the volumes of a set read whether a sibling has drawn and record
     /// their own draw as one step under it, so two volumes due together
@@ -1270,7 +1277,7 @@ impl<B: Backing> Retention<B> {
         Arc::new(Self {
             backing,
             budget,
-            entities: parking_lot::Mutex::new(HashMap::new()),
+            entities: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             set_draws: parking_lot::Mutex::new(()),
             next_reader: AtomicU64::new(0),
             #[cfg(any(test, feature = "test-hooks"))]
@@ -2412,10 +2419,14 @@ impl<B: Backing> Retention<B> {
         let alone = self.backing.alone(&domain, &candidates).await;
         // What a peer may have been told stays until the swarm has been
         // left: asked of exactly the pieces this pass would take, with the
-        // turn held -- the draw is advertised only under an install, which
-        // takes this turn, so nothing of this entity becomes advertised
-        // behind the answer. A boundary piece a pinned neighbour shares is
-        // not among them and does not hold the rest up.
+        // turn held. That holds this entity's own draw back -- advertised
+        // only under its install, which takes this turn -- but not a set's:
+        // the union is advertised by whichever volume drew it, under that
+        // volume's turn, so pieces of this entity can become advertised
+        // behind this answer. What keeps those is the door's reading of the
+        // recorded draws at every unlink ([`Door::drawn`]): a draw is
+        // recorded before it is advertised. A boundary piece a pinned
+        // neighbour shares is not among them and does not hold the rest up.
         if B::SHARE == Share::Half && self.backing.announced_in_swarm(&alone).await {
             tracing::debug!(
                 key = ?key,
@@ -2429,6 +2440,7 @@ impl<B: Backing> Retention<B> {
             state: entity.state.clone(),
             backing: self.backing.clone(),
             key: key.clone(),
+            entities: self.entities.clone(),
             mode: Mode::Slack { opens },
             // A slack entity keeps nothing it is not still handing out, and
             // what it is still handing out is a promise, which this door
@@ -2856,14 +2868,16 @@ impl<B: Backing> Retention<B> {
             "a Share::Nothing policy committed or lost pieces"
         );
         // The door every unlink of this pass asks, the want-set's included.
-        // What the door answers is not for the owner to know about a piece
-        // becoming advertised under the pass: this entity's draw is
-        // advertised only under its turn, which the pass holds throughout,
-        // and it is held above.
+        // This entity's own draw is advertised only under its turn, which
+        // the pass holds throughout, and it is held above; a set's draw
+        // advertised by a sibling volume under the sibling's turn is the
+        // door's to refuse, from the record made before that advertise
+        // ([`Door::drawn`]).
         let door = Door {
             state: entity.state.clone(),
             backing: self.backing.clone(),
             key: key.clone(),
+            entities: self.entities.clone(),
             mode: Mode::Live,
             exempt: consumers.exempt.clone(),
         };
@@ -3830,12 +3844,16 @@ impl<B: Backing> Drop for Reader<B> {
 
 /// The pass's last asking, built by the owner and handed to
 /// [`Backing::reclaim`]. Sync and cheap, callable from a blocking thread:
-/// it takes L2 briefly and no other lock, and asks
-/// [`Backing::keeps_everything`] before L2, never under it.
+/// [`Self::refuses`] takes L2 briefly and no other lock, and asks
+/// [`Backing::keeps_everything`] before L2, never under it;
+/// [`Self::drawn`], asked once per run, takes L1 → L2 to copy out.
 pub struct Door<B: Backing> {
     state: Arc<parking_lot::Mutex<State<B>>>,
     backing: Arc<B>,
     key: B::Key,
+    /// L1, for [`Self::drawn`]: every entity's recorded draw, read at the
+    /// unlink.
+    entities: Arc<Entities<B>>,
     /// Which pass this door is for. A [`Mode::Slack`] door keeps nothing
     /// but what a live read was promised, and closes the moment the entity
     /// is played again.
@@ -3860,6 +3878,43 @@ impl<B: Backing> Door<B> {
     pub fn shut(&self) -> bool {
         self.backing.keeps_everything(&self.key)
             || (matches!(self.mode, Mode::Slack { .. }) && self.backing.is_live(&self.key))
+    }
+
+    /// **Every piece a play session's draw has recorded, of every entity
+    /// a session plays**: what the backing refuses to unlink beside what
+    /// the backend announces, read once per run at the act
+    /// ([`Backing::reclaim`], [`Backing::want`]).
+    ///
+    /// Because a draw is recorded before it is advertised, and -- under a
+    /// set -- it is advertised by whichever volume drew it, under that
+    /// volume's turn and not this one's: a reading of what the backend
+    /// announces, taken by this pass a moment before a sibling's advertise
+    /// of the union lands, says nothing of pieces of this entity that are
+    /// about to be announced. The record is there before the advertise, so
+    /// this reading, taken after the backend's, sees what that one could
+    /// not. A recorded draw of an entity no session plays any more is left
+    /// out: its file was left, and what it announced is the backend's
+    /// reading to answer for.
+    ///
+    /// L1 → L2 per entity to copy the draws out, as
+    /// [`Retention::draws`] does; the backing's `plays` asked after both
+    /// are released (rule 2). Never asked under an owner lock.
+    pub fn drawn(&self) -> BTreeSet<u32> {
+        let draws: Vec<(B::Key, BTreeSet<u32>)> = {
+            let entities = self.entities.lock();
+            entities
+                .iter()
+                .filter_map(|(key, entity)| {
+                    let draw = entity.state.lock().draw.clone()?;
+                    (!draw.is_empty()).then(|| (key.clone(), draw))
+                })
+                .collect()
+        };
+        draws
+            .into_iter()
+            .filter(|(key, _)| self.backing.plays(key))
+            .flat_map(|(_, draw)| draw)
+            .collect()
     }
 
     /// **Whether `index` may not be taken at this instant.**

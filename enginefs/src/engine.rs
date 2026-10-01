@@ -625,6 +625,23 @@ impl<H: TorrentHandle> TorrentBacking<H> {
             .collect()
     }
 
+    /// What no unlink of this torrent may take now, if it is in the swarm:
+    /// what it announces ([`Self::announced_now`]) and every piece a draw
+    /// a session plays has recorded ([`Door::drawn`]) -- read after the
+    /// announcement, since a draw is recorded before it is advertised. A
+    /// set's draw is advertised by whichever volume drew it, under that
+    /// volume's turn and not the one this pass holds, so the announcement
+    /// alone, read a moment before that advertise lands, would let the
+    /// pass unlink a piece the swarm is told of next. Nothing while the
+    /// torrent is not live: no peer is told anything then.
+    async fn protected_now(&self, door: &Door<Self>) -> BTreeSet<u32> {
+        let mut protected = self.announced_now().await;
+        if self.handle.run_state() == crate::backend::RunState::Live {
+            protected.extend(door.drawn());
+        }
+        protected
+    }
+
     /// Stop wanting `run` (`AfterRelease::LeaveDropped`), unlink what
     /// arrived under the drop that nothing keeps, and want again whatever a
     /// neighbour pinned under it. One run of [`Self::want`].
@@ -638,8 +655,9 @@ impl<H: TorrentHandle> TorrentBacking<H> {
         // Less what the torrent announces **and holds**: a piece a peer may
         // have been told of stays had. An advertised piece not held yet is
         // not kept wanted -- the shared set is never fetched for the swarm;
-        // it is announced when the viewer's own window brings it in.
-        let announced = self.announced_now().await;
+        // it is announced when the viewer's own window brings it in. A
+        // recorded draw a sibling has yet to advertise counts as announced.
+        let announced = self.protected_now(door).await;
         let held_now = store.held(&self.info_hash);
         let announced_held = |piece: &u32| {
             announced.contains(piece) && held_now.as_ref().is_some_and(|held| held.contains(*piece))
@@ -661,8 +679,9 @@ impl<H: TorrentHandle> TorrentBacking<H> {
                     let pinned =
                         pinned_spans(&self.handle, &self.pinned, Some(domain.file_idx)).await;
                     // And what arrived under the drop and is announced --
-                    // advertised, complete a moment ago -- stays on the disk.
-                    let announced = self.announced_now().await;
+                    // advertised, complete a moment ago, or recorded to be --
+                    // stays on the disk.
+                    let announced = self.protected_now(door).await;
                     let arrived: Vec<u32> = match (store.held(&self.info_hash), !door.shut()) {
                         (Some(now), true) => {
                             let now = now.in_range(part.clone());
@@ -1338,9 +1357,11 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
             // neighbour's span is the other half, and it is a listing away
             // rather than a bit, so it stays a range check.
             // And what the torrent announces now, asked per run: a piece of
-            // another file's draw on this file's boundary, and anything
-            // advertised by a torrent started since the pass began.
-            let announced = self.announced_now().await;
+            // another file's draw on this file's boundary, anything
+            // advertised by a torrent started since the pass began, and a
+            // set's draw a sibling volume has recorded and not advertised
+            // yet ([`Self::protected_now`]).
+            let announced = self.protected_now(&door).await;
             let mut parts: Vec<Range<u32>> = Vec::new();
             for piece in run.clone() {
                 if door.refuses(piece)

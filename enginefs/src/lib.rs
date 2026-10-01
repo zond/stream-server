@@ -16697,6 +16697,390 @@ mod tests {
         drop((first, second));
     }
 
+    /// **A sibling's advertise of the set cannot race a volume's unlink.**
+    /// Under a set the first volume due advertises the union -- the other
+    /// volumes' pieces among it -- under its own turn, not theirs, so a
+    /// pass on another volume can read what the torrent announces, then
+    /// have the union land, then unlink a piece of it. The draw is recorded
+    /// before it is advertised, and every unlink refuses what a draw a
+    /// session plays has recorded. Parked: the second volume's open has
+    /// recorded the set's draw and waits inside its advertise; the first
+    /// volume, slack, is passed over with one of the set's pieces held.
+    /// The piece stays, and nothing breaches the fake's rules.
+    #[tokio::test]
+    async fn a_volume_unlinks_nothing_of_a_sets_draw_a_sibling_has_yet_to_advertise() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("film.part1.rar".into(), 1000),
+            ("film.part2.rar".into(), 1000),
+        ]);
+        counters.pieces_per_file.store(40, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(1_000_000));
+        // The first volume has an entity -- read once, by nobody's player --
+        // and holds piece 10, inside the member's bytes of it.
+        engine
+            .begin_retention_opening(
+                0,
+                crate::piece_store::Buffering::default(),
+                crate::retention::owner::Opener::Unshared,
+            )
+            .await;
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("10"), [7u8; 25]).unwrap();
+        let _store = seeded_store(&enginefs, &engine);
+
+        enginefs.note_player(
+            PLAYER,
+            played_set(TEST_HASH, &[(0, 110..1000), (1, 50..640)]),
+        );
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 1).await;
+        enginefs.focus_torrent(TEST_HASH).await;
+        assert_eq!(engine.handle.run_state(), RunState::Live);
+
+        // The second volume's open draws the set, records it, and parks in
+        // the advertise.
+        let (entered, release) = (
+            tokio::sync::oneshot::channel::<()>(),
+            tokio::sync::oneshot::channel::<()>(),
+        );
+        *counters.advertise_gate.lock().unwrap() = Some((entered.0, release.1));
+        let open = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                engine
+                    .begin_retention_opening(
+                        1,
+                        crate::piece_store::Buffering::default(),
+                        crate::retention::owner::Opener::Player,
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(TEST_WAIT_BOUND, entered.1)
+            .await
+            .expect("the set's draw is advertised")
+            .expect("the gate");
+        let union: std::collections::BTreeSet<u32> = (4..40).chain(42..66).collect();
+        assert_eq!(engine.retention.draw_of(&1), Some(union));
+        assert!(fake_advertises(&counters).is_empty(), "advertised already");
+
+        // A slack pass over the first volume, with the union not announced.
+        let (_, opens) = engine.retention.readers_and_opens_of(&0);
+        let claim = engine.retention.turn(&0).await.expect("the volume's turn");
+        engine
+            .retention
+            .pass(
+                &0,
+                enginefs.store_registry(),
+                claim,
+                crate::retention::owner::Mode::Slack { opens },
+            )
+            .await;
+        release.0.send(()).expect("the parked advertise");
+        tokio::time::timeout(TEST_WAIT_BOUND, open)
+            .await
+            .expect("the open finishes")
+            .expect("the open task");
+        assert!(
+            fake_advertises(&counters).contains(&10),
+            "the set's draw was not advertised"
+        );
+        assert!(
+            bucket.join("10").is_file(),
+            "a piece of the set's draw left the disk under its advertise"
+        );
+    }
+
+    /// **Out of the swarm, a set's draw holds nothing back**: what keeps a
+    /// recorded draw's pieces is that a peer may be told of them, and a
+    /// stopped torrent tells nobody anything. The first volume, slack, gives
+    /// back its piece of the set's draw as it gives back any piece, as it
+    /// would an announced one (`announced_now` reads nothing then either).
+    #[tokio::test]
+    async fn a_stopped_torrents_volume_keeps_nothing_for_a_sets_draw() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("film.part1.rar".into(), 1000),
+            ("film.part2.rar".into(), 1000),
+        ]);
+        counters.pieces_per_file.store(40, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(1_000_000));
+        engine
+            .begin_retention_opening(
+                0,
+                crate::piece_store::Buffering::default(),
+                crate::retention::owner::Opener::Unshared,
+            )
+            .await;
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("10"), [7u8; 25]).unwrap();
+        let _store = seeded_store(&enginefs, &engine);
+        enginefs.note_player(
+            PLAYER,
+            played_set(TEST_HASH, &[(0, 110..1000), (1, 50..640)]),
+        );
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 1).await;
+        enginefs.focus_torrent(TEST_HASH).await;
+        engine
+            .begin_retention_opening(
+                1,
+                crate::piece_store::Buffering::default(),
+                crate::retention::owner::Opener::Player,
+            )
+            .await;
+        assert!(
+            engine
+                .retention
+                .draw_of(&1)
+                .is_some_and(|draw| draw.contains(&10))
+        );
+        // The torrent leaves the swarm.
+        counters.paused.store(true, Ordering::SeqCst);
+        assert_eq!(engine.handle.run_state(), RunState::Paused);
+
+        let (_, opens) = engine.retention.readers_and_opens_of(&0);
+        let claim = engine.retention.turn(&0).await.expect("the volume's turn");
+        engine
+            .retention
+            .pass(
+                &0,
+                enginefs.store_registry(),
+                claim,
+                crate::retention::owner::Mode::Slack { opens },
+            )
+            .await;
+        assert!(
+            !bucket.join("10").exists(),
+            "a stopped torrent's volume kept a piece for a draw nobody is told of"
+        );
+    }
+
+    /// **A draw nobody plays any more keeps nothing at the door**: the
+    /// record a sibling volume keeps of a set the viewer has left is no
+    /// draw about to be advertised. After a move off the set has ended what
+    /// it shared, the first volume's slack pass -- the first of the drop
+    /// that follows -- takes its piece of the union, though the second
+    /// volume, not passed over yet, still holds the record.
+    #[tokio::test]
+    async fn a_left_sets_record_keeps_nothing_of_a_volume_at_the_door() {
+        use crate::backend::priorities::{BufferProfile, Fetching};
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("film.part1.rar".into(), 1000),
+            ("film.part2.rar".into(), 1000),
+            ("other.mkv".into(), 1000),
+        ]);
+        counters.pieces_per_file.store(40, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(1_000_000));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("10"), [7u8; 25]).unwrap();
+        let _store = seeded_store(&enginefs, &engine);
+        enginefs.note_player(
+            PLAYER,
+            played_set(TEST_HASH, &[(0, 110..1000), (1, 50..640)]),
+        );
+        for (volume, at) in [(0, 110), (1, 50)] {
+            enginefs
+                .on_stream_start_unreconciled(TEST_HASH, volume)
+                .await;
+            enginefs.focus_torrent(TEST_HASH).await;
+            let reader = engine
+                .try_get_file_with_intent(volume, at, 1, Fetching::Streaming, BufferProfile::Normal)
+                .await
+                .expect("the volume");
+            drop(reader);
+            enginefs.on_stream_end(TEST_HASH, volume).await;
+        }
+        assert!(
+            engine
+                .retention
+                .draw_of(&1)
+                .is_some_and(|draw| draw.contains(&10))
+        );
+
+        enginefs.note_player("tv.2", played(TEST_HASH, 2));
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 2).await;
+        enginefs.focus_torrent(TEST_HASH).await;
+        assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 1);
+        assert_eq!(engine.handle.run_state(), RunState::Live);
+        assert!(
+            wait_until(TEST_WAIT_BOUND, || !bucket.join("10").exists()).await,
+            "the left set's record kept the first volume's piece of it"
+        );
+    }
+
+    /// **And a piece of a set's draw that arrives under a sibling's want
+    /// step stays**, the sibling's advertise of it still parked. The first
+    /// volume's live pass stops wanting what is outside its window: what is
+    /// held by then and announced it leaves alone, and what completes under
+    /// the drop and is not announced it unlinks. A piece of the set's draw
+    /// the second volume has recorded and not advertised yet is about to be
+    /// announced, and is treated as if it were. Four-piece volumes of a
+    /// hundred bytes, the member all of both; the piece arrives under the
+    /// drop.
+    #[tokio::test]
+    async fn a_piece_of_a_sets_draw_that_arrives_under_a_siblings_drop_stays() {
+        let (piece, dropped, held) = a_sets_piece_arriving_under_a_siblings_want_step(false).await;
+        assert!(
+            dropped.iter().any(|range| range.contains(&piece)),
+            "the piece was held before the drop: {dropped:?}"
+        );
+        assert!(
+            held,
+            "a piece of the set's draw that arrived under the drop was unlinked"
+        );
+    }
+
+    /// The same, with the piece arriving before the drop, while the want
+    /// step re-wants its windows: held by the drop, it is not dropped --
+    /// the backend keeps having what it is about to announce.
+    #[tokio::test]
+    async fn a_piece_of_a_sets_draw_held_before_a_siblings_drop_is_not_dropped() {
+        let (piece, dropped, held) = a_sets_piece_arriving_under_a_siblings_want_step(true).await;
+        assert!(
+            !dropped.iter().any(|range| range.contains(&piece)),
+            "the backend was told to forget a piece of the set's draw: {dropped:?}"
+        );
+        assert!(held, "a piece of the set's draw was unlinked");
+    }
+
+    /// The fixture of the two tests above: which piece of the first volume
+    /// the set's draw holds, the runs the first volume's pass dropped, and
+    /// whether that piece is on the disk at the end. `at_reselect` lands the
+    /// piece while the want step re-wants its windows, before any drop;
+    /// otherwise inside the first drop.
+    async fn a_sets_piece_arriving_under_a_siblings_want_step(
+        at_reselect: bool,
+    ) -> (u32, Vec<std::ops::Range<u32>>, bool) {
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("film.part1.rar".into(), 100),
+            ("film.part2.rar".into(), 100),
+        ]);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(50));
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        let _store = seeded_store(&enginefs, &engine);
+        engine
+            .begin_retention_opening(
+                0,
+                crate::piece_store::Buffering::default(),
+                crate::retention::owner::Opener::Unshared,
+            )
+            .await;
+        enginefs.note_player(PLAYER, played_set(TEST_HASH, &[(0, 0..100), (1, 0..100)]));
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 1).await;
+        enginefs.focus_torrent(TEST_HASH).await;
+        assert_eq!(engine.handle.run_state(), RunState::Live);
+        engine.begin_retention(1).await;
+        engine.told_set_duration(&[0, 1], Duration::from_secs(1));
+
+        // The second volume draws the set and parks in its advertise.
+        let (entered, release) = (
+            tokio::sync::oneshot::channel::<()>(),
+            tokio::sync::oneshot::channel::<()>(),
+        );
+        *counters.advertise_gate.lock().unwrap() = Some((entered.0, release.1));
+        let draw = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.retention.settle_draw(&1).await }
+        });
+        tokio::time::timeout(TEST_WAIT_BOUND, entered.1)
+            .await
+            .expect("the set's draw is advertised")
+            .expect("the gate");
+        let piece = *engine
+            .retention
+            .draw_of(&1)
+            .expect("the set's draw")
+            .iter()
+            .find(|piece| **piece < 2)
+            .expect("the set's draw holds a piece of the first volume behind its head");
+        assert!(fake_advertises(&counters).is_empty(), "advertised already");
+
+        let arrive = {
+            let bucket = bucket.clone();
+            let registry = enginefs.store_registry().clone();
+            let layout = engine.handle.layout().expect("a layout");
+            move || {
+                std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+                let store = crate::piece_store::PieceStore::under(registry, TEST_HASH, layout);
+                store.init_for_tests().unwrap();
+                // The registry holds it weakly; the test outlives this.
+                std::mem::forget(store);
+            }
+        };
+        // The first volume's viewer is at its last piece: the want step
+        // drops what lies behind.
+        engine.test_read_at(0, 75);
+        let claim = engine.retention.turn(&0).await.expect("the volume's turn");
+        let pass = |claim| {
+            let engine = engine.clone();
+            let registry = enginefs.store_registry().clone();
+            async move {
+                engine
+                    .retention
+                    .pass(&0, &registry, claim, crate::retention::owner::Mode::Live)
+                    .await;
+            }
+        };
+        if at_reselect {
+            let (entered, release) = (
+                tokio::sync::oneshot::channel::<()>(),
+                tokio::sync::oneshot::channel::<()>(),
+            );
+            *counters.reselect_gate.lock().unwrap() = Some((entered.0, release.1));
+            let passing = tokio::spawn(pass(claim));
+            tokio::time::timeout(TEST_WAIT_BOUND, entered.1)
+                .await
+                .expect("the want step re-wants its windows")
+                .expect("the gate");
+            arrive();
+            release.0.send(()).expect("the parked reselect");
+            tokio::time::timeout(TEST_WAIT_BOUND, passing)
+                .await
+                .expect("the pass finishes")
+                .expect("the pass task");
+        } else {
+            *counters.on_first_drop.lock().unwrap() = Some(Box::new(arrive));
+            pass(claim).await;
+            assert!(
+                counters.on_first_drop.lock().unwrap().is_none(),
+                "the want step dropped nothing, so nothing arrived under it"
+            );
+        }
+        release.0.send(()).expect("the parked advertise");
+        tokio::time::timeout(TEST_WAIT_BOUND, draw)
+            .await
+            .expect("the draw finishes")
+            .expect("the draw task");
+        assert!(fake_advertises(&counters).contains(&piece));
+        let dropped = counters
+            .dropped_ranges
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(range, _)| range.clone())
+            .collect();
+        (piece, dropped, bucket.join(piece.to_string()).is_file())
+    }
+
     /// **A move off a set onto one of its own volumes is a move**: the
     /// union was drawn for the set, and the volume played as itself -- the
     /// player's next screen naming the first volume's URL -- shares none of
