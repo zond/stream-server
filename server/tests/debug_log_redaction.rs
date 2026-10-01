@@ -121,8 +121,7 @@ fn no_debug_line_carries_a_callers_credentials() -> anyhow::Result<()> {
         enable_local_service_discovery: false,
         enable_dht: false,
         torrent_listen_port: stream_server::TorrentListenPort::Loopback,
-        pins: Some(Default::default()),
-        proxy_pins: Some(Vec::new()),
+        pins: Some(Vec::new()),
         lan_media_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
         ..stream_server::ServerConfig::default()
     })?;

@@ -63,8 +63,96 @@ pub struct DownloadInfo {
     /// in an error state (a client-safe message either way -- the
     /// backend's own text names server paths and stays in the log),
     /// [`DORMANT_DOWNLOAD_ERROR`] for a pin whose torrent the backend does
-    /// not have. `null` for a healthy download.
+    /// not have and whose piece directory is on the disk. `null` for a
+    /// healthy download, and for a dormant pin with no piece directory,
+    /// which holds nothing and says so (`complete: false`).
     pub error: Option<String>,
+}
+
+/// One download the embedder keeps, as it names it at boot
+/// ([`crate::ServerConfig::pins`]): a torrent's file, an addon link, a
+/// Google Drive file. **One pin set for both stores**: the torrent keys
+/// are the piece store's ([`Self::torrent_pins`]), the link and Drive keys
+/// the proxy cache's ([`Self::proxy_pins`]), and each store applies its
+/// half exactly as before.
+///
+/// Serialized as `{"kind": "torrent", "infoHash", "fileIdx"}`,
+/// `{"kind": "url", "target", "headers"}` or `{"kind": "drive", "fileId"}`
+/// -- the last two are [`crate::ProxyPinKey`]'s own shapes.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum PinKey {
+    /// A file of a torrent. The info hash in any case; it is lowercased.
+    #[serde(rename_all = "camelCase")]
+    Torrent { info_hash: String, file_idx: usize },
+    /// An addon link: the URL stremio-core puts in `d=` plus the path, and
+    /// the `h=` request headers -- the `/proxy` cache key, as
+    /// [`crate::ProxyPinKey::Url`] names it.
+    #[serde(rename_all = "camelCase")]
+    Url {
+        target: String,
+        #[serde(default)]
+        headers: BTreeMap<String, String>,
+    },
+    /// A Google Drive file, by id ([`crate::ProxyPinKey::Drive`]).
+    #[serde(rename_all = "camelCase")]
+    Drive { file_id: String },
+}
+
+impl PinKey {
+    /// The piece store's half: the torrent keys, as info hash (lowercase)
+    /// to its file indices, sorted and without repeats. An empty result
+    /// is an empty set, not an unknown one -- the caller keeps `None` for
+    /// that.
+    pub fn torrent_pins(keys: &[PinKey]) -> enginefs::piece_store::PinSet {
+        let mut pins = enginefs::piece_store::PinSet::new();
+        for key in keys {
+            if let Self::Torrent {
+                info_hash,
+                file_idx,
+            } = key
+            {
+                pins.entry(info_hash.to_lowercase())
+                    .or_default()
+                    .push(*file_idx);
+            }
+        }
+        for indices in pins.values_mut() {
+            indices.sort_unstable();
+            indices.dedup();
+        }
+        pins
+    }
+
+    /// The proxy cache's half: the link and Drive keys.
+    pub fn proxy_pins(keys: &[PinKey]) -> Vec<crate::proxy_downloads::ProxyPinKey> {
+        keys.iter().filter_map(Self::as_proxy).collect()
+    }
+
+    /// This key as the proxy cache names it, or `None` for a torrent's.
+    pub fn as_proxy(&self) -> Option<crate::proxy_downloads::ProxyPinKey> {
+        match self {
+            Self::Torrent { .. } => None,
+            Self::Url { target, headers } => Some(crate::proxy_downloads::ProxyPinKey::Url {
+                target: target.clone(),
+                headers: headers.clone(),
+            }),
+            Self::Drive { file_id } => Some(crate::proxy_downloads::ProxyPinKey::Drive {
+                file_id: file_id.clone(),
+            }),
+        }
+    }
+}
+
+impl From<crate::proxy_downloads::ProxyPinKey> for PinKey {
+    fn from(key: crate::proxy_downloads::ProxyPinKey) -> Self {
+        match key {
+            crate::proxy_downloads::ProxyPinKey::Url { target, headers } => {
+                Self::Url { target, headers }
+            }
+            crate::proxy_downloads::ProxyPinKey::Drive { file_id } => Self::Drive { file_id },
+        }
+    }
 }
 
 /// What a pin whose torrent the backend did not restore reports as its
@@ -322,8 +410,9 @@ pub async fn unpin_download(
 
 /// Every pinned download, behind `ServerHandle::downloads`:
 /// ordered by info hash then file index, the live ones first and the
-/// dormant ones (torrent not restored, [`DORMANT_DOWNLOAD_ERROR`]) after
-/// them. One stats call per torrent, not per file.
+/// dormant ones (torrent not restored: held-nothing, or
+/// [`DORMANT_DOWNLOAD_ERROR`] -- see `dormant_downloads`) after them. One
+/// stats call per torrent, not per file.
 ///
 /// When the embedder named no pin set
 /// ([`enginefs::piece_store::PinsUnknown`]) the list is every file of every
@@ -372,26 +461,70 @@ pub async fn downloads(state: &AppState) -> Vec<DownloadInfo> {
             downloads.push(live_download(&info_hash, file_idx, path, &stats));
         }
     }
-    downloads.extend(
-        engine_fs
-            .dormant_pinned_downloads()
-            .into_iter()
-            .map(|pin| DownloadInfo {
-                info_hash: pin.info_hash,
-                file_idx: pin.file_idx,
-                source: None,
-                play_url: None,
-                path: None,
-                name: String::new(),
-                length: 0,
-                downloaded: 0,
-                complete: false,
-                phase: StartupPhase::Error,
-                error: Some(DORMANT_DOWNLOAD_ERROR.to_string()),
-            }),
-    );
+    downloads.extend(dormant_downloads(&engine_fs).await);
     downloads.extend(proxy_downloads(state).await);
     downloads
+}
+
+/// The dormant pins (`enginefs::BackendEngineFS::dormant_pinned_downloads`:
+/// a pin whose torrent the session did not bring back), each answered by
+/// what the disk says (`docs/design/media-pipeline.md` §2.6):
+///
+/// * **no `.pieces/<hash>` directory**: this server holds nothing of it,
+///   and knows so for certain -- the session never restored the torrent
+///   and no store is on the disk. Reported as held-nothing: `complete:
+///   false`, `downloaded: 0`, phase `buffering` and **no error**, which is
+///   the row a client reads as "not whole" (xtremio marks a finished row
+///   gone). The boot that deleted the previous build's cache directory
+///   leaves every pin the app hands in like this.
+/// * **a directory there**: bytes may be held under a torrent the session
+///   could not restore, and what they amount to is unknown until it comes
+///   back. The dormant answer: phase `error` and
+///   [`DORMANT_DOWNLOAD_ERROR`], which a client reads as "cannot say yet".
+///
+/// One hop to the blocking pool for every pin's `stat`.
+async fn dormant_downloads(engine_fs: &enginefs::EngineFS) -> Vec<DownloadInfo> {
+    let pins = engine_fs.dormant_pinned_downloads();
+    if pins.is_empty() {
+        return Vec::new();
+    }
+    let store = engine_fs.piece_store();
+    let dirs: Vec<std::path::PathBuf> = pins
+        .iter()
+        .map(|pin| store.torrent_dir(&pin.info_hash))
+        .collect();
+    // A stat that could not be made is not "absent": the dormant answer,
+    // which claims nothing, is what such a pin keeps.
+    let held = tokio::task::spawn_blocking(move || {
+        dirs.iter()
+            .map(|dir| match std::fs::symlink_metadata(dir) {
+                Ok(meta) => meta.is_dir(),
+                Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+            })
+            .collect::<Vec<bool>>()
+    })
+    .await
+    .unwrap_or_else(|_| vec![true; pins.len()]);
+    pins.into_iter()
+        .zip(held)
+        .map(|(pin, held_somewhere)| DownloadInfo {
+            info_hash: pin.info_hash,
+            file_idx: pin.file_idx,
+            source: None,
+            play_url: None,
+            path: None,
+            name: String::new(),
+            length: 0,
+            downloaded: 0,
+            complete: false,
+            phase: if held_somewhere {
+                StartupPhase::Error
+            } else {
+                StartupPhase::Buffering
+            },
+            error: held_somewhere.then(|| DORMANT_DOWNLOAD_ERROR.to_string()),
+        })
+        .collect()
 }
 
 /// Every pinned proxy download (`crate::proxy_downloads`), read off the
@@ -552,7 +685,8 @@ pub async fn pin_proxy_download(
                     "a Drive download wants a refreshToken",
                 ));
             }
-            crate::proxy_downloads::pin_drive(state, file_id, token, request.name.clone()).await?
+            crate::proxy_downloads::pin_drive(state, file_id, Some(token), request.name.clone())
+                .await?
         }
         _ => {
             return Err(crate::proxy_downloads::ProxyPinError::Unkeyable(
@@ -560,6 +694,15 @@ pub async fn pin_proxy_download(
             ));
         }
     };
+    proxy_row(state, &dir).await
+}
+
+/// The listing's row for the proxy download pinned under `dir`, right after
+/// the pin was taken.
+pub(crate) async fn proxy_row(
+    state: &AppState,
+    dir: &std::path::Path,
+) -> Result<DownloadInfo, crate::proxy_downloads::ProxyPinError> {
     let rows = proxy_downloads(state).await;
     let name = dir
         .file_name()

@@ -38,6 +38,23 @@ fn seeded_fixture_config() -> ServerConfig {
     fixture_pins::keep_what_the_fixture_seeded(offline_config())
 }
 
+/// A torrent pin set (info hash to file indices) as the one pin set's
+/// torrent keys, [`ServerConfig::pins`].
+fn torrent_pins(
+    pins: std::collections::BTreeMap<String, Vec<usize>>,
+) -> Vec<stream_server::PinKey> {
+    pins.into_iter()
+        .flat_map(|(info_hash, indices)| {
+            indices
+                .into_iter()
+                .map(move |file_idx| stream_server::PinKey::Torrent {
+                    info_hash: info_hash.clone(),
+                    file_idx,
+                })
+        })
+        .collect()
+}
+
 /// **A test announces nothing on the network it is running on**, local
 /// discovery included.
 ///
@@ -1544,10 +1561,10 @@ fn seed_piece_store_files(
 }
 
 /// Pre-seed a torrent's data one file per piece under
-/// `<cacheRoot>/rqbit-downloads/.pieces/<info hash>/<bucket>/<piece>`, which
+/// `<cacheRoot>/media-cache/.pieces/<info hash>/<bucket>/<piece>`, which
 /// is where the session's default storage keeps it.
 ///
-/// A whole file under `rqbit-downloads/<torrent name>/` does not work: the
+/// A whole file under `media-cache/<torrent name>/` does not work: the
 /// session's default storage is `PieceStoreFactory`, so a whole `.mkv`
 /// there is bytes nothing reads, and the check finds every piece missing
 /// and reports the torrent empty.
@@ -1668,7 +1685,7 @@ fn seed_piece_store_pieces(
 /// The session's piece store, where all of a torrent's data is -- the
 /// streaming cache and an offline download alike.
 fn piece_store(cache_root: &std::path::Path) -> enginefs::piece_store::StoreRoot {
-    enginefs::piece_store::StoreRoot::in_download_dir(&cache_root.join("rqbit-downloads"))
+    enginefs::piece_store::StoreRoot::in_download_dir(&cache_root.join(enginefs::CACHE_DIR_NAME))
 }
 
 /// The indices of the complete pieces a torrent's piece store holds.
@@ -1954,7 +1971,7 @@ fn set_background_caps_the_torrent_and_still_streams() -> anyhow::Result<()> {
 /// ranges of the container), so on an upgraded install it is bytes no
 /// retention owner speaks for, no cache figure counts, and nothing else
 /// will ever take: the piece store's own legacy sweep walks
-/// `<cacheRoot>/rqbit-downloads`, one level below this. So this launch
+/// `<cacheRoot>/media-cache`, one level below this. So this launch
 /// takes it, once, and leaves everything beside it alone.
 #[test]
 fn a_previous_builds_archive_scratch_is_gone_at_the_next_start() -> anyhow::Result<()> {
@@ -1992,6 +2009,285 @@ fn a_previous_builds_archive_scratch_is_gone_at_the_next_start() -> anyhow::Resu
     Ok(())
 }
 
+/// Poll until `path` is gone, or fail naming it: the boot's delete of a
+/// retired cache directory runs on the blocking pool after the session
+/// opens, so `start` returning is not the end of it.
+fn until_gone(path: &std::path::Path) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::fs::symlink_metadata(path).is_ok() {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "{} was never deleted",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+/// **The previous build's cache directory is deleted at boot, with no
+/// migration**: `<cacheRoot>/rqbit-downloads` -- pieces, proxy chunks,
+/// session records -- is gone once the boot's delete has run, the session
+/// opened on `<cacheRoot>/media-cache` ([`enginefs::CACHE_DIR_NAME`]) and
+/// nothing beside them is touched. The old name is the on-disk contract
+/// this deletes, so the test spells it.
+#[test]
+fn a_previous_builds_cache_directory_is_deleted_at_boot() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let cache_root = cache_dir.path().join("cache");
+    let old = cache_root.join("rqbit-downloads");
+    let piece = old
+        .join(".pieces")
+        .join("ab".repeat(20))
+        .join("0")
+        .join("0");
+    std::fs::create_dir_all(piece.parent().expect("a bucket"))?;
+    write_payload(&piece, 16 * 1024);
+    std::fs::write(old.join("session.json"), b"{}")?;
+    let neighbour = cache_root.join("keep.txt");
+    std::fs::write(&neighbour, b"not the cache's")?;
+
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_root.clone()),
+        ..offline_config()
+    })?;
+    until_gone(&old)?;
+    until_gone(&cache_root.join(".rqbit-downloads.deleting"))?;
+    assert!(
+        cache_root.join(enginefs::CACHE_DIR_NAME).is_dir(),
+        "the session did not open on {}",
+        enginefs::CACHE_DIR_NAME
+    );
+    assert!(neighbour.is_file(), "a neighbour was touched");
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// **A delete a killed process left half done is finished by the next
+/// boot**: a `.rqbit-downloads.deleting` at the cache root -- the name the
+/// old directory is renamed to before the session opens -- is deleted too,
+/// and so is an old directory found beside it.
+#[test]
+fn a_cache_directory_left_mid_delete_is_deleted_at_the_next_boot() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let cache_root = cache_dir.path().join("cache");
+    let leftover = cache_root.join(".rqbit-downloads.deleting");
+    let old = cache_root.join("rqbit-downloads");
+    for dir in [&leftover, &old] {
+        let piece = dir
+            .join(".pieces")
+            .join("cd".repeat(20))
+            .join("0")
+            .join("0");
+        std::fs::create_dir_all(piece.parent().expect("a bucket"))?;
+        write_payload(&piece, 16 * 1024);
+    }
+
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_root.clone()),
+        ..offline_config()
+    })?;
+    until_gone(&leftover)?;
+    until_gone(&old)?;
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// **What a boot puts under `media-cache` is exactly what the launch sweep
+/// spares.** The sweep removes every entry under it that is neither on
+/// `piece_store::sweep`'s `NOT_OURS` list nor a session record, so a new
+/// directory that is not on that list is deleted by the next launch: this
+/// pins the entries a boot with a torrent added leaves there, and a second
+/// boot, which sweeps, keeping them. A new sibling fails here first.
+#[test]
+fn the_cache_directory_holds_only_what_the_sweep_spares() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let src = tempfile::tempdir()?;
+    let cache_root = resolved(&cache_dir.path().join("cache"));
+    stream_server::pretend_volume_space(&cache_root, u64::MAX);
+    let content = src.path().join("Film");
+    std::fs::create_dir_all(&content)?;
+    write_payload(&content.join("film.bin"), 32 * 1024);
+    let (torrent, info_hash) = real_torrent(&content);
+    let start = || {
+        stream_server::start(stream_server::ServerConfig {
+            http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            config_dir: Some(config_dir.path().join("config")),
+            cache_dir: Some(cache_root.clone()),
+            ..offline_config()
+        })
+    };
+    let entries = || -> anyhow::Result<Vec<String>> {
+        let mut names = std::fs::read_dir(cache_root.join(enginefs::CACHE_DIR_NAME))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        Ok(names)
+    };
+
+    let handle = start()?;
+    // A torrent added, so the piece store has written what it writes.
+    bearer_client(&handle)?
+        .post(format!("http://{}/create", handle.http_addr()))
+        .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
+        .send()?
+        .error_for_status()?;
+    // The piece store's directory and the session's records, which the
+    // sweep spares by name (`NOT_OURS`, `is_session_artifact`). The proxy
+    // cache's `.proxy` is the other name on `NOT_OURS`, made by the first
+    // proxied byte (`proxy.rs`'s sweep tests keep it).
+    let expected = [
+        ".pieces".to_string(),
+        format!("{info_hash}.bitv"),
+        format!("{info_hash}.torrent"),
+        "session.json".to_string(),
+    ];
+    // Polled: the session writes its records as the add and the check
+    // proceed.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while entries()? != expected {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "after a boot: {:?}, not {expected:?}",
+            entries()?
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    handle.shutdown()?;
+    handle.join()?;
+
+    let handle = start()?;
+    assert_eq!(entries()?, expected, "after a second, sweeping boot");
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// **One pin set, both stores**: `ServerConfig::pins: None` is "nobody
+/// said", and a boot under it sweeps neither the piece store nor the proxy
+/// cache; `Some(vec![])` is "nothing is pinned", and a boot under it sweeps
+/// both. What each half keeps of a non-empty set is the stores' own tests'.
+#[test]
+fn one_pin_set_decides_both_launch_sweeps() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let cache_root = cache_dir.path().join("cache");
+    let store = cache_root.join(enginefs::CACHE_DIR_NAME);
+    let start = |pins: Option<Vec<stream_server::PinKey>>| {
+        stream_server::start(stream_server::ServerConfig {
+            http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            config_dir: Some(config_dir.path().join("config")),
+            cache_dir: Some(cache_root.clone()),
+            pins,
+            ..offline_config()
+        })
+    };
+    let piece = store
+        .join(".pieces")
+        .join("ef".repeat(20))
+        .join("0")
+        .join("0");
+    let chunk = store
+        .join(".proxy")
+        .join("0".repeat(64))
+        .join("1024_video%2Fmp4")
+        .join("0")
+        .join("0");
+    let seed = || -> anyhow::Result<()> {
+        for path in [&piece, &chunk] {
+            std::fs::create_dir_all(path.parent().expect("a parent"))?;
+            write_payload(path, 1024);
+        }
+        Ok(())
+    };
+
+    seed()?;
+    let handle = start(None)?;
+    assert!(piece.is_file(), "an unknown pin set swept the piece store");
+    assert!(chunk.is_file(), "an unknown pin set swept the proxy cache");
+    handle.shutdown()?;
+    handle.join()?;
+
+    let handle = start(Some(Vec::new()))?;
+    assert!(!piece.exists(), "an empty pin set kept a piece");
+    assert!(!chunk.exists(), "an empty pin set kept a proxy chunk");
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// **A dormant pin with nothing on the disk is held-nothing; one with a
+/// piece directory is dormant** (`docs/design/media-pipeline.md` §2.6). A
+/// pin the session did not bring back -- every pin, after the boot that
+/// deleted the previous build's cache -- whose `.pieces/<hash>` does not
+/// exist is a fact the server knows: nothing is held, `complete: false`
+/// and no error, the row a client reads as "not whole" and marks gone.
+/// With a directory there, what it holds is unknown until the torrent
+/// returns, and the row stays the dormant one: phase `error`, with the
+/// error that says so.
+#[test]
+fn a_dormant_pin_without_a_piece_directory_holds_nothing() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let cache_root = cache_dir.path().join("cache");
+    let (gone, held) = ("a1".repeat(20), "b2".repeat(20));
+    let piece = cache_root
+        .join(enginefs::CACHE_DIR_NAME)
+        .join(".pieces")
+        .join(&held)
+        .join("0")
+        .join("0");
+    std::fs::create_dir_all(piece.parent().expect("a bucket"))?;
+    write_payload(&piece, 1024);
+
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_root.clone()),
+        pins: Some(vec![
+            stream_server::PinKey::Torrent {
+                info_hash: gone.clone(),
+                file_idx: 0,
+            },
+            stream_server::PinKey::Torrent {
+                info_hash: held.clone(),
+                file_idx: 2,
+            },
+        ]),
+        ..offline_config()
+    })?;
+    let rows = handle.downloads()?;
+    let row = |hash: &str| {
+        rows.iter()
+            .find(|row| row.info_hash == hash)
+            .map(|row| serde_json::to_value(row).expect("a row serializes"))
+            .unwrap_or_else(|| panic!("no row for {hash} in {rows:?}"))
+    };
+    let gone = row(&gone);
+    assert_eq!(gone["complete"], false, "{gone}");
+    assert_eq!(gone["downloaded"], 0, "{gone}");
+    assert_eq!(gone["error"], serde_json::Value::Null, "{gone}");
+    assert_eq!(gone["phase"], "buffering", "{gone}");
+    let held = row(&held);
+    assert_eq!(held["complete"], false, "{held}");
+    assert_eq!(held["fileIdx"], 2, "{held}");
+    assert_eq!(held["phase"], "error", "{held}");
+    assert!(held["error"].is_string(), "{held}");
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
 /// `cacheRoot` set through `POST /settings` is where the data lives *from the
 /// next start*: the running server keeps writing where it opened. At that
 /// next start the setting is prepared before anything opens on it, and one
@@ -2025,7 +2321,8 @@ fn the_cache_root_setting_decides_where_the_next_session_opens() -> anyhow::Resu
     };
     // Where a session keeps its own records for the torrents it holds, and
     // so the mark that a session opened on a root and put a torrent there.
-    let opened_on = |root: &std::path::Path| root.join("rqbit-downloads").join("session.json");
+    let opened_on =
+        |root: &std::path::Path| root.join(enginefs::CACHE_DIR_NAME).join("session.json");
     // The torrent that makes it write them.
     let add_a_torrent = |handle: &stream_server::ServerHandle| -> anyhow::Result<()> {
         let base = format!("http://{}", handle.http_addr());
@@ -2085,7 +2382,7 @@ fn the_cache_root_setting_decides_where_the_next_session_opens() -> anyhow::Resu
     // directory nothing has ever written to and report a cache of nothing
     // while the disk fills up.
     let stray = default_root
-        .join("rqbit-downloads")
+        .join(enginefs::CACHE_DIR_NAME)
         .join(".pieces")
         .join("ffffffffffffffffffffffffffffffffffffffff")
         .join("00")
@@ -2154,14 +2451,16 @@ fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
     let (torrent, info_hash) = real_torrent(&content);
 
     let cache_root = resolved(&cache_dir.path().join("cache"));
-    let root_folder = cache_root.join("rqbit-downloads").join("Show Season 1");
+    let root_folder = cache_root
+        .join(enginefs::CACHE_DIR_NAME)
+        .join("Show Season 1");
 
     let config =
         |pins: std::collections::BTreeMap<String, Vec<usize>>| stream_server::ServerConfig {
             http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
             config_dir: Some(config_dir.path().join("config")),
             cache_dir: Some(cache_root.clone()),
-            pins: Some(pins),
+            pins: Some(torrent_pins(pins)),
             ..offline_config()
         };
     let handle = stream_server::start(config(Default::default()))?;
@@ -2303,7 +2602,7 @@ fn an_unnamed_pin_set_keeps_every_download_and_lists_it() -> anyhow::Result<()> 
             http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
             config_dir: Some(config_dir.path().join("config")),
             cache_dir: Some(cache_root.clone()),
-            pins,
+            pins: pins.map(torrent_pins),
             ..offline_config()
         }
     };
@@ -2350,7 +2649,7 @@ fn an_unnamed_pin_set_keeps_every_download_and_lists_it() -> anyhow::Result<()> 
 }
 
 /// The `.bitv` bitfields librqbit's persistent BitV factory writes next to
-/// the session state (`<cacheRoot>/rqbit-downloads/<infoHash>.bitv`).
+/// the session state (`<cacheRoot>/media-cache/<infoHash>.bitv`).
 fn bitv_files(session_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut files: Vec<_> = std::fs::read_dir(session_dir)
         .expect("session dir")
@@ -2398,14 +2697,14 @@ fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Res
     let (pinned_torrent, pinned_hash) = real_torrent(&pinned);
 
     let cache_root = resolved(&cache_dir.path().join("cache"));
-    let session_dir = cache_root.join("rqbit-downloads");
+    let session_dir = cache_root.join(enginefs::CACHE_DIR_NAME);
 
     let config =
         |pins: std::collections::BTreeMap<String, Vec<usize>>| stream_server::ServerConfig {
             http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
             config_dir: Some(config_dir.path().join("config")),
             cache_dir: Some(cache_root.clone()),
-            pins: Some(pins),
+            pins: Some(torrent_pins(pins)),
             ..offline_config()
         };
     let handle = stream_server::start(config(Default::default()))?;
@@ -2548,8 +2847,10 @@ fn downloads_pin_in_place_and_delete_only_what_they_say() -> anyhow::Result<()> 
     let second = file_index(&stats, "e2.bin");
 
     // Where librqbit says the torrent's files are, which the pin does not
-    // change: `<cacheRoot>/rqbit-downloads/<torrent name>`.
-    let named = cache_root.join("rqbit-downloads").join("Show Season 2");
+    // change: `<cacheRoot>/media-cache/<torrent name>`.
+    let named = cache_root
+        .join(enginefs::CACHE_DIR_NAME)
+        .join("Show Season 2");
 
     // The pin: the file is pinned where it already is, and the answer is a
     // DownloadInfo.
@@ -3512,14 +3813,14 @@ fn a_clean_takes_no_pinned_and_no_ownerless_byte() -> anyhow::Result<()> {
     // An idle leftover with no engine managing it at all -- ordinary cache
     // from a torrent nothing is tracking any more.
     let idle = cache_root
-        .join("rqbit-downloads")
+        .join(enginefs::CACHE_DIR_NAME)
         .join("Leftover")
         .join("old.mkv");
     std::fs::create_dir_all(idle.parent().unwrap())?;
     write_payload(&idle, 16 * 1024);
     // And the legacy whole-file copy of *this* torrent, exactly where a
     // whole-file (filesystem) storage puts a directory torrent's data.
-    let root_folder = cache_root.join("rqbit-downloads").join("Movie");
+    let root_folder = cache_root.join(enginefs::CACHE_DIR_NAME).join("Movie");
     std::fs::create_dir_all(&root_folder)?;
     std::fs::copy(content.join("movie.mkv"), root_folder.join("movie.mkv"))?;
     std::fs::copy(

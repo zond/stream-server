@@ -92,7 +92,7 @@ struct Watch {
 }
 
 impl Watch {
-    fn start(pins: Option<enginefs::piece_store::PinSet>) -> anyhow::Result<Self> {
+    fn start(pins: Option<Vec<stream_server::PinKey>>) -> anyhow::Result<Self> {
         let config_dir = tempfile::tempdir()?;
         let cache_dir = tempfile::tempdir()?;
         let src = tempfile::tempdir()?;

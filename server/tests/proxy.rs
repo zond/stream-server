@@ -27,15 +27,12 @@ use std::path::PathBuf;
 mod torrent_fixtures;
 
 /// The config every test here spreads from: offline and with an empty pin
-/// record (`support/torrent_fixtures.rs`), and the same for the proxy
-/// cache's own pins: an embedder that keeps a record and has pinned
-/// nothing, under which a restart sweeps the cache clean. `None` would keep
-/// everything (`proxy_downloads.rs` has that case).
+/// record (`support/torrent_fixtures.rs`), which is the proxy cache's too
+/// -- one pin set for both stores: an embedder that keeps a record and has
+/// pinned nothing, under which a restart sweeps the cache clean. `None`
+/// would keep everything (`proxy_downloads.rs` has that case).
 fn offline_config() -> stream_server::ServerConfig {
-    stream_server::ServerConfig {
-        proxy_pins: Some(Vec::new()),
-        ..torrent_fixtures::offline_config()
-    }
+    torrent_fixtures::offline_config()
 }
 
 /// One byte of the body at `offset`: a cheap pattern, so a range response
@@ -1801,7 +1798,7 @@ fn the_count_hears_the_clean_and_ignores_what_no_owner_booked() -> anyhow::Resul
         .cache_root
         .path()
         .join("cache")
-        .join("rqbit-downloads")
+        .join(enginefs::CACHE_DIR_NAME)
         .join("Leftover")
         .join("old.mkv");
     std::fs::create_dir_all(legacy.parent().expect("a parent"))?;
@@ -2929,7 +2926,7 @@ fn a_restart_empties_the_proxy_cache() -> anyhow::Result<()> {
     let bucket = cache_root
         .path()
         .join("cache")
-        .join("rqbit-downloads")
+        .join(enginefs::CACHE_DIR_NAME)
         .join(".proxy")
         .join("0".repeat(64))
         .join(format!("{ORIGIN_LENGTH}_video%2Fmp4"))

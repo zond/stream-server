@@ -394,7 +394,7 @@ already there, holding about twice the size of every archive played since
 that build's last clean exit, and nothing else would ever take it: no
 retention owner speaks for those bytes, `ServerHandle::cache_usage` does not count
 them, and the piece store's legacy sweep walks
-`<cacheRoot>/rqbit-downloads`, one level *below* where `.archives` sits.
+`<cacheRoot>/rqbit-downloads` (now `media-cache`), one level *below* where `.archives` sits.
 (Which is also why removing it from `NOT_OURS` frees nothing by itself:
 that list is about names directly under the download dir, and `.archives`
 was never one of them. The exemption was never load-bearing; it is removed

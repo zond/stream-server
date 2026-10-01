@@ -14,7 +14,7 @@ pub use enginefs::pretend_volume_space;
 pub use enginefs::{PIN_FREE_SPACE_MARGIN, PinDownloadError, UnpinOutcome};
 use futures_util::future::BoxFuture;
 pub use proxy_downloads::{ProxyPinError, ProxyPinKey};
-pub use routes::downloads::{DownloadInfo, ProxyDownloadRequest};
+pub use routes::downloads::{DownloadInfo, PinKey, ProxyDownloadRequest};
 // What `ServerHandle::open_drive_file` answers. Named here because `routes`
 // is private, so a type only reachable through it is one an embedder can
 // call the method but not write down the result of -- and `DriveError`
@@ -22,6 +22,7 @@ pub use routes::downloads::{DownloadInfo, ProxyDownloadRequest};
 // that cannot name it cannot construct or match the case that matters.
 /// What [`ServerHandle::publish`] answers: the last segment of a cast URL.
 pub use cast::CastToken;
+pub use media::PinError;
 pub use media::{
     Canceller, GrantSupplier, LocalFile, MediaId, MediaReader, MediaSpec, MemberInfo, PlayToken,
     Refusal, Resolved,
@@ -105,6 +106,91 @@ pub const DEFAULT_HTTP_PORT: u16 = 11470;
 /// purpose, in `run`: deleting what such a build left behind.
 const LEGACY_ARCHIVE_SCRATCH_DIR: &str = ".archives";
 
+/// The name the cache directory had before [`enginefs::CACHE_DIR_NAME`]:
+/// `<cacheRoot>/rqbit-downloads`. **No migration** (the data is cheap): a
+/// boot that finds it deletes it, pieces, proxy cache, session records and
+/// every pinned download's bytes with them. See [`retire_legacy_cache_dir`].
+const LEGACY_CACHE_DIR: &str = "rqbit-downloads";
+
+/// Where [`LEGACY_CACHE_DIR`] is renamed to before the session opens, and
+/// deleted from afterwards: at the cache root, beside `media-cache` and
+/// outside anything the launch sweep walks. A boot that finds one -- left
+/// by a process killed mid-delete -- deletes it too.
+const LEGACY_CACHE_DELETING: &str = ".rqbit-downloads.deleting";
+
+/// Take the previous build's cache directory out of the way, **before the
+/// session opens**, and answer what to delete once it has: a rename, which
+/// is cheap, where the delete of a store of one file per piece on an SD
+/// card is seconds -- so the delete goes to the blocking pool after boot
+/// ([`delete_retired_cache_dirs`]) instead of holding the boot up.
+///
+/// The rename is what lets a killed process's half-finished delete be
+/// recognised: a `.rqbit-downloads.deleting` found here is deleted too. When
+/// both are present the old directory is deleted where it is, after the
+/// leftover; a rename that fails leaves it there to be deleted in place.
+/// Nothing opens either -- the session is on [`enginefs::CACHE_DIR_NAME`] --
+/// so neither is ever read while it goes.
+fn retire_legacy_cache_dir(root: &std::path::Path) -> Vec<PathBuf> {
+    let present = |path: &std::path::Path| std::fs::symlink_metadata(path).is_ok();
+    let old = root.join(LEGACY_CACHE_DIR);
+    let deleting = root.join(LEGACY_CACHE_DELETING);
+    let mut doomed = Vec::new();
+    if present(&deleting) {
+        doomed.push(deleting.clone());
+    }
+    if present(&old) {
+        if !doomed.contains(&deleting) {
+            match std::fs::rename(&old, &deleting) {
+                Ok(()) => {
+                    tracing::info!(
+                        from = %old.display(),
+                        to = %deleting.display(),
+                        "the previous build's cache directory is renamed for deletion; no migration"
+                    );
+                    doomed.push(deleting);
+                    return doomed;
+                }
+                Err(error) => tracing::warn!(
+                    path = %old.display(),
+                    %error,
+                    "could not rename the previous build's cache directory; deleting it in place"
+                ),
+            }
+        }
+        doomed.push(old);
+    }
+    doomed
+}
+
+/// Delete what [`retire_legacy_cache_dir`] set aside. On the blocking pool,
+/// detached: the boot does not wait for it, and a process killed before it
+/// ends leaves the `.deleting` name for the next boot to finish.
+fn delete_retired_cache_dirs(doomed: Vec<PathBuf>) {
+    if doomed.is_empty() {
+        return;
+    }
+    drop(tokio::task::spawn_blocking(move || {
+        for path in doomed {
+            let removed = match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&path),
+                Ok(_) => std::fs::remove_file(&path),
+                Err(error) => Err(error),
+            };
+            match removed {
+                Ok(()) => {
+                    tracing::info!(path = %path.display(), "the previous build's cache directory is deleted")
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "could not delete the previous build's cache directory; the next boot tries again"
+                ),
+            }
+        }
+    }));
+}
+
 mod auth;
 mod cache_budget;
 mod cache_cleaner;
@@ -179,27 +265,24 @@ pub struct ServerConfig {
     /// How the control API authenticates (media routes are always open).
     /// Defaults to a per-launch generated token; see [`ServerAuth`].
     pub auth: ServerAuth,
-    /// What the embedder says is pinned for offline: info hash to the file
-    /// indices it wants kept. Handed in rather than read from a file,
+    /// What the embedder says is pinned for offline: every download the
+    /// user asked for, one [`PinKey`] each -- a torrent's file, an addon
+    /// link, a Google Drive file. Handed in rather than read from a file,
     /// because the one client that pins already keeps that list as the
     /// downloads the user asked for, and two records of one fact are two
     /// records that can disagree -- see `enginefs::piece_store::pin_record`.
+    /// The two stores each take their half: the torrent keys are the piece
+    /// store's pin set, the link and Drive keys the proxy cache's.
     ///
     /// **`None` is "nobody told me", and it is not an empty set.** The
-    /// launch sweep deletes everything the set does not claim, before the
+    /// launch sweeps delete everything the set does not claim, before the
     /// session opens, so silence has to mean *keep everything*: nothing is
-    /// swept, every restored torrent is kept and reported as pinned, and
-    /// nothing is deleted for want of a claim. An embedder whose own record
-    /// would not read passes `None` and warns its user; passing an empty
-    /// map instead says "the user has pinned nothing", which deletes their
-    /// downloads.
-    pub pins: Option<enginefs::piece_store::PinSet>,
-    /// The proxy-cache downloads the embedder keeps -- addon URLs and Drive
-    /// files pinned offline (`crate::proxy_downloads`) -- under the same
-    /// rule as [`Self::pins`]: **`None` is "nobody told me"**, which sweeps
-    /// nothing and exempts nothing, and an empty list is "the user has
-    /// pinned nothing", which sweeps the proxy cache clean.
-    pub proxy_pins: Option<Vec<proxy_downloads::ProxyPinKey>>,
+    /// swept -- no torrent's pieces, no proxied body -- every restored
+    /// torrent is kept and reported as pinned, and nothing is deleted for
+    /// want of a claim. An embedder whose own record would not read passes
+    /// `None` and warns its user; passing an empty list instead says "the
+    /// user has pinned nothing", which deletes their downloads.
+    pub pins: Option<Vec<PinKey>>,
     /// The port librqbit's incoming BitTorrent listener binds.
     /// [`TorrentListenPort::Ephemeral`] by default, so any number of
     /// embedded servers (and the tests) coexist; an embedder that needs a
@@ -294,7 +377,6 @@ impl Default for ServerConfig {
         Self {
             http_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_HTTP_PORT)),
             pins: None,
-            proxy_pins: None,
             config_dir: None,
             cache_dir: None,
             init_logging: false,
@@ -792,6 +874,38 @@ impl ServerHandle {
         self.block_on_server(async move {
             routes::downloads::unpin_proxy_download(&state, &key, delete_files).await
         })
+    }
+
+    /// **Pin what an id names as an offline download**, whatever it is
+    /// (`docs/design/media-pipeline.md` §2.6): a torrent file through
+    /// [`Self::pin_download`] (with the URL's `tr=` trackers, and `-1`
+    /// chosen as the stream route chooses it), a link through
+    /// [`Self::pin_proxy_download`] keyed with its `h=` headers, a Drive file
+    /// under a grant asked of the id's [`GrantSupplier`] (none is needed
+    /// for a file already whole on the disk). A member of a container pins
+    /// the container -- every volume of a set -- since a member is ranges of
+    /// those files. A file on this device is [`PinError::NothingToDownload`].
+    ///
+    /// Answers the rows [`Self::downloads`] lists for it: one, or one per
+    /// volume. The info-hash and key methods stay; this is the same pin.
+    pub fn pin(&self, id: &MediaId) -> Result<Vec<DownloadInfo>, PinError> {
+        let state = self.state.clone();
+        let id = id.clone();
+        self.block_on_server(async move { state.media.pin(&state, &id).await })
+            .unwrap_or(Err(PinError::ServerStopped))
+    }
+
+    /// **Drop the pin on what an id names**, with `delete_files` its bytes
+    /// too: [`Self::unpin_download`] or [`Self::unpin_proxy_download`] for
+    /// each file [`Self::pin`] pinned for it, the outcomes joined
+    /// (`unpinned` if any pin went, `deleted_files` if any bytes did). A
+    /// torrent URL with an explicit file index is unpinned without
+    /// resolving, so a dormant pin's torrent is not added to learn it.
+    pub fn unpin(&self, id: &MediaId, delete_files: bool) -> Result<UnpinOutcome, PinError> {
+        let state = self.state.clone();
+        let id = id.clone();
+        self.block_on_server(async move { state.media.unpin(&state, &id, delete_files).await })
+            .unwrap_or(Err(PinError::ServerStopped))
     }
 
     /// Every pinned download (see `routes::downloads::downloads`).
@@ -1566,15 +1680,24 @@ pub async fn run(
     // One engine, opened on the one torrent-data root; librqbit sessions
     // always persist to disk, so there is no second, memory-only engine and
     // no fallback to one. A failure here is a failure.
+    // The previous build's cache directory, out of the way before the
+    // session opens on the new one, and deleted once it has.
+    let retired = {
+        let root = torrent_data_root.clone();
+        tokio::task::spawn_blocking(move || retire_legacy_cache_dir(&root))
+            .await
+            .unwrap_or_default()
+    };
     let engine = Arc::new(
         EngineFS::new_with_storage(
             torrent_data_root.clone(),
             backend_config,
             Some(tracker_storage),
-            cfg.pins.clone(),
+            cfg.pins.as_deref().map(PinKey::torrent_pins),
         )
         .await?,
     );
+    delete_retired_cache_dirs(retired);
 
     let mut state = AppState::new(engine, settings_arc.clone(), settings_file);
     state.base_url = base_url.clone();
@@ -1643,9 +1766,8 @@ pub async fn run(
     {
         // The pinned proxy downloads first, so the sweep keeps them and the
         // owner counts them: see `crate::proxy_downloads`.
-        let keep = state
-            .proxy_downloads
-            .install(&state, cfg.proxy_pins.as_deref());
+        let proxy_pins = cfg.pins.as_deref().map(PinKey::proxy_pins);
+        let keep = state.proxy_downloads.install(&state, proxy_pins.as_deref());
         let root = state.proxy_cache.root().to_path_buf();
         match tokio::task::spawn_blocking(move || proxy_cache::sweep(&root, keep.as_ref())).await {
             Ok(report) => state.proxy_cache.retention().restored(report.kept_bytes),
@@ -1662,7 +1784,7 @@ pub async fn run(
     // -- the download and the extraction -- and **nothing else will ever
     // take it**: no retention owner speaks for those bytes, no cache
     // figure counts them, and the piece store's own legacy sweep walks
-    // `<cacheRoot>/rqbit-downloads`, one level below this. So it goes
+    // `<cacheRoot>/media-cache`, one level below this. So it goes
     // here, once, on the first launch of a build that has no use for it.
     {
         let stale = torrent_data_root.join(LEGACY_ARCHIVE_SCRATCH_DIR);

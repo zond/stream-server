@@ -9,7 +9,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use stream_server::{ProxyDownloadRequest, ProxyPinKey, ServerConfig, ServerHandle};
+use stream_server::{PinKey, ProxyDownloadRequest, ProxyPinKey, ServerConfig, ServerHandle};
 
 fn byte_at(offset: usize) -> u8 {
     (offset % 251) as u8
@@ -176,11 +176,8 @@ fn answer(request: &Request, socket: &mut TcpStream, ranges: bool) {
 mod torrent_fixtures;
 
 fn offline_config() -> ServerConfig {
-    ServerConfig {
-        // An embedder that keeps a proxy pin record and has pinned nothing.
-        proxy_pins: Some(Vec::new()),
-        ..torrent_fixtures::offline_config()
-    }
+    // An embedder that keeps a pin record and has pinned nothing.
+    torrent_fixtures::offline_config()
 }
 
 struct Fixture {
@@ -205,7 +202,7 @@ impl Fixture {
             http_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             config_dir: Some(config_dir.path().join("config")),
             cache_dir: Some(cache_root.path().join("cache")),
-            proxy_pins,
+            pins: proxy_pins.map(|keys| keys.into_iter().map(PinKey::from).collect()),
             ..offline_config()
         })?;
         Ok(Self {
@@ -226,7 +223,7 @@ impl Fixture {
         self.cache_root
             .path()
             .join("cache")
-            .join("rqbit-downloads")
+            .join(enginefs::CACHE_DIR_NAME)
             .join(".proxy")
     }
 

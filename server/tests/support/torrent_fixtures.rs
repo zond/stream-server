@@ -96,7 +96,7 @@ pub fn real_torrent_with_pieces(dir: &Path, piece_length: u32) -> (Vec<u8>, Stri
 
 /// The session's piece store, where all of a torrent's data is.
 pub fn piece_store(cache_root: &Path) -> enginefs::piece_store::StoreRoot {
-    enginefs::piece_store::StoreRoot::in_download_dir(&cache_root.join("rqbit-downloads"))
+    enginefs::piece_store::StoreRoot::in_download_dir(&cache_root.join(enginefs::CACHE_DIR_NAME))
 }
 
 /// Pre-seed a one-file torrent's every piece where the server reads them:

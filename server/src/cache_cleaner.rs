@@ -354,7 +354,7 @@ mod tests {
         use std::io::{Seek, SeekFrom, Write};
 
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("rqbit-downloads");
+        let root = tmp.path().join(enginefs::CACHE_DIR_NAME);
         let registry = StoreRegistry::new(store(&root));
         // A piece of a torrent no store is registered for: a previous
         // process's, or one this session holds in Error.
@@ -407,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn usage_counts_a_registered_store_and_stats_what_no_store_speaks_for() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("rqbit-downloads");
+        let root = tmp.path().join(enginefs::CACHE_DIR_NAME);
         let registry = Arc::new(StoreRegistry::new(store(&root)));
 
         // A registered torrent, holding one piece of its four.

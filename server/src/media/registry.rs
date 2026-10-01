@@ -1109,6 +1109,276 @@ fn link_name(target: &Url) -> String {
         .unwrap_or_else(|| "link".to_string())
 }
 
+/// **Pins and unpins by id** (`docs/design/media-pipeline.md` §2.6): the
+/// dispatch from what an id names to the two pin paths there are -- the
+/// piece store's (`routes::downloads::pin_download`) for a torrent file,
+/// the proxy cache's (`proxy_downloads::pin_url`, `pin_drive`) for a link
+/// or a Drive file. A member pins its container's files, every volume of a
+/// set; a file on this device has nothing to download.
+impl Registry {
+    /// Pin what `id` names as an offline download, and answer its rows:
+    /// one, or one per volume for a member of a set.
+    pub(crate) async fn pin(
+        &self,
+        state: &AppState,
+        id: &MediaId,
+    ) -> Result<Vec<crate::DownloadInfo>, super::PinError> {
+        use super::PinError;
+        let entry = self.entry(id).map_err(PinError::Refused)?;
+        let target = entry
+            .target
+            .as_ref()
+            .map_err(|refusal| PinError::Refused(refusal.clone()))?;
+        match target {
+            Target::Local { .. } => Err(PinError::NothingToDownload),
+            Target::Drive {
+                file_id,
+                name,
+                grant,
+            } => {
+                // The grant is asked for here, as a resolve asks for it; a
+                // file already whole on the disk needs none.
+                let token = grant();
+                let dir = crate::proxy_downloads::pin_drive(
+                    state,
+                    file_id,
+                    token.as_deref(),
+                    name.clone(),
+                )
+                .await
+                .map_err(PinError::Proxy)?;
+                let row = crate::routes::downloads::proxy_row(state, &dir)
+                    .await
+                    .map_err(PinError::Proxy)?;
+                Ok(vec![row])
+            }
+            Target::Proxy {
+                target,
+                request_headers,
+                ..
+            } => Ok(vec![
+                pin_link(state, target, request_headers, Some(link_name(target))).await?,
+            ]),
+            Target::Torrent { query, .. } => {
+                let resolution = entry.resolution(state).await.map_err(PinError::Refused)?;
+                let Resolution::Torrent {
+                    info_hash,
+                    file_idx,
+                    ..
+                } = &*resolution
+                else {
+                    unreachable!("a torrent target resolves to a torrent");
+                };
+                let trackers = compat::parse_trackers(query.as_deref());
+                let row =
+                    crate::routes::downloads::pin_download(state, info_hash, *file_idx, trackers)
+                        .await
+                        .map_err(PinError::Torrent)?;
+                Ok(vec![row])
+            }
+            Target::Member { .. } => {
+                let resolution = entry.resolution(state).await.map_err(PinError::Refused)?;
+                let mut rows = Vec::new();
+                for volume in member_volumes(state, &resolution).await? {
+                    rows.push(match volume {
+                        Volume::Torrent {
+                            info_hash,
+                            file_idx,
+                        } => crate::routes::downloads::pin_download(
+                            state,
+                            &info_hash,
+                            file_idx,
+                            Vec::new(),
+                        )
+                        .await
+                        .map_err(PinError::Torrent)?,
+                        Volume::Link(url) => {
+                            pin_link(state, &url, &BTreeMap::new(), Some(link_name(&url))).await?
+                        }
+                    });
+                }
+                Ok(rows)
+            }
+        }
+    }
+
+    /// Drop the pin on what `id` names, with `delete_files` its bytes too:
+    /// [`crate::ServerHandle::unpin_download`] or
+    /// [`crate::ServerHandle::unpin_proxy_download`] for each file it pinned,
+    /// the outcomes joined -- `unpinned` if any pin went, `deleted_files` if
+    /// any bytes did.
+    pub(crate) async fn unpin(
+        &self,
+        state: &AppState,
+        id: &MediaId,
+        delete_files: bool,
+    ) -> Result<enginefs::UnpinOutcome, super::PinError> {
+        use super::PinError;
+        let entry = self.entry(id).map_err(PinError::Refused)?;
+        let target = entry
+            .target
+            .as_ref()
+            .map_err(|refusal| PinError::Refused(refusal.clone()))?;
+        let proxy = |key: crate::proxy_downloads::ProxyPinKey| async move {
+            let Some(name) = crate::routes::downloads::proxy_download_key(state, &key) else {
+                return Err(PinError::Proxy(
+                    crate::proxy_downloads::ProxyPinError::Unkeyable(
+                        "nothing this server can key, so nothing is pinned under it",
+                    ),
+                ));
+            };
+            Ok(crate::routes::downloads::unpin_proxy_download(state, &name, delete_files).await)
+        };
+        let torrent = |info_hash: String, file_idx: usize| async move {
+            crate::routes::downloads::unpin_download(state, &info_hash, file_idx, delete_files)
+                .await
+                .map_err(PinError::Torrent)
+        };
+        match target {
+            Target::Local { .. } => Err(PinError::NothingToDownload),
+            Target::Drive { file_id, .. } => {
+                proxy(crate::proxy_downloads::ProxyPinKey::Drive {
+                    file_id: file_id.clone(),
+                })
+                .await
+            }
+            Target::Proxy {
+                target,
+                request_headers,
+                ..
+            } => {
+                proxy(crate::proxy_downloads::ProxyPinKey::Url {
+                    target: target.to_string(),
+                    headers: request_headers.clone(),
+                })
+                .await
+            }
+            // An index needs no resolve: an unpin must not add a torrent
+            // the session does not hold (a dormant pin's) to learn it.
+            Target::Torrent {
+                info_hash,
+                file: StreamFile::Index(file_idx),
+                ..
+            } => torrent(info_hash.clone(), *file_idx).await,
+            Target::Torrent { .. } | Target::Member { .. } => {
+                let resolution = entry.resolution(state).await.map_err(PinError::Refused)?;
+                let volumes = match &*resolution {
+                    Resolution::Torrent {
+                        info_hash,
+                        file_idx,
+                        ..
+                    } => vec![Volume::Torrent {
+                        info_hash: info_hash.clone(),
+                        file_idx: *file_idx,
+                    }],
+                    resolution => member_volumes(state, resolution).await?,
+                };
+                let mut joined = enginefs::UnpinOutcome {
+                    unpinned: false,
+                    deleted_files: false,
+                };
+                for volume in volumes {
+                    let outcome = match volume {
+                        Volume::Torrent {
+                            info_hash,
+                            file_idx,
+                        } => torrent(info_hash, file_idx).await?,
+                        Volume::Link(url) => {
+                            proxy(crate::proxy_downloads::ProxyPinKey::Url {
+                                target: url.to_string(),
+                                headers: BTreeMap::new(),
+                            })
+                            .await?
+                        }
+                    };
+                    joined.unpinned |= outcome.unpinned;
+                    joined.deleted_files |= outcome.deleted_files;
+                }
+                Ok(joined)
+            }
+        }
+    }
+}
+
+/// One file a member's container is made of, as a pin names it.
+enum Volume {
+    /// A file of the torrent the container is in.
+    Torrent { info_hash: String, file_idx: usize },
+    /// A link the container is behind, fetched with no `h=` headers, as an
+    /// archive `/create` fetches its volumes.
+    Link(Url),
+}
+
+/// Every file `resolution`'s container is made of, in set order: a
+/// member's pin is its container's, all of it -- a member is ranges of
+/// those files and nothing else holds its bytes.
+async fn member_volumes(
+    state: &AppState,
+    resolution: &Resolution,
+) -> Result<Vec<Volume>, super::PinError> {
+    let Resolution::Member {
+        format,
+        key,
+        create,
+        torrent,
+        ..
+    } = resolution
+    else {
+        unreachable!("only a member has volumes");
+    };
+    if let Some((info_hash, files)) = torrent {
+        return Ok(files
+            .iter()
+            .map(|file_idx| Volume::Torrent {
+                info_hash: info_hash.clone(),
+                file_idx: *file_idx,
+            })
+            .collect());
+    }
+    // Behind links: the create's own list when the id carries one, else the
+    // session's sources.
+    if let Some(payload) = create {
+        return payload
+            .urls
+            .iter()
+            .map(|url| {
+                Url::parse(url).map(Volume::Link).map_err(|_| {
+                    super::PinError::Refused(Refusal::BadRequest(
+                        "a volume of the archive is not a web address".to_string(),
+                    ))
+                })
+            })
+            .collect();
+    }
+    let session = member_session(state, *format, key, None)
+        .await
+        .map_err(super::PinError::Refused)?;
+    Ok(match session.sources() {
+        SessionSources::Held(sources) => sources
+            .iter()
+            .map(|source| Volume::Link(source.url().clone()))
+            .collect(),
+        SessionSources::Torrent { .. } => {
+            unreachable!("a member in a torrent resolves with its torrent's files")
+        }
+    })
+}
+
+/// Pin one link as a download, and answer its row.
+async fn pin_link(
+    state: &AppState,
+    target: &Url,
+    headers: &BTreeMap<String, String>,
+    name: Option<String>,
+) -> Result<crate::DownloadInfo, super::PinError> {
+    let dir = crate::proxy_downloads::pin_url(state, target.as_str(), headers.clone(), name)
+        .await
+        .map_err(super::PinError::Proxy)?;
+    crate::routes::downloads::proxy_row(state, &dir)
+        .await
+        .map_err(super::PinError::Proxy)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -145,6 +145,17 @@ pub const STOPPED_READ_STALL_BOUND: Duration = Duration::from_secs(20);
 /// needs nothing and is never refused.
 pub const PIN_FREE_SPACE_MARGIN: u64 = 500 * 1024 * 1024;
 
+/// The one directory under `settings.cacheRoot` everything this server
+/// keeps lives in: the piece store (`.pieces`), the proxy cache (`.proxy`)
+/// and the librqbit session's own records (`session.json`, the `.torrent`
+/// and `.bitv` per torrent, the DHT state). Every spelling of the path goes
+/// through this, tests included.
+///
+/// It was `rqbit-downloads` until the media pipeline's step D, which
+/// renamed it with no migration: a boot that finds the old directory
+/// deletes it whole (the server's `run`, before the session opens).
+pub const CACHE_DIR_NAME: &str = "media-cache";
+
 /// How long a magnet add may spend resolving metadata inside the backend
 /// before it is given up on. librqbit's `Session::add_torrent` has no timeout
 /// of its own, so without this an unresolvable magnet (no peers, dead
@@ -3166,7 +3177,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     /// The piece store this engine's data is in:
-    /// `<cacheRoot>/rqbit-downloads/.pieces`, the same root the session's
+    /// `<cacheRoot>/media-cache/.pieces` ([`CACHE_DIR_NAME`]), the same root the session's
     /// default storage factory is built on.
     ///
     /// **The one location question this layer asks, and the store is what it
@@ -5484,7 +5495,7 @@ impl BackendEngineFS<LibrqbitBackend> {
         tracker_storage: Option<Arc<dyn crate::trackers::TrackerStorage>>,
         pins: Option<crate::piece_store::PinSet>,
     ) -> Result<Self> {
-        let download_dir = root_dir.join("rqbit-downloads");
+        let download_dir = root_dir.join(CACHE_DIR_NAME);
         let resolvers = config.dht_bootstrap_dns.resolvers_in(&download_dir);
         let public_trackers = config.public_trackers;
         let tuning = crate::backend::librqbit::SessionTuning::from_settings(
@@ -7862,7 +7873,8 @@ mod tests {
         let (enginefs, counters) = test_enginefs_with_file_count(3);
         // Wherever the backend says its files are -- a folder no layer
         // above it chose -- the pin leaves it there.
-        *counters.output_folder.lock().unwrap() = Some("/cache/rqbit-downloads/show".into());
+        *counters.output_folder.lock().unwrap() =
+            Some(format!("/cache/{CACHE_DIR_NAME}/show").into());
         let before = enginefs.get_engine(TEST_HASH).await.unwrap();
 
         let engine = enginefs.pin_download(TEST_HASH, 2, None).await.unwrap();
@@ -20611,9 +20623,9 @@ mod tests {
         let enginefs = BackendEngineFS::new_with_backend(
             FakeBackend::new(vec![handle]),
             HashMap::new(),
-            root.path().join("rqbit-downloads"),
+            root.path().join(crate::CACHE_DIR_NAME),
         );
-        std::fs::create_dir_all(root.path().join("rqbit-downloads")).unwrap();
+        std::fs::create_dir_all(root.path().join(crate::CACHE_DIR_NAME)).unwrap();
         let pieces = enginefs.piece_store().path().to_path_buf();
         let folder = pieces.join(TEST_HASH);
         std::fs::create_dir_all(folder.join("0")).unwrap();
@@ -20677,7 +20689,7 @@ mod tests {
         let enginefs = BackendEngineFS::new_with_backend(
             FakeBackend::new(Vec::new()),
             HashMap::new(),
-            root.path().join("rqbit-downloads"),
+            root.path().join(crate::CACHE_DIR_NAME),
         );
         let pieces = enginefs.piece_store().path().to_path_buf();
         let folder = pieces.join(TEST_HASH);
@@ -20788,9 +20800,9 @@ mod tests {
         let enginefs = BackendEngineFS::new_with_backend(
             FakeBackend::new(Vec::new()),
             HashMap::new(),
-            root.path().join("rqbit-downloads"),
+            root.path().join(crate::CACHE_DIR_NAME),
         );
-        std::fs::create_dir_all(root.path().join("rqbit-downloads")).unwrap();
+        std::fs::create_dir_all(root.path().join(crate::CACHE_DIR_NAME)).unwrap();
         let pieces = enginefs.piece_store().path().to_path_buf();
         let folder = pieces.join(TEST_HASH);
         std::fs::create_dir_all(folder.join("0")).unwrap();

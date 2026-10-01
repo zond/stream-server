@@ -355,6 +355,12 @@ impl ProxySource {
         }
     }
 
+    /// The origin URL this source reads: what a download of a link-borne
+    /// container's volume pins (`crate::media`'s `pin`).
+    pub(crate) fn url(&self) -> &Url {
+        &self.entity.url
+    }
+
     /// The key directory this source's entity is cached under, when the
     /// cache keys it at all: what registers it for read-ahead.
     pub(crate) fn key_dir(&self) -> Option<std::path::PathBuf> {

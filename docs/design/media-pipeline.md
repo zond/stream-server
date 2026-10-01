@@ -743,7 +743,22 @@ C. **Publish and the cast route.** (M.) 2.7 whole: tokens, `/cast/{token}`,
 
 D. **Pins by id; one pin set; the directory.** (S-M.) `pin(id)`,
    `PinKey`, the rename, the boot delete, `NOT_OURS`, and the held-nothing
-   answer for a dormant pin without a directory (2.6).
+   answer for a dormant pin without a directory (2.6) *(Done:
+   `ServerHandle::pin`/`unpin` dispatch in `media/registry.rs`'s own
+   block; `pin` answers a row per file pinned -- `Vec<DownloadInfo>`, not
+   one, because a set's member pins every volume -- and a refusal is
+   `PinError`. A Drive id with no grant pins only a file already whole
+   (`ProxyPinError::NoGrant` otherwise); an unpin of a torrent URL with an
+   explicit index does not resolve, so it adds no torrent. `PinKey`
+   (`Torrent`, `Url`, `Drive`) in `routes/downloads.rs`, split by
+   `PinKey::torrent_pins`/`proxy_pins`; one `None` now means unknown for
+   both stores. `enginefs::CACHE_DIR_NAME = "media-cache"`; the rename and
+   the delete are `retire_legacy_cache_dir`/`delete_retired_cache_dirs` in
+   `lib.rs`, with both leftovers -- `.deleting`, and an old directory
+   beside it -- deleted in the background. No directory joined
+   `media-cache`, so `NOT_OURS` is unchanged; `embed.rs` pins the entries a
+   boot leaves there. A dormant pin without a piece directory reports
+   `phase: "buffering"`, `complete: false`, no error.)*
 
 E. **The sniff in `resolve`.** (S; M more for explicit volume lists on URL
    and Drive sets.) 2.9, then the app's fallback deleted.

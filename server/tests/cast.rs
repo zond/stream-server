@@ -455,8 +455,8 @@ fn origin_server(
         cache_dir: Some(cache_root),
         drive_refresh_endpoint: Some(url::Url::parse(&origin.url("/refresh"))?),
         drive_api_base: Some(url::Url::parse(&origin.url("/"))?),
-        // An embedder that keeps a proxy pin record, empty at boot.
-        proxy_pins: Some(Vec::new()),
+        // An embedder that keeps a pin record, empty at boot.
+        pins: Some(Vec::new()),
         ..offline_config()
     }))?;
     let lan = start_lan(&handle)?;

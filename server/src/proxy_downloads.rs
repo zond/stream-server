@@ -8,9 +8,9 @@
 //! (`docs/design/generic-downloads.md`):
 //!
 //! * **A pin** -- a claim on a key directory that outlives the process. The
-//!   embedder names the set at boot ([`crate::ServerConfig::proxy_pins`],
-//!   the piece store's rule that `None` is "nobody told me" and not an empty
-//!   set), the launch sweep keeps what it names, and the retention owner
+//!   embedder names the set at boot (the link and Drive keys of
+//!   [`crate::ServerConfig::pins`], under the piece store's rule that `None`
+//!   is "nobody told me" and not an empty set), the launch sweep keeps what it names, and the retention owner
 //!   answers `keeps_everything` from it
 //!   ([`crate::proxy_retention::ProxyRetention::set_pins`]).
 //! * **A filler** -- something that fetches the bytes when no player is
@@ -112,6 +112,10 @@ pub enum ProxyPinError {
     /// Nothing the cache can key: a URL that does not parse or names this
     /// server, a Drive pin with no Drive endpoint.
     Unkeyable(&'static str),
+    /// A Drive file not whole on the disk yet, and no grant to fetch the
+    /// rest with: the id's grant supplier has none (this device is not
+    /// linked to the account).
+    NoGrant,
 }
 
 impl std::fmt::Display for ProxyPinError {
@@ -120,6 +124,9 @@ impl std::fmt::Display for ProxyPinError {
             Self::Source(error) => write!(f, "{error}"),
             Self::Drive(error) => write!(f, "{error}"),
             Self::Unkeyable(why) => write!(f, "this link cannot be a download: {why}"),
+            Self::NoGrant => {
+                f.write_str("this device is not linked to a Google account that can read that file")
+            }
         }
     }
 }
@@ -430,18 +437,19 @@ pub(crate) async fn held_download(
 
 /// Pins a Google Drive file as a download, under the pairing the app
 /// holds: the token renews in Rust for the length of the fill, as it does
-/// for a stream.
+/// for a stream. A file already whole on the disk needs no token -- nothing
+/// is fetched -- so `refresh_token` may be `None` for it; for anything else
+/// `None` is [`ProxyPinError::NoGrant`].
 pub(crate) async fn pin_drive(
     state: &crate::AppState,
     file_id: &str,
-    refresh_token: &str,
+    refresh_token: Option<&str>,
     name: Option<String>,
 ) -> Result<PathBuf, ProxyPinError> {
     let endpoints = state
         .drive
         .as_ref()
         .ok_or(crate::routes::drive::DriveOpenError::NoPairingService)?;
-    let pairing = endpoints.pairing(file_id, refresh_token);
     let key = ProxyPinKey::Drive {
         file_id: file_id.to_string(),
     };
@@ -451,6 +459,7 @@ pub(crate) async fn pin_drive(
     if held_complete(state, &entry).await {
         return Ok(state.proxy_downloads.pin(state, key, name, entry, None));
     }
+    let pairing = endpoints.pairing(file_id, refresh_token.ok_or(ProxyPinError::NoGrant)?);
     let source = crate::sources::drive::DriveSource::open(state, pairing)
         .await
         .map_err(crate::routes::drive::DriveOpenError::Drive)?;

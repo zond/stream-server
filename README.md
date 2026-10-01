@@ -67,7 +67,7 @@ let token = handle.auth_token().map(str::to_string); // control-route bearer
 
 **Prefer `http_addr`'s port `0`** and read the one the OS picked from `ServerHandle::bound_http_addr()`. 11470 is the default because it is what stremio-core's default profile points `streaming_server_url` at, so a client that has never been told otherwise looks there -- but an embedder that retargets core at the address it read back (xtremio does, and so does every test) gains nothing from the number and can only lose the bind to a desktop Stremio, to a second instance of itself, or to whatever else holds the port.
 
-**Hand in the pin sets.** `ServerConfig::pins` (torrent files) and `proxy_pins` (addon URLs and Drive files) are the offline downloads the embedder keeps; the server keeps no record of its own. `None` means *unknown* -- nothing is swept and every torrent is treated as pinned -- while an empty set means *nothing is pinned*, and the launch sweep takes everything unclaimed. See [docs/storage.md](docs/storage.md#offline-downloads).
+**Hand in the pin set.** `ServerConfig::pins` is the offline downloads the embedder keeps, one `PinKey` each -- `Torrent {info_hash, file_idx}`, `Url {target, headers}` or `Drive {file_id}` -- and the server keeps no record of its own. `None` means *unknown* -- nothing is swept and every torrent is treated as pinned -- while an empty list means *nothing is pinned*, and the launch sweeps take everything unclaimed. See [docs/storage.md](docs/storage.md#offline-downloads).
 
 ---
 
@@ -136,6 +136,8 @@ stream-server/
 └── docs/             # The reference behind this README, and design notes
 ```
 
+At run time everything the server keeps is under one directory, `<cacheRoot>/media-cache` (`enginefs::CACHE_DIR_NAME`): the piece store (`.pieces`), the proxy cache (`.proxy`) and the torrent session's records.
+
 Two crates, and neither builds a binary: `server` is the library an embedder links, `enginefs` is what it is built on. [AGENTS.md](AGENTS.md) maps the modules and lists the rules a change has to keep.
 
 | Doc | What it is for |
@@ -153,6 +155,7 @@ Two crates, and neither builds a binary: `server` is the library an embedder lin
 
 ## Upgrade notes
 
+- **2026-10-01. The cache directory is `<cacheRoot>/media-cache`**, renamed from `rqbit-downloads` with **no migration**: the first boot that finds `rqbit-downloads` deletes it whole (renamed aside before the session opens, deleted after), offline downloads included -- a torrent pin the embedder hands in then reports held-nothing (`complete: false`, no `error`) and is downloaded again when pinned again. `ServerConfig::pins` is now one `Option<Vec<PinKey>>` for both stores, replacing `pins` (a torrent `PinSet`) and `proxy_pins`; `None` keeps its meaning. `ServerHandle::pin(&MediaId)` / `unpin(&MediaId, delete_files)` pin by media id. See [docs/storage.md](docs/storage.md#offline-downloads).
 - **2026-09-28. A torrent download on its way always uploads**, whatever `seedingEnabled` says: downloading is activity, not idling. The setting now governs what was played or downloaded before, and `ServerHandle::set_idle_sharing_held` holds it off for the run without writing the setting -- call it with `true` while the app is in the background on a device where that should stop idle sharing, and `false` on the way back. The activity light's down half now also lights for addon-link and Drive downloads.
 - **2026-09-26. Proxied and Drive streams are read ahead of.** A stream a player reads through `/proxy` (with its `p=` token) or `/drive/stream` now fetches the retention window ahead of the player -- or the rest of the file, where the budget covers it whole. Origin traffic per stream goes up by that much, on Drive against the file's quota; requests without a player token fetch exactly what they ask for.
 - **2026-09-26. The app-facing control routes are gone** ([docs/api.md](docs/api.md#removed-routes) lists them). An embedder that called one over HTTP calls the matching `ServerHandle` method instead; the core-protocol routes and every media route are unchanged.

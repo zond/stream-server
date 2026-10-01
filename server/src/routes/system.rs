@@ -131,7 +131,7 @@ pub struct ServerSettings {
     pub server_version: String,
     /// **The one torrent-data root.** Everything a torrent puts on disk
     /// lives under it: the piece store
-    /// (`<cacheRoot>/rqbit-downloads/.pieces/<infoHash>`, one file per
+    /// (`<cacheRoot>/media-cache/.pieces/<infoHash>`, one file per
     /// piece, for the streaming cache and offline downloads alike), the
     /// session's own records beside it, and what `/proxy` cached. It is
     /// the only root the cache is counted and capped over, and pinning is

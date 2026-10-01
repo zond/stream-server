@@ -386,3 +386,50 @@ impl serde::Serialize for Refusal {
         object.end()
     }
 }
+
+/// Why an id could not be pinned or unpinned
+/// ([`crate::ServerHandle::pin`], [`crate::ServerHandle::unpin`]).
+#[derive(Debug)]
+pub enum PinError {
+    /// The id names nothing pinnable: unknown here, or a URL whose shape
+    /// is none of this server's -- or resolving it, which a torrent's `-1`
+    /// and a member need, was refused.
+    Refused(Refusal),
+    /// A file on this device: it is here already, and there is nothing to
+    /// download.
+    NothingToDownload,
+    /// The torrent pin's own refusal ([`crate::ServerHandle::pin_download`]).
+    Torrent(enginefs::PinDownloadError),
+    /// The link or Drive pin's own refusal
+    /// ([`crate::ServerHandle::pin_proxy_download`]).
+    Proxy(crate::proxy_downloads::ProxyPinError),
+    /// The server has stopped, or is stopping.
+    ServerStopped,
+}
+
+impl PinError {
+    /// The sentence to show: never a local path (the torrent half is
+    /// [`enginefs::PinDownloadError::client_message`]).
+    pub fn client_message(&self) -> String {
+        match self {
+            Self::Torrent(error) => error.client_message(),
+            error => error.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for PinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(refusal) => write!(f, "{refusal}"),
+            Self::NothingToDownload => {
+                f.write_str("a file on this device is here already; there is nothing to download")
+            }
+            Self::Torrent(error) => write!(f, "{error}"),
+            Self::Proxy(error) => write!(f, "{error}"),
+            Self::ServerStopped => f.write_str("the server has stopped"),
+        }
+    }
+}
+
+impl std::error::Error for PinError {}

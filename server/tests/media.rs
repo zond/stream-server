@@ -462,8 +462,8 @@ fn origin_server(
         cache_dir: Some(cache_root),
         drive_refresh_endpoint: Some(url::Url::parse(&origin.url("/refresh"))?),
         drive_api_base: Some(url::Url::parse(&origin.url("/"))?),
-        // An embedder that keeps a proxy pin record, empty at boot.
-        proxy_pins: Some(Vec::new()),
+        // An embedder that keeps a pin record, empty at boot.
+        pins: Some(Vec::new()),
         ..offline_config()
     })?;
     Ok((handle, [config_dir, cache_dir]))
@@ -1178,6 +1178,285 @@ fn a_drive_id_whose_grant_died_is_resolved_again_with_a_new_grant() -> anyhow::R
     handle.shutdown()?;
     handle.join()?;
     Ok(())
+}
+
+// --- Pins by id -------------------------------------------------------------
+
+/// Whether `downloads()` lists a torrent row for `file_idx` of `info_hash`.
+fn lists_torrent(
+    handle: &stream_server::ServerHandle,
+    info_hash: &str,
+    file_idx: usize,
+) -> anyhow::Result<bool> {
+    Ok(handle
+        .downloads()?
+        .iter()
+        .any(|row| row.source.is_none() && row.info_hash == info_hash && row.file_idx == file_idx))
+}
+
+/// Whether `downloads()` lists a proxy row whose source is `key`.
+fn lists_proxy(
+    handle: &stream_server::ServerHandle,
+    key: &stream_server::ProxyPinKey,
+) -> anyhow::Result<bool> {
+    Ok(handle
+        .downloads()?
+        .iter()
+        .any(|row| row.source.as_ref() == Some(key)))
+}
+
+/// **A torrent id pins and unpins its file in the piece store**: the `-1`
+/// URL stremio-core builds is resolved to the film as the stream route
+/// picks it, the pin is the info hash's (the row `pin_download` answers),
+/// `downloads()` lists it, and `unpin` by the same id takes it off.
+#[test]
+fn a_torrent_id_pins_and_unpins_its_file() -> anyhow::Result<()> {
+    let fixture = TorrentFixture::start(
+        offline_config(),
+        &["film.mkv", "extras.nfo"],
+        4 * PIECE,
+        |_| true,
+    )?;
+    let film = fixture.index("film.mkv");
+    let id = fixture
+        .handle
+        .register(MediaSpec::StreamingUrl(url::Url::parse(&format!(
+            "{}/{}/-1?f=film",
+            fixture.base, fixture.info_hash
+        ))?))?;
+    assert!(!lists_torrent(&fixture.handle, &fixture.info_hash, film)?);
+
+    let rows = fixture.handle.pin(&id)?;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].info_hash, fixture.info_hash);
+    assert_eq!(rows[0].file_idx, film);
+    assert_eq!(rows[0].source, None);
+    assert!(lists_torrent(&fixture.handle, &fixture.info_hash, film)?);
+    assert!(
+        !lists_torrent(
+            &fixture.handle,
+            &fixture.info_hash,
+            fixture.index("extras.nfo")
+        )?,
+        "the torrent's other file was pinned"
+    );
+
+    let outcome = fixture.handle.unpin(&id, false)?;
+    assert!(outcome.unpinned);
+    assert!(!lists_torrent(&fixture.handle, &fixture.info_hash, film)?);
+    assert!(
+        !fixture.handle.unpin(&id, false)?.unpinned,
+        "unpinned twice"
+    );
+    fixture.stop()
+}
+
+/// **A link id pins into the proxy cache, keyed with its `h=` headers**:
+/// the row's source is the link and the headers, its key is the one the
+/// cache files the stream with those headers under (not the bare link's),
+/// and `unpin` by the id takes it off.
+#[test]
+fn a_link_id_pins_into_the_proxy_cache_keyed_with_its_headers() -> anyhow::Result<()> {
+    let origin = Origin::start()?;
+    let (handle, _dirs) = origin_server(&origin)?;
+    let target = origin.url("/film.bin");
+    let url = url::Url::parse(&format!(
+        "{}&h=Referer%3Ahttps%3A%2F%2Fsite.example",
+        proxy_url(&handle, &target)
+    ))?;
+    let id = handle.register(MediaSpec::StreamingUrl(url))?;
+    let key = stream_server::ProxyPinKey::Url {
+        target: target.clone(),
+        headers: [("Referer".to_string(), "https://site.example".to_string())].into(),
+    };
+    let bare = stream_server::ProxyPinKey::Url {
+        target: target.clone(),
+        headers: Default::default(),
+    };
+
+    let rows = handle.pin(&id)?;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].source.as_ref(), Some(&key));
+    assert_eq!(
+        Some(&rows[0].info_hash),
+        handle.proxy_download_key(&key).as_ref()
+    );
+    assert_ne!(
+        handle.proxy_download_key(&key),
+        handle.proxy_download_key(&bare)
+    );
+    assert_eq!(rows[0].name, "film.bin");
+    assert!(lists_proxy(&handle, &key)?);
+
+    assert!(handle.unpin(&id, true)?.unpinned);
+    assert!(!lists_proxy(&handle, &key)?);
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// **A Drive id pins under the grant its supplier gives**, and without one
+/// a file not on the disk is refused with `NoGrant` rather than fetched
+/// with nothing; `unpin` by the id takes the pin off.
+#[test]
+fn a_drive_id_pins_under_its_grant() -> anyhow::Result<()> {
+    let origin = Origin::start()?;
+    let (handle, _dirs) = origin_server(&origin)?;
+    let key = stream_server::ProxyPinKey::Drive {
+        file_id: FILE_ID.to_string(),
+    };
+    let unlinked = handle.register(MediaSpec::Drive {
+        file_id: FILE_ID.to_string(),
+        name: None,
+        grant: Arc::new(|| None),
+    })?;
+    assert!(
+        matches!(
+            handle.pin(&unlinked),
+            Err(stream_server::PinError::Proxy(
+                stream_server::ProxyPinError::NoGrant
+            ))
+        ),
+        "pinned with no grant"
+    );
+    assert!(!lists_proxy(&handle, &key)?);
+
+    let id = handle.register(MediaSpec::Drive {
+        file_id: FILE_ID.to_string(),
+        name: Some("A Film.mkv".to_string()),
+        grant: Arc::new(|| Some(REFRESH_TOKEN.to_string())),
+    })?;
+    let rows = handle.pin(&id)?;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].source.as_ref(), Some(&key));
+    assert_eq!(rows[0].name, "A Film.mkv");
+    assert!(lists_proxy(&handle, &key)?);
+
+    assert!(handle.unpin(&id, true)?.unpinned);
+    assert!(!lists_proxy(&handle, &key)?);
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// **A file on this device has nothing to download**: pinning or unpinning
+/// its id is refused, and nothing is listed.
+#[test]
+fn a_local_id_refuses_a_pin() -> anyhow::Result<()> {
+    let origin = Origin::start()?;
+    let (handle, dirs) = origin_server(&origin)?;
+    let path = dirs[0].path().join("film.mkv");
+    std::fs::write(&path, payload(PIECE))?;
+    let id = handle.register(MediaSpec::Local {
+        file: stream_server::LocalFile::Path(path),
+        name: None,
+    })?;
+    assert!(matches!(
+        handle.pin(&id),
+        Err(stream_server::PinError::NothingToDownload)
+    ));
+    assert!(matches!(
+        handle.unpin(&id, true),
+        Err(stream_server::PinError::NothingToDownload)
+    ));
+    assert!(handle.downloads()?.is_empty());
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
+/// **A member's id pins its container**: the ZIP's file in the torrent,
+/// which is where the member's bytes are, and not the torrent's other
+/// file; `unpin` by the id takes it off.
+#[test]
+fn a_member_id_pins_its_container() -> anyhow::Result<()> {
+    let film = payload(6 * PIECE + 77);
+    let zip = stored_zip(&[("film.mkv", &film), ("extras.nfo", &payload(PIECE))]);
+    let fixture = TorrentFixture::start_with(
+        offline_config(),
+        &[("fixture.zip", zip), ("other.bin", payload(4 * PIECE))],
+        |_| true,
+    )?;
+    let container = fixture.index("fixture.zip");
+    let id = fixture.handle.register(MediaSpec::StreamingUrl(member_url(
+        &fixture,
+        "zip",
+        "fixture.zip",
+        "film.mkv",
+    )))?;
+    let rows = fixture.handle.pin(&id)?;
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.info_hash.as_str(), row.file_idx))
+            .collect::<Vec<_>>(),
+        [(fixture.info_hash.as_str(), container)]
+    );
+    assert!(lists_torrent(
+        &fixture.handle,
+        &fixture.info_hash,
+        container
+    )?);
+    assert!(!lists_torrent(
+        &fixture.handle,
+        &fixture.info_hash,
+        fixture.index("other.bin")
+    )?);
+
+    assert!(fixture.handle.unpin(&id, false)?.unpinned);
+    assert!(!lists_torrent(
+        &fixture.handle,
+        &fixture.info_hash,
+        container
+    )?);
+    fixture.stop()
+}
+
+/// **A member of a set pins every volume**: a member crosses them all.
+#[cfg(feature = "rar")]
+#[test]
+fn a_member_of_a_rar_set_pins_every_volume() -> anyhow::Result<()> {
+    let film = rar_fixtures::signposted(9 * PIECE);
+    let volumes = rar_fixtures::rar5_volumes(&[("film.mkv", &film)], 4 * PIECE);
+    let names = rar_fixtures::part_names("film", volumes.len());
+    let files = names
+        .iter()
+        .map(String::as_str)
+        .zip(volumes)
+        .collect::<Vec<_>>();
+    let fixture = TorrentFixture::start_with(offline_config(), &files, |_| true)?;
+    let id = fixture.handle.register(MediaSpec::StreamingUrl(member_url(
+        &fixture, "rar", &names[0], "film.mkv",
+    )))?;
+    let mut pinned = fixture
+        .handle
+        .pin(&id)?
+        .into_iter()
+        .map(|row| row.file_idx)
+        .collect::<Vec<_>>();
+    pinned.sort_unstable();
+    let mut expected = names
+        .iter()
+        .map(|name| fixture.index(name))
+        .collect::<Vec<_>>();
+    expected.sort_unstable();
+    assert!(expected.len() > 1, "a set of one volume proves nothing");
+    assert_eq!(pinned, expected);
+    for file_idx in &expected {
+        assert!(lists_torrent(
+            &fixture.handle,
+            &fixture.info_hash,
+            *file_idx
+        )?);
+    }
+    assert!(fixture.handle.unpin(&id, false)?.unpinned);
+    for file_idx in &expected {
+        assert!(!lists_torrent(
+            &fixture.handle,
+            &fixture.info_hash,
+            *file_idx
+        )?);
+    }
+    fixture.stop()
 }
 
 // --- Members of containers --------------------------------------------------

@@ -124,8 +124,9 @@ fn seed_one_file(cache_root: &Path, torrent_bytes: &[u8], content: &Path, only: 
     );
     assert!(!seeded.is_empty(), "the fixture seeds {only}");
 
-    let store =
-        enginefs::piece_store::StoreRoot::in_download_dir(&cache_root.join("rqbit-downloads"));
+    let store = enginefs::piece_store::StoreRoot::in_download_dir(
+        &cache_root.join(enginefs::CACHE_DIR_NAME),
+    );
     let layout = enginefs::piece_store::PieceLayout::new(
         piece_length,
         blob.len() as u64,
