@@ -403,7 +403,7 @@ mod log_redaction_tests {
             "/ftp"
         );
         assert_eq!(log_path("/cast/00112233445566778899aabbccddeeff"), "/cast");
-        assert_eq!(log_path("/cast/0011/hls/master.m3u8"), "/cast");
+        assert_eq!(log_path("/cast/0011/stream.mp4"), "/cast");
         assert_eq!(log_path("/settings"), "/settings");
         assert_eq!(log_path("/proxying/x"), "/proxying/x");
         assert_eq!(log_path("/castle/x"), "/castle/x");

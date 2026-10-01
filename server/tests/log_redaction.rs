@@ -168,9 +168,8 @@ fn a_caller_supplied_url_is_logged_as_its_origin_only() -> anyhow::Result<()> {
         reqwest::StatusCode::NOT_FOUND
     );
 
-    // A rendition's token, under its `hls/` paths: the playlist, the init
-    // segment and a segment produced for it, a `HEAD`, one past the end,
-    // and the same after the unpublish.
+    // A rendition's token, under its stream: the whole of it, one from a
+    // time, a `HEAD`, and the same after the unpublish.
     let film = dir.path().join("film.mkv");
     std::fs::write(&film, vec![7u8; 64 * 1024])?;
     let local = handle.register(stream_server::MediaSpec::Local {
@@ -192,25 +191,19 @@ fn a_caller_supplied_url_is_logged_as_its_origin_only() -> anyhow::Result<()> {
         },
         None,
     )?;
-    let hls = format!("http://{lan}/cast/{}/hls", rendition.as_str());
-    for file in ["index.m3u8", "media.m3u8", "init.mp4", "0.m4s"] {
-        assert_eq!(
-            client.get(format!("{hls}/{file}")).send()?.status(),
-            reqwest::StatusCode::OK,
-            "{file}"
-        );
+    let stream = format!("http://{lan}/cast/{}/stream.mp4", rendition.as_str());
+    for url in [stream.clone(), format!("{stream}?from=15000")] {
+        let response = client.get(&url).send()?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK, "{url}");
+        response.bytes()?;
     }
     assert_eq!(
-        client.head(format!("{hls}/1.m4s")).send()?.status(),
+        client.head(&stream).send()?.status(),
         reqwest::StatusCode::OK
-    );
-    assert_eq!(
-        client.get(format!("{hls}/20.m4s")).send()?.status(),
-        reqwest::StatusCode::NOT_FOUND
     );
     assert!(handle.unpublish(&rendition));
     assert_eq!(
-        client.get(format!("{hls}/2.m4s")).send()?.status(),
+        client.get(&stream).send()?.status(),
         reqwest::StatusCode::NOT_FOUND
     );
 

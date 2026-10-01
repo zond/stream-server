@@ -1,7 +1,9 @@
 //! Renditions (`stream_server::rendition`, `docs/design/renditions.md`,
-//! step F1): `ServerHandle::publish_rendition`, the HLS stream under
-//! `/cast/{token}/hls/` on the LAN listener, the run task's cut rule,
-//! lookahead, seeks, idle release, speed and cut, and the fMP4 muxer --
+//! steps F1-F2): `ServerHandle::publish_rendition`, the progressive
+//! stream at `/cast/{token}/stream.mp4` on the LAN listener, the run task's
+//! cut rule, lookahead, seeks, idle release, speed and cut, and the fMP4
+//! muxer -- the run and the ring through the segment the stream asks for
+//! (`ServerHandle::rendition_segment`), the stream over HTTP --
 //! all driven by the test producer (`support/test_producer.rs`), a Rust
 //! producer on a plain thread behind the same trait the embedder's is.
 //!
@@ -18,7 +20,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use stream_server::rendition::RenditionTuning;
+use stream_server::rendition::{NotServed, RenditionTuning};
 use stream_server::{
     AudioPlan, CastToken, LocalFile, MediaId, MediaSpec, RenditionSpec, RenditionState,
     ServerConfig, TrackKind, VideoPlan,
@@ -103,22 +105,36 @@ impl Fixture {
             .publish_rendition(&self.id, spec(duration_ms, T_MS, start_ms), None)
     }
 
-    fn url(&self, token: &CastToken, file: &str) -> String {
-        format!("{}/cast/{}/hls/{file}", self.lan, token.as_str())
+    /// The rendition's stream, from `from_ms` when it says.
+    fn stream_url(&self, token: &CastToken, from_ms: Option<u64>) -> String {
+        let from = from_ms.map(|ms| format!("?from={ms}")).unwrap_or_default();
+        format!("{}/cast/{}/stream.mp4{from}", self.lan, token.as_str())
     }
 
-    fn get(&self, token: &CastToken, file: &str) -> reqwest::blocking::Response {
-        reqwest::blocking::Client::new()
-            .get(self.url(token, file))
+    fn stream(&self, token: &CastToken, from_ms: Option<u64>) -> reqwest::blocking::Response {
+        reqwest::blocking::Client::builder()
+            .timeout(BOUND)
+            .build()
+            .expect("a client")
+            .get(self.stream_url(token, from_ms))
             .send()
             .expect("the LAN listener answers")
     }
 
-    /// `file`, which must answer `200`.
-    fn bytes(&self, token: &CastToken, file: &str) -> Vec<u8> {
-        let response = self.get(token, file);
-        assert_eq!(response.status(), reqwest::StatusCode::OK, "{file}");
-        response.bytes().expect("a body").to_vec()
+    /// The init segment, as the stream begins with it.
+    fn init(&self, token: &CastToken) -> Vec<u8> {
+        self.handle
+            .rendition_init(token)
+            .expect("the init segment")
+            .to_vec()
+    }
+
+    /// Segment `n`, as the stream asks for it.
+    fn segment(&self, token: &CastToken, n: u64) -> Vec<u8> {
+        self.handle
+            .rendition_segment(token, n)
+            .unwrap_or_else(|miss| panic!("segment {n}: {miss:?}"))
+            .to_vec()
     }
 
     fn probe(&self, token: &CastToken) -> stream_server::rendition::RenditionProbe {
@@ -333,95 +349,14 @@ fn expected(knobs: &Knobs, n: i64) -> (Vec<i64>, Vec<i64>) {
 
 // --- The playlist and the init segment -------------------------------------------
 
-/// **The media playlist is written up front**: VOD, the init segment
-/// named, `ceil(d / T)` entries named relatively, the last one the
-/// remainder, and the end -- with no run started for it.
-#[test]
-fn the_playlist_has_one_entry_per_segment_and_ends() -> anyhow::Result<()> {
-    let fixture = Fixture::quick(Knobs::default())?;
-    let token = fixture.publish(13_500, 0)?;
-    let response = fixture.get(&token, "media.m3u8");
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        response.headers()["content-type"],
-        "application/vnd.apple.mpegurl"
-    );
-    let text = response.text()?;
-    let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines[0], "#EXTM3U");
-    assert!(lines.contains(&"#EXT-X-PLAYLIST-TYPE:VOD"));
-    assert!(lines.contains(&"#EXT-X-MAP:URI=\"init.mp4\""));
-    let names: Vec<&str> = lines
-        .iter()
-        .copied()
-        .filter(|line| !line.starts_with('#'))
-        .collect();
-    let count = 13_500u64.div_ceil(u64::from(T_MS)) as usize;
-    assert_eq!(names.len(), count);
-    for (index, name) in names.iter().enumerate() {
-        assert_eq!(*name, format!("{index}.m4s"), "relative, numbered");
-    }
-    assert_eq!(
-        lines
-            .iter()
-            .filter(|line| line.starts_with("#EXTINF:"))
-            .count(),
-        count
-    );
-    assert!(
-        lines.contains(&"#EXTINF:0.500,"),
-        "the last is the remainder"
-    );
-    assert_eq!(lines.last(), Some(&"#EXT-X-ENDLIST"));
-    assert_eq!(fixture.probe(&token).runs_started, 0, "nothing ran for it");
-    assert_eq!(fixture.handle.rendition_state(&token), RenditionState::Idle);
-    Ok(())
-}
-
-/// **The master playlist names the one variant's codecs**, read from the
-/// first run's formats -- so it starts that run and waits for them, as
-/// `init.mp4` does -- with its size and the source's average rate, and
-/// names the media playlist. Without it the Cast receiver's Shaka Player
-/// (4.15) types a muxed stream's buffer from the init segment as video
-/// alone and fails the first append.
-#[test]
-fn the_master_playlist_names_the_codecs_of_the_first_run() -> anyhow::Result<()> {
-    let fixture = Fixture::quick(Knobs::default())?;
-    let token = fixture.publish(60_000, 0)?;
-    let response = fixture.get(&token, "index.m3u8");
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        response.headers()["content-type"],
-        "application/vnd.apple.mpegurl"
-    );
-    // The test producer's x264 SPS (High, level 1.3) and AAC-LC; the file
-    // is 1 MiB over 60 s: 1 048 576 x 8 bits / 60 s, rounded up.
-    let bandwidth = 139_811;
-    assert_eq!(
-        response.text()?,
-        format!(
-            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n\
-             #EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS=\"avc1.64000D,mp4a.40.2\",\
-             RESOLUTION=320x240\nmedia.m3u8\n"
-        )
-    );
-    assert_eq!(
-        fixture.probe(&token).runs_started,
-        1,
-        "it ran for the codecs"
-    );
-    assert!(fixture.probe(&token).init, "and froze them, once");
-    Ok(())
-}
-
-/// **`init.mp4` is `ftyp` + `moov`** with the producer's parameter sets in
+/// **The init segment is `ftyp` + `moov`** with the producer's parameter sets in
 /// the `avcC` and its AudioSpecificConfig in the `esds`, and the first run
 /// starts at the spec's start for it.
 #[test]
 fn the_init_segment_carries_the_producers_codec_configuration() -> anyhow::Result<()> {
     let fixture = Fixture::quick(Knobs::default())?;
     let token = fixture.publish(60_000, 7_500)?;
-    let init = fixture.bytes(&token, "init.mp4");
+    let init = fixture.init(&token);
     let kinds: Vec<String> = Boxes::of(&init).into_iter().map(|(kind, _)| kind).collect();
     assert_eq!(kinds, ["ftyp", "moov"]);
 
@@ -473,9 +408,9 @@ fn each_segment_is_cut_at_the_first_key_at_or_after_its_time() -> anyhow::Result
     let knobs = Knobs::default();
     let fixture = Fixture::quick(knobs.clone())?;
     let token = fixture.publish(30_000, 0)?;
-    fixture.bytes(&token, "init.mp4");
+    fixture.init(&token);
     for n in 0..6i64 {
-        let segment = parse_segment(&fixture.bytes(&token, &format!("{n}.m4s")));
+        let segment = parse_segment(&fixture.segment(&token, n as u64));
         assert_eq!(segment.sequence, n as u32 + 1);
         let video = segment.track(1).expect("video in every segment here");
         let key = knobs.key_at_or_after(n * T_US).unwrap();
@@ -500,7 +435,7 @@ fn a_run_discards_what_precedes_its_cut() -> anyhow::Result<()> {
     let knobs = Knobs::default();
     let fixture = Fixture::quick(knobs.clone())?;
     let token = fixture.publish(30_000, 0)?;
-    let segment = parse_segment(&fixture.bytes(&token, "5.m4s"));
+    let segment = parse_segment(&fixture.segment(&token, 5));
     let runs = fixture.producer.runs();
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].from, Duration::from_secs(5));
@@ -539,12 +474,12 @@ fn a_request_far_ahead_starts_a_new_run_and_stops_the_old() -> anyhow::Result<()
     let knobs = Knobs::default();
     let fixture = Fixture::quick(knobs.clone())?;
     let token = fixture.publish(60_000, 0)?;
-    fixture.bytes(&token, "init.mp4");
+    fixture.init(&token);
     for n in 0..4 {
-        fixture.bytes(&token, &format!("{n}.m4s"));
+        fixture.segment(&token, n);
     }
     assert_eq!(fixture.probe(&token).runs_started, 1);
-    let segment = parse_segment(&fixture.bytes(&token, "40.m4s"));
+    let segment = parse_segment(&fixture.segment(&token, 40));
     let runs = fixture.producer.runs();
     assert_eq!(runs.len(), 2);
     assert_eq!(runs[1].from, Duration::from_secs(40));
@@ -568,23 +503,17 @@ fn a_request_for_the_segment_in_production_joins_it() -> anyhow::Result<()> {
         ..Knobs::default()
     })?;
     let token = fixture.publish(60_000, 0)?;
-    fixture.bytes(&token, "init.mp4");
+    fixture.init(&token);
     assert_eq!(fixture.probe(&token).in_production, Some(0));
-    let url = fixture.url(&token, "0.m4s");
-    let requests: Vec<_> = (0..2)
-        .map(|_| {
-            let url = url.clone();
-            std::thread::spawn(move || {
-                reqwest::blocking::get(&url)
-                    .and_then(|response| response.bytes())
-                    .map(|bytes| bytes.to_vec())
-            })
-        })
-        .collect();
-    let bodies: Vec<Vec<u8>> = requests
-        .into_iter()
-        .map(|request| request.join().expect("the request thread").expect("a body"))
-        .collect();
+    let bodies: Vec<Vec<u8>> = std::thread::scope(|scope| {
+        let requests: Vec<_> = (0..2)
+            .map(|_| scope.spawn(|| fixture.segment(&token, 0)))
+            .collect();
+        requests
+            .into_iter()
+            .map(|request| request.join().expect("the request thread"))
+            .collect()
+    });
     assert_eq!(bodies[0], bodies[1]);
     assert_eq!(fixture.probe(&token).runs_started, 1, "no second run");
     assert_eq!(fixture.producer.runs().len(), 1);
@@ -598,7 +527,7 @@ fn a_request_for_the_segment_in_production_joins_it() -> anyhow::Result<()> {
 fn the_lookahead_blocks_the_producer() -> anyhow::Result<()> {
     let fixture = Fixture::quick(Knobs::default())?;
     let token = fixture.publish(60_000, 0)?;
-    fixture.bytes(&token, "init.mp4");
+    fixture.init(&token);
     let run = fixture.producer.runs()[0].clone();
     // The sink blocks whenever the channel is full, which a producer this
     // fast makes it often; the lookahead is the state it stays in: the
@@ -620,7 +549,7 @@ fn the_lookahead_blocks_the_producer() -> anyhow::Result<()> {
         furthest(&run)
     );
 
-    fixture.bytes(&token, "1.m4s");
+    fixture.segment(&token, 1);
     until(
         "one more segment is made, and the producer blocks again",
         || held(&[0, 1, 2, 3], 4),
@@ -643,8 +572,8 @@ fn an_idle_run_is_released_and_restarted_at_the_rings_edge() -> anyhow::Result<(
         },
     )?;
     let token = fixture.publish(60_000, 0)?;
-    fixture.bytes(&token, "init.mp4");
-    fixture.bytes(&token, "0.m4s");
+    fixture.init(&token);
+    fixture.segment(&token, 0);
     let first = fixture.producer.runs()[0].clone();
     until("the idle run is let go", || {
         fixture.probe(&token).run_from.is_none()
@@ -657,13 +586,13 @@ fn an_idle_run_is_released_and_restarted_at_the_rings_edge() -> anyhow::Result<(
         "the ring is kept"
     );
 
-    fixture.bytes(&token, "1.m4s");
+    fixture.segment(&token, 1);
     assert_eq!(
         fixture.probe(&token).runs_started,
         1,
         "served from the ring"
     );
-    let segment = parse_segment(&fixture.bytes(&token, "3.m4s"));
+    let segment = parse_segment(&fixture.segment(&token, 3));
     let runs = fixture.producer.runs();
     assert_eq!(runs.len(), 2);
     assert_eq!(runs[1].from, Duration::from_secs(3), "at the ring's edge");
@@ -673,10 +602,10 @@ fn an_idle_run_is_released_and_restarted_at_the_rings_edge() -> anyhow::Result<(
 
 // --- The cut ---------------------------------------------------------------------
 
-/// **Unpublish wakes a request waiting on a segment with an error** -- a
-/// `503`, never a clean end -- and stops the producer.
+/// **Unpublish answers a stream still waiting for its first segment with
+/// an error** -- a `503`, never a clean end -- and stops the producer.
 #[test]
-fn unpublish_wakes_a_waiting_request_and_stops_the_producer() -> anyhow::Result<()> {
+fn unpublish_wakes_a_waiting_stream_and_stops_the_producer() -> anyhow::Result<()> {
     let fixture = Fixture::start(
         Knobs {
             speed: Some(0.05),
@@ -690,9 +619,8 @@ fn unpublish_wakes_a_waiting_request_and_stops_the_producer() -> anyhow::Result<
         },
     )?;
     let token = fixture.publish(60_000, 0)?;
-    fixture.bytes(&token, "init.mp4");
     let before = fixture.handle.lan_media_requests_served();
-    let url = fixture.url(&token, "0.m4s");
+    let url = fixture.stream_url(&token, None);
     let waiting = std::thread::spawn(move || {
         reqwest::blocking::Client::builder()
             .timeout(BOUND)
@@ -700,8 +628,13 @@ fn unpublish_wakes_a_waiting_request_and_stops_the_producer() -> anyhow::Result<
             .and_then(|client| client.get(&url).send())
             .map(|response| (response.status(), response.text().unwrap_or_default()))
     });
-    until("the segment request reaches the listener", || {
+    until("the stream request reaches the listener", || {
         fixture.handle.lan_media_requests_served() > before
+    });
+    // The run is begun by the stream's request (nothing else asks), and
+    // its producer has its job: the request holds the rendition.
+    until("the producer has the stream's run", || {
+        !fixture.producer.runs().is_empty()
     });
     assert_eq!(
         fixture.handle.rendition_state(&token),
@@ -718,17 +651,44 @@ fn unpublish_wakes_a_waiting_request_and_stops_the_producer() -> anyhow::Result<
         RenditionState::Ended
     );
     assert_eq!(
-        fixture.get(&token, "0.m4s").status(),
+        fixture.stream(&token, None).status(),
         reqwest::StatusCode::NOT_FOUND
     );
+    Ok(())
+}
+
+/// **Unpublish breaks a stream partway with an error**, never a clean end
+/// a receiver would read as the film being over.
+#[test]
+fn unpublish_breaks_a_stream_partway() -> anyhow::Result<()> {
+    let fixture = Fixture::start(
+        Knobs {
+            speed: Some(1.0),
+            ..Knobs::default()
+        },
+        RenditionTuning {
+            speed_window: Duration::from_secs(3600),
+            idle_release: Duration::from_secs(3600),
+        },
+    )?;
+    let token = fixture.publish(60_000, 0)?;
+    let mut response = fixture.stream(&token, None);
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let mut first = [0u8; 8];
+    std::io::Read::read_exact(&mut response, &mut first)?;
+    assert_eq!(&first[4..], b"ftyp");
+    assert!(fixture.handle.unpublish(&token));
+    let mut rest = Vec::new();
+    let read = std::io::Read::read_to_end(&mut response, &mut rest);
+    assert!(read.is_err(), "a clean end after {} bytes", rest.len());
     Ok(())
 }
 
 // --- Speed -----------------------------------------------------------------------
 
 /// **A producer slower than real time fails the rendition with its
-/// sentence**, and `rendition_state` says so; a request is answered `503`
-/// with it.
+/// sentence**, and `rendition_state` says so; a stream asked for then is
+/// answered `503` with it.
 #[test]
 fn a_producer_slower_than_real_time_fails_the_rendition() -> anyhow::Result<()> {
     let fixture = Fixture::start(
@@ -742,7 +702,7 @@ fn a_producer_slower_than_real_time_fails_the_rendition() -> anyhow::Result<()> 
         },
     )?;
     let token = fixture.publish(60_000, 0)?;
-    fixture.bytes(&token, "init.mp4");
+    fixture.init(&token);
     let mut sentence = String::new();
     until("the rendition fails", || {
         match fixture.handle.rendition_state(&token) {
@@ -760,13 +720,41 @@ fn a_producer_slower_than_real_time_fails_the_rendition() -> anyhow::Result<()> 
         "{sentence}"
     );
     assert!(sentence.contains(" seconds of film in 1"), "{sentence}");
-    let response = fixture.get(&token, "5.m4s");
+    let response = fixture.stream(&token, Some(5000));
     assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     let body: serde_json::Value = response.json()?;
     assert_eq!(body["refused"], "renditionFailed");
     assert_eq!(body["message"], sentence.as_str());
     let run = fixture.producer.runs()[0].clone();
     until("the producer is stopped", || run.stopped());
+    Ok(())
+}
+
+/// **A rendition that fails partway breaks its stream with an error**: the
+/// stream had begun (`200`), and a clean end would tell the receiver the
+/// film is over.
+#[test]
+fn a_rendition_that_fails_partway_breaks_its_stream() -> anyhow::Result<()> {
+    let fixture = Fixture::start(
+        Knobs {
+            speed: Some(0.5),
+            ..Knobs::default()
+        },
+        RenditionTuning {
+            speed_window: Duration::from_secs(1),
+            ..RenditionTuning::default()
+        },
+    )?;
+    let token = fixture.publish(60_000, 0)?;
+    let mut response = fixture.stream(&token, None);
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let mut rest = Vec::new();
+    let read = std::io::Read::read_to_end(&mut response, &mut rest);
+    assert!(read.is_err(), "a clean end after {} bytes", rest.len());
+    assert!(matches!(
+        fixture.handle.rendition_state(&token),
+        RenditionState::Failed { .. }
+    ));
     Ok(())
 }
 
@@ -786,9 +774,9 @@ fn a_producer_faster_than_real_time_is_not_failed() -> anyhow::Result<()> {
         },
     )?;
     let token = fixture.publish(60_000, 0)?;
-    fixture.bytes(&token, "init.mp4");
+    fixture.init(&token);
     for n in 0..5 {
-        fixture.bytes(&token, &format!("{n}.m4s"));
+        fixture.segment(&token, n);
     }
     assert_eq!(
         fixture.handle.rendition_state(&token),
@@ -892,10 +880,10 @@ fn a_slow_source_is_not_a_slow_producer() -> anyhow::Result<()> {
         .handle
         .publish_rendition(&id, spec(60_000, T_MS, 0), None)?;
     let wall = Instant::now();
-    fixture.bytes(&token, "init.mp4");
+    fixture.init(&token);
     let started = Instant::now();
     for n in 0..4 {
-        fixture.bytes(&token, &format!("{n}.m4s"));
+        fixture.segment(&token, n);
     }
     let spent = started.elapsed();
     assert!(
@@ -911,7 +899,7 @@ fn a_slow_source_is_not_a_slow_producer() -> anyhow::Result<()> {
     Ok(())
 }
 
-// --- Formats, failures, ranges, routes, refusals -----------------------------------
+// --- Formats, failures, the stream, routes, refusals -----------------------------------
 
 /// **A later run in another format fails the rendition**: the init segment
 /// describes the first run's, and a seek that comes back different cannot
@@ -923,10 +911,14 @@ fn a_format_change_on_a_later_run_fails_the_rendition() -> anyhow::Result<()> {
         ..Knobs::default()
     })?;
     let token = fixture.publish(60_000, 0)?;
-    fixture.bytes(&token, "init.mp4");
-    fixture.bytes(&token, "0.m4s");
-    let response = fixture.get(&token, "30.m4s");
+    fixture.init(&token);
+    fixture.segment(&token, 0);
+    // A receiver's seek: a stream from 30 s, whose run comes back
+    // different, answered before a byte of it is sent.
+    let response = fixture.stream(&token, Some(30_000));
     assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let refused = fixture.handle.rendition_segment(&token, 30);
+    assert!(matches!(refused, Err(NotServed::Failed(_))), "{refused:?}");
     let RenditionState::Failed { sentence } = fixture.handle.rendition_state(&token) else {
         panic!("the rendition did not fail");
     };
@@ -943,7 +935,7 @@ fn a_producers_failure_fails_the_rendition_with_its_sentence() -> anyhow::Result
         ..Knobs::default()
     })?;
     let token = fixture.publish(60_000, 0)?;
-    let response = fixture.get(&token, "0.m4s");
+    let response = fixture.stream(&token, None);
     assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         fixture.handle.rendition_state(&token),
@@ -954,71 +946,106 @@ fn a_producers_failure_fails_the_rendition_with_its_sentence() -> anyhow::Result
     Ok(())
 }
 
-/// **A segment is ranged like any file**: a `Range` is a `206` with the
-/// right `Content-Range` and those bytes, a `HEAD` has the length, and a
-/// body counts as one served.
+/// **The stream is the init segment and every segment in order**, to the
+/// film's end: `video/mp4`, with no length and no ranges offered, one body
+/// counted -- and each segment the bytes the run makes for it.
 #[test]
-fn a_range_of_a_segment_is_a_206() -> anyhow::Result<()> {
+fn the_stream_is_the_init_segment_and_every_segment_in_order() -> anyhow::Result<()> {
     let fixture = Fixture::quick(Knobs::default())?;
-    let token = fixture.publish(60_000, 0)?;
+    let token = fixture.publish(5_500, 0)?;
     let bodies = fixture.handle.lan_media_bodies_served();
-    let whole = fixture.bytes(&token, "0.m4s");
-    assert_eq!(fixture.handle.lan_media_bodies_served(), bodies + 1);
-    let response = reqwest::blocking::Client::new()
-        .get(fixture.url(&token, "0.m4s"))
-        .header(reqwest::header::RANGE, "bytes=100-299")
-        .send()?;
-    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
-    assert_eq!(
-        response.headers()["content-range"],
-        format!("bytes 100-299/{}", whole.len()).as_str()
-    );
-    assert_eq!(response.headers()["content-length"], "200");
-    assert_eq!(response.bytes()?.as_ref(), &whole[100..300]);
-    let response = reqwest::blocking::Client::new()
-        .head(fixture.url(&token, "0.m4s"))
-        .send()?;
+    let response = fixture.stream(&token, None);
     assert_eq!(response.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        response.headers()["content-length"],
-        whole.len().to_string().as_str()
-    );
-    assert_eq!(fixture.handle.lan_media_bodies_served(), bodies + 2);
+    assert_eq!(response.headers()["content-type"], "video/mp4");
+    assert!(response.headers().get("content-length").is_none());
+    assert!(response.headers().get("accept-ranges").is_none());
+    let body = response.bytes()?.to_vec();
+    assert_eq!(fixture.handle.lan_media_bodies_served(), bodies + 1);
+
+    let mut expected = fixture.init(&token);
+    for n in 0..6 {
+        expected.extend_from_slice(&fixture.segment(&token, n));
+    }
+    assert_eq!(body.len(), expected.len());
+    assert!(body == expected, "the stream is not init + segments 0-5");
+    let kinds: Vec<String> = Boxes::of(&body).into_iter().map(|(kind, _)| kind).collect();
+    assert_eq!(&kinds[..2], ["ftyp", "moov"]);
+    assert_eq!(kinds.iter().filter(|kind| *kind == "moof").count(), 6);
     Ok(())
 }
 
-/// **A token names what it was published as**: a plain publication's
-/// `hls/` is a `404`; a rendition's serves its `hls/` and the source as it
-/// is; past the last segment and a name that is none of the three are
-/// `404`.
+/// **A stream from a time starts at the segment it falls in**, made by a
+/// run from there, and runs on to the end; a `Range` changes nothing.
 #[test]
-fn a_plain_publication_has_no_hls() -> anyhow::Result<()> {
+fn a_stream_from_a_time_starts_at_its_segment() -> anyhow::Result<()> {
+    let knobs = Knobs::default();
+    let fixture = Fixture::quick(knobs.clone())?;
+    let token = fixture.publish(5_500, 0)?;
+    let response = reqwest::blocking::Client::builder()
+        .timeout(BOUND)
+        .build()?
+        .get(fixture.stream_url(&token, Some(3_500)))
+        .header(reqwest::header::RANGE, "bytes=0-")
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body = response.bytes()?.to_vec();
+    assert_eq!(fixture.producer.runs()[0].from, Duration::from_secs(3));
+    let init = fixture.init(&token);
+    assert_eq!(&body[..init.len()], init.as_slice());
+    // The first segment: its `styp`, `moof` and `mdat`.
+    let segments = &body[init.len()..];
+    let first_len: usize = (0..3).fold(0, |at, _| at + u32_at(segments, at) as usize);
+    let first = parse_segment(&segments[..first_len]);
+    assert_eq!(first.sequence, 4, "segment 3 first");
+    assert_eq!(
+        first.track(1).unwrap().tfdt,
+        (knobs.key_at_or_after(3 * T_US).unwrap() * 90 / 1000) as u64
+    );
+    let moofs = Boxes::of(&body)
+        .into_iter()
+        .filter(|(kind, _)| kind == "moof")
+        .count();
+    assert_eq!(moofs, 3, "segments 3, 4 and 5");
+    Ok(())
+}
+
+/// **A `HEAD` answers the stream's headers and starts nothing.**
+#[test]
+fn a_head_of_the_stream_starts_no_run() -> anyhow::Result<()> {
+    let fixture = Fixture::quick(Knobs::default())?;
+    let token = fixture.publish(60_000, 0)?;
+    let response = reqwest::blocking::Client::new()
+        .head(fixture.stream_url(&token, None))
+        .send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "video/mp4");
+    assert_eq!(fixture.probe(&token).runs_started, 0);
+    Ok(())
+}
+
+/// **A token names what it was published as**: a plain publication has no
+/// stream; a rendition's serves its stream and the source as it is; there
+/// is no HLS any more.
+#[test]
+fn a_plain_publication_has_no_stream() -> anyhow::Result<()> {
     let fixture = Fixture::quick(Knobs::default())?;
     let plain = fixture.handle.publish(&fixture.id, None)?;
-    for file in ["index.m3u8", "media.m3u8", "init.mp4", "0.m4s"] {
-        assert_eq!(
-            fixture.get(&plain, file).status(),
-            reqwest::StatusCode::NOT_FOUND,
-            "{file}"
-        );
-    }
-    let token = fixture.publish(10_000, 0)?;
-    for file in ["index.m3u8", "media.m3u8"] {
-        assert_eq!(
-            fixture.get(&token, file).status(),
-            reqwest::StatusCode::OK,
-            "{file}"
-        );
-    }
+    assert_eq!(
+        fixture.stream(&plain, None).status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    let token = fixture.publish(2_000, 0)?;
+    assert_eq!(
+        fixture.stream(&token, None).status(),
+        reqwest::StatusCode::OK
+    );
     let as_is = reqwest::blocking::get(format!("{}/cast/{}", fixture.lan, token.as_str()))?;
     assert_eq!(as_is.status(), reqwest::StatusCode::OK);
     assert_eq!(as_is.bytes()?.len(), 1 << 20);
-    for file in ["10.m4s", "master.m3u8", "x.m4s"] {
-        assert_eq!(
-            fixture.get(&token, file).status(),
-            reqwest::StatusCode::NOT_FOUND,
-            "{file}"
-        );
+    for file in ["hls/index.m3u8", "hls/init.mp4", "hls/0.m4s", "x.mp4"] {
+        let response =
+            reqwest::blocking::get(format!("{}/cast/{}/{file}", fixture.lan, token.as_str()))?;
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND, "{file}");
     }
     Ok(())
 }
@@ -1058,25 +1085,16 @@ fn publish_rendition_is_refused_without_a_producer() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A by-hand check, not CI: with `RENDITION_DUMP=<dir>`, write the init
-/// segment and six segments, each alone and all concatenated, for
-/// `ffprobe`.
+/// A by-hand check, not CI: with `RENDITION_DUMP=<dir>`, write the stream
+/// of a 30 s rendition as `stream.mp4`, for `ffprobe`.
 #[test]
-#[ignore = "writes files for a by-hand ffprobe; run with RENDITION_DUMP=<dir>"]
+#[ignore = "writes a file for a by-hand ffprobe; run with RENDITION_DUMP=<dir>"]
 fn dump_for_ffprobe() -> anyhow::Result<()> {
     let dir = std::path::PathBuf::from(std::env::var("RENDITION_DUMP")?);
     std::fs::create_dir_all(&dir)?;
     let fixture = Fixture::quick(Knobs::default())?;
     let token = fixture.publish(30_000, 0)?;
-    let mut all = fixture.bytes(&token, "init.mp4");
-    std::fs::write(dir.join("init.mp4"), &all)?;
-    for n in 0..6 {
-        let segment = fixture.bytes(&token, &format!("{n}.m4s"));
-        std::fs::write(dir.join(format!("{n}.m4s")), &segment)?;
-        all.extend_from_slice(&segment);
-    }
-    std::fs::write(dir.join("all.mp4"), &all)?;
-    std::fs::write(dir.join("index.m3u8"), fixture.bytes(&token, "index.m3u8"))?;
-    std::fs::write(dir.join("media.m3u8"), fixture.bytes(&token, "media.m3u8"))?;
+    let body = fixture.stream(&token, None).bytes()?;
+    std::fs::write(dir.join("stream.mp4"), &body)?;
     Ok(())
 }

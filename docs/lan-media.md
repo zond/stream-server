@@ -52,32 +52,32 @@ live in memory only.
 ## Renditions
 
 A cast the receiver cannot decode as it is -- an MKV, surround sound over
-Bluetooth, HEVC to a receiver without it -- is cast as a **rendition**: an
-HLS stream produced on demand by the embedder's producer and muxed here,
-nothing on disk ([design/renditions.md](design/renditions.md)).
+Bluetooth, HEVC to a receiver without it -- is cast as a **rendition**: one
+progressive fragmented MP4 produced on demand by the embedder's producer
+and muxed here, nothing on disk ([design/renditions.md](design/renditions.md)).
 `ServerHandle::publish_rendition(&MediaId, RenditionSpec, Option<PlayToken>)`
 publishes one under a token with every rule above (random, memory only, a
 lease on the id, cut by `unpublish` and the listener's stop, never logged);
 it is refused with `noProducer` until the embedder has called
 `install_producer`. The receiver is handed
-`<lan_media_base_url>/cast/<token>/hls/index.m3u8`.
+`<lan_media_base_url>/cast/<token>/stream.mp4`.
 
 | Path | Answers |
 |---|---|
-| `GET`/`HEAD /cast/{token}/hls/index.m3u8` | The master playlist, `application/vnd.apple.mpegurl`: one muxed variant, `#EXT-X-STREAM-INF` with `BANDWIDTH` (the source's average rate), `CODECS` (RFC 6381, from the first run's formats: `avc1.PPCCLL` or `hvc1.…`, `mp4a.40.N`) and `RESOLUTION`, naming `media.m3u8`. Waits for the first run's formats, as `init.mp4` does. The Cast receiver's Shaka Player (4.15) needs it: handed the media playlist alone, it types a muxed stream's buffer as video from the init segment and fails the first append (`MEDIA_SOURCE_OPERATION_FAILED`) |
-| `GET`/`HEAD /cast/{token}/hls/media.m3u8` | The media playlist, `application/vnd.apple.mpegurl`: VOD, `#EXT-X-MAP` naming `init.mp4`, `ceil(duration / T)` entries `0.m4s`, `1.m4s`, ... (relative, so it names no host), `#EXT-X-ENDLIST`. Written at publish; never waits |
-| `GET`/`HEAD /cast/{token}/hls/init.mp4` | The init segment (`ftyp` + `moov`), `video/mp4`. Waits for the first run's track formats, starting that run at the spec's `startMs` if none is live |
-| `GET`/`HEAD /cast/{token}/hls/{n}.m4s` | Segment `n` (`styp` + `moof` + `mdat`), `video/mp4`, whole and in memory, ranged like any file (`206` and `Content-Range` for a `Range`). Waits while it is produced; `404` past the last segment; `503` `{"refused":"renditionFailed","message":...}` once the rendition has failed, and `503` `{"refused":"unpublished"}` for a request the unpublish woke |
+| `GET /cast/{token}/stream.mp4[?from=<ms>]` | `200`, `video/mp4`, `Cache-Control: no-store`, **no `Content-Length` and no `Accept-Ranges`**: the init segment (`ftyp` + `moov`), then segment after segment (`styp` + `moof` + `mdat`), from the one `from` falls in (the spec's `startMs` without it) to the film's end, each sent as it is made, the next asked for as the receiver takes the last. A `Range` header is not read. Waits for the first segment and the init segment before it answers, so a rendition that cannot start is `503` `{"refused":"renditionFailed","message":...}` (or `{"refused":"unpublished"}` for one the unpublish woke); after that, a failure or the cut breaks the body with an error, and only the film's end is a clean end. Nothing times it out |
+| `HEAD /cast/{token}/stream.mp4` | The same headers, at once; starts nothing |
 
-A plain token has no `hls/` (`404`); a rendition's token serves its
-`hls/` and, like a plain one, the source as it is at `/cast/{token}`. A
-`GET` of `init.mp4` or a segment counts as a body
-(`lan_media_bodies_served`); a playlist does not. Segment `n` is cut at
-the first video sync sample at or after `n x T` and holds the audio whose
+A plain token has no `stream.mp4` (`404`); a rendition's token serves it
+and, like a plain one, the source as it is at `/cast/{token}`. A stream's
+`GET` counts as one body (`lan_media_bodies_served`). **A seek is a new
+stream** from another `from`: the receiver plays a progressive file it
+cannot seek by bytes, and the stream's timestamps are the film's, so
+`currentTime` reads the film's position from wherever it starts. Segment
+`n` (a unit inside the stream, `T` long) is cut at the first video sync
+sample at or after `n x T` and holds the audio whose
 time falls in `[n x T, (n+1) x T)`. Production runs at most two segments
-past the last request and then waits; a request far from where the run is
--- behind what is kept, or more than two past what is being made -- is a
-seek, which starts a new run there. A run nobody has asked anything of for
+past the one the stream last asked for and then waits; a stream from a
+time far from where the run is starts a new run there. A run nobody has asked anything of for
 a minute is let go (the segments made are kept). A run that makes less than
 its own time in film over ten seconds of its own work -- leaving out the
 time it waited for the receiver and for the source -- fails the rendition

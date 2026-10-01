@@ -42,12 +42,12 @@
 //!
 //! **Renditions** (`docs/design/renditions.md`, `crate::rendition`) are
 //! publications too ([`crate::ServerHandle::publish_rendition`]), with the
-//! same token rules and the same cut, and an HLS stream under
-//! `/cast/{token}/hls/`: `index.m3u8` (the master playlist), `media.m3u8`,
-//! `init.mp4` and `{n}.m4s`, each ranged by the same framing, each segment
-//! in memory. A plain
-//! publication has no `hls/` (`404`); a rendition's token serves its
-//! `hls/` and, like a plain one, the source as it is at `/cast/{token}`.
+//! same token rules and the same cut, and one progressive fragmented MP4
+//! at `/cast/{token}/stream.mp4` (`?from=<ms>` for a start other than the
+//! spec's): the init segment and the media segments in order, sent as
+//! they are made. A plain publication has no `stream.mp4` (`404`); a
+//! rendition's token serves it and, like a plain one, the source as it is
+//! at `/cast/{token}`.
 
 use crate::media::registry::Entry;
 use crate::media::{MediaId, PlayToken, Refusal};
@@ -61,12 +61,12 @@ use crate::translators::session::Lease;
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use bytes::Bytes;
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -119,7 +119,7 @@ struct Publication {
     id: MediaId,
     play: Option<PlayToken>,
     cut: CancellationToken,
-    /// The HLS stream behind the token, for a rendition. Its runs' stops
+    /// The stream behind the token, for a rendition. Its runs' stops
     /// are children of `cut`, so the cut ends them; its ring goes with the
     /// last holder -- the map, a request in flight, a run task -- each of
     /// which lets go at the cut.
@@ -277,30 +277,45 @@ impl Casts {
             .and_then(|publication| publication.rendition.clone())
             .map(|rendition| rendition.probe())
     }
+
+    /// The rendition published as `token`, if it is one.
+    pub(crate) fn rendition(&self, token: &CastToken) -> Option<Arc<Rendition>> {
+        self.get(token.as_str())
+            .and_then(|publication| publication.rendition.clone())
+    }
 }
 
-/// The LAN listener's routes: `/cast/{token}`, and a rendition's HLS
-/// stream under `/cast/{token}/hls/`. Nothing else.
+/// The LAN listener's routes: `/cast/{token}`, and a rendition's stream,
+/// `/cast/{token}/stream.mp4`. Nothing else.
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route("/cast/{token}", get(cast_get).head(cast_head))
-        .route("/cast/{token}/hls/{file}", get(hls_get).head(hls_head))
+        .route(
+            "/cast/{token}/stream.mp4",
+            get(stream_get).head(stream_head),
+        )
 }
 
-async fn hls_get(
-    State(state): State<AppState>,
-    Path((token, file)): Path<(String, String)>,
-    headers: HeaderMap,
-) -> Response {
-    serve_hls(&state, &token, &file, &headers, true).await
+/// Where a rendition's stream starts: `?from=<ms>` on the film's clock.
+#[derive(serde::Deserialize)]
+struct StreamQuery {
+    from: Option<u64>,
 }
 
-async fn hls_head(
+async fn stream_get(
     State(state): State<AppState>,
-    Path((token, file)): Path<(String, String)>,
-    headers: HeaderMap,
+    Path(token): Path<String>,
+    Query(query): Query<StreamQuery>,
 ) -> Response {
-    serve_hls(&state, &token, &file, &headers, false).await
+    serve_stream(&state, &token, query.from, true).await
+}
+
+async fn stream_head(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+    Query(query): Query<StreamQuery>,
+) -> Response {
+    serve_stream(&state, &token, query.from, false).await
 }
 
 /// What a rendition answers when it has no bytes for the request: `404`
@@ -326,15 +341,29 @@ fn not_served(reason: NotServed) -> Response {
     }
 }
 
-/// One file of a rendition's HLS stream: a playlist, the init segment or
-/// a media segment, whole and in memory, framed by `MediaRange`.
-async fn serve_hls(
-    state: &AppState,
-    token: &str,
-    file: &str,
-    headers: &HeaderMap,
-    body: bool,
-) -> Response {
+/// **A rendition's stream**: one progressive fragmented MP4 -- the init
+/// segment, then segment after segment from the one `from` falls in (the
+/// spec's start without it) to the film's end -- sent as the segments are
+/// made. A receiver plays it as a file it reads forward (`<video src>`),
+/// not through Media Source.
+///
+/// The answer waits for the first segment and the init segment, so a
+/// rendition that cannot start is a status (`503`, as [`not_served`] says)
+/// rather than a body that breaks. After that it is `200`, `video/mp4`,
+/// **no length and no ranges**: the length of what is not made yet is not
+/// known, and offering ranges would invite a seek by bytes that a stream
+/// made from a time cannot answer. A `Range` header is not read; the
+/// answer is the stream from its start. A seek is a new stream from
+/// another `from`.
+///
+/// Each segment after the first is asked for as the receiver takes the
+/// last -- the body is polled only as the socket drains -- so a receiver
+/// that pauses stops asking, and the run's lookahead holds the producer.
+/// No timer ends a stream: a segment that is slow to come is waited for.
+/// The cut (unpublish, the listener's stop) breaks the body with an error,
+/// as it does a plain cast's, and so does a rendition that fails partway;
+/// only the film's end is a clean end.
+async fn serve_stream(state: &AppState, token: &str, from: Option<u64>, body: bool) -> Response {
     let Some(publication) = state.lan_media.casts().get(token) else {
         tracing::info!("cast request for a token that is not published");
         return StatusCode::NOT_FOUND.into_response();
@@ -342,74 +371,77 @@ async fn serve_hls(
     let Some(rendition) = publication.rendition.clone() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let (bytes, content_type, media) = if file == "index.m3u8" {
-        (
-            rendition.master(state).await,
-            "application/vnd.apple.mpegurl",
-            false,
-        )
-    } else if file == crate::rendition::MEDIA_PLAYLIST {
-        (
-            Ok(rendition.playlist()),
-            "application/vnd.apple.mpegurl",
-            false,
-        )
-    } else if file == "init.mp4" {
-        (rendition.init(state).await, "video/mp4", true)
-    } else if let Some(segment) = file
-        .strip_suffix(".m4s")
-        .and_then(|number| number.parse::<u64>().ok())
-    {
-        (rendition.segment(state, segment).await, "video/mp4", true)
-    } else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let bytes = match bytes {
-        Ok(bytes) => bytes,
-        Err(reason) => return not_served(reason),
-    };
-    let size = bytes.len() as u64;
-    let range = headers
-        .get(header::RANGE)
-        .and_then(|value| value.to_str().ok());
-    let Some(framing) = util::MediaRange::of(range, size) else {
-        return util::range_not_satisfiable(size);
-    };
     let mut res_headers = HeaderMap::new();
     res_headers.insert(
         header::CONTENT_TYPE,
-        content_type.parse().expect("a MIME type"),
+        "video/mp4".parse().expect("a MIME type"),
     );
-    framing.write_headers(size, &mut res_headers);
+    res_headers.insert(
+        header::CACHE_CONTROL,
+        "no-store".parse().expect("a header value"),
+    );
     if !body {
-        return (framing.status(), res_headers, Body::empty()).into_response();
+        return (StatusCode::OK, res_headers, Body::empty()).into_response();
     }
-    let length = framing.content_length(size);
-    let slice = if size == 0 {
-        Bytes::new()
-    } else {
-        bytes.slice(framing.start as usize..=framing.end as usize)
+    let first = rendition.first_segment(from);
+    // The first segment starts the run there (or joins one), and the init
+    // segment is frozen by the time it is out; either failing is the one
+    // answer, since a failure fails the whole rendition.
+    let begun = async {
+        let first_bytes = rendition.segment(state, first).await?;
+        Ok::<_, NotServed>((rendition.init(state).await?, first_bytes))
     };
-    if media {
-        state.lan_media.record_body();
-    }
-    let chunks = futures_util::stream::iter(
-        slice
-            .chunks(64 * 1024)
-            .map(|chunk| Ok(slice.slice_ref(chunk)))
-            .collect::<Vec<std::io::Result<Bytes>>>(),
-    );
+    let (init, first_bytes) = match begun.await {
+        Ok(begun) => begun,
+        Err(reason) => return not_served(reason),
+    };
+    state.lan_media.record_body();
+    let count = rendition.count();
+    let later = {
+        let state = state.clone();
+        let rendition = rendition.clone();
+        futures_util::stream::unfold(Some(first + 1), move |next| {
+            let state = state.clone();
+            let rendition = rendition.clone();
+            async move {
+                let segment = next.filter(|segment| *segment < count)?;
+                match rendition.segment(&state, segment).await {
+                    Ok(bytes) => Some((Ok(bytes), Some(segment + 1))),
+                    // Past the film's end, as a run that reached it found.
+                    Err(NotServed::NotFound) => None,
+                    Err(NotServed::Failed(sentence)) => {
+                        Some((Err(std::io::Error::other(sentence)), None))
+                    }
+                    Err(NotServed::Cut) => {
+                        Some((Err(std::io::Error::other("the cast was unpublished")), None))
+                    }
+                }
+            }
+        })
+    };
+    let chunks = futures_util::stream::iter([Ok(init), Ok(first_bytes)])
+        .chain(later)
+        .flat_map(|piece: std::io::Result<Bytes>| {
+            let pieces: Vec<std::io::Result<Bytes>> = match piece {
+                Ok(bytes) => bytes
+                    .chunks(64 * 1024)
+                    .map(|chunk| Ok(bytes.slice_ref(chunk)))
+                    .collect(),
+                Err(error) => vec![Err(error)],
+            };
+            futures_util::stream::iter(pieces)
+        });
     let body = CastBody {
         chunks: Box::pin(chunks),
         cut: Box::pin(publication.cut.clone().cancelled_owned()),
         ended: false,
         cut_seen: false,
         delivered: 0,
-        length,
+        length: 0,
         kind: "rendition",
         _held: Box::new(()),
     };
-    (framing.status(), res_headers, Body::from_stream(body)).into_response()
+    (StatusCode::OK, res_headers, Body::from_stream(body)).into_response()
 }
 
 async fn cast_get(

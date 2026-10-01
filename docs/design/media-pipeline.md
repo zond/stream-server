@@ -86,7 +86,7 @@ Two more facts the rest of this note leans on:
  torrent  ────────── piece store (.pieces) ─┐
  HTTP     ────────── proxy cache (.proxy)  ─┼── MemberView ──┬── mpv, in process   (xtremio://<id>)
  Drive    ────────── proxy cache (.proxy)  ─┤   (nests)      ├── cast receiver     (/cast/<token>)
- local    ────────── none                  ─┘                └── rendition (F)     (/cast/<token>/hls/...)
+ local    ────────── none                  ─┘                └── rendition (F)     (/cast/<token>/stream.mp4)
                      └── pins live here
 ```
 
@@ -654,7 +654,9 @@ HLS rendition:
   `hlsSegmentFormat`/`hlsVideoSegmentFormat` hints must be exposed for fMP4
   on the default receiver.
 
-Routes: `GET /cast/{token}/hls/index.m3u8` and `GET /cast/{token}/hls/{n}.m4s`
+*(Superseded in F2: a rendition is one progressive fragmented MP4 at
+`/cast/{token}/stream.mp4`, not HLS -- `renditions.md` §5, F2.)* Routes as
+first planned: `GET /cast/{token}/hls/index.m3u8` and `GET /cast/{token}/hls/{n}.m4s`
 (plus the init segment), under the same token and the same cut-on-unpublish.
 F gets its own design note before it is built; this section fixes only
 what it must not break.

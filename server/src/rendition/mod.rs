@@ -3,23 +3,25 @@
 //! `docs/design/media-pipeline.md` §5).
 //!
 //! A rendition is a published cast token ([`crate::ServerHandle::publish_rendition`])
-//! with an HLS stream behind it: a master playlist naming the one variant
-//! and its codecs, a VOD media playlist written up front from the film's
-//! duration, an init segment, and media segments produced on demand
-//! by a [`Producer`](crate::rendition::Producer) the embedder installed -- the thing that demuxes,
-//! decodes and encodes, which the server never does itself. The server's
-//! half is everything else: the routes (`crate::cast`), the playlist, the
-//! cut rule, the fMP4 muxer (`mux.rs`), the ring of segments in
-//! memory, and the speed a run is judged by.
+//! with **one progressive fragmented MP4** behind it
+//! (`/cast/{token}/stream.mp4`, `crate::cast`): the init segment, then
+//! media segments in order from a start time, each produced on demand by a
+//! [`Producer`](crate::rendition::Producer) the embedder installed -- the
+//! thing that demuxes, decodes and encodes, which the server never does
+//! itself. The server's half is everything else: the route, the cut rule,
+//! the fMP4 muxer (`mux.rs`), the ring of segments in memory, and the
+//! speed a run is judged by.
+//!
+//! **Not HLS.** zond's Chromecast with Google TV plays no HLS above 720p
+//! through its Media Source path -- ours, ffmpeg's or Mux's own, TS or
+//! fMP4, at any bitrate -- and plays the same film as a progressive
+//! fragmented MP4 through its plain `<video src>` path
+//! (`docs/design/renditions.md`, F2). A segment is an internal unit: the
+//! stream is the segments one after another, and a seek is a new stream
+//! from another start.
 //!
 //! # The rules this keeps
 //!
-//! * **The master playlist names the codecs**, and so waits for the first
-//!   run's formats, as the init segment does. A receiver's Shaka Player
-//!   (the Cast receiver's 4.15) handed the media playlist alone guesses a
-//!   video-only type from the init segment of a muxed stream and fails its
-//!   first append (`MEDIA_SOURCE_OPERATION_FAILED`); behind a master
-//!   playlist it takes the variant as muxed.
 //! * **Nothing on disk.** Segments live in a ring in memory -- two behind
 //!   the last request, [`LOOKAHEAD`](crate::rendition::LOOKAHEAD) ahead, [`RING_CAP`](crate::rendition::RING_CAP) at most -- and are
 //!   dropped.
@@ -27,8 +29,7 @@
 //!   presentation time is at or after N x T and ends where N+1 begins; an
 //!   audio sample belongs to the segment its presentation time falls in on
 //!   the N x T grid. What a run is handed before its first cut is
-//!   discarded. A segment is produced whole before it is answered, so a
-//!   segment is `Bytes` ranged like any file.
+//!   discarded. A segment is produced whole before it is sent.
 //! * **A request for segment N** is answered from the ring; or waits, when
 //!   N is the segment in production or at most [`LOOKAHEAD`](crate::rendition::LOOKAHEAD) past it (and
 //!   joins that production, never restarts it); or is a seek: the run is
@@ -38,7 +39,7 @@
 //!   sink, and the producer's next write blocks.
 //! * **An idle run is let go** after [`IDLE_RELEASE`](crate::rendition::IDLE_RELEASE) without a request; the
 //!   ring is kept and the next request starts a new run where it asks.
-//! * **The first run's formats are frozen** into `init.mp4`; a later run
+//! * **The first run's formats are frozen** into the init segment; a later run
 //!   whose formats differ fails the rendition.
 //! * **A run slower than real time fails the rendition with a sentence**:
 //!   under 1.0x over [`SPEED_WINDOW`](crate::rendition::SPEED_WINDOW) of busy time once its first segment
@@ -82,7 +83,7 @@ const SINK_CAPACITY: usize = 32;
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RenditionSpec {
-    /// The film's duration, from mpv: the playlist is written from it.
+    /// The film's duration, from mpv: how many segments there are.
     pub duration_ms: u64,
     /// Target segment length (6000; `docs/design/renditions.md` §6).
     pub segment_ms: u32,
@@ -382,7 +383,7 @@ pub struct RenditionProbe {
 
 /// Why a request under a rendition is not answered with bytes.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum NotServed {
+pub enum NotServed {
     /// Past the last segment, or past the film's end.
     NotFound,
     /// The rendition failed; the sentence.
@@ -409,9 +410,6 @@ struct Inner {
     failed: Option<String>,
     /// The first segment past the film's end, once a run reached it.
     end: Option<u64>,
-    /// The source's length, from the first run's reader: what the master
-    /// playlist's `BANDWIDTH` is worked out from.
-    source_len: Option<u64>,
     last_request: u64,
     last_request_at: Instant,
     runs_started: u64,
@@ -459,13 +457,12 @@ impl Inner {
     }
 }
 
-/// One published rendition: the spec, the playlist written from it, the
-/// producer, and the ring with the run that fills it.
+/// One published rendition: the spec, the producer, and the ring with the
+/// run that fills it.
 pub(crate) struct Rendition {
     id: MediaId,
     play: Option<PlayToken>,
     spec: RenditionSpec,
-    playlist: Bytes,
     count: u64,
     producer: Arc<dyn Producer>,
     tuning: RenditionTuning,
@@ -495,7 +492,6 @@ impl Rendition {
         );
         let count = spec.duration_ms.div_ceil(u64::from(spec.segment_ms));
         Ok(Self {
-            playlist: playlist(&spec),
             count,
             id,
             play,
@@ -511,7 +507,6 @@ impl Rendition {
                 run: None,
                 failed: None,
                 end: None,
-                source_len: None,
                 last_request: 0,
                 last_request_at: Instant::now(),
                 runs_started: 0,
@@ -535,38 +530,16 @@ impl Rendition {
         i64::from(self.spec.segment_ms) * 1000
     }
 
-    /// The media playlist, written at publish.
-    pub(crate) fn playlist(&self) -> Bytes {
-        self.playlist.clone()
+    /// How many segments the film is cut into: `ceil(duration / T)`.
+    pub(crate) fn count(&self) -> u64 {
+        self.count
     }
 
-    /// Record the source's length, from a run's reader; the first one
-    /// counts.
-    pub(crate) fn note_source_len(&self, len: u64) {
-        self.inner().source_len.get_or_insert(len);
-    }
-
-    /// **The master playlist**: the one variant, its `CODECS`, `RESOLUTION`
-    /// and `BANDWIDTH` (the source's average rate), naming the media
-    /// playlist. The codecs are the first run's, so this waits for them --
-    /// and starts that run -- as [`Self::init`] does.
-    pub(crate) async fn master(self: &Arc<Self>, state: &AppState) -> Result<Bytes, NotServed> {
-        self.init(state).await?;
-        let (formats, source_len) = {
-            let inner = self.inner();
-            (inner.formats.clone().unwrap_or_default(), inner.source_len)
-        };
-        let codecs = mux::codecs(&formats).map_err(NotServed::Failed)?;
-        let bandwidth = source_len
-            .unwrap_or(0)
-            .saturating_mul(8000)
-            .div_ceil(self.spec.duration_ms)
-            .max(1);
-        Ok(master_playlist(
-            bandwidth,
-            &codecs,
-            mux::resolution(&formats),
-        ))
+    /// The segment a stream asked to start at `from_ms` begins with -- the
+    /// spec's start when it names none -- held inside the film.
+    pub(crate) fn first_segment(&self, from_ms: Option<u64>) -> u64 {
+        let from = from_ms.unwrap_or(self.spec.start_ms);
+        (from / u64::from(self.spec.segment_ms)).min(self.count - 1)
     }
 
     pub(crate) fn state(&self) -> RenditionState {
@@ -724,48 +697,6 @@ impl Rendition {
     }
 }
 
-/// The name the master playlist gives the media playlist, which the route
-/// serves under it.
-pub(crate) const MEDIA_PLAYLIST: &str = "media.m3u8";
-
-/// The master playlist: one variant, muxed, and the media playlist's name.
-fn master_playlist(bandwidth: u64, codecs: &str, resolution: Option<(u32, u32)>) -> Bytes {
-    let resolution = resolution
-        .map(|(width, height)| format!(",RESOLUTION={width}x{height}"))
-        .unwrap_or_default();
-    Bytes::from(format!(
-        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n\
-         #EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS=\"{codecs}\"{resolution}\n\
-         {MEDIA_PLAYLIST}\n"
-    ))
-}
-
-/// The VOD playlist: every segment `T` long but the last, which is what is
-/// left of the duration; names relative, so it names no host.
-fn playlist(spec: &RenditionSpec) -> Bytes {
-    use std::fmt::Write as _;
-    let segment_ms = u64::from(spec.segment_ms);
-    let count = spec.duration_ms.div_ceil(segment_ms);
-    let mut out = String::with_capacity(64 + count as usize * 24);
-    out.push_str("#EXTM3U\n#EXT-X-VERSION:7\n");
-    let _ = writeln!(out, "#EXT-X-TARGETDURATION:{}", segment_ms.div_ceil(1000));
-    out.push_str(
-        "#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-INDEPENDENT-SEGMENTS\n\
-         #EXT-X-MAP:URI=\"init.mp4\"\n",
-    );
-    for index in 0..count {
-        let length = segment_ms.min(spec.duration_ms - index * segment_ms);
-        let _ = writeln!(
-            out,
-            "#EXTINF:{}.{:03},\n{index}.m4s",
-            length / 1000,
-            length % 1000
-        );
-    }
-    out.push_str("#EXT-X-ENDLIST\n");
-    Bytes::from(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -779,31 +710,6 @@ mod tests {
             audio: AudioPlan::Copy,
             audio_track: 0,
         }
-    }
-
-    #[test]
-    fn the_playlist_ends_on_the_remainder() {
-        let text = String::from_utf8(playlist(&spec(13_500, 6000)).to_vec()).unwrap();
-        assert_eq!(
-            text,
-            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:6\n#EXT-X-PLAYLIST-TYPE:VOD\n\
-             #EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MAP:URI=\"init.mp4\"\n\
-             #EXTINF:6.000,\n0.m4s\n#EXTINF:6.000,\n1.m4s\n#EXTINF:1.500,\n2.m4s\n#EXT-X-ENDLIST\n"
-        );
-    }
-
-    #[test]
-    fn the_master_names_its_one_variant_and_the_media_playlist() {
-        let text = String::from_utf8(
-            master_playlist(139_811, "avc1.64000D,mp4a.40.2", Some((320, 240))).to_vec(),
-        )
-        .unwrap();
-        assert_eq!(
-            text,
-            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n\
-             #EXT-X-STREAM-INF:BANDWIDTH=139811,CODECS=\"avc1.64000D,mp4a.40.2\",RESOLUTION=320x240\n\
-             media.m3u8\n"
-        );
     }
 
     #[test]

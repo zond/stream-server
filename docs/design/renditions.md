@@ -1,6 +1,30 @@
 # Renditions: a cast the receiver can decode, produced on demand, nothing on disk
 
-Design, 2026-10-01. **F1 (the server side) is built, F0 landed in the app, F1½ answered (libavformat); F2-F5 are not.** This is step F
+Design, 2026-10-01. **F1 (the server side) is built, F0 landed in the app, F1½ answered (libavformat), F2's producer built; F3-F5 are not.**
+
+> **Amended in F2 (zond, 2026-10-01): a rendition is ONE progressive
+> fragmented MP4, not HLS.** Measured on zond's Chromecast with Google TV
+> (§5, F2): its Media Source path plays no HLS above 720p -- ours, ffmpeg's
+> or Mux's own 1080p variant, TS or fMP4, even at 2 Mbit/s -- while the
+> same 1080p film plays as one progressive fragmented MP4 through its
+> plain `<video src>` path. "Why keep HLS if everything works with
+> progressive fMP4?" (zond) -- so HLS is gone: no playlists, no
+> `init.mp4`/`{n}.m4s` routes, no `hlsSegmentFormat` hints. The rendition
+> is `GET /cast/{token}/stream.mp4[?from=<ms>]`: the init segment, then the
+> segments in order from the one `from` falls in, sent as they are made,
+> with no length and no ranges. Everything behind the routes stays as
+> designed below -- the run, the cut rule, the ring, the lookahead, the
+> idle release, the speed rule, the muxer, the frozen formats -- with the
+> segment now a unit inside the stream that the stream asks for in turn.
+> **A seek is a new load of the stream from the new time** (`?from=`): a
+> progressive file made from a time cannot be sought by bytes, and the
+> stream's timestamps are the film's own, so the receiver's `currentTime`
+> reads the film's position whatever the stream started at (measured in
+> desktop Chrome: a stream from segment 2 of 6 s segments starts at
+> `currentTime` 12, `seekable` is empty, the duration grows as fragments
+> arrive). Where the sections below say playlist, `#EXTINF`,
+> `index.m3u8` or "a request for segment N", read the stream and the
+> segment it asks for next. This is step F
 of `docs/design/media-pipeline.md` (§2.10 fixed what it must not break;
 this note is the design that section asked for). Written against
 stream-server `410a1e2`, xtremio `c9cc260`, flutter_chrome_cast 1.4.8 and
@@ -523,7 +547,7 @@ sentence.
 
 | Route | Answers |
 |---|---|
-| `GET/HEAD /cast/{token}/hls/index.m3u8` | The playlist, `application/vnd.apple.mpegurl`. Written at publish; never waits. *(F2: the master playlist, waiting for the codecs; the media playlist moved to `media.m3u8`. See F2 below.)* |
+| `GET/HEAD /cast/{token}/hls/index.m3u8` | The playlist, `application/vnd.apple.mpegurl`. Written at publish; never waits. |
 | `GET/HEAD /cast/{token}/hls/init.mp4` | The init segment, `video/mp4`. Waits for the first run's formats. |
 | `GET/HEAD /cast/{token}/hls/{n}.m4s` | Segment `n`, `video/mp4`, ranged by `MediaRange` over the whole segment in memory. `404` past the last; `503` with `{refused, message}` once the rendition has failed. |
 
@@ -698,24 +722,36 @@ F2. **Kotlin producer, repackage only, end to end on the phone** (M). The
 
    *(Built in xtremio as a Rust producer over libavformat from the
    vendored libmpv (F1½), not Kotlin over JNI: `rust/src/libav.rs`,
-   `rust/src/rendition.rs`. First run on zond's TV, 2026-10-01: the
-   decision chose the rendition, the receiver fetched the playlist,
-   `init.mp4` and segment 0 whole, then gave up ("idle (error)") without
-   asking for segment 1. Reproduced on a desktop with the Shaka Player the
-   Cast receiver framework loads by default (4.15.56, `use_shaka_for_hls`
-   defaults to true; CAF's own Shaka configuration):
-   `MEDIA_SOURCE_OPERATION_FAILED` (3014) on the first append. Handed a
-   media playlist alone, that Shaka probes the init segment and types the
-   SourceBuffer of the muxed stream from its video codec only
-   (`MediaSourceEngine.getRealInfo_`), changes the buffer to video alone,
-   and the muxed init segment no longer fits. Behind a master playlist the
-   same Shaka takes the variant as muxed and plays the stream through and
-   seeks (current Shaka, 5.2, plays either). So `index.m3u8` is now a
-   master playlist naming one variant with its `CODECS`, `RESOLUTION` and
-   `BANDWIDTH`, and the media playlist is `media.m3u8`; muxed fMP4 HLS
-   stands (§6's question), separate audio and video playlists are not
-   needed. The master waits for the first run's formats, as `init.mp4`
-   does.)*
+   `rust/src/rendition.rs`. What zond's TV did with it, 2026-10-01, all
+   with the default receiver:*
+   * *As HLS (fMP4, a media playlist): fetched the playlist, `init.mp4`
+     and segment 0 (the 1080p clip), then IDLE/ERROR. On a desktop the
+     receiver framework's default Shaka Player (4.15.56;
+     `use_shaka_for_hls` defaults to true) failed the same files' first
+     append (`MEDIA_SOURCE_OPERATION_FAILED`): handed a bare media playlist
+     of muxed fMP4 it types the buffer from the video codec alone. A master
+     playlist naming the `CODECS` fixed that on the desktop (stream-server
+     `8897914`), and the TV still failed after segment 0.*
+   * *zond then bisected on the TV from a desktop with pychromecast:
+     every 1080p HLS stream fails there -- ours, ffmpeg's of the same clip
+     (fMP4 or TS), Mux's own 1080p variant served alone, the clip at about
+     2 Mbit/s, the clip without audio or without B-frames -- and every
+     stream of 720p or less plays (Mux's public multi-variant stream, whose
+     ABR picks 720p; the clip re-encoded at 720p, B-frames and all). The
+     same 1080p clip plays as a progressive MP4, and as one fragmented MP4
+     (`frag_keyframe+empty_moov+default_base_moof`) served as `video/mp4`.
+     A diagnosis for HLS on this receiver is not needed any more, so none
+     was made.*
+   * *Hence the amendment at the top: one progressive fragmented MP4 at
+     `/cast/{token}/stream.mp4`, HLS removed (and with it `8897914`'s
+     master playlist). CORS headers are not needed by a `<video src>`
+     stream; the LAN listener sends `Access-Control-Allow-Origin: *` on
+     every response anyway, as it always has (`lan_cors_layer`).*
+   * *The app's half (not built yet): publish, hand the receiver
+     `stream.mp4?from=<position>` as `video/mp4` with no start position of
+     its own (the stream already starts there), map a seek -- the phone's
+     or the TV remote's, which the receiver cannot do in an unseekable
+     file -- to a new LOAD at the new time, and drop the HLS fields.*
 
 F3. **Audio to stereo AAC** (M). `MediaCodec` decode when the phone has a
    decoder, libavcodec from `libmpv.so` otherwise (2.6), downmix,
@@ -750,7 +786,8 @@ F5. **The receiver table and the decision UI** (M). `ReceiverCaps`, the
   **not verified**; the fallback is a master playlist with separate video
   and audio media playlists (`#EXT-X-MEDIA`), two more routes and the
   same muxer writing two track sets. F2 finds out.
-* **HLS, not one progressive fMP4.** A progressive transcode has no length
+* **HLS, not one progressive fMP4.** *(Reversed in F2, measured: see the
+  amendment at the top.)* A progressive transcode has no length
   to put in `Content-Length` and no index to seek by time without one; a
   repackage-only progressive MP4 would need the whole source's sample
   table up front, which is a read of the whole file. HLS is the shape where
