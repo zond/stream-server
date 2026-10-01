@@ -566,6 +566,18 @@ off a set onto one of its volumes is a move: the file is left
 member. Before, the same file meant "nothing left", and the second episode
 of a season in one ZIP shared the first's extent for the session's life.
 
+**A member's duration gives the container no stream rate** (same review).
+The app's duration report for a member of one container went to the
+container as its own (`note_duration`), so the container's stream rate was
+the container's length over the episode's duration -- ten times the
+episode's for a ten-episode ZIP -- every open was granted that read-ahead,
+and the draw, sized beside it, was usually empty. It now goes where a set's
+does, for the member's draw alone (`ServerHandle::note_media_duration` ->
+`EngineFS::on_set_duration` with the one container file): the container's
+stream has no rate, as a volume has none, and the draw is the member's
+bytes over the duration (`State::draw_buffering` reads `set_duration` for
+any member).
+
 ### 2.9 The container sniff moves into `resolve`
 
 `resolve` reads the first `0x8006` bytes (`enginefs::retention::sniff::HEAD_BYTES`,

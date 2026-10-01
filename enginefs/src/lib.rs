@@ -3610,11 +3610,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
     }
 
-    /// **How long the film of a member across a set is** -- a film in a
-    /// multi-volume RAR set, `files` its volumes -- for the set's draw
-    /// alone: its rate is the member's length over this, and no volume's
-    /// own stream takes a rate from it, a volume being a fraction of the
-    /// film ([`crate::retention::owner::Retention::note_set_duration`]).
+    /// **How long the film of a member is** -- a film in one container,
+    /// `files` that one file, or in a multi-volume RAR set, `files` its
+    /// volumes -- for the member's draw alone: its rate is the member's
+    /// length over this, and no file's own stream takes a rate from it, a
+    /// volume being a fraction of the film and a container perhaps a season
+    /// of them ([`crate::retention::owner::Retention::note_set_duration`]).
     pub async fn on_set_duration(
         &self,
         info_hash: &str,
@@ -17929,9 +17930,11 @@ mod tests {
     /// rate is the member's. Pieces of 250 bytes, a container of 10 000
     /// bytes, a member of its first 5 000, a film of 1 000 s: the member's
     /// 5 B/s over the 90 committed seconds buys one piece, where the
-    /// container's 10 B/s would have bought three. The open states no
-    /// read-ahead of its own, so the rate's is the one the draw is sized
-    /// beside.
+    /// container's 10 B/s would have bought three. The duration is told as
+    /// the server tells a member's (`note_media_duration`): for the draw
+    /// alone, so the container's stream takes no rate from it. The open
+    /// states no read-ahead of its own, so the rate's is the one the draw
+    /// is sized beside.
     #[tokio::test]
     async fn a_members_draw_is_sized_from_the_members_rate() {
         let (enginefs, counters) = test_enginefs_with_files(vec![("film.zip".into(), 10_000)]);
@@ -17951,17 +17954,79 @@ mod tests {
             )
             .await;
         assert_eq!(engine.retention.draw_of(&0), None, "drawn before the rate");
-        engine.told_duration(0, Duration::from_secs(1_000));
+        engine.told_set_duration(&[0], Duration::from_secs(1_000));
+        assert_eq!(
+            engine.retention.bitrate(&0),
+            None,
+            "the container's stream took a rate from the member's duration"
+        );
         engine.retention.settle_draw(&0).await;
         let draw = engine
             .retention
             .draw_of(&0)
-            .expect("drawn once the rate is known");
-        assert_eq!(draw.len(), 1, "sized from the container's rate: {draw:?}");
+            .expect("drawn once the member's rate is known");
+        assert_eq!(
+            draw.len(),
+            1,
+            "not sized from the member's 5 B/s (one piece of 250 B over 90 s): {draw:?}"
+        );
         assert!(
             draw.iter().all(|piece| *piece < 20),
             "drawn outside the member: {draw:?}"
         );
+    }
+
+    /// **A member's duration gives the container's stream no rate.** A
+    /// season in one container: 4 000 MiB of pieces of 4 MiB, the episode
+    /// its first 400 MiB, 200 s long. Told to the container as its own
+    /// duration, the stream's rate would be the container's 20 MiB/s, every
+    /// open would ask 90 s of that -- 1 800 MiB, the whole 200 MiB budget
+    /// -- and the draw, sized beside it, would be empty. Told for the draw
+    /// alone, the stream has no rate (as a set's volume has none), the open
+    /// asks the intent's constant, and the draw is sized beside the
+    /// member's 2 MiB/s: 180 MiB of read-ahead, and room beside it to share.
+    #[tokio::test]
+    async fn a_members_duration_gives_the_container_no_stream_rate() {
+        use crate::backend::priorities::{BufferProfile, Fetching};
+        const MIB: u64 = 1024 * 1024;
+        let (enginefs, counters) =
+            test_enginefs_with_files(vec![("season.zip".into(), 4_000 * MIB)]);
+        counters.pieces_per_file.store(1_000, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(200 * MIB));
+        enginefs.note_player(PLAYER, played_member(TEST_HASH, 0, 0..400 * MIB));
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        let first = engine
+            .try_get_file_with_intent(0, 0, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("the first open");
+        assert_eq!(engine.retention.draw_of(&0), None, "drawn before the rate");
+        drop(first);
+
+        // What the server does with the member's duration.
+        engine.told_set_duration(&[0], Duration::from_secs(200));
+        assert_eq!(
+            engine.retention.bitrate(&0),
+            None,
+            "the container's stream took the member's duration as its own"
+        );
+        let second = engine
+            .try_get_file_with_intent(0, 0, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("the open after the duration");
+        let draw = engine
+            .retention
+            .draw_of(&0)
+            .expect("drawn once the member's rate is known");
+        assert!(
+            !draw.is_empty(),
+            "the draw was sized beside a container-length read-ahead"
+        );
+        assert!(
+            draw.iter().all(|piece| *piece < 100),
+            "drawn outside the member: {draw:?}"
+        );
+        drop(second);
     }
 
     /// **A move to another member of the same container is a move**: the

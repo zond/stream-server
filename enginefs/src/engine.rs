@@ -1980,8 +1980,9 @@ impl<H: TorrentHandle> Engine<H> {
         self.retention.note_duration(&file_idx, duration);
     }
 
-    /// The film of a member across a set of this torrent's files lasts
-    /// `duration`: told to every volume, for the set's draw alone
+    /// The film of a member in these files of this torrent -- one
+    /// container, or a set's volumes -- lasts `duration`: told to each, for
+    /// the member's draw alone
     /// ([`crate::retention::owner::Retention::note_set_duration`]).
     pub fn told_set_duration(&self, files: &[usize], duration: std::time::Duration) {
         for file_idx in files {

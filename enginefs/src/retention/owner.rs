@@ -957,13 +957,16 @@ struct State<B: Backing> {
     /// which sizes the window exactly, and leaves where it is to the reads,
     /// which for a receiver are plainly sequential.
     duration: Option<std::time::Duration>,
-    /// **How long the film of a member this entity is a volume of is**
-    /// ([`Retention::note_set_duration`]): what the set's draw divides the
-    /// member's length by ([`Backing::played_set`]). Never this entity's
-    /// own rate, as [`Self::duration`] is: a volume's length over the
-    /// film's duration is the film's rate divided by the number of volumes,
-    /// and a read-ahead sized from it would starve the player. A property
-    /// of the film, kept like [`Self::duration`].
+    /// **How long the film of a member this entity holds is** -- a member
+    /// of this one container ([`Backing::played_member`]) or a member across
+    /// a set it is a volume of ([`Backing::played_set`])
+    /// ([`Retention::note_set_duration`]): what the member's draw divides
+    /// the member's length by. Never this entity's own rate, as
+    /// [`Self::duration`] is: a volume's length over the film's duration is
+    /// the film's rate divided by the number of volumes, a container's
+    /// length over an episode's is the episode's times the episodes in it,
+    /// and a read-ahead sized from either would starve the player or fill
+    /// the budget. A property of the film, kept like [`Self::duration`].
     set_duration: Option<std::time::Duration>,
     /// **What this entity shares for the rest of its play session**: the
     /// draw decided once the viewer's playback stream's read-ahead was known
@@ -1460,10 +1463,10 @@ impl<B: Backing> Retention<B> {
         entity.state.lock().duration = Some(duration);
     }
 
-    /// **How long the film of a member across a set is**, told to one of
-    /// its volumes ([`State::set_duration`]): the rate the set's draw is
-    /// sized with, and nothing else -- the volume's own stream keeps no rate
-    /// from it. L2 only, like [`Self::note_duration`].
+    /// **How long the film of a member is**, told to its container or to
+    /// one of the volumes of its set ([`State::set_duration`]): the rate
+    /// the member's draw is sized with, and nothing else -- the entity's own
+    /// stream keeps no rate from it. L2 only, like [`Self::note_duration`].
     pub fn note_set_duration(&self, key: &B::Key, duration: std::time::Duration) {
         if duration.is_zero() {
             return;
@@ -1709,7 +1712,7 @@ impl<B: Backing> Retention<B> {
     /// it ([`Backing::played_member`]): then the content is not asked, and
     /// the draw is sized and made over the member's extent alone
     /// ([`Backing::narrowed`]), its rate the extent's length over the
-    /// stated duration.
+    /// member's duration, told for the draw alone ([`State::set_duration`]).
     ///
     /// **A member across a set is drawn once for the set**
     /// ([`Backing::played_set`]): the volume whose session is due first
@@ -1855,7 +1858,9 @@ impl<B: Backing> Retention<B> {
                     }
                 },
             };
-            let buffering = state.draw_buffering(budget, &over, map.is_some());
+            // A member's duration, of one container or across a set, is
+            // told for the draw alone ([`State::set_duration`]).
+            let buffering = state.draw_buffering(budget, &over, member.is_some() || map.is_some());
             let (sized, refused) = match budget {
                 CacheBudget::Bytes(bytes) => match B::policy(&over, bytes, buffering) {
                     Ok(policy) => (Some(policy), None),
@@ -3202,9 +3207,7 @@ impl<B: Backing> State<B> {
         asked
     }
 
-    /// `domain`'s bytes over the film's stated duration: the entity's own
-    /// rate, or -- for the draw of a play session on a member -- the
-    /// member's, whose film the duration is ([`Backing::narrowed`]).
+    /// `domain`'s bytes over the entity's stated duration: its own rate.
     fn rate_over(&self, domain: &B::Domain) -> Option<u64> {
         self.duration
             .filter(|duration| !duration.is_zero())
@@ -3469,14 +3472,17 @@ impl<B: Backing> State<B> {
     /// times the widest seconds the viewer asked for, never past the whole
     /// cache (`Engine::try_get_file_with_intent` asks exactly that).
     ///
-    /// The rate is `over`'s: the entity's own domain, or the member a play
-    /// session plays inside it ([`Backing::narrowed`]), whose length the
-    /// stated duration is the film of -- or, for a member across a `set`,
-    /// the member's bytes in every volume ([`Backing::joined`]) over the
-    /// set's duration ([`State::set_duration`]).
-    fn draw_buffering(&self, budget: CacheBudget, over: &B::Domain, set: bool) -> Buffering {
+    /// The rate is `over`'s: the entity's own domain over its stated
+    /// duration -- or, for a `member` (the member a play session plays
+    /// inside one container, [`Backing::narrowed`], or its bytes in every
+    /// volume of a set, [`Backing::joined`]), the member's length over the
+    /// duration told for the draw alone ([`State::set_duration`]), which
+    /// gives the entity's own stream no rate: a container's length over an
+    /// episode's duration is the episode's rate times however many episodes
+    /// the container holds.
+    fn draw_buffering(&self, budget: CacheBudget, over: &B::Domain, member: bool) -> Buffering {
         let mut buffering = self.buffering().widest(self.asked);
-        buffering.bytes_per_second = if set {
+        buffering.bytes_per_second = if member {
             self.set_duration
                 .filter(|duration| !duration.is_zero())
                 .and_then(|duration| Some((B::bytes(over)? as f64 / duration.as_secs_f64()) as u64))

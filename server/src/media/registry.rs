@@ -333,23 +333,25 @@ impl Resolution {
         }
     }
 
-    /// The one torrent file a member's container is, when it is one: what
-    /// its play session is on, and what a player's reports about the film
-    /// are about. `None` for a set ([`Self::set_files`]) and for a
-    /// container behind links.
-    /// The torrent files of a member's multi-volume set, when it is one:
-    /// what its play session is on, and what the film's duration is told
-    /// to, for the set's draw ([`enginefs::EngineFS::on_set_duration`]).
-    fn set_files(&self) -> Option<(String, Vec<usize>)> {
+    /// The torrent files a member lies in, when it lies in a torrent: its
+    /// one container file, or every volume of its multi-volume set. What
+    /// the film's duration is told to, for the member's draw alone
+    /// ([`enginefs::EngineFS::on_set_duration`]): a container's length over
+    /// an episode's duration, or a volume's, is no rate of anything, so no
+    /// file's stream takes one from it.
+    fn member_files(&self) -> Option<(String, Vec<usize>)> {
         match self {
             Self::Member {
                 torrent: Some((info_hash, files)),
                 ..
-            } if files.len() > 1 => Some((info_hash.clone(), files.clone())),
+            } if !files.is_empty() => Some((info_hash.clone(), files.clone())),
             _ => None,
         }
     }
 
+    /// The one torrent file a member's container is, when it is one: what
+    /// its play session is on, and what a player's reports about playing
+    /// are about. `None` for a set and for a container behind links.
     fn container_file(&self) -> Option<(String, usize)> {
         match self {
             Self::Member {
@@ -518,9 +520,9 @@ impl Registry {
     /// `note_player_stalled`). `None` for anything else, which those reports
     /// are not about, and for an id not resolved yet.
     ///
-    /// For a member of a single-file container in a torrent, that file: the
-    /// film's duration is the member's, and the play session's draw divides
-    /// the member's extent by it.
+    /// For a member of a single-file container in a torrent, that file --
+    /// though not for the film's duration, which is the member's and goes
+    /// to [`Self::member_files`].
     pub(crate) fn torrent_file(&self, id: &MediaId) -> Option<(String, usize)> {
         match &*self.peek(id)? {
             Resolution::Torrent {
@@ -533,11 +535,12 @@ impl Registry {
         }
     }
 
-    /// The torrent files of the multi-volume set whose member `id`
-    /// resolved to, for the film's duration (`note_media_duration`). `None`
-    /// for anything else, and for an id not resolved yet.
-    pub(crate) fn set_files(&self, id: &MediaId) -> Option<(String, Vec<usize>)> {
-        self.peek(id)?.set_files()
+    /// The torrent files the member `id` resolved to lies in -- its one
+    /// container file, or its set's volumes -- for the film's duration
+    /// (`note_media_duration`), which they take for the member's draw
+    /// alone. `None` for anything else, and for an id not resolved yet.
+    pub(crate) fn member_files(&self, id: &MediaId) -> Option<(String, Vec<usize>)> {
+        self.peek(id)?.member_files()
     }
 
     /// A reader over what `id` names, resolving it first if nothing has.
@@ -1791,12 +1794,14 @@ mod tests {
         }
     }
 
-    /// **The film's duration for a member across a set is told to every
-    /// volume of the set** (`ServerHandle::note_media_duration`), for the
-    /// set's draw: the set's files, and nothing for a single-file container
-    /// or a container behind links.
+    /// **The film's duration for a member is told to the files it lies
+    /// in, for the member's draw alone** (`ServerHandle::note_media_duration`):
+    /// every volume of a set, the one file of a single-file container --
+    /// whose stream would otherwise take a container's length over an
+    /// episode's duration as its rate -- and nothing for a container behind
+    /// links.
     #[test]
-    fn a_sets_duration_is_its_volumes() {
+    fn a_members_duration_is_its_files() {
         let registry = Registry::new();
         let hash = "ab".repeat(20);
         for (torrent, expected) in [
@@ -1804,7 +1809,7 @@ mod tests {
                 Some((hash.clone(), vec![3, 4, 5])),
                 Some((hash.clone(), vec![3, 4, 5])),
             ),
-            (Some((hash.clone(), vec![3])), None),
+            (Some((hash.clone(), vec![3])), Some((hash.clone(), vec![3]))),
             (None, None),
         ] {
             let id = registry
@@ -1824,7 +1829,7 @@ mod tests {
                     sniffed_in: None,
                 }));
             drop(entry);
-            assert_eq!(registry.set_files(&id), expected);
+            assert_eq!(registry.member_files(&id), expected);
         }
     }
 
