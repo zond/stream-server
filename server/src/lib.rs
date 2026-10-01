@@ -27,6 +27,10 @@ pub use media::{
     Canceller, GrantSupplier, LocalFile, MediaId, MediaReader, MediaSpec, MemberInfo, PlayToken,
     Refusal, Resolved,
 };
+pub use rendition::{
+    AudioPlan, Job, Producer, ProducerRefusal, RenditionSpec, RenditionState, Sample, SampleSink,
+    Stopped, TrackFormat, TrackKind, VideoPlan,
+};
 pub use routes::drive::{DriveFileOpened, DriveOpenError};
 #[doc(hidden)]
 pub use routes::stream::{pretend_available_space, pretend_available_space_readings};
@@ -217,6 +221,10 @@ mod proxy_cache;
 pub mod proxy_downloads;
 mod proxy_retention;
 mod proxy_streams;
+/// Renditions: a cast the receiver can decode, produced on demand by the
+/// embedder's [`Producer`], muxed and ringed here, nothing on disk
+/// (`docs/design/renditions.md`).
+pub mod rendition;
 mod routes;
 /// **The seam every translated container reads through**: a file whose
 /// bytes something else fetched and keeps -- a torrent's piece store, the
@@ -1410,9 +1418,67 @@ impl ServerHandle {
     pub fn publish(&self, id: &MediaId, play: Option<PlayToken>) -> anyhow::Result<CastToken> {
         let lease = self.state.media.lease(id)?;
         let lan_media = &self.state.lan_media;
-        lan_media
-            .casts()
-            .publish(|| lan_media.bound_addr().is_some(), lease, id.clone(), play)
+        lan_media.casts().publish(
+            || lan_media.bound_addr().is_some(),
+            lease,
+            id.clone(),
+            play,
+            None,
+        )
+    }
+
+    /// **Install the rendition producer**: the embedder's demuxer, decoders
+    /// and encoders, which [`Self::publish_rendition`] needs. Once, by the
+    /// embedder, after the server starts; a second call replaces the first
+    /// for renditions published from then on.
+    pub fn install_producer(&self, producer: Arc<dyn Producer>) {
+        self.state.lan_media.casts().install_producer(producer);
+    }
+
+    /// **Publish a rendition of an id for a cast**: the token the
+    /// receiver's playlist URL is built on,
+    /// `<lan_media_base_url>/cast/<token>/hls/index.m3u8`. As
+    /// [`Self::publish`] -- refused while the LAN listener is down, holds
+    /// the id's lease, unpublished by [`Self::unpublish`] or the listener's
+    /// stop -- and refused (`noProducer`) when no producer is installed
+    /// ([`Self::install_producer`]). The playlist is written now, from
+    /// `spec.duration_ms`; no run starts until the receiver asks.
+    pub fn publish_rendition(
+        &self,
+        id: &MediaId,
+        spec: RenditionSpec,
+        play: Option<PlayToken>,
+    ) -> anyhow::Result<CastToken> {
+        let lease = self.state.media.lease(id)?;
+        let lan_media = &self.state.lan_media;
+        lan_media.casts().publish(
+            || lan_media.bound_addr().is_some(),
+            lease,
+            id.clone(),
+            play,
+            Some(spec),
+        )
+    }
+
+    /// **Where a rendition is**: producing, idle, failed with the sentence
+    /// to show, or ended (not published any more -- or never a rendition).
+    /// Cheap: no runtime hop, safe to poll.
+    pub fn rendition_state(&self, token: &CastToken) -> RenditionState {
+        self.state.lan_media.casts().rendition_state(token)
+    }
+
+    /// The durations renditions published from now on run by. For the
+    /// tests: a release period or a speed window a test can wait out.
+    #[doc(hidden)]
+    pub fn set_rendition_tuning(&self, tuning: rendition::RenditionTuning) {
+        self.state.lan_media.casts().set_tuning(tuning);
+    }
+
+    /// What a rendition holds right now: its runs and its ring. A probe for
+    /// the tests; nothing decides anything from it.
+    #[doc(hidden)]
+    pub fn rendition_probe(&self, token: &CastToken) -> Option<rendition::RenditionProbe> {
+        self.state.lan_media.casts().rendition_probe(token)
     }
 
     /// **Unpublish a cast token**: nothing more is served under it, and a

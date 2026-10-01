@@ -39,9 +39,20 @@
 //! would), without one they are an aside. A torrent source registers its
 //! stream at the body's open and ends it when the body is dropped, as the
 //! HTTP torrent route's body does.
+//!
+//! **Renditions** (`docs/design/renditions.md`, `crate::rendition`) are
+//! publications too ([`crate::ServerHandle::publish_rendition`]), with the
+//! same token rules and the same cut, and an HLS stream under
+//! `/cast/{token}/hls/`: `index.m3u8`, `init.mp4` and `{n}.m4s`, each
+//! ranged by the same framing, each segment in memory. A plain
+//! publication has no `hls/` (`404`); a rendition's token serves its
+//! `hls/` and, like a plain one, the source as it is at `/cast/{token}`.
 
 use crate::media::registry::Entry;
 use crate::media::{MediaId, PlayToken, Refusal};
+use crate::rendition::{
+    NotServed, Producer, Rendition, RenditionSpec, RenditionState, RenditionTuning,
+};
 use crate::routes::{compat, util};
 use crate::sources::ReadHint;
 use crate::state::AppState;
@@ -107,15 +118,32 @@ struct Publication {
     id: MediaId,
     play: Option<PlayToken>,
     cut: CancellationToken,
+    /// The HLS stream behind the token, for a rendition. Its runs' stops
+    /// are children of `cut`, so the cut ends them; its ring goes with the
+    /// last holder -- the map, a request in flight, a run task -- each of
+    /// which lets go at the cut.
+    rendition: Option<Arc<Rendition>>,
     _lease: Lease<Entry>,
 }
 
-/// Every token published and not unpublished. Held by
-/// [`crate::lan_media::LanMedia`], whose stop unpublishes all of them.
+/// Every token published and not unpublished, and what a rendition needs
+/// to be published at all. Held by [`crate::lan_media::LanMedia`], whose
+/// stop unpublishes all of them.
 #[derive(Default)]
 pub(crate) struct Casts {
     published: std::sync::Mutex<HashMap<String, Arc<Publication>>>,
+    /// The embedder's producer (`ServerHandle::install_producer`): without
+    /// one, a rendition is refused.
+    producer: std::sync::Mutex<Option<Arc<dyn Producer>>>,
+    /// The release period and the speed window renditions published from
+    /// now on run by.
+    tuning: std::sync::Mutex<RenditionTuning>,
 }
+
+/// Why a rendition was not published: the sentence of the error
+/// `publish_rendition` answers when no producer is installed.
+pub(crate) const NO_PRODUCER: &str =
+    "no rendition producer is installed (noProducer); install one with install_producer first";
 
 impl Casts {
     fn published(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Publication>>> {
@@ -134,23 +162,51 @@ impl Casts {
         lease: Lease<Entry>,
         id: MediaId,
         play: Option<PlayToken>,
+        rendition: Option<RenditionSpec>,
     ) -> anyhow::Result<CastToken> {
         let token = CastToken::random()?;
+        let cut = CancellationToken::new();
+        let rendition = match rendition {
+            None => None,
+            Some(spec) => {
+                let producer = self
+                    .producer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!(NO_PRODUCER))?;
+                let tuning = *self
+                    .tuning
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                Some(Arc::new(Rendition::new(
+                    id.clone(),
+                    play.clone(),
+                    spec,
+                    producer,
+                    tuning,
+                    cut.clone(),
+                )?))
+            }
+        };
         let mut published = self.published();
         anyhow::ensure!(
             running(),
             "the LAN media listener is not running; start it with set_lan_media(true) first"
         );
+        let is_rendition = rendition.is_some();
         published.insert(
             token.0.clone(),
             Arc::new(Publication {
                 id,
                 play,
-                cut: CancellationToken::new(),
+                cut,
+                rendition,
                 _lease: lease,
             }),
         );
         tracing::info!(
+            rendition = is_rendition,
             published = published.len(),
             played = published
                 .values()
@@ -187,12 +243,166 @@ impl Casts {
     fn get(&self, token: &str) -> Option<Arc<Publication>> {
         self.published().get(token).cloned()
     }
+
+    /// Install the embedder's producer, replacing any before it.
+    /// Renditions already published keep the one they were published with.
+    pub(crate) fn install_producer(&self, producer: Arc<dyn Producer>) {
+        *self
+            .producer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(producer);
+    }
+
+    pub(crate) fn set_tuning(&self, tuning: RenditionTuning) {
+        *self
+            .tuning
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = tuning;
+    }
+
+    /// Where the rendition under `token` is: [`RenditionState::Ended`] for a
+    /// token that is not published, or not a rendition.
+    pub(crate) fn rendition_state(&self, token: &CastToken) -> RenditionState {
+        self.get(token.as_str())
+            .and_then(|publication| publication.rendition.clone())
+            .map_or(RenditionState::Ended, |rendition| rendition.state())
+    }
+
+    pub(crate) fn rendition_probe(
+        &self,
+        token: &CastToken,
+    ) -> Option<crate::rendition::RenditionProbe> {
+        self.get(token.as_str())
+            .and_then(|publication| publication.rendition.clone())
+            .map(|rendition| rendition.probe())
+    }
 }
 
-/// The LAN listener's routes: `/cast/{token}`, and nothing else. (Step F's
-/// renditions will live under `/cast/{token}/hls/...`.)
+/// The LAN listener's routes: `/cast/{token}`, and a rendition's HLS
+/// stream under `/cast/{token}/hls/`. Nothing else.
 pub(crate) fn router() -> Router<AppState> {
-    Router::new().route("/cast/{token}", get(cast_get).head(cast_head))
+    Router::new()
+        .route("/cast/{token}", get(cast_get).head(cast_head))
+        .route("/cast/{token}/hls/{file}", get(hls_get).head(hls_head))
+}
+
+async fn hls_get(
+    State(state): State<AppState>,
+    Path((token, file)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    serve_hls(&state, &token, &file, &headers, true).await
+}
+
+async fn hls_head(
+    State(state): State<AppState>,
+    Path((token, file)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    serve_hls(&state, &token, &file, &headers, false).await
+}
+
+/// What a rendition answers when it has no bytes for the request: `404`
+/// past the end, `503` with `{refused, message}` once it has failed or
+/// while it is being cut -- never a clean empty body a receiver would read
+/// as the film being over.
+fn not_served(reason: NotServed) -> Response {
+    match reason {
+        NotServed::NotFound => StatusCode::NOT_FOUND.into_response(),
+        NotServed::Failed(message) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "refused": "renditionFailed", "message": message })),
+        )
+            .into_response(),
+        NotServed::Cut => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "refused": "unpublished",
+                "message": "the cast was unpublished",
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// One file of a rendition's HLS stream: the playlist, the init segment or
+/// a media segment, whole and in memory, framed by `MediaRange`.
+async fn serve_hls(
+    state: &AppState,
+    token: &str,
+    file: &str,
+    headers: &HeaderMap,
+    body: bool,
+) -> Response {
+    let Some(publication) = state.lan_media.casts().get(token) else {
+        tracing::info!("cast request for a token that is not published");
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(rendition) = publication.rendition.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let (bytes, content_type, media) = if file == "index.m3u8" {
+        (
+            Ok(rendition.playlist()),
+            "application/vnd.apple.mpegurl",
+            false,
+        )
+    } else if file == "init.mp4" {
+        (rendition.init(state).await, "video/mp4", true)
+    } else if let Some(segment) = file
+        .strip_suffix(".m4s")
+        .and_then(|number| number.parse::<u64>().ok())
+    {
+        (rendition.segment(state, segment).await, "video/mp4", true)
+    } else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let bytes = match bytes {
+        Ok(bytes) => bytes,
+        Err(reason) => return not_served(reason),
+    };
+    let size = bytes.len() as u64;
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok());
+    let Some(framing) = util::MediaRange::of(range, size) else {
+        return util::range_not_satisfiable(size);
+    };
+    let mut res_headers = HeaderMap::new();
+    res_headers.insert(
+        header::CONTENT_TYPE,
+        content_type.parse().expect("a MIME type"),
+    );
+    framing.write_headers(size, &mut res_headers);
+    if !body {
+        return (framing.status(), res_headers, Body::empty()).into_response();
+    }
+    let length = framing.content_length(size);
+    let slice = if size == 0 {
+        Bytes::new()
+    } else {
+        bytes.slice(framing.start as usize..=framing.end as usize)
+    };
+    if media {
+        state.lan_media.record_body();
+    }
+    let chunks = futures_util::stream::iter(
+        slice
+            .chunks(64 * 1024)
+            .map(|chunk| Ok(slice.slice_ref(chunk)))
+            .collect::<Vec<std::io::Result<Bytes>>>(),
+    );
+    let body = CastBody {
+        chunks: Box::pin(chunks),
+        cut: Box::pin(publication.cut.clone().cancelled_owned()),
+        ended: false,
+        cut_seen: false,
+        delivered: 0,
+        length,
+        kind: "rendition",
+        _held: Box::new(()),
+    };
+    (framing.status(), res_headers, Body::from_stream(body)).into_response()
 }
 
 async fn cast_get(
@@ -301,7 +511,7 @@ async fn serve(state: &AppState, token: &str, headers: &HeaderMap, body: bool) -
         delivered: 0,
         length,
         kind: source.kind(),
-        _held: (source, entry),
+        _held: Box::new((source, entry)),
     };
     (framing.status(), res_headers, Body::from_stream(body)).into_response()
 }
@@ -314,7 +524,8 @@ type Chunks = Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>;
 /// connection, and the receiver reads a broken source rather than a file
 /// that ended early (`proxy_streams::ClosableStream`'s rule, for the same
 /// reason). It holds the source and the id's lease for as long as it is
-/// read; dropped, the source's stream ends.
+/// read (nothing, for a rendition's file, which is bytes in memory);
+/// dropped, the source's stream ends.
 struct CastBody {
     chunks: Chunks,
     cut: Pin<Box<WaitForCancellationFutureOwned>>,
@@ -323,7 +534,7 @@ struct CastBody {
     delivered: u64,
     length: u64,
     kind: &'static str,
-    _held: (crate::media::reader::Source, Lease<Entry>),
+    _held: Box<dyn Send>,
 }
 
 impl Stream for CastBody {

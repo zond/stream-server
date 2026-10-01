@@ -12,6 +12,11 @@
 
 use std::io::Read;
 
+/// The rendition producer the renditions tests drive, for a rendition
+/// token's requests here.
+#[path = "support/test_producer.rs"]
+mod test_producer;
+
 /// A string that appears nowhere but in the URLs this test sends.
 const SECRET: &str = "s3cr3t-token-do-not-log";
 
@@ -163,6 +168,52 @@ fn a_caller_supplied_url_is_logged_as_its_origin_only() -> anyhow::Result<()> {
         reqwest::StatusCode::NOT_FOUND
     );
 
+    // A rendition's token, under its `hls/` paths: the playlist, the init
+    // segment and a segment produced for it, a `HEAD`, one past the end,
+    // and the same after the unpublish.
+    let film = dir.path().join("film.mkv");
+    std::fs::write(&film, vec![7u8; 64 * 1024])?;
+    let local = handle.register(stream_server::MediaSpec::Local {
+        file: stream_server::LocalFile::Path(film),
+        name: None,
+    })?;
+    handle.install_producer(test_producer::TestProducer::new(
+        test_producer::Knobs::default(),
+    ));
+    let rendition = handle.publish_rendition(
+        &local,
+        stream_server::RenditionSpec {
+            duration_ms: 20_000,
+            segment_ms: 1000,
+            start_ms: 0,
+            video: stream_server::VideoPlan::Copy,
+            audio: stream_server::AudioPlan::Copy,
+            audio_track: 0,
+        },
+        None,
+    )?;
+    let hls = format!("http://{lan}/cast/{}/hls", rendition.as_str());
+    for file in ["index.m3u8", "init.mp4", "0.m4s"] {
+        assert_eq!(
+            client.get(format!("{hls}/{file}")).send()?.status(),
+            reqwest::StatusCode::OK,
+            "{file}"
+        );
+    }
+    assert_eq!(
+        client.head(format!("{hls}/1.m4s")).send()?.status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        client.get(format!("{hls}/20.m4s")).send()?.status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    assert!(handle.unpublish(&rendition));
+    assert_eq!(
+        client.get(format!("{hls}/2.m4s")).send()?.status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+
     // An archive create, whose download is logged at INFO and whose failure
     // at ERROR.
     let response = client
@@ -192,7 +243,11 @@ fn a_caller_supplied_url_is_logged_as_its_origin_only() -> anyhow::Result<()> {
         logs.contains("\"path\":\"/cast\""),
         "and the LAN request span names the cast route: {logs}"
     );
-    for token in [token.as_str(), unknown] {
+    assert!(
+        logs.contains("rendition_run_start"),
+        "the rendition's run was logged at all: {logs}"
+    );
+    for token in [token.as_str(), rendition.as_str(), unknown] {
         assert!(
             !logs.contains(token),
             "a cast token reached the log files: {}",

@@ -1,6 +1,6 @@
 # Renditions: a cast the receiver can decode, produced on demand, nothing on disk
 
-Design, 2026-10-01. **Proposed; nothing here is built yet.** This is step F
+Design, 2026-10-01. **F1 (the server side) is built; F0 and F2-F5 are not.** This is step F
 of `docs/design/media-pipeline.md` (§2.10 fixed what it must not break;
 this note is the design that section asked for). Written against
 stream-server `410a1e2`, xtremio `c9cc260`, flutter_chrome_cast 1.4.8 and
@@ -602,6 +602,66 @@ F1. **Server: the rendition route, the muxer, the ring, the trait, with a
    `206` with the right `Content-Range`; no token in any log line. A
    by-hand check, not CI: `ffprobe` and a desktop Shaka player over the
    test producer's output, which proves the boxes decode-side.
+   *(Done: `server/src/rendition/` -- `mod.rs` (the types, the
+   `Rendition` with its ring and request rules), `run.rs` (the run task
+   and the `Cutter`), `mux.rs` (the fMP4 boxes, `avcC`/`hvcC`/`esds`,
+   Annex-B to length-prefixed), `speed.rs` (the wait clocks and the
+   window); the three routes in `cast.rs`; `ServerHandle::{install_producer,
+   publish_rendition, rendition_state}`; `server/tests/renditions.rs` with
+   the test producer in `server/tests/support/test_producer.rs`, and the
+   rendition token in `log_redaction.rs`. By hand: `ffprobe` over an
+   `init.mp4` and six segments concatenated reads an `avc1` H.264 High
+   320x240 stream at 90 kHz and an `mp4a` AAC-LC 48 kHz stereo stream,
+   156 video packets (6.24 s, keys every 0.48 s, `K` flags where the
+   producer set them) and 282 audio packets (6.016 s), and the playlist as
+   a 30 s HLS input; its only complaints are about the fake slice payloads.
+   No Shaka or Cast receiver has played it. Where the code differs from
+   the sections above:*
+   * *`rendition_state` answers a `RenditionState` -- `producing`,
+     `idle`, `failed {sentence}`, `ended` (not published, or not a
+     rendition) -- not an `Option` of a struct with `segmentsServed` and
+     `speed`; those were not built.*
+   * *A rendition's token also serves the source as it is at
+     `/cast/{token}` (the step's brief, over §3's "a token names one or the
+     other"); a plain token's `hls/` is `404` as §3 says.*
+   * *`TrackFormat` is an enum: `H264 {width, height, csd0, csd1}`,
+     `Hevc {width, height, csd0}`, `Aac {sample_rate, channels, csd0}`,
+     each `csd` as `MediaFormat` carries it (Annex-B parameter sets, the
+     AudioSpecificConfig). A producer reports every track's format before
+     its first sample: the formats are taken as they stand then.
+     `Producer::start` answers a `ProducerRefusal(sentence)`, which fails
+     the rendition with it.*
+   * *Audio is assigned on the N x T grid, as 2.1 says; a segment is
+     complete once video has passed its cut and audio has reached
+     (N+1) x T, or at the source's end. What precedes a run's first cut is
+     never emitted: a run's output starts at its own segment. A segment
+     with no samples at all (a GOP longer than T with no audio) is a
+     `styp`, a `moof` with only its `mfhd`, and an empty `mdat`.*
+   * *Clocks: video on 90 kHz, audio on its sample rate, `mvhd` in ms,
+     the duration in `mehd`. A segment's decode times are its presentation
+     times sorted (2.2's reorder window is the segment). AUDs are dropped
+     from samples; a sample with no start code is taken as length-prefixed
+     already.*
+   * *The lookahead: a run completes at most L segments past the last
+     request (or stops at the 96 MiB cap), then stops reading its sink,
+     whose channel holds 32 samples; the producer blocks once that fills.
+     The ring keeps `[last request - 2, last request + 2]`.*
+   * *Speed: media time is measured at the sink as samples are written,
+     busy time is the run's wall time less the time the producer spent
+     blocked in the sink and in the reader (both timed on the producer's
+     thread), checked every tenth of the window. A producer that reads on
+     one thread while another blocks in the sink would have overlapping
+     waits subtracted twice; Android's producer is to keep reads and
+     writes on one thread, or this changes.*
+   * *Cut: a request waiting on a segment is woken through the run (its
+     stop is a child of the cut, and every run's end wakes the waiters)
+     and answered `503` `{refused: "unpublished"}`; a failed rendition is
+     `503` `{refused: "renditionFailed", message}`. `init.mp4` and segment
+     `GET`s count as bodies; the playlist does not.*
+   * *`set_rendition_tuning` and `rendition_probe` (doc-hidden) make the
+     release period and the speed window settable and the ring observable
+     for the tests; `SampleSink::probe` shows whether the producer is
+     blocked in it.*
 
 F1½. **A one-hour spike on zond's phone, before F2 is written**: does
    `MediaExtractor` over a `MediaDataSource` expose DTS and TrueHD audio

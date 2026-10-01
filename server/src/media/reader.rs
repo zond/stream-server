@@ -113,6 +113,10 @@ impl Source {
 struct Shown {
     waiting: AtomicBool,
     opened_with: std::sync::Mutex<Option<BufferProfile>>,
+    /// The time the foreign side has spent blocked in a read or a seek:
+    /// how long the source kept a rendition's producer
+    /// (`crate::rendition::speed`), which its speed leaves out.
+    waits: Arc<crate::rendition::WaitClock>,
 }
 
 /// A blocking reader over a registered id: what mpv's `stream_cb` and a
@@ -180,7 +184,7 @@ impl MediaReader {
             max: buf.len(),
             reply,
         })?;
-        let bytes = Self::wait(answer)??;
+        let bytes = self.timed(answer)??;
         buf[..bytes.len()].copy_from_slice(&bytes);
         Ok(bytes.len())
     }
@@ -191,7 +195,7 @@ impl MediaReader {
     pub fn seek(&mut self, offset: u64) -> io::Result<u64> {
         let (reply, answer) = oneshot::channel();
         self.send(Command::Seek { offset, reply })?;
-        Self::wait(answer)?
+        self.timed(answer)?
     }
 
     /// Cancel the call in flight and every later one. Does not block.
@@ -252,6 +256,20 @@ impl MediaReader {
 
     fn wait<T>(answer: oneshot::Receiver<T>) -> io::Result<T> {
         answer.blocking_recv().map_err(|_| gone())
+    }
+
+    /// [`Self::wait`], with the time spent in it on the reader's wait clock.
+    fn timed<T>(&self, answer: oneshot::Receiver<T>) -> io::Result<T> {
+        self.shown.waits.enter(std::time::Instant::now());
+        let answered = Self::wait(answer);
+        self.shown.waits.leave(std::time::Instant::now());
+        answered
+    }
+
+    /// The time this reader's caller has spent blocked in it, for a
+    /// rendition's speed (`crate::rendition::speed`).
+    pub(crate) fn waits(&self) -> Arc<crate::rendition::WaitClock> {
+        self.shown.waits.clone()
     }
 }
 

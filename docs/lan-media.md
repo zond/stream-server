@@ -13,7 +13,7 @@ tokens and nothing else**.
 
 | | |
 |---|---|
-| **What it exposes** | One route, `GET`/`HEAD` `/cast/{token}` ([`server/src/cast.rs`](../server/src/cast.rs)). The app publishes a media id for a cast (`ServerHandle::publish(&MediaId, Option<PlayToken>) -> CastToken`) and hands the receiver `<lan_media_base_url>/cast/<token>`; the route serves what the id resolves to -- a torrent file, a link through `/proxy`'s cache, a Google Drive file, a finished download, a member of an archive -- with the range framing every media route shares (`200`/`206`/`416`, `Content-Range`, `HEAD`, the DLNA headers). An unknown token is a `404`. A link whose origin will not serve ranges is refused (`501`, `{"refused":"noRanges"}`): nothing here can seek it for a receiver |
+| **What it exposes** | `GET`/`HEAD` `/cast/{token}` ([`server/src/cast.rs`](../server/src/cast.rs)), and for a rendition its HLS stream under `/cast/{token}/hls/` ([Renditions](#renditions)). The app publishes a media id for a cast (`ServerHandle::publish(&MediaId, Option<PlayToken>) -> CastToken`) and hands the receiver `<lan_media_base_url>/cast/<token>`; the route serves what the id resolves to -- a torrent file, a link through `/proxy`'s cache, a Google Drive file, a finished download, a member of an archive -- with the range framing every media route shares (`200`/`206`/`416`, `Content-Range`, `HEAD`, the DLNA headers). An unknown token is a `404`. A link whose origin will not serve ranges is refused (`501`, `{"refused":"noRanges"}`): nothing here can seek it for a receiver |
 | **What it does not** | Every other path is a `404`, every method: the control router is **not mounted at all** (a control path answers `404`, never the `401` that would confirm the route exists and only a bearer token is missing), and neither is any loopback media route -- not the torrent routes, the archive routes, `/proxy`, `/ftp`, `/drive/stream`, `/downloads/{key}/stream` or `/local-addon` |
 | **Where it binds** | `ServerConfig::lan_media_addr: Option<SocketAddr>` -- `None` by default, so nothing changes unless an embedder asks for it. `Some(0.0.0.0:0)` lets the OS pick the port |
 | **When it runs** | `ServerHandle::set_lan_media(true)` starts it, `set_lan_media(false)` stops it -- meant to bracket a cast session, so the LAN surface exists only while something is casting. Nothing is bound at startup, whatever the configuration: a port already in use fails the cast that asked for the listener, never the server |
@@ -48,6 +48,41 @@ live in memory only.
   every request line and span (`routes::util::log_path`, beside `/proxy`
   and `/ftp`), and `CastToken`'s `Debug` prints no token: a token in a log
   file is a URL into this device for as long as it is published.
+
+## Renditions
+
+A cast the receiver cannot decode as it is -- an MKV, surround sound over
+Bluetooth, HEVC to a receiver without it -- is cast as a **rendition**: an
+HLS stream produced on demand by the embedder's producer and muxed here,
+nothing on disk ([design/renditions.md](design/renditions.md)).
+`ServerHandle::publish_rendition(&MediaId, RenditionSpec, Option<PlayToken>)`
+publishes one under a token with every rule above (random, memory only, a
+lease on the id, cut by `unpublish` and the listener's stop, never logged);
+it is refused with `noProducer` until the embedder has called
+`install_producer`. The receiver is handed
+`<lan_media_base_url>/cast/<token>/hls/index.m3u8`.
+
+| Path | Answers |
+|---|---|
+| `GET`/`HEAD /cast/{token}/hls/index.m3u8` | The playlist, `application/vnd.apple.mpegurl`: VOD, `#EXT-X-MAP` naming `init.mp4`, `ceil(duration / T)` entries `0.m4s`, `1.m4s`, ... (relative, so it names no host), `#EXT-X-ENDLIST`. Written at publish; never waits |
+| `GET`/`HEAD /cast/{token}/hls/init.mp4` | The init segment (`ftyp` + `moov`), `video/mp4`. Waits for the first run's track formats, starting that run at the spec's `startMs` if none is live |
+| `GET`/`HEAD /cast/{token}/hls/{n}.m4s` | Segment `n` (`styp` + `moof` + `mdat`), `video/mp4`, whole and in memory, ranged like any file (`206` and `Content-Range` for a `Range`). Waits while it is produced; `404` past the last segment; `503` `{"refused":"renditionFailed","message":...}` once the rendition has failed, and `503` `{"refused":"unpublished"}` for a request the unpublish woke |
+
+A plain token has no `hls/` (`404`); a rendition's token serves its
+`hls/` and, like a plain one, the source as it is at `/cast/{token}`. A
+`GET` of `init.mp4` or a segment counts as a body
+(`lan_media_bodies_served`); the playlist does not. Segment `n` is cut at
+the first video sync sample at or after `n x T` and holds the audio whose
+time falls in `[n x T, (n+1) x T)`. Production runs at most two segments
+past the last request and then waits; a request far from where the run is
+-- behind what is kept, or more than two past what is being made -- is a
+seek, which starts a new run there. A run nobody has asked anything of for
+a minute is let go (the segments made are kept). A run that makes less than
+its own time in film over ten seconds of its own work -- leaving out the
+time it waited for the receiver and for the source -- fails the rendition
+with a sentence, which `ServerHandle::rendition_state(&CastToken)` reports
+(`{"state":"failed","sentence":...}`; otherwise `producing`, `idle`, or
+`ended` for a token not published).
 
 `ServerHandle::lan_media_base_url(for_peer)` builds the URL to hand a receiver:
 the host is the local interface that shares `for_peer`'s subnet, taken from the

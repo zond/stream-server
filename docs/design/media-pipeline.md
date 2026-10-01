@@ -848,7 +848,13 @@ E. **The sniff in `resolve`.** (S; M more for explicit volume lists on URL
    link and Drive sets is not done.)*
 
 F. **Renditions.** (Server route M; Kotlin producer L.) Its own design note
-   first (2.10).
+   first (2.10): `docs/design/renditions.md`, whose §5 splits it into
+   F0-F5. *(F1, the server side, done: `server/src/rendition/`
+   (`Producer`, `Job`, `SampleSink`, the run task, the cut rule, the ring,
+   speed, the fMP4 muxer), the three `hls/` routes in `cast.rs`,
+   `ServerHandle::{install_producer, publish_rendition, rendition_state}`,
+   `server/tests/renditions.rs` with a Rust test producer. The Kotlin
+   producer (F2-F4) and the app's half (F0, F5) are not.)*
 
 ## 6. Decisions taken here, for zond to overrule
 
