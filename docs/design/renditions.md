@@ -1,6 +1,6 @@
 # Renditions: a cast the receiver can decode, produced on demand, nothing on disk
 
-Design, 2026-10-01. **F1 (the server side) is built; F0 and F2-F5 are not.** This is step F
+Design, 2026-10-01. **F1 (the server side) is built, F0 landed in the app, F1½ answered (libavformat); F2-F5 are not.** This is step F
 of `docs/design/media-pipeline.md` (§2.10 fixed what it must not break;
 this note is the design that section asked for). Written against
 stream-server `410a1e2`, xtremio `c9cc260`, flutter_chrome_cast 1.4.8 and
@@ -671,6 +671,21 @@ F1½. **A one-hour spike on zond's phone, before F2 is written**: does
    from `libmpv.so` reading the same `MediaReader` through
    `avio_alloc_context`) before anything is built on it. (zond, over
    "decide after F2".)
+   *(Done 2026-10-01 on zond's phone -- motorola edge 60 pro, Android 16,
+   API 36 -- with a throwaway app reading through a `MediaDataSource`.
+   The answer is **libavformat**. MediaExtractor's Matroska extractor
+   drops every Dolby and DTS audio track ("A_DTS / A_TRUEHD / A_AC3 /
+   A_EAC3 is not supported"): a five-track MKV came back as its video
+   alone, although the phone HAS Dolby AC3/E-AC3 decoders -- so "a
+   decoder exists" and "the extractor exposes the track" are separate
+   facts. There is no AVI extractor at all ("Failed to instantiate
+   extractor"). H.264/HEVC samples do come out in Annex-B with csd in
+   Annex-B (HEVC: csd-0 only, VPS+SPS+PPS+SEI), times are PTS in decode
+   order. Decoders on the phone: AC3/E-AC3 (c2.dolby.*), none for DTS or
+   TrueHD; encoders for AAC, AVC, HEVC. So F2 demuxes with libavformat
+   (Annex-B via the `*_mp4toannexb` bitstream filters, or length-prefixed
+   samples the muxer already accepts), MediaCodec stays for decode where a
+   decoder exists and for every encode, libavcodec for DTS/TrueHD.)*
 
 F2. **Kotlin producer, repackage only, end to end on the phone** (M). The
    JNI exports (`awaitJob`, `readAt`, `size`, `format`, `sample`, `end`,
