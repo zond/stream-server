@@ -309,7 +309,7 @@ so a reader holding the handle would hold up the stop for as long as mpv
 held the stream. The task holds the pieces of `AppState` it needs and the
 runtime `Handle`, as `translators::IndexReader` (the precedent for a blocking
 reader over a `ByteSource`) and `ServerHandle::block_on_server`
-(`lib.rs:1097`) do.
+(`lib.rs`) do.
 
 **When the runtime shuts down**, its tasks are dropped: the reader goes
 with its task, the reply sender with it, and the foreign `blocking_recv`
