@@ -67,6 +67,15 @@ it is refused with `noProducer` until the embedder has called
 | `GET /cast/{token}/stream.mp4[?from=<ms>]` | `200`, `video/mp4`, `Cache-Control: no-store`, **no `Content-Length` and no `Accept-Ranges`**: the init segment (`ftyp` + `moov`), then segment after segment (`styp` + `moof` + `mdat`), from the one `from` falls in (the spec's `startMs` without it) to the film's end, each sent as it is made, the next asked for as the receiver takes the last. A `Range` header is not read. Waits for the first segment and the init segment before it answers, so a rendition that cannot start is `503` `{"refused":"renditionFailed","message":...}` (or `{"refused":"unpublished"}` for one the unpublish woke); after that, a failure or the cut breaks the body with an error, and only the film's end is a clean end. Nothing times it out |
 | `HEAD /cast/{token}/stream.mp4` | The same headers, at once; starts nothing |
 
+The init segment carries the film's length (`mvhd`, `tkhd`, and each
+track's `mdhd` on its own clock, which is the one a receiver's demuxer
+reads), so the receiver knows it from the first byte. A receiver cannot
+seek in the stream: asked to, it fetches the stream again from its start.
+That is a **restart** -- a fetch from a start an earlier fetch from the
+same start had sent three segments of -- and is counted
+(`ServerHandle::rendition_restarts(&CastToken)`), so the app can load the
+stream again where the receiver was.
+
 A plain token has no `stream.mp4` (`404`); a rendition's token serves it
 and, like a plain one, the source as it is at `/cast/{token}`. A stream's
 `GET` counts as one body (`lan_media_bodies_served`). **A seek is a new

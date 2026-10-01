@@ -1040,6 +1040,74 @@ fn a_stream_from_a_time_starts_at_its_segment() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Reads `response` until `moofs` segments have come, and answers what came.
+fn read_segments(response: &mut reqwest::blocking::Response, moofs: usize) -> Vec<u8> {
+    let mut seen = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while seen.windows(4).filter(|window| window == b"moof").count() < moofs {
+        let n = std::io::Read::read(response, &mut chunk).expect("the stream goes on");
+        assert!(n > 0, "the stream ended early");
+        seen.extend_from_slice(&chunk[..n]);
+    }
+    seen
+}
+
+/// **A receiver that fetches the stream again from a start it has played
+/// past is restarting it** -- what a receiver that cannot seek in the
+/// stream does with a seek -- and the restarts are counted for the app. A
+/// receiver's first fetches at a load (two in a row, the first let go at
+/// once) and a stream from a new start (the app's own reload) are not.
+#[test]
+fn a_stream_fetched_again_from_where_it_was_played_is_a_restart() -> anyhow::Result<()> {
+    let fixture = Fixture::start(
+        Knobs {
+            speed: Some(1.5),
+            ..Knobs::default()
+        },
+        RenditionTuning {
+            speed_window: Duration::from_secs(3600),
+            idle_release: Duration::from_secs(3600),
+        },
+    )?;
+    let token = fixture.publish(60_000, 0)?;
+    // The load: a fetch the receiver lets go of after the first bytes, and
+    // the one it plays.
+    let mut sniff = fixture.stream(&token, None);
+    let mut first = [0u8; 8];
+    std::io::Read::read_exact(&mut sniff, &mut first)?;
+    drop(sniff);
+    let mut playing = fixture.stream(&token, None);
+    read_segments(
+        &mut playing,
+        stream_server::rendition::RESTART_AFTER as usize + 1,
+    );
+    assert_eq!(
+        fixture.handle.rendition_restarts(&token),
+        0,
+        "a load is no restart"
+    );
+
+    // The remote's seek: the stream again from its start.
+    drop(playing);
+    let mut again = fixture.stream(&token, None);
+    assert_eq!(again.status(), reqwest::StatusCode::OK);
+    read_segments(&mut again, 1);
+    assert_eq!(fixture.handle.rendition_restarts(&token), 1);
+    drop(again);
+
+    // The app's reload: a stream from where the receiver was.
+    let mut reload = fixture.stream(&token, Some(12_345));
+    read_segments(&mut reload, 1);
+    assert_eq!(
+        fixture.handle.rendition_restarts(&token),
+        1,
+        "a new start is no restart"
+    );
+    let plain = fixture.handle.publish(&fixture.id, None)?;
+    assert_eq!(fixture.handle.rendition_restarts(&plain), 0);
+    Ok(())
+}
+
 /// **A `HEAD` answers the stream's headers and starts nothing.**
 #[test]
 fn a_head_of_the_stream_starts_no_run() -> anyhow::Result<()> {

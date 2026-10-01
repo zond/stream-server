@@ -76,6 +76,9 @@ pub const RING_CAP: usize = 96 * 1024 * 1024;
 pub const IDLE_RELEASE: Duration = Duration::from_secs(60);
 /// The busy time a run's speed is judged over.
 pub const SPEED_WINDOW: Duration = Duration::from_secs(10);
+/// Segments a stream from a start must have sent before another `GET` from
+/// that same start counts as a restart ([`Rendition::stream_begins`]).
+pub const RESTART_AFTER: u64 = 3;
 /// Samples in flight between a producer and its run.
 const SINK_CAPACITY: usize = 32;
 
@@ -471,6 +474,16 @@ pub(crate) struct Rendition {
     inner: Mutex<Inner>,
     /// Bumped on every change a request or a run may be waiting for.
     version: watch::Sender<u64>,
+    /// The streams asked for, by start: what makes a restart.
+    streams: Mutex<Streams>,
+}
+
+/// The streams of one rendition: for each start (`from`, ms) the most
+/// segments any stream from it has sent, and how many restarts there were.
+#[derive(Default)]
+struct Streams {
+    sent_from: std::collections::HashMap<u64, u64>,
+    restarts: u64,
 }
 
 impl Rendition {
@@ -512,7 +525,52 @@ impl Rendition {
                 runs_started: 0,
             }),
             version: watch::channel(0).0,
+            streams: Mutex::new(Streams::default()),
         })
+    }
+
+    fn streams(&self) -> std::sync::MutexGuard<'_, Streams> {
+        self.streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Where a stream asked to start at `from_ms` starts: there, or the
+    /// spec's start when it names none.
+    pub(crate) fn stream_start_ms(&self, from_ms: Option<u64>) -> u64 {
+        from_ms.unwrap_or(self.spec.start_ms)
+    }
+
+    /// **A stream from `start_ms` begins**: whether it is a *restart*, which
+    /// is counted. A receiver that cannot seek in a stream (it offers no
+    /// ranges) answers a seek by fetching it again from its start and
+    /// playing from there; a restart is that -- a stream from a start some
+    /// earlier stream from the same start had already sent
+    /// [`RESTART_AFTER`] segments of. A receiver's first fetches, which may
+    /// be several in a row at a load, have sent nothing yet; a new start (the
+    /// app loading the stream from somewhere else) has no history.
+    pub(crate) fn stream_begins(&self, start_ms: u64) -> bool {
+        let mut streams = self.streams();
+        let restart = streams
+            .sent_from
+            .get(&start_ms)
+            .is_some_and(|sent| *sent >= RESTART_AFTER);
+        if restart {
+            streams.restarts += 1;
+        }
+        restart
+    }
+
+    /// A stream from `start_ms` has sent `segments` segments.
+    pub(crate) fn stream_sent(&self, start_ms: u64, segments: u64) {
+        let mut streams = self.streams();
+        let sent = streams.sent_from.entry(start_ms).or_default();
+        *sent = (*sent).max(segments);
+    }
+
+    /// How many restarts there were ([`Self::stream_begins`]).
+    pub(crate) fn restarts(&self) -> u64 {
+        self.streams().restarts
     }
 
     fn inner(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -535,11 +593,10 @@ impl Rendition {
         self.count
     }
 
-    /// The segment a stream asked to start at `from_ms` begins with -- the
-    /// spec's start when it names none -- held inside the film.
-    pub(crate) fn first_segment(&self, from_ms: Option<u64>) -> u64 {
-        let from = from_ms.unwrap_or(self.spec.start_ms);
-        (from / u64::from(self.spec.segment_ms)).min(self.count - 1)
+    /// The segment a stream starting at `start_ms` begins with, held inside
+    /// the film.
+    pub(crate) fn first_segment(&self, start_ms: u64) -> u64 {
+        (start_ms / u64::from(self.spec.segment_ms)).min(self.count - 1)
     }
 
     pub(crate) fn state(&self) -> RenditionState {

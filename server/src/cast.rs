@@ -383,7 +383,18 @@ async fn serve_stream(state: &AppState, token: &str, from: Option<u64>, body: bo
     if !body {
         return (StatusCode::OK, res_headers, Body::empty()).into_response();
     }
-    let first = rendition.first_segment(from);
+    let start_ms = rendition.stream_start_ms(from);
+    if rendition.stream_begins(start_ms) {
+        // The receiver could not seek in the stream and is playing it again
+        // from its start; the app is told (`rendition_restarts`) and puts it
+        // back where it was. Logged without the token.
+        tracing::info!(
+            restarts = rendition.restarts(),
+            stage = "rendition_stream_restart",
+            "a receiver fetched a rendition's stream again from its start"
+        );
+    }
+    let first = rendition.first_segment(start_ms);
     // The first segment starts the run there (or joins one), and the init
     // segment is frozen by the time it is out; either failing is the one
     // answer, since a failure fails the whole rendition.
@@ -396,6 +407,7 @@ async fn serve_stream(state: &AppState, token: &str, from: Option<u64>, body: bo
         Err(reason) => return not_served(reason),
     };
     state.lan_media.record_body();
+    rendition.stream_sent(start_ms, 1);
     let count = rendition.count();
     let later = {
         let state = state.clone();
@@ -406,7 +418,10 @@ async fn serve_stream(state: &AppState, token: &str, from: Option<u64>, body: bo
             async move {
                 let segment = next.filter(|segment| *segment < count)?;
                 match rendition.segment(&state, segment).await {
-                    Ok(bytes) => Some((Ok(bytes), Some(segment + 1))),
+                    Ok(bytes) => {
+                        rendition.stream_sent(start_ms, segment - first + 1);
+                        Some((Ok(bytes), Some(segment + 1)))
+                    }
                     // Past the film's end, as a run that reached it found.
                     Err(NotServed::NotFound) => None,
                     Err(NotServed::Failed(sentence)) => {

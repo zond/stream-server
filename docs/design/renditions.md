@@ -24,7 +24,27 @@ Design, 2026-10-01. **F1 (the server side) is built, F0 landed in the app, F1½ 
 > `currentTime` 12, `seekable` is empty, the duration grows as fragments
 > arrive). Where the sections below say playlist, `#EXTINF`,
 > `index.m3u8` or "a request for segment N", read the stream and the
-> segment it asks for next. This is step F
+> segment it asks for next.
+>
+> **Seeking, measured on the TV (2026-10-01) and decided (zond): seeks are
+> the phone's.** With the film's length in the init segment (each track's
+> `mdhd`, which is where Chrome's MP4 demuxer -- ffmpeg's -- reads a
+> fragmented file's duration; `mvhd`/`mehd` alone left the receiver's
+> duration at what had arrived), the receiver shows the whole film. A seek
+> on the receiver -- a sender's SEEK or the TV remote -- cannot be made in a
+> stream with no ranges: the receiver fetches the stream again from its
+> start (`Range: bytes=0-`) and plays from there, and the target never
+> appears in its status. A new LOAD of `stream.mp4?from=<ms>` with
+> `currentTime` there plays from the target within three seconds. So the
+> app seeks by reloading at the target, and a receiver seek is made
+> harmless: the server counts a **restart** -- a fetch of the stream from a
+> start some earlier fetch from the same start had already sent
+> `RESTART_AFTER` (3) segments of; a receiver's first fetches at a load, two
+> in a row at times, and a stream from a new start are not --
+> `ServerHandle::rendition_restarts`, and the app, seeing the count move,
+> loads the stream again where the receiver was. The stream stays
+> `BUFFERED` (no LIVE marking): the TV keeps its seek bar and the film's
+> length. This is step F
 of `docs/design/media-pipeline.md` (§2.10 fixed what it must not break;
 this note is the design that section asked for). Written against
 stream-server `410a1e2`, xtremio `c9cc260`, flutter_chrome_cast 1.4.8 and

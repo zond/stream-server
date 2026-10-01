@@ -1469,6 +1469,22 @@ impl ServerHandle {
         self.state.lan_media.casts().rendition_state(token)
     }
 
+    /// **How many times a receiver restarted a rendition's stream**: fetched
+    /// it again from a start it had already played well past -- what a
+    /// receiver that cannot seek in the stream (it offers no ranges) does
+    /// when the viewer seeks with its remote, and what a network blip may
+    /// make it do. The receiver then plays from that start; the app,
+    /// watching this count, loads the stream again where the receiver was.
+    /// A receiver's first fetches at a load, and a stream from a new start,
+    /// are not restarts. `0` for a token that is not a rendition. Cheap.
+    pub fn rendition_restarts(&self, token: &CastToken) -> u64 {
+        self.state
+            .lan_media
+            .casts()
+            .rendition(token)
+            .map_or(0, |rendition| rendition.restarts())
+    }
+
     /// The durations renditions published from now on run by. For the
     /// tests: a release period or a speed window a test can wait out.
     #[doc(hidden)]
