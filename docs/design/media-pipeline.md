@@ -555,6 +555,17 @@ volume's stream takes a rate from it. The torrent-wide rules need nothing
 new: `announced_now`, `announced_in_swarm` and `reclaim_rest` read the
 advertised set, which holds the union.
 
+**A draw is made for a member** (review of `39a9105`/`1d0d109`, fixed on
+`review-fixes`). The draw records what it was made for -- the member's
+extent, or the set -- and counts as shared only while the sessions on its
+file play that (`DrawnFor`, `Engine::shares_now`). A move to another member
+of the same container, from the container played as itself to a member, or
+off a set onto one of its volumes is a move: the file is left
+(`PlaySessions::play`), `EndShares` ends the old draw and forgets it
+(`Retention::forget_draw_made_for`), and the next open draws the new
+member. Before, the same file meant "nothing left", and the second episode
+of a season in one ZIP shared the first's extent for the session's life.
+
 ### 2.9 The container sniff moves into `resolve`
 
 `resolve` reads the first `0x8006` bytes (`enginefs::retention::sniff::HEAD_BYTES`,

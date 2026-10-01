@@ -4,7 +4,7 @@ use crate::backend::{
 };
 use crate::piece_store::{HeldSnapshot, RetentionPolicy, Share, StoreRegistry};
 use crate::retention::live::{Live, Reading};
-use crate::retention::owner::{Backing, Door, Install, Mode, Retention, Trigger};
+use crate::retention::owner::{Backing, Door, DrawnFor, Install, Mode, Retention, Trigger};
 use anyhow::Context;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ops::Range;
@@ -2572,18 +2572,58 @@ impl<H: TorrentHandle> Engine<H> {
     /// ([`crate::retention::sessions::PlaySessions::covers`]). Nothing else:
     /// a file the viewer's player left shares nothing, whatever still reads
     /// it, and nothing while the pin set is unknown names a download.
+    ///
+    /// **A draw counts only for what it was made for** ([`DrawnFor`]): a
+    /// session on the file that plays another member of it, the file as
+    /// itself after a member, or one volume after the set shares nothing of
+    /// it -- a draw is made for a member, and a new member on the same file
+    /// is a move.
     async fn shares_now(&self) -> BTreeSet<u32> {
+        self.shares_now_and_stale().await.0
+    }
+
+    /// [`Self::shares_now`], and the draws of files a session still covers
+    /// that it counted out because they were made for something else: what
+    /// [`Self::advertise_afresh`] forgets once it has rebuilt the set
+    /// without them.
+    async fn shares_now_and_stale(&self) -> (BTreeSet<u32>, Vec<(usize, DrawnFor<usize>)>) {
         let mut shares: BTreeSet<u32> = BTreeSet::new();
         for span in pinned_spans(&self.handle, &self.pinned_files, None).await {
             shares.extend(span);
         }
-        let sessions = self.live.sessions();
-        for (file_idx, draw) in self.retention.draws() {
-            if sessions.covers(&self.info_hash, file_idx) {
+        let mut stale = Vec::new();
+        for (file_idx, draw, made_for) in self.retention.draws_for() {
+            if !self.covers(file_idx) {
+                continue;
+            }
+            if self.played_for(file_idx) == made_for {
                 shares.extend(draw);
+            } else {
+                stale.push((file_idx, made_for));
             }
         }
-        shares
+        (shares, stale)
+    }
+
+    /// Whether a viewer's session is on `file_idx` and shares it.
+    fn covers(&self, file_idx: usize) -> bool {
+        self.live.sessions().covers(&self.info_hash, file_idx)
+    }
+
+    /// What a draw of `file_idx` is made for now: the member the sessions
+    /// sharing it play, and the set it is a volume of
+    /// ([`Backing::played_member`], [`Backing::played_set`]).
+    fn played_for(&self, file_idx: usize) -> DrawnFor<usize> {
+        let sessions = self.live.sessions();
+        DrawnFor {
+            member: sessions.member_of(&self.info_hash, file_idx),
+            set: sessions.set_of(&self.info_hash, file_idx).map(|volumes| {
+                volumes
+                    .into_iter()
+                    .map(|volume| (volume.file_idx, volume.member))
+                    .collect()
+            }),
+        }
     }
 
     /// **A delete of `file_idx` asked while a read of that file is open**:
@@ -2661,16 +2701,17 @@ impl<H: TorrentHandle> Engine<H> {
         if !played {
             return true;
         }
-        // Played: only the draws the one player on the torrent left.
+        // Played: only the draws the one player on the torrent left -- the
+        // file, or the member of it the draw was made for.
         let left: BTreeSet<u32> = self
             .retention
-            .draws()
+            .draws_for()
             .into_iter()
-            .filter(|(file_idx, _)| {
-                !sessions.covers(&self.info_hash, *file_idx)
+            .filter(|(file_idx, _, made_for)| {
+                (!self.covers(*file_idx) || self.played_for(*file_idx) != *made_for)
                     && sessions.may_end_now(&self.info_hash, *file_idx)
             })
-            .flat_map(|(_, draw)| draw)
+            .flat_map(|(_, draw, _)| draw)
             .collect();
         unshared.iter().any(|piece| left.contains(piece))
     }
@@ -2726,12 +2767,20 @@ impl<H: TorrentHandle> Engine<H> {
             .set_pieces_advertised(0..u32::MAX, false)
             .await
             .context("clearing a stopped torrent's advertised set")?;
-        let shares = self.shares_now().await;
+        let (shares, stale) = self.shares_now_and_stale().await;
         for run in crate::retention::runs(&shares.into_iter().collect::<Vec<_>>()) {
             self.handle
                 .set_pieces_advertised(run, true)
                 .await
                 .context("advertising what a stopped torrent still shares")?;
+        }
+        // A draw made for what the session on its file no longer plays --
+        // another member of the same container -- is advertised no more:
+        // forgotten, so the next open or pass draws what is played now.
+        for (file_idx, made_for) in stale {
+            self.retention
+                .forget_draw_made_for(&file_idx, &made_for)
+                .await;
         }
         Ok(())
     }

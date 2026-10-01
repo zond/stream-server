@@ -16625,6 +16625,60 @@ mod tests {
         );
     }
 
+    /// **A move off a set onto one of its own volumes is a move**: the
+    /// union was drawn for the set, and the volume played as itself -- the
+    /// player's next screen naming the first volume's URL -- shares none of
+    /// it. The move ends the union as a move to another file would, and the
+    /// volume's own draw is the volume's to make afresh.
+    #[tokio::test]
+    async fn a_move_off_a_set_onto_one_of_its_volumes_ends_the_sets_draw() {
+        use crate::backend::priorities::{BufferProfile, Fetching};
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("film.part1.rar".into(), 1000),
+            ("film.part2.rar".into(), 1000),
+        ]);
+        counters.pieces_per_file.store(40, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(1_000_000));
+        enginefs.note_player(
+            PLAYER,
+            played_set(TEST_HASH, &[(0, 110..1000), (1, 50..640)]),
+        );
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        enginefs.focus_torrent(TEST_HASH).await;
+        let first = engine
+            .try_get_file_with_intent(0, 110, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("the first volume");
+        let union: Vec<u32> = (4..40).chain(42..66).collect();
+        assert_eq!(fake_advertises(&counters), union);
+        drop(first);
+
+        enginefs.note_player("tv.2", played(TEST_HASH, 0));
+        assert!(
+            engine.shares_to_end().await,
+            "the set's union is still shared under its first volume played as itself"
+        );
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        enginefs.focus_torrent(TEST_HASH).await;
+        assert_eq!(
+            counters.stop_torrent.load(Ordering::SeqCst),
+            1,
+            "the move did not end what the set shared"
+        );
+        assert_eq!(engine.handle.run_state(), RunState::Live);
+        assert!(
+            fake_advertises(&counters).is_empty(),
+            "the set's union is still announced: {:?}",
+            fake_advertises(&counters)
+        );
+        assert_eq!(
+            engine.retention.draw_of(&0),
+            None,
+            "the volume kept the set's draw, and will never draw its own"
+        );
+    }
+
     /// **A set's draw is sized from the member's whole length over the
     /// film's duration, and the duration gives no volume a rate of its
     /// own.** Pieces of 250 bytes, two volumes of 20 000 bytes, the member
@@ -17908,6 +17962,132 @@ mod tests {
             draw.iter().all(|piece| *piece < 20),
             "drawn outside the member: {draw:?}"
         );
+    }
+
+    /// **A move to another member of the same container is a move**: the
+    /// first member's draw was made for that member, so once the session is
+    /// on the second it is shared no more, the move ends it as a move to
+    /// another file would -- the torrent stopped, its advertised set made
+    /// again without it -- and the next open draws the second member.
+    /// A ZIP of two equal members, pieces of 25 bytes: the first member's
+    /// pieces are 0..20, the second's 20..40.
+    #[tokio::test]
+    async fn a_move_to_another_member_of_the_same_container_ends_the_first_members_draw() {
+        use crate::backend::priorities::{BufferProfile, Fetching};
+        let (enginefs, counters) = test_enginefs_with_files(vec![("season.zip".into(), 1000)]);
+        counters.pieces_per_file.store(40, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(1_000_000));
+        enginefs.note_player(PLAYER, played_member(TEST_HASH, 0, 0..500));
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        enginefs.focus_torrent(TEST_HASH).await;
+        let first = engine
+            .try_get_file_with_intent(0, 0, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("the first member's stream");
+        let first_member: std::collections::BTreeSet<u32> = (0..20).collect();
+        assert_eq!(engine.retention.draw_of(&0), Some(first_member.clone()));
+        assert_eq!(
+            fake_advertises(&counters),
+            first_member.iter().copied().collect::<Vec<_>>()
+        );
+        drop(first);
+
+        // The next episode: the second member, the viewer's next screen.
+        enginefs.note_player("tv.2", played_member(TEST_HASH, 0, 500..1000));
+        assert!(
+            engine.shares_to_end().await,
+            "the first member's draw is still shared under the second member"
+        );
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        enginefs.focus_torrent(TEST_HASH).await;
+        assert_eq!(
+            counters.stop_torrent.load(Ordering::SeqCst),
+            1,
+            "the move did not end what the first member shared"
+        );
+        assert_eq!(engine.handle.run_state(), RunState::Live);
+        let second = engine
+            .try_get_file_with_intent(0, 500, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("the second member's stream");
+        let second_member: std::collections::BTreeSet<u32> = (20..40).collect();
+        assert_eq!(
+            engine.retention.draw_of(&0),
+            Some(second_member.clone()),
+            "the second member did not draw its own extent"
+        );
+        assert_eq!(
+            fake_advertises(&counters),
+            second_member.iter().copied().collect::<Vec<_>>(),
+            "the torrent does not advertise the second member alone"
+        );
+        assert!(!engine.shares_to_end().await);
+        // An end of the first member's draw that comes late -- the second's
+        // recorded meanwhile -- forgets nothing it was not about.
+        engine
+            .retention
+            .forget_draw_made_for(
+                &0,
+                &crate::retention::owner::DrawnFor {
+                    member: Some(0..500),
+                    set: None,
+                },
+            )
+            .await;
+        assert_eq!(
+            engine.retention.draw_of(&0),
+            Some(second_member),
+            "a late end of the first member's draw forgot the second's"
+        );
+        drop(second);
+    }
+
+    /// **The container played as itself, then a member of it**: the file's
+    /// own play session found an archive and drew nothing, a draw made for
+    /// the file as itself. The member is a new film on the same file, and
+    /// an empty draw advertised nothing, so the member's open draws its
+    /// extent at once -- nothing to end first.
+    #[tokio::test]
+    async fn a_member_after_its_container_was_played_as_itself_draws_its_extent() {
+        use crate::backend::priorities::{BufferProfile, Fetching};
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.rar".into(), 1000)]);
+        counters.pieces_per_file.store(40, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(1_000_000));
+        let mut head = vec![0u8; 1000];
+        head[..7].copy_from_slice(b"Rar!\x1a\x07\x00");
+        counters.file_heads.lock().unwrap().insert(0, Some(head));
+        enginefs.note_player(PLAYER, played(TEST_HASH, 0));
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        let file = engine
+            .try_get_file_with_intent(0, 0, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("the file's stream");
+        assert_eq!(
+            engine.retention.draw_of(&0),
+            Some(std::collections::BTreeSet::new()),
+            "the archive played as itself drew something"
+        );
+        drop(file);
+
+        enginefs.note_player("tv.2", played_member(TEST_HASH, 0, 110..590));
+        let member = engine
+            .try_get_file_with_intent(0, 110, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("the member's stream");
+        let extent: std::collections::BTreeSet<u32> = (4..24).collect();
+        assert_eq!(
+            engine.retention.draw_of(&0),
+            Some(extent.clone()),
+            "the member kept the file's empty draw"
+        );
+        assert_eq!(
+            fake_advertises(&counters),
+            extent.into_iter().collect::<Vec<_>>()
+        );
+        assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 0);
+        drop(member);
     }
 
     /// **A draw whose first bytes were read across a move is not made.**

@@ -132,6 +132,23 @@ impl Played {
             Self::Elsewhere => false,
         }
     }
+
+    /// **What a draw over `file_idx` is made for under this**: the member
+    /// of it played ([`Played::Torrent`]'s `member`, `None` for the file as
+    /// itself), or the set it is a volume of. Two plays of one file that
+    /// answer differently play different films in it, and a draw made for
+    /// one is nothing the other shares.
+    fn made_for(&self, file_idx: usize) -> (Option<Range<u64>>, Option<&[Volume]>) {
+        match self {
+            Self::Torrent {
+                file_idx: f,
+                member,
+                ..
+            } if *f == file_idx => (member.clone(), None),
+            Self::Set { volumes, .. } => (None, Some(volumes.as_slice())),
+            Self::Torrent { .. } | Self::Elsewhere => (None, None),
+        }
+    }
 }
 
 /// A player token as the app mints it: `<viewer>.<screen>` -- a viewer id
@@ -242,15 +259,24 @@ impl PlaySessions {
         if previous.played == played {
             return Heard::Current { moved: false };
         }
-        // What it left: every file it was on that it is not on now. The
-        // same file with only `shares` changed leaves nothing, and a set
-        // left leaves every volume of it.
+        // What it left: every file it was on that it is not on now, and
+        // every file it shared and still shares for another film -- another
+        // member of the same container, the file as itself after a member
+        // of it, a set after a member of one volume: a draw is made for a
+        // member, and a new member on the same file is a move. The same
+        // file with only `shares` changed leaves nothing, and a set left
+        // leaves every volume of it.
         if let Some(hash) = previous.played.info_hash() {
             let left: Vec<usize> = previous
                 .played
                 .files()
                 .into_iter()
-                .filter(|file| !played.on_file(hash, *file))
+                .filter(|file| {
+                    !played.on_file(hash, *file)
+                        || (previous.played.shares_file(hash, *file)
+                            && played.shares_file(hash, *file)
+                            && previous.played.made_for(*file) != played.made_for(*file))
+                })
                 .collect();
             let others = inner
                 .by_viewer
@@ -537,6 +563,54 @@ mod tests {
         assert_eq!(sessions.member_of("t", 0), None, "two members");
         sessions.play("phone.4", file("t", 0));
         assert_eq!(sessions.member_of("t", 0), None, "the file as itself");
+    }
+
+    /// **A new member on the same file is a move**: a draw is made for a
+    /// member, so a session moving to another member of the file it is on
+    /// -- or from the file as itself to a member of it, or from a member to
+    /// a set the file is a volume of -- leaves the file as a move to another
+    /// file would, while the same member again moves nothing and `shares`
+    /// flipping alone leaves nothing.
+    #[test]
+    fn a_new_member_on_the_same_file_leaves_the_file() {
+        let member = |bytes: Range<u64>| Played::Torrent {
+            info_hash: "t".into(),
+            file_idx: 0,
+            shares: true,
+            member: Some(bytes),
+        };
+        let sessions = PlaySessions::default();
+        sessions.play("tv.1", member(0..500));
+        assert_eq!(sessions.play("tv.1", member(0..500)), SAME);
+        assert!(!sessions.may_end_now("t", 0));
+        assert_eq!(sessions.play("tv.2", member(500..1000)), CURRENT);
+        assert!(sessions.may_end_now("t", 0), "another member of the file");
+
+        let sessions = PlaySessions::default();
+        sessions.play("tv.1", file("t", 0));
+        sessions.play("tv.2", member(0..500));
+        assert!(
+            sessions.may_end_now("t", 0),
+            "the file, then a member of it"
+        );
+
+        let sessions = PlaySessions::default();
+        sessions.play("tv.1", member(0..500));
+        sessions.play("tv.2", set("t", &[(0, 0..500), (1, 0..500)]));
+        assert!(sessions.may_end_now("t", 0), "a member, then a set");
+
+        let sessions = PlaySessions::default();
+        sessions.play("tv.1", file("t", 0));
+        sessions.play(
+            "tv.2",
+            Played::Torrent {
+                info_hash: "t".into(),
+                file_idx: 0,
+                shares: false,
+                member: None,
+            },
+        );
+        assert!(!sessions.may_end_now("t", 0), "only `shares` changed");
     }
 
     /// An archive's session is on the torrent but shares nothing.

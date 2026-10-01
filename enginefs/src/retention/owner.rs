@@ -267,6 +267,27 @@ pub enum Opener {
     Unshared,
 }
 
+/// **What a play session's draw was made for**: the member of the entity
+/// the session played ([`Backing::played_member`], `None` for the entity as
+/// itself) and the set it played the entity as a volume of
+/// ([`Backing::played_set`]). Recorded with the draw
+/// ([`State::drawn_for`]), because a draw is made for a member: a session
+/// that moves to another member of the same container -- the next episode
+/// of a season in one ZIP -- plays a different film in the same entity, and
+/// the first member's draw is nothing it shares. The driver counts a draw
+/// as shared only while what it was made for is what is played now
+/// ([`Retention::draws_for`]), and a set's volume adopts a sibling's draw
+/// only when it was made for this set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrawnFor<K> {
+    pub member: Option<Range<u64>>,
+    pub set: Option<Vec<(K, Range<u64>)>>,
+}
+
+/// One entity's draw as [`Retention::draws_for`] lists it: the key, the
+/// pieces and what they were drawn for.
+pub type DrawMade<K> = (K, BTreeSet<u32>, DrawnFor<K>);
+
 /// **How long a play session waits for the film's rate before it draws
 /// anyway**, counted from the first pass that finds playback under way (a
 /// delivered byte) and the draw still undecided.
@@ -960,6 +981,12 @@ struct State<B: Backing> {
     /// the play session: a [`Mode::Slack`] pass that runs once the backend
     /// has left the swarm forgets it with the bytes.
     draw: Option<BTreeSet<u32>>,
+    /// **What [`Self::draw`] was made for** ([`DrawnFor`]): `Some` exactly
+    /// when the draw is. A draw whose record no longer matches what the
+    /// session plays is shared no more, and is forgotten once the driver
+    /// has ended it ([`Retention::forget_draw_made_for`]) -- or at once
+    /// when it is empty, since nothing of it was ever advertised.
+    drawn_for: Option<DrawnFor<B::Key>>,
     /// **The viewer's player opened this entity in this play session**
     /// ([`Opener::Player`]): the one kind of open whose session draws a
     /// shared set, and only while a play session is on the entity
@@ -1297,6 +1324,7 @@ impl<B: Backing> Retention<B> {
                         duration: None,
                         set_duration: None,
                         draw: None,
+                        drawn_for: None,
                         player_opened: false,
                         asked: Buffering::default(),
                         draw_waiting_since: None,
@@ -1719,6 +1747,10 @@ impl<B: Backing> Retention<B> {
         let member = self.backing.played_member(&entity.key);
         // Or a member across a set this file is one volume of.
         let set = self.backing.played_set(&entity.key);
+        let made_for = DrawnFor {
+            member: member.clone(),
+            set: set.clone(),
+        };
         // What the file is, asked of its first bytes once they are held --
         // off L2, and once per session: an archive shares nothing, and one
         // that cannot be told yet waits. Not asked for a member, whose
@@ -1726,7 +1758,7 @@ impl<B: Backing> Retention<B> {
         // member path has already answered.
         let (domain, content) = {
             let state = entity.state.lock();
-            if state.draw.is_some() || !state.player_opened {
+            if state.draw_settled(&made_for) || !state.player_opened {
                 return;
             }
             (state.domain.clone(), state.content)
@@ -1771,12 +1803,12 @@ impl<B: Backing> Retention<B> {
                 .as_ref()
                 .and_then(|parts| self.sibling_draw(&entity.key, parts));
             let mut state = entity.state.lock();
-            if state.draw.is_some() || !state.player_opened {
+            if state.draw_settled(&made_for) || !state.player_opened {
                 return;
             }
             if !content {
                 // An archive: decided, and nothing in it.
-                state.adopt_draw(&mut claim.guard, BTreeSet::new());
+                state.adopt_draw(&mut claim.guard, BTreeSet::new(), made_for);
                 drop(state);
                 tracing::debug!(
                     key = ?entity.key,
@@ -1788,7 +1820,7 @@ impl<B: Backing> Retention<B> {
                 // The set's draw, made and advertised by the volume that
                 // was due first: this volume keeps its pieces of it, and
                 // nothing is drawn or advertised again.
-                state.adopt_draw(&mut claim.guard, draw);
+                state.adopt_draw(&mut claim.guard, draw, made_for);
                 return;
             }
             // What the draw is made over: the member's pieces, with its
@@ -1799,7 +1831,7 @@ impl<B: Backing> Retention<B> {
             let (over, map) = match (&member, joined) {
                 (_, Some(Some((over, map)))) => (over, Some(map)),
                 (_, Some(None)) => {
-                    state.adopt_draw(&mut claim.guard, BTreeSet::new());
+                    state.adopt_draw(&mut claim.guard, BTreeSet::new(), made_for);
                     drop(state);
                     tracing::warn!(
                         key = ?entity.key,
@@ -1812,7 +1844,7 @@ impl<B: Backing> Retention<B> {
                 (Some(bytes), None) => match B::narrowed(&state.domain, bytes.clone()) {
                     Some(over) => (over, None),
                     None => {
-                        state.adopt_draw(&mut claim.guard, BTreeSet::new());
+                        state.adopt_draw(&mut claim.guard, BTreeSet::new(), made_for);
                         drop(state);
                         tracing::warn!(
                             key = ?entity.key,
@@ -1854,7 +1886,7 @@ impl<B: Backing> Retention<B> {
                     .filter_map(|index| map.get(index as usize).copied())
                     .collect(),
             };
-            state.adopt_draw(&mut claim.guard, draw.clone());
+            state.adopt_draw(&mut claim.guard, draw.clone(), made_for);
             (draw, refused)
         };
         if let Some(error) = refused {
@@ -2118,6 +2150,45 @@ impl<B: Backing> Retention<B> {
                 Some((key.clone(), draw))
             })
             .collect()
+    }
+
+    /// [`Self::draws`], each with what it was made for ([`DrawnFor`]): what
+    /// the driver compares with what is played now, since a draw made for
+    /// one member is nothing another member of the same entity shares. L1 →
+    /// L2, no I/O, as [`Self::draws`].
+    pub fn draws_for(&self) -> Vec<DrawMade<B::Key>> {
+        let entities = self.entities.lock();
+        entities
+            .iter()
+            .filter_map(|(key, entity)| {
+                let state = entity.state.lock();
+                let draw = state.draw.clone()?;
+                let made_for = state.drawn_for.clone()?;
+                Some((key.clone(), draw, made_for))
+            })
+            .collect()
+    }
+
+    /// **`key`'s draw made for `made_for` has been ended**: the driver
+    /// found it shared no more -- the session moved to another member of
+    /// the entity, or off a set onto one volume -- and has taken it out of
+    /// what the backend advertises with the backend out of the swarm
+    /// (`EndShares`). Forget it under the entity's turn, so the session's
+    /// next open or pass draws what is played now, as [`Self::end_play_session`]
+    /// lets the next open of a deleted file draw afresh -- the session moved
+    /// back meanwhile included: the rebuild left that draw out all the
+    /// same. A draw recorded since for something else is kept.
+    pub async fn forget_draw_made_for(&self, key: &B::Key, made_for: &DrawnFor<B::Key>) {
+        let Some(entity) = self.lookup(key) else {
+            return;
+        };
+        let Some(mut claim) = self.turn(key).await else {
+            return;
+        };
+        let mut state = entity.state.lock();
+        if state.drawn_for.as_ref() == Some(made_for) {
+            state.forget_draw(&mut claim.guard);
+        }
     }
 
     /// Decide `key`'s draw now if it is due, as an open would: what a test
@@ -3446,11 +3517,39 @@ impl<B: Backing> State<B> {
 
     /// Record the play session's draw, and have the standing policy share
     /// it and nothing else. Under the turn.
-    fn adopt_draw(&mut self, _turn: &mut Turn, draw: BTreeSet<u32>) {
+    fn adopt_draw(&mut self, _turn: &mut Turn, draw: BTreeSet<u32>, made_for: DrawnFor<B::Key>) {
         if let Some(installed) = self.installed.as_mut() {
             installed.policy.adopt_draw(&draw);
         }
         self.draw = Some(draw);
+        self.drawn_for = Some(made_for);
+    }
+
+    /// Whether the draw is decided for `made_for`, so nothing is drawn
+    /// again: a draw is recorded, and it is not an empty one made for
+    /// something else. An empty draw advertised nothing, so one made for
+    /// another member, another set or the file as itself -- a volume first
+    /// played by its URL, whose sniff found an archive -- is replaced by
+    /// the draw of what is played now, which withdraws nothing.
+    fn draw_settled(&self, made_for: &DrawnFor<B::Key>) -> bool {
+        match &self.draw {
+            None => false,
+            Some(draw) => !draw.is_empty() || self.drawn_for.as_ref() == Some(made_for),
+        }
+    }
+
+    /// The draw is shared no more and its announcement has been ended:
+    /// forget it, so the session's next open or pass draws what is played
+    /// now. The standing policy keeps nothing of it any more. Under the
+    /// turn. The open, the read-ahead asked and what the content is stay:
+    /// the session is still on the entity.
+    fn forget_draw(&mut self, _turn: &mut Turn) {
+        if let Some(installed) = self.installed.as_mut() {
+            installed.policy.adopt_draw(&BTreeSet::new());
+        }
+        self.draw = None;
+        self.drawn_for = None;
+        self.draw_waiting_since = None;
     }
 
     /// Nothing bounds this entity any more, its play session is over, and
@@ -3470,6 +3569,7 @@ impl<B: Backing> State<B> {
         self.windows = Vec::new();
         self.consumed_at = None;
         self.draw = None;
+        self.drawn_for = None;
         self.player_opened = false;
         self.asked = Buffering::default();
         self.draw_waiting_since = None;
