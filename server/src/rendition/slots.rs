@@ -135,6 +135,35 @@ pub(crate) type Muxer<'a> =
 pub(crate) struct Filled {
     pub end: End,
     pub fragment: Bytes,
+    /// The samples kept, `(video, audio)`: what a spill keeps is what a
+    /// truncation would, so a spill no longer allowed when it is recorded
+    /// is recorded as this truncation, with the same bytes.
+    pub kept: (usize, usize),
+}
+
+impl Filled {
+    /// The end to record, the next slot's start being `decided` now (or
+    /// there being no next slot): a spill not allowed -- the next slot was
+    /// made, or a run started at it, maybe while this one was filled -- is
+    /// the truncation that keeps the same samples, and so the same bytes.
+    pub(crate) fn end_now(&self, decided: bool) -> End {
+        match self.end {
+            End::Spill(_) if decided => {
+                tracing::warn!(
+                    kept_video = self.kept.0,
+                    kept_audio = self.kept.1,
+                    stage = "rendition_slot_truncated",
+                    "a rendition's segment did not fit its slot and the next was already \
+                     decided; its end is dropped"
+                );
+                End::Truncated {
+                    video: self.kept.0,
+                    audio: self.kept.1,
+                }
+            }
+            end => end,
+        }
+    }
 }
 
 fn samples(placed: &[Placed]) -> Vec<MuxSample> {
@@ -209,16 +238,18 @@ impl Content {
         }
     }
 
-    /// **Fill a slot of `size` bytes for the first time**: everything when
-    /// it fits; otherwise the longest prefix that does, the rest spilled
-    /// into the next slot when `may_spill`, dropped when not.
-    pub(crate) fn fill(&self, size: u64, may_spill: bool, mux: Muxer<'_>) -> Filled {
+    /// **Fill a slot of `size` bytes**: everything when it fits; otherwise
+    /// the longest prefix that does, the rest spilled into the next slot --
+    /// or, if that is not allowed when the end is recorded, dropped
+    /// ([`Filled::end_now`]).
+    pub(crate) fn fill(&self, size: u64, mux: Muxer<'_>) -> Filled {
         let fits = |fragment: &Bytes| fragment.len() as u64 + MIN_PAD <= size;
         let whole = self.mux_prefix(self.video.len(), self.audio.len(), mux);
         if fits(&whole) {
             return Filled {
                 end: End::Natural,
                 fragment: whole,
+                kept: (self.video.len(), self.audio.len()),
             };
         }
         let prefixes = self.prefixes();
@@ -235,22 +266,10 @@ impl Content {
             }
         }
         let (video, audio) = prefixes[low];
-        let end = if may_spill {
-            End::Spill(self.cursor_after(video, audio))
-        } else {
-            tracing::warn!(
-                slot = self.slot,
-                dropped_video = self.video.len() - video,
-                dropped_audio = self.audio.len() - audio,
-                stage = "rendition_slot_truncated",
-                "a rendition's segment did not fit its slot and the next was already made; \
-                 its end is dropped"
-            );
-            End::Truncated { video, audio }
-        };
         Filled {
-            end,
+            end: End::Spill(self.cursor_after(video, audio)),
             fragment: self.mux_prefix(video, audio, mux),
+            kept: (video, audio),
         }
     }
 }
@@ -318,7 +337,7 @@ mod tests {
     fn a_segment_that_fits_ends_naturally() {
         let segments = segments(vec![cut(3, &[0, 250_000, 500_000, 750_000])]);
         let content = gather(&segments, Cursor::at(3), 3);
-        let filled = content.fill(440 + MIN_PAD, true, &fake);
+        let filled = content.fill(440 + MIN_PAD, &fake);
         assert_eq!(filled.end, End::Natural);
         assert_eq!(filled.fragment.len(), 440);
     }
@@ -334,7 +353,7 @@ mod tests {
         ]);
         let content = gather(&segments, Cursor::at(3), 3);
         // Room for two frames and their two audio frames, not three.
-        let filled = content.fill(220 + MIN_PAD + 50, true, &fake);
+        let filled = content.fill(220 + MIN_PAD + 50, &fake);
         let cursor = Cursor {
             video: (3, 2),
             audio: (3, 2),
@@ -342,7 +361,7 @@ mod tests {
         assert_eq!(filled.end, End::Spill(cursor));
         assert_eq!(filled.fragment.len(), 220);
         let next = gather(&segments, cursor, 4);
-        let all = next.fill(10_000, true, &fake);
+        let all = next.fill(10_000, &fake);
         assert_eq!(all.end, End::Natural);
         // Two of segment 3's frames, two of segment 4's, then the audio:
         // two of 3's and four of 4's.
@@ -368,7 +387,7 @@ mod tests {
             "nothing, the I, the first group, all"
         );
         // Room for five frames: only four may be kept.
-        let filled = content.fill(500 + 10 + MIN_PAD, true, &fake);
+        let filled = content.fill(500 + 10 + MIN_PAD, &fake);
         assert_eq!(
             filled.end,
             End::Spill(Cursor {
@@ -379,22 +398,22 @@ mod tests {
     }
 
     /// **When the next slot's start is decided, the overflow is dropped**:
-    /// the same prefix, the end recorded as truncated.
+    /// the prefix a spill would keep, recorded as truncated -- decided when
+    /// the end is recorded, so a run started at the next slot while this
+    /// one was filled is counted; anything that fitted stays as it is.
     #[test]
     fn an_overflow_with_the_next_slot_decided_is_truncated() {
         let segments = segments(vec![cut(3, &[0, 250_000, 500_000, 750_000])]);
         let content = gather(&segments, Cursor::at(3), 3);
-        let filled = content.fill(220 + MIN_PAD + 50, false, &fake);
-        assert_eq!(filled.end, End::Truncated { video: 2, audio: 2 });
+        let filled = content.fill(220 + MIN_PAD + 50, &fake);
+        assert!(matches!(filled.end_now(false), End::Spill(_)));
+        assert_eq!(filled.end_now(true), End::Truncated { video: 2, audio: 2 });
         assert_eq!(
             kept(&filled.fragment, 2),
             vec![3_000_000, 3_250_000, 3_000_000, 3_250_000]
         );
-        let spilled = content.fill(220 + MIN_PAD + 50, true, &fake);
-        assert_eq!(
-            spilled.fragment, filled.fragment,
-            "the same prefix either way"
-        );
+        let whole = content.fill(10_000, &fake);
+        assert_eq!(whole.end_now(true), End::Natural);
     }
 
     /// Nothing fits but the empty fragment: everything spills.
@@ -402,7 +421,7 @@ mod tests {
     fn a_slot_too_small_for_one_frame_spills_it_all() {
         let segments = segments(vec![cut(3, &[0, 250_000])]);
         let content = gather(&segments, Cursor::at(3), 3);
-        let filled = content.fill(50 + MIN_PAD, true, &fake);
+        let filled = content.fill(50 + MIN_PAD, &fake);
         assert_eq!(filled.end, End::Spill(Cursor::at(3)));
         assert!(filled.fragment.is_empty());
     }

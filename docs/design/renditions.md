@@ -584,7 +584,16 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
 * **The header** is the init segment and the `sidx`. Then **one slot per
   segment**: slot `k` holds segment `k`'s fragment, padded with a `free`
   box to the slot's end. The `sidx` gives each slot's size and duration,
-  so FFmpeg jumps to the slot that holds a time.
+  so FFmpeg jumps to the slot that holds a time. **One `sidx`, the
+  video's** -- tried and measured against one per track: FFmpeg n6's
+  `get_frag_time` finds the sound's fragment by the video's `sidx` time
+  when the sound has none, so both streams land in the same slot; with an
+  index of its own, each stream picks its slot by its own times, and where
+  those are not the slot's real start (an estimated layout, labelled late)
+  the sound picked an earlier slot than the picture and the seek read back
+  (`ffmpeg -ss 60` on zond's film as a transport stream: seven requests,
+  back and forth; headless Chrome: six). With the video's alone: the
+  Matroska file two requests and one far `Range` in Chrome, as before.
 * **With the source's index, the slots mirror the source.** The producer
   reports the video's sync samples -- `(pts, byte position)`, from
   libavformat's index (Matroska cues, an MP4's sample tables, an AVI's
@@ -625,8 +634,9 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   is shown after anything left over, so decode times stay in order -- and
   the rest **spills** to the start of the next slot, before that
   segment's own samples; when the next slot's start is already decided (it
-  was made, or a run was started at it) the rest is **dropped** instead,
-  and logged. The decision is recorded per slot the first time, so a slot
+  was made, or a run was started at it -- checked when the end is
+  recorded, since two runs may be live) or there is no next slot, the rest
+  is **dropped** instead, and logged. The decision is recorded per slot the first time, so a slot
   made again -- the ring let it go, or a run was started at it -- is made
   the same way: a slot's start is where the slot before spilled to, or its
   own segment's beginning. Mirrored from a real index, a spill is rare
@@ -645,22 +655,42 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   before the spec's start, so it makes the slot the receiver will jump to.
   A range that begins in a slot waits for that slot's fragment before it
   answers (a failure is a `503`); one that begins in the header answers at
-  once. **The latest asker wins**: the first slot a range asks for moves
-  the run there, on its first look only, if it is not the slot in
-  production or within the lookahead; a request that finds the run moved
-  elsewhere later waits for it to be let go, and the slots a range reads
-  on into never move a live run -- so two reads far apart (`ffprobe` keeps
-  its first connection open while it seeks on a second) never take the run
-  from each other in turn, which they did, millions of times, before this
-  rule. **The receiver's opening read**, from the header on into slot 0,
-  which it never chose, does not move the first run until a read has asked
-  that run for a slot (the receiver's jump to the start, which joins it).
-  A run started at a slot counts the lookahead from it. **A run is never
-  let go while a request waits for it to make a slot**, however long the
-  making takes -- before, a source that stalled past the idle release
-  restarted its run from scratch every minute. The lookahead, the ring,
-  the speed rule and the absence of any give-up timer (a stalled source is
-  waited for) are otherwise unchanged.
+  once. **Up to two runs** (`MAX_RUNS`), each with its own lookahead
+  (counted from the last slot asked of it, and from where it starts), its
+  own idle clock and its own waiters: a slot in the ring is answered; one a
+  run will make within its lookahead joins that run; otherwise the request
+  starts a run there beside the live one, or -- both taken -- in place of
+  the least recently asked run **nobody waits on**, and only a range's
+  first look at its first slot may take a run somebody waits on. So two
+  readers far apart (`ffprobe` keeping its first connection open while it
+  seeks on a second; zond's TV reading on from 0:30 while it seeks to
+  1:00) each keep their run, instead of taking one run from each other
+  in turn -- millions of times a second in the first build, every few
+  seconds on the TV in the second. **The receiver's opening read**, from
+  the header on into slot 0, which it never chose, starts a run only when
+  none is live. **A run is never let go while a request waits for it to
+  make a slot**, however long the making takes. **The ring keeps what it
+  can hold** (96 MiB), the slots farthest from where any run is asked
+  dropped first, never the lookahead ahead of one: a body's read on runs
+  ahead of what the receiver took into socket buffers, and a slot dropped
+  two behind the last request was asked for again by the receiver's next
+  ranged block and made again by a new run (headless Chrome, a seek to
+  60 s). The speed rule and the absence of any give-up timer (a stalled
+  source is waited for) are unchanged.
+* **A segment's sound begins 64 ms before its cut** (`AUDIO_LEAD_US`, more
+  than one AAC frame): the audio frame playing at the sync sample is in the
+  sync sample's fragment. FFmpeg n6's `mov_read_seek` seeks the video, then
+  every other stream to the sync sample's time, backward: with each
+  fragment's sound cut at or after the sync sample -- up to a frame later
+  -- the target fragment held no sound at or before it, and the sound
+  stream fell back to the last frame it knew, from the reads at the
+  file's opening: `ffmpeg -ss 60` asked `0-`, the target, then 4.6 MB (6 s)
+  and the target again, and zond's TV, seeking to 1:00, read on from 0:30
+  and stalled buffering. With the lead, `ffmpeg -ss` makes two requests --
+  the start, the target -- at 30, 60, 90 and 300 s on the mirrored film,
+  and headless Chrome one far `Range` per seek. An estimated layout (a
+  transport stream) still reads forward from the slot before after a seek
+  -- its slots are labelled a GOP late -- up to about 16 s of film.
 * **The app** (xtremio) loads `stream.mp4` with the receiver told to start
   at the phone's position, and a seek on the phone is a plain `SEEK` to
   the receiver again; the reload and the undo of the receiver's restarts

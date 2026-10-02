@@ -69,8 +69,9 @@ it is refused with `noProducer` until the embedder has called
 
 **The receiver seeks by bytes.** The init segment carries the film's
 length (`mvhd`, `tkhd`, and each track's `mdhd` on its own clock, which is
-the one a receiver's demuxer reads), and the `sidx` one reference per slot
--- its size and its time -- so a seek is one `Range` straight at the slot
+the one a receiver's demuxer reads), and the video's `sidx` one reference
+per slot -- its size and its time -- so a seek, in every stream (the sound
+finds its slot by the video's times), is one `Range` straight at the slot
 that holds the time (measured on zond's TV:
 [design/renditions.md](design/renditions.md), "Seeking by bytes"). With
 the source's index (Matroska cues, an MP4's sample tables, an AVI's
@@ -83,7 +84,8 @@ over the source's size, 15% larger and 8 KiB on top, each
 labelled in the `sidx` 10 s after its cut (its first sync sample may be
 up to a GOP late). A segment holds the
 video from its sync sample to the next segment's and the audio between
-the two cuts. One that does not fit its slot keeps what fits and
+the two cuts, 64 ms early (so the frame playing at the sync sample is in
+its fragment, where a demuxer seeking the sound looks). One that does not fit its slot keeps what fits and
 **spills** the rest into the next slot -- or, when the next slot is
 already made, **drops** it (logged) -- a decision made once and kept, so a
 slot made again is the same bytes. The last 16 bytes of every slot are
@@ -92,18 +94,19 @@ file's end for an `mfra`).
 
 A plain token has no `stream.mp4` (`404`); a rendition's token serves it
 and, like a plain one, the source as it is at `/cast/{token}`. Each `GET`
-counts as one body (`lan_media_bodies_served`). Production runs at most two
-slots past the one last asked for and then waits; a range at a slot far
-from where the run is starts a new run there, two seconds before the
-slot's cut (so a run started there makes exactly what one passing through
-makes) -- except the receiver's opening read, which reads from the header
-on into the first slot without having chosen it, and does not move the
-first run (made at the spec's start, where the receiver is about to seek).
-The latest asker wins: a range moves the run only when it first asks, a
-range read on into its next slots never does, and one whose run was taken
-elsewhere waits for that run to be let go. A run nobody has asked anything
-of for a minute is let go (the slots made are kept) -- never while a
-request waits for it to make a slot. A run that makes less than its own time in film over ten
+counts as one body (`lan_media_bodies_served`). Up to two runs are live at once,
+each producing at most two slots past the one last asked of it and then
+waiting; a range at a slot no run will make soon starts a run there, two
+seconds before the slot's cut (so a run started there makes exactly what
+one passing through makes), beside the other or in place of the least
+recently asked one nobody is waiting on -- only a range's first look at
+its first slot takes a run somebody waits on -- so two readers far apart
+each keep one. The receiver's opening read, from the header on into the
+first slot it never chose, starts a run only when none is live (the first
+is at the spec's start, where the receiver is about to seek). The ring
+keeps what 96 MiB holds, the slots farthest from any run dropped first. A
+run nobody has asked anything of for a minute is let go (the slots made
+are kept) -- never while a request waits for it to make a slot. A run that makes less than its own time in film over ten
 seconds of its own work -- leaving out the time it waited for the receiver
 and for the source -- fails the rendition with a sentence, which
 `ServerHandle::rendition_state(&CastToken)` reports

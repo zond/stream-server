@@ -25,7 +25,8 @@
 //! # The rules this keeps
 //!
 //! * **Nothing on disk.** Fragments live in a ring in memory -- two behind
-//!   the last request, [`LOOKAHEAD`](crate::rendition::LOOKAHEAD) ahead, [`RING_CAP`](crate::rendition::RING_CAP) at most -- and are
+//!   as many as [`RING_CAP`](crate::rendition::RING_CAP) holds, the farthest from where any run is asked
+//!   dropped first, never the [`LOOKAHEAD`](crate::rendition::LOOKAHEAD) ahead of one -- and are
 //!   dropped.
 //! * **Every byte is the same however often it is made**: the layout is
 //!   frozen with the first run's formats and the source's index, the
@@ -81,9 +82,12 @@ pub(crate) use speed::WaitClock;
 /// Segments produced past the last request before the producer is made to
 /// wait (`L`, §2.1).
 pub const LOOKAHEAD: u64 = 2;
-/// Segments kept behind the last request, for a receiver's retry.
-pub const BEHIND: u64 = 2;
-/// The most the ring holds, whatever the segment count says.
+/// How many runs may be live at once: two reads far apart (a receiver's
+/// demuxer reading one place while its data source fills another) each
+/// have one, rather than take one from each other in turn.
+pub const MAX_RUNS: usize = 2;
+/// The most the ring holds, whatever the segment count says. Slots are
+/// kept until it is full, the farthest from where any run is asked first.
 pub const RING_CAP: usize = 96 * 1024 * 1024;
 /// How long a run is kept with no request before it is let go.
 pub const IDLE_RELEASE: Duration = Duration::from_secs(60);
@@ -398,6 +402,8 @@ impl SampleSink {
 pub struct RenditionTuning {
     pub idle_release: Duration,
     pub speed_window: Duration,
+    /// The ring's cap in bytes ([`RING_CAP`]).
+    pub ring_cap: usize,
 }
 
 impl Default for RenditionTuning {
@@ -405,6 +411,7 @@ impl Default for RenditionTuning {
         Self {
             idle_release: IDLE_RELEASE,
             speed_window: SPEED_WINDOW,
+            ring_cap: RING_CAP,
         }
     }
 }
@@ -415,10 +422,12 @@ impl Default for RenditionTuning {
 pub struct RenditionProbe {
     /// Runs begun since the publish.
     pub runs_started: u64,
-    /// The slot the live run began at, if one is live.
+    /// The slot the latest live run began at, if one is live.
     pub run_from: Option<u64>,
-    /// The slot the live run is producing.
+    /// The slot the latest live run is producing.
     pub in_production: Option<u64>,
+    /// How many runs are live.
+    pub live_runs: usize,
     /// The slots in the ring.
     pub ring: Vec<u64>,
     /// Whether the layout -- and with it the init segment -- is frozen.
@@ -444,43 +453,78 @@ pub enum NotServed {
     Cut,
 }
 
-/// What a request for a slot is (`docs/design/renditions.md` §2.8). **The
-/// latest asker wins**: a request moves the run to its slot only when it
-/// first looks -- and then only a [`Ask::Seek`], or an [`Ask::Open`] while
-/// no read has asked the first run for a slot -- and otherwise waits for
-/// the run that is making something else, or for none to be live, when it
-/// starts one. Two reads far apart (a client that keeps one connection open
-/// while it seeks on another) never take the run from each other in turn.
+/// What a request for a slot is (`docs/design/renditions.md` §2.8). A
+/// slot in the ring is answered; one a live run will make within its
+/// lookahead is waited for (the request **joins** that run); otherwise the
+/// request starts a run there when fewer than [`MAX_RUNS`] are live -- two
+/// readers far apart each get their own -- and, with every run taken,
+/// replaces one **nobody is waiting on** (the least recently asked), or --
+/// a [`Ask::Seek`] on its first look -- any, the least recently asked. A
+/// request waited on is never taken from, so two readers never take the
+/// runs from each other in turn; a request that may do none of this waits.
+/// The first run, before any read has asked it for a slot, counts as
+/// waited on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ask {
-    /// The first slot of a range the receiver chose: it may move the run
-    /// there.
+    /// The first slot of a range the receiver chose.
     Seek,
-    /// A range read on into its next slot: it never moves a live run.
+    /// A range read on into its next slot.
     Continue,
     /// The receiver opening the file: a read from the header on, into the
-    /// first slot it reaches without having chosen it. It does not move the
-    /// first run -- started at the spec's start, where the receiver was told
-    /// to play and is about to seek -- before any read has asked that run
-    /// for a slot.
+    /// first slot it reaches without having chosen it. It starts a run only
+    /// when none is live: the first run is at the spec's start, where the
+    /// receiver was told to play and is about to seek, and the second is
+    /// for a reader that chose where it reads.
     Open,
 }
 
-/// A request counted in [`Inner::joined`] while it waits for the live run
-/// to make its slot; uncounted when it stops waiting, however it stops.
+/// A request counted in its run's waiters while it waits for that run to
+/// make its slot; uncounted when it stops waiting, however it stops.
 struct Joined {
     rendition: Arc<Rendition>,
-    counted: bool,
+    run: Option<u64>,
+}
+
+impl Joined {
+    fn set(&mut self, inner: &mut Inner, run: Option<u64>) {
+        if self.run == run {
+            return;
+        }
+        if let Some(old) = self.run.and_then(|generation| inner.run_mut(generation)) {
+            old.joined -= 1;
+        }
+        if let Some(new) = run.and_then(|generation| inner.run_mut(generation)) {
+            new.joined += 1;
+        }
+        self.run = run;
+    }
 }
 
 impl Drop for Joined {
     fn drop(&mut self) {
-        if self.counted {
-            self.rendition.inner().joined -= 1;
-            // A run waiting for the count to fall looks again.
+        if let Some(generation) = self.run {
+            if let Some(run) = self.rendition.inner().run_mut(generation) {
+                run.joined -= 1;
+            }
+            // A run waiting for its waiters to go looks again.
             self.rendition.bump();
         }
     }
+}
+
+/// What a request that is not answered from the ring nor joins a run may
+/// do about its slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Start {
+    /// Start a run there, beside the live ones.
+    Beside,
+    /// Start a run there in place of the least recently asked one nobody
+    /// waits on.
+    ReplacingUnwaited,
+    /// Start a run there in place of the least recently asked one.
+    Replacing,
+    /// Wait.
+    Wait,
 }
 
 impl Ask {
@@ -489,31 +533,61 @@ impl Ask {
         Ask::Continue
     }
 
-    /// Whether a request may start a run at its slot (when the slot is not
-    /// in the ring nor in production): on its `first` look or later, with
-    /// the live run's `reserved` flag, or `None` with no run live.
-    fn moves(self, first: bool, live: Option<bool>) -> bool {
-        match (self, live) {
-            (_, None) => true,
-            (Ask::Seek, Some(_)) => first,
-            (Ask::Open, Some(reserved)) => first && !reserved,
-            (Ask::Continue, Some(_)) => false,
+    /// What a request may do (see [`Ask`]): on its `first` look or later,
+    /// with `live` runs live, of which `unwaited` have nobody waiting on
+    /// them.
+    fn start(self, first: bool, live: usize, unwaited: usize) -> Start {
+        if live < MAX_RUNS {
+            Start::Beside
+        } else if self == Ask::Seek && first {
+            Start::Replacing
+        } else if unwaited > 0 {
+            Start::ReplacingUnwaited
+        } else {
+            Start::Wait
         }
     }
 }
 
-/// The live run, as a request sees it.
-struct RunSlot {
+/// A live run, as a request sees it.
+pub(crate) struct RunSlot {
     generation: u64,
-    /// The first run, which no read has asked for a slot of yet: an
-    /// [`Ask::Open`] leaves it where it is.
+    /// The first run, which no read has asked for a slot of yet: it is
+    /// counted as waited on.
     reserved: bool,
     /// The slot it began at; for the run that freezes the layout, known
     /// once it has.
     from: u64,
     /// The slot in production: the lowest not yet in the ring.
     next_out: u64,
+    /// The last slot a request asked of it -- the lookahead counts from
+    /// here -- and when.
+    last_request: u64,
+    last_request_at: Instant,
+    /// Requests waiting for it to make their slot: while any is, it is not
+    /// idle, however long the making takes (a source that stalls is waited
+    /// for).
+    joined: usize,
     stop: CancellationToken,
+}
+
+impl RunSlot {
+    /// Whether nobody waits on this run.
+    fn unwaited(&self) -> bool {
+        self.joined == 0 && !self.reserved
+    }
+
+    /// Whether a request for `slot` waits for this run: the slot in
+    /// production or within the lookahead past it.
+    fn joins(&self, slot: u64) -> bool {
+        slot >= self.next_out && slot <= self.next_out + LOOKAHEAD
+    }
+
+    /// Whether this run made `slot` or is making it: what a request
+    /// answered from the ring moves the lookahead of.
+    fn covers(&self, slot: u64) -> bool {
+        slot >= self.from && slot <= self.next_out + LOOKAHEAD
+    }
 }
 
 /// The decisions that make a slot the same every time it is made
@@ -555,50 +629,89 @@ pub(crate) struct Inner {
     /// Each slot's fragment, by slot; the padding is not kept.
     ring: BTreeMap<u64, Bytes>,
     ring_bytes: usize,
-    run: Option<RunSlot>,
+    /// The live runs, at most [`MAX_RUNS`].
+    runs: Vec<RunSlot>,
+    ring_cap: usize,
     failed: Option<String>,
     plan: SlotPlan,
-    last_request: u64,
-    last_request_at: Instant,
     runs_started: u64,
-    /// Requests waiting for the live run to make their slot: while any is,
-    /// the run is not idle, however long the making takes (a source that
-    /// stalls is waited for).
-    joined: usize,
 }
 
 impl Inner {
-    fn note_request(&mut self, slot: u64, now: Instant) {
-        self.last_request = slot;
-        self.last_request_at = now;
-        let (low, high) = (slot.saturating_sub(BEHIND), slot + LOOKAHEAD);
-        let gone: Vec<u64> = self
-            .ring
-            .keys()
-            .copied()
-            .filter(|key| *key < low || *key > high)
-            .collect();
-        for key in gone {
-            if let Some(bytes) = self.ring.remove(&key) {
-                self.ring_bytes -= bytes.len();
-            }
-        }
-        // The cap: the oldest behind the request go first; nothing at or
-        // ahead of it is taken (the gate stops production instead).
-        while self.ring_bytes > RING_CAP {
-            let Some(oldest) = self.ring.keys().next().copied().filter(|key| *key < slot) else {
-                break;
-            };
-            if let Some(bytes) = self.ring.remove(&oldest) {
-                self.ring_bytes -= bytes.len();
-            }
+    pub(crate) fn run(&self, generation: u64) -> Option<&RunSlot> {
+        self.runs.iter().find(|run| run.generation == generation)
+    }
+
+    fn run_mut(&mut self, generation: u64) -> Option<&mut RunSlot> {
+        self.runs
+            .iter_mut()
+            .find(|run| run.generation == generation)
+    }
+
+    /// A request for `slot` reached run `generation`: its lookahead counts
+    /// from there, and it is not idle.
+    fn note_request(&mut self, generation: u64, slot: u64, now: Instant) {
+        if let Some(run) = self.run_mut(generation) {
+            run.last_request = slot;
+            run.last_request_at = now;
         }
     }
 
-    /// When the live run is idle: `release` after the last request -- or
-    /// never, while a request waits for it to make a slot.
-    pub(crate) fn idle_at(&self, release: Duration) -> Option<Instant> {
-        (self.joined == 0).then(|| self.last_request_at + release)
+    /// Whether run `generation` must wait for a request before it makes
+    /// slot `next_out`: it is [`LOOKAHEAD`] past the last one asked of it,
+    /// or the ring is full and it is past that.
+    pub(crate) fn gated(&self, generation: u64, next_out: u64) -> bool {
+        self.run(generation).is_none_or(|run| {
+            next_out > run.last_request + LOOKAHEAD
+                || (self.ring_bytes >= self.ring_cap && next_out > run.last_request)
+        })
+    }
+
+    /// The run a new one takes the place of: the least recently asked --
+    /// of those nobody waits on, when `unwaited_only`.
+    fn replaced(&self, unwaited_only: bool) -> Option<usize> {
+        self.runs
+            .iter()
+            .enumerate()
+            .filter(|(_, run)| !unwaited_only || run.unwaited())
+            .min_by_key(|(_, run)| run.last_request_at)
+            .map(|(at, _)| at)
+    }
+
+    /// When run `generation` is idle: `release` after the last request asked
+    /// of it -- or never, while a request waits for it to make a slot.
+    pub(crate) fn idle_at(&self, generation: u64, release: Duration) -> Option<Instant> {
+        self.run(generation)
+            .and_then(|run| (run.joined == 0).then(|| run.last_request_at + release))
+    }
+
+    /// Over the cap, the slots farthest from where any run is asked go
+    /// first; none at or ahead of a run's last request within its
+    /// lookahead.
+    fn trim(&mut self) {
+        let anchors: Vec<u64> = self.runs.iter().map(|run| run.last_request).collect();
+        while self.ring_bytes > self.ring_cap {
+            let far = self
+                .ring
+                .keys()
+                .copied()
+                .filter(|key| {
+                    !anchors
+                        .iter()
+                        .any(|anchor| key >= anchor && *key <= anchor + LOOKAHEAD)
+                })
+                .max_by_key(|key| {
+                    anchors
+                        .iter()
+                        .map(|anchor| key.abs_diff(*anchor))
+                        .min()
+                        .unwrap_or(u64::MAX)
+                });
+            let Some(far) = far else { break };
+            if let Some(bytes) = self.ring.remove(&far) {
+                self.ring_bytes -= bytes.len();
+            }
+        }
     }
 
     fn insert(&mut self, slot: u64, bytes: Bytes) {
@@ -606,6 +719,7 @@ impl Inner {
         if let Some(old) = self.ring.insert(slot, bytes) {
             self.ring_bytes -= old.len();
         }
+        self.trim();
     }
 }
 
@@ -653,13 +767,11 @@ impl Rendition {
                 layout: None,
                 ring: BTreeMap::new(),
                 ring_bytes: 0,
-                run: None,
+                runs: Vec::new(),
+                ring_cap: tuning.ring_cap,
                 failed: None,
                 plan: SlotPlan::default(),
-                last_request: 0,
-                last_request_at: Instant::now(),
                 runs_started: 0,
-                joined: 0,
             }),
             version: watch::channel(0).0,
         })
@@ -698,7 +810,7 @@ impl Rendition {
                 sentence: sentence.clone(),
             };
         }
-        if inner.run.is_some() {
+        if !inner.runs.is_empty() {
             RenditionState::Producing
         } else {
             RenditionState::Idle
@@ -724,8 +836,9 @@ impl Rendition {
         };
         RenditionProbe {
             runs_started: inner.runs_started,
-            run_from: inner.run.as_ref().map(|run| run.from),
-            in_production: inner.run.as_ref().map(|run| run.next_out),
+            run_from: inner.runs.last().map(|run| run.from),
+            in_production: inner.runs.last().map(|run| run.next_out),
+            live_runs: inner.runs.len(),
             ring: inner.ring.keys().copied().collect(),
             init: inner.layout.is_some(),
             total: inner.layout.as_ref().map(|layout| layout.total),
@@ -742,17 +855,25 @@ impl Rendition {
             tracing::warn!(sentence = %sentence, "rendition failed");
             inner.failed = Some(sentence);
         }
-        if let Some(run) = inner.run.take() {
+        for run in inner.runs.drain(..) {
             run.stop.cancel();
         }
     }
 
-    /// Start a run, dropping the live one: at `slot` (the seek path), or --
-    /// with no layout yet -- the run that will freeze it, from a segment
-    /// before the spec's start.
-    fn start_run(self: &Arc<Self>, inner: &mut Inner, state: &AppState, slot: Option<u64>) {
-        if let Some(old) = inner.run.take() {
-            old.stop.cancel();
+    /// Start a run -- at `slot` (the seek path), or, with no layout yet, the
+    /// run that will freeze it, from a segment before the spec's start --
+    /// dropping the least recently asked run if [`MAX_RUNS`] are live (of
+    /// those nobody waits on, when `unwaited_only`). Answers its generation.
+    fn start_run(
+        self: &Arc<Self>,
+        inner: &mut Inner,
+        state: &AppState,
+        slot: Option<u64>,
+        unwaited_only: bool,
+    ) -> u64 {
+        while inner.runs.len() >= MAX_RUNS {
+            let at = inner.replaced(unwaited_only).unwrap_or(0);
+            inner.runs.remove(at).stop.cancel();
         }
         inner.runs_started += 1;
         let generation = inner.runs_started;
@@ -763,7 +884,6 @@ impl Rendition {
                 // the slot before has not decided it, and the lookahead is
                 // counted from it -- whoever asked last.
                 inner.plan.fixed.insert(slot);
-                inner.note_request(slot, Instant::now());
                 let anchor = inner.plan.start(slot).anchor();
                 let from = if anchor == 0 {
                     0
@@ -784,11 +904,15 @@ impl Rendition {
             }
         };
         let stop = self.cut.child_token();
-        inner.run = Some(RunSlot {
+        // Its lookahead counts from where it starts: whoever asked last.
+        inner.runs.push(RunSlot {
             generation,
             reserved: slot.is_none(),
             from: from_slot,
             next_out: from_slot,
+            last_request: from_slot,
+            last_request_at: Instant::now(),
+            joined: 0,
             stop: stop.clone(),
         });
         tracing::info!(
@@ -806,6 +930,7 @@ impl Rendition {
             Duration::from_micros(from_us as u64),
             stop,
         ));
+        generation
     }
 
     /// **The first sample of a run**: the layout frozen from the first run's
@@ -823,11 +948,7 @@ impl Rendition {
         start: Option<u64>,
     ) -> Result<(Arc<layout::Layout>, u64, slots::Cursor), run::Frozen> {
         let mut inner = self.inner();
-        if !inner
-            .run
-            .as_ref()
-            .is_some_and(|run| run.generation == generation)
-        {
+        if inner.run(generation).is_none() {
             return Err(run::Frozen::Stopped);
         }
         let layout = match (&inner.formats, inner.layout.clone()) {
@@ -872,45 +993,35 @@ impl Rendition {
         if start.is_none() {
             // The run that froze the layout: it is the receiver's first
             // request's, which asked for the spec's start.
-            if let Some(run) = inner.run.as_mut() {
+            if let Some(run) = inner.run_mut(generation) {
                 run.from = slot;
                 run.next_out = slot;
             }
-            inner.note_request(slot, Instant::now());
+            inner.note_request(generation, slot, Instant::now());
         }
         drop(inner);
         self.bump();
         Ok((layout, slot, cursor))
     }
 
-    /// Whether slot `slot`, made for the first time, may spill into the
-    /// next: there is one, and its start is not decided.
-    pub(crate) fn may_spill(&self, slot: u64) -> bool {
-        let inner = self.inner();
-        let count = inner.layout.as_ref().map_or(0, |layout| layout.slots.len()) as u64;
-        slot + 1 < count && !inner.plan.decided(slot + 1)
-    }
-
-    /// Slot `slot` made, under the run's generation: its fragment in the
-    /// ring, and its end recorded the first time. Answers the end recorded
-    /// -- this one, or the one it was first made with -- or `None` when the
-    /// run is no longer the live one.
+    /// Slot `slot` made by run `generation`: its fragment in the ring, and
+    /// its end recorded the first time -- a spill that a run started at the
+    /// next slot has made impossible since recorded as the truncation it
+    /// keeps the same bytes of. Answers the end recorded -- this one, or the
+    /// one it was first made with -- or `None` when the run is not live.
     pub(crate) fn publish_slot(
         &self,
         generation: u64,
         slot: u64,
-        end: slots::End,
-        fragment: Bytes,
+        filled: slots::Filled,
     ) -> Option<slots::End> {
         let recorded = {
             let mut inner = self.inner();
-            let run = inner
-                .run
-                .as_mut()
-                .filter(|run| run.generation == generation)?;
-            run.next_out = slot + 1;
+            inner.run_mut(generation)?.next_out = slot + 1;
+            let count = inner.layout.as_ref().map_or(0, |layout| layout.slots.len()) as u64;
+            let end = filled.end_now(slot + 1 >= count || inner.plan.decided(slot + 1));
             let recorded = *inner.plan.ends.entry(slot).or_insert(end);
-            inner.insert(slot, fragment);
+            inner.insert(slot, filled.fragment);
             recorded
         };
         self.bump();
@@ -936,9 +1047,8 @@ impl Rendition {
                 if let Some(layout) = &inner.layout {
                     return Ok(layout.clone());
                 }
-                if inner.run.is_none() {
-                    inner.last_request_at = Instant::now();
-                    self.start_run(&mut inner, state, None);
+                if inner.runs.is_empty() {
+                    self.start_run(&mut inner, state, None, false);
                 }
             }
             if !self.wait(&mut seen).await {
@@ -953,9 +1063,8 @@ impl Rendition {
         Ok(layout.header.slice(..layout.init_len))
     }
 
-    /// **Slot `slot`'s fragment**: from the ring, after the production it
-    /// joins, or from a new run started at it -- when [`Ask`] lets this
-    /// request move the run; otherwise after the run elsewhere is done.
+    /// **Slot `slot`'s fragment**: from the ring, after the production of
+    /// the run it joins, or from a run started at it, as [`Ask`] says.
     pub(crate) async fn slot(
         self: &Arc<Self>,
         state: &AppState,
@@ -963,11 +1072,11 @@ impl Rendition {
         ask: Ask,
     ) -> Result<Bytes, NotServed> {
         let mut seen = self.version.subscribe();
-        let mut noted = false;
+        let mut noted = None;
         let mut first = true;
         let mut joined = Joined {
             rendition: self.clone(),
-            counted: false,
+            run: None,
         };
         loop {
             {
@@ -982,37 +1091,64 @@ impl Rendition {
                 if slot >= count {
                     return Err(NotServed::NotFound);
                 }
-                let in_ring = inner.ring.contains_key(&slot);
-                let joins = inner
-                    .run
-                    .as_ref()
-                    .is_some_and(|run| slot >= run.next_out && slot <= run.next_out + LOOKAHEAD);
-                let moves = ask.moves(first, inner.run.as_ref().map(|run| run.reserved));
-                first = false;
-                if joins != joined.counted {
-                    if joins {
-                        inner.joined += 1;
-                    } else {
-                        inner.joined -= 1;
-                    }
-                    joined.counted = joins;
-                }
-                if in_ring || joins || moves {
-                    if !noted {
-                        noted = true;
-                        inner.note_request(slot, Instant::now());
-                        // The gate moved: a run waiting on it looks again.
-                        self.bump();
-                    }
-                    if let Some(run) = inner.run.as_mut() {
+                let now = Instant::now();
+                if inner.ring.contains_key(&slot) {
+                    joined.set(&mut inner, None);
+                    // A read from the ring moves the lookahead of the run
+                    // that made it, if one is making on from it.
+                    let covering = inner
+                        .runs
+                        .iter()
+                        .filter(|run| run.covers(slot))
+                        .max_by_key(|run| run.from)
+                        .map(|run| run.generation);
+                    if let Some(run) = covering.and_then(|generation| inner.run_mut(generation)) {
                         run.reserved = false;
                     }
-                    if let Some(bytes) = inner.ring.get(&slot) {
-                        return Ok(bytes.clone());
+                    if let Some(generation) = covering
+                        && noted != Some(generation)
+                    {
+                        inner.note_request(generation, slot, now);
+                        inner.trim();
+                        self.bump();
                     }
-                    if !joins {
-                        self.start_run(&mut inner, state, Some(slot));
+                    return Ok(inner.ring[&slot].clone());
+                }
+                let joins = inner
+                    .runs
+                    .iter()
+                    .find(|run| run.joins(slot))
+                    .map(|run| run.generation);
+                let unwaited = inner.runs.iter().filter(|run| run.unwaited()).count();
+                let start = if ask == Ask::Open && !inner.runs.is_empty() {
+                    // The receiver opening the file reads on into a slot it
+                    // did not choose; it is about to seek where a run is.
+                    Start::Wait
+                } else {
+                    ask.start(first, inner.runs.len(), unwaited)
+                };
+                first = false;
+                let target = match (joins, start) {
+                    (Some(generation), _) => Some(generation),
+                    (None, Start::Beside | Start::Replacing) => {
+                        Some(self.start_run(&mut inner, state, Some(slot), false))
                     }
+                    (None, Start::ReplacingUnwaited) => {
+                        Some(self.start_run(&mut inner, state, Some(slot), true))
+                    }
+                    (None, Start::Wait) => None,
+                };
+                joined.set(&mut inner, target);
+                if let Some(run) = target.and_then(|generation| inner.run_mut(generation)) {
+                    run.reserved = false;
+                }
+                if let Some(generation) = target
+                    && noted != Some(generation)
+                {
+                    noted = Some(generation);
+                    inner.note_request(generation, slot, now);
+                    // The gate moved: a run waiting on it looks again.
+                    self.bump();
                 }
             }
             if !self.wait(&mut seen).await {
@@ -1047,26 +1183,107 @@ mod tests {
         }
     }
 
-    /// **The latest asker wins**: with no run live anyone starts one; a
-    /// seek moves a live run on its first look only; an opening read never
-    /// moves the first run before a read asked it for a slot, and otherwise
-    /// as a seek; a read on into the next slot never moves a live run.
+    /// **What a request may start**: with room, a run beside the live ones;
+    /// with every run taken, a seek on its first look in place of any, and
+    /// anything else in place of one nobody waits on -- or nothing.
     #[test]
-    fn only_a_first_look_moves_a_live_run() {
+    fn a_request_starts_a_run_with_room_and_takes_none_waited_on() {
         for ask in [Ask::Seek, Ask::Continue, Ask::Open] {
-            assert!(ask.moves(true, None) && ask.moves(false, None), "{ask:?}");
-        }
-        assert!(Ask::Seek.moves(true, Some(false)));
-        assert!(Ask::Seek.moves(true, Some(true)));
-        assert!(!Ask::Seek.moves(false, Some(false)));
-        assert!(Ask::Open.moves(true, Some(false)));
-        assert!(!Ask::Open.moves(true, Some(true)));
-        assert!(!Ask::Open.moves(false, Some(false)));
-        assert!(!Ask::Continue.moves(true, Some(false)));
-        assert!(!Ask::Continue.moves(true, Some(true)));
-        for ask in [Ask::Seek, Ask::Continue, Ask::Open] {
+            assert_eq!(ask.start(false, MAX_RUNS - 1, 0), Start::Beside, "{ask:?}");
+            assert_eq!(ask.start(false, MAX_RUNS, 0), Start::Wait, "{ask:?}");
+            assert_eq!(
+                ask.start(false, MAX_RUNS, 1),
+                Start::ReplacingUnwaited,
+                "{ask:?}"
+            );
             assert_eq!(ask.then(), Ask::Continue, "a range reads on from {ask:?}");
         }
+        assert_eq!(Ask::Seek.start(true, MAX_RUNS, 0), Start::Replacing);
+        assert_eq!(Ask::Continue.start(true, MAX_RUNS, 0), Start::Wait);
+        assert_eq!(Ask::Open.start(true, MAX_RUNS, 0), Start::Wait);
+    }
+
+    fn inner_with(runs: &[u64], ring: &[u64], cap: usize) -> Inner {
+        let mut inner = Inner {
+            formats: None,
+            layout: None,
+            ring: BTreeMap::new(),
+            ring_bytes: 0,
+            runs: Vec::new(),
+            ring_cap: usize::MAX,
+            failed: None,
+            plan: SlotPlan::default(),
+            runs_started: 0,
+        };
+        for (generation, at) in runs.iter().enumerate() {
+            inner.runs.push(RunSlot {
+                generation: generation as u64,
+                reserved: false,
+                from: *at,
+                next_out: *at,
+                last_request: *at,
+                last_request_at: Instant::now(),
+                joined: 0,
+                stop: CancellationToken::new(),
+            });
+        }
+        for slot in ring {
+            inner.insert(*slot, Bytes::from(vec![0u8; 10]));
+        }
+        inner.ring_cap = cap;
+        inner.trim();
+        inner
+    }
+
+    /// **A run is waited on** while a request waits for its making, and
+    /// while it is the first run nobody has asked yet; otherwise another
+    /// request may take its place.
+    #[test]
+    fn a_run_is_unwaited_only_with_nobody_waiting() {
+        let mut inner = inner_with(&[4], &[], usize::MAX);
+        let run = &mut inner.runs[0];
+        assert!(run.unwaited());
+        run.joined = 1;
+        assert!(!run.unwaited());
+        run.joined = 0;
+        run.reserved = true;
+        assert!(!run.unwaited());
+    }
+
+    /// **A run taken in place of is the least recently asked**, and -- for
+    /// a request that may take only an unwaited one -- never one a request
+    /// waits on.
+    #[test]
+    fn the_run_replaced_is_the_least_recently_asked_unwaited() {
+        let mut inner = inner_with(&[4, 30], &[], usize::MAX);
+        let now = Instant::now();
+        inner.runs[0].last_request_at = now - Duration::from_secs(5);
+        inner.runs[1].last_request_at = now;
+        assert_eq!(inner.replaced(false), Some(0));
+        assert_eq!(inner.replaced(true), Some(0));
+        inner.runs[0].joined = 1;
+        assert_eq!(inner.replaced(false), Some(0), "a seek takes any");
+        assert_eq!(inner.replaced(true), Some(1), "not the one waited on");
+        inner.runs[1].joined = 1;
+        assert_eq!(inner.replaced(true), None);
+    }
+
+    /// **The ring keeps what it can hold**, and over its cap drops the
+    /// slots farthest from where any run is asked -- never one a run is
+    /// asked at or within its lookahead.
+    #[test]
+    fn the_ring_drops_the_slots_farthest_from_any_run() {
+        let all = [0, 1, 2, 3, 10, 11, 12, 30];
+        let kept = |cap| {
+            inner_with(&[2, 11], &all, cap)
+                .ring
+                .keys()
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(kept(usize::MAX), all, "under the cap, everything");
+        assert_eq!(kept(60), vec![1, 2, 3, 10, 11, 12], "30 and 0 go first");
+        assert_eq!(kept(1), vec![2, 3, 11, 12], "never what a run is making");
     }
 
     #[test]

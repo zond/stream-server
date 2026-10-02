@@ -53,8 +53,9 @@ pub enum IndexKnob {
     /// film's.
     Proportional,
     /// The same, but the first sync sample at or after `at_us` is put one
-    /// byte before the next: the segment it starts gets almost no bytes of
-    /// the source, and overflows its slot.
+    /// byte before the next (or the source's end, for the last): the
+    /// segment it starts gets almost no bytes of the source, and overflows
+    /// its slot.
     Squeezed { at_us: i64 },
 }
 
@@ -148,8 +149,7 @@ impl Knobs {
             .map(|(at, pts)| IndexEntry {
                 pts_us: *pts,
                 pos: if Some(at) == squeezed {
-                    keys.get(at + 1)
-                        .map_or(place(*pts), |next| place(*next) - 1)
+                    keys.get(at + 1).map_or(len - 1, |next| place(*next) - 1)
                 } else {
                     place(*pts)
                 },

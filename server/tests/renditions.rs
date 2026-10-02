@@ -192,6 +192,15 @@ impl Fixture {
     }
 }
 
+/// A ring that keeps only the slots a run is making: anything read again
+/// is made again.
+fn small_ring() -> RenditionTuning {
+    RenditionTuning {
+        ring_cap: 1,
+        ..RenditionTuning::default()
+    }
+}
+
 fn spec(duration_ms: u64, segment_ms: u32, start_ms: u64) -> RenditionSpec {
     RenditionSpec {
         duration_ms,
@@ -257,7 +266,11 @@ struct Header {
 }
 
 impl Header {
-    /// From the file's first bytes (`head`), the file `total` long.
+    /// From the file's first bytes (`head`), the file `total` long: the
+    /// init segment, then one `sidx` -- the video's, on 90 kHz: a demuxer
+    /// seeking the sound finds its slot by the video's times, the same slot
+    /// -- naming the slots, which begin right after it (so there is no
+    /// other index) and end where the file does.
     fn of(head: &[u8], total: u64) -> Self {
         let size = |at: usize| u32_at(head, at) as usize;
         assert_eq!(&head[4..8], b"ftyp");
@@ -456,9 +469,11 @@ fn cut(knobs: &Knobs, n: i64) -> i64 {
 }
 
 /// What segment `n` must hold, by the cut rule, for `knobs`' film: video
-/// from its cut's key to the next cut's, audio between the cuts.
+/// from its cut's key to the next cut's, audio between the cuts, each the
+/// audio lead (64 ms) early.
 fn expected(knobs: &Knobs, n: i64) -> (Vec<i64>, Vec<i64>) {
     let (from, to) = (cut(knobs, n), cut(knobs, n + 1));
+    let lead = |cut: i64| cut.saturating_sub(64_000);
     let video = knobs
         .video_frames()
         .into_iter()
@@ -468,7 +483,7 @@ fn expected(knobs: &Knobs, n: i64) -> (Vec<i64>, Vec<i64>) {
     let audio = knobs
         .audio_frames()
         .into_iter()
-        .filter(|pts| *pts >= from && *pts < to)
+        .filter(|pts| *pts >= lead(from) && *pts < lead(to))
         .collect();
     (video, audio)
 }
@@ -722,11 +737,6 @@ fn a_run_discards_what_precedes_its_cut() -> anyhow::Result<()> {
             .any(|(track, pts)| *track == TrackKind::Audio && *pts < 5 * T_US),
         "and audio"
     );
-    assert!(
-        fixture.probe(&token).ring.iter().all(|n| *n >= 5),
-        "nothing before the run's segment is made: {:?}",
-        fixture.probe(&token).ring
-    );
     let (want_video, want_audio) = expected(&knobs, 5);
     assert_eq!(want_video.first(), Some(&5_280_000));
     assert_eq!(segment.video_pts(&knobs), want_video);
@@ -741,10 +751,15 @@ fn a_run_discards_what_precedes_its_cut() -> anyhow::Result<()> {
 /// read in order by another run.
 #[test]
 fn every_range_is_the_same_bytes_as_the_whole() -> anyhow::Result<()> {
-    let fixture = Fixture::quick(Knobs {
-        length: Duration::from_millis(12_000),
-        ..Knobs::default()
-    })?;
+    // A ring that keeps only what a run is making, so the ranges below are
+    // made by different runs.
+    let fixture = Fixture::start(
+        Knobs {
+            length: Duration::from_millis(12_000),
+            ..Knobs::default()
+        },
+        small_ring(),
+    )?;
     let token = fixture.publish(12_000, 0)?;
     let header = fixture.header(&token);
     let far = header.slots[9].0 + 100;
@@ -752,7 +767,10 @@ fn every_range_is_the_same_bytes_as_the_whole() -> anyhow::Result<()> {
     let middle = header.slots[3].0 - 7;
     let first = fixture.range(&token, middle - 2_000, middle + 2_000);
     let second = fixture.range(&token, middle, middle + 30_000);
-    let file = fixture.file(&token);
+    // The whole file, as a receiver that chose where to read reads it.
+    let header_len = header.slots[0].0;
+    let mut file = fixture.range(&token, 0, header_len - 1);
+    file.extend(fixture.range(&token, header_len, header.total - 1));
     assert!(file[far as usize..far as usize + 5_001] == far_bytes[..]);
     assert!(file[(middle - 2_000) as usize..=(middle + 2_000) as usize] == first[..]);
     assert!(file[middle as usize..=(middle + 30_000) as usize] == second[..]);
@@ -876,6 +894,94 @@ fn a_read_left_open_does_not_take_the_run_back() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// **Three seeks waiting at once take turns**: with both runs taken, a
+/// seek takes one only on its first look, so the three are made one after
+/// another -- not by runs taken from each other while they wait.
+#[test]
+fn three_seeks_waiting_at_once_take_turns() -> anyhow::Result<()> {
+    let fixture = Fixture::start(
+        Knobs {
+            speed: Some(4.0),
+            ..Knobs::default()
+        },
+        RenditionTuning {
+            idle_release: Duration::from_millis(300),
+            speed_window: Duration::from_secs(3600),
+            ..RenditionTuning::default()
+        },
+    )?;
+    let token = fixture.publish(60_000, 0)?;
+    let header = fixture.header(&token);
+    let (fixture, token, header) = (&fixture, &token, &header);
+    std::thread::scope(|scope| {
+        let reads: Vec<_> = [10usize, 30, 50]
+            .map(|n| {
+                scope.spawn(move || {
+                    let (at, size, _) = header.slots[n];
+                    fixture.range(token, at, at + size - 1)
+                })
+            })
+            .into_iter()
+            .collect();
+        for read in reads {
+            assert_eq!(&read.join().expect("a read")[4..8], b"styp");
+        }
+    });
+    let runs = fixture.probe(token).runs_started;
+    assert!(
+        runs <= 6,
+        "{runs} runs: the seeks took the runs from each other"
+    );
+    Ok(())
+}
+
+/// **Two readers reading on far apart each keep a run**: the receiver's
+/// read at its seek's target and another read walking forward from
+/// earlier (zond's TV, 2026-10-02: a seek to 1:00 and a read on from 0:30
+/// at once). Both read six slots to the end, in turns, and the runs are
+/// the first and one each -- neither takes the other's.
+#[test]
+fn two_readers_reading_on_far_apart_each_keep_a_run() -> anyhow::Result<()> {
+    let fixture = Fixture::start(
+        Knobs {
+            speed: Some(8.0),
+            ..Knobs::default()
+        },
+        RenditionTuning {
+            idle_release: Duration::from_secs(3600),
+            ..RenditionTuning::default()
+        },
+    )?;
+    let token = fixture.publish(60_000, 0)?;
+    let header = fixture.header(&token);
+    let span = |from: usize| {
+        let to = header.slots[from + 5];
+        (header.slots[from].0, to.0 + to.1 - 1)
+    };
+    let (fixture, token) = (&fixture, &token);
+    let bodies: Vec<Vec<u8>> = std::thread::scope(|scope| {
+        [10usize, 40]
+            .map(|from| {
+                let (start, end) = span(from);
+                scope.spawn(move || fixture.range(token, start, end))
+            })
+            .into_iter()
+            .map(|read| read.join().expect("a reader"))
+            .collect()
+    });
+    for (body, from) in bodies.iter().zip([10usize, 40]) {
+        let (start, end) = span(from);
+        assert_eq!(body.len() as u64, end + 1 - start);
+    }
+    let probe = fixture.probe(token);
+    assert!(
+        probe.runs_started <= 3,
+        "{} runs for two readers: they took the runs from each other",
+        probe.runs_started
+    );
+    Ok(())
+}
+
 /// **Two seeks waiting at once take turns, not the run from each other**:
 /// a range at slot 40 waits for the run it moved there; a range at slot 10
 /// moves it again and keeps it; the first waits for that run to be let go
@@ -954,7 +1060,7 @@ fn frames_in(file: &[u8], header: &Header, knobs: &Knobs) -> (Vec<i64>, Vec<i64>
 #[test]
 fn an_overflowing_segment_spills_into_the_next_slot() -> anyhow::Result<()> {
     let knobs = squeezed();
-    let fixture = Fixture::start_with(knobs.clone(), RenditionTuning::default(), SQUEEZED_LEN)?;
+    let fixture = Fixture::start_with(knobs.clone(), small_ring(), SQUEEZED_LEN)?;
     let token = fixture.publish(20_000, 0)?;
     let file = fixture.file(&token);
     let header = Header::of(&file, file.len() as u64);
@@ -1033,12 +1139,35 @@ fn an_overflow_into_a_decided_slot_is_truncated() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// **The last slot cannot spill**: there is no slot after it, so a last
+/// segment that overflows keeps what fits and drops the rest, and the
+/// file still ends where its length says.
+#[test]
+fn an_overflowing_last_slot_is_truncated() -> anyhow::Result<()> {
+    let knobs = Knobs {
+        index: Some(IndexKnob::Squeezed { at_us: 19 * T_US }),
+        ..squeezed()
+    };
+    let fixture = Fixture::start_with(knobs.clone(), RenditionTuning::default(), SQUEEZED_LEN)?;
+    let token = fixture.publish(20_000, 0)?;
+    let file = fixture.file(&token);
+    let header = Header::of(&file, file.len() as u64);
+    let last = header.slots.len() - 1;
+    let probe = fixture.probe(&token);
+    assert_eq!(probe.truncated, vec![last as u64]);
+    assert!(probe.spilled.is_empty());
+    parse_segment(fragment_of(header.slot(&file, last)));
+    Ok(())
+}
+
 // --- Seeks, joins, the lookahead, the idle release -------------------------------
 
-/// **A request far ahead is a seek**: slot 40 after 0-3 starts a new run
-/// there, and the old run's sink answers `Stopped`.
+/// **A request far ahead is a seek, beside the run that is there**: slot
+/// 40 after 0-3 starts a second run at 40 and leaves the first; a third
+/// place, with both runs live, takes the least recently asked -- the
+/// first, whose sink answers `Stopped`.
 #[test]
-fn a_request_far_ahead_starts_a_new_run_and_stops_the_old() -> anyhow::Result<()> {
+fn a_far_request_starts_a_run_and_a_third_takes_the_least_recently_asked() -> anyhow::Result<()> {
     let knobs = Knobs::default();
     let fixture = Fixture::quick(knobs.clone())?;
     let token = fixture.publish(60_000, 0)?;
@@ -1053,10 +1182,15 @@ fn a_request_far_ahead_starts_a_new_run_and_stops_the_old() -> anyhow::Result<()
     let key = knobs.key_at_or_after(40 * T_US).unwrap();
     assert_eq!(runs[1].from, asked_from(key));
     let probe = fixture.probe(&token);
-    assert_eq!(probe.runs_started, 2);
+    assert_eq!((probe.runs_started, probe.live_runs), (2, 2));
     assert_eq!(probe.run_from, Some(40));
-    until("the old run's sink answers Stopped", || runs[0].stopped());
     assert_eq!(segment.track(1).unwrap().tfdt, (key * 90 / 1000) as u64);
+    assert!(!runs[0].stopped(), "the first run is left where it is");
+
+    fixture.segment(&token, 20);
+    until("the first run's sink answers Stopped", || runs[0].stopped());
+    assert!(!runs[1].stopped(), "the run asked last is kept");
+    assert_eq!(fixture.probe(&token).live_runs, 2);
     Ok(())
 }
 
@@ -1187,6 +1321,7 @@ fn unpublish_wakes_a_waiting_range_and_stops_the_producer() -> anyhow::Result<()
         RenditionTuning {
             speed_window: Duration::from_secs(3600),
             idle_release: Duration::from_secs(3600),
+            ..RenditionTuning::default()
         },
     )?;
     let token = fixture.publish(60_000, 0)?;
@@ -1242,6 +1377,7 @@ fn unpublish_breaks_a_body_partway() -> anyhow::Result<()> {
         RenditionTuning {
             speed_window: Duration::from_secs(3600),
             idle_release: Duration::from_secs(3600),
+            ..RenditionTuning::default()
         },
     )?;
     let token = fixture.publish(60_000, 0)?;

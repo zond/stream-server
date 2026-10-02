@@ -2,7 +2,7 @@
 //! the reader, hands the producer its [`Job`], and takes the samples off
 //! the sink's channel -- applying the cut rule ([`Cutter`]), muxing each
 //! segment as it completes and putting it in the ring -- while it judges
-//! the run's speed, stops taking samples once [`LOOKAHEAD`] segments are
+//! the run's speed, stops taking samples once [`LOOKAHEAD`](super::LOOKAHEAD) segments are
 //! ahead of the last request, and lets the run go when it has been idle for
 //! the release period. Dropping the task's channel is what makes the sink
 //! answer [`super::Stopped`]; cancelling the reader is what wakes a
@@ -13,8 +13,7 @@ use super::mux::{self, Formats, MuxSample};
 use super::slots::{self, Cursor, End};
 use super::speed::Speed;
 use super::{
-    IndexEntry, Job, LOOKAHEAD, RING_CAP, Rendition, SINK_CAPACITY, SampleSink, SinkMessage,
-    SinkShown, TrackKind,
+    IndexEntry, Job, Rendition, SINK_CAPACITY, SampleSink, SinkMessage, SinkShown, TrackKind,
 };
 use crate::state::AppState;
 use std::collections::BTreeMap;
@@ -22,6 +21,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+/// How far before a segment's cut its sound begins: an audio frame that
+/// starts this little before the cut is the segment's. More than one AAC
+/// frame at any rate (HE-AAC at 44.1 kHz is 46 ms), so the frame playing
+/// at the sync sample is in the sync sample's fragment.
+pub(crate) const AUDIO_LEAD_US: i64 = 64_000;
 
 /// One segment's samples, as the cut rule assigned them.
 #[derive(Default)]
@@ -43,7 +48,7 @@ pub(crate) struct Cut {
 /// producer wrote them. Segment N begins at the first video sync sample at
 /// or after its cut (`cuts[N]`, from the layout: an indexed sync sample's
 /// time, or N x T); each audio sample goes to the segment whose cuts its
-/// presentation time falls between; what precedes the run's first segment
+/// presentation time falls between, [`AUDIO_LEAD_US`] early; what precedes the run's first segment
 /// is discarded. A segment is complete once video has moved past it (a
 /// later cut) and audio has reached the next cut -- or, for a track the run
 /// does not have, at once.
@@ -90,7 +95,9 @@ impl Cutter {
                 Some(current) if sample.key => current.max(self.segment_of(sample.pts_us)),
                 Some(current) => current,
             },
-            TrackKind::Audio if self.has_audio => self.segment_of(sample.pts_us),
+            TrackKind::Audio if self.has_audio => {
+                self.segment_of(sample.pts_us.saturating_add(AUDIO_LEAD_US))
+            }
             // A track with no format: nothing in the init segment describes
             // it, so nothing can carry it.
             _ => return Vec::new(),
@@ -220,12 +227,9 @@ pub(crate) async fn run(
     };
     {
         let mut inner = rendition.inner();
-        let ours = inner
-            .run
-            .as_ref()
-            .is_some_and(|run| run.generation == generation);
+        let ours = inner.run(generation).is_some();
         if ours {
-            inner.run = None;
+            inner.runs.retain(|run| run.generation != generation);
             if let Outcome::Failed(sentence) = outcome {
                 rendition.fail(&mut inner, sentence);
             }
@@ -302,11 +306,10 @@ impl Making {
                 mux::media_segment(formats, sequence, video, video_next, audio, audio_next)
             };
             let size = self.layout.slots[slot as usize].size;
-            let filled = content.fill(size, rendition.may_spill(slot), &mux);
+            let filled = content.fill(size, &mux);
             // The end the slot was first made with, which says where the
             // next starts: the same prefix whichever it is now.
-            let Some(end) = rendition.publish_slot(generation, slot, filled.end, filled.fragment)
-            else {
+            let Some(end) = rendition.publish_slot(generation, slot, filled) else {
                 return false;
             };
             self.cursor = match end {
@@ -378,17 +381,14 @@ async fn drive(
     loop {
         let (gated, idle_at) = {
             let inner = rendition.inner();
-            let Some(run) = inner
-                .run
-                .as_ref()
-                .filter(|run| run.generation == generation)
-            else {
+            let Some(run) = inner.run(generation) else {
                 return Outcome::Stopped;
             };
             let next_out = making.as_ref().map_or(run.next_out, |making| making.slot);
-            let gated = next_out > inner.last_request + LOOKAHEAD
-                || (inner.ring_bytes >= RING_CAP && next_out > inner.last_request);
-            (gated, inner.idle_at(rendition.tuning.idle_release))
+            (
+                inner.gated(generation, next_out),
+                inner.idle_at(generation, rendition.tuning.idle_release),
+            )
         };
         tokio::select! {
             biased;
@@ -401,7 +401,9 @@ async fn drive(
             } => {
                 // Looked at again under the lock: a request may have come
                 // in, or begun waiting, since the deadline was read.
-                let idle_at = rendition.inner().idle_at(rendition.tuning.idle_release);
+                let idle_at = rendition
+                    .inner()
+                    .idle_at(generation, rendition.tuning.idle_release);
                 if idle_at.is_some_and(|at| Instant::now() >= at) {
                     return Outcome::Released;
                 }
@@ -594,7 +596,8 @@ mod tests {
     }
 
     /// **Cuts from an index**: segment 1 begins at the indexed key at
-    /// 1.2 s, and audio before it is segment 0's, whatever the grid says.
+    /// 1.2 s, and audio before it (by more than the lead) is segment 0's,
+    /// whatever the grid says.
     #[test]
     fn indexed_cuts_are_where_segments_begin() {
         let cuts: Arc<[i64]> = vec![i64::MIN, 1_200_000, 2_400_000].into();
@@ -613,8 +616,9 @@ mod tests {
             vec![0, 200_000, 400_000, 600_000, 800_000, 1_000_000]
         );
         assert_eq!(pts(&out[1].video).first(), Some(&1_200_000));
-        assert_eq!(pts(&out[0].audio).last(), Some(&1_199_999));
-        assert_eq!(pts(&out[1].audio).first(), Some(&1_399_999));
+        // The frame 1 us before the cut is within the lead: segment 1's.
+        assert_eq!(pts(&out[0].audio).last(), Some(&999_999));
+        assert_eq!(pts(&out[1].audio).first(), Some(&1_199_999));
     }
 
     /// **A segment waits for its audio**: video moving past the next cut
@@ -633,6 +637,42 @@ mod tests {
         out.extend(cutter.push(TrackKind::Audio, sample(1_000_000, true)));
         assert_eq!(out.len(), 1);
         assert_eq!(pts(&out[0].audio), vec![0, 800_000]);
+    }
+
+    /// **A segment's sound begins at or before its picture**: the audio
+    /// frame playing at the cut is the segment's, not the one before's --
+    /// a demuxer seeking every stream to the sync sample's time looks for
+    /// sound at or before it in the same fragment, and finding none goes
+    /// back to the last it read (FFmpeg n6's `mov_read_seek`, measured).
+    #[test]
+    fn a_segments_sound_begins_at_or_before_its_sync_sample() {
+        let cuts: Arc<[i64]> = vec![i64::MIN, 1_000_000, 2_000_000].into();
+        let mut cutter = Cutter::new(cuts, 0, true, true);
+        let mut out = Vec::new();
+        // Audio frames every 21.333 ms from -5 ms; keys every 500 ms.
+        let mut audio = (0..).map(|n| n * 21_333 - 5_000).peekable();
+        for frame in 0..60i64 {
+            let pts = frame * 40_000;
+            while audio.peek().is_some_and(|at| *at <= pts) {
+                out.extend(cutter.push(TrackKind::Audio, sample(audio.next().unwrap(), true)));
+            }
+            out.extend(cutter.push(TrackKind::Video, sample(pts, pts % 500_000 == 0)));
+        }
+        assert!(out.len() >= 2);
+        for cut in &out[1..] {
+            let key = cut.video[0].pts_us;
+            let sound = cut.audio[0].pts_us;
+            assert!(
+                sound <= key,
+                "segment {}: sound from {sound}, picture from {key}",
+                cut.index
+            );
+            assert!(
+                key - sound < AUDIO_LEAD_US,
+                "segment {}: no more than the lead",
+                cut.index
+            );
+        }
     }
 
     /// A GOP longer than T leaves the segment between empty.
