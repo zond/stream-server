@@ -840,6 +840,83 @@ fn opening_the_file_does_not_move_the_run_from_the_start() -> anyhow::Result<()>
     Ok(())
 }
 
+/// **Two reads far apart do not take the run from each other**: a body
+/// reading on from slot 2 that its client stopped taking (`ffprobe` keeps
+/// its first connection open while it seeks on a second), and a range at
+/// slot 40. The range moves the run at most once; the body reading on
+/// waits for it rather than move it back.
+#[test]
+fn a_read_left_open_does_not_take_the_run_back() -> anyhow::Result<()> {
+    let fixture = Fixture::start(
+        Knobs::default(),
+        RenditionTuning {
+            idle_release: Duration::from_secs(3600),
+            ..RenditionTuning::default()
+        },
+    )?;
+    let token = fixture.publish(60_000, 0)?;
+    let header = fixture.header(&token);
+    let mut left_open = fixture.get(&token, Some(format!("bytes={}-", header.slots[2].0)));
+    let mut first = [0u8; 8];
+    std::io::Read::read_exact(&mut left_open, &mut first)?;
+    assert_eq!(&first[4..], b"styp");
+    let (at, size, _) = header.slots[40];
+    let far = fixture.range(&token, at, at + size - 1);
+    assert_eq!(&far[4..8], b"styp");
+    let probe = fixture.probe(&token);
+    assert!(
+        probe.runs_started <= 3,
+        "{} runs: the reads took the run from each other",
+        probe.runs_started
+    );
+    drop(left_open);
+    Ok(())
+}
+
+/// **Two seeks waiting at once take turns, not the run from each other**:
+/// a range at slot 40 waits for the run it moved there; a range at slot 10
+/// moves it again and keeps it; the first waits for that run to be let go
+/// -- not while the second still waits on it -- and then has a run of its
+/// own, counted from its own slot.
+#[test]
+fn two_seeks_waiting_at_once_take_turns() -> anyhow::Result<()> {
+    let fixture = Fixture::start(
+        Knobs {
+            speed: Some(4.0),
+            ..Knobs::default()
+        },
+        RenditionTuning {
+            idle_release: Duration::from_millis(300),
+            ..RenditionTuning::default()
+        },
+    )?;
+    let token = fixture.publish(60_000, 0)?;
+    let header = fixture.header(&token);
+    let slot = |n: usize| {
+        let (at, size, _) = header.slots[n];
+        (at, at + size - 1)
+    };
+    let (fixture, token) = (&fixture, &token);
+    let (far, near) = std::thread::scope(|scope| {
+        let (from, to) = slot(40);
+        let far = scope.spawn(move || fixture.range(token, from, to));
+        until("the far range's run is at slot 40", || {
+            fixture.probe(token).run_from == Some(40)
+        });
+        let (from, to) = slot(10);
+        let near = fixture.range(token, from, to);
+        (far.join().expect("the far range"), near)
+    });
+    assert_eq!(&far[4..8], b"styp");
+    assert_eq!(&near[4..8], b"styp");
+    let runs = fixture.probe(token).runs_started;
+    assert!(
+        runs <= 4,
+        "{runs} runs: the seeks took the run from each other"
+    );
+    Ok(())
+}
+
 // --- The overflow rule -------------------------------------------------------------
 
 /// Knobs whose segments overflow the slot an index squeezed: frames big

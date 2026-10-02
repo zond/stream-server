@@ -41,12 +41,15 @@
 //!   the slot in production or at most [`LOOKAHEAD`](crate::rendition::LOOKAHEAD) past it (and joins that
 //!   production, never restarts it); or is a seek: the run is dropped and a
 //!   new one starts at N -- except the receiver's opening read, which does
-//!   not move the first run ([`Ask::Open`](crate::rendition::Ask::Open)).
+//!   not move the first run, and a read never takes the run back from a later
+//!   one ([`Ask`](crate::rendition::Ask)).
 //! * **The lookahead blocks the producer**: a run completes at most
 //!   [`LOOKAHEAD`](crate::rendition::LOOKAHEAD) slots past the last request, then stops reading its
 //!   sink, and the producer's next write blocks.
-//! * **An idle run is let go** after [`IDLE_RELEASE`](crate::rendition::IDLE_RELEASE) without a request; the
-//!   ring is kept and the next request starts a new run where it asks.
+//! * **An idle run is let go** after [`IDLE_RELEASE`](crate::rendition::IDLE_RELEASE) without a request,
+//!   and never while a request waits for it to make a slot (a source that
+//!   stalls is waited for, however long); the ring is kept and the next
+//!   request starts a new run where it asks.
 //! * **The first run's formats are frozen** into the init segment; a later run
 //!   whose formats differ fails the rendition.
 //! * **A run slower than real time fails the rendition with a sentence**:
@@ -441,19 +444,62 @@ pub enum NotServed {
     Cut,
 }
 
-/// What a request for a slot is (`docs/design/renditions.md`, "Seeking by
-/// bytes").
+/// What a request for a slot is (`docs/design/renditions.md` §2.8). **The
+/// latest asker wins**: a request moves the run to its slot only when it
+/// first looks -- and then only a [`Ask::Seek`], or an [`Ask::Open`] while
+/// no read has asked the first run for a slot -- and otherwise waits for
+/// the run that is making something else, or for none to be live, when it
+/// starts one. Two reads far apart (a client that keeps one connection open
+/// while it seeks on another) never take the run from each other in turn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ask {
-    /// A read the receiver chose: a range that begins in the slot, or one
-    /// read on into it. It may move the run there.
+    /// The first slot of a range the receiver chose: it may move the run
+    /// there.
     Seek,
+    /// A range read on into its next slot: it never moves a live run.
+    Continue,
     /// The receiver opening the file: a read from the header on, into the
     /// first slot it reaches without having chosen it. It does not move the
     /// first run -- started at the spec's start, where the receiver was told
-    /// to play and is about to seek -- before any read has asked for a
-    /// slot; it waits for that run instead, or for none to be live.
+    /// to play and is about to seek -- before any read has asked that run
+    /// for a slot.
     Open,
+}
+
+/// A request counted in [`Inner::joined`] while it waits for the live run
+/// to make its slot; uncounted when it stops waiting, however it stops.
+struct Joined {
+    rendition: Arc<Rendition>,
+    counted: bool,
+}
+
+impl Drop for Joined {
+    fn drop(&mut self) {
+        if self.counted {
+            self.rendition.inner().joined -= 1;
+            // A run waiting for the count to fall looks again.
+            self.rendition.bump();
+        }
+    }
+}
+
+impl Ask {
+    /// What a range asks for the slot after this one: it reads on into it.
+    pub(crate) fn then(self) -> Self {
+        Ask::Continue
+    }
+
+    /// Whether a request may start a run at its slot (when the slot is not
+    /// in the ring nor in production): on its `first` look or later, with
+    /// the live run's `reserved` flag, or `None` with no run live.
+    fn moves(self, first: bool, live: Option<bool>) -> bool {
+        match (self, live) {
+            (_, None) => true,
+            (Ask::Seek, Some(_)) => first,
+            (Ask::Open, Some(reserved)) => first && !reserved,
+            (Ask::Continue, Some(_)) => false,
+        }
+    }
 }
 
 /// The live run, as a request sees it.
@@ -503,7 +549,7 @@ impl SlotPlan {
     }
 }
 
-struct Inner {
+pub(crate) struct Inner {
     formats: Option<mux::Formats>,
     layout: Option<Arc<layout::Layout>>,
     /// Each slot's fragment, by slot; the padding is not kept.
@@ -515,6 +561,10 @@ struct Inner {
     last_request: u64,
     last_request_at: Instant,
     runs_started: u64,
+    /// Requests waiting for the live run to make their slot: while any is,
+    /// the run is not idle, however long the making takes (a source that
+    /// stalls is waited for).
+    joined: usize,
 }
 
 impl Inner {
@@ -543,6 +593,12 @@ impl Inner {
                 self.ring_bytes -= bytes.len();
             }
         }
+    }
+
+    /// When the live run is idle: `release` after the last request -- or
+    /// never, while a request waits for it to make a slot.
+    pub(crate) fn idle_at(&self, release: Duration) -> Option<Instant> {
+        (self.joined == 0).then(|| self.last_request_at + release)
     }
 
     fn insert(&mut self, slot: u64, bytes: Bytes) {
@@ -603,6 +659,7 @@ impl Rendition {
                 last_request: 0,
                 last_request_at: Instant::now(),
                 runs_started: 0,
+                joined: 0,
             }),
             version: watch::channel(0).0,
         })
@@ -703,8 +760,10 @@ impl Rendition {
         let (from_us, from_slot) = match (slot, inner.layout.clone()) {
             (Some(slot), Some(layout)) => {
                 // A run is started here: the slot's start is decided now, if
-                // the slot before has not decided it.
+                // the slot before has not decided it, and the lookahead is
+                // counted from it -- whoever asked last.
                 inner.plan.fixed.insert(slot);
+                inner.note_request(slot, Instant::now());
                 let anchor = inner.plan.start(slot).anchor();
                 let from = if anchor == 0 {
                     0
@@ -895,8 +954,8 @@ impl Rendition {
     }
 
     /// **Slot `slot`'s fragment**: from the ring, after the production it
-    /// joins, or from a new run started at it -- except that an
-    /// [`Ask::Open`] waits for the first run rather than move it ([`Ask`]).
+    /// joins, or from a new run started at it -- when [`Ask`] lets this
+    /// request move the run; otherwise after the run elsewhere is done.
     pub(crate) async fn slot(
         self: &Arc<Self>,
         state: &AppState,
@@ -905,7 +964,11 @@ impl Rendition {
     ) -> Result<Bytes, NotServed> {
         let mut seen = self.version.subscribe();
         let mut noted = false;
-        let mut deferring = false;
+        let mut first = true;
+        let mut joined = Joined {
+            rendition: self.clone(),
+            counted: false,
+        };
         loop {
             {
                 let mut inner = self.inner();
@@ -924,17 +987,17 @@ impl Rendition {
                     .run
                     .as_ref()
                     .is_some_and(|run| slot >= run.next_out && slot <= run.next_out + LOOKAHEAD);
-                // Once an opening read has waited for the first run, it
-                // goes on waiting while any run is live: the receiver's
-                // jump to its start has asked for that run by then.
-                deferring = ask == Ask::Open
-                    && !in_ring
-                    && !joins
-                    && inner
-                        .run
-                        .as_ref()
-                        .is_some_and(|run| deferring || run.reserved);
-                if !deferring {
+                let moves = ask.moves(first, inner.run.as_ref().map(|run| run.reserved));
+                first = false;
+                if joins != joined.counted {
+                    if joins {
+                        inner.joined += 1;
+                    } else {
+                        inner.joined -= 1;
+                    }
+                    joined.counted = joins;
+                }
+                if in_ring || joins || moves {
                     if !noted {
                         noted = true;
                         inner.note_request(slot, Instant::now());
@@ -981,6 +1044,28 @@ mod tests {
             video: VideoPlan::Copy,
             audio: AudioPlan::Copy,
             audio_track: 0,
+        }
+    }
+
+    /// **The latest asker wins**: with no run live anyone starts one; a
+    /// seek moves a live run on its first look only; an opening read never
+    /// moves the first run before a read asked it for a slot, and otherwise
+    /// as a seek; a read on into the next slot never moves a live run.
+    #[test]
+    fn only_a_first_look_moves_a_live_run() {
+        for ask in [Ask::Seek, Ask::Continue, Ask::Open] {
+            assert!(ask.moves(true, None) && ask.moves(false, None), "{ask:?}");
+        }
+        assert!(Ask::Seek.moves(true, Some(false)));
+        assert!(Ask::Seek.moves(true, Some(true)));
+        assert!(!Ask::Seek.moves(false, Some(false)));
+        assert!(Ask::Open.moves(true, Some(false)));
+        assert!(!Ask::Open.moves(true, Some(true)));
+        assert!(!Ask::Open.moves(false, Some(false)));
+        assert!(!Ask::Continue.moves(true, Some(false)));
+        assert!(!Ask::Continue.moves(true, Some(true)));
+        for ask in [Ask::Seek, Ask::Continue, Ask::Open] {
+            assert_eq!(ask.then(), Ask::Continue, "a range reads on from {ask:?}");
         }
     }
 

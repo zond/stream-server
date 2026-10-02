@@ -349,9 +349,9 @@ struct FileReader {
     end: u64,
     /// The first slot's fragment, when the answer waited for it.
     first: Option<(u64, Bytes)>,
-    /// What the next fragment is asked as: the first slot of a read from
-    /// the header on is the receiver opening the file; every other slot it
-    /// chose.
+    /// What the next fragment is asked as: the range's first slot is the
+    /// receiver's choice (or, from the header on, its opening read), the
+    /// rest are read on into.
     ask: Ask,
 }
 
@@ -396,7 +396,7 @@ impl FileReader {
                 }
             }
         };
-        self.ask = Ask::Seek;
+        self.ask = self.ask.then();
         let bytes = slot_bytes(&fragment, place.size, from, to);
         self.next += to + 1 - from;
         Some(Ok(bytes))
@@ -447,9 +447,10 @@ fn slot_bytes(fragment: &Bytes, size: u64, from: u64, to: u64) -> Bytes {
 ///
 /// Each later slot is asked for as the receiver takes the bytes before it,
 /// so a receiver that pauses stops asking and the run's lookahead holds
-/// the producer. A slot a read asks for may move the run there, except
-/// the first slot of a read from the header on, which waits for the first
-/// run rather than move it ([`Ask`]). The last bytes of a slot are always zeros and are
+/// the producer. The first slot a range asks for may move the run there --
+/// except a read from the header on, the receiver opening the file, which
+/// waits for the first run rather than move it; the slots a range reads on
+/// into never move a live run ([`Ask`]: the latest asker wins). The last bytes of a slot are always zeros and are
 /// answered without asking for anything. No timer ends a body: a slot that
 /// is slow to come is waited for. The cut (unpublish, the listener's stop)
 /// and a rendition that fails partway break the body with an error.

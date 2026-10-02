@@ -97,8 +97,11 @@ slot's cut (so a run started there makes exactly what one passing through
 makes) -- except the receiver's opening read, which reads from the header
 on into the first slot without having chosen it, and does not move the
 first run (made at the spec's start, where the receiver is about to seek).
-A run nobody has asked anything of for a minute is let go (the slots made
-are kept). A run that makes less than its own time in film over ten
+The latest asker wins: a range moves the run only when it first asks, a
+range read on into its next slots never does, and one whose run was taken
+elsewhere waits for that run to be let go. A run nobody has asked anything
+of for a minute is let go (the slots made are kept) -- never while a
+request waits for it to make a slot. A run that makes less than its own time in film over ten
 seconds of its own work -- leaving out the time it waited for the receiver
 and for the source -- fails the rendition with a sentence, which
 `ServerHandle::rendition_state(&CastToken)` reports

@@ -388,16 +388,21 @@ async fn drive(
             let next_out = making.as_ref().map_or(run.next_out, |making| making.slot);
             let gated = next_out > inner.last_request + LOOKAHEAD
                 || (inner.ring_bytes >= RING_CAP && next_out > inner.last_request);
-            (gated, inner.last_request_at + rendition.tuning.idle_release)
+            (gated, inner.idle_at(rendition.tuning.idle_release))
         };
         tokio::select! {
             biased;
             () = stop.cancelled() => return Outcome::Stopped,
-            () = tokio::time::sleep_until(idle_at.into()) => {
+            () = async {
+                match idle_at {
+                    Some(at) => tokio::time::sleep_until(at.into()).await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 // Looked at again under the lock: a request may have come
-                // in since the deadline was read.
-                let inner = rendition.inner();
-                if Instant::now() >= inner.last_request_at + rendition.tuning.idle_release {
+                // in, or begun waiting, since the deadline was read.
+                let idle_at = rendition.inner().idle_at(rendition.tuning.idle_release);
+                if idle_at.is_some_and(|at| Instant::now() >= at) {
                     return Outcome::Released;
                 }
             }

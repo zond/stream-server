@@ -633,13 +633,22 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   before the spec's start, so it makes the slot the receiver will jump to.
   A range that begins in a slot waits for that slot's fragment before it
   answers (a failure is a `503`); one that begins in the header answers at
-  once. The slot a read asks for moves the run there if it is not the slot
-  in production or within the lookahead -- **except the receiver's opening
-  read**, from the header on into slot 0, which it never chose: it waits
-  for the first run rather than move it, until a read has asked that run
-  for a slot (the receiver's jump to the start, which joins it). The
-  lookahead, the ring, the idle release, the speed rule and the absence
-  of any give-up timer (a stalled source is waited for) are unchanged.
+  once. **The latest asker wins**: the first slot a range asks for moves
+  the run there, on its first look only, if it is not the slot in
+  production or within the lookahead; a request that finds the run moved
+  elsewhere later waits for it to be let go, and the slots a range reads
+  on into never move a live run -- so two reads far apart (`ffprobe` keeps
+  its first connection open while it seeks on a second) never take the run
+  from each other in turn, which they did, millions of times, before this
+  rule. **The receiver's opening read**, from the header on into slot 0,
+  which it never chose, does not move the first run until a read has asked
+  that run for a slot (the receiver's jump to the start, which joins it).
+  A run started at a slot counts the lookahead from it. **A run is never
+  let go while a request waits for it to make a slot**, however long the
+  making takes -- before, a source that stalled past the idle release
+  restarted its run from scratch every minute. The lookahead, the ring,
+  the speed rule and the absence of any give-up timer (a stalled source is
+  waited for) are otherwise unchanged.
 * **The app** (xtremio) loads `stream.mp4` with the receiver told to start
   at the phone's position, and a seek on the phone is a plain `SEEK` to
   the receiver again; the reload and the undo of the receiver's restarts
