@@ -43,6 +43,14 @@ pub(crate) const SLOT_BASE: u64 = 8 * 1024;
 pub(crate) const HEADROOM_DIVISOR: u64 = 64;
 /// How much larger than the source's average an estimated slot is.
 pub(crate) const ESTIMATE_SLACK_PERCENT: u64 = 15;
+/// How much later than its cut an estimated slot's time in the `sidx` is:
+/// the longest GOP assumed. An estimated segment begins at the first sync
+/// sample at or after its cut -- up to a GOP after it -- and a demuxer that
+/// picks the slot whose time is at or before a target must find a sync
+/// sample at or before the target in it, or it falls back to what it read
+/// before and decodes forward from there (Chrome did, from 24 s to 5:00, on
+/// zond's 10-minute film as a transport stream).
+pub(crate) const ESTIMATE_LABEL_LATE_US: i64 = 10_000_000;
 /// The bytes at the end of every slot that are always zero.
 pub(crate) const TAIL_ZEROS: u64 = 16;
 /// The least room a fragment leaves in its slot: a `free` box's header and
@@ -70,6 +78,11 @@ pub(crate) struct Plan {
     pub cuts: Vec<i64>,
     /// Where the first segment's video begins, for the `sidx`.
     pub first_us: i64,
+    /// How much later than its cut each later slot's time in the `sidx` is
+    /// ([`ESTIMATE_LABEL_LATE_US`] for an estimate: its segment's real
+    /// start is not known; none mirrored, where the cut is the sync
+    /// sample).
+    pub label_late_us: i64,
     /// Each slot's length in bytes.
     pub sizes: Vec<u64>,
     /// Mirrored from an index (or estimated).
@@ -125,6 +138,7 @@ impl Plan {
         Self {
             cuts,
             first_us: chosen[0].pts_us.max(0),
+            label_late_us: 0,
             sizes,
             exact: true,
         }
@@ -153,6 +167,7 @@ impl Plan {
         Self {
             cuts,
             first_us: 0,
+            label_late_us: ESTIMATE_LABEL_LATE_US,
             sizes,
             exact: false,
         }
@@ -253,7 +268,8 @@ impl Layout {
                 if k == 0 {
                     earliest
                 } else {
-                    mux::ticks(plan.cuts[k], timescale).clamp(earliest, end)
+                    mux::ticks(plan.cuts[k].saturating_add(plan.label_late_us), timescale)
+                        .clamp(earliest, end)
                 }
             })
             .collect();
@@ -501,6 +517,7 @@ mod tests {
         let plan = |count: usize, size: u64| Plan {
             cuts: vec![i64::MIN; count],
             first_us: 0,
+            label_late_us: 0,
             sizes: vec![size; count],
             exact: false,
         };
@@ -509,6 +526,31 @@ mod tests {
         assert!(layout(plan(65_536, 100)).is_err());
         assert!(layout(plan(2, (1 << 31) - 1)).is_ok());
         assert!(layout(plan(2, 1 << 31)).is_err());
+    }
+
+    /// **An estimated slot's time in the `sidx` is a GOP late**: its segment
+    /// begins at the first sync sample at or after the cut, so the slot a
+    /// demuxer picks for a time must be one that began before it. The times
+    /// stop at the film's end.
+    #[test]
+    fn an_estimated_slot_is_labelled_a_gop_after_its_cut() {
+        let plan = Plan::new(None, 1_000_000, 30_000_000, 6 * T);
+        let layout = Layout::new(Bytes::new(), plan, 1, 1000, 30_000_000).unwrap();
+        let sidx = &layout.header[..];
+        let durations: Vec<u32> = (0..5).map(|k| u32_at(sidx, 40 + k * 12 + 4)).collect();
+        // Slot 0 from 0 to 16 s, slot 1 from 16 to 22, ..., slot 3 from 28
+        // to the end at 30, slot 4 from the end.
+        assert_eq!(durations, vec![16_000, 6_000, 6_000, 2_000, 0]);
+        let mirrored = Plan::new(
+            Some(&[entry(0, 0), entry(6 * T + 40_000, 500), entry(12 * T, 900)]),
+            1_000,
+            12 * T,
+            6 * T,
+        );
+        assert_eq!(
+            mirrored.label_late_us, 0,
+            "a mirrored cut is the sync sample"
+        );
     }
 
     /// A run handed samples from a time makes whole the first slot cut at or

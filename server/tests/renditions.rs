@@ -605,7 +605,8 @@ fn the_sidx_mirrors_the_sources_index() -> anyhow::Result<()> {
 }
 
 /// **Without an index the layout is estimated**: slots on the grid, in
-/// proportion to time over the source, 15% larger and a base on top.
+/// proportion to time over the source, 15% larger and a base on top, each
+/// labelled in the `sidx` a GOP after its cut.
 #[test]
 fn without_an_index_the_slots_are_estimated() -> anyhow::Result<()> {
     let fixture = Fixture::quick(Knobs {
@@ -621,7 +622,9 @@ fn without_an_index_the_slots_are_estimated() -> anyhow::Result<()> {
     for (k, (_, size, duration)) in header.slots.iter().enumerate() {
         let k = k as u64;
         assert_eq!(*size, scaled(k + 1) - scaled(k) + 8 * 1024, "slot {k}");
-        assert_eq!(*duration, 90_000);
+        // A GOP late (10 s), at the film's end at the latest: the first
+        // slot to the end, the rest none.
+        assert_eq!(*duration, if k == 0 { 900_000 } else { 0 }, "slot {k}");
     }
     let file = fixture.file(&token);
     for n in 0..10 {

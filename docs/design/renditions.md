@@ -609,7 +609,16 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
 * **Without one, the slots are estimated**: segments on the `k x T` grid
   (a segment's real start may be up to a GOP later, which the `tfdt`
   says), slot `k` in proportion to time over the source's size, **15%**
-  larger and 8 KiB on top.
+  larger and 8 KiB on top. The `sidx` labels an estimated slot **10 s
+  after its cut** (the longest GOP assumed), so the slot a demuxer picks
+  for a time began before it: labelled at the cut, Chrome picked a slot
+  whose first sync sample was after the target, found none at or before
+  it, and decoded forward from the start of what it had read -- 24 s to
+  5:00 on zond's 10-minute film as a transport stream (headless Chrome,
+  `tool/rendition-video`). Labelled late, the same seek is one far
+  `Range`; the demuxer starts at the slot's last sync sample before the
+  target, a few seconds of decoding at most. `ffprobe` did not show this:
+  it seeks to the target in either.
 * **The overflow rule** (`slots.rs`). A segment whose fragment does not
   leave 24 bytes of its slot (a `free` header and a zero tail) keeps the
   longest prefix that fits -- cut in decode order only where nothing kept

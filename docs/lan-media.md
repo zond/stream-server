@@ -79,7 +79,9 @@ sync sample at or after `n x T`, and its slot is as long as the source's
 bytes from that sync sample to the next segment's, plus a little headroom
 (8 KiB and a 64th); without one (a transport stream, an MKV with no cues)
 the slots are **estimated**: on the `n x T` grid, in proportion to time
-over the source's size, 15% larger and 8 KiB on top. A segment holds the
+over the source's size, 15% larger and 8 KiB on top, each
+labelled in the `sidx` 10 s after its cut (its first sync sample may be
+up to a GOP late). A segment holds the
 video from its sync sample to the next segment's and the audio between
 the two cuts. One that does not fit its slot keeps what fits and
 **spills** the rest into the next slot -- or, when the next slot is
