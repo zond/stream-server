@@ -969,8 +969,14 @@ impl Rendition {
                     layout::Plan::new(index, source_len, self.duration_us(), self.segment_us());
                 let (track, timescale) = formats.indexed_track();
                 let layout = Arc::new(
-                    layout::Layout::new(init, plan, track, timescale, self.duration_us())
-                        .map_err(run::Frozen::Failed)?,
+                    layout::Layout::new(
+                        init,
+                        plan,
+                        (track, timescale),
+                        formats.sound_beside_picture(),
+                        self.duration_us(),
+                    )
+                    .map_err(run::Frozen::Failed)?,
                 );
                 tracing::info!(
                     exact = layout.exact,

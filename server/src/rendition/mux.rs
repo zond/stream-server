@@ -46,6 +46,12 @@ impl Formats {
         if self.video.is_some() { 2 } else { 1 }
     }
 
+    /// The sound's track when there is a picture too: the one an estimated
+    /// layout indexes again, early (see [`super::layout::Layout::new`]).
+    pub(crate) fn sound_beside_picture(&self) -> Option<u32> {
+        (self.video.is_some() && self.audio.is_some()).then(|| self.audio_track_id())
+    }
+
     /// The track the `sidx` indexes, and its clock: the video's, or the
     /// sound's when there is no picture.
     pub(crate) fn indexed_track(&self) -> (u32, u32) {
@@ -56,11 +62,30 @@ impl Formats {
         }
     }
 
+    /// The sound's clock: the picture's when there is one, so that every
+    /// track counts time alike, or else its sample rate. FFmpeg before 6.0
+    /// (commit e1e981c, 2022) places a track the `sidx` does not index by
+    /// comparing its seek time against the indexed track's times unscaled:
+    /// with sound on 48 kHz and picture on 90 kHz, a seek to 85 s placed
+    /// the sound at 45 s, and the Chromecast read on from there.
     fn audio_timescale(&self) -> u32 {
+        if self.video.is_some() {
+            VIDEO_TIMESCALE
+        } else {
+            self.audio_sample_rate()
+        }
+    }
+
+    fn audio_sample_rate(&self) -> u32 {
         match &self.audio {
             Some(TrackFormat::Aac { sample_rate, .. }) => (*sample_rate).max(1),
             _ => 48_000,
         }
+    }
+
+    /// One AAC frame (1024 samples) on the sound's clock.
+    fn audio_frame_ticks(&self) -> u64 {
+        1024 * u64::from(self.audio_timescale()) / u64::from(self.audio_sample_rate())
     }
 }
 
@@ -642,17 +667,23 @@ pub(crate) fn init_segment(formats: &Formats, duration_ms: u64) -> Result<Bytes,
 
 /// The segment index (`sidx`, version 1): one reference per slot of the
 /// file, on `track`'s clock (`timescale`), the first starting at
-/// `earliest` and right after this box (`first_offset` 0). Each reference
+/// `earliest` and `first_offset` bytes after this box. Each reference
 /// is `(size, duration)`: a media reference of `size` bytes and
 /// `duration` ticks that starts with a stream access point of unknown type
 /// -- what FFmpeg's MP4 demuxer (the one in a Cast receiver's Chrome) reads
 /// to jump to the slot that holds a time with one `Range`.
-pub(crate) fn sidx(track: u32, timescale: u32, earliest: u64, refs: &[(u32, u32)]) -> Vec<u8> {
+pub(crate) fn sidx(
+    track: u32,
+    timescale: u32,
+    earliest: u64,
+    first_offset: u64,
+    refs: &[(u32, u32)],
+) -> Vec<u8> {
     let mut body = Vec::with_capacity(28 + refs.len() * 12);
     body.extend_from_slice(&track.to_be_bytes());
     body.extend_from_slice(&timescale.to_be_bytes());
     body.extend_from_slice(&earliest.to_be_bytes());
-    body.extend_from_slice(&0u64.to_be_bytes()); // first_offset
+    body.extend_from_slice(&first_offset.to_be_bytes());
     body.extend_from_slice(&0u16.to_be_bytes()); // reserved
     body.extend_from_slice(&(refs.len() as u16).to_be_bytes());
     for &(size, duration) in refs {
@@ -726,14 +757,20 @@ fn lay_video(samples: &[MuxSample], next_pts: Option<i64>, hevc: bool) -> Laid {
     }
 }
 
-fn lay_audio(track_id: u32, timescale: u32, samples: &[MuxSample], next_pts: Option<i64>) -> Laid {
+fn lay_audio(
+    track_id: u32,
+    timescale: u32,
+    frame_ticks: u64,
+    samples: &[MuxSample],
+    next_pts: Option<i64>,
+) -> Laid {
     let pts: Vec<u64> = samples
         .iter()
         .map(|sample| ticks(sample.pts_us, timescale))
         .collect();
     let next = next_pts.map(|pts| ticks(pts, timescale));
     let mut entries = Vec::with_capacity(samples.len());
-    let mut last_duration = 1024u64;
+    let mut last_duration = frame_ticks;
     for (index, sample) in samples.iter().enumerate() {
         let duration = match pts.get(index + 1) {
             Some(following) if *following > pts[index] => following - pts[index],
@@ -801,6 +838,7 @@ pub(crate) fn media_segment(
         laid.push(lay_audio(
             formats.audio_track_id(),
             formats.audio_timescale(),
+            formats.audio_frame_ticks(),
             audio,
             audio_next,
         ));
@@ -937,6 +975,49 @@ mod tests {
         assert_eq!(durations, vec![3600, 3600, 3600, 3600]);
         assert_eq!(laid.entries[0].2, 0x0200_0000);
         assert_eq!(laid.entries[1].2, 0x0101_0000);
+    }
+
+    /// Beside a picture the sound counts on the picture's clock: one AAC
+    /// frame with nothing after it lasts 1024 samples there (1920 ticks of
+    /// 90 kHz at 48 kHz); alone it keeps its sample rate.
+    #[test]
+    fn the_sound_counts_on_the_pictures_clock() {
+        let aac = |sample_rate| TrackFormat::Aac {
+            sample_rate,
+            channels: 2,
+            csd0: Bytes::from_static(&[0x11, 0x90]),
+        };
+        let picture = Some(TrackFormat::H264 {
+            width: 320,
+            height: 240,
+            csd0: Bytes::from_static(X264_SPS),
+            csd1: Bytes::from_static(X264_PPS),
+        });
+        let both = Formats {
+            video: picture,
+            audio: Some(aac(48_000)),
+        };
+        assert_eq!(both.audio_timescale(), VIDEO_TIMESCALE);
+        assert_eq!(both.audio_frame_ticks(), 1920);
+        let laid = lay_audio(
+            2,
+            both.audio_timescale(),
+            both.audio_frame_ticks(),
+            &[MuxSample {
+                pts_us: 1_000_000,
+                key: true,
+                data: Bytes::from_static(&[1]),
+            }],
+            None,
+        );
+        assert_eq!(laid.base, 90_000);
+        assert_eq!(laid.entries[0].0, 1920);
+        let alone = Formats {
+            video: None,
+            audio: Some(aac(44_100)),
+        };
+        assert_eq!(alone.audio_timescale(), 44_100);
+        assert_eq!(alone.audio_frame_ticks(), 1024);
     }
 
     /// The `trun`'s data offsets point at each track's bytes in the `mdat`.

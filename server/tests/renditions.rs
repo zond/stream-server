@@ -165,7 +165,9 @@ impl Fixture {
         let moov = u64::from(u32_at(&self.range(token, ftyp, ftyp + 7), 0));
         let sidx = self.range(token, ftyp + moov, ftyp + moov + 39);
         let count = u64::from(u16::from_be_bytes([sidx[38], sidx[39]]));
-        let len = ftyp + moov + 40 + 12 * count;
+        // A second `sidx` (the sound's) follows when the first says so.
+        let after = u64::from_be_bytes(sidx[28..36].try_into().unwrap());
+        let len = ftyp + moov + 40 + 12 * count + after;
         Header::of(&self.range(token, 0, len - 1), total)
     }
 
@@ -262,15 +264,19 @@ struct Header {
     earliest: u64,
     /// `(offset, size, duration)` per slot.
     slots: Vec<(u64, u64, u32)>,
+    /// The sound's `sidx`, when there is one: its earliest time and each
+    /// slot's duration.
+    sound: Option<(u64, Vec<u32>)>,
     total: u64,
 }
 
 impl Header {
     /// From the file's first bytes (`head`), the file `total` long: the
-    /// init segment, then one `sidx` -- the video's, on 90 kHz: a demuxer
+    /// init segment, then the video's `sidx`, on 90 kHz -- a demuxer
     /// seeking the sound finds its slot by the video's times, the same slot
-    /// -- naming the slots, which begin right after it (so there is no
-    /// other index) and end where the file does.
+    /// -- naming the slots, which begin right after it, or after the
+    /// sound's `sidx` when one follows (an estimated layout's: the same
+    /// slots, labelled early), and end where the file does.
     fn of(head: &[u8], total: u64) -> Self {
         let size = |at: usize| u32_at(head, at) as usize;
         assert_eq!(&head[4..8], b"ftyp");
@@ -282,9 +288,34 @@ impl Header {
         assert_eq!(sidx[8], 1, "sidx version 1");
         assert_eq!(u32_at(sidx, 12), 1, "the video track");
         assert_eq!(u32_at(sidx, 16), 90_000, "on the video's clock");
-        assert_eq!(&sidx[28..36], &[0; 8], "slots begin right after it");
+        let after = u64::from_be_bytes(sidx[28..36].try_into().unwrap()) as usize;
         let count = u16::from_be_bytes([sidx[38], sidx[39]]) as usize;
-        let mut offset = (init_len + sidx.len()) as u64;
+        let sound = (after > 0).then(|| {
+            let at = init_len + sidx.len();
+            let sound = &head[at..at + size(at)];
+            assert_eq!(
+                sound.len(),
+                after,
+                "the slots begin right after the sound's sidx"
+            );
+            assert_eq!(&sound[4..8], b"sidx");
+            assert_eq!(u32_at(sound, 12), 2, "the sound's track");
+            assert_eq!(u32_at(sound, 16), 90_000, "on the video's clock");
+            assert_eq!(&sound[28..36], &[0; 8], "slots begin right after it");
+            assert_eq!(u16::from_be_bytes([sound[38], sound[39]]) as usize, count);
+            let durations = (0..count)
+                .map(|k| {
+                    let at = 40 + k * 12;
+                    assert_eq!(u32_at(sound, at), u32_at(sidx, at), "slot {k}'s size");
+                    u32_at(sound, at + 4)
+                })
+                .collect();
+            (
+                u64::from_be_bytes(sound[20..28].try_into().unwrap()),
+                durations,
+            )
+        });
+        let mut offset = (init_len + sidx.len() + after) as u64;
         let slots = (0..count)
             .map(|k| {
                 let at = 40 + k * 12;
@@ -300,6 +331,7 @@ impl Header {
             init_len,
             earliest: u64::from_be_bytes(sidx[20..28].try_into().unwrap()),
             slots,
+            sound,
             total,
         }
     }
@@ -447,9 +479,15 @@ impl Segment {
         let mut at = traf.data_offset;
         let mut out = Vec::new();
         for &(duration, size, _) in &traf.samples {
-            let pts_us = (ticks * 1_000_000 + 24_000) / 48_000;
+            // The sound is on the video's 90 kHz clock (FFmpeg before 6.0
+            // compares the two tracks' times unscaled).
             let frame = i64::from(u32_at(&self.from_moof, at));
-            assert_eq!(Knobs::audio_pts(frame), pts_us, "the bytes are the frame's");
+            let pts_us = Knobs::audio_pts(frame);
+            assert_eq!(
+                (pts_us * 90_000 + 500_000) / 1_000_000,
+                ticks,
+                "the bytes are the frame's"
+            );
             out.push(pts_us);
             ticks += i64::from(duration);
             at += size as usize;
@@ -570,7 +608,9 @@ fn the_init_segment_says_how_long_the_film_is() -> anyhow::Result<()> {
         .filter(|(kind, _)| kind == "trak")
         .map(|(_, body)| body)
         .collect();
-    for (trak, timescale) in traks.iter().zip([90_000u64, 48_000]) {
+    // Every track on one clock, the video's: FFmpeg before 6.0 places the
+    // sound by the video's `sidx` times without rescaling them.
+    for (trak, timescale) in traks.iter().zip([90_000u64, 90_000]) {
         let tkhd = Boxes::find(trak, "tkhd");
         assert_eq!(u32_at(tkhd, 20), 60_000, "tkhd, on the movie clock");
         let mdhd = Boxes::path(trak, &["mdia", "mdhd"]);
@@ -592,6 +632,10 @@ fn the_sidx_mirrors_the_sources_index() -> anyhow::Result<()> {
     let token = fixture.publish(60_000, 0)?;
     let header = fixture.header(&token);
     assert_eq!(header.slots.len(), 60);
+    // Mirrored, the video's labels are its sync samples: the sound needs
+    // no index of its own (FFmpeg seeks it to the picture's sample, which
+    // its own slot holds, with the sound's lead).
+    assert!(header.sound.is_none(), "one sidx");
     assert_eq!(fixture.probe(&token).exact, Some(true));
     let place = |pts: i64| (pts as i128 * SOURCE_LEN as i128 / 60_000_000) as u64;
     let headroom = |span: u64| span + 8 * 1024 + span / 64;
@@ -640,6 +684,20 @@ fn without_an_index_the_slots_are_estimated() -> anyhow::Result<()> {
         // A GOP late (10 s), at the film's end at the latest: the first
         // slot to the end, the rest none.
         assert_eq!(*duration, if k == 0 { 900_000 } else { 0 }, "slot {k}");
+    }
+    // The sound's labels are each cut less its lead (64 ms), not a GOP
+    // late: the slot FFmpeg picks for the sound by the picture's sync
+    // sample is then never one before the picture's.
+    let (earliest, durations) = header.sound.as_ref().expect("the sound's sidx");
+    assert_eq!(*earliest, 0);
+    let lead = 64 * 90;
+    for (k, duration) in durations.iter().enumerate() {
+        let expected = match k {
+            0 => 90_000 - lead,
+            9 => 90_000 + lead,
+            _ => 90_000,
+        };
+        assert_eq!(*duration, expected, "the sound's slot {k}");
     }
     let file = fixture.file(&token);
     for n in 0..10 {

@@ -35,6 +35,7 @@
 
 use super::IndexEntry;
 use super::mux;
+use super::run;
 use bytes::Bytes;
 
 /// Bytes every slot is given beyond its share of the source.
@@ -230,7 +231,7 @@ impl Slot {
 /// The whole file's shape: the header bytes, the slots, the length.
 #[derive(Debug)]
 pub(crate) struct Layout {
-    /// `ftyp` + `moov` + `sidx`.
+    /// `ftyp` + `moov` + `sidx` (two for an estimated layout with sound).
     pub header: Bytes,
     /// Where the init segment ends inside [`Self::header`].
     pub init_len: usize,
@@ -242,16 +243,27 @@ pub(crate) struct Layout {
 }
 
 impl Layout {
-    /// The layout for `plan` behind `init`: the `sidx` on `track`'s clock
-    /// (`timescale`), the film `duration_us` long. An error is the sentence
-    /// a viewer is shown, for a film no `sidx` can describe.
+    /// The layout for `plan` behind `init`: the `sidx` for `indexed`
+    /// (a track and its clock, which every track shares), the film
+    /// `duration_us` long. An error is the sentence a viewer is shown, for
+    /// a film no `sidx` can describe.
+    ///
+    /// An estimated layout indexes `sound` (the sound's track beside a
+    /// picture) again, in a second `sidx` labelled at each cut less the
+    /// sound's lead, not a GOP late. A seek places the picture on a sync
+    /// sample inside the slot its late label picked, which can be before
+    /// that label; FFmpeg then seeks the sound to that sample's time, and
+    /// by the picture's labels that is the slot before -- 6.0 to 8.0
+    /// asked for it (master does not). Labelled early, the sound's slot is
+    /// the picture's or a later one, never an earlier.
     pub(crate) fn new(
         init: Bytes,
         plan: Plan,
-        track: u32,
-        timescale: u32,
+        indexed: (u32, u32),
+        sound: Option<u32>,
         duration_us: i64,
     ) -> Result<Self, String> {
+        let (track, timescale) = indexed;
         let count = plan.sizes.len();
         if count == 0 || count > usize::from(u16::MAX) {
             return Err("This film is too long to send to the television in one piece.".into());
@@ -263,31 +275,44 @@ impl Layout {
         }
         let earliest = mux::ticks(plan.first_us, timescale);
         let end = mux::ticks(duration_us, timescale).max(earliest);
-        let starts: Vec<u64> = (0..count)
-            .map(|k| {
-                if k == 0 {
-                    earliest
-                } else {
-                    mux::ticks(plan.cuts[k].saturating_add(plan.label_late_us), timescale)
-                        .clamp(earliest, end)
-                }
-            })
-            .collect();
-        let refs: Vec<(u32, u32)> = (0..count)
-            .map(|k| {
-                let next = starts.get(k + 1).copied().unwrap_or(end);
-                let duration = next.saturating_sub(starts[k]);
-                (
-                    plan.sizes[k] as u32,
-                    u32::try_from(duration).unwrap_or(u32::MAX),
-                )
-            })
-            .collect();
-        let sidx = mux::sidx(track, timescale, earliest, &refs);
+        let refs = |late_us: i64| -> Vec<(u32, u32)> {
+            let starts: Vec<u64> = (0..count)
+                .map(|k| {
+                    if k == 0 {
+                        earliest
+                    } else {
+                        mux::ticks(plan.cuts[k].saturating_add(late_us), timescale)
+                            .clamp(earliest, end)
+                    }
+                })
+                .collect();
+            (0..count)
+                .map(|k| {
+                    let next = starts.get(k + 1).copied().unwrap_or(end);
+                    let duration = next.saturating_sub(starts[k]);
+                    (
+                        plan.sizes[k] as u32,
+                        u32::try_from(duration).unwrap_or(u32::MAX),
+                    )
+                })
+                .collect()
+        };
+        let sound = sound
+            .filter(|_| plan.label_late_us > 0)
+            .map(|sound| mux::sidx(sound, timescale, earliest, 0, &refs(-run::AUDIO_LEAD_US)));
+        let sound_len = sound.as_ref().map_or(0, Vec::len) as u64;
+        let sidx = mux::sidx(
+            track,
+            timescale,
+            earliest,
+            sound_len,
+            &refs(plan.label_late_us),
+        );
         let init_len = init.len();
-        let mut header = Vec::with_capacity(init_len + sidx.len());
+        let mut header = Vec::with_capacity(init_len + sidx.len() + sound_len as usize);
         header.extend_from_slice(&init);
         header.extend_from_slice(&sidx);
+        header.extend_from_slice(sound.as_deref().unwrap_or_default());
         let mut offset = header.len() as u64;
         let slots = plan
             .sizes
@@ -468,7 +493,7 @@ mod tests {
         let plan = Plan::new(Some(&index), 70_000, 6_000_000, T);
         let sizes = plan.sizes.clone();
         let init = Bytes::from_static(b"\0\0\0\x08ftyp");
-        let layout = Layout::new(init, plan, 1, 90_000, 6_000_000).expect("a layout");
+        let layout = Layout::new(init, plan, (1, 90_000), None, 6_000_000).expect("a layout");
         let sidx = &layout.header[8..];
         assert_eq!(u32_at(sidx, 0) as usize, sidx.len());
         assert_eq!(&sidx[4..8], b"sidx");
@@ -521,7 +546,7 @@ mod tests {
             sizes: vec![size; count],
             exact: false,
         };
-        let layout = |plan| Layout::new(Bytes::new(), plan, 1, 90_000, 1_000_000);
+        let layout = |plan| Layout::new(Bytes::new(), plan, (1, 90_000), None, 1_000_000);
         assert!(layout(plan(65_535, 100)).is_ok());
         assert!(layout(plan(65_536, 100)).is_err());
         assert!(layout(plan(2, (1 << 31) - 1)).is_ok());
@@ -535,7 +560,7 @@ mod tests {
     #[test]
     fn an_estimated_slot_is_labelled_a_gop_after_its_cut() {
         let plan = Plan::new(None, 1_000_000, 30_000_000, 6 * T);
-        let layout = Layout::new(Bytes::new(), plan, 1, 1000, 30_000_000).unwrap();
+        let layout = Layout::new(Bytes::new(), plan, (1, 1000), None, 30_000_000).unwrap();
         let sidx = &layout.header[..];
         let durations: Vec<u32> = (0..5).map(|k| u32_at(sidx, 40 + k * 12 + 4)).collect();
         // Slot 0 from 0 to 16 s, slot 1 from 16 to 22, ..., slot 3 from 28
@@ -558,7 +583,7 @@ mod tests {
     #[test]
     fn a_run_from_a_time_makes_the_first_slot_cut_after_it() {
         let plan = Plan::new(None, 10_000, 10_000_000, T);
-        let layout = Layout::new(Bytes::new(), plan, 1, 90_000, 10_000_000).unwrap();
+        let layout = Layout::new(Bytes::new(), plan, (1, 90_000), None, 10_000_000).unwrap();
         assert_eq!(layout.first_slot_from(-5), 0);
         assert_eq!(layout.first_slot_from(0), 0);
         assert_eq!(layout.first_slot_from(1), 1);

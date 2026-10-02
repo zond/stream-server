@@ -584,16 +584,48 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
 * **The header** is the init segment and the `sidx`. Then **one slot per
   segment**: slot `k` holds segment `k`'s fragment, padded with a `free`
   box to the slot's end. The `sidx` gives each slot's size and duration,
-  so FFmpeg jumps to the slot that holds a time. **One `sidx`, the
-  video's** -- tried and measured against one per track: FFmpeg n6's
-  `get_frag_time` finds the sound's fragment by the video's `sidx` time
-  when the sound has none, so both streams land in the same slot; with an
-  index of its own, each stream picks its slot by its own times, and where
-  those are not the slot's real start (an estimated layout, labelled late)
-  the sound picked an earlier slot than the picture and the seek read back
-  (`ffmpeg -ss 60` on zond's film as a transport stream: seven requests,
-  back and forth; headless Chrome: six). With the video's alone: the
-  Matroska file two requests and one far `Range` in Chrome, as before.
+  so FFmpeg jumps to the slot that holds a time. **The video's `sidx`,
+  and every track on its 90 kHz clock** (the sound's `mdhd` too). FFmpeg
+  finds a stream the `sidx` does not index by the indexed track's times
+  (`get_frag_time`), so the sound lands in the picture's slot -- but
+  before 6.0 (commit e1e981c, May 2022) it compared those times with the
+  sound's seek time **unscaled**: with the sound on 48 kHz, a seek to
+  85 s put the sound at 85 x 48/90 = 45 s and the demuxer read on from
+  there. That is what zond's Chromecast with Google TV did (Android TV
+  14, `mediashell` 3.72): remote seeks to 1:25 and 4:14 asked for the
+  target and, at once, 0:42 and 2:12, and played after ~30 s of the TV
+  walking the fragments between. On one clock the comparison is right
+  in every version.
+* **An estimated layout indexes the sound again**, in a second `sidx`
+  (the video's `first_offset` steps over it) labelled at each cut less
+  the sound's lead, not a GOP late. A seek places the picture on a sync
+  sample inside the slot its late label picked, often before that label;
+  FFmpeg then seeks the sound to that sample's time, which by the
+  picture's labels is the slot before, and asked for it (6.0 to 8.0; 4.4
+  and 5.1 walked from much further back). Labelled early, the sound's
+  slot is the picture's or a later one. A mirrored layout needs no second
+  index: its labels are the sync samples. (Last round one `sidx` per
+  track was tried with both labelled late, and the sound picked an
+  earlier slot than the picture -- that is the late label, not the
+  second index.)
+* **Measured** (2026-10-02) with libavformat 4.4, 5.1, 6.0, 6.1, 7.0,
+  7.1, 8.0 and master, as Chrome's `FFmpegDemuxer` drives it (demux to
+  42 s, `av_seek_frame` on the video, backward, demux 20 s on), over
+  HTTP against a fresh server per probe, on zond's 10-minute film as
+  Matroska (mirrored) and as a transport stream (estimated); requests
+  behind the target slot's after the seek:
+
+  | layout | seek | before (90/48 kHz, one `sidx`) | now |
+  |---|---|---|---|
+  | mirrored | 85 s | 4.4, 5.1: picture at 42 s, 1 | 0 everywhere |
+  | mirrored | 252 s | 4.4, 5.1: 20 (from 135 s) | 0 everywhere |
+  | estimated | 85 s | 4.4, 5.1: 14; 6.0-8.0: 2; master: 0 | 0 everywhere |
+  | estimated | 252 s | 4.4, 5.1: 40; 6.0-8.0: 2; master: 0 | 0 everywhere |
+
+  Both streams land in the target slot in every version now (the
+  estimated layout on the slot's last sync sample before the target,
+  reading forward from it). Headless Chrome 154, played 15 s then
+  seeked: one far `Range` per seek on both.
 * **With the source's index, the slots mirror the source.** The producer
   reports the video's sync samples -- `(pts, byte position)`, from
   libavformat's index (Matroska cues, an MP4's sample tables, an AVI's
@@ -685,12 +717,11 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   -- the target fragment held no sound at or before it, and the sound
   stream fell back to the last frame it knew, from the reads at the
   file's opening: `ffmpeg -ss 60` asked `0-`, the target, then 4.6 MB (6 s)
-  and the target again, and zond's TV, seeking to 1:00, read on from 0:30
-  and stalled buffering. With the lead, `ffmpeg -ss` makes two requests --
+  and the target again. With the lead, `ffmpeg -ss` makes two requests --
   the start, the target -- at 30, 60, 90 and 300 s on the mirrored film,
-  and headless Chrome one far `Range` per seek. An estimated layout (a
-  transport stream) still reads forward from the slot before after a seek
-  -- its slots are labelled a GOP late -- up to about 16 s of film.
+  and headless Chrome one far `Range` per seek. zond's TV, seeking to
+  1:00, read on from 0:30 and stalled buffering; that was not this but the
+  clocks above (60 x 48/90 = 32 s), and it went on with the lead.
 * **The app** (xtremio) loads `stream.mp4` with the receiver told to start
   at the phone's position, and a seek on the phone is a plain `SEEK` to
   the receiver again; the reload and the undo of the receiver's restarts
