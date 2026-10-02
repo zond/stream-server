@@ -767,7 +767,15 @@ F2. **Kotlin producer, repackage only, end to end on the phone** (M). The
      master playlist). CORS headers are not needed by a `<video src>`
      stream; the LAN listener sends `Access-Control-Allow-Origin: *` on
      every response anyway, as it always has (`lan_cors_layer`).*
-   * *The app's half (not built yet): publish, hand the receiver
+   * *Verified on zond's TV 2026-10-02 (xtremio 244209d): a 1080p H.264 +
+     AAC MKV the Chromecast refuses plays as a rendition with sound; the
+     receiver shows the full 10:00 from the first byte (`mdhd`); a phone seek
+     reloads `?from=` and lands (5:00); a TV-remote seek is undone back to
+     where the receiver was (the target is never reported); Stop hands the
+     film back to the phone at the receiver's position. Remote seeks that
+     actually move are only possible with a receiver of our own, which zond
+     declined for now.*
+   * *The app's half (built since, see above): publish, hand the receiver
      `stream.mp4?from=<position>` as `video/mp4` with no start position of
      its own (the stream already starts there), map a seek -- the phone's
      or the TV remote's, which the receiver cannot do in an unseekable
