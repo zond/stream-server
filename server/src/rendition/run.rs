@@ -8,11 +8,13 @@
 //! answer [`super::Stopped`]; cancelling the reader is what wakes a
 //! producer parked in a read.
 
+use super::layout::Layout;
 use super::mux::{self, Formats, MuxSample};
+use super::slots::{self, Cursor, End};
 use super::speed::Speed;
 use super::{
-    Job, LOOKAHEAD, RING_CAP, Rendition, SINK_CAPACITY, SampleSink, SinkMessage, SinkShown,
-    TrackKind,
+    IndexEntry, Job, LOOKAHEAD, RING_CAP, Rendition, SINK_CAPACITY, SampleSink, SinkMessage,
+    SinkShown, TrackKind,
 };
 use crate::state::AppState;
 use std::collections::BTreeMap;
@@ -39,13 +41,15 @@ pub(crate) struct Cut {
 
 /// **The cut rule**, applied to one run's samples in the order the
 /// producer wrote them. Segment N begins at the first video sync sample at
-/// or after N x T; each audio sample goes to the segment its presentation
-/// time falls in on the N x T grid; what precedes the run's first cut is
-/// discarded. A segment is complete once video has moved past it (a later
-/// cut) and audio has reached its end -- or, for a track the run does not
-/// have, at once.
+/// or after its cut (`cuts[N]`, from the layout: an indexed sync sample's
+/// time, or N x T); each audio sample goes to the segment whose cuts its
+/// presentation time falls between; what precedes the run's first segment
+/// is discarded. A segment is complete once video has moved past it (a
+/// later cut) and audio has reached the next cut -- or, for a track the run
+/// does not have, at once.
 pub(crate) struct Cutter {
-    segment_us: i64,
+    /// `cuts[0]` is [`i64::MIN`].
+    cuts: Arc<[i64]>,
     has_video: bool,
     has_audio: bool,
     /// The segment video samples go to now; `None` before the first cut.
@@ -57,9 +61,9 @@ pub(crate) struct Cutter {
 }
 
 impl Cutter {
-    pub(crate) fn new(segment_us: i64, start: u64, has_video: bool, has_audio: bool) -> Self {
+    pub(crate) fn new(cuts: Arc<[i64]>, start: u64, has_video: bool, has_audio: bool) -> Self {
         Self {
-            segment_us,
+            cuts,
             has_video,
             has_audio,
             video_segment: None,
@@ -70,7 +74,7 @@ impl Cutter {
     }
 
     fn segment_of(&self, pts_us: i64) -> u64 {
-        (pts_us.max(0) / self.segment_us) as u64
+        (self.cuts.partition_point(|cut| *cut <= pts_us) as u64).saturating_sub(1)
     }
 
     /// Take one sample; answer the segments it completed, in order.
@@ -82,7 +86,7 @@ impl Cutter {
                 None if !sample.key => return Vec::new(),
                 None => self.segment_of(sample.pts_us),
                 // A sync sample cuts when it is at or after the next
-                // segment's time; the segments it passes over are empty.
+                // segment's cut; the segments it passes over are empty.
                 Some(current) if sample.key => current.max(self.segment_of(sample.pts_us)),
                 Some(current) => current,
             },
@@ -91,9 +95,9 @@ impl Cutter {
             // it, so nothing can carry it.
             _ => return Vec::new(),
         };
-        // Before the run's first segment -- the producer starts at the sync
-        // sample before it, and audio a frame early -- or behind a segment
-        // already out: discarded, and not kept.
+        // Before the run's first segment -- the producer starts well before
+        // it, at a sync sample -- or behind a segment already out:
+        // discarded, and not kept.
         if segment < self.next_out {
             return Vec::new();
         }
@@ -123,8 +127,9 @@ impl Cutter {
         let video = !self.has_video || self.video_segment.is_some_and(|at| at > segment);
         let audio = !self.has_audio
             || self
-                .audio_high
-                .is_some_and(|high| high >= (segment as i64 + 1) * self.segment_us);
+                .cuts
+                .get(segment as usize + 1)
+                .is_some_and(|next| self.audio_high.is_some_and(|high| high >= *next));
         video && audio
     }
 
@@ -184,16 +189,28 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// Run `generation` of `rendition`, from `start`, until it ends.
+/// Run `generation` of `rendition` until it ends: the producer handed
+/// `from`, the output starting at slot `start` (or, for the run that
+/// freezes the layout, at the first slot cut at or after `from`).
 pub(crate) async fn run(
     rendition: Arc<Rendition>,
     state: AppState,
     generation: u64,
-    start: u64,
+    start: Option<u64>,
+    from: Duration,
     stop: CancellationToken,
 ) {
     let mut produced = 0u64;
-    let outcome = drive(&rendition, &state, generation, start, &stop, &mut produced).await;
+    let outcome = drive(
+        &rendition,
+        &state,
+        generation,
+        start,
+        from,
+        &stop,
+        &mut produced,
+    )
+    .await;
     stop.cancel();
     let kind = match &outcome {
         Outcome::Stopped => "stopped",
@@ -245,11 +262,71 @@ fn speed_sentence(spec: &super::RenditionSpec, media: Duration, busy: Duration) 
     )
 }
 
+/// A run's output side, once the layout is frozen: the cutter, and the
+/// slots it fills from the segments the cutter completes.
+struct Making {
+    layout: Arc<Layout>,
+    cutter: Cutter,
+    /// The next slot to make.
+    slot: u64,
+    /// Where its content starts.
+    cursor: Cursor,
+    /// Segments completed and not yet wholly in a slot.
+    segments: BTreeMap<u64, Cut>,
+}
+
+impl Making {
+    /// Take the segments the cutter completed and make every slot they
+    /// complete (all that are left, at the film's `ending`); `false` once
+    /// the run is no longer the live one.
+    fn take(
+        &mut self,
+        rendition: &Rendition,
+        generation: u64,
+        formats: &Formats,
+        cuts: Vec<Cut>,
+        ending: bool,
+    ) -> bool {
+        for cut in cuts {
+            self.segments.insert(cut.index, cut);
+        }
+        let count = self.layout.slots.len() as u64;
+        while self.slot < count && (ending || self.cutter.next_out > self.slot) {
+            let slot = self.slot;
+            let content = slots::gather(&self.segments, self.cursor, slot);
+            let sequence = (slot + 1) as u32;
+            let mux = |video: &[MuxSample],
+                       video_next: Option<i64>,
+                       audio: &[MuxSample],
+                       audio_next: Option<i64>| {
+                mux::media_segment(formats, sequence, video, video_next, audio, audio_next)
+            };
+            let size = self.layout.slots[slot as usize].size;
+            let filled = content.fill(size, rendition.may_spill(slot), &mux);
+            // The end the slot was first made with, which says where the
+            // next starts: the same prefix whichever it is now.
+            let Some(end) = rendition.publish_slot(generation, slot, filled.end, filled.fragment)
+            else {
+                return false;
+            };
+            self.cursor = match end {
+                End::Spill(cursor) => cursor,
+                End::Natural | End::Truncated { .. } => Cursor::at(slot + 1),
+            };
+            let keep = self.cursor.anchor();
+            self.segments.retain(|segment, _| *segment >= keep);
+            self.slot += 1;
+        }
+        true
+    }
+}
+
 async fn drive(
     rendition: &Arc<Rendition>,
     state: &AppState,
     generation: u64,
-    start: u64,
+    start: Option<u64>,
+    from: Duration,
     stop: &CancellationToken,
     produced: &mut u64,
 ) -> Outcome {
@@ -263,6 +340,7 @@ async fn drive(
         Ok(reader) => reader,
         Err(refusal) => return Outcome::Failed(refusal.to_string()),
     };
+    let source_len = reader.len();
     let reader_waits = reader.waits();
     let _cancel_reader = CancelOnDrop(reader.canceller());
     let (tx, mut rx) = mpsc::channel(SINK_CAPACITY);
@@ -272,11 +350,11 @@ async fn drive(
         stop: stop.clone(),
         shown: shown.clone(),
     };
-    let segment_us = rendition.segment_us();
     let job = Job {
         reader,
         spec: rendition.spec.clone(),
-        from: Duration::from_micros(start * segment_us as u64),
+        from,
+        wants_index: !rendition.has_layout(),
         sink,
     };
     if let Err(refusal) = rendition.producer.start(job) {
@@ -294,19 +372,20 @@ async fn drive(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut seen = rendition.version.subscribe();
     let mut formats = Formats::default();
-    let mut cutter: Option<Cutter> = None;
+    let mut index: Option<Vec<IndexEntry>> = None;
+    let mut making: Option<Making> = None;
 
     loop {
         let (gated, idle_at) = {
             let inner = rendition.inner();
-            if !inner
+            let Some(run) = inner
                 .run
                 .as_ref()
-                .is_some_and(|run| run.generation == generation)
-            {
+                .filter(|run| run.generation == generation)
+            else {
                 return Outcome::Stopped;
-            }
-            let next_out = cutter.as_ref().map_or(start, |cutter| cutter.next_out);
+            };
+            let next_out = making.as_ref().map_or(run.next_out, |making| making.slot);
             let gated = next_out > inner.last_request + LOOKAHEAD
                 || (inner.ring_bytes >= RING_CAP && next_out > inner.last_request);
             (gated, inner.last_request_at + rendition.tuning.idle_release)
@@ -346,29 +425,53 @@ async fn drive(
                                     .to_string(),
                             );
                         }
-                        if cutter.is_none() {
+                        if making.is_none() {
                             match track {
                                 TrackKind::Video => formats.video = Some(format),
                                 TrackKind::Audio => formats.audio = Some(format),
                             }
                         }
                     }
-                    SinkMessage::Sample(sample) => {
-                        if cutter.is_none() {
-                            if let Err(sentence) = freeze(rendition, &formats) {
-                                return Outcome::Failed(sentence);
-                            }
-                            cutter = Some(Cutter::new(
-                                segment_us,
-                                start,
-                                formats.video.is_some(),
-                                formats.audio.is_some(),
-                            ));
+                    SinkMessage::Index(entries) => {
+                        if making.is_none() {
+                            index = Some(entries);
                         }
-                        let Some(cutting) = cutter.as_mut() else {
+                    }
+                    SinkMessage::Sample(sample) => {
+                        if making.is_none() {
+                            let frozen = rendition.freeze(
+                                generation,
+                                &formats,
+                                index.as_deref(),
+                                source_len,
+                                from,
+                                start,
+                            );
+                            match frozen {
+                                Ok((layout, slot, cursor)) => {
+                                    let cutter = Cutter::new(
+                                        layout.cuts.clone(),
+                                        cursor.anchor(),
+                                        formats.video.is_some(),
+                                        formats.audio.is_some(),
+                                    );
+                                    making = Some(Making {
+                                        layout,
+                                        cutter,
+                                        slot,
+                                        cursor,
+                                        segments: BTreeMap::new(),
+                                    });
+                                }
+                                Err(Frozen::Failed(sentence)) => return Outcome::Failed(sentence),
+                                Err(Frozen::Stopped) => return Outcome::Stopped,
+                            }
+                        }
+                        let Some(making) = making.as_mut() else {
                             continue;
                         };
-                        let cuts = cutting.push(
+                        let before = making.slot;
+                        let cuts = making.cutter.push(
                             sample.track,
                             MuxSample {
                                 pts_us: sample.pts_us,
@@ -377,24 +480,25 @@ async fn drive(
                             },
                         );
                         if !cuts.is_empty() {
-                            *produced += cuts.len() as u64;
-                            let next_out = cutting.next_out;
-                            if !publish(rendition, generation, &formats, cuts, next_out, None) {
+                            if !making.take(rendition, generation, &formats, cuts, false) {
                                 return Outcome::Stopped;
                             }
-                            speed.start(busy(Instant::now()), shown.media.media());
+                            if making.slot > before {
+                                *produced += making.slot - before;
+                                speed.start(busy(Instant::now()), shown.media.media());
+                            }
                         }
                     }
                     SinkMessage::End => {
-                        let Some(cutting) = cutter.as_mut() else {
+                        let Some(making) = making.as_mut() else {
                             return Outcome::Failed(
                                 "The conversion ended before it produced anything.".to_string(),
                             );
                         };
-                        let cuts = cutting.finish();
-                        *produced += cuts.len() as u64;
-                        let next_out = cutting.next_out;
-                        publish(rendition, generation, &formats, cuts, next_out, Some(next_out));
+                        let before = making.slot;
+                        let cuts = making.cutter.finish();
+                        making.take(rendition, generation, &formats, cuts, true);
+                        *produced += making.slot - before;
                         return Outcome::Ended;
                     }
                     SinkMessage::Fail(sentence) => return Outcome::Failed(sentence),
@@ -404,71 +508,12 @@ async fn drive(
     }
 }
 
-/// The first sample of a run: freeze the formats into the init segment,
-/// or -- for a later run -- check they are the ones frozen.
-fn freeze(rendition: &Rendition, formats: &Formats) -> Result<(), String> {
-    let mut inner = rendition.inner();
-    match &inner.formats {
-        None => {
-            let init = mux::init_segment(formats, rendition.spec.duration_ms)?;
-            inner.formats = Some(formats.clone());
-            inner.init = Some(init);
-            drop(inner);
-            rendition.bump();
-            Ok(())
-        }
-        Some(frozen) if frozen == formats => Ok(()),
-        Some(_) => Err(
-            "The conversion came back from a seek in a different format, which the television \
-             cannot follow; cast the film again."
-                .to_string(),
-        ),
-    }
-}
-
-/// Mux `cuts` into the ring, under the run's generation; `false` when the
-/// run is no longer the live one.
-fn publish(
-    rendition: &Rendition,
-    generation: u64,
-    formats: &Formats,
-    cuts: Vec<Cut>,
-    next_out: u64,
-    end: Option<u64>,
-) -> bool {
-    let segments: Vec<(u64, bytes::Bytes)> = cuts
-        .into_iter()
-        .map(|cut| {
-            let bytes = mux::media_segment(
-                formats,
-                (cut.index + 1) as u32,
-                &cut.video,
-                cut.video_next,
-                &cut.audio,
-                cut.audio_next,
-            );
-            (cut.index, bytes)
-        })
-        .collect();
-    {
-        let mut inner = rendition.inner();
-        let Some(run) = inner
-            .run
-            .as_mut()
-            .filter(|run| run.generation == generation)
-        else {
-            return false;
-        };
-        run.next_out = next_out;
-        for (index, bytes) in segments {
-            inner.insert(index, bytes);
-        }
-        if let Some(end) = end {
-            inner.end = Some(inner.end.map_or(end, |known| known.min(end)));
-        }
-    }
-    rendition.bump();
-    true
+/// Why a run could not freeze the layout.
+pub(crate) enum Frozen {
+    /// The rendition cannot go on: the sentence.
+    Failed(String),
+    /// The run is no longer the live one.
+    Stopped,
 }
 
 #[cfg(test)]
@@ -486,6 +531,13 @@ mod tests {
         }
     }
 
+    /// Cuts every T, as an estimated layout makes them.
+    fn grid() -> Arc<[i64]> {
+        (0..100)
+            .map(|k| if k == 0 { i64::MIN } else { k * T })
+            .collect()
+    }
+
     fn pts(samples: &[MuxSample]) -> Vec<i64> {
         samples.iter().map(|sample| sample.pts_us).collect()
     }
@@ -494,7 +546,7 @@ mod tests {
     /// the key at 1.2 s, the first at or after 1 s.
     #[test]
     fn a_segment_begins_at_the_first_key_at_or_after_its_time() {
-        let mut cutter = Cutter::new(T, 0, true, false);
+        let mut cutter = Cutter::new(grid(), 0, true, false);
         let mut cuts = Vec::new();
         for frame in 0..10i64 {
             cuts.extend(cutter.push(TrackKind::Video, sample(frame * 200_000, frame % 2 == 0)));
@@ -518,7 +570,7 @@ mod tests {
     /// first key at or after 2 s, and no audio before 2 s.
     #[test]
     fn what_precedes_the_runs_cut_is_discarded() {
-        let mut cutter = Cutter::new(T, 2, true, true);
+        let mut cutter = Cutter::new(grid(), 2, true, true);
         let mut cuts = Vec::new();
         for frame in 6..8i64 {
             cuts.extend(cutter.push(TrackKind::Audio, sample(frame * 250_000 - 100_000, true)));
@@ -536,10 +588,52 @@ mod tests {
         assert!(cuts[0].audio.iter().all(|s| s.pts_us < 3_000_000));
     }
 
+    /// **Cuts from an index**: segment 1 begins at the indexed key at
+    /// 1.2 s, and audio before it is segment 0's, whatever the grid says.
+    #[test]
+    fn indexed_cuts_are_where_segments_begin() {
+        let cuts: Arc<[i64]> = vec![i64::MIN, 1_200_000, 2_400_000].into();
+        let mut cutter = Cutter::new(cuts, 0, true, true);
+        let mut out = Vec::new();
+        for frame in 0..15i64 {
+            out.extend(cutter.push(TrackKind::Audio, sample(frame * 200_000 - 1, true)));
+            out.extend(cutter.push(TrackKind::Video, sample(frame * 200_000, frame % 2 == 0)));
+        }
+        assert_eq!(
+            out.iter().map(|cut| cut.index).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            pts(&out[0].video),
+            vec![0, 200_000, 400_000, 600_000, 800_000, 1_000_000]
+        );
+        assert_eq!(pts(&out[1].video).first(), Some(&1_200_000));
+        assert_eq!(pts(&out[0].audio).last(), Some(&1_199_999));
+        assert_eq!(pts(&out[1].audio).first(), Some(&1_399_999));
+    }
+
+    /// **A segment waits for its audio**: video moving past the next cut
+    /// does not complete it while audio before that cut can still come --
+    /// a container that stores audio after the video it plays beside.
+    #[test]
+    fn a_segment_waits_for_audio_up_to_the_next_cut() {
+        let cuts: Arc<[i64]> = vec![i64::MIN, 1_000_000].into();
+        let mut cutter = Cutter::new(cuts, 0, true, true);
+        let mut out = Vec::new();
+        out.extend(cutter.push(TrackKind::Video, sample(0, true)));
+        out.extend(cutter.push(TrackKind::Audio, sample(0, true)));
+        out.extend(cutter.push(TrackKind::Video, sample(1_000_000, true)));
+        assert!(out.is_empty(), "audio has not reached the cut");
+        out.extend(cutter.push(TrackKind::Audio, sample(800_000, true)));
+        out.extend(cutter.push(TrackKind::Audio, sample(1_000_000, true)));
+        assert_eq!(out.len(), 1);
+        assert_eq!(pts(&out[0].audio), vec![0, 800_000]);
+    }
+
     /// A GOP longer than T leaves the segment between empty.
     #[test]
     fn a_long_gop_leaves_a_segment_empty() {
-        let mut cutter = Cutter::new(T, 0, true, false);
+        let mut cutter = Cutter::new(grid(), 0, true, false);
         let mut cuts = Vec::new();
         for (pts_us, key) in [
             (0, true),

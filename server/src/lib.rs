@@ -28,8 +28,8 @@ pub use media::{
     Refusal, Resolved,
 };
 pub use rendition::{
-    AudioPlan, Job, Producer, ProducerRefusal, RenditionSpec, RenditionState, Sample, SampleSink,
-    Stopped, TrackFormat, TrackKind, VideoPlan,
+    AudioPlan, IndexEntry, Job, Producer, ProducerRefusal, RenditionSpec, RenditionState, Sample,
+    SampleSink, Stopped, TrackFormat, TrackKind, VideoPlan,
 };
 pub use routes::drive::{DriveFileOpened, DriveOpenError};
 #[doc(hidden)]
@@ -1436,15 +1436,15 @@ impl ServerHandle {
     }
 
     /// **Publish a rendition of an id for a cast**: the token the
-    /// receiver's stream URL is built on,
+    /// receiver's URL is built on,
     /// `<lan_media_base_url>/cast/<token>/stream.mp4` -- one progressive
-    /// fragmented MP4 from `spec.start_ms`, or from `?from=<ms>` for a
-    /// stream that starts elsewhere (a seek is a new load of the stream from
-    /// there). As [`Self::publish`] -- refused while the LAN listener is
-    /// down, holds the id's lease, unpublished by [`Self::unpublish`] or the
-    /// listener's stop -- and refused (`noProducer`) when no producer is
-    /// installed ([`Self::install_producer`]). No run starts until the
-    /// receiver asks.
+    /// fragmented MP4 with a length and ranges, which the receiver seeks in
+    /// by bytes; its first run starts at `spec.start_ms`, where the receiver
+    /// is told to start. As [`Self::publish`] -- refused while the LAN
+    /// listener is down, holds the id's lease, unpublished by
+    /// [`Self::unpublish`] or the listener's stop -- and refused
+    /// (`noProducer`) when no producer is installed
+    /// ([`Self::install_producer`]). No run starts until the receiver asks.
     pub fn publish_rendition(
         &self,
         id: &MediaId,
@@ -1469,22 +1469,6 @@ impl ServerHandle {
         self.state.lan_media.casts().rendition_state(token)
     }
 
-    /// **How many times a receiver restarted a rendition's stream**: fetched
-    /// it again from a start it had already played well past -- what a
-    /// receiver that cannot seek in the stream (it offers no ranges) does
-    /// when the viewer seeks with its remote, and what a network blip may
-    /// make it do. The receiver then plays from that start; the app,
-    /// watching this count, loads the stream again where the receiver was.
-    /// A receiver's first fetches at a load, and a stream from a new start,
-    /// are not restarts. `0` for a token that is not a rendition. Cheap.
-    pub fn rendition_restarts(&self, token: &CastToken) -> u64 {
-        self.state
-            .lan_media
-            .casts()
-            .rendition(token)
-            .map_or(0, |rendition| rendition.restarts())
-    }
-
     /// The durations renditions published from now on run by. For the
     /// tests: a release period or a speed window a test can wait out.
     #[doc(hidden)]
@@ -1499,9 +1483,9 @@ impl ServerHandle {
         self.state.lan_media.casts().rendition_probe(token)
     }
 
-    /// A rendition's init segment, as its stream begins with it: for the
-    /// tests of the run and the ring, which the stream sends only in
-    /// order. Blocks as the stream would.
+    /// A rendition's init segment (`ftyp` + `moov`), as its file begins
+    /// with it: for the tests of the run and the ring. Blocks as the file's
+    /// first request would.
     #[doc(hidden)]
     pub fn rendition_init(&self, token: &CastToken) -> Result<bytes::Bytes, rendition::NotServed> {
         let rendition = self
@@ -1515,9 +1499,10 @@ impl ServerHandle {
             .unwrap_or(Err(rendition::NotServed::Cut))
     }
 
-    /// Segment `segment` of a rendition, as its stream asks for it: from the
-    /// ring, after the production it joins, or from a new run. For the
-    /// tests, as [`Self::rendition_init`].
+    /// The fragment in slot `segment` of a rendition (without its
+    /// padding), as a range that begins in it asks for it: from the ring,
+    /// after the production it joins, or from a new run. For the tests, as
+    /// [`Self::rendition_init`].
     #[doc(hidden)]
     pub fn rendition_segment(
         &self,
@@ -1531,8 +1516,10 @@ impl ServerHandle {
             .rendition(token)
             .ok_or(rendition::NotServed::NotFound)?;
         let state = self.state.clone();
-        self.block_on_server(async move { rendition.segment(&state, segment).await })
-            .unwrap_or(Err(rendition::NotServed::Cut))
+        self.block_on_server(
+            async move { rendition.slot(&state, segment, rendition::Ask::Seek).await },
+        )
+        .unwrap_or(Err(rendition::NotServed::Cut))
     }
 
     /// **Unpublish a cast token**: nothing more is served under it, and a

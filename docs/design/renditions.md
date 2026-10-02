@@ -1,6 +1,6 @@
 # Renditions: a cast the receiver can decode, produced on demand, nothing on disk
 
-Design, 2026-10-01. **F1 (the server side) is built, F0 landed in the app, F1½ answered (libavformat), F2's producer built; F3-F5 are not.**
+Design, 2026-10-01; §2.8 2026-10-02. **F1 (the server side) is built, F0 landed in the app, F1½ answered (libavformat), F2's producer built and its file seekable by bytes (§2.8); F3-F5 are not.**
 
 > **Amended in F2 (zond, 2026-10-01): a rendition is ONE progressive
 > fragmented MP4, not HLS.** Measured on zond's Chromecast with Google TV
@@ -10,41 +10,24 @@ Design, 2026-10-01. **F1 (the server side) is built, F0 landed in the app, F1½ 
 > plain `<video src>` path. "Why keep HLS if everything works with
 > progressive fMP4?" (zond) -- so HLS is gone: no playlists, no
 > `init.mp4`/`{n}.m4s` routes, no `hlsSegmentFormat` hints. The rendition
-> is `GET /cast/{token}/stream.mp4[?from=<ms>]`: the init segment, then the
-> segments in order from the one `from` falls in, sent as they are made,
-> with no length and no ranges. Everything behind the routes stays as
+> is `GET /cast/{token}/stream.mp4`. Everything behind the routes stays as
 > designed below -- the run, the cut rule, the ring, the lookahead, the
 > idle release, the speed rule, the muxer, the frozen formats -- with the
-> segment now a unit inside the stream that the stream asks for in turn.
-> **A seek is a new load of the stream from the new time** (`?from=`): a
-> progressive file made from a time cannot be sought by bytes, and the
-> stream's timestamps are the film's own, so the receiver's `currentTime`
-> reads the film's position whatever the stream started at (measured in
-> desktop Chrome: a stream from segment 2 of 6 s segments starts at
-> `currentTime` 12, `seekable` is empty, the duration grows as fragments
-> arrive). Where the sections below say playlist, `#EXTINF`,
-> `index.m3u8` or "a request for segment N", read the stream and the
-> segment it asks for next.
+> segment now a unit inside the file. Where the sections below say
+> playlist, `#EXTINF`, `index.m3u8` or "a request for segment N", read the
+> file and the slot a range asks for.
 >
-> **Seeking, measured on the TV (2026-10-01) and decided (zond): seeks are
-> the phone's.** With the film's length in the init segment (each track's
-> `mdhd`, which is where Chrome's MP4 demuxer -- ffmpeg's -- reads a
-> fragmented file's duration; `mvhd`/`mehd` alone left the receiver's
-> duration at what had arrived), the receiver shows the whole film. A seek
-> on the receiver -- a sender's SEEK or the TV remote -- cannot be made in a
-> stream with no ranges: the receiver fetches the stream again from its
-> start (`Range: bytes=0-`) and plays from there, and the target never
-> appears in its status. A new LOAD of `stream.mp4?from=<ms>` with
-> `currentTime` there plays from the target within three seconds. So the
-> app seeks by reloading at the target, and a receiver seek is made
-> harmless: the server counts a **restart** -- a fetch of the stream from a
-> start some earlier fetch from the same start had already sent
-> `RESTART_AFTER` (3) segments of; a receiver's first fetches at a load, two
-> in a row at times, and a stream from a new start are not --
-> `ServerHandle::rendition_restarts`, and the app, seeing the count move,
-> loads the stream again where the receiver was. The stream stays
-> `BUFFERED` (no LIVE marking): the TV keeps its seek bar and the film's
-> length. This is step F
+> **Amended again (zond, 2026-10-02): the file has a length and ranges,
+> and the receiver seeks in it by bytes** (§2.8). The first F2 stream had
+> neither -- `?from=<ms>` started it elsewhere, and a receiver's own seek
+> made it fetch the stream again from its start, which the app undid by
+> loading it again where the receiver had been. Measured by hand on the TV
+> the same day (§2.8): with a length, ranges that answer exact bytes, and
+> a `sidx` after the `moov`, a seek with the TV's remote is one `Range`
+> straight at the target fragment, and plays. So the layout of the file is
+> fixed before it is made -- each segment in a slot as long as its share
+> of the source, padded -- the `?from=` start and the restart count are
+> gone, and the app's seeks are the receiver's again. This is step F
 of `docs/design/media-pipeline.md` (§2.10 fixed what it must not break;
 this note is the design that section asked for). Written against
 stream-server `410a1e2`, xtremio `c9cc260`, flutter_chrome_cast 1.4.8 and
@@ -560,6 +543,110 @@ those. The cast watchdog (`_castFetchCheck`) reads `rendition_state`
 beside the two counts, and a failed rendition ends the cast with its
 sentence.
 
+### 2.8 Seeking by bytes: the mirror layout
+
+*Measured 2026-10-02 on zond's Chromecast with Google TV, by hand from a
+desktop over `adb reverse`, with Python servers serving a 10-minute 1080p
+H.264/AAC film repackaged by `ffmpeg` (`frag_keyframe+empty_moov`, the
+moov's lengths patched; the scratch servers and the TV's logs are in the
+session's `f2/` scratchpad, `TV_FINDINGS.md` and `handseek_f2.py`):*
+
+1. **No length, no ranges** (the first F2 stream): a seek past what is
+   buffered -- the remote's or a sender's -- makes the receiver fetch the
+   stream again from byte 0; the target is never reported.
+2. **A length and `Accept-Ranges`, but a far `Range` answered with a fresh
+   file** (a new `ftyp`/`moov` from the target time) **fails at load**: the
+   TV's Chrome reads in ranged blocks even when it reads forward
+   (`bytes=1.0M-`, `1.5M-`, `2.0M-`, ..., each connection dropped after
+   about 3.3 MB), so every range must be the exact, consistent bytes of
+   one file.
+3. **A length, ranges and exact bytes, no index**: a seek makes FFmpeg's
+   MP4 demuxer (inside Chrome) walk every `moof` from the start -- about
+   one ranged request per fragment, skipping the `mdat`s. Fine when every
+   byte is local; far too slow behind a torrent. An `mfra` at the end is
+   **ignored** by FFmpeg 6 (it peeks at the last 4-16 bytes for its size
+   and never reads it).
+4. **Plus a `sidx`** (version 1, `reference_ID` the video track, its
+   timescale, `earliest_presentation_time`, `first_offset` 0, one
+   reference per fragment: `referenced_size` the fragment's bytes,
+   `subsegment_duration`, `starts_with_SAP` 1) **right after the `moov`**:
+   `ffprobe` seeks to 5:00 in four requests (the start, a 4-byte peek at
+   the end, the first fragment, one jump to the target fragment), and on
+   the TV zond's remote seeks were **one** `Range: bytes=X-` at the target
+   fragment each, and played (5:00, 7:16). The receiver showed 10:00 from
+   the `mdhd`.
+
+So the file needs a length and a `sidx` before anything is produced, and
+every byte answered the same whoever asks and whenever. The design zond
+approved, **the mirror layout**, built in `rendition/layout.rs`,
+`slots.rs`, `run.rs` and `cast.rs`:
+
+* **The header** is the init segment and the `sidx`. Then **one slot per
+  segment**: slot `k` holds segment `k`'s fragment, padded with a `free`
+  box to the slot's end. The `sidx` gives each slot's size and duration,
+  so FFmpeg jumps to the slot that holds a time.
+* **With the source's index, the slots mirror the source.** The producer
+  reports the video's sync samples -- `(pts, byte position)`, from
+  libavformat's index (Matroska cues, an MP4's sample tables, an AVI's
+  `idx1`), refined for Matroska with each cue's `CueRelativePosition` --
+  when the job asks for them (`Job::wants_index`, the first run only).
+  Segment `k` is cut at the first indexed sync sample at or after `k x T`
+  (each a different one: a GOP longer than `T` makes one segment, not an
+  empty one), and slot `k` is the source's bytes from that sync sample to
+  the next segment's -- the same samples, so about the same bytes -- plus
+  **headroom**, 8 KiB and a 64th of the span: a fragment carries a `moof`
+  where a Matroska cluster carries a few bytes per block, and an MP4
+  source keeps its sample tables in its `moov`, so the same samples are
+  never quite the same size. The last slot runs to the source's end. The
+  file's length is the header plus every slot, exact before a byte is
+  made; the `sidx`'s durations are the indexed times, exact by
+  construction. An index that stops more than a minute (or a twentieth of
+  the film) before the end is not the film's -- it is the few entries a
+  demuxer adds as it reads a file that has none -- and is estimated.
+* **Without one, the slots are estimated**: segments on the `k x T` grid
+  (a segment's real start may be up to a GOP later, which the `tfdt`
+  says), slot `k` in proportion to time over the source's size, **15%**
+  larger and 8 KiB on top.
+* **The overflow rule** (`slots.rs`). A segment whose fragment does not
+  leave 24 bytes of its slot (a `free` header and a zero tail) keeps the
+  longest prefix that fits -- cut in decode order only where nothing kept
+  is shown after anything left over, so decode times stay in order -- and
+  the rest **spills** to the start of the next slot, before that
+  segment's own samples; when the next slot's start is already decided (it
+  was made, or a run was started at it) the rest is **dropped** instead,
+  and logged. The decision is recorded per slot the first time, so a slot
+  made again -- the ring let it go, or a run was started at it -- is made
+  the same way: a slot's start is where the slot before spilled to, or its
+  own segment's beginning. Mirrored from a real index, a spill is rare
+  (the headroom absorbs the difference in overhead); estimated, it is how
+  a stretch of the film denser than the average is carried.
+* **The same bytes every time.** The muxer is a pure function of a slot's
+  samples, and a slot's samples do not depend on where its run started:
+  a run made for a slot asks its producer to start **two seconds before**
+  the cut (`SEEK_BACK`), so a sample a container stores before the sync
+  sample it seeks to (audio interleaved ahead of video) is still read,
+  and everything before the cut is discarded as before.
+* **The last 16 bytes of every slot are zeros**, answered without making
+  anything: FFmpeg's peek at the file's end for an `mfra` size reads 0.
+* **Requests.** `HEAD` and any `GET` wait for the layout -- the first
+  run's formats and index -- starting that run a segment and two seconds
+  before the spec's start, so it makes the slot the receiver will jump to.
+  A range that begins in a slot waits for that slot's fragment before it
+  answers (a failure is a `503`); one that begins in the header answers at
+  once. The slot a read asks for moves the run there if it is not the slot
+  in production or within the lookahead -- **except the receiver's opening
+  read**, from the header on into slot 0, which it never chose: it waits
+  for the first run rather than move it, until a read has asked that run
+  for a slot (the receiver's jump to the start, which joins it). The
+  lookahead, the ring, the idle release, the speed rule and the absence
+  of any give-up timer (a stalled source is waited for) are unchanged.
+* **The app** (xtremio) loads `stream.mp4` with the receiver told to start
+  at the phone's position, and a seek on the phone is a plain `SEEK` to
+  the receiver again; the reload and the undo of the receiver's restarts
+  are gone, and with them `ServerHandle::rendition_restarts`.
+
+What a TV hand test of this is, before the app: §5, F2.
+
 ## 3. Routes and the contract with the client
 
 **On the LAN listener**, under the same token and the same cut, beside
@@ -772,14 +859,13 @@ F2. **Kotlin producer, repackage only, end to end on the phone** (M). The
      receiver shows the full 10:00 from the first byte (`mdhd`); a phone seek
      reloads `?from=` and lands (5:00); a TV-remote seek is undone back to
      where the receiver was (the target is never reported); Stop hands the
-     film back to the phone at the receiver's position. Remote seeks that
-     actually move are only possible with a receiver of our own, which zond
-     declined for now.*
-   * *The app's half (built since, see above): publish, hand the receiver
-     `stream.mp4?from=<position>` as `video/mp4` with no start position of
-     its own (the stream already starts there), map a seek -- the phone's
-     or the TV remote's, which the receiver cannot do in an unseekable
-     file -- to a new LOAD at the new time, and drop the HLS fields.*
+     film back to the phone at the receiver's position.*
+   * *The same day, by hand (§2.8): a file with a length, exact ranges and
+     a `sidx` makes the TV's remote seeks one `Range` each, and they play.
+     So the file is laid out before it is made (§2.8), `?from=` and the
+     restart count went, and the app hands the receiver `stream.mp4` and
+     its seeks back as `SEEK`s. Not on the TV yet as built; the hand test
+     is in the xtremio change's report.*
 
 F3. **Audio to stereo AAC** (M). `MediaCodec` decode when the phone has a
    decoder, libavcodec from `libmpv.so` otherwise (2.6), downmix,

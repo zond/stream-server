@@ -4,53 +4,63 @@
 //!
 //! A rendition is a published cast token ([`crate::ServerHandle::publish_rendition`])
 //! with **one progressive fragmented MP4** behind it
-//! (`/cast/{token}/stream.mp4`, `crate::cast`): the init segment, then
-//! media segments in order from a start time, each produced on demand by a
-//! [`Producer`](crate::rendition::Producer) the embedder installed -- the
-//! thing that demuxes, decodes and encodes, which the server never does
-//! itself. The server's half is everything else: the route, the cut rule,
-//! the fMP4 muxer (`mux.rs`), the ring of segments in memory, and the
-//! speed a run is judged by.
+//! (`/cast/{token}/stream.mp4`, `crate::cast`), its media segments each
+//! produced on demand by a [`Producer`](crate::rendition::Producer) the
+//! embedder installed -- the thing that demuxes, decodes and encodes, which
+//! the server never does itself. The server's half is everything else: the
+//! route, the file's byte layout, the cut rule, the fMP4 muxer (`mux.rs`),
+//! the ring of fragments in memory, and the speed a run is judged by.
 //!
-//! **Not HLS.** zond's Chromecast with Google TV plays no HLS above 720p
-//! through its Media Source path -- ours, ffmpeg's or Mux's own, TS or
-//! fMP4, at any bitrate -- and plays the same film as a progressive
-//! fragmented MP4 through its plain `<video src>` path
-//! (`docs/design/renditions.md`, F2). A segment is an internal unit: the
-//! stream is the segments one after another, and a seek is a new stream
-//! from another start.
+//! **Not HLS, and seekable by bytes.** zond's Chromecast with Google TV
+//! plays no HLS above 720p through its Media Source path, and plays a
+//! progressive fragmented MP4 through its plain `<video src>` path -- and
+//! seeks in one with a single `Range` when it has a length, exact bytes and
+//! a `sidx` (`docs/design/renditions.md` §2.8). So the file's layout is
+//! fixed before it is made (`layout.rs`): a header (`ftyp` + `moov` +
+//! `sidx`), then one slot per segment, mirrored from the source's index or
+//! estimated, each its segment's fragment padded to the slot's end
+//! (`slots.rs` says what goes in one and what happens when it does not
+//! fit).
 //!
 //! # The rules this keeps
 //!
-//! * **Nothing on disk.** Segments live in a ring in memory -- two behind
+//! * **Nothing on disk.** Fragments live in a ring in memory -- two behind
 //!   the last request, [`LOOKAHEAD`](crate::rendition::LOOKAHEAD) ahead, [`RING_CAP`](crate::rendition::RING_CAP) at most -- and are
 //!   dropped.
-//! * **The cut rule**: segment N begins at the first video sync sample whose
-//!   presentation time is at or after N x T and ends where N+1 begins; an
-//!   audio sample belongs to the segment its presentation time falls in on
-//!   the N x T grid. What a run is handed before its first cut is
-//!   discarded. A segment is produced whole before it is sent.
-//! * **A request for segment N** is answered from the ring; or waits, when
-//!   N is the segment in production or at most [`LOOKAHEAD`](crate::rendition::LOOKAHEAD) past it (and
-//!   joins that production, never restarts it); or is a seek: the run is
-//!   dropped and a new one starts at N x T.
+//! * **Every byte is the same however often it is made**: the layout is
+//!   frozen with the first run's formats and the source's index, the
+//!   overflow rule's decision per slot is recorded, and a run asks its
+//!   producer for [`SEEK_BACK`](crate::rendition::SEEK_BACK) before its first cut, so a slot's samples do
+//!   not depend on where its run started.
+//! * **The cut rule**: segment N begins at the first video sync sample at or
+//!   after its cut -- an indexed sync sample's time, or N x T -- and ends
+//!   where N+1 begins; an audio sample belongs to the segment whose cuts its
+//!   presentation time falls between. What a run is handed before its first
+//!   cut is discarded. A slot is produced whole before it is sent.
+//! * **A request for slot N** is answered from the ring; or waits, when N is
+//!   the slot in production or at most [`LOOKAHEAD`](crate::rendition::LOOKAHEAD) past it (and joins that
+//!   production, never restarts it); or is a seek: the run is dropped and a
+//!   new one starts at N -- except the receiver's opening read, which does
+//!   not move the first run ([`Ask::Open`](crate::rendition::Ask::Open)).
 //! * **The lookahead blocks the producer**: a run completes at most
-//!   [`LOOKAHEAD`](crate::rendition::LOOKAHEAD) segments past the last request, then stops reading its
+//!   [`LOOKAHEAD`](crate::rendition::LOOKAHEAD) slots past the last request, then stops reading its
 //!   sink, and the producer's next write blocks.
 //! * **An idle run is let go** after [`IDLE_RELEASE`](crate::rendition::IDLE_RELEASE) without a request; the
 //!   ring is kept and the next request starts a new run where it asks.
 //! * **The first run's formats are frozen** into the init segment; a later run
 //!   whose formats differ fails the rendition.
 //! * **A run slower than real time fails the rendition with a sentence**:
-//!   under 1.0x over [`SPEED_WINDOW`](crate::rendition::SPEED_WINDOW) of busy time once its first segment
+//!   under 1.0x over [`SPEED_WINDOW`](crate::rendition::SPEED_WINDOW) of busy time once its first slot
 //!   is out, where busy time leaves out the sink's and the reader's waits
 //!   (`speed.rs`).
 //! * **Cut by unpublish**, as a plain cast is: the run is dropped (its sink
 //!   answers [`Stopped`](crate::rendition::Stopped), its reader is cancelled), the ring goes, and a
-//!   request waiting on a segment is answered with an error.
+//!   request waiting on a slot is answered with an error.
 
+pub(crate) mod layout;
 pub(crate) mod mux;
 mod run;
+mod slots;
 pub(crate) mod speed;
 
 use crate::media::{MediaId, MediaReader, PlayToken};
@@ -76,9 +86,12 @@ pub const RING_CAP: usize = 96 * 1024 * 1024;
 pub const IDLE_RELEASE: Duration = Duration::from_secs(60);
 /// The busy time a run's speed is judged over.
 pub const SPEED_WINDOW: Duration = Duration::from_secs(10);
-/// Segments a stream from a start must have sent before another `GET` from
-/// that same start counts as a restart ([`Rendition::stream_begins`]).
-pub const RESTART_AFTER: u64 = 3;
+/// How far before a segment's cut a run asks its producer to start: a
+/// container may store a sample shown at or after the cut before the sync
+/// sample it seeks to (audio interleaved ahead of video), and a segment
+/// made by a run started at it must hold exactly what one made by a run
+/// passing through it holds. What comes before the cut is discarded.
+pub const SEEK_BACK: Duration = Duration::from_secs(2);
 /// Samples in flight between a producer and its run.
 const SINK_CAPACITY: usize = 32;
 
@@ -185,6 +198,20 @@ impl TrackFormat {
     }
 }
 
+/// **One sync sample of the source's video, where the source's index puts
+/// it**: what a rendition's byte layout mirrors (`layout.rs`). The producer
+/// reports the index once, when [`Job::wants_index`] asks, before its first
+/// sample ([`SampleSink::index`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexEntry {
+    /// Presentation time, microseconds on the film's clock -- the clock the
+    /// samples are on.
+    pub pts_us: i64,
+    /// The byte in the source where the sync sample begins (or the
+    /// container unit that begins with it).
+    pub pos: u64,
+}
+
 /// One access unit: presentation time in microseconds from the film's
 /// start, whether it is a sync sample, and its bytes (video in Annex-B).
 #[derive(Clone, Debug)]
@@ -238,16 +265,20 @@ pub struct Job {
     /// the reads are the viewer's playback.
     pub reader: MediaReader,
     pub spec: RenditionSpec,
-    /// Start here: N x T for a run that begins at segment N. The producer
-    /// starts at the sync sample at or before it; the server discards what
-    /// precedes the cut.
+    /// Start here: [`SEEK_BACK`] before the cut of the first segment the
+    /// run makes. The producer starts at the sync sample at or before it;
+    /// the server discards what precedes the cut.
     pub from: Duration,
+    /// The rendition's layout is not fixed yet: report the source's index
+    /// ([`SampleSink::index`]) before the first sample, if it has one.
+    pub wants_index: bool,
     pub sink: SampleSink,
 }
 
 /// What a sink carries into its run.
 pub(crate) enum SinkMessage {
     Format(TrackKind, TrackFormat),
+    Index(Vec<IndexEntry>),
     Sample(Sample),
     End,
     Fail(String),
@@ -300,6 +331,13 @@ impl SampleSink {
     /// and channels.
     pub fn format(&self, track: TrackKind, format: TrackFormat) -> Result<(), Stopped> {
         self.send(SinkMessage::Format(track, format))
+    }
+
+    /// The source's index of the video's sync samples, when
+    /// [`Job::wants_index`] asks -- before the first sample. Without one the
+    /// layout is estimated.
+    pub fn index(&self, entries: Vec<IndexEntry>) -> Result<(), Stopped> {
+        self.send(SinkMessage::Index(entries))
     }
 
     /// One access unit. Blocks while the run is [`LOOKAHEAD`] segments
@@ -374,20 +412,28 @@ impl Default for RenditionTuning {
 pub struct RenditionProbe {
     /// Runs begun since the publish.
     pub runs_started: u64,
-    /// The segment the live run began at, if one is live.
+    /// The slot the live run began at, if one is live.
     pub run_from: Option<u64>,
-    /// The segment the live run is producing.
+    /// The slot the live run is producing.
     pub in_production: Option<u64>,
-    /// The segments in the ring.
+    /// The slots in the ring.
     pub ring: Vec<u64>,
-    /// Whether the init segment is frozen.
+    /// Whether the layout -- and with it the init segment -- is frozen.
     pub init: bool,
+    /// The file's length, once the layout is frozen.
+    pub total: Option<u64>,
+    /// Whether the layout mirrors the source's index (or is estimated).
+    pub exact: Option<bool>,
+    /// The slots whose content spilled into the next, and the ones cut
+    /// short.
+    pub spilled: Vec<u64>,
+    pub truncated: Vec<u64>,
 }
 
 /// Why a request under a rendition is not answered with bytes.
 #[derive(Debug, PartialEq, Eq)]
 pub enum NotServed {
-    /// Past the last segment, or past the film's end.
+    /// Past the last slot.
     NotFound,
     /// The rendition failed; the sentence.
     Failed(String),
@@ -395,34 +441,87 @@ pub enum NotServed {
     Cut,
 }
 
+/// What a request for a slot is (`docs/design/renditions.md`, "Seeking by
+/// bytes").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ask {
+    /// A read the receiver chose: a range that begins in the slot, or one
+    /// read on into it. It may move the run there.
+    Seek,
+    /// The receiver opening the file: a read from the header on, into the
+    /// first slot it reaches without having chosen it. It does not move the
+    /// first run -- started at the spec's start, where the receiver was told
+    /// to play and is about to seek -- before any read has asked for a
+    /// slot; it waits for that run instead, or for none to be live.
+    Open,
+}
+
 /// The live run, as a request sees it.
 struct RunSlot {
     generation: u64,
+    /// The first run, which no read has asked for a slot of yet: an
+    /// [`Ask::Open`] leaves it where it is.
+    reserved: bool,
+    /// The slot it began at; for the run that freezes the layout, known
+    /// once it has.
     from: u64,
-    /// The segment in production: the lowest not yet in the ring.
+    /// The slot in production: the lowest not yet in the ring.
     next_out: u64,
     stop: CancellationToken,
 }
 
+/// The decisions that make a slot the same every time it is made
+/// (`slots.rs`).
+#[derive(Default)]
+struct SlotPlan {
+    /// How each slot made so far ended.
+    ends: BTreeMap<u64, slots::End>,
+    /// Slots a run was started at before the slot ahead of them was made:
+    /// their start is their own segment's beginning, decided.
+    fixed: std::collections::BTreeSet<u64>,
+}
+
+impl SlotPlan {
+    /// Where slot `slot`'s content starts.
+    fn start(&self, slot: u64) -> slots::Cursor {
+        match slot
+            .checked_sub(1)
+            .and_then(|before| self.ends.get(&before))
+        {
+            Some(slots::End::Spill(cursor)) => *cursor,
+            _ => slots::Cursor::at(slot),
+        }
+    }
+
+    /// Whether slot `slot`'s start is decided: the slot before it was made,
+    /// or a run started at it.
+    fn decided(&self, slot: u64) -> bool {
+        self.fixed.contains(&slot)
+            || slot
+                .checked_sub(1)
+                .is_some_and(|before| self.ends.contains_key(&before))
+    }
+}
+
 struct Inner {
     formats: Option<mux::Formats>,
-    init: Option<Bytes>,
+    layout: Option<Arc<layout::Layout>>,
+    /// Each slot's fragment, by slot; the padding is not kept.
     ring: BTreeMap<u64, Bytes>,
     ring_bytes: usize,
     run: Option<RunSlot>,
     failed: Option<String>,
-    /// The first segment past the film's end, once a run reached it.
-    end: Option<u64>,
+    plan: SlotPlan,
     last_request: u64,
     last_request_at: Instant,
     runs_started: u64,
 }
 
 impl Inner {
-    fn note_request(&mut self, segment: u64, now: Instant) {
-        self.last_request = segment;
+    fn note_request(&mut self, slot: u64, now: Instant) {
+        self.last_request = slot;
         self.last_request_at = now;
-        let (low, high) = (segment.saturating_sub(BEHIND), segment + LOOKAHEAD);
+        let (low, high) = (slot.saturating_sub(BEHIND), slot + LOOKAHEAD);
         let gone: Vec<u64> = self
             .ring
             .keys()
@@ -437,13 +536,7 @@ impl Inner {
         // The cap: the oldest behind the request go first; nothing at or
         // ahead of it is taken (the gate stops production instead).
         while self.ring_bytes > RING_CAP {
-            let Some(oldest) = self
-                .ring
-                .keys()
-                .next()
-                .copied()
-                .filter(|key| *key < segment)
-            else {
+            let Some(oldest) = self.ring.keys().next().copied().filter(|key| *key < slot) else {
                 break;
             };
             if let Some(bytes) = self.ring.remove(&oldest) {
@@ -452,21 +545,20 @@ impl Inner {
         }
     }
 
-    fn insert(&mut self, segment: u64, bytes: Bytes) {
+    fn insert(&mut self, slot: u64, bytes: Bytes) {
         self.ring_bytes += bytes.len();
-        if let Some(old) = self.ring.insert(segment, bytes) {
+        if let Some(old) = self.ring.insert(slot, bytes) {
             self.ring_bytes -= old.len();
         }
     }
 }
 
-/// One published rendition: the spec, the producer, and the ring with the
-/// run that fills it.
+/// One published rendition: the spec, the producer, the layout, and the
+/// ring with the run that fills it.
 pub(crate) struct Rendition {
     id: MediaId,
     play: Option<PlayToken>,
     spec: RenditionSpec,
-    count: u64,
     producer: Arc<dyn Producer>,
     tuning: RenditionTuning,
     /// The publication's cut: every run's stop is a child of it.
@@ -474,16 +566,6 @@ pub(crate) struct Rendition {
     inner: Mutex<Inner>,
     /// Bumped on every change a request or a run may be waiting for.
     version: watch::Sender<u64>,
-    /// The streams asked for, by start: what makes a restart.
-    streams: Mutex<Streams>,
-}
-
-/// The streams of one rendition: for each start (`from`, ms) the most
-/// segments any stream from it has sent, and how many restarts there were.
-#[derive(Default)]
-struct Streams {
-    sent_from: std::collections::HashMap<u64, u64>,
-    restarts: u64,
 }
 
 impl Rendition {
@@ -503,9 +585,7 @@ impl Rendition {
             spec.duration_ms > 0,
             "a rendition's duration must be above zero"
         );
-        let count = spec.duration_ms.div_ceil(u64::from(spec.segment_ms));
         Ok(Self {
-            count,
             id,
             play,
             spec,
@@ -514,63 +594,18 @@ impl Rendition {
             cut,
             inner: Mutex::new(Inner {
                 formats: None,
-                init: None,
+                layout: None,
                 ring: BTreeMap::new(),
                 ring_bytes: 0,
                 run: None,
                 failed: None,
-                end: None,
+                plan: SlotPlan::default(),
                 last_request: 0,
                 last_request_at: Instant::now(),
                 runs_started: 0,
             }),
             version: watch::channel(0).0,
-            streams: Mutex::new(Streams::default()),
         })
-    }
-
-    fn streams(&self) -> std::sync::MutexGuard<'_, Streams> {
-        self.streams
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Where a stream asked to start at `from_ms` starts: there, or the
-    /// spec's start when it names none.
-    pub(crate) fn stream_start_ms(&self, from_ms: Option<u64>) -> u64 {
-        from_ms.unwrap_or(self.spec.start_ms)
-    }
-
-    /// **A stream from `start_ms` begins**: whether it is a *restart*, which
-    /// is counted. A receiver that cannot seek in a stream (it offers no
-    /// ranges) answers a seek by fetching it again from its start and
-    /// playing from there; a restart is that -- a stream from a start some
-    /// earlier stream from the same start had already sent
-    /// [`RESTART_AFTER`] segments of. A receiver's first fetches, which may
-    /// be several in a row at a load, have sent nothing yet; a new start (the
-    /// app loading the stream from somewhere else) has no history.
-    pub(crate) fn stream_begins(&self, start_ms: u64) -> bool {
-        let mut streams = self.streams();
-        let restart = streams
-            .sent_from
-            .get(&start_ms)
-            .is_some_and(|sent| *sent >= RESTART_AFTER);
-        if restart {
-            streams.restarts += 1;
-        }
-        restart
-    }
-
-    /// A stream from `start_ms` has sent `segments` segments.
-    pub(crate) fn stream_sent(&self, start_ms: u64, segments: u64) {
-        let mut streams = self.streams();
-        let sent = streams.sent_from.entry(start_ms).or_default();
-        *sent = (*sent).max(segments);
-    }
-
-    /// How many restarts there were ([`Self::stream_begins`]).
-    pub(crate) fn restarts(&self) -> u64 {
-        self.streams().restarts
     }
 
     fn inner(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -588,15 +623,12 @@ impl Rendition {
         i64::from(self.spec.segment_ms) * 1000
     }
 
-    /// How many segments the film is cut into: `ceil(duration / T)`.
-    pub(crate) fn count(&self) -> u64 {
-        self.count
+    fn duration_us(&self) -> i64 {
+        i64::try_from(self.spec.duration_ms.saturating_mul(1000)).unwrap_or(i64::MAX)
     }
 
-    /// The segment a stream starting at `start_ms` begins with, held inside
-    /// the film.
-    pub(crate) fn first_segment(&self, start_ms: u64) -> u64 {
-        (start_ms / u64::from(self.spec.segment_ms)).min(self.count - 1)
+    pub(crate) fn has_layout(&self) -> bool {
+        self.inner().layout.is_some()
     }
 
     pub(crate) fn state(&self) -> RenditionState {
@@ -618,12 +650,31 @@ impl Rendition {
 
     pub(crate) fn probe(&self) -> RenditionProbe {
         let inner = self.inner();
+        let ended = |truncated: bool| {
+            inner
+                .plan
+                .ends
+                .iter()
+                .filter(|(_, end)| {
+                    if truncated {
+                        matches!(end, slots::End::Truncated { .. })
+                    } else {
+                        matches!(end, slots::End::Spill(_))
+                    }
+                })
+                .map(|(slot, _)| *slot)
+                .collect()
+        };
         RenditionProbe {
             runs_started: inner.runs_started,
             run_from: inner.run.as_ref().map(|run| run.from),
             in_production: inner.run.as_ref().map(|run| run.next_out),
             ring: inner.ring.keys().copied().collect(),
-            init: inner.init.is_some(),
+            init: inner.layout.is_some(),
+            total: inner.layout.as_ref().map(|layout| layout.total),
+            exact: inner.layout.as_ref().map(|layout| layout.exact),
+            spilled: ended(false),
+            truncated: ended(true),
         }
     }
 
@@ -639,22 +690,51 @@ impl Rendition {
         }
     }
 
-    /// Start a run at `segment`, dropping the live one: the seek path.
-    fn start_run(self: &Arc<Self>, inner: &mut Inner, state: &AppState, segment: u64) {
+    /// Start a run, dropping the live one: at `slot` (the seek path), or --
+    /// with no layout yet -- the run that will freeze it, from a segment
+    /// before the spec's start.
+    fn start_run(self: &Arc<Self>, inner: &mut Inner, state: &AppState, slot: Option<u64>) {
         if let Some(old) = inner.run.take() {
             old.stop.cancel();
         }
         inner.runs_started += 1;
         let generation = inner.runs_started;
+        let back = i64::try_from(SEEK_BACK.as_micros()).unwrap_or(i64::MAX);
+        let (from_us, from_slot) = match (slot, inner.layout.clone()) {
+            (Some(slot), Some(layout)) => {
+                // A run is started here: the slot's start is decided now, if
+                // the slot before has not decided it.
+                inner.plan.fixed.insert(slot);
+                let anchor = inner.plan.start(slot).anchor();
+                let from = if anchor == 0 {
+                    0
+                } else {
+                    layout.cuts[anchor as usize].saturating_sub(back).max(0)
+                };
+                (from, slot)
+            }
+            _ => {
+                let start_us = i64::try_from(self.spec.start_ms.saturating_mul(1000))
+                    .unwrap_or(i64::MAX)
+                    .min(self.duration_us());
+                let from = start_us
+                    .saturating_sub(self.segment_us())
+                    .saturating_sub(back)
+                    .max(0);
+                (from, 0)
+            }
+        };
         let stop = self.cut.child_token();
         inner.run = Some(RunSlot {
             generation,
-            from: segment,
-            next_out: segment,
+            reserved: slot.is_none(),
+            from: from_slot,
+            next_out: from_slot,
             stop: stop.clone(),
         });
         tracing::info!(
-            from = segment,
+            from = slot,
+            from_ms = from_us / 1000,
             runs = generation,
             stage = "rendition_run_start",
             "rendition run started"
@@ -663,14 +743,127 @@ impl Rendition {
             self.clone(),
             state.clone(),
             generation,
-            segment,
+            slot,
+            Duration::from_micros(from_us as u64),
             stop,
         ));
     }
 
-    /// The init segment: frozen from the first run's formats, waiting for
-    /// them -- and starting that run at the spec's start, if none is live.
-    pub(crate) async fn init(self: &Arc<Self>, state: &AppState) -> Result<Bytes, NotServed> {
+    /// **The first sample of a run**: the layout frozen from the first run's
+    /// formats and index -- or, for a later run, its formats checked against
+    /// it -- and where the run's output starts: `start`, or the first slot
+    /// cut at or after `from` for the run that froze the layout. That
+    /// slot's start is decided, and with it the run's first cursor.
+    pub(crate) fn freeze(
+        &self,
+        generation: u64,
+        formats: &mux::Formats,
+        index: Option<&[IndexEntry]>,
+        source_len: u64,
+        from: Duration,
+        start: Option<u64>,
+    ) -> Result<(Arc<layout::Layout>, u64, slots::Cursor), run::Frozen> {
+        let mut inner = self.inner();
+        if !inner
+            .run
+            .as_ref()
+            .is_some_and(|run| run.generation == generation)
+        {
+            return Err(run::Frozen::Stopped);
+        }
+        let layout = match (&inner.formats, inner.layout.clone()) {
+            (Some(frozen), Some(layout)) => {
+                if frozen != formats {
+                    return Err(run::Frozen::Failed(
+                        "The conversion came back from a seek in a different format, which the \
+                         television cannot follow; cast the film again."
+                            .to_string(),
+                    ));
+                }
+                layout
+            }
+            _ => {
+                let init = mux::init_segment(formats, self.spec.duration_ms)
+                    .map_err(run::Frozen::Failed)?;
+                let plan =
+                    layout::Plan::new(index, source_len, self.duration_us(), self.segment_us());
+                let (track, timescale) = formats.indexed_track();
+                let layout = Arc::new(
+                    layout::Layout::new(init, plan, track, timescale, self.duration_us())
+                        .map_err(run::Frozen::Failed)?,
+                );
+                tracing::info!(
+                    exact = layout.exact,
+                    slots = layout.slots.len(),
+                    total = layout.total,
+                    source = source_len,
+                    stage = "rendition_layout",
+                    "rendition layout frozen"
+                );
+                inner.formats = Some(formats.clone());
+                inner.layout = Some(layout.clone());
+                layout
+            }
+        };
+        let from_us = i64::try_from(from.as_micros()).unwrap_or(i64::MAX);
+        let slot = start.unwrap_or_else(|| layout.first_slot_from(from_us));
+        let slot = slot.min(layout.slots.len() as u64 - 1);
+        inner.plan.fixed.insert(slot);
+        let cursor = inner.plan.start(slot);
+        if start.is_none() {
+            // The run that froze the layout: it is the receiver's first
+            // request's, which asked for the spec's start.
+            if let Some(run) = inner.run.as_mut() {
+                run.from = slot;
+                run.next_out = slot;
+            }
+            inner.note_request(slot, Instant::now());
+        }
+        drop(inner);
+        self.bump();
+        Ok((layout, slot, cursor))
+    }
+
+    /// Whether slot `slot`, made for the first time, may spill into the
+    /// next: there is one, and its start is not decided.
+    pub(crate) fn may_spill(&self, slot: u64) -> bool {
+        let inner = self.inner();
+        let count = inner.layout.as_ref().map_or(0, |layout| layout.slots.len()) as u64;
+        slot + 1 < count && !inner.plan.decided(slot + 1)
+    }
+
+    /// Slot `slot` made, under the run's generation: its fragment in the
+    /// ring, and its end recorded the first time. Answers the end recorded
+    /// -- this one, or the one it was first made with -- or `None` when the
+    /// run is no longer the live one.
+    pub(crate) fn publish_slot(
+        &self,
+        generation: u64,
+        slot: u64,
+        end: slots::End,
+        fragment: Bytes,
+    ) -> Option<slots::End> {
+        let recorded = {
+            let mut inner = self.inner();
+            let run = inner
+                .run
+                .as_mut()
+                .filter(|run| run.generation == generation)?;
+            run.next_out = slot + 1;
+            let recorded = *inner.plan.ends.entry(slot).or_insert(end);
+            inner.insert(slot, fragment);
+            recorded
+        };
+        self.bump();
+        Some(recorded)
+    }
+
+    /// **The file's layout**: frozen by the first run's first sample --
+    /// starting that run, from before the spec's start, if none is live.
+    pub(crate) async fn layout(
+        self: &Arc<Self>,
+        state: &AppState,
+    ) -> Result<Arc<layout::Layout>, NotServed> {
         let mut seen = self.version.subscribe();
         loop {
             {
@@ -681,14 +874,12 @@ impl Rendition {
                 if let Some(sentence) = &inner.failed {
                     return Err(NotServed::Failed(sentence.clone()));
                 }
-                if let Some(init) = &inner.init {
-                    return Ok(init.clone());
+                if let Some(layout) = &inner.layout {
+                    return Ok(layout.clone());
                 }
                 if inner.run.is_none() {
-                    let start =
-                        (self.spec.start_ms / u64::from(self.spec.segment_ms)).min(self.count - 1);
-                    inner.note_request(start, Instant::now());
-                    self.start_run(&mut inner, state, start);
+                    inner.last_request_at = Instant::now();
+                    self.start_run(&mut inner, state, None);
                 }
             }
             if !self.wait(&mut seen).await {
@@ -697,18 +888,24 @@ impl Rendition {
         }
     }
 
-    /// Segment `segment`: from the ring, after the production it joins, or
-    /// from a new run started at it.
-    pub(crate) async fn segment(
+    /// The init segment (`ftyp` + `moov`), as the file begins with it.
+    pub(crate) async fn init(self: &Arc<Self>, state: &AppState) -> Result<Bytes, NotServed> {
+        let layout = self.layout(state).await?;
+        Ok(layout.header.slice(..layout.init_len))
+    }
+
+    /// **Slot `slot`'s fragment**: from the ring, after the production it
+    /// joins, or from a new run started at it -- except that an
+    /// [`Ask::Open`] waits for the first run rather than move it ([`Ask`]).
+    pub(crate) async fn slot(
         self: &Arc<Self>,
         state: &AppState,
-        segment: u64,
+        slot: u64,
+        ask: Ask,
     ) -> Result<Bytes, NotServed> {
-        if segment >= self.count {
-            return Err(NotServed::NotFound);
-        }
         let mut seen = self.version.subscribe();
         let mut noted = false;
+        let mut deferring = false;
         loop {
             {
                 let mut inner = self.inner();
@@ -718,23 +915,41 @@ impl Rendition {
                 if let Some(sentence) = &inner.failed {
                     return Err(NotServed::Failed(sentence.clone()));
                 }
-                if !noted {
-                    noted = true;
-                    inner.note_request(segment, Instant::now());
-                    // The gate moved: a run waiting on it looks again.
-                    self.bump();
-                }
-                if let Some(bytes) = inner.ring.get(&segment) {
-                    return Ok(bytes.clone());
-                }
-                if inner.end.is_some_and(|end| segment >= end) {
+                let count = inner.layout.as_ref().map_or(0, |layout| layout.slots.len()) as u64;
+                if slot >= count {
                     return Err(NotServed::NotFound);
                 }
-                let joins = inner.run.as_ref().is_some_and(|run| {
-                    segment >= run.next_out && segment <= run.next_out + LOOKAHEAD
-                });
-                if !joins {
-                    self.start_run(&mut inner, state, segment);
+                let in_ring = inner.ring.contains_key(&slot);
+                let joins = inner
+                    .run
+                    .as_ref()
+                    .is_some_and(|run| slot >= run.next_out && slot <= run.next_out + LOOKAHEAD);
+                // Once an opening read has waited for the first run, it
+                // goes on waiting while any run is live: the receiver's
+                // jump to its start has asked for that run by then.
+                deferring = ask == Ask::Open
+                    && !in_ring
+                    && !joins
+                    && inner
+                        .run
+                        .as_ref()
+                        .is_some_and(|run| deferring || run.reserved);
+                if !deferring {
+                    if !noted {
+                        noted = true;
+                        inner.note_request(slot, Instant::now());
+                        // The gate moved: a run waiting on it looks again.
+                        self.bump();
+                    }
+                    if let Some(run) = inner.run.as_mut() {
+                        run.reserved = false;
+                    }
+                    if let Some(bytes) = inner.ring.get(&slot) {
+                        return Ok(bytes.clone());
+                    }
+                    if !joins {
+                        self.start_run(&mut inner, state, Some(slot));
+                    }
                 }
             }
             if !self.wait(&mut seen).await {

@@ -31,7 +31,7 @@ use bytes::Bytes;
 pub(crate) const VIDEO_TIMESCALE: u32 = 90_000;
 
 /// The track ids: video is 1, audio is 2 (or 1 when there is no video).
-const VIDEO_TRACK: u32 = 1;
+pub(crate) const VIDEO_TRACK: u32 = 1;
 
 /// What a run reported for its tracks, frozen into the init segment by the
 /// first run and compared against every later one.
@@ -44,6 +44,16 @@ pub(crate) struct Formats {
 impl Formats {
     fn audio_track_id(&self) -> u32 {
         if self.video.is_some() { 2 } else { 1 }
+    }
+
+    /// The track the `sidx` indexes, and its clock: the video's, or the
+    /// sound's when there is no picture.
+    pub(crate) fn indexed_track(&self) -> (u32, u32) {
+        if self.video.is_some() {
+            (VIDEO_TRACK, VIDEO_TIMESCALE)
+        } else {
+            (self.audio_track_id(), self.audio_timescale())
+        }
     }
 
     fn audio_timescale(&self) -> u32 {
@@ -628,6 +638,29 @@ pub(crate) fn init_segment(formats: &Formats, duration_ms: u64) -> Result<Bytes,
     let mut out = ftyp;
     out.extend_from_slice(&moov);
     Ok(Bytes::from(out))
+}
+
+/// The segment index (`sidx`, version 1): one reference per slot of the
+/// file, on `track`'s clock (`timescale`), the first starting at
+/// `earliest` and right after this box (`first_offset` 0). Each reference
+/// is `(size, duration)`: a media reference of `size` bytes and
+/// `duration` ticks that starts with a stream access point of unknown type
+/// -- what FFmpeg's MP4 demuxer (the one in a Cast receiver's Chrome) reads
+/// to jump to the slot that holds a time with one `Range`.
+pub(crate) fn sidx(track: u32, timescale: u32, earliest: u64, refs: &[(u32, u32)]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(28 + refs.len() * 12);
+    body.extend_from_slice(&track.to_be_bytes());
+    body.extend_from_slice(&timescale.to_be_bytes());
+    body.extend_from_slice(&earliest.to_be_bytes());
+    body.extend_from_slice(&0u64.to_be_bytes()); // first_offset
+    body.extend_from_slice(&0u16.to_be_bytes()); // reserved
+    body.extend_from_slice(&(refs.len() as u16).to_be_bytes());
+    for &(size, duration) in refs {
+        body.extend_from_slice(&(size & 0x7fff_ffff).to_be_bytes());
+        body.extend_from_slice(&duration.to_be_bytes());
+        body.extend_from_slice(&(1u32 << 31).to_be_bytes()); // starts with a SAP
+    }
+    full(b"sidx", 1, 0, &[&body])
 }
 
 // --- Media segments --------------------------------------------------------------

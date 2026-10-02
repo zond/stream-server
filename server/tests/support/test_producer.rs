@@ -11,9 +11,12 @@
 //!
 //! The knobs: a speed factor (a producer slower than real time paces
 //! itself, which is the work being simulated, not a wait for anything); a
-//! run that reports another format; a run that fails; and reads from the
+//! run that reports another format; a run that fails; reads from the
 //! job's reader at every sync sample, so a slow source is a slow producer
-//! in wall time and not in busy time.
+//! in wall time and not in busy time; the size of a video frame; and the
+//! index it reports when the job wants one ([`IndexKnob`]): every sync
+//! sample at a position in proportion to its time over the reader's
+//! length, one squeezed against the next, or none.
 
 #![allow(dead_code)]
 
@@ -22,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use stream_server::rendition::SinkProbe;
-use stream_server::{Job, Producer, ProducerRefusal, Sample, TrackFormat, TrackKind};
+use stream_server::{IndexEntry, Job, Producer, ProducerRefusal, Sample, TrackFormat, TrackKind};
 
 /// x264's SPS for 320x240 High, Annex-B, as `csd-0` carries it.
 pub const SPS: &[u8] = &[
@@ -43,6 +46,18 @@ pub const ASC: &[u8] = &[0x11, 0x90];
 const AAC_FRAME: i64 = 1024;
 const AAC_RATE: i64 = 48_000;
 
+/// The index a run reports when its job wants one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexKnob {
+    /// Every sync sample, at the reader's length times its time over the
+    /// film's.
+    Proportional,
+    /// The same, but the first sync sample at or after `at_us` is put one
+    /// byte before the next: the segment it starts gets almost no bytes of
+    /// the source, and overflows its slot.
+    Squeezed { at_us: i64 },
+}
+
 #[derive(Clone, Debug)]
 pub struct Knobs {
     pub fps: u32,
@@ -59,6 +74,10 @@ pub struct Knobs {
     /// Read one byte of the job's reader at `stride` x the GOP's index at
     /// every sync sample: a seek and a read the source answers.
     pub read_stride: Option<u64>,
+    /// Filler bytes in each video frame after its NAL header and number.
+    pub frame_bytes: usize,
+    /// The index reported; `None` reports none.
+    pub index: Option<IndexKnob>,
 }
 
 impl Default for Knobs {
@@ -71,6 +90,8 @@ impl Default for Knobs {
             other_format_on_run: None,
             fail_on_run: None,
             read_stride: None,
+            frame_bytes: 120,
+            index: Some(IndexKnob::Proportional),
         }
     }
 }
@@ -107,6 +128,35 @@ impl Knobs {
             .collect()
     }
 
+    /// Every sync sample's index entry for a source `len` bytes long, as
+    /// `knob` places them.
+    pub fn index(&self, knob: IndexKnob, len: u64) -> Vec<IndexEntry> {
+        let length = self.length.as_micros() as i64;
+        let place = |pts: i64| (pts as i128 * len as i128 / length as i128) as u64;
+        let keys: Vec<i64> = self
+            .video_frames()
+            .into_iter()
+            .filter(|(_, key)| *key)
+            .map(|(pts, _)| pts)
+            .collect();
+        let squeezed = match knob {
+            IndexKnob::Squeezed { at_us } => keys.iter().position(|pts| *pts >= at_us),
+            IndexKnob::Proportional => None,
+        };
+        keys.iter()
+            .enumerate()
+            .map(|(at, pts)| IndexEntry {
+                pts_us: *pts,
+                pos: if Some(at) == squeezed {
+                    keys.get(at + 1)
+                        .map_or(place(*pts), |next| place(*next) - 1)
+                } else {
+                    place(*pts)
+                },
+            })
+            .collect()
+    }
+
     /// The first sync sample at or after `at_us`.
     pub fn key_at_or_after(&self, at_us: i64) -> Option<i64> {
         self.video_frames()
@@ -119,6 +169,8 @@ impl Knobs {
 /// What one run did, as the tests read it.
 pub struct RunRecord {
     pub from: Duration,
+    /// The job asked for the source's index.
+    pub wanted_index: bool,
     pub probe: SinkProbe,
     /// The sink answered `Stopped`.
     pub stopped: AtomicBool,
@@ -166,6 +218,7 @@ impl Producer for TestProducer {
     fn start(&self, job: Job) -> Result<(), ProducerRefusal> {
         let record = Arc::new(RunRecord {
             from: job.from,
+            wanted_index: job.wants_index,
             probe: job.sink.probe(),
             stopped: AtomicBool::new(false),
             ended: AtomicBool::new(false),
@@ -205,10 +258,10 @@ pub fn frame_of(bytes: &[u8]) -> i64 {
         .fold(0i64, |frame, byte| (frame << 7) | i64::from(byte & 0x7f))
 }
 
-fn video_payload(frame: i64, key: bool) -> Bytes {
+fn video_payload(frame: i64, key: bool, filler: usize) -> Bytes {
     let mut data = vec![0, 0, 0, 1, if key { 0x65 } else { 0x41 }];
     data.extend_from_slice(&frame_bytes(frame));
-    data.extend(std::iter::repeat_n(0xab, 120));
+    data.extend(std::iter::repeat_n(0xab, filler));
     Bytes::from(data)
 }
 
@@ -223,6 +276,7 @@ fn produce(knobs: &Knobs, index: usize, job: Job, record: &RunRecord) {
         mut reader,
         from,
         sink,
+        wants_index,
         ..
     } = job;
     let from_us = from.as_micros() as i64;
@@ -260,6 +314,13 @@ fn produce(knobs: &Knobs, index: usize, job: Job, record: &RunRecord) {
             return;
         }
     }
+    if wants_index
+        && let Some(knob) = knobs.index
+        && sink.index(knobs.index(knob, reader.len())).is_err()
+    {
+        record.stopped.store(true, Ordering::SeqCst);
+        return;
+    }
     let wall = Instant::now();
     let first = knobs.video_pts(video).min(Knobs::audio_pts(audio));
     let mut written = 0usize;
@@ -294,7 +355,7 @@ fn produce(knobs: &Knobs, index: usize, job: Job, record: &RunRecord) {
                 track: TrackKind::Video,
                 pts_us: video_pts,
                 key,
-                data: video_payload(video, key),
+                data: video_payload(video, key, knobs.frame_bytes),
             };
             video += 1;
             sample

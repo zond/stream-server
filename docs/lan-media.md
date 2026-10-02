@@ -13,7 +13,7 @@ tokens and nothing else**.
 
 | | |
 |---|---|
-| **What it exposes** | `GET`/`HEAD` `/cast/{token}` ([`server/src/cast.rs`](../server/src/cast.rs)), and for a rendition its HLS stream under `/cast/{token}/hls/` ([Renditions](#renditions)). The app publishes a media id for a cast (`ServerHandle::publish(&MediaId, Option<PlayToken>) -> CastToken`) and hands the receiver `<lan_media_base_url>/cast/<token>`; the route serves what the id resolves to -- a torrent file, a link through `/proxy`'s cache, a Google Drive file, a finished download, a member of an archive -- with the range framing every media route shares (`200`/`206`/`416`, `Content-Range`, `HEAD`, the DLNA headers). An unknown token is a `404`. A link whose origin will not serve ranges is refused (`501`, `{"refused":"noRanges"}`): nothing here can seek it for a receiver |
+| **What it exposes** | `GET`/`HEAD` `/cast/{token}` ([`server/src/cast.rs`](../server/src/cast.rs)), and for a rendition its file at `/cast/{token}/stream.mp4` ([Renditions](#renditions)). The app publishes a media id for a cast (`ServerHandle::publish(&MediaId, Option<PlayToken>) -> CastToken`) and hands the receiver `<lan_media_base_url>/cast/<token>`; the route serves what the id resolves to -- a torrent file, a link through `/proxy`'s cache, a Google Drive file, a finished download, a member of an archive -- with the range framing every media route shares (`200`/`206`/`416`, `Content-Range`, `HEAD`, the DLNA headers). An unknown token is a `404`. A link whose origin will not serve ranges is refused (`501`, `{"refused":"noRanges"}`): nothing here can seek it for a receiver |
 | **What it does not** | Every other path is a `404`, every method: the control router is **not mounted at all** (a control path answers `404`, never the `401` that would confirm the route exists and only a bearer token is missing), and neither is any loopback media route -- not the torrent routes, the archive routes, `/proxy`, `/ftp`, `/drive/stream`, `/downloads/{key}/stream` or `/local-addon` |
 | **Where it binds** | `ServerConfig::lan_media_addr: Option<SocketAddr>` -- `None` by default, so nothing changes unless an embedder asks for it. `Some(0.0.0.0:0)` lets the OS pick the port |
 | **When it runs** | `ServerHandle::set_lan_media(true)` starts it, `set_lan_media(false)` stops it -- meant to bracket a cast session, so the LAN surface exists only while something is casting. Nothing is bound at startup, whatever the configuration: a port already in use fails the cast that asked for the listener, never the server |
@@ -64,33 +64,44 @@ it is refused with `noProducer` until the embedder has called
 
 | Path | Answers |
 |---|---|
-| `GET /cast/{token}/stream.mp4[?from=<ms>]` | `200`, `video/mp4`, `Cache-Control: no-store`, **no `Content-Length` and no `Accept-Ranges`**: the init segment (`ftyp` + `moov`), then segment after segment (`styp` + `moof` + `mdat`), from the one `from` falls in (the spec's `startMs` without it) to the film's end, each sent as it is made, the next asked for as the receiver takes the last. A `Range` header is not read. Waits for the first segment and the init segment before it answers, so a rendition that cannot start is `503` `{"refused":"renditionFailed","message":...}` (or `{"refused":"unpublished"}` for one the unpublish woke); after that, a failure or the cut breaks the body with an error, and only the film's end is a clean end. Nothing times it out |
-| `HEAD /cast/{token}/stream.mp4` | The same headers, at once; starts nothing |
+| `GET /cast/{token}/stream.mp4` | `video/mp4`, `Cache-Control: no-store`, a `Content-Length` and `Accept-Ranges: bytes`, with the range framing every media route shares (`200`, `206` with `Content-Range`, `416` naming the length): **a file whose every byte is fixed before it is made** -- the header (`ftyp` + `moov` + `sidx`), then one slot per segment, each that segment's fragment (`styp` + `moof` + `mdat`) padded with a `free` box to the slot's end. Waits for the first run's formats and the source's index, which fix the length. A range that begins in a slot waits for that slot's fragment before it answers, so a rendition that cannot make it is `503` `{"refused":"renditionFailed","message":...}` (or `{"refused":"unpublished"}` for one the unpublish woke); a range that begins in the header answers at once. After that, a failure or the cut breaks the body with an error. Nothing times it out |
+| `HEAD /cast/{token}/stream.mp4` | The same headers; waits for the length as a `GET` does (starting the first run) |
 
-The init segment carries the film's length (`mvhd`, `tkhd`, and each
-track's `mdhd` on its own clock, which is the one a receiver's demuxer
-reads), so the receiver knows it from the first byte. A receiver cannot
-seek in the stream: asked to, it fetches the stream again from its start.
-That is a **restart** -- a fetch from a start an earlier fetch from the
-same start had sent three segments of -- and is counted
-(`ServerHandle::rendition_restarts(&CastToken)`), so the app can load the
-stream again where the receiver was.
+**The receiver seeks by bytes.** The init segment carries the film's
+length (`mvhd`, `tkhd`, and each track's `mdhd` on its own clock, which is
+the one a receiver's demuxer reads), and the `sidx` one reference per slot
+-- its size and its time -- so a seek is one `Range` straight at the slot
+that holds the time (measured on zond's TV:
+[design/renditions.md](design/renditions.md), "Seeking by bytes"). With
+the source's index (Matroska cues, an MP4's sample tables, an AVI's
+`idx1`) the layout **mirrors** it: segment `n` is cut at the first indexed
+sync sample at or after `n x T`, and its slot is as long as the source's
+bytes from that sync sample to the next segment's, plus a little headroom
+(8 KiB and a 64th); without one (a transport stream, an MKV with no cues)
+the slots are **estimated**: on the `n x T` grid, in proportion to time
+over the source's size, 15% larger and 8 KiB on top. A segment holds the
+video from its sync sample to the next segment's and the audio between
+the two cuts. One that does not fit its slot keeps what fits and
+**spills** the rest into the next slot -- or, when the next slot is
+already made, **drops** it (logged) -- a decision made once and kept, so a
+slot made again is the same bytes. The last 16 bytes of every slot are
+zeros and are answered without making anything (a demuxer peeking at the
+file's end for an `mfra`).
 
 A plain token has no `stream.mp4` (`404`); a rendition's token serves it
-and, like a plain one, the source as it is at `/cast/{token}`. A stream's
-`GET` counts as one body (`lan_media_bodies_served`). **A seek is a new
-stream** from another `from`: the receiver plays a progressive file it
-cannot seek by bytes, and the stream's timestamps are the film's, so
-`currentTime` reads the film's position from wherever it starts. Segment
-`n` (a unit inside the stream, `T` long) is cut at the first video sync
-sample at or after `n x T` and holds the audio whose
-time falls in `[n x T, (n+1) x T)`. Production runs at most two segments
-past the one the stream last asked for and then waits; a stream from a
-time far from where the run is starts a new run there. A run nobody has asked anything of for
-a minute is let go (the segments made are kept). A run that makes less than
-its own time in film over ten seconds of its own work -- leaving out the
-time it waited for the receiver and for the source -- fails the rendition
-with a sentence, which `ServerHandle::rendition_state(&CastToken)` reports
+and, like a plain one, the source as it is at `/cast/{token}`. Each `GET`
+counts as one body (`lan_media_bodies_served`). Production runs at most two
+slots past the one last asked for and then waits; a range at a slot far
+from where the run is starts a new run there, two seconds before the
+slot's cut (so a run started there makes exactly what one passing through
+makes) -- except the receiver's opening read, which reads from the header
+on into the first slot without having chosen it, and does not move the
+first run (made at the spec's start, where the receiver is about to seek).
+A run nobody has asked anything of for a minute is let go (the slots made
+are kept). A run that makes less than its own time in film over ten
+seconds of its own work -- leaving out the time it waited for the receiver
+and for the source -- fails the rendition with a sentence, which
+`ServerHandle::rendition_state(&CastToken)` reports
 (`{"state":"failed","sentence":...}`; otherwise `producing`, `idle`, or
 `ended` for a token not published).
 

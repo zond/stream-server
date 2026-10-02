@@ -43,16 +43,16 @@
 //! **Renditions** (`docs/design/renditions.md`, `crate::rendition`) are
 //! publications too ([`crate::ServerHandle::publish_rendition`]), with the
 //! same token rules and the same cut, and one progressive fragmented MP4
-//! at `/cast/{token}/stream.mp4` (`?from=<ms>` for a start other than the
-//! spec's): the init segment and the media segments in order, sent as
-//! they are made. A plain publication has no `stream.mp4` (`404`); a
-//! rendition's token serves it and, like a plain one, the source as it is
-//! at `/cast/{token}`.
+//! at `/cast/{token}/stream.mp4`: a file with a length and ranges whose
+//! every byte is fixed before it is made (header, then one padded slot per
+//! segment), so a receiver seeks in it by bytes. A plain publication has
+//! no `stream.mp4` (`404`); a rendition's token serves it and, like a
+//! plain one, the source as it is at `/cast/{token}`.
 
 use crate::media::registry::Entry;
 use crate::media::{MediaId, PlayToken, Refusal};
 use crate::rendition::{
-    NotServed, Producer, Rendition, RenditionSpec, RenditionState, RenditionTuning,
+    Ask, NotServed, Producer, Rendition, RenditionSpec, RenditionState, RenditionTuning,
 };
 use crate::routes::{compat, util};
 use crate::sources::ReadHint;
@@ -61,7 +61,7 @@ use crate::translators::session::Lease;
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -296,26 +296,20 @@ pub(crate) fn router() -> Router<AppState> {
         )
 }
 
-/// Where a rendition's stream starts: `?from=<ms>` on the film's clock.
-#[derive(serde::Deserialize)]
-struct StreamQuery {
-    from: Option<u64>,
-}
-
 async fn stream_get(
     State(state): State<AppState>,
     Path(token): Path<String>,
-    Query(query): Query<StreamQuery>,
+    headers: HeaderMap,
 ) -> Response {
-    serve_stream(&state, &token, query.from, true).await
+    serve_stream(&state, &token, &headers, true).await
 }
 
 async fn stream_head(
     State(state): State<AppState>,
     Path(token): Path<String>,
-    Query(query): Query<StreamQuery>,
+    headers: HeaderMap,
 ) -> Response {
-    serve_stream(&state, &token, query.from, false).await
+    serve_stream(&state, &token, &headers, false).await
 }
 
 /// What a rendition answers when it has no bytes for the request: `404`
@@ -341,35 +335,142 @@ fn not_served(reason: NotServed) -> Response {
     }
 }
 
-/// **A rendition's stream**: one progressive fragmented MP4 -- the init
-/// segment, then segment after segment from the one `from` falls in (the
-/// spec's start without it) to the film's end -- sent as the segments are
-/// made. A receiver plays it as a file it reads forward (`<video src>`),
-/// not through Media Source.
+/// Zeros for a slot's padding, handed out without allocating.
+static ZEROS: [u8; 64 * 1024] = [0; 64 * 1024];
+
+/// A rendition file's bytes from `next` to `end` (inclusive), piece by
+/// piece: the header, then each slot's fragment and padding, the
+/// fragments asked of the rendition as the body gets to them.
+struct FileReader {
+    state: AppState,
+    rendition: Arc<Rendition>,
+    layout: Arc<crate::rendition::layout::Layout>,
+    next: u64,
+    end: u64,
+    /// The first slot's fragment, when the answer waited for it.
+    first: Option<(u64, Bytes)>,
+    /// What the next fragment is asked as: the first slot of a read from
+    /// the header on is the receiver opening the file; every other slot it
+    /// chose.
+    ask: Ask,
+}
+
+impl FileReader {
+    /// The next piece, `None` at the range's end.
+    async fn piece(&mut self) -> Option<std::io::Result<Bytes>> {
+        if self.next > self.end {
+            return None;
+        }
+        let header = self.layout.header.len() as u64;
+        if self.next < header {
+            let to = (self.end + 1).min(header);
+            let piece = self.layout.header.slice(self.next as usize..to as usize);
+            self.next = to;
+            return Some(Ok(piece));
+        }
+        let slot = self.layout.slot_at(self.next)?;
+        let place = self.layout.slots[slot as usize];
+        let from = self.next - place.offset;
+        let to = (self.end - place.offset).min(place.size - 1);
+        if place.in_tail(from) {
+            let len = (to + 1 - from) as usize;
+            self.next += len as u64;
+            // A tail is at most TAIL_ZEROS long.
+            return Some(Ok(Bytes::from_static(&ZEROS[..len])));
+        }
+        let fragment = match self.first.take() {
+            Some((first, fragment)) if first == slot => fragment,
+            _ => {
+                let asked = self.rendition.slot(&self.state, slot, self.ask).await;
+                match asked {
+                    Ok(fragment) => fragment,
+                    Err(reason) => {
+                        // Nothing after an error.
+                        self.next = u64::MAX;
+                        return Some(Err(std::io::Error::other(match reason {
+                            NotServed::Cut => "the cast was unpublished".to_string(),
+                            NotServed::Failed(sentence) => sentence,
+                            NotServed::NotFound => "past the rendition's last slot".to_string(),
+                        })));
+                    }
+                }
+            }
+        };
+        self.ask = Ask::Seek;
+        let bytes = slot_bytes(&fragment, place.size, from, to);
+        self.next += to + 1 - from;
+        Some(Ok(bytes))
+    }
+}
+
+/// Bytes `from..=to` of a slot `size` long holding `fragment`: the
+/// fragment, a `free` box header, zeros.
+fn slot_bytes(fragment: &Bytes, size: u64, from: u64, to: u64) -> Bytes {
+    let len = fragment.len() as u64;
+    let pad = size - len;
+    let header = crate::rendition::layout::free_header(pad);
+    let mut out = Vec::with_capacity((to + 1 - from) as usize);
+    let mut at = from;
+    while at <= to {
+        if at < len {
+            let upto = (to + 1).min(len);
+            out.extend_from_slice(&fragment[at as usize..upto as usize]);
+            at = upto;
+        } else if at < len + 8 {
+            let upto = (to + 1).min(len + 8);
+            out.extend_from_slice(&header[(at - len) as usize..(upto - len) as usize]);
+            at = upto;
+        } else {
+            out.resize(out.len() + (to + 1 - at) as usize, 0);
+            at = to + 1;
+        }
+    }
+    Bytes::from(out)
+}
+
+/// **A rendition's file**: one progressive fragmented MP4 with a length
+/// and ranges (`docs/design/renditions.md`, "Seeking by bytes") -- the
+/// header (`ftyp` + `moov` + `sidx`), then one slot per segment, each its
+/// fragment padded with a `free` box, every byte the same however often
+/// and in whatever order it is asked for. A receiver plays it as a file
+/// (`<video src>`), not through Media Source, and seeks in it by bytes:
+/// it finds the time in the `sidx` and asks for a `Range` there.
 ///
-/// The answer waits for the first segment and the init segment, so a
-/// rendition that cannot start is a status (`503`, as [`not_served`] says)
-/// rather than a body that breaks. After that it is `200`, `video/mp4`,
-/// **no length and no ranges**: the length of what is not made yet is not
-/// known, and offering ranges would invite a seek by bytes that a stream
-/// made from a time cannot answer. A `Range` header is not read; the
-/// answer is the stream from its start. A seek is a new stream from
-/// another `from`.
+/// The length is known once the first run has reported the source's
+/// formats and index, so the answer -- a `HEAD` too -- waits for that
+/// (starting the run, from the spec's start, if none is live). Then the
+/// range framing every media route shares: `200` or `206` with
+/// `Content-Range`, `416` for a range past the end. A range that begins in
+/// a slot waits for that slot's fragment before it answers, so a rendition
+/// that cannot make it is a status (`503`, as [`not_served`] says) rather
+/// than a body that breaks; one that begins in the header answers at once.
 ///
-/// Each segment after the first is asked for as the receiver takes the
-/// last -- the body is polled only as the socket drains -- so a receiver
-/// that pauses stops asking, and the run's lookahead holds the producer.
-/// No timer ends a stream: a segment that is slow to come is waited for.
-/// The cut (unpublish, the listener's stop) breaks the body with an error,
-/// as it does a plain cast's, and so does a rendition that fails partway;
-/// only the film's end is a clean end.
-async fn serve_stream(state: &AppState, token: &str, from: Option<u64>, body: bool) -> Response {
+/// Each later slot is asked for as the receiver takes the bytes before it,
+/// so a receiver that pauses stops asking and the run's lookahead holds
+/// the producer. A slot a read asks for may move the run there, except
+/// the first slot of a read from the header on, which waits for the first
+/// run rather than move it ([`Ask`]). The last bytes of a slot are always zeros and are
+/// answered without asking for anything. No timer ends a body: a slot that
+/// is slow to come is waited for. The cut (unpublish, the listener's stop)
+/// and a rendition that fails partway break the body with an error.
+async fn serve_stream(state: &AppState, token: &str, headers: &HeaderMap, body: bool) -> Response {
     let Some(publication) = state.lan_media.casts().get(token) else {
         tracing::info!("cast request for a token that is not published");
         return StatusCode::NOT_FOUND.into_response();
     };
     let Some(rendition) = publication.rendition.clone() else {
         return StatusCode::NOT_FOUND.into_response();
+    };
+    let layout = match rendition.layout(state).await {
+        Ok(layout) => layout,
+        Err(reason) => return not_served(reason),
+    };
+    let size = layout.total;
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok());
+    let Some(framing) = util::MediaRange::of(range, size) else {
+        return util::range_not_satisfiable(size);
     };
     let mut res_headers = HeaderMap::new();
     res_headers.insert(
@@ -380,83 +481,67 @@ async fn serve_stream(state: &AppState, token: &str, from: Option<u64>, body: bo
         header::CACHE_CONTROL,
         "no-store".parse().expect("a header value"),
     );
+    framing.write_headers(size, &mut res_headers);
     if !body {
-        return (StatusCode::OK, res_headers, Body::empty()).into_response();
+        return (framing.status(), res_headers, Body::empty()).into_response();
     }
-    let start_ms = rendition.stream_start_ms(from);
-    if rendition.stream_begins(start_ms) {
-        // The receiver could not seek in the stream and is playing it again
-        // from its start; the app is told (`rendition_restarts`) and puts it
-        // back where it was. Logged without the token.
-        tracing::info!(
-            restarts = rendition.restarts(),
-            stage = "rendition_stream_restart",
-            "a receiver fetched a rendition's stream again from its start"
-        );
-    }
-    let first = rendition.first_segment(start_ms);
-    // The first segment starts the run there (or joins one), and the init
-    // segment is frozen by the time it is out; either failing is the one
-    // answer, since a failure fails the whole rendition.
-    let begun = async {
-        let first_bytes = rendition.segment(state, first).await?;
-        Ok::<_, NotServed>((rendition.init(state).await?, first_bytes))
-    };
-    let (init, first_bytes) = match begun.await {
-        Ok(begun) => begun,
-        Err(reason) => return not_served(reason),
+    // A range that begins in a slot -- and not in its zero tail -- waits for
+    // that slot's fragment: the receiver's seek.
+    let first = match layout.slot_at(framing.start) {
+        Some(slot)
+            if !layout.slots[slot as usize]
+                .in_tail(framing.start - layout.slots[slot as usize].offset) =>
+        {
+            match rendition.slot(state, slot, Ask::Seek).await {
+                Ok(fragment) => Some((slot, fragment)),
+                Err(reason) => return not_served(reason),
+            }
+        }
+        _ => None,
     };
     state.lan_media.record_body();
-    rendition.stream_sent(start_ms, 1);
-    let count = rendition.count();
-    let later = {
-        let state = state.clone();
-        let rendition = rendition.clone();
-        futures_util::stream::unfold(Some(first + 1), move |next| {
-            let state = state.clone();
-            let rendition = rendition.clone();
-            async move {
-                let segment = next.filter(|segment| *segment < count)?;
-                match rendition.segment(&state, segment).await {
-                    Ok(bytes) => {
-                        rendition.stream_sent(start_ms, segment - first + 1);
-                        Some((Ok(bytes), Some(segment + 1)))
-                    }
-                    // Past the film's end, as a run that reached it found.
-                    Err(NotServed::NotFound) => None,
-                    Err(NotServed::Failed(sentence)) => {
-                        Some((Err(std::io::Error::other(sentence)), None))
-                    }
-                    Err(NotServed::Cut) => {
-                        Some((Err(std::io::Error::other("the cast was unpublished")), None))
-                    }
-                }
-            }
-        })
+    let ask = if framing.start < layout.header.len() as u64 {
+        // A read from the header on: the receiver opening the file, which
+        // reads on into the first slot without having chosen it.
+        Ask::Open
+    } else {
+        Ask::Seek
     };
-    let chunks = futures_util::stream::iter([Ok(init), Ok(first_bytes)])
-        .chain(later)
-        .flat_map(|piece: std::io::Result<Bytes>| {
-            let pieces: Vec<std::io::Result<Bytes>> = match piece {
-                Ok(bytes) => bytes
-                    .chunks(64 * 1024)
-                    .map(|chunk| Ok(bytes.slice_ref(chunk)))
-                    .collect(),
-                Err(error) => vec![Err(error)],
-            };
-            futures_util::stream::iter(pieces)
-        });
+    let reader = FileReader {
+        state: state.clone(),
+        rendition,
+        layout,
+        next: framing.start,
+        end: framing.end,
+        first,
+        ask,
+    };
+    let chunks = futures_util::stream::unfold(reader, |mut reader| async move {
+        let piece = reader.piece().await?;
+        Some((piece, reader))
+    })
+    .flat_map(|piece: std::io::Result<Bytes>| {
+        let pieces: Vec<std::io::Result<Bytes>> = match piece {
+            Ok(bytes) => bytes
+                .chunks(64 * 1024)
+                .map(|chunk| Ok(bytes.slice_ref(chunk)))
+                .collect(),
+            Err(error) => vec![Err(error)],
+        };
+        futures_util::stream::iter(pieces)
+    });
+    let length = framing.content_length(size);
     let body = CastBody {
         chunks: Box::pin(chunks),
         cut: Box::pin(publication.cut.clone().cancelled_owned()),
         ended: false,
         cut_seen: false,
         delivered: 0,
-        length: 0,
+        length,
         kind: "rendition",
         _held: Box::new(()),
     };
-    (StatusCode::OK, res_headers, Body::from_stream(body)).into_response()
+    (framing.status(), res_headers, Body::from_stream(body)).into_response()
 }
 
 async fn cast_get(
