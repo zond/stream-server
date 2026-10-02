@@ -600,9 +600,12 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   never quite the same size. The last slot runs to the source's end. The
   file's length is the header plus every slot, exact before a byte is
   made; the `sidx`'s durations are the indexed times, exact by
-  construction. An index that stops more than a minute (or a twentieth of
-  the film) before the end is not the film's -- it is the few entries a
-  demuxer adds as it reads a file that has none -- and is estimated.
+  construction. An index that starts more than a minute into the film, stops
+  more than a minute (or a twentieth of the film) before its end, or has
+  a gap of more than a minute is not the film's -- it is the few entries a
+  demuxer adds as it reads or seeks in a file that has none (a transport
+  stream's seek leaves its start and its end: measured, it made a 6-minute
+  film two slots) -- and is estimated.
 * **Without one, the slots are estimated**: segments on the `k x T` grid
   (a segment's real start may be up to a GOP later, which the `tfdt`
   says), slot `k` in proportion to time over the source's size, **15%**

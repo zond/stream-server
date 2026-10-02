@@ -161,9 +161,11 @@ impl Plan {
 
 /// The entries of `index` a layout can mirror -- sorted by time, each
 /// after the last in the file, inside the source -- or `None` when it is no
-/// index of the whole film: fewer than two, or stopping more than
-/// [`INDEX_REACH_US`] (or a twentieth of the film) before its end, as the
-/// few entries a demuxer adds while reading a file that has none do.
+/// index of the whole film: fewer than two, starting or stopping more than
+/// [`INDEX_REACH_US`] from the film's ends (the end: or a twentieth of the
+/// film), or with a gap longer than that between two entries -- the few
+/// entries a demuxer adds while reading or seeking in a file that has none
+/// (a transport stream's seek leaves its start and its end).
 pub(crate) fn usable(
     index: &[IndexEntry],
     source_len: u64,
@@ -183,9 +185,15 @@ pub(crate) fn usable(
             candidates.push(entry);
         }
     }
-    let last = candidates.last()?;
+    let (first, last) = (candidates.first()?, candidates.last()?);
     let reach = INDEX_REACH_US.max(duration_us / 20);
-    (candidates.len() >= 2 && last.pts_us.saturating_add(reach) >= duration_us)
+    let dense = candidates
+        .windows(2)
+        .all(|pair| pair[1].pts_us - pair[0].pts_us <= INDEX_REACH_US);
+    (candidates.len() >= 2
+        && dense
+        && first.pts_us <= INDEX_REACH_US
+        && last.pts_us.saturating_add(reach) >= duration_us)
         .then_some(candidates)
 }
 
@@ -390,9 +398,18 @@ mod tests {
         assert!(!Plan::new(Some(&start), 1 << 30, hour, 6 * T).exact);
         assert!(!Plan::new(Some(&start[..1]), 1 << 30, 3 * T, T).exact);
         assert!(!Plan::new(None, 1 << 30, 3 * T, T).exact);
-        // Within a minute of the end is the whole film's.
-        let near = [entry(0, 0), entry(hour - 50_000_000, 1000)];
-        assert!(usable(&near, 1 << 30, hour).is_some());
+        // Within a minute of the end is the whole film's, every gap a
+        // minute at most.
+        let whole: Vec<IndexEntry> = (0..=60)
+            .map(|minute| entry(minute * 59_000_000, minute as u64 * 1000))
+            .collect();
+        assert!(usable(&whole, 1 << 30, hour).is_some());
+        // What a transport stream's seek leaves: its start and its end, an
+        // hour apart -- no index.
+        let ends = [entry(0, 0), entry(hour - 50_000_000, 1000)];
+        assert!(usable(&ends, 1 << 30, hour).is_none());
+        // Nor one that begins a minute in.
+        assert!(usable(&whole[2..], 1 << 30, hour).is_none());
     }
 
     /// **Estimated**: the grid, slots in proportion to time over the
