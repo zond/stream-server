@@ -56,7 +56,8 @@
 //!
 //! 1. L1 → L2 only, and only inside [`Retention::holdings`],
 //!    [`Retention::forget_empty`], `drawn_in`, [`Retention::draws`],
-//!    [`Retention::draws_for`] and [`Door::drawn`], which take L1 and read
+//!    [`Retention::draws_for`], [`Retention::withdraw_from_draws_made_for`]
+//!    and [`Door::drawn`], which take L1 and read
 //!    each entity's L2 under it; never L2 → L1. An entity holds its own `Arc` and never
 //!    reaches the map. (Every other reader of the map --
 //!    [`Retention::readers`], `lookup`, `entity` -- copies the `Arc`s out
@@ -89,7 +90,10 @@
 //!    liveness value ([`crate::retention::live`]), not an install. The one
 //!    reading across entities is a set's draw (under S): a volume adopts
 //!    the draw a sibling already holds, read under the sibling's L2 and
-//!    copied out, and writes only its own state.
+//!    copied out, and writes only its own state. The one write across a
+//!    set's entities is a delete's ([`Retention::withdraw_from_draws_made_for`]),
+//!    which takes each volume's turn in turn -- released before the next --
+//!    and S under it, as a draw does.
 //! 5. Writes to `installed`, `windows`, `stride` and the in-place advance of
 //!    the policy require `&mut Turn`, so "written only under the turn" is a
 //!    type -- with one documented exception: [`State::install_now`]
@@ -2211,6 +2215,59 @@ impl<B: Backing> Retention<B> {
         let mut state = entity.state.lock();
         if state.drawn_for.as_ref() == Some(made_for) {
             state.forget_draw(&mut claim.guard);
+        }
+    }
+
+    /// **`pieces` leave every draw made for `made_for`**: one volume of a
+    /// played set is being deleted, and the set's union, recorded on every
+    /// volume that has drawn or adopted it, shares that volume's pieces no
+    /// more -- as [`Self::end_play_session`] ends what a deleted film
+    /// shared. Each volume's record is narrowed under its own turn (one at
+    /// a time, rule 4) and S, so the driver's next reading of what is
+    /// shared ([`Self::draws_for`]) leaves them out and its `EndShares`
+    /// takes them out of the announcement. A volume adopting the union
+    /// meanwhile copies it from a sibling not narrowed yet; the sweep runs
+    /// again until no record made for the set holds any of `pieces`.
+    pub async fn withdraw_from_draws_made_for(
+        &self,
+        made_for: &DrawnFor<B::Key>,
+        pieces: &BTreeSet<u32>,
+    ) {
+        loop {
+            let holding: Vec<Arc<Entity<B>>> = {
+                let entities = self.entities.lock();
+                entities
+                    .values()
+                    .filter(|entity| {
+                        let state = entity.state.lock();
+                        state.drawn_for.as_ref() == Some(made_for)
+                            && state
+                                .draw
+                                .as_ref()
+                                .is_some_and(|draw| !draw.is_disjoint(pieces))
+                    })
+                    .cloned()
+                    .collect()
+            };
+            if holding.is_empty() {
+                return;
+            }
+            for entity in holding {
+                let mut claim = Claim {
+                    guard: entity.turn.clone().lock_owned().await,
+                    about: None,
+                };
+                let _set_turn = self.set_draws.lock();
+                let mut state = entity.state.lock();
+                if state.drawn_for.as_ref() != Some(made_for) {
+                    continue;
+                }
+                let Some(draw) = state.draw.as_ref() else {
+                    continue;
+                };
+                let narrowed: BTreeSet<u32> = draw.difference(pieces).copied().collect();
+                state.adopt_draw(&mut claim.guard, narrowed, made_for.clone());
+            }
         }
     }
 

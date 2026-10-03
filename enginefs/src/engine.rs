@@ -2648,6 +2648,51 @@ impl<H: TorrentHandle> Engine<H> {
         }
     }
 
+    /// **`file_idx` is being deleted, and it is a volume of a set a draw
+    /// was made for**: what the set shared of it ends, as the deleted
+    /// file's own session does ([`Retention::end_play_session`]). The
+    /// union is recorded on every volume that drew or adopted it, so the
+    /// siblings' records lose the deleted volume's pieces -- all but a
+    /// piece it shares with another volume of the set, which is that
+    /// volume's to share. Called before the delete's `EndShares`, which
+    /// then rebuilds the announcement without them. A sibling that has not
+    /// drawn yet draws afresh at its next open, as the next open of a
+    /// deleted film does.
+    pub(crate) async fn withdraw_deleted_volume(&self, file_idx: usize) {
+        let mut sets: Vec<DrawnFor<usize>> = Vec::new();
+        for (_, _, made_for) in self.retention.draws_for() {
+            let names_it = made_for
+                .set
+                .as_ref()
+                .is_some_and(|parts| parts.iter().any(|(volume, _)| *volume == file_idx));
+            if names_it && !sets.contains(&made_for) {
+                sets.push(made_for);
+            }
+        }
+        if sets.is_empty() {
+            return;
+        }
+        let Some(span) = self.handle.file_pieces(file_idx).await else {
+            return;
+        };
+        for made_for in sets {
+            let mut gone: BTreeSet<u32> = span.pieces.clone().collect();
+            for (volume, _) in made_for.set.iter().flatten() {
+                if *volume == file_idx {
+                    continue;
+                }
+                if let Some(other) = self.handle.file_pieces(*volume).await {
+                    for piece in other.pieces {
+                        gone.remove(&piece);
+                    }
+                }
+            }
+            self.retention
+                .withdraw_from_draws_made_for(&made_for, &gone)
+                .await;
+        }
+    }
+
     /// **A delete of `file_idx` asked while a read of that file is open**:
     /// it happens as soon as the read ends
     /// ([`crate::BackendEngineFS`]'s waiting deletes, asked when a stream

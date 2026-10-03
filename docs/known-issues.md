@@ -26,15 +26,6 @@ carried in below.
   `enginefs/src/retention/scenario.rs`'s `CONTAINER_METADATA_LOOKAHEAD` and
   `PLAYBACK_LOOKAHEAD` keep the field's numbers under the names of constants
   that no longer exist -- a scenario stays the measurement it was taken from.
-- **Deleting one volume while its set plays keeps its pieces advertised
-  until the set is left** (review of `1d0d109`, 2026-10-01, H3). The set's
-  draw is recorded on every volume, so the delete's `end_play_session` on
-  the deleted volume leaves the union recorded on the others, which still
-  count as shared (`Engine::shares_now`): the deleted volume's pieces stay
-  in the advertised set -- announced and no longer held -- until the
-  viewer leaves the set and `EndShares` rebuilds it. Nothing breaks (an
-  advertised piece not held is announced to nobody), but the delete does
-  not end what the deleted file shared, as it does for a film. Not fixed.
 - **A set's draw advertised by a sibling can still land between the
   door's reading and an unlink** (2026-10-01, what is left of review H1).
   The door now refuses every piece of a recorded draw of a played entity
@@ -251,6 +242,18 @@ process.
 
 ## Closed, one line each
 
+- 2026-10-03 -- **Deleting one volume while its set played kept its
+  pieces advertised until the set was left** (review of `1d0d109`, H3):
+  the set's union is recorded on every volume, and the delete ended only
+  the deleted volume's record, so the union on its siblings still counted
+  as shared and the deleted pieces stayed announced -- and, announced,
+  stayed on the disk. The delete now takes the volume's pieces out of
+  every record made for the set (`Engine::withdraw_deleted_volume`,
+  `Retention::withdraw_from_draws_made_for`), all but a boundary piece
+  another volume of the set lies in, before its `EndShares`. Tests
+  `deleting_a_volume_while_its_set_plays_ends_what_that_volume_shared`,
+  `deleting_a_volume_keeps_the_piece_it_shares_with_a_sibling_shared`.
+
 - 2026-10-01 -- **Review of the member-sharing commits (`39a9105`,
   `1d0d109`)**, fixed on `review-fixes`. B1: a move to another member of
   the same container kept the first member's draw (a draw now records what
@@ -263,7 +266,7 @@ process.
   H1: a sibling's advertise of the union could race a volume's unlink; test
   `a_volume_unlinks_nothing_of_a_sets_draw_a_sibling_has_yet_to_advertise`.
   H2: a volume adopted any sibling's draw, a stale empty one included; test
-  `a_volume_adopts_only_a_draw_made_for_its_set`. H3 is open above.
+  `a_volume_adopts_only_a_draw_made_for_its_set`. H3 is closed above.
 
 - 2026-09-29 -- **Offline tests reached the DHT**: `resolve_dht_bootstrap_names`
   off stopped only this server's own resolution, and librqbit resolved the

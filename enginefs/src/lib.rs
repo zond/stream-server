@@ -4449,8 +4449,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             // Nothing reads the file: what its play session drew ends with
             // it, and the torrent is no longer the one playing on its
             // account -- or the reconcile below would start it again for a
-            // file that is gone.
+            // file that is gone. A volume of a played set shared through the
+            // set's union too, recorded on its siblings: that ends as well.
             engine.retention.end_play_session(&file_idx).await;
+            engine.withdraw_deleted_volume(file_idx).await;
             self.live
                 .forget(&crate::retention::live::LiveEntity::Torrent {
                     info_hash: info_hash.clone(),
@@ -17254,6 +17256,128 @@ mod tests {
             None,
             "the volume kept the set's draw, and will never draw its own"
         );
+    }
+
+    /// **Deleting one volume of a set while the set plays ends what that
+    /// volume shared, as deleting a film does** (review of `1d0d109`, H3).
+    /// The set's union is recorded on every volume, so ending the deleted
+    /// volume's session alone left the union on its sibling, still counted
+    /// as shared: the deleted volume's pieces stayed announced and, being
+    /// announced, stayed on the disk until the viewer left the set. The
+    /// sibling keeps its own part of the draw, and the deleted volume's
+    /// pieces leave the announcement and then the disk.
+    #[tokio::test]
+    async fn deleting_a_volume_while_its_set_plays_ends_what_that_volume_shared() {
+        use crate::backend::priorities::{BufferProfile, Fetching};
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("film.part1.rar".into(), 1000),
+            ("film.part2.rar".into(), 1000),
+        ]);
+        counters.pieces_per_file.store(40, Ordering::SeqCst);
+        // Where the backend says the files are: the delete asks.
+        let tmp = tempfile::tempdir().unwrap();
+        *counters.output_folder.lock().unwrap() = Some(tmp.path().to_path_buf());
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(1_000_000));
+        enginefs.note_player(
+            PLAYER,
+            played_set(TEST_HASH, &[(0, 110..1000), (1, 50..640)]),
+        );
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        enginefs.focus_torrent(TEST_HASH).await;
+        let first = engine
+            .try_get_file_with_intent(0, 110, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("the first volume");
+        drop(first);
+        // The reader crosses into the second volume, which adopts the
+        // union: the set's draw is now recorded on both.
+        let second = engine
+            .try_get_file_with_intent(1, 50, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("the second volume");
+        let union: Vec<u32> = (4..40).chain(42..66).collect();
+        assert_eq!(fake_advertises(&counters), union);
+        assert_eq!(
+            engine.retention.draw_of(&1),
+            Some(union.iter().copied().collect()),
+            "the second volume did not adopt the set's draw"
+        );
+
+        enginefs.unpin_download(TEST_HASH, 0, true).await.unwrap();
+
+        let rest: Vec<u32> = (42..66).collect();
+        assert_eq!(
+            fake_advertises(&counters),
+            rest,
+            "the deleted volume's pieces are still announced"
+        );
+        assert_eq!(
+            engine.retention.draw_of(&1),
+            Some(rest.iter().copied().collect()),
+            "the second volume still shares the deleted volume's pieces"
+        );
+        assert!(
+            counters
+                .dropped_ranges
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(range, _)| *range == (0..40)),
+            "the deleted volume's pieces stayed on the disk: {:?}",
+            counters.dropped_ranges.lock().unwrap()
+        );
+        drop(second);
+    }
+
+    /// **The deleted volume's piece that a sibling's bytes share stays
+    /// shared**: it is the sibling's to share. A first file of 1 000 bytes
+    /// sets 25-byte pieces; the 1 010-byte volume after it ends ten bytes
+    /// into piece 80, where the next volume's member bytes begin. Deleting
+    /// the first volume of the set takes pieces 40 to 79 out of the draw,
+    /// and keeps 80 with the rest of what the second volume shares.
+    #[tokio::test]
+    async fn deleting_a_volume_keeps_the_piece_it_shares_with_a_sibling_shared() {
+        use crate::backend::priorities::{BufferProfile, Fetching};
+        let (enginefs, counters) = test_enginefs_with_files(vec![
+            ("extras.mkv".into(), 1000),
+            ("film.part1.rar".into(), 1010),
+            ("film.part2.rar".into(), 1000),
+        ]);
+        counters.pieces_per_file.store(40, Ordering::SeqCst);
+        let tmp = tempfile::tempdir().unwrap();
+        *counters.output_folder.lock().unwrap() = Some(tmp.path().to_path_buf());
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(1_000_000));
+        enginefs.note_player(PLAYER, played_set(TEST_HASH, &[(1, 0..1010), (2, 0..500)]));
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 1).await;
+        enginefs.focus_torrent(TEST_HASH).await;
+        let first = engine
+            .try_get_file_with_intent(1, 0, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("the first volume");
+        drop(first);
+        let second = engine
+            .try_get_file_with_intent(2, 0, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("the second volume");
+        let union: Vec<u32> = (40..=100).collect();
+        assert_eq!(fake_advertises(&counters), union);
+
+        enginefs.unpin_download(TEST_HASH, 1, true).await.unwrap();
+
+        let rest: Vec<u32> = (80..=100).collect();
+        assert_eq!(
+            fake_advertises(&counters),
+            rest,
+            "the deleted volume's own pieces are still announced, or the piece \
+             it shares with the next volume is not"
+        );
+        assert_eq!(
+            engine.retention.draw_of(&2),
+            Some(rest.iter().copied().collect())
+        );
+        drop(second);
     }
 
     /// **A set's draw is sized from the member's whole length over the
