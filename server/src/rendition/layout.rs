@@ -7,7 +7,8 @@
 //! same however often and from wherever it is asked for, before most of it
 //! has been produced. That is this layout: the header (`ftyp` + `moov` +
 //! `sidx`), then one **slot** per segment, each holding that segment's
-//! fragment (`styp` + `moof` + `mdat`) padded with a `free` box to the
+//! fragment (`moof` + `mdat`, after a `styp` unless the slot opens at its
+//! `sidx` label: `mux::media_segment`) padded with a `free` box to the
 //! slot's end. Slot sizes are decided here, from the source, and never
 //! change; what goes in a slot is the run's business (`run.rs`), which
 //! makes it fit.

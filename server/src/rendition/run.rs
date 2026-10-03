@@ -299,11 +299,16 @@ impl Making {
             let slot = self.slot;
             let content = slots::gather(&self.segments, self.cursor, slot);
             let sequence = (slot + 1) as u32;
+            // At its label: mirrored (the label is the cut) and opening
+            // with its own segment, not with what the slot before spilled.
+            let at_label = self.layout.exact && self.cursor == Cursor::at(slot);
             let mux = |video: &[MuxSample],
                        video_next: Option<i64>,
                        audio: &[MuxSample],
                        audio_next: Option<i64>| {
-                mux::media_segment(formats, sequence, video, video_next, audio, audio_next)
+                mux::media_segment(
+                    formats, sequence, at_label, video, video_next, audio, audio_next,
+                )
             };
             let size = self.layout.slots[slot as usize].size;
             let filled = content.fill(size, &mux);

@@ -7,7 +7,8 @@
 //! `trex` per track, and one `trak` per track: `tkhd`, `mdia` with `mdhd`,
 //! `hdlr` and `minf` -- `vmhd`/`smhd`, `dinf`/`dref`, and an `stbl` whose
 //! only entry is the sample description: `avc1`+`avcC`, `hvc1`+`hvcC` or
-//! `mp4a`+`esds`, every sample table empty). A media segment is `styp` +
+//! `mp4a`+`esds`, every sample table empty). A media segment is a `styp`
+//! unless it opens at its `sidx` label (see [`media_segment`]), a
 //! `moof` (`mfhd`, and per track with samples one `traf`: `tfhd` with
 //! default-base-is-moof, `tfdt` version 1, `trun` version 1) + `mdat`,
 //! video's bytes first.
@@ -817,13 +818,35 @@ fn traf(laid: &Laid, data_offset: u32) -> Vec<u8> {
     bx(b"traf", &[&tfhd, &tfdt, &trun])
 }
 
-/// Segment `sequence`'s bytes: `styp`, `moof` and `mdat` for the video
-/// samples (in decode order) and the audio samples given. `next_*` is the
-/// presentation time of the track's first sample after this segment, when
-/// it is known, which is the last sample's duration.
+/// Segment `sequence`'s bytes: a `moof` and an `mdat` for the video
+/// samples (in decode order) and the audio samples given, after a `styp`
+/// unless the segment opens `at_label` -- its first samples at the time
+/// its slot's `sidx` reference says. `next_*` is the presentation time of
+/// the track's first sample after this segment, when it is known, which is
+/// the last sample's duration.
+///
+/// **The `styp` is there to keep the `sidx` and the `moof` apart**, and
+/// only then. FFmpeg keeps one fragment-index entry per offset, the
+/// `sidx`'s reference and each `moof` it reads:
+///
+/// * apart (a `styp` first), they are two entries for one fragment, and
+///   after a seek to it every version (4.4 to master) parsed its `moof`
+///   twice -- seeking the second stream picks the `moof`'s own entry,
+///   unread -- doubling its samples in the index. A later seek back to a
+///   fragment read neither at the start nor since then lost the index's
+///   order and landed at the end of what was read at the start: zond's
+///   TV, back to 0:43 after seeks to 1:55, 7:05 and 8:41, read fragment
+///   after fragment, buffering.
+/// * together, FFmpeg up to 4.4 (the TV's Chrome 92) takes the fragment's
+///   decode time from the `sidx` label, not the `tfdt` (5.0 added
+///   `use_tfdt`, on by default). Right when the label is the segment's
+///   start -- a mirrored layout's cut -- and wrong otherwise: an estimated
+///   layout labels its slots a GOP late (and its sound early), and a slot
+///   that opens with what the slot before spilled opens before its cut.
 pub(crate) fn media_segment(
     formats: &Formats,
     sequence: u32,
+    at_label: bool,
     video: &[MuxSample],
     video_next: Option<i64>,
     audio: &[MuxSample],
@@ -843,7 +866,6 @@ pub(crate) fn media_segment(
             audio_next,
         ));
     }
-    let styp = bx(b"styp", &[b"msdh", &0u32.to_be_bytes(), b"msdhmsix"]);
     let mfhd = full(b"mfhd", 0, 0, &[&sequence.to_be_bytes()]);
 
     // The moof's size does not depend on the offsets written into it, so
@@ -866,6 +888,11 @@ pub(crate) fn media_segment(
         .collect();
     let mdat = bx(b"mdat", &payload);
 
+    let styp = if at_label {
+        Vec::new()
+    } else {
+        bx(b"styp", &[b"msdh", &0u32.to_be_bytes(), b"msdhmsix"])
+    };
     let mut out = Vec::with_capacity(styp.len() + moof.len() + mdat.len());
     out.extend_from_slice(&styp);
     out.extend_from_slice(&moof);
@@ -1041,9 +1068,9 @@ mod tests {
             key: true,
             data: Bytes::from_static(&[0xde, 0xad]),
         }];
-        let segment = media_segment(&formats, 1, &[sample(0, true)], None, &audio, None);
-        let styp_len = u32::from_be_bytes(segment[..4].try_into().unwrap()) as usize;
-        let moof = &segment[styp_len..];
+        let segment = media_segment(&formats, 1, true, &[sample(0, true)], None, &audio, None);
+        assert_eq!(&segment[4..8], b"moof", "the segment begins with its moof");
+        let moof = &segment[..];
         // The audio traf's trun is the last box in the moof: its data
         // offset is the 4 bytes after its sample count.
         let find = |needle: &[u8]| {

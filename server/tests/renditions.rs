@@ -343,19 +343,35 @@ impl Header {
     }
 }
 
-/// A slot's fragment: `styp`, `moof`, `mdat`, then a `free` box to the
-/// slot's end whose last bytes are zeros.
+/// A slot's fragment: a `styp` unless the slot opens at its `sidx` label
+/// ([`opens_at_label`]), `moof`, `mdat`, then a `free` box to the slot's
+/// end whose last bytes are zeros.
 fn fragment_of(slot: &[u8]) -> &[u8] {
     let boxes = Boxes::of(slot);
     let kinds: Vec<&str> = boxes.iter().map(|(kind, _)| kind.as_str()).collect();
-    assert_eq!(kinds, ["styp", "moof", "mdat", "free"]);
-    let free = boxes[3].1.len() + 8;
+    let styp = usize::from(kinds[0] == "styp");
+    assert_eq!(kinds[styp..], ["moof", "mdat", "free"]);
+    let free = boxes[styp + 2].1.len() + 8;
     assert!(
         free >= 24,
         "the padding is at least a header and the zero tail"
     );
     assert!(slot[slot.len() - 16..].iter().all(|byte| *byte == 0));
     &slot[..slot.len() - free]
+}
+
+/// Whether a slot opens with its `moof`, where the `sidx` points -- no
+/// `styp` between. Only a slot whose first samples are at its label may:
+/// FFmpeg up to 4.4 (the Chromecast with Google TV's Chrome 92) takes a
+/// fragment's decode time from the label when the two are one offset, and
+/// apart, every version parsed the `moof` twice after a seek to it, and a
+/// later seek back landed at the end of what was read at the start.
+fn opens_at_label(slot: &[u8]) -> bool {
+    match &slot[4..8] {
+        b"moof" => true,
+        b"styp" => false,
+        other => panic!("a slot opening with {other:?}"),
+    }
 }
 
 /// One track's run in a segment, as the boxes say it.
@@ -379,9 +395,10 @@ struct Segment {
 fn parse_segment(bytes: &[u8]) -> Segment {
     let top = Boxes::of(bytes);
     let kinds: Vec<&str> = top.iter().map(|(kind, _)| kind.as_str()).collect();
-    assert_eq!(kinds, ["styp", "moof", "mdat"]);
-    let moof_at = 8 + top[0].1.len();
-    let moof = top[1].1;
+    let styp = usize::from(kinds[0] == "styp");
+    assert_eq!(kinds[styp..], ["moof", "mdat"]);
+    let moof_at = if styp == 1 { 8 + top[0].1.len() } else { 0 };
+    let moof = top[styp].1;
     let mut sequence = 0;
     let mut trafs = Vec::new();
     for (kind, body) in Boxes::of(moof) {
@@ -636,6 +653,13 @@ fn the_sidx_mirrors_the_sources_index() -> anyhow::Result<()> {
     // no index of its own (FFmpeg seeks it to the picture's sample, which
     // its own slot holds, with the sound's lead).
     assert!(header.sound.is_none(), "one sidx");
+    let file = fixture.file(&token);
+    for n in 0..header.slots.len() {
+        assert!(
+            opens_at_label(header.slot(&file, n)),
+            "slot {n} opens with its moof"
+        );
+    }
     assert_eq!(fixture.probe(&token).exact, Some(true));
     let place = |pts: i64| (pts as i128 * SOURCE_LEN as i128 / 60_000_000) as u64;
     let headroom = |span: u64| span + 8 * 1024 + span / 64;
@@ -701,6 +725,9 @@ fn without_an_index_the_slots_are_estimated() -> anyhow::Result<()> {
     }
     let file = fixture.file(&token);
     for n in 0..10 {
+        // Labelled a GOP late, a slot keeps its sidx reference and its
+        // moof apart, or FFmpeg 4.4 would time it by the label.
+        assert!(!opens_at_label(header.slot(&file, n)), "slot {n}");
         let segment = parse_segment(fragment_of(header.slot(&file, n)));
         assert_eq!(segment.sequence, n as u32 + 1);
     }
@@ -768,38 +795,46 @@ fn each_segment_is_cut_at_the_first_key_at_or_after_its_time() -> anyhow::Result
     Ok(())
 }
 
-/// **What precedes the cut is discarded**: a run for segment 5, which the
-/// producer starts at the key before 5.28 s less two seconds, puts nothing
-/// before that key in segment 5, and no audio before it.
+/// **What precedes the cut is discarded**: a run for segment 6, which the
+/// producer starts at the key before its cut less two seconds, puts
+/// nothing before that key in segment 6, and no audio before it.
+///
+/// Segment 6, not 5: the first run, started for the header, pauses with
+/// slot 3 next (two past slot 0), and a request within two slots of a
+/// run's next one joins it -- slot 5 sometimes did, and no second run
+/// started.
 #[test]
 fn a_run_discards_what_precedes_its_cut() -> anyhow::Result<()> {
+    const N: u64 = 6;
     let knobs = Knobs::default();
     let fixture = Fixture::quick(knobs.clone())?;
     let token = fixture.publish(30_000, 0)?;
     fixture.init(&token);
-    let segment = parse_segment(&fixture.segment(&token, 5));
+    let segment = parse_segment(&fixture.segment(&token, N));
+    let key = knobs.key_at_or_after(N as i64 * T_US).unwrap();
     let runs = fixture.producer.runs();
     assert_eq!(runs.len(), 2);
-    assert_eq!(runs[1].from, asked_from(5_280_000));
+    assert_eq!(runs[1].from, asked_from(key));
     assert!(!runs[1].wanted_index, "the layout is frozen already");
     let emitted = runs[1].emitted();
     assert!(
         emitted
             .iter()
-            .any(|(track, pts)| *track == TrackKind::Video && *pts < 5 * T_US),
+            .any(|(track, pts)| *track == TrackKind::Video && *pts < N as i64 * T_US),
         "the producer did hand over video before the cut: {emitted:?}"
     );
     assert!(
         emitted
             .iter()
-            .any(|(track, pts)| *track == TrackKind::Audio && *pts < 5 * T_US),
+            .any(|(track, pts)| *track == TrackKind::Audio && *pts < N as i64 * T_US),
         "and audio"
     );
-    let (want_video, want_audio) = expected(&knobs, 5);
-    assert_eq!(want_video.first(), Some(&5_280_000));
+    let (want_video, want_audio) = expected(&knobs, N as i64);
+    assert!(key > N as i64 * T_US, "the cut is a key after N x T");
+    assert_eq!(want_video.first(), Some(&key));
     assert_eq!(segment.video_pts(&knobs), want_video);
     assert_eq!(segment.audio_pts(), want_audio);
-    assert_eq!(segment.track(1).unwrap().tfdt, 5_280_000 * 90 / 1000);
+    assert_eq!(segment.track(1).unwrap().tfdt, (key * 90 / 1000) as u64);
     Ok(())
 }
 
@@ -911,7 +946,7 @@ fn opening_the_file_does_not_move_the_run_from_the_start() -> anyhow::Result<()>
     });
     let at = header.slots[30].0;
     let target = fixture.range(&token, at, at + 1000);
-    assert_eq!(&target[4..8], b"styp");
+    assert_eq!(&target[4..8], b"moof");
     let probe = fixture.probe(&token);
     assert_eq!(probe.runs_started, 1, "one run, from the start");
     assert_eq!(probe.run_from, Some(27));
@@ -938,10 +973,10 @@ fn a_read_left_open_does_not_take_the_run_back() -> anyhow::Result<()> {
     let mut left_open = fixture.get(&token, Some(format!("bytes={}-", header.slots[2].0)));
     let mut first = [0u8; 8];
     std::io::Read::read_exact(&mut left_open, &mut first)?;
-    assert_eq!(&first[4..], b"styp");
+    assert_eq!(&first[4..], b"moof");
     let (at, size, _) = header.slots[40];
     let far = fixture.range(&token, at, at + size - 1);
-    assert_eq!(&far[4..8], b"styp");
+    assert_eq!(&far[4..8], b"moof");
     let probe = fixture.probe(&token);
     assert!(
         probe.runs_started <= 3,
@@ -982,7 +1017,7 @@ fn three_seeks_waiting_at_once_take_turns() -> anyhow::Result<()> {
             .into_iter()
             .collect();
         for read in reads {
-            assert_eq!(&read.join().expect("a read")[4..8], b"styp");
+            assert_eq!(&read.join().expect("a read")[4..8], b"moof");
         }
     });
     let runs = fixture.probe(token).runs_started;
@@ -1074,8 +1109,8 @@ fn two_seeks_waiting_at_once_take_turns() -> anyhow::Result<()> {
         let near = fixture.range(token, from, to);
         (far.join().expect("the far range"), near)
     });
-    assert_eq!(&far[4..8], b"styp");
-    assert_eq!(&near[4..8], b"styp");
+    assert_eq!(&far[4..8], b"moof");
+    assert_eq!(&near[4..8], b"moof");
     let runs = fixture.probe(token).runs_started;
     assert!(
         runs <= 4,
@@ -1139,6 +1174,11 @@ fn an_overflowing_segment_spills_into_the_next_slot() -> anyhow::Result<()> {
         spilled.video_pts(&knobs)[0] < cut(&knobs, 11),
         "slot 11 begins with segment 10's end"
     );
+    // So it opens before its label, and keeps a styp; its neighbours open
+    // at theirs.
+    assert!(!opens_at_label(header.slot(&file, 11)));
+    assert!(opens_at_label(header.slot(&file, 10)));
+    assert!(opens_at_label(header.slot(&file, 12)));
 
     // Slot 11 again, from a run started there.
     let at = header.slots[11].0;

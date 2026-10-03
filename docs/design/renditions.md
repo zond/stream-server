@@ -275,8 +275,10 @@ with a producer written in Rust on a plain thread.
 **The muxer is the server's**, in Rust, hand-written: the boxes this needs
 are a short list -- `ftyp`, `moov` (`mvhd`, `mvex`/`trex`/`mehd`, one
 `trak` per track with `avc1`+`avcC`, `hvc1`+`hvcC` or `mp4a`+`esds`) for
-the init segment, and `styp`, `moof` (`mfhd`, one `traf` per track with
-`tfhd`, `tfdt`, `trun`) and `mdat` per segment. It converts Annex-B
+the init segment, and `moof` (`mfhd`, one `traf` per track with
+`tfhd`, `tfdt`, `trun`) and `mdat` per segment, after a `styp` only when
+the segment does not open at its `sidx` label (the mirror layout, below,
+says why). It converts Annex-B
 samples (what Android's extractors and encoders hand out, with start
 codes) to length-prefixed, and builds `avcC`/`hvcC` from the parameter
 sets in `csd-0`/`csd-1`. Copied H.264 or HEVC with B-frames needs a
@@ -626,6 +628,36 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   estimated layout on the slot's last sync sample before the target,
   reading forward from it). Headless Chrome 154, played 15 s then
   seeked: one far `Range` per seek on both.
+* **A slot opens with its `moof` when it opens at its label; with a
+  `styp` otherwise.** FFmpeg keeps one fragment-index entry per offset:
+  the `sidx`'s reference and each `moof` it reads.
+  * Apart (a `styp` first), they are two entries for one fragment, and
+    after a seek to it FFmpeg parsed its `moof` twice -- seeking the
+    second stream picks the `moof`'s own entry, unread -- doubling its
+    samples in the index. Forward seeks survived that; a seek **back** to
+    a fragment read neither at the start nor since did not: its samples
+    went in between the doubles, the index was out of order, and the
+    search landed at the end of what was read at the start. zond's TV
+    (Chrome 92), back to 0:43 after seeks to 1:55, 7:05 and 8:41, asked
+    for 0:43's slot, then 0:18's, and walked forward a slot per request,
+    buffering, for over a minute. Every version, 4.4 to master, did the
+    same on a file (the video landing at 16 s), and headless Chrome 154
+    made 30 requests for that seek.
+  * Together, FFmpeg up to 4.4 -- the TV's -- takes a fragment's decode
+    time from the `sidx` label instead of its `tfdt` (5.0 added
+    `use_tfdt`, on by default). Right only where the label is the
+    segment's start.
+
+  So a slot opens with its `moof` exactly when it is mirrored and opens
+  with its own segment (not with what the slot before spilled): its label
+  is its cut. Then the back seek lands in its slot in every version, and
+  in Chrome it is one request. **An estimated layout keeps the `styp`**
+  -- its labels are a GOP late (the sound's early), and without it FFmpeg
+  4.4 put picture and sound 10 s apart -- **and with it the walk on a
+  seek back** to a fragment not read before (headless Chrome: 7 to 17
+  requests; on the TV it may not recover). Fixing that needs a label that
+  is each slot's real start before the slot is made, which an estimate
+  does not have: open.
 * **With the source's index, the slots mirror the source.** The producer
   reports the video's sync samples -- `(pts, byte position)`, from
   libavformat's index (Matroska cues, an MP4's sample tables, an AVI's
@@ -680,6 +712,13 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   the cut (`SEEK_BACK`), so a sample a container stores before the sync
   sample it seeks to (audio interleaved ahead of video) is still read,
   and everything before the cut is discarded as before.
+  A run from the film's start seeks to the start too (the producer's
+  rule, xtremio `rendition.rs`), as the first run does to read the cues:
+  a seek is not a read from the file's first byte -- zond's film's audio
+  packet at -21 ms, before the first cluster's key, comes back only
+  without one -- and slot 0 made again by a run that did not seek had an
+  audio frame more (found replaying the TV's requests against a fresh
+  server; every slot now matches a sequential read).
 * **The last 16 bytes of every slot are zeros**, answered without making
   anything: FFmpeg's peek at the file's end for an `mfra` size reads 0.
 * **Requests.** `HEAD` and any `GET` wait for the layout -- the first
@@ -849,8 +888,9 @@ F1. **Server: the rendition route, the muxer, the ring, the trait, with a
      (N+1) x T, or at the source's end. What precedes a run's first cut is
      never emitted: a run's output starts at its own segment. A segment
      with no samples at all (a GOP longer than T with no audio) is a
-     `styp`, a `moof` with only its `mfhd`, and an empty `mdat`.*
-   * *Clocks: video on 90 kHz, audio on its sample rate, `mvhd` in ms,
+     `moof` with only its `mfhd`, and an empty `mdat`.*
+   * *Clocks: video on 90 kHz, audio on the video's 90 kHz too (its sample
+     rate when there is no video), `mvhd` in ms,
      the duration in `mehd`. A segment's decode times are its presentation
      times sorted (2.2's reorder window is the segment). AUDs are dropped
      from samples; a sample with no start code is taken as length-prefixed
