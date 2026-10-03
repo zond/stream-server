@@ -6,8 +6,10 @@
 //! The init segment is `ftyp` + `moov` (`mvhd`, `mvex` with `mehd` and one
 //! `trex` per track, and one `trak` per track: `tkhd`, `mdia` with `mdhd`,
 //! `hdlr` and `minf` -- `vmhd`/`smhd`, `dinf`/`dref`, and an `stbl` whose
-//! only entry is the sample description: `avc1`+`avcC`, `hvc1`+`hvcC` or
-//! `mp4a`+`esds`, every sample table empty). A media segment is a `styp`
+//! only entry is the sample description: `avc1`+`avcC`, `hvc1`+`hvcC` --
+//! the `hvcC` with the SEI messages beside the parameter sets, and a `colr`
+//! after it when the SPS describes its colours -- or `mp4a`+`esds`, every
+//! sample table empty). A media segment is a `styp`
 //! unless it opens at its `sidx` label (see [`media_segment`]), a
 //! `moof` (`mfhd`, and per track with samples one `traf`: `tfhd` with
 //! default-base-is-moof, `tfdt` version 1, `trun` version 1) + `mdat`,
@@ -325,6 +327,18 @@ struct HevcSps {
     chroma_format_idc: u8,
     bit_depth_luma_minus8: u8,
     bit_depth_chroma_minus8: u8,
+    /// The VUI's colour description, when it gives one ([`hevc_vui_colour`]).
+    colour: Option<Colour>,
+}
+
+/// A colour description as an SPS's VUI gives it and a `colr` box of type
+/// `nclx` carries it (ISO/IEC 23091-2 code points, as both use).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Colour {
+    primaries: u8,
+    transfer: u8,
+    matrix: u8,
+    full_range: bool,
 }
 
 fn parse_hevc_sps(sps: &[u8]) -> Option<HevcSps> {
@@ -369,6 +383,7 @@ fn parse_hevc_sps(sps: &[u8]) -> Option<HevcSps> {
     }
     let bit_depth_luma_minus8 = bits.ue()? as u8;
     let bit_depth_chroma_minus8 = bits.ue()? as u8;
+    let colour = hevc_vui_colour(&mut bits, max_sub_layers_minus1);
     Some(HevcSps {
         general,
         max_sub_layers_minus1,
@@ -376,10 +391,162 @@ fn parse_hevc_sps(sps: &[u8]) -> Option<HevcSps> {
         chroma_format_idc,
         bit_depth_luma_minus8,
         bit_depth_chroma_minus8,
+        colour,
     })
 }
 
-/// `hvcC` from the VPS, SPS and PPS in `csd-0`, in Annex-B.
+/// **The colour description in an HEVC SPS's VUI** (H.265 7.3.2.2 and
+/// E.2.1), read on from just after the bit depths: everything between is
+/// walked only to reach it. `None` when the SPS has no VUI, the VUI no
+/// colour description, or the walk runs off the end -- the `hvcC` is still
+/// written, without a `colr`.
+///
+/// It is what tells a receiver an HDR10 film is PQ on BT.2020 (and an HLG
+/// one HLG) from the sample entry, the way a Matroska file says it in its
+/// `Colour` element; the SPS says it too, but a demuxer reading the
+/// container (FFmpeg's, inside a Cast receiver's Chrome) takes the
+/// container's word.
+fn hevc_vui_colour(bits: &mut Bits, max_sub_layers_minus1: u8) -> Option<Colour> {
+    let log2_max_poc_lsb = bits.ue()? + 4;
+    let ordering_for_all = bits.u(1)? == 1;
+    let first = if ordering_for_all {
+        0
+    } else {
+        max_sub_layers_minus1
+    };
+    for _ in first..=max_sub_layers_minus1 {
+        for _ in 0..3 {
+            bits.ue()?; // max_dec_pic_buffering, num_reorder_pics, max_latency_increase
+        }
+    }
+    for _ in 0..6 {
+        bits.ue()?; // coding and transform block sizes, hierarchy depths
+    }
+    if bits.u(1)? == 1 && bits.u(1)? == 1 {
+        // scaling_list_enabled_flag, sps_scaling_list_data_present_flag:
+        // scaling_list_data() (7.3.4); a signed value is as long as an
+        // unsigned one, so `ue` steps over `se` too.
+        for size_id in 0..4u32 {
+            let step = if size_id == 3 { 3 } else { 1 };
+            for _ in (0..6).step_by(step) {
+                if bits.u(1)? == 0 {
+                    bits.ue()?; // scaling_list_pred_matrix_id_delta
+                } else {
+                    let coefficients = 64.min(1u32 << (4 + (size_id << 1)));
+                    if size_id > 1 {
+                        bits.ue()?; // scaling_list_dc_coef_minus8
+                    }
+                    for _ in 0..coefficients {
+                        bits.ue()?; // scaling_list_delta_coef
+                    }
+                }
+            }
+        }
+    }
+    bits.u(2)?; // amp_enabled_flag, sample_adaptive_offset_enabled_flag
+    if bits.u(1)? == 1 {
+        // pcm_enabled_flag: two bit depths, two sizes, a flag.
+        bits.u(8)?;
+        bits.ue()?;
+        bits.ue()?;
+        bits.u(1)?;
+    }
+    // st_ref_pic_set() (7.3.7), each set's NumDeltaPocs kept for the next,
+    // which may be predicted from it.
+    let sets = bits.ue()?;
+    if sets > 64 {
+        return None;
+    }
+    let mut deltas: Vec<u64> = Vec::with_capacity(sets as usize);
+    for index in 0..sets as usize {
+        let predicted = index != 0 && bits.u(1)? == 1;
+        if predicted {
+            bits.u(1)?; // delta_rps_sign
+            bits.ue()?; // abs_delta_rps_minus1
+            let mut count = 0;
+            for _ in 0..=deltas[index - 1] {
+                let used = bits.u(1)? == 1;
+                if used || bits.u(1)? == 1 {
+                    count += 1;
+                }
+            }
+            deltas.push(count);
+        } else {
+            let negative = bits.ue()?;
+            let positive = bits.ue()?;
+            if negative + positive > 32 {
+                return None;
+            }
+            for _ in 0..negative + positive {
+                bits.ue()?; // delta_poc_minus1
+                bits.u(1)?; // used_by_curr_pic_flag
+            }
+            deltas.push(negative + positive);
+        }
+    }
+    if bits.u(1)? == 1 {
+        // long_term_ref_pics_present_flag
+        let long_terms = bits.ue()?;
+        if long_terms > 32 {
+            return None;
+        }
+        for _ in 0..long_terms {
+            bits.u(log2_max_poc_lsb as u32)?;
+            bits.u(1)?;
+        }
+    }
+    bits.u(2)?; // sps_temporal_mvp_enabled_flag, strong_intra_smoothing_enabled_flag
+    if bits.u(1)? == 0 {
+        return None; // no VUI
+    }
+    if bits.u(1)? == 1 && bits.u(8)? == 255 {
+        bits.u(32)?; // aspect_ratio_idc EXTENDED_SAR: sar_width, sar_height
+    }
+    if bits.u(1)? == 1 {
+        bits.u(1)?; // overscan_appropriate_flag
+    }
+    if bits.u(1)? == 0 {
+        return None; // no video_signal_type
+    }
+    bits.u(3)?; // video_format
+    let full_range = bits.u(1)? == 1;
+    if bits.u(1)? == 0 {
+        return None; // no colour_description
+    }
+    Some(Colour {
+        primaries: bits.u(8)? as u8,
+        transfer: bits.u(8)? as u8,
+        matrix: bits.u(8)? as u8,
+        full_range,
+    })
+}
+
+/// A `colr` box of type `nclx` (ISO/IEC 14496-12 12.1.5) for `colour`.
+fn colr(colour: Colour) -> Vec<u8> {
+    let mut body = Vec::with_capacity(11);
+    body.extend_from_slice(b"nclx");
+    body.extend_from_slice(&u16::from(colour.primaries).to_be_bytes());
+    body.extend_from_slice(&u16::from(colour.transfer).to_be_bytes());
+    body.extend_from_slice(&u16::from(colour.matrix).to_be_bytes());
+    body.push(u8::from(colour.full_range) << 7);
+    bx(b"colr", &[&body])
+}
+
+/// The `colr` box for an HEVC track whose SPS (in `csd0`, Annex-B)
+/// describes its colours, or nothing.
+pub(crate) fn hevc_colr(csd0: &[u8]) -> Option<Vec<u8>> {
+    let sps = annex_b_units(csd0)
+        .into_iter()
+        .find(|unit| unit.len() >= 2 && (unit[0] >> 1) & 0x3f == 33)?;
+    parse_hevc_sps(sps)?.colour.map(colr)
+}
+
+/// `hvcC` from the VPS, SPS and PPS in `csd-0`, in Annex-B, and the SEI
+/// messages beside them: a film's mastering display and light levels (an
+/// HDR10 encode's) are often there and nowhere in its samples -- x265
+/// writes them with its headers, which a Matroska file keeps in its
+/// `hvcC` -- so dropping them would leave the receiver's decoder without
+/// them.
 pub(crate) fn hvcc(csd0: &[u8]) -> Result<Vec<u8>, String> {
     let units = annex_b_units(csd0);
     let of_type = |kind: u8| -> Vec<&[u8]> {
@@ -409,9 +576,21 @@ pub(crate) fn hvcc(csd0: &[u8]) -> Result<Vec<u8>, String> {
     out.push(
         ((parsed.max_sub_layers_minus1 + 1) << 3) | (u8::from(parsed.temporal_id_nesting) << 2) | 3,
     );
-    out.push(3);
-    for (kind, set) in [(32u8, &vps), (33, &sps), (34, &pps)] {
-        out.push(0x80 | kind);
+    // Parameter sets complete (`hvc1`); SEI arrays not claimed complete.
+    let (prefix_sei, suffix_sei) = (of_type(39), of_type(40));
+    let arrays: Vec<(u8, &Vec<&[u8]>)> = [
+        (0x80 | 32u8, &vps),
+        (0x80 | 33, &sps),
+        (0x80 | 34, &pps),
+        (39, &prefix_sei),
+        (40, &suffix_sei),
+    ]
+    .into_iter()
+    .filter(|(_, set)| !set.is_empty())
+    .collect();
+    out.push(arrays.len() as u8);
+    for (kind, set) in arrays {
+        out.push(kind);
         out.extend_from_slice(&(set.len() as u16).to_be_bytes());
         for unit in set.iter() {
             out.extend_from_slice(&(unit.len() as u16).to_be_bytes());
@@ -518,7 +697,16 @@ fn trak(
             height,
             csd0,
         } => (
-            visual_entry(b"hvc1", *width, *height, bx(b"hvcC", &[&hvcc(csd0)?])),
+            visual_entry(
+                b"hvc1",
+                *width,
+                *height,
+                [
+                    bx(b"hvcC", &[&hvcc(csd0)?]),
+                    hevc_colr(csd0).unwrap_or_default(),
+                ]
+                .concat(),
+            ),
             *b"vide",
             *width,
             *height,
@@ -970,6 +1158,105 @@ mod tests {
         assert_eq!(hvcc[18], 0xf8, "8-bit chroma");
         assert_eq!(hvcc[22], 3, "three arrays");
         assert_eq!(hvcc[23], 0x80 | 32, "the VPS first");
+    }
+
+    /// x265's headers for a 320x240 Main 10 HDR10 encode (BT.2020, PQ,
+    /// a mastering display and light levels), as `csd-0` carries them: the
+    /// VPS, the SPS -- whose VUI says BT.2020 primaries (9), PQ (16), the
+    /// BT.2020 non-constant matrix (9), limited range -- the PPS, and the
+    /// two SEI messages x265 writes with its headers (light levels, then
+    /// the mastering display).
+    const X265_HDR10_CSD: &[u8] = &[
+        0, 0, 0, 1, 0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x02, 0x20, 0x00, 0x00, 0x03, 0x00, 0x90,
+        0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c, 0x95, 0x98, 0x09, 0, 0, 0, 1, 0x42, 0x01,
+        0x01, 0x02, 0x20, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00,
+        0x3c, 0xa0, 0x0a, 0x08, 0x0f, 0x13, 0x65, 0x95, 0x9a, 0x49, 0x32, 0xbc, 0x05, 0xa8, 0x48,
+        0x80, 0x48, 0x20, 0x00, 0x00, 0x03, 0x00, 0x20, 0x00, 0x00, 0x03, 0x03, 0x21, 0, 0, 0, 1,
+        0x44, 0x01, 0xc1, 0x72, 0xbc, 0x62, 0x40, 0, 0, 0, 1, 0x4e, 0x01, 0x90, 0x04, 0x03, 0xe8,
+        0x01, 0x90, 0x80, 0, 0, 0, 1, 0x4e, 0x01, 0x89, 0x18, 0x33, 0xc2, 0x86, 0xc4, 0x1d, 0x4c,
+        0x0b, 0xb8, 0x84, 0xd0, 0x3e, 0x80, 0x3d, 0x13, 0x40, 0x42, 0x00, 0x98, 0x96, 0x80, 0x00,
+        0x00, 0x03, 0x00, 0x01, 0x80,
+    ];
+
+    /// x265's SPS for 320x240 Main, BT.709 in full range, eight B-frames
+    /// in a pyramid and six references: more reference picture sets to walk.
+    const X265_709_FULL_SPS: &[u8] = &[
+        0, 0, 0, 1, 0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03,
+        0x00, 0x00, 0x03, 0x00, 0x3c, 0xa0, 0x0a, 0x08, 0x0f, 0x16, 0x59, 0xd8, 0xa9, 0x24, 0xca,
+        0xf0, 0x16, 0xe0, 0x20, 0x20, 0x20, 0x80, 0x00, 0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x0c,
+        0x84,
+    ];
+
+    /// **An HDR10 film's `hvc1` says what it is**: Main 10 and ten bits in
+    /// the `hvcC`, the two SEI messages kept beside the parameter sets, and
+    /// a `colr` with the VUI's colour description -- what a receiver's
+    /// demuxer reads to show PQ as PQ.
+    #[test]
+    fn an_hdr10_hvcc_keeps_its_sei_and_its_colours_go_in_a_colr() {
+        let hvcc = hvcc(X265_HDR10_CSD).expect("an hvcC");
+        assert_eq!(hvcc[1], 0x02, "Main 10");
+        assert_eq!(hvcc[17], 0xfa, "10-bit luma");
+        assert_eq!(hvcc[18], 0xfa, "10-bit chroma");
+        assert_eq!(hvcc[22], 4, "VPS, SPS, PPS and the SEI");
+        let arrays: Vec<(u8, u16)> = {
+            let mut at = 23;
+            let mut out = Vec::new();
+            while at < hvcc.len() {
+                let kind = hvcc[at];
+                let count = u16::from_be_bytes([hvcc[at + 1], hvcc[at + 2]]);
+                at += 3;
+                for _ in 0..count {
+                    at += 2 + usize::from(u16::from_be_bytes([hvcc[at], hvcc[at + 1]]));
+                }
+                out.push((kind, count));
+            }
+            out
+        };
+        assert_eq!(arrays, vec![(0xa0, 1), (0xa1, 1), (0xa2, 1), (39, 2)]);
+
+        assert_eq!(
+            hevc_colr(X265_HDR10_CSD).expect("a colour description"),
+            [
+                &[0, 0, 0, 19][..],
+                b"colr",
+                b"nclx",
+                &[0, 9, 0, 16, 0, 9, 0]
+            ]
+            .concat()
+        );
+        assert_eq!(
+            hevc_colr(X265_709_FULL_SPS).expect("a colour description"),
+            [
+                &[0, 0, 0, 19][..],
+                b"colr",
+                b"nclx",
+                &[0, 1, 0, 1, 0, 1, 0x80]
+            ]
+            .concat()
+        );
+        // x265 by default says nothing about colour: no `colr` at all.
+        assert_eq!(hevc_colr(X265_CSD), None);
+
+        // And the sample entry carries both, the `colr` after the `hvcC`.
+        let format = TrackFormat::Hevc {
+            width: 320,
+            height: 240,
+            csd0: Bytes::from_static(X265_HDR10_CSD),
+        };
+        let trak = trak(1, VIDEO_TIMESCALE, &format, 1000).expect("a trak");
+        let hvc1 = trak
+            .windows(4)
+            .position(|window| window == b"hvc1")
+            .expect("an hvc1 entry");
+        let hvcc_at = trak
+            .windows(4)
+            .position(|window| window == b"hvcC")
+            .unwrap();
+        let colr_at = trak
+            .windows(4)
+            .position(|window| window == b"colr")
+            .unwrap();
+        assert!(hvc1 < hvcc_at && hvcc_at < colr_at);
     }
 
     fn sample(pts_us: i64, key: bool) -> MuxSample {

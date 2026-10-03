@@ -281,7 +281,12 @@ the segment does not open at its `sidx` label (the mirror layout, below,
 says why). It converts Annex-B
 samples (what Android's extractors and encoders hand out, with start
 codes) to length-prefixed, and builds `avcC`/`hvcC` from the parameter
-sets in `csd-0`/`csd-1`. Copied H.264 or HEVC with B-frames needs a
+sets in `csd-0`/`csd-1` -- an `hvcC` keeping the SEI messages beside them
+(x265 writes an HDR10 film's mastering display and light levels with its
+headers, which a Matroska file keeps in its `hvcC` and nowhere in its
+samples), and an `hvc1` followed by a `colr` (`nclx`) with the colour
+description of the SPS's VUI, so a demuxer reading the container sees PQ or
+HLG on BT.2020 as the Matroska `Colour` element said it. Copied H.264 or HEVC with B-frames needs a
 decode time per sample, which `MediaExtractor` does not report (only a
 presentation time); the muxer derives decode times as the sorted
 presentation times of the reorder window, and writes composition offsets
@@ -988,6 +993,19 @@ F2. **Kotlin producer, repackage only, end to end on the phone** (M). The
      restart count went, and the app hands the receiver `stream.mp4` and
      its seeks back as `SEEK`s. Not on the TV yet as built; the hand test
      is in the xtremio change's report.*
+   * *HEVC (2026-10-03): the decision copies HEVC + AAC Matroska too, for
+     zond's Chromecast with Google TV 4K (`sabrina`, HEVC Main and Main 10
+     up to 4K; a constant until F5's table). The producer hands the
+     `hvcC`'s sets and SEI as `csd-0` and its samples in Annex-B (so the
+     length-prefix reading of a sample never meets a length of 256 to 511),
+     the muxer writes `hvc1` + `hvcC` + `colr` and four-byte lengths, and
+     the key flags are the container's -- Matroska's for HEVC are the IRAP
+     pictures its cues index, x265's open GOPs making every key after the
+     first a CRA. Dolby Vision is not signalled: profiles 7 and 8 go over as
+     their base layer with the RPU and enhancement-layer NAL units (62, 63)
+     dropped, and profile 5 (no compatible base layer) fails the rendition
+     with a sentence. Checked end to end on a desktop (xtremio
+     `rust/tests/rendition.rs`); not on the TV yet.*
 
 F3. **Audio to stereo AAC** (M). `MediaCodec` decode when the phone has a
    decoder, libavcodec from `libmpv.so` otherwise (2.6), downmix,
