@@ -1,6 +1,6 @@
 # Renditions: a cast the receiver can decode, produced on demand, nothing on disk
 
-Design, 2026-10-01; §2.8 2026-10-02. **F1 (the server side) is built, F0 landed in the app, F1½ answered (libavformat), F2's producer built and its file seekable by bytes (§2.8); F3-F5 are not.**
+Design, 2026-10-01; §2.8 2026-10-02. **F1 (the server side) is built, F0 landed in the app, F1½ answered (libavformat), F2's producer built and its file seekable by bytes (§2.8), F3's sound conversion built in the app (2026-10-04, not on the TV yet); F4 and F5 are not.**
 
 > **Amended in F2 (zond, 2026-10-01): a rendition is ONE progressive
 > fragmented MP4, not HLS.** Measured on zond's Chromecast with Google TV
@@ -1038,6 +1038,42 @@ F3. **Audio to stereo AAC** (M). `MediaCodec` decode when the phone has a
    decision's audio rule. Proven with the H.264 + E-AC3 film that plays
    silent on zond's TV today.
 
+   *(Built 2026-10-04 in xtremio -- `rust/src/sound.rs`,
+   `rust/src/mediacodec.rs`, `libav::SoundDecoder`/`LibavAac` -- with no
+   server change: the plan is `Copy`/`AacStereo`, the producer reports
+   `Aac {48000, 2, 0x1190}` and hands AAC-LC frames. Where it differs from
+   the step as written:*
+   * *libavcodec decodes everything, `MediaCodec` decodes nothing: one
+     path, and the phone's Dolby `MediaCodec` decoders would only cover two
+     of the four codecs (none for DTS or TrueHD on zond's phone). Downmix
+     and resampling by libswresample, normalised so nothing clips. Encode by
+     `MediaCodec` through the NDK's C API (`c2.android.aac.encoder`, FDK,
+     from a `dlopen`ed `libmediandk.so`; no JNI), or by FFmpeg's own AAC
+     encoder where the library has one (a desktop's system FFmpeg, which
+     the end-to-end tests use).*
+   * *The same bytes whichever run makes a slot (§2.8): the sound is made
+     in chunks of 48 AAC frames on a fixed grid of the film's clock, each
+     from a fresh decoder, resampler and encoder fed from fixed pre-rolls
+     (0.4 s of packets for the decoder, two frames for the encoder) to a
+     bound that is a function of the chunk, the encoder's priming (FFmpeg
+     1024 samples, FDK 1600) discarded by count; a chunk is made only by a
+     run that read from before its pre-roll, which the `SEEK_BACK` of two
+     seconds always covers. Frame `i` is at `i x 64000/3` us, `i x 1920` on
+     the 90 kHz clock; the audio lead and the per-track clock are
+     untouched.*
+   * *The decision converts every sound that is not AAC (AAC with more than
+     two channels is still copied until the stats poll has a channel
+     count), in Matroska and QuickTime, and in an MP4 or M4V whose sound
+     the receiver would play silent or not at all.*
+   * *Measured on a desktop (`rust/tests/rendition_sound.rs`): E-AC3 5.1,
+     AC3 5.1, DTS 5.1 and TrueHD 5.1 in Matroska and AC3 in MP4 come back
+     AAC-LC stereo 48 kHz, decode clean, every click within 3 ms of the
+     source's against its flash (whole and from every slot alone), every
+     slot byte-identical when made first by its own run, and a seek two
+     requests. Not on a phone or the TV yet; FDK's determinism across a
+     codec stop/configure/start and its 1600-sample priming are read from
+     AOSP's source, not measured.*
+
 F4. **Video transcode to H.264** (L). Surface path, the GL scaling pass,
    forced sync frames at N x T, speed measured on zond's phone at 1080p
    from HEVC. The decision's video rule.
@@ -1104,6 +1140,9 @@ F5. **The receiver table and the decision UI** (M). `ReceiverCaps`, the
   between ffmpeg majors), and a bump of the jar re-generates them. A
   desktop's system libmpv links a different ffmpeg, so this path is
   Android-only by construction; a desktop casts as-is or refuses.
+  *(As built, the bindings refuse a library whose majors differ and take
+  one whose majors match -- the host's FFmpeg 6.1 does -- which is how the
+  tests run the whole producer on a desktop.)*
 * **Production with the screen off needs the foreground service.** Android
   stops an app's threads in the background; the downloads already run
   under a foreground service with a notification (`docs/ANDROID.md`), and a
