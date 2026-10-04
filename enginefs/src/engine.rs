@@ -2308,8 +2308,13 @@ impl<H: TorrentHandle> Engine<H> {
     /// longer -- which is what makes the aside rule cheap, since a subtitle
     /// read while a film plays is a second entity with a reader of its own.
     ///
+    /// And for a file something holds ([`crate::retention::holds`]: the file
+    /// a player screen plays, the file a cast is of): a television waiting
+    /// on a cast reads it between long silences, and the cell may name
+    /// something else.
+    ///
     /// Everything else is [`Mode::Slack`]: nobody is playing it, nobody is
-    /// reading it, and its bytes go. Not a clock anywhere -- a stream that
+    /// reading it, nothing holds it, and its bytes go. Not a clock anywhere -- a stream that
     /// stopped is not a stream that has been replaced, and pausing for an
     /// hour changes nothing here.
     fn mode_of(&self, live: &Reading, file_idx: usize) -> Mode {
@@ -2327,7 +2332,10 @@ impl<H: TorrentHandle> Engine<H> {
         let in_live_set = live
             .file_of(&self.info_hash)
             .is_some_and(|playing| self.live.together(&self.info_hash, playing, file_idx));
-        if in_live_set || readers > 0 {
+        // A file something holds -- a player screen playing it, a cast of
+        // it published -- is in use whatever the cell names: it keeps its
+        // window, as the played file's is kept ([`crate::retention::holds`]).
+        if in_live_set || readers > 0 || self.live.holds().holds_file(&self.info_hash, file_idx) {
             Mode::Live
         } else {
             // The count of opens this reading was taken beside, so the pass

@@ -961,6 +961,8 @@ impl<B: TorrentBackend + 'static> Housekeeping<B> {
                 Some(register)
             } else if self.live.is_torrent(&hash) {
                 Some("playing")
+            } else if self.live.holds().holds(&hash) {
+                Some("held")
             } else {
                 None
             };
@@ -1022,7 +1024,8 @@ impl<B: TorrentBackend + 'static> Housekeeping<B> {
             && !engine.is_pinned()
             && engine.active_streams.load(Ordering::SeqCst) == 0
             && age_secs > INACTIVE_TORRENT_REMOVE_TIMEOUT.as_secs()
-            && !self.live.is_torrent(&hash);
+            && !self.live.is_torrent(&hash)
+            && !self.live.holds().holds(&hash);
         if !still_idle {
             tracing::debug!(
                 info_hash = %hash,
@@ -1652,6 +1655,38 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// from any other afterwards, and only for the one thing that is a
     /// statement about the *device*: the read refusal. The stop call itself
     /// is the same call.
+    /// **Whether anything is using `engine`'s torrent**, by what said so --
+    /// the reconciler's `held` ([`crate::reconcile::Conditions::held`]):
+    ///
+    /// * **an explicit hold** ([`crate::retention::holds`]): a player screen
+    ///   open on it, from its first request until the screen says it is
+    ///   gone, paused or stalled alike; a cast of it, from publish to
+    ///   unpublish;
+    /// * **a read still being delivered off it**: a body mid-flight, for
+    ///   exactly as long as it lasts -- stopping the torrent under one
+    ///   stalls it;
+    /// * **the last thing a stream opened on** (the liveness cell), as
+    ///   before holds existed: a stream open without a player token (a
+    ///   client on the HTTP routes) declares nothing else, and the last
+    ///   torrent played goes on sharing. What it no longer is, is the only
+    ///   thing keeping a torrent a player or a television is using.
+    ///
+    /// Not the reads open at this instant, and not the cell alone: the
+    /// first is a seek's gap away from false while a player is watching,
+    /// and the second is moved by any other open -- a subtitle on another
+    /// torrent, a link through `/proxy` -- while a television waits on the
+    /// torrent.
+    async fn held(&self, engine: &Arc<Engine<B::Handle>>) -> bool {
+        let info_hash = &engine.info_hash;
+        if self.live.holds().holds(info_hash) {
+            return true;
+        }
+        if engine.retention.readers() > 0 {
+            return true;
+        }
+        self.live.is_torrent(info_hash)
+    }
+
     async fn reconcile_engine(
         &self,
         engine: &Arc<Engine<B::Handle>>,
@@ -1694,24 +1729,21 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let conditions = crate::reconcile::Conditions {
             run_state: engine.handle.run_state(),
             settled: engine.is_settled(),
-            // Playing is the liveness value, plus the reads still being
-            // delivered off this torrent: a body mid-flight is not what a
-            // viewer is watching, but stopping the torrent under one stalls
-            // it. Neither is a clock, and neither is an activity register a
-            // request left behind.
+            // **Held: what said it is using the torrent** ([`Self::held`]),
+            // never a guess from what happens to be reading at this tick.
             //
-            // **The cell itself, under this hash's lock -- never the tick's
-            // copy of it.** The timer takes one reading before its first
-            // engine and then spends the tick on the engines before this
-            // one, and a pass on the predecessor can hold it inside a
-            // backend call for the length of the switch task's unlink.
-            // The torrent a viewer opened meanwhile has its cell written
-            // (`on_stream_start` does that first) and no byte delivered
-            // yet, so `readers()` is 0; read from the copy it is a torrent
-            // nobody is playing, the ladder's last arm answers `Stop`, and
-            // the timer's next `Run` for it waits out `RECONCILE_MIN_DWELL`
-            // -- the episode just started, parked for fifteen seconds.
-            playing: self.live.is_torrent(&engine.info_hash) || engine.retention.readers() > 0,
+            // **Asked now, under this hash's lock -- never off the tick's
+            // copy of the cell.** The timer takes one reading before its
+            // first engine and then spends the tick on the engines before
+            // this one, and a pass on the predecessor can hold it inside a
+            // backend call for the length of the switch task's unlink. The
+            // torrent a viewer opened meanwhile has its stream registered
+            // and its cell written (`on_stream_start` does both first); read
+            // from the copy it is a torrent nobody holds, the ladder's last
+            // arm answers `Stop`, and the timer's next `Run` for it waits
+            // out `RECONCILE_MIN_DWELL` -- the episode just started, parked
+            // for fifteen seconds.
+            held: self.held(engine).await,
             pinned: engine.is_pinned(),
             has_metadata: engine.handle.has_metadata().await,
             finished: engine.handle.is_finished().await,
@@ -1747,7 +1779,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             for_space = verdict.for_space,
             ?trigger,
             run_state = ?conditions.run_state,
-            playing = conditions.playing,
+            held = conditions.held,
             pinned = conditions.pinned,
             has_metadata = conditions.has_metadata,
             finished = conditions.finished,
@@ -1877,7 +1909,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let conditions = crate::reconcile::Conditions {
             run_state: engine.handle.run_state(),
             shares_to_end: false,
-            playing: self.live.is_torrent(&engine.info_hash) || engine.retention.readers() > 0,
+            held: self.held(engine).await,
             pinned: engine.is_pinned(),
             ..conditions
         };
@@ -1914,7 +1946,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 tracing::info!(
                     info_hash = %engine.info_hash,
                     available = ?conditions.available,
-                    playing = conditions.playing,
+                    held = conditions.held,
                     pinned = conditions.pinned,
                     "torrent_stopped_by_reconciler"
                 );
@@ -3617,12 +3649,38 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// that request makes already sees the move: the next episode of the
     /// same torrent ends what the last one shared on the spot, before its
     /// reader waits on a byte.
+    ///
+    /// **And it is the screen's hold** ([`crate::retention::holds`]): the
+    /// torrent the request names is held for the token's screen from now
+    /// until [`Self::release_player`] -- paused, stalled or with no read open
+    /// -- and a proxied stream lets the screen's hold go. An older screen's
+    /// request holds nothing, as it moves nothing.
     pub fn note_player(
         &self,
         token: &str,
         played: crate::retention::sessions::Played,
     ) -> crate::retention::sessions::Heard {
         let heard = self.live.sessions().play(token, played.clone());
+        if heard != crate::retention::sessions::Heard::Stale {
+            match &played {
+                crate::retention::sessions::Played::Torrent {
+                    info_hash,
+                    file_idx,
+                    ..
+                } => {
+                    self.live
+                        .holds()
+                        .hold_for_player(token, info_hash, vec![*file_idx]);
+                }
+                crate::retention::sessions::Played::Set { info_hash, volumes } => {
+                    let files = volumes.iter().map(|volume| volume.file_idx).collect();
+                    self.live.holds().hold_for_player(token, info_hash, files);
+                }
+                crate::retention::sessions::Played::Elsewhere => {
+                    self.live.holds().release_player(token);
+                }
+            }
+        }
         match heard {
             crate::retention::sessions::Heard::Current { moved: true } => {
                 tracing::info!(token, ?played, "play_session_moved");
@@ -3637,6 +3695,21 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             crate::retention::sessions::Heard::Current { moved: false } => {}
         }
         heard
+    }
+
+    /// **The player screen `token` is gone** -- the viewer left it: the
+    /// torrent its requests held ([`Self::note_player`]) is released, if no
+    /// newer screen of the viewer has taken the hold since. What runs it
+    /// afterwards is whatever else holds it, a pin, or the idle-sharing
+    /// policy, at the next reconcile. Whether a hold was released.
+    pub fn release_player(&self, token: &str) -> bool {
+        self.live.holds().release_player(token)
+    }
+
+    /// The explicit holds ([`crate::retention::holds`]): what a cast takes
+    /// for as long as it is published.
+    pub fn holds(&self) -> &crate::retention::holds::Holds {
+        self.live.holds()
     }
 
     /// Called when a stream starts for a torrent file.
@@ -4458,6 +4531,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     info_hash: info_hash.clone(),
                     file_idx,
                 });
+            self.live.holds().forget_file(&info_hash, file_idx);
             // Before the want-set is re-planned, because it is planned from
             // exactly this bookkeeping: `reconcile_with_active_selection`
             // unions the registered active file into `only_files`, so
@@ -18457,7 +18531,7 @@ mod tests {
 
     /// **A torrent stopped while its play session was on it announces
     /// nothing stale when it starts again.** The viewer went back to the
-    /// board; another stream took the cell, the torrent stopped, and its
+    /// board (the screen let its hold go); another stream took the cell, the torrent stopped, and its
     /// file's slack pass took the draw with the bytes -- while the fork kept
     /// the advertised set. The viewer opens the film again: the torrent
     /// starts, and the fake's check at the start fails a test whose torrent
@@ -18481,7 +18555,9 @@ mod tests {
         let advertised = fake_advertises(&counters);
         assert!(!advertised.is_empty());
 
-        // Another stream takes the cell; the viewer's session stays.
+        // The viewer left the screen -- its hold goes -- and another stream
+        // takes the cell; the viewer's session stays.
+        enginefs.release_player(PLAYER);
         enginefs.live().open(
             crate::retention::live::LiveEntity::Proxy {
                 dir: "/elsewhere".into(),
@@ -22272,6 +22348,33 @@ mod tests {
         assert_eq!(
             *removed.lock().unwrap(),
             vec![OTHER_HASH.to_string(), TEST_HASH.to_string()]
+        );
+    }
+
+    /// **A held engine is not idle**: a cast published for longer than the
+    /// inactivity window, with nothing read and the cell elsewhere, keeps its
+    /// torrent in the session; once let go, the next window removes it.
+    #[tokio::test(start_paused = true)]
+    async fn idle_sweeper_keeps_a_held_engine_until_it_is_let_go() {
+        let TwoEngines { enginefs, .. } = test_enginefs_with_two_engines();
+        let present = |hash: &str| {
+            let engines = enginefs.engines.clone();
+            let hash = hash.to_string();
+            async move { engines.read().await.contains_key(&hash) }
+        };
+        let hold = enginefs.holds().hold(TEST_HASH, None);
+        tokio::time::sleep(INACTIVE_TORRENT_REMOVE_TIMEOUT + Duration::from_secs(30)).await;
+        assert!(present(TEST_HASH).await, "a held engine was swept as idle");
+        assert!(
+            !present(OTHER_HASH).await,
+            "an idle engine is still removed"
+        );
+
+        drop(hold);
+        tokio::time::sleep(INACTIVE_TORRENT_REMOVE_TIMEOUT + Duration::from_secs(30)).await;
+        assert!(
+            !present(TEST_HASH).await,
+            "let go, it is idle like any other"
         );
     }
 

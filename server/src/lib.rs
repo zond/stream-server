@@ -1136,6 +1136,28 @@ impl ServerHandle {
         self.state.proxy_streams.close(token)
     }
 
+    /// **The player screen `token` is gone**: what the app says when the
+    /// viewer leaves a player. The torrent the screen held is let go
+    /// (`enginefs::retention::holds`) -- from its first request until this,
+    /// the screen's torrent ran whether it was playing, paused, stalled or
+    /// had no read open at all -- and the screen is retired: a later
+    /// request carrying its token (a cast it published reads with it)
+    /// holds nothing. What runs the torrent afterwards is whatever else
+    /// holds it -- a cast still published, a pin -- or the idle-sharing
+    /// policy. A newer screen of the viewer keeps its own hold. Whether a
+    /// hold was released. Its proxied streams are
+    /// [`Self::close_proxy_streams`]'s.
+    pub fn release_player(&self, token: &str) -> bool {
+        self.state.engine.release_player(token)
+    }
+
+    /// Who holds `info_hash` now (`enginefs::retention::holds`): the
+    /// screens and casts that said they are using it. For the tests.
+    #[doc(hidden)]
+    pub fn torrent_holders(&self, info_hash: &str) -> Vec<enginefs::retention::holds::Holder> {
+        self.state.engine.holds().holders(&info_hash.to_lowercase())
+    }
+
     /// Tell the server whether the app it lives in is in the background.
     ///
     /// `true` puts the torrent session on a lean footprint
@@ -1424,6 +1446,7 @@ impl ServerHandle {
             id.clone(),
             play,
             None,
+            self.state.engine.holds(),
         )
     }
 
@@ -1459,6 +1482,7 @@ impl ServerHandle {
             id.clone(),
             play,
             Some(spec),
+            self.state.engine.holds(),
         )
     }
 

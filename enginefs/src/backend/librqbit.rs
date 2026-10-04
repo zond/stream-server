@@ -9597,6 +9597,9 @@ mod tests {
         // `explicit_piece_advertising`, so a disk that empties is one
         // emptied after the stop; the recorder's side of the same order is
         // `a_switch_to_another_torrent_stops_the_one_left_before_its_bytes_go`.
+        // Its player's own request says so (`p=` on a proxied stream), which
+        // lets the screen's hold on this torrent go, and the stream opens.
+        efs.note_player("tv.1", crate::retention::sessions::Played::Elsewhere);
         efs.live().open(
             crate::retention::live::LiveEntity::Proxy {
                 dir: tmp.path().join("elsewhere"),

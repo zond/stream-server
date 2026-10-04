@@ -45,6 +45,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::retention::holds::Holds;
 use crate::retention::sessions::PlaySessions;
 
 /// The one entity being played.
@@ -94,6 +95,11 @@ pub struct Live {
     /// **Files of one torrent that are one thing to watch**: the volumes of
     /// a RAR set, read by one archive session ([`Live::hold_set`]).
     sets: VolumeSets,
+    /// **Who said they are using a torrent** -- a player screen open on it,
+    /// a cast of it published -- which is not this cell either: the cell is
+    /// the last thing a stream opened, the holds are what the app declared
+    /// ([`Holds`]). Here for the same reason as the sessions.
+    holds: Holds,
 }
 
 impl Default for Live {
@@ -102,6 +108,7 @@ impl Default for Live {
             cell: tokio::sync::watch::Sender::new(None),
             sessions: PlaySessions::default(),
             sets: VolumeSets::default(),
+            holds: Holds::default(),
         }
     }
 }
@@ -137,6 +144,12 @@ impl Live {
     /// The play sessions: which files the viewer's players are playing.
     pub fn sessions(&self) -> &PlaySessions {
         &self.sessions
+    }
+
+    /// The explicit holds: which torrents a player screen or a cast said
+    /// it is using.
+    pub fn holds(&self) -> &Holds {
+        &self.holds
     }
 
     /// Holds `files` of `info_hash` as **one thing to watch** until the

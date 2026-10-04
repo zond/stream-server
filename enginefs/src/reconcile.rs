@@ -1,7 +1,7 @@
 //! Whether a torrent should be running, recomputed from what is true now.
 //!
 //! There is one persisted pause bit in the backend and there are two
-//! reasons to pause: nothing is playing it and nobody pinned it, and the
+//! reasons to pause: nothing holds it and nobody pinned it, and the
 //! volume the torrent writes to is under its floor ([`Volumes::floor`],
 //! which is [`crate::free_space_floor`] of the volume's own size, and
 //! [`CACHE_FREE_SPACE_FLOOR`] only on a volume large enough for it). A
@@ -135,17 +135,17 @@ pub struct Conditions {
     /// [`Self::run_state`], which is about the backend's state machine and
     /// nothing to do with this process: see [`desired`]'s first two arms.
     pub settled: bool,
-    /// This torrent is the one being played
-    /// ([`crate::retention::live`]), or a read is still delivering bytes
-    /// off it.
+    /// Something said it is using this torrent: an explicit hold (a player
+    /// screen open on it, a cast of it published --
+    /// [`crate::retention::holds`]), a read still being delivered off it, or
+    /// it is the last thing a stream opened on ([`crate::retention::live`]).
+    /// `EngineFS::held` reads it.
     ///
-    /// A value with one writer and no expiry, and not a clock: a viewer who
-    /// pauses for an hour is still watching this torrent, and what says
-    /// otherwise is their opening something else. The reads are here
-    /// because stopping a torrent under a body still being delivered
-    /// stalls it -- an in-flight response is not what a viewer is watching,
-    /// but it is a reason not to take the torrent away.
-    pub playing: bool,
+    /// Declared, not inferred, and not a clock: a viewer who pauses for an
+    /// hour still has the screen open, a television still has the cast, and
+    /// what ends either is the holder saying so (leaving the player,
+    /// unpublishing), never a gap in the reads.
+    pub held: bool,
     /// Some file of it is pinned as an offline download.
     pub pinned: bool,
     /// The backend stopped this torrent because a write hit `ENOSPC`
@@ -200,7 +200,7 @@ pub struct Conditions {
 ///    `Initializing` with no check running, nothing but an unpause runs it
 ///    again, and `ManagedTorrent::wait_until_initialized` refuses every
 ///    waiter on that pair). An actuator acts on settled readings; this arm
-///    exists so the arms below cannot read `playing` or `available` off an
+///    exists so the arms below cannot read `held` or `available` off an
 ///    unsettled one and conclude `Run`.
 /// 2. **Want-set not re-applied -> [`Decision::Stop`].**
 ///    [`Conditions::settled`]: a torrent this process has not put its
@@ -234,7 +234,7 @@ pub struct Conditions {
 ///    torrent -- or a download was unpinned, and what it announced has to
 ///    end. It ends only by the torrent leaving the swarm, so the torrent is
 ///    stopped before anything of it is deleted, whatever else holds: above
-///    `playing` and `pinned`, which decide only whether it starts again
+///    `held` and `pinned`, which decide only whether it starts again
 ///    afterwards, and above the free-space arm, which would stop it anyway.
 ///    Only a settled `Live` or `Paused` torrent reaches it.
 /// 5. **No metadata -> [`Decision::Run`].** A resolving magnet must stay
@@ -243,7 +243,7 @@ pub struct Conditions {
 ///    how you make a magnet that never resolves. Above the free-space arm
 ///    for that reason -- it cannot fill a disk.
 /// 6. **Writing, and the volume is under the line -> [`Decision::Stop`].**
-///    Above `playing`, which is the point: librqbit writes the file it
+///    Above `held`, which is the point: librqbit writes the file it
 ///    wants straight to `ENOSPC` and calls that a fatal torrent error, so a
 ///    stream that is playing is exactly the torrent that will run the
 ///    volume to zero. A finished torrent writes nothing and so is never
@@ -264,13 +264,16 @@ pub struct Conditions {
 ///    it. So it is stopped, seeding on or off.
 ///
 ///    No clock decides this arm and no [`Trigger`] gates it:
-///    [`Conditions::playing`] is the liveness value
-///    ([`crate::retention::live`]), written once when the server sees a
-///    stream open and not by anything a request leaves behind. A viewer
-///    who pauses keeps their torrent running and their window intact for as
-///    long as they like; a viewer who opens something else loses both at
-///    the next tick. Seeding is what a *pinned* torrent does, and pins are
-///    kept: with nothing playing and nothing pinned there is nothing to
+///    [`Conditions::held`] is what the users of the torrent declared -- a
+///    player screen's hold from its first request until it is left, a
+///    cast's from publish to unpublish, a body's for as long as it is
+///    delivered ([`crate::retention::holds`]) -- and nothing a request leaves
+///    behind. A viewer who pauses keeps their torrent running for as long
+///    as they like, and so does a television the film was handed to,
+///    whatever else a stream opens meanwhile; the last torrent a stream
+///    opened on stays up after that too.
+///    Otherwise seeding is what a *pinned* torrent does, and pins are
+///    kept: with nothing held and nothing pinned there is nothing to
 ///    seed from, because the bytes are going.
 pub fn desired(conditions: &Conditions, trigger: Trigger) -> Decision {
     verdict(conditions, trigger).decision
@@ -308,8 +311,7 @@ pub fn verdict(conditions: &Conditions, trigger: Trigger) -> Verdict {
                 .available
                 .is_some_and(|available| available >= resume_line(conditions.floor));
             return arm(
-                if conditions.out_of_space && has_room && (conditions.playing || conditions.pinned)
-                {
+                if conditions.out_of_space && has_room && (conditions.held || conditions.pinned) {
                     Decision::RestartFromError
                 } else {
                     Decision::Leave
@@ -356,7 +358,7 @@ pub fn verdict(conditions: &Conditions, trigger: Trigger) -> Verdict {
     // anything, so the answer is the same whoever is asking, and
     // `focus_torrent` -- which registers nothing at all -- is safe on its
     // own account rather than by running two lines after something else.
-    arm(if conditions.playing || conditions.pinned {
+    arm(if conditions.held || conditions.pinned {
         Decision::Run
     } else {
         Decision::Stop
@@ -792,7 +794,7 @@ mod tests {
     /// on a roomy volume, with seeding on. Every test below changes the one
     /// condition it is about.
     ///
-    /// `playing` is part of "nothing wrong with it". A torrent nobody
+    /// `held` is part of "nothing wrong with it". A torrent nobody
     /// is playing and nobody has pinned is one the ladder stops -- its
     /// bytes are the retention owner's to delete, so there is nothing for
     /// it to fetch and nothing to seed from.
@@ -800,7 +802,7 @@ mod tests {
         Conditions {
             run_state: RunState::Live,
             settled: true,
-            playing: true,
+            held: true,
             pinned: false,
             has_metadata: true,
             finished: false,
@@ -824,7 +826,7 @@ mod tests {
                 for available in [Some(u64::MAX), Some(0), None] {
                     let ended = Conditions {
                         run_state,
-                        playing,
+                        held: playing,
                         pinned,
                         available,
                         shares_to_end: true,
@@ -921,7 +923,7 @@ mod tests {
     #[test]
     fn a_torrent_nobody_plays_and_nobody_pinned_is_stopped() {
         let left = Conditions {
-            playing: false,
+            held: false,
             ..healthy()
         };
         assert_eq!(desired(&left, Trigger::Timer), Decision::Stop);
@@ -966,7 +968,7 @@ mod tests {
         ] {
             let watched = Conditions {
                 run_state,
-                playing: true,
+                held: true,
                 pinned: true,
                 ..healthy()
             };
@@ -984,7 +986,7 @@ mod tests {
     fn an_errored_torrent_with_no_room_to_restart_into_is_left_alone() {
         let dead = Conditions {
             run_state: RunState::Error,
-            playing: true,
+            held: true,
             available: Some(0),
             ..healthy()
         };
@@ -1019,7 +1021,7 @@ mod tests {
         let killed = Conditions {
             run_state: RunState::Error,
             out_of_space: true,
-            playing: true,
+            held: true,
             available: Some(CACHE_FREE_SPACE_FLOOR + FREE_SPACE_RESUME_MARGIN),
             ..healthy()
         };
@@ -1032,7 +1034,7 @@ mod tests {
         assert_eq!(
             desired(
                 &Conditions {
-                    playing: false,
+                    held: false,
                     pinned: true,
                     ..killed
                 },
@@ -1067,7 +1069,7 @@ mod tests {
             (
                 "nobody is playing it and nobody pinned it",
                 Conditions {
-                    playing: false,
+                    held: false,
                     ..killed
                 },
             ),
@@ -1098,19 +1100,19 @@ mod tests {
         let resolving = Conditions {
             has_metadata: false,
             available: Some(0),
-            playing: false,
+            held: false,
             ..healthy()
         };
         assert_eq!(desired(&resolving, Trigger::Timer), Decision::Run);
     }
 
-    /// The arm the free-space watch exists for, and it is above `playing`
+    /// The arm the free-space watch exists for, and it is above `held`
     /// on purpose: the torrent that fills the volume is the one being
     /// watched.
     #[test]
     fn a_writing_torrent_under_the_floor_stops_even_while_watched() {
         let starving = Conditions {
-            playing: true,
+            held: true,
             pinned: true,
             available: Some(CACHE_FREE_SPACE_FLOOR - 1),
             ..healthy()
@@ -1192,7 +1194,7 @@ mod tests {
         let stopped_at_the_floor = Conditions {
             run_state: RunState::Paused,
             available: Some(CACHE_FREE_SPACE_FLOOR),
-            playing: true,
+            held: true,
             ..healthy()
         };
         assert_eq!(

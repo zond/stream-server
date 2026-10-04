@@ -28,7 +28,10 @@ live in memory only.
 * **Publishing needs the listener running** (`set_lan_media(true)` first),
   and an id this server holds (`register` issued it and it has not been let
   go). The publication **holds the id** as an open reader does, so the id
-  is not evicted while it is cast.
+  is not evicted while it is cast, and **holds its torrent** (an id a
+  torrent is behind): from publish to unpublish the torrent runs and keeps
+  its windows whatever the receiver is reading and whatever else opens
+  ([Storage](storage.md), *Who keeps a torrent running*).
 * **With a play token**, the receiver's reads are the viewer's playback --
   the same rules `open_reader` applies: the play session moves to the file,
   and it shares as the app's own player's would. Each `GET` opens the id's

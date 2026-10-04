@@ -917,6 +917,37 @@ fn read_ahead(state: &AppState, source: &ProxySource) {
 }
 
 impl Entry {
+    /// **The torrent this id reads, and its files, as far as is known
+    /// without waiting**: resolved, the file (or a member's volumes); a
+    /// torrent's streaming URL not resolved yet names the torrent alone
+    /// (`None`: every file). What a published cast holds
+    /// (`crate::cast`); `None` for an id read from anywhere else, or a
+    /// member not resolved yet -- which a cast never is, since the player
+    /// resolved it to play it.
+    pub(crate) fn torrent_now(&self) -> Option<(String, Option<Vec<usize>>)> {
+        let resolved = self
+            .resolution
+            .try_lock()
+            .ok()
+            .and_then(|held| held.clone());
+        match resolved.as_deref() {
+            Some(Resolution::Torrent {
+                info_hash,
+                file_idx,
+                ..
+            }) => return Some((info_hash.clone(), Some(vec![*file_idx]))),
+            Some(Resolution::Member {
+                torrent: Some((info_hash, files)),
+                ..
+            }) => return Some((info_hash.to_lowercase(), Some(files.clone()))),
+            _ => {}
+        }
+        match &self.target {
+            Ok(Target::Torrent { info_hash, .. }) => Some((info_hash.to_lowercase(), None)),
+            _ => None,
+        }
+    }
+
     /// What this id resolves to: kept from before, or found now.
     async fn resolution(&self, state: &AppState) -> Result<Arc<Resolution>, Refusal> {
         let target = self.target.as_ref().map_err(Clone::clone)?;

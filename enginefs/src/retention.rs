@@ -61,6 +61,7 @@ use crate::piece_store::{DeleteOutcome, HeldSnapshot, StoreRegistry};
 
 pub mod deadline;
 pub mod exempt;
+pub mod holds;
 pub(crate) mod ledger;
 pub mod live;
 pub mod owner;

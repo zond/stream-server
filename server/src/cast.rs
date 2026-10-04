@@ -124,7 +124,24 @@ struct Publication {
     /// last holder -- the map, a request in flight, a run task -- each of
     /// which lets go at the cut.
     rendition: Option<Arc<Rendition>>,
+    /// **The cast's hold on its torrent** (`enginefs::retention::holds`),
+    /// for an id a torrent is behind: from publish to unpublish the torrent
+    /// runs and keeps its bytes, whatever the receiver is reading and
+    /// whatever else a stream opens. Taken while the player's own hold is
+    /// still there, so the hand-over has no gap; let go by the unpublish.
+    hold: std::sync::Mutex<Option<enginefs::retention::holds::TorrentHold>>,
     _lease: Lease<Entry>,
+}
+
+impl Publication {
+    /// Let go of the torrent: unpublished, now -- not when the last request
+    /// still holding the publication finishes.
+    fn release(&self) {
+        self.hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
 }
 
 /// Every token published and not unpublished, and what a rendition needs
@@ -164,6 +181,7 @@ impl Casts {
         id: MediaId,
         play: Option<PlayToken>,
         rendition: Option<RenditionSpec>,
+        holds: &enginefs::retention::holds::Holds,
     ) -> anyhow::Result<CastToken> {
         let token = CastToken::random()?;
         let cut = CancellationToken::new();
@@ -196,6 +214,9 @@ impl Casts {
             "the LAN media listener is not running; start it with set_lan_media(true) first"
         );
         let is_rendition = rendition.is_some();
+        let hold = lease
+            .torrent_now()
+            .map(|(info_hash, files)| holds.hold(&info_hash, files));
         published.insert(
             token.0.clone(),
             Arc::new(Publication {
@@ -203,6 +224,7 @@ impl Casts {
                 play,
                 cut,
                 rendition,
+                hold: std::sync::Mutex::new(hold),
                 _lease: lease,
             }),
         );
@@ -224,6 +246,7 @@ impl Casts {
         let Some(publication) = self.published().remove(token.as_str()) else {
             return false;
         };
+        publication.release();
         publication.cut.cancel();
         tracing::info!("cast unpublished");
         true
@@ -233,6 +256,7 @@ impl Casts {
     pub(crate) fn unpublish_all(&self) -> usize {
         let all: Vec<_> = self.published().drain().map(|(_, cast)| cast).collect();
         for publication in &all {
+            publication.release();
             publication.cut.cancel();
         }
         if !all.is_empty() {
