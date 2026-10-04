@@ -28,8 +28,8 @@ pub use media::{
     Refusal, Resolved,
 };
 pub use rendition::{
-    AudioPlan, IndexEntry, Job, Producer, ProducerRefusal, RenditionSpec, RenditionState, Sample,
-    SampleSink, Stopped, TrackFormat, TrackKind, VideoPlan,
+    AudioPlan, IndexEntry, Job, Producer, ProducerRefusal, RenditionReadiness, RenditionSpec,
+    RenditionState, Sample, SampleSink, Stopped, TrackFormat, TrackKind, VideoPlan,
 };
 pub use routes::drive::{DriveFileOpened, DriveOpenError};
 #[doc(hidden)]
@@ -1491,6 +1491,71 @@ impl ServerHandle {
     /// Cheap: no runtime hop, safe to poll.
     pub fn rendition_state(&self, token: &CastToken) -> RenditionState {
         self.state.lan_media.casts().rendition_state(token)
+    }
+
+    /// **Make a published rendition's start before any receiver asks**: the
+    /// first run, the layout it fixes from the source's formats and index
+    /// (for a Matroska file, its Cues, usually at the end), the header, and
+    /// the slot a receiver told to start at the spec's `startMs` asks for
+    /// first. Returns at once; the work runs on the server and
+    /// [`Self::rendition_readiness`] says how far it has got, so the app
+    /// tells the receiver to load only once its first requests will be
+    /// answered at once -- a receiver gives up on a load that stays silent
+    /// (measured: a minute for a thin swarm's first piece and Cues). The
+    /// receiver's requests then find the same run and the slot in the ring.
+    ///
+    /// No give-up timer: a stalled source is waited for as long as it takes,
+    /// and [`Self::unpublish`] ends the wait. A second call is a no-op.
+    /// Whether `token` is a published rendition.
+    pub fn prepare_rendition(&self, token: &CastToken) -> bool {
+        let casts = self.state.lan_media.casts();
+        let Some(rendition) = casts.rendition(token) else {
+            return false;
+        };
+        if !rendition.begin_prepare() {
+            return true;
+        }
+        let state = self.state.clone();
+        let preparing = casts.preparing();
+        preparing.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.runtime.spawn(async move {
+            struct Done(Arc<std::sync::atomic::AtomicUsize>);
+            impl Drop for Done {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let _done = Done(preparing);
+            if let Err(reason) = rendition.prepare(&state).await {
+                tracing::info!(
+                    ?reason,
+                    stage = "rendition_prepare_end",
+                    "rendition not prepared"
+                );
+            }
+        });
+        true
+    }
+
+    /// **How far a rendition's preparation has got**
+    /// ([`Self::prepare_rendition`]): `{"phase": "index"}` while the source's
+    /// index is read, `"start"` while the receiver's first slot is made,
+    /// `"ready"`, `"failed"` with the `sentence` to show, or `"ended"` for a
+    /// token not published (any more) or not a rendition. Cheap: no runtime
+    /// hop, safe to poll.
+    pub fn rendition_readiness(&self, token: &CastToken) -> RenditionReadiness {
+        self.state.lan_media.casts().rendition_readiness(token)
+    }
+
+    /// How many preparations are waiting now. For the tests: an unpublish
+    /// ends one.
+    #[doc(hidden)]
+    pub fn renditions_preparing(&self) -> usize {
+        self.state
+            .lan_media
+            .casts()
+            .preparing()
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The durations renditions published from now on run by. For the

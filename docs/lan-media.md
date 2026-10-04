@@ -116,6 +116,21 @@ and for the source -- fails the rendition with a sentence, which
 (`{"state":"failed","sentence":...}`; otherwise `producing`, `idle`, or
 `ended` for a token not published).
 
+**Prepare before the receiver is told to load.** A receiver's first answer
+waits for the layout (the first run's formats and the source's index -- a
+Matroska file's Cues, usually at its end) and the slot it starts in, and the
+Chromecast default receiver gives up on a load that stays silent that long:
+behind a thin swarm it took a minute. So `ServerHandle::prepare_rendition(&CastToken)`
+starts that work with no request -- the first run, the layout, the header,
+and the slot a receiver told to start at `startMs` asks for first (by the
+`sidx` label: the slot holding the time when mirrored, an earlier one when
+estimated) -- and `rendition_readiness(&CastToken)` says how far it has got:
+`{"phase":"index"}`, `"start"`, `"ready"`, `"failed"` with the `sentence`, or
+`"ended"`. The app loads the receiver at `ready`, and the receiver's requests
+find the same run and the slot in the ring. No timer gives up: a preparation
+waits on a stalled source as long as it takes (its run counts as waited on,
+so it is never let go), and an unpublish ends it.
+
 `ServerHandle::lan_media_base_url(for_peer)` builds the URL to hand a receiver:
 the host is the local interface that shares `for_peer`'s subnet, taken from the
 same interface enumeration `GET /network-info` answers from -- on a host with a

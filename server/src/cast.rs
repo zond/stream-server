@@ -52,7 +52,8 @@
 use crate::media::registry::Entry;
 use crate::media::{MediaId, PlayToken, Refusal};
 use crate::rendition::{
-    Ask, NotServed, Producer, Rendition, RenditionSpec, RenditionState, RenditionTuning,
+    Ask, NotServed, Producer, Rendition, RenditionReadiness, RenditionSpec, RenditionState,
+    RenditionTuning,
 };
 use crate::routes::{compat, util};
 use crate::sources::ReadHint;
@@ -156,6 +157,9 @@ pub(crate) struct Casts {
     /// The release period and the speed window renditions published from
     /// now on run by.
     tuning: std::sync::Mutex<RenditionTuning>,
+    /// Preparations waiting now (`ServerHandle::prepare_rendition`): what a
+    /// test reads to see an unpublish end one.
+    preparing: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Why a rendition was not published: the sentence of the error
@@ -291,6 +295,19 @@ impl Casts {
         self.get(token.as_str())
             .and_then(|publication| publication.rendition.clone())
             .map_or(RenditionState::Ended, |rendition| rendition.state())
+    }
+
+    /// How far the rendition under `token` has got towards its receiver's
+    /// start: [`RenditionReadiness::Ended`] for a token that is not
+    /// published, or not a rendition.
+    pub(crate) fn rendition_readiness(&self, token: &CastToken) -> RenditionReadiness {
+        self.rendition(token)
+            .map_or(RenditionReadiness::Ended, |rendition| rendition.readiness())
+    }
+
+    /// How many preparations are waiting now: each holds this while it does.
+    pub(crate) fn preparing(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.preparing.clone()
     }
 
     pub(crate) fn rendition_probe(

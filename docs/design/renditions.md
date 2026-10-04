@@ -766,6 +766,21 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   and headless Chrome one far `Range` per seek. zond's TV, seeking to
   1:00, read on from 0:30 and stalled buffering; that was not this but the
   clocks above (60 x 48/90 = 32 s), and it went on with the lead.
+* **Prepared before the load** (2026-10-04). zond's phone cast an HEVC
+  Matroska film from a torrent with one or two peers: the first piece took
+  38 s and the last (the Cues) 26 s before the first run could fix the
+  layout, and the receiver (the Chromecast default receiver, Chrome 92)
+  gave up on a first answer that silent; the same film from a Real-Debrid
+  link cast fine. So the app asks `ServerHandle::prepare_rendition` right
+  after publishing, which starts the first run and waits -- counted among
+  its waiters, so never let go -- for the layout and then the slot the
+  receiver will ask for first (`Layout::slot_for_time`: the last slot whose
+  `sidx` label is at or before the start), and loads the receiver once
+  `rendition_readiness` says `ready`. The phone shows the phase meanwhile
+  and keeps playing; the hand-over position is taken at the load. (The same
+  investigation found the torrent stopped under the cast once anything else
+  opened; that was the reconciler's guess at "playing", replaced by explicit
+  holds -- `docs/storage.md`, *Who keeps a torrent running*.)
 * **The app** (xtremio) loads `stream.mp4` with the receiver told to start
   at the phone's position, and a seek on the phone is a plain `SEEK` to
   the receiver again; the reload and the undo of the receiver's restarts
@@ -799,6 +814,8 @@ reading of step C holds unchanged.
 | `install_producer(Arc<dyn Producer>)` | Once, by the embedder. Without one, `publish_rendition` refuses `noProducer`. |
 | `publish_rendition(&MediaId, RenditionSpec, Option<PlayToken>) -> anyhow::Result<CastToken>` | As `publish`: refused while the listener is down; holds the id's lease; writes the playlist. Starts no run: the receiver's first request does. |
 | `rendition_state(&CastToken) -> Option<RenditionState>` | `{ producing, segmentsServed, speed, failed: Option<{refused, message}> }`. Cheap, no runtime hop, safe to poll. |
+| `prepare_rendition(&CastToken) -> bool` | Starts the first run and makes the receiver's first slot with no request (§2.8, *Prepared before the load*). |
+| `rendition_readiness(&CastToken) -> RenditionReadiness` | `index`, `start`, `ready`, `failed{sentence}` or `ended`. Cheap, safe to poll. |
 | `unpublish(&CastToken) -> bool` | Unchanged; for a rendition it also drops the run and the ring (2.1). |
 
 `Producer`, `Job`, `SampleSink` and `TrackFormat` are Rust API for the

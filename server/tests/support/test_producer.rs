@@ -79,6 +79,60 @@ pub struct Knobs {
     pub frame_bytes: usize,
     /// The index reported; `None` reports none.
     pub index: Option<IndexKnob>,
+    /// A gate the first run waits at before it reports its index -- a
+    /// source whose index is behind a stalled swarm -- until the test opens
+    /// it, or the run is stopped.
+    pub index_gate: Option<Arc<Gate>>,
+    /// A gate every run waits at after its first sample -- the layout is
+    /// fixed by then, the slots not made -- until the test opens it.
+    pub start_gate: Option<Arc<Gate>>,
+}
+
+/// A source that stalls until opened ([`Knobs::index_gate`]), with a probe
+/// for whether a run is parked at it.
+#[derive(Debug, Default)]
+pub struct Gate {
+    open: Mutex<bool>,
+    opened: std::sync::Condvar,
+    parked: AtomicBool,
+}
+
+impl Gate {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// A run is waiting at the gate right now.
+    pub fn is_parked(&self) -> bool {
+        self.parked.load(Ordering::SeqCst)
+    }
+
+    /// Let every run through.
+    pub fn open(&self) {
+        *self.open.lock().unwrap() = true;
+        self.opened.notify_all();
+    }
+
+    /// Wait until the gate opens (`true`) or `stopped` says the run is gone
+    /// (`false`). The stop is looked at between short waits: the sink has
+    /// no way to wake this.
+    fn pass(&self, stopped: impl Fn() -> bool) -> bool {
+        let mut open = self.open.lock().unwrap();
+        self.parked.store(true, Ordering::SeqCst);
+        while !*open {
+            if stopped() {
+                self.parked.store(false, Ordering::SeqCst);
+                return false;
+            }
+            open = self
+                .opened
+                .wait_timeout(open, Duration::from_millis(5))
+                .unwrap()
+                .0;
+        }
+        self.parked.store(false, Ordering::SeqCst);
+        true
+    }
 }
 
 impl Default for Knobs {
@@ -93,6 +147,8 @@ impl Default for Knobs {
             read_stride: None,
             frame_bytes: 120,
             index: Some(IndexKnob::Proportional),
+            index_gate: None,
+            start_gate: None,
         }
     }
 }
@@ -314,6 +370,13 @@ fn produce(knobs: &Knobs, index: usize, job: Job, record: &RunRecord) {
             return;
         }
     }
+    if wants_index && let Some(gate) = &knobs.index_gate {
+        let probe = sink.probe();
+        if !gate.pass(|| probe.is_stopped()) {
+            record.stopped.store(true, Ordering::SeqCst);
+            return;
+        }
+    }
     if wants_index
         && let Some(knob) = knobs.index
         && sink.index(knobs.index(knob, reader.len())).is_err()
@@ -376,6 +439,15 @@ fn produce(knobs: &Knobs, index: usize, job: Job, record: &RunRecord) {
         }
         record.emitted.lock().unwrap().push((track, pts));
         written += 1;
+        if written == 1
+            && let Some(gate) = &knobs.start_gate
+        {
+            let probe = sink.probe();
+            if !gate.pass(|| probe.is_stopped()) {
+                record.stopped.store(true, Ordering::SeqCst);
+                return;
+            }
+        }
         if let Some((run, sentence)) = &knobs.fail_on_run
             && *run == index
             && written >= 10

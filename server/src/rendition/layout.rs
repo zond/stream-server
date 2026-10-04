@@ -241,6 +241,9 @@ pub(crate) struct Layout {
     /// The plan's cuts, which the run's cutter cuts at.
     pub cuts: std::sync::Arc<[i64]>,
     pub exact: bool,
+    /// How far after its cut each slot's `sidx` label is (0 mirrored, a GOP
+    /// for an estimated layout): what [`Self::slot_for_time`] reads.
+    pub label_late_us: i64,
 }
 
 impl Layout {
@@ -334,6 +337,7 @@ impl Layout {
             total: offset,
             cuts: plan.cuts.into(),
             exact: plan.exact,
+            label_late_us: plan.label_late_us,
         })
     }
 
@@ -344,6 +348,20 @@ impl Layout {
         }
         let at = self.slots.partition_point(|slot| slot.offset <= offset);
         Some(at as u64 - 1)
+    }
+
+    /// **The slot a receiver told to start at `at_us` asks for first**: the
+    /// last whose `sidx` label is at or before it -- the slot holding it for
+    /// a mirrored layout, possibly an earlier one for an estimated layout,
+    /// whose labels are late. What a preparation makes before the receiver
+    /// is told to load.
+    pub(crate) fn slot_for_time(&self, at_us: i64) -> u64 {
+        let late = self.label_late_us;
+        let picked = self
+            .cuts
+            .partition_point(|cut| cut.saturating_add(late) <= at_us)
+            .saturating_sub(1) as u64;
+        picked.min(self.slots.len() as u64 - 1)
     }
 
     /// The first slot whose cut is at or after `from_us`: the first a run

@@ -163,6 +163,32 @@ pub enum RenditionState {
     Ended,
 }
 
+/// **How far a published rendition has got towards the slot its receiver
+/// starts in**, as the app asks before it tells the receiver to load
+/// ([`crate::ServerHandle::rendition_readiness`]): the phase a preparation
+/// ([`crate::ServerHandle::prepare_rendition`]) is in. A receiver's first
+/// answer waits for exactly this, and a receiver gives up on a load whose
+/// first answer stays silent too long -- so the app waits here instead,
+/// where the viewer can see why and cancel.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "phase", rename_all = "camelCase")]
+pub enum RenditionReadiness {
+    /// The first run is reading the source's formats and index -- for a
+    /// Matroska file, its Cues, usually at the end -- and the file's layout
+    /// is not fixed yet: nothing of it can be answered.
+    Index,
+    /// The layout is fixed, so the header (`ftyp`, `moov`, `sidx`) is
+    /// answerable; the slot the receiver starts in is being made.
+    Start,
+    /// The slot the receiver starts in is made: told to load now, the
+    /// receiver's first requests are answered at once.
+    Ready,
+    /// The rendition cannot go on; `sentence` is what the viewer is shown.
+    Failed { sentence: String },
+    /// Not published (any more), or not a rendition.
+    Ended,
+}
+
 /// Which track a format or a sample is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TrackKind {
@@ -736,6 +762,10 @@ pub(crate) struct Rendition {
     inner: Mutex<Inner>,
     /// Bumped on every change a request or a run may be waiting for.
     version: watch::Sender<u64>,
+    /// A preparation was asked for ([`Self::begin_prepare`]): once.
+    prepare_begun: AtomicBool,
+    /// The preparation made the slot the receiver starts in.
+    prepared: AtomicBool,
 }
 
 impl Rendition {
@@ -774,6 +804,8 @@ impl Rendition {
                 runs_started: 0,
             }),
             version: watch::channel(0).0,
+            prepare_begun: AtomicBool::new(false),
+            prepared: AtomicBool::new(false),
         })
     }
 
@@ -815,6 +847,59 @@ impl Rendition {
         } else {
             RenditionState::Idle
         }
+    }
+
+    /// How far the preparation has got ([`RenditionReadiness`]).
+    pub(crate) fn readiness(&self) -> RenditionReadiness {
+        if self.cut.is_cancelled() {
+            return RenditionReadiness::Ended;
+        }
+        let inner = self.inner();
+        if let Some(sentence) = &inner.failed {
+            return RenditionReadiness::Failed {
+                sentence: sentence.clone(),
+            };
+        }
+        if self.prepared.load(Ordering::SeqCst) {
+            RenditionReadiness::Ready
+        } else if inner.layout.is_none() {
+            RenditionReadiness::Index
+        } else {
+            RenditionReadiness::Start
+        }
+    }
+
+    /// Whether this is the first ask for a preparation: the caller starts
+    /// one ([`Self::prepare`]) only then.
+    pub(crate) fn begin_prepare(&self) -> bool {
+        !self.prepare_begun.swap(true, Ordering::SeqCst)
+    }
+
+    /// **Make the receiver's start before it asks**: the first run, the
+    /// layout it fixes (the source's formats and index), and the slot the
+    /// receiver told to start at `spec.start_ms` asks for first
+    /// ([`layout::Layout::slot_for_time`]) -- what its first requests would
+    /// otherwise wait for in silence. Waits as long as the source takes,
+    /// like a request: the run it waits on is never let go meanwhile, and
+    /// no timer gives up on it (a stalled source is waited for; the viewer
+    /// is the one who cancels, by unpublishing, which ends this with
+    /// [`NotServed::Cut`]). A receiver's later request finds the layout
+    /// fixed and the slot in the ring -- the same run, not a second.
+    pub(crate) async fn prepare(self: &Arc<Self>, state: &AppState) -> Result<u64, NotServed> {
+        let layout = self.layout(state).await?;
+        let start_us = i64::try_from(self.spec.start_ms.saturating_mul(1000))
+            .unwrap_or(i64::MAX)
+            .min(self.duration_us());
+        let slot = layout.slot_for_time(start_us);
+        // Read on into, as the receiver's opening read would be: it joins
+        // the first run when the slot is in its lookahead, and starts one
+        // beside it otherwise -- an estimated layout's late labels can pick
+        // a slot before the one the first run began at.
+        self.slot(state, slot, Ask::Continue).await?;
+        self.prepared.store(true, Ordering::SeqCst);
+        self.bump();
+        tracing::info!(slot, stage = "rendition_prepared", "rendition prepared");
+        Ok(slot)
     }
 
     pub(crate) fn probe(&self) -> RenditionProbe {
@@ -1041,6 +1126,13 @@ impl Rendition {
         state: &AppState,
     ) -> Result<Arc<layout::Layout>, NotServed> {
         let mut seen = self.version.subscribe();
+        // Counted among the first run's waiters while this waits: a run is
+        // never let go while something waits for what it makes, and the
+        // source's index can take minutes behind a thin swarm.
+        let mut joined = Joined {
+            rendition: self.clone(),
+            run: None,
+        };
         loop {
             {
                 let mut inner = self.inner();
@@ -1056,6 +1148,8 @@ impl Rendition {
                 if inner.runs.is_empty() {
                     self.start_run(&mut inner, state, None, false);
                 }
+                let first = inner.runs.first().map(|run| run.generation);
+                joined.set(&mut inner, first);
             }
             if !self.wait(&mut seen).await {
                 return Err(NotServed::Cut);
@@ -1320,5 +1414,31 @@ mod tests {
             .unwrap(),
             serde_json::json!({"state": "failed", "sentence": "no"})
         );
+        for (readiness, json) in [
+            (
+                RenditionReadiness::Index,
+                serde_json::json!({"phase": "index"}),
+            ),
+            (
+                RenditionReadiness::Start,
+                serde_json::json!({"phase": "start"}),
+            ),
+            (
+                RenditionReadiness::Ready,
+                serde_json::json!({"phase": "ready"}),
+            ),
+            (
+                RenditionReadiness::Ended,
+                serde_json::json!({"phase": "ended"}),
+            ),
+            (
+                RenditionReadiness::Failed {
+                    sentence: "no".into(),
+                },
+                serde_json::json!({"phase": "failed", "sentence": "no"}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(readiness).unwrap(), json);
+        }
     }
 }

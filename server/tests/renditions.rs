@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 
 use stream_server::rendition::{NotServed, RenditionTuning};
 use stream_server::{
-    AudioPlan, CastToken, LocalFile, MediaId, MediaSpec, RenditionSpec, RenditionState,
-    ServerConfig, TrackKind, VideoPlan,
+    AudioPlan, CastToken, LocalFile, MediaId, MediaSpec, RenditionReadiness, RenditionSpec,
+    RenditionState, ServerConfig, TrackKind, VideoPlan,
 };
 
 #[path = "support/torrent_fixtures.rs"]
@@ -34,7 +34,7 @@ use torrent_fixtures::offline_config;
 
 #[path = "support/test_producer.rs"]
 mod test_producer;
-use test_producer::{ASC, IndexKnob, Knobs, PPS, SPS, TestProducer, frame_of};
+use test_producer::{ASC, Gate, IndexKnob, Knobs, PPS, SPS, TestProducer, frame_of};
 
 /// A bound on a mistake, never a wait a correct run spends.
 const BOUND: Duration = Duration::from_secs(60);
@@ -1848,5 +1848,187 @@ fn dump_for_ffprobe() -> anyhow::Result<()> {
     })?;
     let token = fixture.publish(30_000, 0)?;
     std::fs::write(dir.join("stream.mp4"), fixture.file(&token))?;
+    Ok(())
+}
+
+// --- Preparing before the receiver is told to load -------------------------------
+
+/// The slot holding `at_us`, by `knobs`' cuts: what a receiver told to start
+/// there asks for first from a mirrored layout.
+fn slot_holding(knobs: &Knobs, at_us: i64) -> u64 {
+    (1..).find(|n| cut(knobs, *n) > at_us).unwrap() as u64 - 1
+}
+
+/// **A preparation makes the header and the receiver's first slot with no
+/// request at all**, and a receiver's requests afterwards are answered
+/// from it: the same run, the slot from the ring.
+#[test]
+fn preparing_makes_the_receivers_start_before_any_request() -> anyhow::Result<()> {
+    let knobs = Knobs::default();
+    let fixture = Fixture::quick(knobs.clone())?;
+    let token = fixture.publish(60_000, 7_500)?;
+    assert_eq!(
+        fixture.handle.rendition_readiness(&token),
+        RenditionReadiness::Index
+    );
+    assert_eq!(fixture.probe(&token).runs_started, 0, "nothing until asked");
+
+    assert!(fixture.handle.prepare_rendition(&token));
+    until("the rendition is ready", || {
+        fixture.handle.rendition_readiness(&token) == RenditionReadiness::Ready
+    });
+    let start = slot_holding(&knobs, 7_500_000);
+    let probe = fixture.probe(&token);
+    assert!(probe.init, "the layout, and with it the header, is made");
+    assert!(
+        probe.ring.contains(&start),
+        "slot {start} in {:?}",
+        probe.ring
+    );
+    assert_eq!(fixture.handle.lan_media_requests_served(), 0);
+    assert!(fixture.handle.prepare_rendition(&token), "a second ask");
+
+    // The receiver: its header, then a range at the slot it starts in.
+    let header = fixture.header(&token);
+    let slot = header.slots[start as usize];
+    let bytes = fixture.range(&token, slot.0, slot.0 + slot.1 - 1);
+    let fragment = fixture.segment(&token, start);
+    assert_eq!(&bytes[..fragment.len()], &fragment[..]);
+    assert_eq!(
+        fixture.probe(&token).runs_started,
+        1,
+        "the receiver was answered from what the preparation made"
+    );
+    assert_eq!(fixture.producer.runs().len(), 1);
+    Ok(())
+}
+
+/// **A preparation for an estimated layout makes the slot the receiver's
+/// demuxer picks by its late label**, which is before the slot holding the
+/// time: that is the one its first range asks for.
+#[test]
+fn preparing_an_estimated_layout_makes_the_slot_its_label_picks() -> anyhow::Result<()> {
+    let fixture = Fixture::quick(Knobs {
+        index: None,
+        ..Knobs::default()
+    })?;
+    let token = fixture.publish(60_000, 7_500)?;
+    assert!(fixture.handle.prepare_rendition(&token));
+    until("the rendition is ready", || {
+        fixture.handle.rendition_readiness(&token) == RenditionReadiness::Ready
+    });
+    let probe = fixture.probe(&token);
+    assert_eq!(probe.exact, Some(false));
+    // Labelled 10 s after its cut, no slot but the first is labelled at or
+    // before 7.5 s.
+    assert!(probe.ring.contains(&0), "slot 0 in {:?}", probe.ring);
+    Ok(())
+}
+
+/// The window over which "a stalled preparation is not given up on" is
+/// measured: ten release periods of the tuning below, in which a run
+/// nobody counted as waiting would have been let go ten times.
+const STALL_WINDOW: Duration = Duration::from_millis(300);
+
+/// **A preparation waits on a stalled source without giving up, and says
+/// how far it has got**: `index` while the source's index does not come --
+/// its run is not let go however short the release period -- `start` once
+/// the layout is fixed and the slots are not made, `ready` once they are.
+#[test]
+fn preparing_waits_on_a_stalled_source_and_reports_its_phase() -> anyhow::Result<()> {
+    let index_gate = Gate::new();
+    let start_gate = Gate::new();
+    let fixture = Fixture::start(
+        Knobs {
+            index_gate: Some(index_gate.clone()),
+            start_gate: Some(start_gate.clone()),
+            ..Knobs::default()
+        },
+        RenditionTuning {
+            idle_release: Duration::from_millis(30),
+            ..RenditionTuning::default()
+        },
+    )?;
+    let token = fixture.publish(60_000, 7_500)?;
+    assert!(fixture.handle.prepare_rendition(&token));
+    until("the run waits on the source's index", || {
+        index_gate.is_parked()
+    });
+    assert_eq!(
+        fixture.handle.rendition_readiness(&token),
+        RenditionReadiness::Index
+    );
+    std::thread::sleep(STALL_WINDOW);
+    assert!(
+        index_gate.is_parked(),
+        "the run waiting on the index was let go"
+    );
+    assert_eq!(fixture.probe(&token).runs_started, 1);
+    assert!(!fixture.producer.runs()[0].probe.is_stopped());
+    assert_eq!(
+        fixture.handle.rendition_readiness(&token),
+        RenditionReadiness::Index
+    );
+
+    index_gate.open();
+    until("the run waits after its first sample", || {
+        start_gate.is_parked()
+    });
+    until("the layout is fixed", || {
+        fixture.handle.rendition_readiness(&token) == RenditionReadiness::Start
+    });
+    start_gate.open();
+    until("the rendition is ready", || {
+        fixture.handle.rendition_readiness(&token) == RenditionReadiness::Ready
+    });
+    assert_eq!(fixture.probe(&token).runs_started, 1);
+    Ok(())
+}
+
+/// **Unpublish ends a preparation waiting on a stalled source**: the wait
+/// goes, the producer is told to stop, and the readiness is `ended`.
+#[test]
+fn unpublish_ends_a_waiting_preparation() -> anyhow::Result<()> {
+    let gate = Gate::new();
+    let fixture = Fixture::quick(Knobs {
+        index_gate: Some(gate.clone()),
+        ..Knobs::default()
+    })?;
+    let token = fixture.publish(60_000, 0)?;
+    assert!(fixture.handle.prepare_rendition(&token));
+    until("the run waits on the source", || gate.is_parked());
+    assert_eq!(fixture.handle.renditions_preparing(), 1);
+
+    assert!(fixture.handle.unpublish(&token));
+    until("the preparation ends", || {
+        fixture.handle.renditions_preparing() == 0
+    });
+    let run = fixture.producer.runs()[0].clone();
+    until("the producer is stopped", || run.done());
+    assert!(run.stopped());
+    assert_eq!(
+        fixture.handle.rendition_readiness(&token),
+        RenditionReadiness::Ended
+    );
+    assert!(!fixture.handle.prepare_rendition(&token), "not published");
+    Ok(())
+}
+
+/// **A rendition that fails while it is prepared says so**, with the
+/// sentence the viewer is shown.
+#[test]
+fn a_preparation_that_fails_reads_failed_with_its_sentence() -> anyhow::Result<()> {
+    let fixture = Fixture::quick(Knobs {
+        fail_on_run: Some((0, "This film cannot be repackaged.".into())),
+        ..Knobs::default()
+    })?;
+    let token = fixture.publish(60_000, 7_500)?;
+    assert!(fixture.handle.prepare_rendition(&token));
+    until("the preparation fails", || {
+        fixture.handle.rendition_readiness(&token)
+            == RenditionReadiness::Failed {
+                sentence: "This film cannot be repackaged.".into(),
+            }
+    });
     Ok(())
 }
