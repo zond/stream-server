@@ -41,9 +41,9 @@
 //! * **A request for slot N** is answered from the ring; or waits, when N is
 //!   the slot in production or at most [`LOOKAHEAD`](crate::rendition::LOOKAHEAD) past it (and joins that
 //!   production, never restarts it); or is a seek: the run is dropped and a
-//!   new one starts at N -- except the receiver's opening read, which does
-//!   not move the first run, and a read never takes the run back from a later
-//!   one ([`Ask`](crate::rendition::Ask)).
+//!   new one starts at N -- except that a read never takes the run back from
+//!   a later one ([`Ask`](crate::rendition::Ask)). **Requests, and nothing
+//!   else, make slots**: never where a player was told to start.
 //! * **The lookahead blocks the producer**: a run completes at most
 //!   [`LOOKAHEAD`](crate::rendition::LOOKAHEAD) slots past the last request, then stops reading its
 //!   sink, and the producer's next write blocks.
@@ -110,8 +110,10 @@ pub struct RenditionSpec {
     pub duration_ms: u64,
     /// Target segment length (6000; `docs/design/renditions.md` §6).
     pub segment_ms: u32,
-    /// Where the receiver will start: the first run begins at this
-    /// segment, so the init segment and the first segment come from one run.
+    /// Where the receiver will be told to start. Production never reads it
+    /// -- the receiver's requests decide what is made -- only a preparation
+    /// does, to ask for the slot the receiver will ask for first
+    /// ([`crate::ServerHandle::prepare_rendition`]).
     pub start_ms: u64,
     pub video: VideoPlan,
     pub audio: AudioPlan,
@@ -488,20 +490,15 @@ pub enum NotServed {
 /// a [`Ask::Seek`] on its first look -- any, the least recently asked. A
 /// request waited on is never taken from, so two readers never take the
 /// runs from each other in turn; a request that may do none of this waits.
-/// The first run, before any read has asked it for a slot, counts as
-/// waited on.
+/// **Nothing else makes a slot**: production is the receiver's requests --
+/// or a preparation making the ones the receiver will ask first, through
+/// this same path -- and never where a player was told to start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ask {
     /// The first slot of a range the receiver chose.
     Seek,
     /// A range read on into its next slot.
     Continue,
-    /// The receiver opening the file: a read from the header on, into the
-    /// first slot it reaches without having chosen it. It starts a run only
-    /// when none is live: the first run is at the spec's start, where the
-    /// receiver was told to play and is about to seek, and the second is
-    /// for a reader that chose where it reads.
-    Open,
 }
 
 /// A request counted in its run's waiters while it waits for that run to
@@ -578,9 +575,6 @@ impl Ask {
 /// A live run, as a request sees it.
 pub(crate) struct RunSlot {
     generation: u64,
-    /// The first run, which no read has asked for a slot of yet: it is
-    /// counted as waited on.
-    reserved: bool,
     /// The slot it began at; for the run that freezes the layout, known
     /// once it has.
     from: u64,
@@ -600,7 +594,7 @@ pub(crate) struct RunSlot {
 impl RunSlot {
     /// Whether nobody waits on this run.
     fn unwaited(&self) -> bool {
-        self.joined == 0 && !self.reserved
+        self.joined == 0
     }
 
     /// Whether a request for `slot` waits for this run: the slot in
@@ -875,27 +869,25 @@ impl Rendition {
         !self.prepare_begun.swap(true, Ordering::SeqCst)
     }
 
-    /// **Make the receiver's start before it asks**: the first run, the
-    /// layout it fixes (the source's formats and index), and the slot the
-    /// receiver told to start at `spec.start_ms` asks for first
-    /// ([`layout::Layout::slot_for_time`]) -- what its first requests would
-    /// otherwise wait for in silence. Waits as long as the source takes,
-    /// like a request: the run it waits on is never let go meanwhile, and
-    /// no timer gives up on it (a stalled source is waited for; the viewer
-    /// is the one who cancels, by unpublishing, which ends this with
-    /// [`NotServed::Cut`]). A receiver's later request finds the layout
-    /// fixed and the slot in the ring -- the same run, not a second.
+    /// **Ask for what the receiver will ask for first, before it does** --
+    /// a simulated receiver, through the same request path as the real
+    /// one, so nothing here produces anything a request would not: the
+    /// header (which waits for the layout: the source's formats and index),
+    /// slot 0 (Chrome's FFmpeg demuxer reads on from the header into the
+    /// first fragment before it seeks), then the slot a receiver told to
+    /// start at `spec.start_ms` jumps to ([`layout::Layout::slot_for_time`]).
+    /// Its first requests then find all three in the ring. Waits as long as
+    /// the source takes, as a request does: a run with a request waiting on
+    /// it is never let go, and nothing gives up (the viewer cancels by
+    /// unpublishing, which ends this with [`NotServed::Cut`]).
     pub(crate) async fn prepare(self: &Arc<Self>, state: &AppState) -> Result<u64, NotServed> {
         let layout = self.layout(state).await?;
         let start_us = i64::try_from(self.spec.start_ms.saturating_mul(1000))
             .unwrap_or(i64::MAX)
             .min(self.duration_us());
         let slot = layout.slot_for_time(start_us);
-        // Read on into, as the receiver's opening read would be: it joins
-        // the first run when the slot is in its lookahead, and starts one
-        // beside it otherwise -- an estimated layout's late labels can pick
-        // a slot before the one the first run began at.
-        self.slot(state, slot, Ask::Continue).await?;
+        self.slot(state, 0, Ask::Seek).await?;
+        self.slot(state, slot, Ask::Seek).await?;
         self.prepared.store(true, Ordering::SeqCst);
         self.bump();
         tracing::info!(slot, stage = "rendition_prepared", "rendition prepared");
@@ -946,7 +938,7 @@ impl Rendition {
     }
 
     /// Start a run -- at `slot` (the seek path), or, with no layout yet, the
-    /// run that will freeze it, from a segment before the spec's start --
+    /// run that will freeze it, from the film's start --
     /// dropping the least recently asked run if [`MAX_RUNS`] are live (of
     /// those nobody waits on, when `unwaited_only`). Answers its generation.
     fn start_run(
@@ -977,22 +969,15 @@ impl Rendition {
                 };
                 (from, slot)
             }
-            _ => {
-                let start_us = i64::try_from(self.spec.start_ms.saturating_mul(1000))
-                    .unwrap_or(i64::MAX)
-                    .min(self.duration_us());
-                let from = start_us
-                    .saturating_sub(self.segment_us())
-                    .saturating_sub(back)
-                    .max(0);
-                (from, 0)
-            }
+            // The run that fixes the layout, for the file's header: from
+            // the film's start, which is what a reader of the header reads
+            // on into. Never from where a player was told to start.
+            _ => (0, 0),
         };
         let stop = self.cut.child_token();
         // Its lookahead counts from where it starts: whoever asked last.
         inner.runs.push(RunSlot {
             generation,
-            reserved: slot.is_none(),
             from: from_slot,
             next_out: from_slot,
             last_request: from_slot,
@@ -1082,8 +1067,8 @@ impl Rendition {
         inner.plan.fixed.insert(slot);
         let cursor = inner.plan.start(slot);
         if start.is_none() {
-            // The run that froze the layout: it is the receiver's first
-            // request's, which asked for the spec's start.
+            // The run that froze the layout, for the header's reader: it
+            // reads on into slot 0.
             if let Some(run) = inner.run_mut(generation) {
                 run.from = slot;
                 run.next_out = slot;
@@ -1120,7 +1105,7 @@ impl Rendition {
     }
 
     /// **The file's layout**: frozen by the first run's first sample --
-    /// starting that run, from before the spec's start, if none is live.
+    /// starting that run, from the film's start, if none is live.
     pub(crate) async fn layout(
         self: &Arc<Self>,
         state: &AppState,
@@ -1202,9 +1187,6 @@ impl Rendition {
                         .filter(|run| run.covers(slot))
                         .max_by_key(|run| run.from)
                         .map(|run| run.generation);
-                    if let Some(run) = covering.and_then(|generation| inner.run_mut(generation)) {
-                        run.reserved = false;
-                    }
                     if let Some(generation) = covering
                         && noted != Some(generation)
                     {
@@ -1220,13 +1202,7 @@ impl Rendition {
                     .find(|run| run.joins(slot))
                     .map(|run| run.generation);
                 let unwaited = inner.runs.iter().filter(|run| run.unwaited()).count();
-                let start = if ask == Ask::Open && !inner.runs.is_empty() {
-                    // The receiver opening the file reads on into a slot it
-                    // did not choose; it is about to seek where a run is.
-                    Start::Wait
-                } else {
-                    ask.start(first, inner.runs.len(), unwaited)
-                };
+                let start = ask.start(first, inner.runs.len(), unwaited);
                 first = false;
                 let target = match (joins, start) {
                     (Some(generation), _) => Some(generation),
@@ -1239,9 +1215,6 @@ impl Rendition {
                     (None, Start::Wait) => None,
                 };
                 joined.set(&mut inner, target);
-                if let Some(run) = target.and_then(|generation| inner.run_mut(generation)) {
-                    run.reserved = false;
-                }
                 if let Some(generation) = target
                     && noted != Some(generation)
                 {
@@ -1288,7 +1261,7 @@ mod tests {
     /// anything else in place of one nobody waits on -- or nothing.
     #[test]
     fn a_request_starts_a_run_with_room_and_takes_none_waited_on() {
-        for ask in [Ask::Seek, Ask::Continue, Ask::Open] {
+        for ask in [Ask::Seek, Ask::Continue] {
             assert_eq!(ask.start(false, MAX_RUNS - 1, 0), Start::Beside, "{ask:?}");
             assert_eq!(ask.start(false, MAX_RUNS, 0), Start::Wait, "{ask:?}");
             assert_eq!(
@@ -1300,7 +1273,6 @@ mod tests {
         }
         assert_eq!(Ask::Seek.start(true, MAX_RUNS, 0), Start::Replacing);
         assert_eq!(Ask::Continue.start(true, MAX_RUNS, 0), Start::Wait);
-        assert_eq!(Ask::Open.start(true, MAX_RUNS, 0), Start::Wait);
     }
 
     fn inner_with(runs: &[u64], ring: &[u64], cap: usize) -> Inner {
@@ -1318,7 +1290,6 @@ mod tests {
         for (generation, at) in runs.iter().enumerate() {
             inner.runs.push(RunSlot {
                 generation: generation as u64,
-                reserved: false,
                 from: *at,
                 next_out: *at,
                 last_request: *at,
@@ -1346,8 +1317,7 @@ mod tests {
         run.joined = 1;
         assert!(!run.unwaited());
         run.joined = 0;
-        run.reserved = true;
-        assert!(!run.unwaited());
+        assert!(run.unwaited());
     }
 
     /// **A run taken in place of is the least recently asked**, and -- for

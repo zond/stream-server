@@ -391,8 +391,8 @@ struct FileReader {
     /// The first slot's fragment, when the answer waited for it.
     first: Option<(u64, Bytes)>,
     /// What the next fragment is asked as: the range's first slot is the
-    /// receiver's choice (or, from the header on, its opening read), the
-    /// rest are read on into.
+    /// receiver's request wherever the range began, the rest are read on
+    /// into.
     ask: Ask,
 }
 
@@ -479,7 +479,7 @@ fn slot_bytes(fragment: &Bytes, size: u64, from: u64, to: u64) -> Bytes {
 ///
 /// The length is known once the first run has reported the source's
 /// formats and index, so the answer -- a `HEAD` too -- waits for that
-/// (starting the run, from the spec's start, if none is live). Then the
+/// (starting the run, from the film's start, if none is live). Then the
 /// range framing every media route shares: `200` or `206` with
 /// `Content-Range`, `416` for a range past the end. A range that begins in
 /// a slot waits for that slot's fragment before it answers, so a rendition
@@ -489,8 +489,8 @@ fn slot_bytes(fragment: &Bytes, size: u64, from: u64, to: u64) -> Bytes {
 /// Each later slot is asked for as the receiver takes the bytes before it,
 /// so a receiver that pauses stops asking and the run's lookahead holds
 /// the producer. The first slot a range asks for may move the run there --
-/// except a read from the header on, the receiver opening the file, which
-/// waits for the first run rather than move it; the slots a range reads on
+/// a read from the header on into slot 0 included: Chrome's demuxer probes
+/// it before it seeks, and a read that waits for nobody waits forever; the slots a range reads on
 /// into never move a live run ([`Ask`]: the latest asker wins). The last bytes of a slot are always zeros and are
 /// answered without asking for anything. No timer ends a body: a slot that
 /// is slow to come is waited for. The cut (unpublish, the listener's stop)
@@ -542,13 +542,11 @@ async fn serve_stream(state: &AppState, token: &str, headers: &HeaderMap, body: 
         _ => None,
     };
     state.lan_media.record_body();
-    let ask = if framing.start < layout.header.len() as u64 {
-        // A read from the header on: the receiver opening the file, which
-        // reads on into the first slot without having chosen it.
-        Ask::Open
-    } else {
-        Ask::Seek
-    };
+    // The first slot a range reaches is one it asked for, wherever the
+    // range began: a read from the header on into slot 0 (Chrome's demuxer
+    // probing the first fragment) is as much the receiver's request as a
+    // jump to its start.
+    let ask = Ask::Seek;
     let reader = FileReader {
         state: state.clone(),
         rendition,

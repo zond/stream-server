@@ -1462,8 +1462,9 @@ impl ServerHandle {
     /// receiver's URL is built on,
     /// `<lan_media_base_url>/cast/<token>/stream.mp4` -- one progressive
     /// fragmented MP4 with a length and ranges, which the receiver seeks in
-    /// by bytes; its first run starts at `spec.start_ms`, where the receiver
-    /// is told to start. As [`Self::publish`] -- refused while the LAN
+    /// by bytes. What is made is what the receiver asks for (or a
+    /// [`Self::prepare_rendition`] asks for in its place), never where it was
+    /// told to start. As [`Self::publish`] -- refused while the LAN
     /// listener is down, holds the id's lease, unpublished by
     /// [`Self::unpublish`] or the listener's stop -- and refused
     /// (`noProducer`) when no producer is installed
@@ -1493,16 +1494,18 @@ impl ServerHandle {
         self.state.lan_media.casts().rendition_state(token)
     }
 
-    /// **Make a published rendition's start before any receiver asks**: the
-    /// first run, the layout it fixes from the source's formats and index
-    /// (for a Matroska file, its Cues, usually at the end), the header, and
-    /// the slot a receiver told to start at the spec's `startMs` asks for
-    /// first. Returns at once; the work runs on the server and
+    /// **Ask for what a receiver will ask for first, before it does**: a
+    /// simulated receiver through the same request path -- the header
+    /// (which waits for the layout: the source's formats and index, for a
+    /// Matroska file its Cues, usually at the end), slot 0 (Chrome's
+    /// demuxer probes the first fragment before it seeks), and the slot a
+    /// receiver told to start at the spec's `startMs` jumps to. Returns at
+    /// once; the work runs on the server and
     /// [`Self::rendition_readiness`] says how far it has got, so the app
     /// tells the receiver to load only once its first requests will be
     /// answered at once -- a receiver gives up on a load that stays silent
     /// (measured: a minute for a thin swarm's first piece and Cues). The
-    /// receiver's requests then find the same run and the slot in the ring.
+    /// receiver's requests then find all three in the ring.
     ///
     /// No give-up timer: a stalled source is waited for as long as it takes,
     /// and [`Self::unpublish`] ends the wait. A second call is a no-op.

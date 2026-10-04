@@ -104,9 +104,10 @@ seconds before the slot's cut (so a run started there makes exactly what
 one passing through makes), beside the other or in place of the least
 recently asked one nobody is waiting on -- only a range's first look at
 its first slot takes a run somebody waits on -- so two readers far apart
-each keep one. The receiver's opening read, from the header on into the
-first slot it never chose, starts a run only when none is live (the first
-is at the spec's start, where the receiver is about to seek). The ring
+each keep one. Only requests make slots: the run that fixes the layout
+starts at the film's start, what a reader of the header reads on into, and
+the receiver's opening read into slot 0 is served like any read (Chrome's
+demuxer probes it before it seeks). The ring
 keeps what 96 MiB holds, the slots farthest from any run dropped first. A
 run nobody has asked anything of for a minute is let go (the slots made
 are kept) -- never while a request waits for it to make a slot. A run that makes less than its own time in film over ten
@@ -121,13 +122,13 @@ waits for the layout (the first run's formats and the source's index -- a
 Matroska file's Cues, usually at its end) and the slot it starts in, and the
 Chromecast default receiver gives up on a load that stays silent that long:
 behind a thin swarm it took a minute. So `ServerHandle::prepare_rendition(&CastToken)`
-starts that work with no request -- the first run, the layout, the header,
-and the slot a receiver told to start at `startMs` asks for first (by the
-`sidx` label: the slot holding the time when mirrored, an earlier one when
-estimated) -- and `rendition_readiness(&CastToken)` says how far it has got:
+asks for what the receiver will ask first, through the same request path --
+the header, slot 0 (the demuxer's probe), and the slot for `startMs` (by
+the `sidx` label: the slot holding the time when mirrored, an earlier one
+when estimated) -- and `rendition_readiness(&CastToken)` says how far it has got:
 `{"phase":"index"}`, `"start"`, `"ready"`, `"failed"` with the `sentence`, or
 `"ended"`. The app loads the receiver at `ready`, and the receiver's requests
-find the same run and the slot in the ring. No timer gives up: a preparation
+find all three in the ring. No timer gives up: a preparation
 waits on a stalled source as long as it takes (its run counts as waited on,
 so it is never let go), and an unpublish ends it.
 

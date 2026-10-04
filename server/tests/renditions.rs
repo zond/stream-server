@@ -554,9 +554,9 @@ fn asked_from(cut_us: i64) -> Duration {
 
 /// **The init segment is `ftyp` + `moov`** with the producer's parameter
 /// sets in the `avcC` and its AudioSpecificConfig in the `esds`; the first
-/// run -- asked for the source's index -- starts a segment and
-/// [`SEEK_BACK`](stream_server::rendition::SEEK_BACK) before the spec's
-/// start, so it makes the segment the receiver starts at.
+/// run -- asked for the source's index -- starts at the film's start, what
+/// a reader of the header reads on into, **whatever start the spec names**:
+/// production follows requests, never where a player was told to start.
 #[test]
 fn the_init_segment_carries_the_producers_codec_configuration() -> anyhow::Result<()> {
     let fixture = Fixture::quick(Knobs::default())?;
@@ -599,10 +599,10 @@ fn the_init_segment_carries_the_producers_codec_configuration() -> anyhow::Resul
 
     let runs = fixture.producer.runs();
     assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0].from, Duration::from_millis(7_500 - 1_000 - 2_000));
+    assert_eq!(runs[0].from, Duration::ZERO, "not the spec's 7.5 s");
     assert!(runs[0].wanted_index);
     let probe = fixture.probe(&token);
-    assert_eq!(probe.run_from, Some(5), "the first slot cut after 4.5 s");
+    assert_eq!(probe.run_from, Some(0));
     assert_eq!(probe.exact, Some(true));
     Ok(())
 }
@@ -918,39 +918,82 @@ fn the_end_of_the_file_is_answered_without_a_run() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// **A receiver opening the file reads on from the header without moving
-/// the run**: the first run makes the slot at the spec's start, a read of
-/// the header that goes on into slot 0 waits rather than move it, and the
-/// receiver's jump to its start joins it.
+/// **A receiver gets what it asks for, from where it was told to start**:
+/// its opening read from the header on runs into slot 0 (Chrome's FFmpeg
+/// demuxer probes the first fragment before it seeks to `currentTime`),
+/// and slot 0 is made for it; its jump to the slot for its start is made
+/// for it too -- neither waiting on an idle release. On zond's TV the
+/// opening read waited for a run nobody would start, at 10704 bytes, until
+/// the receiver gave up.
 #[test]
-fn opening_the_file_does_not_move_the_run_from_the_start() -> anyhow::Result<()> {
+fn a_receiver_told_to_start_late_gets_slot_0_and_its_start() -> anyhow::Result<()> {
+    let knobs = Knobs::default();
     let fixture = Fixture::start(
-        Knobs::default(),
+        knobs.clone(),
         RenditionTuning {
+            // No release can stand in for a run the reads need.
             idle_release: Duration::from_secs(3600),
             ..RenditionTuning::default()
         },
     )?;
-    let token = fixture.publish(60_000, 30_000)?;
+    let token = fixture.publish(60_000, 30_500)?;
+    let header = fixture.header(&token);
     let mut opening = fixture.get(&token, Some("bytes=0-".to_string()));
     assert_eq!(opening.status(), reqwest::StatusCode::PARTIAL_CONTENT);
-    let mut first = [0u8; 8];
-    std::io::Read::read_exact(&mut opening, &mut first)?;
-    assert_eq!(&first[4..], b"ftyp");
-    let header = fixture.header(&token);
-    // A segment and two seconds before the start: the first cut after
-    // 27 s.
-    assert_eq!(fixture.probe(&token).run_from, Some(27));
-    until("the first run makes the slots from its start", || {
-        fixture.probe(&token).ring == [27, 28, 29]
-    });
-    let at = header.slots[30].0;
+    let mut head = vec![0u8; header.slots[1].0 as usize];
+    std::io::Read::read_exact(&mut opening, &mut head)?;
+    assert_eq!(&head[4..8], b"ftyp");
+    let fragment = fixture.segment(&token, 0);
+    let slot0 = &head[header.slots[0].0 as usize..];
+    assert_eq!(&slot0[..fragment.len()], &fragment[..], "slot 0");
+
+    let start = slot_holding(&knobs, 30_500_000);
+    let at = header.slots[start as usize].0;
     let target = fixture.range(&token, at, at + 1000);
     assert_eq!(&target[4..8], b"moof");
-    let probe = fixture.probe(&token);
-    assert_eq!(probe.runs_started, 1, "one run, from the start");
-    assert_eq!(probe.run_from, Some(27));
+    // The run from the start, which the open body may have read on far
+    // into, and one for the jump at most: no third, and no release.
+    assert!(fixture.probe(&token).runs_started <= 2);
     drop(opening);
+    Ok(())
+}
+
+/// The release period of [`a_body_waiting_on_a_stalled_slot_keeps_its_run_and_gets_it`],
+/// and the window its "never let go" is measured over: ten of them.
+const WAITED_RELEASE: Duration = Duration::from_millis(100);
+const WAITED_WINDOW: Duration = Duration::from_secs(1);
+
+/// **A body waiting on a slot its source has not given yet keeps its run**,
+/// however short the release period, and gets the slot when the source
+/// does: no release ends it, cleanly or otherwise.
+#[test]
+fn a_body_waiting_on_a_stalled_slot_keeps_its_run_and_gets_it() -> anyhow::Result<()> {
+    let gate = Gate::new();
+    let fixture = Fixture::start(
+        Knobs {
+            start_gate: Some(gate.clone()),
+            ..Knobs::default()
+        },
+        RenditionTuning {
+            idle_release: WAITED_RELEASE,
+            ..RenditionTuning::default()
+        },
+    )?;
+    let token = fixture.publish(60_000, 0)?;
+    // The body is the run's first request: it waits for the layout, then
+    // for slot 0, and is counted among the run's waiters throughout.
+    let mut body = fixture.get(&token, Some("bytes=0-".to_string()));
+    until("the source stalls under slot 0", || gate.is_parked());
+    std::thread::sleep(WAITED_WINDOW);
+    assert_eq!(fixture.probe(&token).runs_started, 1, "never let go");
+    assert!(!fixture.producer.runs()[0].probe.is_stopped());
+    let header = fixture.header(&token);
+    gate.open();
+    let mut head = vec![0u8; header.slots[1].0 as usize];
+    std::io::Read::read_exact(&mut body, &mut head)?;
+    let fragment = fixture.segment(&token, 0);
+    let slot0 = &head[header.slots[0].0 as usize..];
+    assert_eq!(&slot0[..fragment.len()], &fragment[..]);
     Ok(())
 }
 
@@ -1881,25 +1924,33 @@ fn preparing_makes_the_receivers_start_before_any_request() -> anyhow::Result<()
     let probe = fixture.probe(&token);
     assert!(probe.init, "the layout, and with it the header, is made");
     assert!(
-        probe.ring.contains(&start),
-        "slot {start} in {:?}",
+        probe.ring.contains(&start) && probe.ring.contains(&0),
+        "slot 0 and slot {start} in {:?}",
         probe.ring
     );
+    let prepared_runs = probe.runs_started;
     assert_eq!(fixture.handle.lan_media_requests_served(), 0);
     assert!(fixture.handle.prepare_rendition(&token), "a second ask");
 
-    // The receiver: its header, then a range at the slot it starts in.
+    // The receiver: its header, its opening read through slot 0, then a
+    // range at the slot it starts in.
     let header = fixture.header(&token);
+    let opening = fixture.range(&token, 0, header.slots[1].0 - 1);
+    let first = fixture.segment(&token, 0);
+    assert_eq!(
+        &opening[header.slots[0].0 as usize..][..first.len()],
+        &first[..]
+    );
     let slot = header.slots[start as usize];
     let bytes = fixture.range(&token, slot.0, slot.0 + slot.1 - 1);
     let fragment = fixture.segment(&token, start);
     assert_eq!(&bytes[..fragment.len()], &fragment[..]);
     assert_eq!(
         fixture.probe(&token).runs_started,
-        1,
-        "the receiver was answered from what the preparation made"
+        prepared_runs,
+        "the receiver was answered from what the preparation made, no new run"
     );
-    assert_eq!(fixture.producer.runs().len(), 1);
+    assert_eq!(prepared_runs, 2, "the header's from the start, the jump's");
     Ok(())
 }
 
@@ -1981,7 +2032,11 @@ fn preparing_waits_on_a_stalled_source_and_reports_its_phase() -> anyhow::Result
     until("the rendition is ready", || {
         fixture.handle.rendition_readiness(&token) == RenditionReadiness::Ready
     });
-    assert_eq!(fixture.probe(&token).runs_started, 1);
+    assert_eq!(
+        fixture.probe(&token).runs_started,
+        2,
+        "the header's run and the jump's"
+    );
     Ok(())
 }
 

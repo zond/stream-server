@@ -726,9 +726,12 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   server; every slot now matches a sequential read).
 * **The last 16 bytes of every slot are zeros**, answered without making
   anything: FFmpeg's peek at the file's end for an `mfra` size reads 0.
-* **Requests.** `HEAD` and any `GET` wait for the layout -- the first
-  run's formats and index -- starting that run a segment and two seconds
-  before the spec's start, so it makes the slot the receiver will jump to.
+* **Requests, and nothing else, make slots** (zond, 2026-10-04: "always
+  just give the tv what it asks for", as the phone's own player is given
+  what it reads). `HEAD` and any `GET` wait for the layout -- the first
+  run's formats and index -- starting that run from the film's start, what
+  a reader of the header reads on into; where the receiver was told to
+  start decides nothing here.
   A range that begins in a slot waits for that slot's fragment before it
   answers (a failure is a `503`); one that begins in the header answers at
   once. **Up to two runs** (`MAX_RUNS`), each with its own lookahead
@@ -743,8 +746,11 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   1:00) each keep their run, instead of taking one run from each other
   in turn -- millions of times a second in the first build, every few
   seconds on the TV in the second. **The receiver's opening read**, from
-  the header on into slot 0, which it never chose, starts a run only when
-  none is live. **A run is never let go while a request waits for it to
+  the header on into slot 0, is a request like any other: Chrome 92's
+  FFmpeg demuxer on zond's TV probes slot 0 before it seeks to
+  `currentTime`, and when a rule kept that read from starting a run (the
+  first run was at the spec's start) it sat on the header -- 10704 bytes
+  -- for a minute until the receiver gave up. **A run is never let go while a request waits for it to
   make a slot**, however long the making takes. **The ring keeps what it
   can hold** (96 MiB), the slots farthest from where any run is asked
   dropped first, never the lookahead ahead of one: a body's read on runs
@@ -772,12 +778,14 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   layout, and the receiver (the Chromecast default receiver, Chrome 92)
   gave up on a first answer that silent; the same film from a Real-Debrid
   link cast fine. So the app asks `ServerHandle::prepare_rendition` right
-  after publishing, which starts the first run and waits -- counted among
-  its waiters, so never let go -- for the layout and then the slot the
-  receiver will ask for first (`Layout::slot_for_time`: the last slot whose
-  `sidx` label is at or before the start), and loads the receiver once
-  `rendition_readiness` says `ready`. The phone shows the phase meanwhile
-  and keeps playing; the hand-over position is taken at the load. (The same
+  after publishing: a simulated receiver, through the same request path,
+  asking for what the receiver will ask first -- the header (which waits,
+  counted among the first run's waiters, so never let go, for the layout),
+  slot 0 (the demuxer's probe), and the slot for the start it will be told
+  (`Layout::slot_for_time`: the last slot whose `sidx` label is at or
+  before it). It loads the receiver once `rendition_readiness` says
+  `ready`, at the start the preparation asked for. The phone shows the
+  phase meanwhile, paused at that position. (The same
   investigation found the torrent stopped under the cast once anything else
   opened; that was the reconciler's guess at "playing", replaced by explicit
   holds -- `docs/storage.md`, *Who keeps a torrent running*.)
