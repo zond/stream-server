@@ -1659,6 +1659,56 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         .await;
     }
 
+    /// **Whether anything is using `engine`'s torrent**, by what said so --
+    /// the reconciler's `held` ([`crate::reconcile::Conditions::held`]):
+    ///
+    /// * **an explicit hold** ([`crate::retention::holds`]): a player screen
+    ///   open on it, from its first request until the screen says it is
+    ///   gone, paused or stalled alike; a cast of it, from publish to
+    ///   unpublish;
+    /// * **a body being delivered off it**: a stream response registered on
+    ///   it ([`Self::on_stream_start`] to [`Self::on_stream_end`], which every
+    ///   route that opens a torrent reader brackets its response with), or
+    ///   a read that has promised pieces or delivered a byte and not ended
+    ///   ([`crate::retention::owner::Retention::readers`]). That is a declaration,
+    ///   not a guess: the route says a body is being sent to somebody for
+    ///   as long as it is, and stopping the torrent under it stalls it.
+    ///   The registration comes before the reader opens and the reconcile
+    ///   its open asks for, so a stream with no player token -- another
+    ///   client on the HTTP routes, a translated source's own reads --
+    ///   starts its torrent and keeps it for exactly as long as its
+    ///   response lasts;
+    /// * **the last thing a stream opened on** (the liveness cell), as
+    ///   before holds existed: the last torrent played goes on running, and
+    ///   sharing, after its screen has gone, until any other open moves
+    ///   the cell. What it no longer is, is the only thing keeping a
+    ///   torrent a player or a television is using.
+    ///
+    /// Not the reads open at this instant, and not the cell alone: the
+    /// first is a seek's gap away from false while a player is watching,
+    /// and the second is moved by any other open -- a subtitle on another
+    /// torrent, a link through `/proxy` -- while a television waits on the
+    /// torrent.
+    async fn held(&self, engine: &Arc<Engine<B::Handle>>) -> bool {
+        let info_hash = &engine.info_hash;
+        if self.live.holds().holds(info_hash) {
+            return true;
+        }
+        if engine.retention.readers() > 0 {
+            return true;
+        }
+        if self
+            .active_streams
+            .read()
+            .await
+            .get(info_hash)
+            .is_some_and(|count| *count > 0)
+        {
+            return true;
+        }
+        self.live.is_torrent(info_hash)
+    }
+
     /// Decide for one engine and act on the decision, under that hash's
     /// reconcile lock.
     ///
@@ -1675,38 +1725,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// from any other afterwards, and only for the one thing that is a
     /// statement about the *device*: the read refusal. The stop call itself
     /// is the same call.
-    /// **Whether anything is using `engine`'s torrent**, by what said so --
-    /// the reconciler's `held` ([`crate::reconcile::Conditions::held`]):
-    ///
-    /// * **an explicit hold** ([`crate::retention::holds`]): a player screen
-    ///   open on it, from its first request until the screen says it is
-    ///   gone, paused or stalled alike; a cast of it, from publish to
-    ///   unpublish;
-    /// * **a read still being delivered off it**: a body mid-flight, for
-    ///   exactly as long as it lasts -- stopping the torrent under one
-    ///   stalls it;
-    /// * **the last thing a stream opened on** (the liveness cell), as
-    ///   before holds existed: a stream open without a player token (a
-    ///   client on the HTTP routes) declares nothing else, and the last
-    ///   torrent played goes on sharing. What it no longer is, is the only
-    ///   thing keeping a torrent a player or a television is using.
-    ///
-    /// Not the reads open at this instant, and not the cell alone: the
-    /// first is a seek's gap away from false while a player is watching,
-    /// and the second is moved by any other open -- a subtitle on another
-    /// torrent, a link through `/proxy` -- while a television waits on the
-    /// torrent.
-    async fn held(&self, engine: &Arc<Engine<B::Handle>>) -> bool {
-        let info_hash = &engine.info_hash;
-        if self.live.holds().holds(info_hash) {
-            return true;
-        }
-        if engine.retention.readers() > 0 {
-            return true;
-        }
-        self.live.is_torrent(info_hash)
-    }
-
     async fn reconcile_engine(
         &self,
         engine: &Arc<Engine<B::Handle>>,
@@ -8515,13 +8533,18 @@ mod tests {
         if let Some(sweep) = enginefs.take_sweep_task() {
             sweep.abort();
         }
-        // The fixture's torrent is the one being played, which is what a
-        // stream open writes (`on_stream_start`) and what the ladder's
-        // bottom arm reads. Almost every test below is about the
-        // free-space arm -- a volume filling under a torrent somebody is
-        // watching -- and without this every one of them would be
-        // measuring the arm that stops a torrent nobody is watching. The
-        // few that are about *that* say so by opening something else.
+        // The fixture's torrent is the one being played: a player screen
+        // holds it (what the ladder's bottom arm reads, `Conditions::held`)
+        // and the liveness cell names it (what its windows are drawn
+        // round). Almost every test below is about the free-space arm -- a
+        // volume filling under a torrent somebody is watching -- and
+        // without the hold every one of them would be measuring the arm
+        // that stops a torrent nobody is watching. The few that are about
+        // *that* say so with `nothing_torrent_is_playing`, which releases
+        // it.
+        enginefs
+            .holds()
+            .hold_for_player(FIXTURE_SCREEN, TEST_HASH, vec![0]);
         enginefs.live().open(
             crate::retention::live::LiveEntity::Torrent {
                 info_hash: TEST_HASH.to_string(),
@@ -8531,6 +8554,11 @@ mod tests {
         );
         (enginefs, counters)
     }
+
+    /// The player screen that holds `test_enginefs_for_reconciler`'s
+    /// torrent. A viewer of its own, so that nothing a test's `PLAYER`
+    /// does replaces its hold.
+    const FIXTURE_SCREEN: &str = "fixture.1";
 
     /// Nothing is playing this server's torrents any more: a proxied body
     /// is. What a viewer opening something else does to every torrent at
@@ -8545,6 +8573,8 @@ mod tests {
         // The viewer, whichever of its screens the test was on: a token
         // with no screen number is always current.
         enginefs.note_player("tv", crate::retention::sessions::Played::Elsewhere);
+        // And the reconciler fixture's screen is gone.
+        enginefs.release_player(FIXTURE_SCREEN);
     }
 
     /// Every call the reconciler could make and does not, in one place.
@@ -8752,14 +8782,10 @@ mod tests {
         enginefs.reconcile_tick().await;
         assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
 
-        // And is replaced by another entity: from here nothing is playing
-        // this torrent, whatever anything asks about it.
-        enginefs.live().open(
-            crate::retention::live::LiveEntity::Proxy {
-                dir: "/elsewhere".into(),
-            },
-            false,
-        );
+        // And ends, and the viewer moves on to another entity: from here
+        // nothing is playing this torrent, whatever anything asks about it.
+        enginefs.on_stream_end(TEST_HASH, 0).await;
+        nothing_torrent_is_playing(&enginefs);
 
         // Five minutes of a details page polling every ten seconds. Both
         // halves of what the route does to the engine, because both write
@@ -8786,6 +8812,47 @@ mod tests {
             RunState::Paused,
             "nobody is watching it, so there is nothing for it to fetch"
         );
+        assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 1);
+    }
+
+    /// **A body being delivered keeps its torrent running, and only for as
+    /// long as it is.** A stream with no player token -- another client on
+    /// the HTTP routes, a translated source's own reads -- declares no hold;
+    /// its response does: registered before its reader opens and ended when
+    /// the body ends. Here the response is open with no read in flight (the
+    /// gap between two of its reads) and a `/proxy` body has moved the
+    /// liveness cell since, so nothing else speaks for the torrent: it runs.
+    /// The response ends, and the next tick stops it -- a stop waits out no
+    /// dwell.
+    #[tokio::test(start_paused = true)]
+    async fn a_response_being_delivered_keeps_its_torrent_and_its_end_lets_it_go() {
+        let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
+        enginefs.set_free_space_probe(|_| Ok(u64::MAX));
+        nothing_torrent_is_playing(&enginefs);
+
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        enginefs.focus_torrent(TEST_HASH).await;
+        enginefs.live().open(
+            crate::retention::live::LiveEntity::Proxy {
+                dir: "/a-link".into(),
+            },
+            false,
+        );
+        assert!(enginefs.holds().holders(TEST_HASH).is_empty());
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Run)],
+            "a torrent stopped under a response still being delivered"
+        );
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
+        assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 0);
+
+        enginefs.on_stream_end(TEST_HASH, 0).await;
+        assert_eq!(
+            enginefs.reconcile_tick().await,
+            vec![(TEST_HASH.to_string(), Decision::Stop)]
+        );
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
         assert_eq!(counters.stop_torrent.load(Ordering::SeqCst), 1);
     }
 
@@ -19803,6 +19870,8 @@ mod tests {
         let left = &two.counters[0];
         enginefs.note_player(PLAYER, played(OTHER_HASH, 0));
         enginefs.on_stream_start_unreconciled(OTHER_HASH, 0).await;
+        // And the film's own response closes.
+        enginefs.on_stream_end(TEST_HASH, 0).await;
         assert!(engine.shares_to_end().await);
 
         enginefs.drop_slack().await;
@@ -19837,6 +19906,7 @@ mod tests {
     async fn a_cache_clean_stops_a_torrent_before_it_takes_what_it_announced() {
         let (two, engine, bucket) = one_of_two_torrents_played().await;
         let enginefs = &two.enginefs;
+        enginefs.on_stream_end(TEST_HASH, 0).await;
         nothing_torrent_is_playing(enginefs);
         let freed = enginefs.drop_slack().await;
         assert_eq!(freed, 2, "both pieces of the ended session");
@@ -20293,6 +20363,8 @@ mod tests {
         let _store = seeded_store(&enginefs, &engine);
         engine.begin_retention(0).await;
         engine.test_read_at(0, 0);
+        // The viewer's screen holds it, which is what the ladder reads.
+        enginefs.holds().hold_for_player(PLAYER, TEST_HASH, vec![0]);
         // Stopped, so the ladder's own `Run` has a call to make -- and that
         // call is what the tick can be parked in, which is the gap between
         // its two halves.
@@ -20313,8 +20385,9 @@ mod tests {
             "the ladder decided Run and its start is inside the backend"
         );
 
-        // The viewer opens something else, in the gap: after the ladder has
-        // read, before the pass has.
+        // The viewer leaves the screen and opens something else, in the
+        // gap: after the ladder has read, before the pass has.
+        enginefs.release_player(PLAYER);
         enginefs.live().open(
             crate::retention::live::LiveEntity::Proxy {
                 dir: "/elsewhere".into(),
@@ -20327,7 +20400,7 @@ mod tests {
         assert_eq!(
             tick.await.expect("the tick"),
             vec![(TEST_HASH.to_string(), Decision::Run)],
-            "the ladder read the torrent as the one being played"
+            "the ladder read the torrent as held"
         );
         assert!(
             bucket.join("0").is_file(),
@@ -21654,6 +21727,11 @@ mod tests {
             crate::retention::live::Reading::nothing(),
             "nothing is playing in a process that has served nothing"
         );
+        // And nothing holds anything: holds live in the process's memory,
+        // so a player screen the app never released -- the app was killed,
+        // and the server inside it with it -- holds nothing after a restart.
+        assert!(enginefs.holds().holders(TEST_HASH).is_empty());
+        assert!(enginefs.holds().holders(OTHER_HASH).is_empty());
 
         let mut decided = enginefs.reconcile_tick().await;
         decided.sort_by(|left, right| left.0.cmp(&right.0));

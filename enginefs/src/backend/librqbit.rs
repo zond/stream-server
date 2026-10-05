@@ -4343,12 +4343,15 @@ mod tests {
         (efs, hash)
     }
 
-    /// The server saw a stream open on file 0 of this torrent: what makes
-    /// it the entity being played, and so one the ladder keeps running.
-    /// Without it a restored torrent is one nobody is watching, which the
-    /// ladder stops and the retention passes empty.
+    /// A player screen is on file 0 of this torrent: its hold is what the
+    /// ladder keeps running ([`crate::retention::holds`]), and the stream it
+    /// opened made the file the entity being played, which the retention
+    /// passes keep. Without it a restored torrent is one nobody is
+    /// watching, which the ladder stops and the retention passes empty.
     #[cfg(test)]
     fn plays(efs: &crate::BackendEngineFS<LibrqbitBackend>, hash: &str) {
+        efs.holds()
+            .hold_for_player("tv.1", &hash.to_lowercase(), vec![0]);
         efs.live().open(
             crate::retention::live::LiveEntity::Torrent {
                 info_hash: hash.to_lowercase(),
