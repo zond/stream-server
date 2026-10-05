@@ -5855,6 +5855,13 @@ mod tests {
         prefetches: Mutex<Vec<(usize, u64, u64)>>,
         /// How many of the prefetches handed out are still held.
         prefetches_held: Arc<AtomicUsize>,
+        /// Every offset a prefetch was seeked to, in order.
+        prefetch_seeks: Mutex<Vec<u64>>,
+        /// The pieces (of the fake's first file) a prefetch's read finds
+        /// here; a read of any other parks until [`FakeCounters::arrive`].
+        prefetch_here: Mutex<std::collections::BTreeSet<u64>>,
+        /// The parked prefetch read's waker.
+        prefetch_waker: Mutex<Option<std::task::Waker>>,
         /// What the fake reports as its median piece completion.
         deadline_median: Mutex<Option<std::time::Duration>>,
         /// Every `piece_claims_at` the blocked-read probe asked, as
@@ -6122,7 +6129,76 @@ mod tests {
         start_gate: tokio::sync::Notify,
     }
 
+    /// What the fake hands out as a [`crate::backend::Prefetch`]: a stream
+    /// that records where it is seeked to and answers a read only for a
+    /// piece the test has let arrive.
+    struct FakePrefetch {
+        counters: Arc<FakeCounters>,
+        piece_length: u64,
+        at: u64,
+    }
+
+    impl tokio::io::AsyncRead for FakePrefetch {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            // The waker first, so an arrival between the look and the park
+            // is not missed.
+            *self.counters.prefetch_waker.lock().unwrap() = Some(cx.waker().clone());
+            let here = self
+                .counters
+                .prefetch_here
+                .lock()
+                .unwrap()
+                .contains(&(self.at / self.piece_length));
+            if !here {
+                return std::task::Poll::Pending;
+            }
+            buf.put_slice(&[0]);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncSeek for FakePrefetch {
+        fn start_seek(
+            mut self: std::pin::Pin<&mut Self>,
+            position: std::io::SeekFrom,
+        ) -> std::io::Result<()> {
+            let std::io::SeekFrom::Start(at) = position else {
+                return Err(std::io::Error::other(
+                    "the fake prefetch seeks from the start",
+                ));
+            };
+            self.at = at;
+            self.counters.prefetch_seeks.lock().unwrap().push(at);
+            Ok(())
+        }
+
+        fn poll_complete(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<u64>> {
+            std::task::Poll::Ready(Ok(self.at))
+        }
+    }
+
+    impl Drop for FakePrefetch {
+        fn drop(&mut self) {
+            self.counters.prefetches_held.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
     impl FakeCounters {
+        /// `piece` has arrived: a prefetch's read parked on it answers.
+        fn arrive(&self, piece: u64) {
+            self.prefetch_here.lock().unwrap().insert(piece);
+            if let Some(waker) = self.prefetch_waker.lock().unwrap().take() {
+                waker.wake();
+            }
+        }
+
         /// Record a breach of the sharing rule, and fail where it happened.
         /// Where it happened may be a task nobody awaits, whose panic is
         /// swallowed: the record is what the test's [`Counters`] asks.
@@ -6967,20 +7043,17 @@ mod tests {
             lookahead_bytes: u64,
         ) -> Result<Option<crate::backend::Prefetch>> {
             self.gate().await?;
-            /// Counts itself out of `prefetches_held` when let go.
-            struct Held(Arc<AtomicUsize>);
-            impl Drop for Held {
-                fn drop(&mut self) {
-                    self.0.fetch_sub(1, Ordering::SeqCst);
-                }
-            }
             self.counters.prefetches.lock().unwrap().push((
                 file_idx,
                 start_offset,
                 lookahead_bytes,
             ));
             self.counters.prefetches_held.fetch_add(1, Ordering::SeqCst);
-            Ok(Some(Box::new(Held(self.counters.prefetches_held.clone()))))
+            Ok(Some(Box::new(FakePrefetch {
+                counters: self.counters.clone(),
+                piece_length: self.piece_length().unwrap_or(1).max(1),
+                at: start_offset,
+            })))
         }
 
         async fn get_file_reader(
@@ -13498,47 +13571,147 @@ mod tests {
         );
     }
 
-    /// **A pre-want is the backend's ask over the window and a promise on
-    /// the file's pieces, and it is not a read.** The window reaches the
-    /// backend as the offset and the length it is; the entity is promised
-    /// the pieces the window lies in; nothing registers a stream; and
-    /// dropping it ends both halves.
+    /// Wait for `ready`, yielding to the runtime between looks: a walk runs
+    /// on a task of its own, and what a test waits for is what it did.
+    async fn until_prewant(what: &str, ready: impl Fn() -> bool) {
+        for _ in 0..10_000 {
+            if ready() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("never: {what}");
+    }
+
+    /// **A pre-want asks for its steps in the order it is handed them, one
+    /// stream reaching one step ahead, and promises each as it begins it;
+    /// it is not a read.** The stream is opened on the first step with the
+    /// longest step as its reach; the walk moves on only when a piece has
+    /// arrived, a step at a time and a piece at a time; the promise grows
+    /// to cover what has been begun and nothing further; once every step
+    /// is here the stream is let go and the promise stands; and dropping it
+    /// ends both.
     #[tokio::test]
-    async fn a_prewant_asks_for_its_window_and_promises_its_pieces_until_let_go() {
+    async fn a_prewant_walks_its_steps_in_order_and_promises_each_as_it_begins() {
         let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 800)]);
         counters.pieces_per_file.store(8, Ordering::SeqCst);
         let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
         engine.begin_retention(0).await;
-        assert!(
-            engine.prewant(0, 300..300).await.is_none(),
-            "an empty window"
-        );
+        assert!(engine.prewant(0, vec![]).await.is_none(), "nothing to ask");
+        let empty_step = std::iter::once(300..300).collect();
+        assert!(engine.prewant(0, empty_step).await.is_none());
+        let promised = || engine.retention.holding(&0).expect("the entity").promised;
+        let seeks = || counters.prefetch_seeks.lock().unwrap().clone();
 
-        let prewant = engine.prewant(0, 250..520).await.expect("a pre-want");
-        assert_eq!(*counters.prefetches.lock().unwrap(), vec![(0, 250, 270)]);
-        assert_eq!(counters.prefetches_held.load(Ordering::SeqCst), 1);
+        // From 400 outward: forward, back, a forward step of two pieces,
+        // back again.
+        let prewant = engine
+            .prewant(0, vec![400..500, 300..400, 500..700, 250..300])
+            .await
+            .expect("a pre-want");
         assert_eq!(
-            engine.retention.holding(&0).expect("the entity").promised,
-            vec![2..6],
-            "the pieces 250..520 lie in, promised"
+            *counters.prefetches.lock().unwrap(),
+            vec![(0, 400, 200)],
+            "one stream, on the first step, reaching the longest step ahead"
         );
+        until_prewant("the walk is on the first step", || seeks() == vec![400]).await;
+        assert_eq!(promised(), vec![4..5], "the first step, and no more");
         assert_eq!(
             engine.active_streams.load(Ordering::SeqCst),
             0,
             "a pre-want is not a read"
         );
 
+        counters.arrive(4);
+        until_prewant("the walk moved back a step", || seeks() == vec![400, 300]).await;
+        assert_eq!(promised(), vec![3..5]);
+        counters.arrive(3);
+        until_prewant("the walk is on the third step", || {
+            seeks() == vec![400, 300, 500]
+        })
+        .await;
+        assert_eq!(promised(), vec![3..7]);
+        counters.arrive(5);
+        until_prewant("a step is walked a piece at a time", || {
+            seeks() == vec![400, 300, 500, 600]
+        })
+        .await;
+        counters.arrive(6);
+        until_prewant("the walk is on the last step", || {
+            seeks() == vec![400, 300, 500, 600, 250]
+        })
+        .await;
+        assert_eq!(promised(), vec![2..7]);
+        assert_eq!(counters.prefetches_held.load(Ordering::SeqCst), 1);
+
+        counters.arrive(2);
+        until_prewant("everything is here and the stream is let go", || {
+            counters.prefetches_held.load(Ordering::SeqCst) == 0
+        })
+        .await;
+        assert_eq!(promised(), vec![2..7], "what arrived is still promised");
+        assert_eq!(seeks().len(), 5, "and nothing more was asked for");
+
         drop(prewant);
-        assert_eq!(counters.prefetches_held.load(Ordering::SeqCst), 0);
-        assert!(
-            engine
-                .retention
-                .holding(&0)
-                .expect("the entity")
-                .promised
-                .is_empty(),
-            "and nothing promised once it is let go"
+        until_prewant("the promise is let go", || promised().is_empty()).await;
+    }
+
+    /// **Dropping a pre-want mid-walk ends the ask and the promise**, and
+    /// **a pre-want asks for no more than a quarter of the cache**: whole
+    /// steps in order while they fit, since what it holds is promised and
+    /// no pass can give it back.
+    #[tokio::test]
+    async fn a_prewant_is_bounded_by_the_cache_and_ends_when_it_is_dropped() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 800)]);
+        counters.pieces_per_file.store(8, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        // A quarter of 1000 is 250: the first two steps, not the third.
+        enginefs.set_cache_budget(Some(1000));
+        engine.begin_retention(0).await;
+        let promised = || engine.retention.holding(&0).expect("the entity").promised;
+        let seeks = || counters.prefetch_seeks.lock().unwrap().clone();
+        counters.arrive(4);
+        counters.arrive(3);
+        counters.arrive(5);
+
+        let prewant = engine
+            .prewant(0, vec![400..500, 300..400, 500..600])
+            .await
+            .expect("a pre-want");
+        until_prewant("the steps that fit are here", || {
+            counters.prefetches_held.load(Ordering::SeqCst) == 0
+        })
+        .await;
+        assert_eq!(
+            seeks(),
+            vec![400, 300],
+            "the third step was never asked for"
         );
+        assert_eq!(promised(), vec![3..5]);
+        drop(prewant);
+        until_prewant("the promise is let go", || promised().is_empty()).await;
+
+        // A cache too small for a step: the first one, cut to the quarter.
+        enginefs.set_cache_budget(Some(200));
+        let prewant = engine
+            .prewant(0, vec![600..700, 500..600])
+            .await
+            .expect("a pre-want");
+        assert_eq!(
+            counters.prefetches.lock().unwrap().last(),
+            Some(&(0, 600, 50))
+        );
+        until_prewant("the walk is parked on its piece", || {
+            seeks().last() == Some(&600)
+        })
+        .await;
+        assert_eq!(promised(), vec![6..7]);
+        assert_eq!(counters.prefetches_held.load(Ordering::SeqCst), 1);
+        drop(prewant);
+        until_prewant("dropped mid-walk, the ask and the promise end", || {
+            counters.prefetches_held.load(Ordering::SeqCst) == 0 && promised().is_empty()
+        })
+        .await;
     }
 
     /// **A live file nothing bounds keeps the whole of itself.**
@@ -14117,6 +14290,24 @@ mod tests {
             "a new player starts its stalls from none"
         );
         assert_eq!(handed().len(), 3);
+
+        // A pre-want's stream beside the reader's: the depth is widened by
+        // the pieces the pre-want has at the head of the lookahead -- two
+        // here, a quarter of the cache being one piece and a position
+        // inside a piece reaching one more -- so the reader's share of the
+        // split head stays three, and it comes back down, a piece a pass,
+        // once the pre-want is gone.
+        let one_step = std::iter::once(100..200).collect();
+        let prewant = engine.prewant(0, one_step).await.expect("a pre-want");
+        pass().await;
+        assert_eq!(
+            handed().last(),
+            Some(&5),
+            "three for the reader, two beside"
+        );
+        drop(prewant);
+        pass().await;
+        assert_eq!(handed().last(), Some(&4), "down a piece a pass");
     }
 
     /// **A piece that arrives under the pass, outside the window, does not

@@ -9,9 +9,12 @@ pub mod priorities;
 pub trait FileStreamTrait: AsyncRead + AsyncSeek + Unpin + Send + Sync {}
 impl<T: AsyncRead + AsyncSeek + Unpin + Send + Sync> FileStreamTrait for T {}
 
-/// What [`TorrentHandle::prefetch`] answers: the backend's ask of the swarm,
-/// standing until this is dropped. Opaque on purpose -- nothing reads it.
-pub type Prefetch = Box<dyn std::any::Any + Send + Sync>;
+/// What [`TorrentHandle::prefetch`] answers: a stream nobody plays from.
+/// Its lookahead is asked of the swarm from wherever it is positioned for
+/// as long as it is held; a seek moves the ask, and a read is how its
+/// holder learns a piece has arrived -- it parks until the piece under the
+/// position is here.
+pub type Prefetch = Box<dyn FileStreamTrait>;
 
 #[derive(Debug, Clone)]
 pub enum TorrentSource {
@@ -788,11 +791,12 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
         start_offset: u64,
         lookahead_bytes: u64,
     ) -> Result<Box<dyn FileStreamTrait>>;
-    /// **Ask the swarm for `lookahead_bytes` of `file_idx` from
-    /// `start_offset`, as a stream reading there would, for as long as the
-    /// answer is held** -- and read nothing. What a resumed film's pre-want
-    /// is ([`crate::engine::Engine::prewant`]): the region a player will
-    /// read once it has opened the file, asked for while it opens.
+    /// **A stream over `file_idx` that is nobody's position**: it asks the
+    /// backend to fetch `lookahead_bytes` ahead of wherever it stands,
+    /// starting at `start_offset`, for as long as it is held, as a reader's
+    /// stream does. What a resumed film's pre-want walks its window with
+    /// ([`crate::engine::Engine::prewant`]): a seek moves the ask, and a
+    /// read parks until the piece under the position has arrived.
     ///
     /// Not [`Self::get_file_reader`], whose reader is *where a stream is*:
     /// the startup window a client is shown follows the newest one, and a

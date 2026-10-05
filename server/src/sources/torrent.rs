@@ -257,25 +257,22 @@ impl TorrentSource {
         self.play.is_some()
     }
 
-    /// **Ask the swarm for `window` of this file ahead of the player**
-    /// (`crate::media::prewant`), as a future that owns what it needs, so
-    /// the asking runs on a task of its own and never holds up a read.
-    /// `None` for an aside, which has no playback to ask ahead of.
+    /// **Ask the swarm for `steps` of this file, in that order, ahead of
+    /// the player** (`crate::media::prewant`), as a future that owns what it
+    /// needs, so the asking runs on a task of its own and never holds up an
+    /// open or a read. `None` for an aside, which has no playback to ask
+    /// ahead of.
     pub(crate) fn prewant(
         &self,
-        window: std::ops::Range<u64>,
-    ) -> Option<
-        impl std::future::Future<
-            Output = Option<enginefs::engine::PreWant<enginefs::backend::librqbit::LibrqbitHandle>>,
-        > + Send
-        + 'static,
-    > {
+        steps: Vec<std::ops::Range<u64>>,
+    ) -> Option<impl std::future::Future<Output = Option<enginefs::engine::PreWant>> + Send + 'static>
+    {
         self.play.as_ref()?;
         let (engine, info_hash, file_idx) =
             (self.engine.clone(), self.info_hash.clone(), self.file_idx);
         Some(async move {
             let torrent = Self::torrent(&engine, &info_hash).await.ok()?;
-            torrent.prewant(file_idx, window).await
+            torrent.prewant(file_idx, steps).await
         })
     }
 

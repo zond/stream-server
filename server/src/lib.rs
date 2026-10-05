@@ -708,9 +708,10 @@ impl ServerHandle {
     /// film is if the app knows -- `None` for a playback from the top. Set
     /// before [`Self::open_reader`], as [`Self::set_buffer`] can be: a
     /// torrent file read with a play then asks the swarm for the resume
-    /// point once the file's head is in, beside the index read, instead of
-    /// only when the player blocks on it (`docs/design/media-pipeline.md`,
-    /// "Pre-want"). Where the last session on the file ended
+    /// point at the open, beside the file's head, instead of only when the
+    /// player blocks on it (`docs/design/media-pipeline.md`, "Pre-want"):
+    /// from where the resume point is taken to be, outward, a step at a
+    /// time. Where the last session on the file ended
     /// ([`Self::note_media_position`]) places the window when it is near
     /// the resume time; the resume time's share of the file does
     /// otherwise. Nothing for anything but a torrent file.
@@ -749,10 +750,11 @@ impl ServerHandle {
         self.state.media.read_wait(id)
     }
 
-    /// The window a reader of `id` is pre-wanting now: a probe for the
-    /// tests of [`Self::set_resume`], and nothing a client decides from.
+    /// What a reader of `id` is pre-wanting now, in the order it is asked
+    /// for: a probe for the tests of [`Self::set_resume`], and nothing a
+    /// client decides from.
     #[doc(hidden)]
-    pub fn media_prewant(&self, id: &MediaId) -> Option<std::ops::Range<u64>> {
+    pub fn media_prewant(&self, id: &MediaId) -> Option<Vec<std::ops::Range<u64>>> {
         self.state.media.prewanting(id)
     }
 

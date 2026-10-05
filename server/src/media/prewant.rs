@@ -8,13 +8,16 @@
 //! weak swarm the waits add up: 38 s, then 26 s, then seconds per piece.
 //! The resume point is the one of the three the server can know ahead --
 //! from where the last session on the file ended, or from the resume time
-//! and the film's length -- so it is asked for once the head is in, beside
-//! the index read, rather than after it.
+//! and the film's length -- and all three are needed before the first
+//! frame, so it is asked for **at the open, beside the head**: fetched one
+//! after the other the waits add up, and sharing the swarm between them
+//! costs the head little and the total nothing.
 //!
 //! This module is the policy, and nothing in it touches a torrent: where
-//! the window is ([`window`]), when it is asked for and when it is let go
-//! ([`Tracker`]). The reader task applies it (`super::reader`) and the
-//! engine does the asking (`enginefs::engine::Engine::prewant`).
+//! the window is and where in it the resume point is taken to be
+//! ([`plan`]), the order it is asked for in ([`Plan::steps`]), and when it
+//! is let go ([`Tracker`]). The reader task applies it (`super::reader`)
+//! and the engine does the asking (`enginefs::engine::Engine::prewant`).
 
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
@@ -75,6 +78,12 @@ pub struct Rules {
     /// How near the resume time must be to the remembered one for the
     /// remembered offset to be used.
     pub near_ms: u64,
+    /// How much of the window is asked for at once ([`Plan::steps`]): the
+    /// reach of the one stream the window is walked with. It is what
+    /// bounds the pre-want's place in the swarm's priorities, whatever the
+    /// window's size -- the backend takes one piece of each stream in
+    /// turn, and this is all the pre-want's stream ever has there.
+    pub step: u64,
     /// The bytes one run of reads -- from an open or a seek -- may deliver
     /// outside the window before the player is taken to be playing
     /// somewhere else, and the pre-want is let go. The head and the index
@@ -93,9 +102,22 @@ impl Default for Rules {
             behind: 48 * MIB,
             ahead: 16 * MIB,
             near_ms: 60_000,
+            step: 16 * MIB,
             elsewhere: 16 * MIB,
         }
     }
+}
+
+/// Where to ask for, and where in it the resume point is taken to be.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Plan {
+    /// Everything that may be asked for.
+    pub window: Range<u64>,
+    /// The likeliest byte of the resume point, inside the window: what is
+    /// asked for first, and outward from.
+    pub centre: u64,
+    /// Why the window is where it is.
+    pub basis: Basis,
 }
 
 /// **Where to ask for**, in a file of `len` bytes, for a playback resuming
@@ -106,18 +128,22 @@ impl Default for Rules {
 /// * **Remembered**, when the last session on this file ended within
 ///   [`Rules::near_ms`] of the resume time: from [`Rules::behind`] before
 ///   the offset it was reading to [`Rules::ahead`] past it, moved by the
-///   gap in time at the film's own rate when the length is known.
-/// * **Estimated** otherwise: the resume time's share of the file, and
-///   either side of it the larger of [`Rules::half_per_mille`] of the file
-///   and [`Rules::min_half`], never past [`Rules::max_half`].
+///   gap in time at the film's own rate when the length is known. The
+///   centre is the middle of that: the picture was somewhere in the
+///   player's buffer behind its last read, so with the default numbers the
+///   first two steps are the 32 MiB behind the remembered byte, the half
+///   nearer it first.
+/// * **Estimated** otherwise: the resume time's share of the file is the
+///   centre, and either side of it the larger of [`Rules::half_per_mille`]
+///   of the file and [`Rules::min_half`], never past [`Rules::max_half`].
 ///
 /// Clamped to the file either way.
-pub fn window(
+pub fn plan(
     len: u64,
     hint: ResumeHint,
     remembered: Option<Remembered>,
     rules: Rules,
-) -> Option<(Range<u64>, Basis)> {
+) -> Option<Plan> {
     if hint.at_ms == 0 || len == 0 {
         return None;
     }
@@ -126,20 +152,18 @@ pub fn window(
         let runtime = runtime?;
         Some((u128::from(len) * u128::from(ms) / u128::from(runtime)).min(u128::from(len)) as u64)
     };
-    let (start, end, basis) =
+    let (start, centre, end, basis) =
         match remembered.filter(|kept| kept.at_ms.abs_diff(hint.at_ms) <= rules.near_ms) {
             Some(kept) => {
                 let gap = at_rate(kept.at_ms.abs_diff(hint.at_ms)).unwrap_or(0);
-                let centre = if hint.at_ms >= kept.at_ms {
+                let read_to = if hint.at_ms >= kept.at_ms {
                     kept.offset.saturating_add(gap)
                 } else {
                     kept.offset.saturating_sub(gap)
                 };
-                (
-                    centre.saturating_sub(rules.behind),
-                    centre.saturating_add(rules.ahead),
-                    Basis::Remembered,
-                )
+                let start = read_to.saturating_sub(rules.behind);
+                let end = read_to.saturating_add(rules.ahead);
+                (start, start + (end - start) / 2, end, Basis::Remembered)
             }
             None => {
                 let centre = at_rate(hint.at_ms)?;
@@ -147,111 +171,100 @@ pub fn window(
                 let half = half.max(rules.min_half).min(rules.max_half);
                 (
                     centre.saturating_sub(half),
+                    centre,
                     centre.saturating_add(half),
                     Basis::Estimated,
                 )
             }
         };
     let window = start.min(len)..end.min(len);
-    (!window.is_empty()).then_some((window, basis))
+    (!window.is_empty()).then(|| Plan {
+        centre: centre.clamp(window.start, window.end),
+        window,
+        basis,
+    })
 }
 
-/// What a served read asks of the pre-want.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Step {
-    /// Ask for this window now.
-    Start(Range<u64>),
-    /// Let the pre-want go.
-    Stop,
-    /// Nothing changes.
-    Stay,
+impl Plan {
+    /// **The window in the order it is asked for**: `step` bytes at a time,
+    /// from the centre outward -- the step ahead of the centre, the step
+    /// behind it, the next ahead, the next behind -- until both sides
+    /// reach the window's ends. Each step touches what was asked before
+    /// it, so what has been asked for is always one run of the file.
+    ///
+    /// Outward, because the centre is a guess with an error either way and
+    /// a sweep from the window's front would spend its first minute on a
+    /// weak swarm on bytes far before the resume point; ahead first,
+    /// because a player reads forward from wherever it lands.
+    pub fn steps(&self, step: u64) -> Vec<Range<u64>> {
+        let step = step.max(1);
+        let (mut back, mut ahead) = (self.centre, self.centre);
+        let mut steps = Vec::new();
+        while ahead < self.window.end || back > self.window.start {
+            if ahead < self.window.end {
+                let to = ahead.saturating_add(step).min(self.window.end);
+                steps.push(ahead..to);
+                ahead = to;
+            }
+            if back > self.window.start {
+                let from = back.saturating_sub(step).max(self.window.start);
+                steps.push(from..back);
+                back = from;
+            }
+        }
+        steps
+    }
 }
 
-/// **When the window is asked for and when it is let go**, from the reads
-/// the player is served. Clock-free: every transition is a read.
+/// **When the pre-want is let go**, from the reads the player is served.
+/// Clock-free: every transition is a read.
 ///
-/// 1. **Waiting**, from the open, until the first read that delivers a
-///    byte: the file's head, which the player needs before anything else,
-///    has the swarm to itself. librqbit shares its priority list round
-///    robin between streams, so asking alongside the head would halve the
-///    head's share; asking after it costs the index read half of its share
-///    instead, which the resume point needed next anyway.
-/// 2. **Asking**, until the player reaches the window -- a read inside it,
-///    and from there its own stream reads ahead -- or plays elsewhere: one
-///    run of reads delivering [`Rules::elsewhere`] bytes outside it, which
-///    a wrong estimate looks like and the head and index never do. A first
-///    read already inside the window never starts it.
-/// 3. **Done**, for the reader's life.
+/// It is asked for from the open. It is let go when the player reaches
+/// the window -- a read inside it, and from there its own stream reads
+/// ahead -- or plays elsewhere: one run of reads delivering
+/// [`Rules::elsewhere`] bytes outside it, which a wrong estimate looks like
+/// and the head and index never do. Once let go it stays so, for the
+/// reader's life.
 #[derive(Debug)]
 pub struct Tracker {
     window: Range<u64>,
-    phase: Phase,
+    /// What this run of reads -- since the open or the last seek -- has
+    /// delivered outside the window; `None` once the pre-want is let go.
+    outside: Option<u64>,
     elsewhere: u64,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum Phase {
-    Waiting,
-    Asking {
-        /// What this run of reads -- since the open or the last seek -- has
-        /// delivered outside the window.
-        outside: u64,
-    },
-    Done,
-}
-
 impl Tracker {
-    /// A tracker for `window`, waiting for the first delivered byte.
+    /// A tracker for a pre-want of `window`, asked for from now.
     pub fn new(window: Range<u64>, rules: Rules) -> Self {
         Self {
             window,
-            phase: Phase::Waiting,
+            outside: Some(0),
             elsewhere: rules.elsewhere,
         }
     }
 
-    /// The window this tracker asks for.
-    pub fn window(&self) -> Range<u64> {
-        self.window.clone()
-    }
-
-    /// A read was served from `begin` to `end`.
-    pub fn served(&mut self, begin: u64, end: u64) -> Step {
+    /// A read was served from `begin` to `end`. Whether the pre-want is to
+    /// be let go now -- answered `true` once.
+    pub fn served(&mut self, begin: u64, end: u64) -> bool {
+        let Some(outside) = self.outside.as_mut() else {
+            return false;
+        };
         if end <= begin {
-            return Step::Stay;
+            return false;
         }
         let inside = begin < self.window.end && self.window.start < end;
-        match &mut self.phase {
-            Phase::Done => Step::Stay,
-            Phase::Waiting if inside => {
-                self.phase = Phase::Done;
-                Step::Stay
-            }
-            Phase::Waiting => {
-                self.phase = Phase::Asking {
-                    outside: end - begin,
-                };
-                Step::Start(self.window.clone())
-            }
-            Phase::Asking { .. } if inside => {
-                self.phase = Phase::Done;
-                Step::Stop
-            }
-            Phase::Asking { outside } => {
-                *outside = outside.saturating_add(end - begin);
-                if *outside >= self.elsewhere {
-                    self.phase = Phase::Done;
-                    Step::Stop
-                } else {
-                    Step::Stay
-                }
-            }
+        *outside = outside.saturating_add(end - begin);
+        let lets_go = inside || *outside >= self.elsewhere;
+        if lets_go {
+            self.outside = None;
         }
+        lets_go
     }
 
     /// The reader moved: a new run of reads starts.
     pub fn seeked(&mut self) {
-        if let Phase::Asking { outside } = &mut self.phase {
+        if let Some(outside) = self.outside.as_mut() {
             *outside = 0;
         }
     }
@@ -270,80 +283,146 @@ mod tests {
         }
     }
 
+    fn planned(
+        len: u64,
+        hint: ResumeHint,
+        remembered: Option<Remembered>,
+    ) -> Option<(Range<u64>, u64, Basis)> {
+        plan(len, hint, remembered, Rules::default())
+            .map(|plan| (plan.window, plan.centre, plan.basis))
+    }
+
     /// **Without a memory, the resume time's share of the file**, and
     /// either side of it the larger of 3% of the file and 64 MiB, never
     /// more than 128 MiB: a 4 GiB film resumed halfway is asked for from
-    /// 2 GiB less 3% to 2 GiB plus 3%.
+    /// 2 GiB less 3% to 2 GiB plus 3%, and from 2 GiB outward.
     #[test]
     fn an_estimate_is_the_resume_times_share_of_the_file() {
-        let rules = Rules::default();
         let len = 4 * GIB;
         let half = len * 30 / 1000;
         assert_eq!(
-            window(len, hint(3600, Some(7200)), None, rules),
-            Some((2 * GIB - half..2 * GIB + half, Basis::Estimated))
+            planned(len, hint(3600, Some(7200)), None),
+            Some((2 * GIB - half..2 * GIB + half, 2 * GIB, Basis::Estimated))
         );
-        // A small file: 64 MiB either side, clamped at the top of the file.
+        // A small file: 64 MiB either side, clamped at the top of the file,
+        // and the centre still the estimate.
+        let centre = GIB * 152 / 7200;
         assert_eq!(
-            window(GIB, hint(152, Some(7200)), None, rules),
-            Some((0..GIB * 152 / 7200 + 64 * MIB, Basis::Estimated))
+            planned(GIB, hint(152, Some(7200)), None),
+            Some((0..centre + 64 * MIB, centre, Basis::Estimated))
         );
         // A huge one: no more than 128 MiB either side.
         let huge = 40 * GIB;
         assert_eq!(
-            window(huge, hint(3600, Some(7200)), None, rules),
-            Some((20 * GIB - 128 * MIB..20 * GIB + 128 * MIB, Basis::Estimated))
+            planned(huge, hint(3600, Some(7200)), None),
+            Some((
+                20 * GIB - 128 * MIB..20 * GIB + 128 * MIB,
+                20 * GIB,
+                Basis::Estimated
+            ))
         );
+        assert_eq!(planned(len, hint(0, Some(7200)), None), None, "the top");
+        assert_eq!(planned(len, hint(3600, None), None), None, "no length");
+        assert_eq!(planned(len, hint(3600, Some(0)), None), None);
         assert_eq!(
-            window(len, hint(0, Some(7200)), None, rules),
-            None,
-            "from the top"
-        );
-        assert_eq!(
-            window(len, hint(3600, None), None, rules),
-            None,
-            "no length"
-        );
-        assert_eq!(window(len, hint(3600, Some(0)), None, rules), None);
-        assert_eq!(
-            window(len, hint(9000, Some(7200)), None, rules),
-            Some((len - half..len, Basis::Estimated)),
+            planned(len, hint(9000, Some(7200)), None),
+            Some((len - half..len, len, Basis::Estimated)),
             "a resume time past the runtime is the file's end"
         );
     }
 
     /// **A memory near the resume time wins**: the window is around where
     /// the last session was reading -- mostly behind it, since the player
-    /// read ahead of what it showed -- and moved by the gap in time at the
-    /// film's rate. Too far away in time, the estimate stands.
+    /// read ahead of what it showed -- its centre the middle of the player's
+    /// buffer behind that byte, and all of it moved by the gap in time at
+    /// the film's rate. Too far away in time, the estimate stands.
     #[test]
     fn a_memory_near_the_resume_time_is_where_the_window_goes() {
-        let rules = Rules::default();
         let len = 7200 * MIB;
         let kept = Remembered {
             offset: 3000 * MIB,
             at_ms: 3000 * 1000,
         };
         assert_eq!(
-            window(len, hint(3000, None), Some(kept), rules),
-            Some((2952 * MIB..3016 * MIB, Basis::Remembered)),
+            planned(len, hint(3000, None), Some(kept)),
+            Some((2952 * MIB..3016 * MIB, 2984 * MIB, Basis::Remembered)),
             "no length needed"
         );
         // Ten seconds later at a megabyte a second.
         assert_eq!(
-            window(len, hint(3010, Some(7200)), Some(kept), rules),
-            Some((2962 * MIB..3026 * MIB, Basis::Remembered))
+            planned(len, hint(3010, Some(7200)), Some(kept)),
+            Some((2962 * MIB..3026 * MIB, 2994 * MIB, Basis::Remembered))
         );
         assert_eq!(
-            window(len, hint(2990, Some(7200)), Some(kept), rules),
-            Some((2942 * MIB..3006 * MIB, Basis::Remembered))
+            planned(len, hint(2990, Some(7200)), Some(kept)),
+            Some((2942 * MIB..3006 * MIB, 2974 * MIB, Basis::Remembered))
         );
         assert_eq!(
-            window(len, hint(3061, Some(7200)), Some(kept), rules).map(|(_, basis)| basis),
+            planned(len, hint(3061, Some(7200)), Some(kept)).map(|(.., basis)| basis),
             Some(Basis::Estimated),
             "past a minute away, the memory is not this playback's"
         );
-        assert_eq!(window(len, hint(3061, None), Some(kept), rules), None);
+        assert_eq!(planned(len, hint(3061, None), Some(kept)), None);
+    }
+
+    /// **The window is asked for from the centre outward, a step at a
+    /// time, ahead first**: every step touches what was asked before it,
+    /// the ends are cut to the window, and a side that has reached its end
+    /// leaves the rest to the other. A remembered window's first two steps
+    /// are the player's buffer behind the byte it last read.
+    #[test]
+    fn the_steps_go_from_the_centre_outward_ahead_first() {
+        let plan = Plan {
+            window: 100..450,
+            centre: 200,
+            basis: Basis::Estimated,
+        };
+        assert_eq!(
+            plan.steps(100),
+            vec![200..300, 100..200, 300..400, 400..450],
+            "behind is done after one step; ahead goes on, cut at the end"
+        );
+        let all_behind = Plan {
+            window: 0..250,
+            centre: 250,
+            basis: Basis::Estimated,
+        };
+        assert_eq!(all_behind.steps(100), vec![150..250, 50..150, 0..50]);
+        assert_eq!(all_behind.steps(0).len(), 250, "a step is at least a byte");
+
+        let kept = Remembered {
+            offset: 3000 * MIB,
+            at_ms: 3000 * 1000,
+        };
+        let rules = Rules::default();
+        let remembered = plan_of(7200 * MIB, hint(3000, None), Some(kept), rules);
+        assert_eq!(
+            remembered.steps(rules.step),
+            vec![
+                2984 * MIB..3000 * MIB,
+                2968 * MIB..2984 * MIB,
+                3000 * MIB..3016 * MIB,
+                2952 * MIB..2968 * MIB,
+            ]
+        );
+        // And everything in the window is asked for exactly once.
+        let estimated = plan_of(4 * GIB, hint(3600, Some(7200)), None, rules);
+        let mut steps = estimated.steps(rules.step);
+        assert_eq!(steps[0].start, 2 * GIB, "the centre first");
+        steps.sort_by_key(|step| step.start);
+        assert_eq!(
+            steps.first().map(|step| step.start),
+            Some(estimated.window.start)
+        );
+        assert_eq!(
+            steps.last().map(|step| step.end),
+            Some(estimated.window.end)
+        );
+        assert!(steps.windows(2).all(|pair| pair[0].end == pair[1].start));
+    }
+
+    fn plan_of(len: u64, hint: ResumeHint, remembered: Option<Remembered>, rules: Rules) -> Plan {
+        plan(len, hint, remembered, rules).expect("a plan")
     }
 
     fn tracker() -> Tracker {
@@ -356,28 +435,20 @@ mod tests {
         )
     }
 
-    /// **The head first, then the window, until the player reaches it**:
-    /// nothing is asked before the first byte is served, the window is
-    /// asked for after it, and a read inside the window lets it go -- for
-    /// good.
+    /// **Asked for from the open, and let go when the player reaches the
+    /// window**: the head and the index, read elsewhere, let nothing go,
+    /// a read inside the window does -- once, and for good.
     #[test]
-    fn the_window_is_asked_for_after_the_head_and_let_go_when_the_player_reaches_it() {
+    fn the_window_is_let_go_when_the_player_reaches_it() {
         let mut tracker = tracker();
-        assert_eq!(tracker.served(0, 0), Step::Stay, "nothing delivered yet");
-        assert_eq!(
-            tracker.served(0, 100),
-            Step::Start(1000..2000),
-            "the head is in"
-        );
-        assert_eq!(tracker.served(5000, 5100), Step::Stay, "the index");
+        assert!(!tracker.served(0, 0), "nothing delivered");
+        assert!(!tracker.served(0, 100), "the head");
         tracker.seeked();
-        assert_eq!(
-            tracker.served(900, 1001),
-            Step::Stop,
-            "the player is in the window"
-        );
-        assert_eq!(tracker.served(0, 100), Step::Stay, "and it stays let go");
-        assert_eq!(tracker.served(5000, 6000), Step::Stay);
+        assert!(!tracker.served(5000, 5100), "the index");
+        tracker.seeked();
+        assert!(tracker.served(900, 1001), "the player is in the window");
+        assert!(!tracker.served(1001, 1100), "and it is let go only once");
+        assert!(!tracker.served(5000, 6000));
     }
 
     /// **A player that plays elsewhere lets the window go**: one run of
@@ -386,20 +457,11 @@ mod tests {
     #[test]
     fn a_player_playing_elsewhere_lets_the_window_go() {
         let mut tracker = tracker();
-        assert_eq!(tracker.served(0, 100), Step::Start(1000..2000));
-        assert_eq!(tracker.served(100, 250), Step::Stay, "250 of 300");
+        assert!(!tracker.served(0, 100));
+        assert!(!tracker.served(100, 250), "250 of 300");
         tracker.seeked();
-        assert_eq!(tracker.served(5000, 5200), Step::Stay, "a new run: 200");
-        assert_eq!(tracker.served(5200, 5300), Step::Stop, "300 in one run");
-        assert_eq!(tracker.served(1500, 1600), Step::Stay);
-    }
-
-    /// A first read already inside the window -- the head is the window --
-    /// never asks: the player's own stream is reading there.
-    #[test]
-    fn a_first_read_inside_the_window_asks_for_nothing() {
-        let mut tracker = Tracker::new(0..2000, Rules::default());
-        assert_eq!(tracker.served(0, 100), Step::Stay);
-        assert_eq!(tracker.served(5000, 5100), Step::Stay);
+        assert!(!tracker.served(5000, 5200), "a new run: 200");
+        assert!(tracker.served(5200, 5300), "300 in one run");
+        assert!(!tracker.served(1500, 1600));
     }
 }

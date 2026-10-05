@@ -91,6 +91,22 @@ pub fn depth(
     ceiling.map_or(asked, |ceiling| asked.min(ceiling)).max(1)
 }
 
+/// **The depth to hand down while another asker stands beside the
+/// readers**: `depth` for the readers, and as many again -- up to `other`,
+/// the pieces the other asker has at the head of the lookahead.
+///
+/// The backend counts its split depth over every stream's lookahead taken
+/// one piece each in turn, in an order it shuffles per ask. A pre-want is
+/// one more stream ([`crate::engine::Engine::prewant`]), so under a depth of
+/// `depth` the readers' own share of the split head would be half of it,
+/// rounded either way with the shuffle -- and at a depth of one, the piece
+/// a read is blocked on would be handed whole to one peer half the time.
+/// `depth + min(depth, other)` entries of that interleaving hold `depth` of
+/// the readers' pieces whichever stream the shuffle put first.
+pub fn beside(depth: usize, other: usize) -> usize {
+    depth.saturating_add(depth.min(other))
+}
+
 /// **This video's stalls, and the depth last handed down** -- what the
 /// pass keeps between two readings so it applies a depth only when it
 /// changes, and lets it fall no faster than a piece a pass.
@@ -113,6 +129,9 @@ pub struct DeadlineDepth {
     /// asking two, settled one pass after the other, flapped the depth
     /// 6/5/6/5. The depth is the most any file still being read asks.
     asked_by: std::collections::HashMap<usize, usize>,
+    /// How many pieces askers that are not readers -- pre-wants -- have at
+    /// the head of the lookahead now; see [`beside`].
+    beside: usize,
 }
 
 impl DeadlineDepth {
@@ -129,6 +148,23 @@ impl DeadlineDepth {
     /// How many stalls this video's player has reported.
     pub fn stalls(&self) -> usize {
         self.stalls
+    }
+
+    /// An asker that is no reader now has `pieces` at the head of the
+    /// lookahead; see [`beside`].
+    pub fn stand_beside(&mut self, pieces: usize) {
+        self.beside = self.beside.saturating_add(pieces);
+    }
+
+    /// That asker is gone, with its `pieces`.
+    pub fn step_away(&mut self, pieces: usize) {
+        self.beside = self.beside.saturating_sub(pieces);
+    }
+
+    /// The pieces askers that are no readers have at the head of the
+    /// lookahead.
+    pub fn standing_beside(&self) -> usize {
+        self.beside
     }
 
     /// The depth to hand the backend given that the arithmetic asks for
@@ -258,6 +294,52 @@ mod tests {
         assert_eq!(depth(None, PIECE, Some(RATE), 1, 0), 1);
         // No bitrate, no ceiling: the stalls stand.
         assert_eq!(depth(None, PIECE, None, 1, 100), FLOOR + 100);
+    }
+
+    /// **With another stream beside them, the readers keep their depth
+    /// whichever stream the backend's shuffle puts first.** The backend's
+    /// order is one piece of each stream in turn; the split head is its
+    /// first entries. Counted here for both orders, a reader with pieces
+    /// to spare and another asker with `other`: the widened depth always
+    /// holds `depth` of the reader's, and the plain one does not.
+    #[test]
+    fn beside_another_asker_the_readers_keep_their_depth() {
+        // How many of the first `head` entries are the reader's, with the
+        // other asker's `other` pieces interleaved, first or second.
+        let readers = |head: usize, other: usize, other_first: bool| {
+            let (mut taken, mut mine, mut theirs) = (0, 0, 0);
+            let mut their_turn = other_first;
+            while taken < head {
+                if their_turn && theirs < other {
+                    theirs += 1;
+                    taken += 1;
+                } else if !their_turn || theirs >= other {
+                    mine += 1;
+                    taken += 1;
+                }
+                their_turn = !their_turn;
+            }
+            mine
+        };
+        for depth in 1..=6 {
+            for other in 0..=8 {
+                let head = beside(depth, other);
+                for other_first in [false, true] {
+                    assert!(
+                        readers(head, other, other_first) >= depth,
+                        "depth {depth} beside {other}, other first: {other_first}"
+                    );
+                }
+            }
+        }
+        assert_eq!(beside(2, 0), 2, "nobody beside: the depth itself");
+        assert_eq!(beside(2, 5), 4);
+        assert_eq!(beside(6, 5), 11, "no more than the other asker has");
+        assert_eq!(
+            readers(1, 5, true),
+            0,
+            "the plain depth of one, with the other first: the blocked piece is not in the head"
+        );
     }
 
     /// The counter resets on a new player and the depth applies on change

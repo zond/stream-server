@@ -495,7 +495,7 @@ impl Registry {
 
     /// The window a reader of `id` is pre-wanting now, if any: a probe for
     /// the tests of the pre-want.
-    pub(crate) fn prewanting(&self, id: &MediaId) -> Option<std::ops::Range<u64>> {
+    pub(crate) fn prewanting(&self, id: &MediaId) -> Option<Vec<std::ops::Range<u64>>> {
         self.entries.get(id.as_str())?.watch.prewanting()
     }
 
@@ -642,7 +642,7 @@ impl Registry {
         id: &MediaId,
         entry: &Entry,
         source: &Source,
-    ) -> Option<Tracker> {
+    ) -> Option<reader::Planned> {
         let Source::Torrent(torrent) = source else {
             return None;
         };
@@ -653,18 +653,22 @@ impl Registry {
         let (info_hash, file_idx) = self.torrent_file(id)?;
         let remembered = state.read_memory.recall(&info_hash, file_idx);
         let rules = self.prewant_rules();
-        let (window, basis) = prewant::window(torrent.len(), hint, remembered, rules)?;
+        let plan = prewant::plan(torrent.len(), hint, remembered, rules)?;
         tracing::info!(
             info_hash = %info_hash,
             file_idx,
             resume_ms = hint.at_ms,
-            start = window.start,
-            end = window.end,
-            ?basis,
+            start = plan.window.start,
+            centre = plan.centre,
+            end = plan.window.end,
+            basis = ?plan.basis,
             stage = "prewant_planned",
-            "a resumed playback will ask for its resume point once the head is in"
+            "a resumed playback asks for its resume point at the open, from the centre outward"
         );
-        Some(Tracker::new(window, rules))
+        Some(reader::Planned {
+            steps: plan.steps(rules.step),
+            tracker: Tracker::new(plan.window, rules),
+        })
     }
 
     /// A lease on `id`'s entry, so it is not evicted while it is held: what

@@ -933,6 +933,10 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
             asking.seconds,
             streams.deadline.stalls(),
         );
+        // And as many again while a pre-want's stream stands beside the
+        // readers', so the readers' own share of the split head is what it
+        // was without it.
+        let asked = crate::retention::deadline::beside(asked, streams.deadline.standing_beside());
         if let Some(depth) = streams.settle_deadline(domain.file_idx, asked, now) {
             self.handle.set_deadline_pieces(depth);
             crate::retention::trace::deadline_depth(
@@ -3280,42 +3284,54 @@ impl<H: TorrentHandle> Engine<H> {
         ))
     }
 
-    /// **Ask the swarm for `window` of `file_idx` now, before any read
-    /// reaches it**, for as long as the answer is held: a resumed film's
-    /// pre-want (`docs/design/media-pipeline.md`, "Pre-want").
+    /// **Ask the swarm for `steps` of `file_idx`, in that order, before any
+    /// read reaches them**, for as long as the answer is held: a resumed
+    /// film's pre-want (`docs/design/media-pipeline.md`, "Pre-want").
     ///
-    /// Two halves, each the existing mechanism for "somebody is about to
-    /// read this":
+    /// `steps` are byte ranges of the file, the likeliest to be read first
+    /// -- from where the resume point is taken to be, outward -- each no
+    /// longer than what should be asked for at once. Two halves, each the
+    /// existing mechanism for "somebody is about to read this":
     ///
-    /// * **The backend's ask** ([`TorrentHandle::prefetch`]): a stream over
-    ///   the window that reads nothing, so its pieces are in the picker's
-    ///   priority list beside the player's own streams.
-    /// * **A promise on the file's entity** ([`Retention::promise_ahead`]):
-    ///   nothing unlinks a piece of the window before it is read, and a
-    ///   pass wants it as it wants what a parked read waits for. No head:
-    ///   where the entity is said to be stays the player's reads'.
+    /// * **The backend's ask** ([`TorrentHandle::prefetch`]): one stream,
+    ///   reaching one step ahead of where it stands, walked through the
+    ///   steps piece by piece as they arrive ([`walk_prewant`]). One stream
+    ///   whatever the window's size, because the backend shares its
+    ///   priority list between streams one piece each in turn: the pre-want
+    ///   never has more than a step of pieces there, and a read blocked on
+    ///   a piece keeps its turn at the head of every ask.
+    /// * **A promise on the file's entity** ([`Retention::promise_ahead`]),
+    ///   grown a step at a time: nothing unlinks a piece of a step once it
+    ///   is asked for, and a pass wants it as it wants what a parked read
+    ///   waits for. No head: where the entity is said to be stays the
+    ///   player's reads'.
+    ///
+    /// **Never more than a quarter of the cache** ([`PREWANT_CACHE_SHARE`]):
+    /// a promised piece cannot be given back, so the steps past that are
+    /// not asked for at all.
     ///
     /// **It is not a read.** No stream is registered, nothing counts in
     /// [`Self::active_streams`], no byte is noted: whatever keeps the
     /// torrent running is the player's own hold, and a pre-want neither
-    /// extends nor replaces it. `None` when the backend has no streams to
-    /// ask through, or the window is empty or past the file.
+    /// extends nor replaces it. While it stands, the split depth handed to
+    /// the backend is widened so the readers keep theirs
+    /// ([`crate::retention::deadline::beside`]). `None` when the backend has
+    /// no streams to ask through, or there is nothing to ask for.
     pub async fn prewant(
         self: &Arc<Self>,
         file_idx: usize,
-        window: std::ops::Range<u64>,
-    ) -> Option<PreWant<H>> {
+        steps: Vec<Range<u64>>,
+    ) -> Option<PreWant> {
         let span = self.handle.file_pieces(file_idx).await?;
         let piece_length = self.handle.piece_length().filter(|length| *length > 0)?;
-        if window.is_empty() {
-            return None;
-        }
-        let prefetch = match self
-            .handle
-            .prefetch(file_idx, window.start, window.end - window.start)
-            .await
-        {
-            Ok(prefetch) => prefetch?,
+        let steps = steps_within(
+            steps,
+            self.retention.cap().map(|cap| cap / PREWANT_CACHE_SHARE),
+        );
+        let first = steps.first()?.clone();
+        let reach = steps.iter().map(|step| step.end - step.start).max()?;
+        let stream = match self.handle.prefetch(file_idx, first.start, reach).await {
+            Ok(stream) => stream?,
             Err(error) => {
                 tracing::debug!(
                     info_hash = %self.info_hash,
@@ -3326,23 +3342,134 @@ impl<H: TorrentHandle> Engine<H> {
                 return None;
             }
         };
-        let first = crate::retention::playhead_piece(&span, piece_length, window.start);
-        let last = crate::retention::playhead_piece(&span, piece_length, window.end - 1);
         let promise = self
             .retention
-            .promise_ahead(&file_idx, first..last.saturating_add(1));
+            .promise_ahead(&file_idx, pieces_of(&span, piece_length, &first));
+        // What the stream has at the head of the lookahead: its reach in
+        // pieces, and one more for a position inside a piece.
+        let beside = usize::try_from(reach.div_ceil(piece_length))
+            .unwrap_or(usize::MAX)
+            .saturating_add(1);
+        self.streams.lock().deadline.stand_beside(beside);
+        let walk = tokio::spawn(walk_prewant(stream, promise, steps, span, piece_length));
         Some(PreWant {
-            _prefetch: prefetch,
-            _promise: promise,
+            walk,
+            streams: self.streams.clone(),
+            beside,
         })
     }
 }
 
-/// What [`Engine::prewant`] answers: the backend's ask and the entity's
-/// promise, both ended by dropping it.
-pub struct PreWant<H: TorrentHandle> {
-    _prefetch: crate::backend::Prefetch,
-    _promise: Option<crate::retention::owner::Reader<TorrentBacking<H>>>,
+/// The share of the cache a pre-want may ask for: a quarter. Half the cache
+/// is the play session's committed set and the rest the player's own
+/// window; what a pre-want holds is promised, so no pass can give it back
+/// while it stands, and a window sized for a guess about where the film
+/// resumes must not be what fills a small device's cache.
+pub const PREWANT_CACHE_SHARE: u64 = 4;
+
+/// `steps`, in order, for as long as their bytes come to no more than
+/// `limit`: whole steps, and the first one cut to the limit if it alone is
+/// more. Everything, with no limit.
+fn steps_within(steps: Vec<Range<u64>>, limit: Option<u64>) -> Vec<Range<u64>> {
+    let mut left = limit.unwrap_or(u64::MAX);
+    let mut kept = Vec::new();
+    for step in steps.into_iter().filter(|step| !step.is_empty()) {
+        let len = step.end - step.start;
+        if len > left {
+            if kept.is_empty() && left > 0 {
+                kept.push(step.start..step.start + left);
+            }
+            break;
+        }
+        left -= len;
+        kept.push(step);
+    }
+    kept
+}
+
+/// The pieces of the torrent the bytes `step` of a file lie in.
+fn pieces_of(span: &FilePieceSpan, piece_length: u64, step: &Range<u64>) -> Range<u32> {
+    let first = crate::retention::playhead_piece(span, piece_length, step.start);
+    let last = crate::retention::playhead_piece(span, piece_length, step.end.saturating_sub(1));
+    first..last.saturating_add(1)
+}
+
+/// **A pre-want's walk**: the steps in order, each promised as it is begun
+/// and walked from its first piece to its last -- the stream is put on a
+/// piece, and a read of one byte parks there until the piece has arrived.
+///
+/// The stream reaches a step ahead of where it stands, so a step's pieces
+/// are all asked for at once and the walk only decides when to move on:
+/// forward its reach runs into the step after, which is the step it would
+/// have asked for next. With every step here the stream is let go -- there
+/// is nothing left to ask -- and the promise stands until the task is
+/// aborted ([`PreWant`]'s drop), as it does if the stream fails: a torrent
+/// stopped under it has nobody to ask, and what has arrived is still about
+/// to be read.
+async fn walk_prewant<H: TorrentHandle>(
+    mut stream: crate::backend::Prefetch,
+    promise: Option<crate::retention::owner::Reader<TorrentBacking<H>>>,
+    steps: Vec<Range<u64>>,
+    span: FilePieceSpan,
+    piece_length: u64,
+) {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut promised: Option<Range<u32>> = None;
+    'steps: for step in steps {
+        // The steps touch, so what has been begun is one run of pieces: a
+        // promise is one range, and this one only ever grows.
+        let pieces = pieces_of(&span, piece_length, &step);
+        let all = match promised.take() {
+            Some(had) => had.start.min(pieces.start)..had.end.max(pieces.end),
+            None => pieces,
+        };
+        if let Some(promise) = &promise {
+            promise.promises(all.clone());
+        }
+        promised = Some(all);
+        let mut at = step.start;
+        while at < step.end {
+            let arrived = async {
+                stream.seek(std::io::SeekFrom::Start(at)).await?;
+                stream.read(&mut [0u8; 1]).await
+            }
+            .await;
+            match arrived {
+                Ok(0) => break 'steps,
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::debug!(
+                        at,
+                        error = %error,
+                        "a pre-want's stream failed; what it promised stands"
+                    );
+                    break 'steps;
+                }
+            }
+            // The start of the next piece, in the file's own offsets.
+            let next = (span.offset.saturating_add(at) / piece_length + 1) * piece_length;
+            at = next.saturating_sub(span.offset);
+        }
+    }
+    drop(stream);
+    std::future::pending::<()>().await;
+}
+
+/// What [`Engine::prewant`] answers: the walk, with the backend's ask and
+/// the entity's promise in it, ended by dropping this.
+pub struct PreWant {
+    walk: tokio::task::JoinHandle<()>,
+    streams: Arc<parking_lot::Mutex<crate::retention::streams::Streams>>,
+    /// What this pre-want stood beside the readers with; see
+    /// [`crate::retention::deadline::beside`].
+    beside: usize,
+}
+
+impl Drop for PreWant {
+    fn drop(&mut self) {
+        self.walk.abort();
+        self.streams.lock().deadline.step_away(self.beside);
+    }
 }
 
 #[cfg(test)]

@@ -671,8 +671,12 @@ data at the resume point. Each used to be fetched only once mpv blocked on
 it: on a weak swarm, measured on a phone, 38 s for the head, 26 s for the
 index at the end, then seconds per piece at 152 s, each in turn.
 
-The resume point is the one the server can know ahead, so a played torrent
-reader asks for it once the head is in, beside the index read:
+The resume point is the one the server can know ahead, and all three are
+needed before the first frame, so a played torrent reader asks for it **at
+its open, beside the head**: fetched one after the other the waits add up,
+and sharing the swarm between them costs the head little and the total
+nothing. *(First built asking only after the first served read; changed the
+same day, zond's decision.)*
 
 * **Told, not inferred.** The app states where the playback resumes and,
   if it knows, how long the film is (`ServerHandle::set_resume(id,
@@ -681,27 +685,61 @@ reader asks for it once the head is in, beside the index read:
   remembered per torrent file with the byte the reader was last served to,
   in `read-positions.json` beside `settings.json` (`media::memory`, the
   last 64 files).
-* **Where** (`media::prewant::window`): a memory within a minute of the
-  resume time places it -- 48 MiB behind the remembered byte to 16 MiB past
-  it, since mpv's last read was ahead of its picture by its own buffer --
-  moved by the gap in time at the film's rate when the length is known;
-  otherwise the resume time's share of the file, ±3% of the file or ±64
-  MiB, whichever is larger, and never more than ±128 MiB.
-* **When** (`media::prewant::Tracker`): after the first read that delivers
-  a byte. librqbit interleaves every stream's lookahead round robin and has
-  no notion of one stream ranking below another, so asking alongside the
-  head would halve the head's share; asked after it, the window shares with
-  the index read, which the resume point needed next anyway. Ranking it
-  strictly below the player's reads needs a priority on librqbit's streams
-  -- a fork change, not done here.
-* **How** (`Engine::prewant`): a librqbit stream over the window that reads
-  nothing (`TorrentHandle::prefetch`; no `OpenPosition`, so the startup
-  window a client is shown still follows the player), and a promise on the
-  file's entity with no head (`Retention::promise_ahead`), so nothing
-  unlinks a fetched piece before it is read and a pass wants it as it wants
-  what a parked read waits for. It is **not a read**: no stream registered,
-  nothing in `active_streams`, nothing noted. What keeps the torrent running
-  is the player's own hold.
+* **Where** (`media::prewant::plan`): a window and a centre, the likeliest
+  byte of the resume point. A memory within a minute of the resume time
+  places the window -- 48 MiB behind the remembered byte to 16 MiB past it,
+  since mpv's last read was ahead of its picture by its own buffer -- moved
+  by the gap in time at the film's rate when the length is known, with its
+  centre in the middle; otherwise the centre is the resume time's share of
+  the file and the window ±3% of the file or ±64 MiB around it, whichever
+  is larger, never more than ±128 MiB.
+* **In what order** (`Plan::steps`): from the centre outward, 16 MiB at a
+  time, ahead first -- the step ahead of the centre, the step behind it,
+  the next ahead, the next behind. A sweep from the window's front would
+  spend its first minute on a weak swarm on bytes far before the resume
+  point; outward, a guess that is off by `d` bytes either way is reached
+  after about `2d`. For a memory the first two steps are the 32 MiB behind
+  the remembered byte -- mpv's buffer, where its picture was -- the half
+  nearer that byte first.
+* **How** (`Engine::prewant`): **one** librqbit stream, reaching one step
+  ahead of where it stands (`TorrentHandle::prefetch`; no `OpenPosition`,
+  so the startup window a client is shown still follows the player), walked
+  through the steps: it is put on a piece and a read of one byte parks
+  there until the piece has arrived, then the next piece, then the next
+  step. Forward its reach runs into the following step, which is the one it
+  would have asked for next, and at the window's end up to one step past
+  it. Each step is promised on the file's entity as it is begun
+  (`Retention::promise_ahead`, no head), so nothing unlinks a fetched piece
+  before it is read and a pass wants it as it wants what a parked read
+  waits for. It is **not a read**: no stream registered, nothing in
+  `active_streams`, nothing noted. What keeps the torrent running is the
+  player's own hold.
+* **What a blocked read keeps.** librqbit has no notion of one stream
+  ranking below another: its priority list is one piece of each open stream
+  in turn, in an order shuffled per ask, and a peer takes the first piece
+  there it can -- a free one, or a share of one in flight inside the split
+  head. So beside one reader, the piece a read is blocked on is first or
+  second in every peer's ask, and while both it and the pre-want's first
+  piece have shares to give a peer takes whichever the shuffle put first:
+  **about half of the asks each** (one part in `readers + 1` to the
+  pre-want), never less, and all of them once the other's shares are taken.
+  That is the whole of what the pre-want can cost a real read, **whatever
+  the window's size**, because it is one stream with one step of reach --
+  five pieces of 4 MiB in the priority list, not 256 MiB of them -- and
+  past the blocked piece the reader's own lookahead and the pre-want's
+  alternate piece for piece. The split depth (`retention::deadline`) is
+  counted over that same interleaving, so while a pre-want stands the depth
+  handed down is widened by as many pieces as the pre-want has there
+  (`deadline::beside`): the readers' share of the split head is what it was
+  without it, and at a depth of one the blocked piece is never handed whole
+  to one peer for the shuffle having put the pre-want first. Ranking the
+  pre-want strictly below the player's reads needs a priority on librqbit's
+  streams -- a fork change, not done.
+* **Bounded by the cache.** What a pre-want holds is promised, so no pass
+  can give it back while it stands: it asks for whole steps, in order, up
+  to a quarter of the cache (`PREWANT_CACHE_SHARE`) and no further. On a
+  10 GiB cache that is the whole window; on a 150 MB one, the first two
+  steps.
 * **Let go** when the player reads inside the window (its own stream reads
   ahead from there), when one run of reads -- from an open or a seek --
   delivers 16 MiB outside it (the player is playing elsewhere: a wrong

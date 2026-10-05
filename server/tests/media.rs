@@ -1864,16 +1864,18 @@ fn viewer() -> Option<PlayToken> {
 }
 
 /// The pre-want's numbers, shrunk to the fixtures' sixteen-kilobyte pieces
-/// so a window is a few pieces of a film of thirty-two.
+/// so a window is a few pieces of a film of thirty-two, asked for a piece
+/// at a time.
 fn piece_rules() -> stream_server::media::prewant::Rules {
     let piece = PIECE as u64;
     stream_server::media::prewant::Rules {
         min_half: 2 * piece,
         half_per_mille: 0,
         max_half: 2 * piece,
-        behind: 2 * piece,
+        behind: 3 * piece,
         ahead: piece,
         near_ms: 60_000,
+        step: piece,
         elsewhere: 4 * piece,
     }
 }
@@ -1901,8 +1903,10 @@ fn read_at(reader: MediaReader, at: u64, len: usize) -> anyhow::Result<(MediaRea
 /// near it asks first.** The first session reads at twenty pieces in and
 /// leaves at 1000 s, which is remembered beside the settings with the byte
 /// it was last served to; the next, resuming at 1010 s with no length
-/// known, asks for the region around that byte -- only once the head is in
-/// -- and lets it go when the player reads inside it.
+/// known, asks for the region around that byte **at its open, before a
+/// byte is read** -- the piece behind the remembered byte first, then
+/// outward a piece at a time -- and lets it go when the player reads
+/// inside it.
 #[test]
 fn a_session_ended_at_an_offset_is_asked_for_first_by_the_next_playback_near_it()
 -> anyhow::Result<()> {
@@ -1917,6 +1921,11 @@ fn a_session_ended_at_an_offset_is_asked_for_first_by_the_next_playback_near_it(
 
     let first = fixture.register("film.mkv")?;
     let reader = fixture.handle.open_reader(&first, viewer())?;
+    assert_eq!(
+        fixture.handle.media_prewant(&first),
+        None,
+        "a playback from the top asks for nothing ahead"
+    );
     let (reader, left) = read_at(reader, 20 * piece, 1000)?;
     fixture
         .handle
@@ -1937,16 +1946,22 @@ fn a_session_ended_at_an_offset_is_asked_for_first_by_the_next_playback_near_it(
         }),
     )?;
     let reader = fixture.handle.open_reader(&next, viewer())?;
+    // From the middle of the three pieces behind and one ahead, outward.
+    let steps = vec![
+        left - piece..left,
+        left - 2 * piece..left - piece,
+        left..left + piece,
+        left - 3 * piece..left - 2 * piece,
+    ];
+    until("the remembered region is asked for at the open", || {
+        Ok(fixture.handle.media_prewant(&next) == Some(steps.clone()))
+    })?;
+    let (reader, _) = read_at(reader, 0, 100)?;
     assert_eq!(
         fixture.handle.media_prewant(&next),
-        None,
-        "nothing is asked for before the head is in"
+        Some(steps),
+        "the head, read elsewhere, lets nothing go"
     );
-    let (reader, _) = read_at(reader, 0, 100)?;
-    let window = left - 2 * piece..left + piece;
-    until("the remembered region is asked for", || {
-        Ok(fixture.handle.media_prewant(&next) == Some(window.clone()))
-    })?;
     let (reader, _) = read_at(reader, left - piece, 100)?;
     until("the player reached it and it is let go", || {
         Ok(fixture.handle.media_prewant(&next).is_none())
@@ -1955,9 +1970,14 @@ fn a_session_ended_at_an_offset_is_asked_for_first_by_the_next_playback_near_it(
     fixture.stop()
 }
 
-/// **Without a memory, the resume time's share of the file**, and a player
-/// that plays elsewhere -- a run of reads the length of the threshold,
-/// outside the window -- lets it go: a wrong estimate keeps nothing.
+/// How long a "nothing is asked for" claim is watched for: the window the
+/// claim is measured over, never a wait for something to finish.
+const QUIET: Duration = Duration::from_millis(500);
+
+/// **Without a memory, the resume time's share of the file, from there
+/// outward**, and a player that plays elsewhere -- a run of reads the
+/// length of the threshold, outside the window -- lets it go: a wrong
+/// estimate keeps nothing. An aside asks for nothing, resume or not.
 #[test]
 fn an_estimate_is_asked_for_and_let_go_when_the_player_plays_elsewhere() -> anyhow::Result<()> {
     let piece = PIECE as u64;
@@ -1977,17 +1997,23 @@ fn an_estimate_is_asked_for_and_let_go_when_the_player_plays_elsewhere() -> anyh
             runtime_ms: Some(1_600_000),
         }),
     )?;
+    let steps = vec![
+        10 * piece..11 * piece,
+        9 * piece..10 * piece,
+        11 * piece..12 * piece,
+        8 * piece..9 * piece,
+    ];
     let reader = fixture.handle.open_reader(&id, viewer())?;
-    let (reader, _) = read_at(reader, 0, 100)?;
-    until("the estimate is asked for", || {
-        Ok(fixture.handle.media_prewant(&id) == Some(8 * piece..12 * piece))
+    until("the estimate is asked for at the open", || {
+        Ok(fixture.handle.media_prewant(&id) == Some(steps.clone()))
     })?;
+    let (reader, _) = read_at(reader, 0, 100)?;
     let (reader, _) = read_at(reader, 20 * piece, 3 * PIECE)?;
     let (reader, _) = read_at(reader, 16 * piece, PIECE)?;
     assert_eq!(
         fixture.handle.media_prewant(&id),
-        Some(8 * piece..12 * piece),
-        "an index read's worth elsewhere, and another after a seek, let nothing go"
+        Some(steps),
+        "the head, an index read's worth elsewhere, and another after a seek, let nothing go"
     );
     let (reader, _) = read_at(reader, 24 * piece, 4 * PIECE)?;
     until("the player played elsewhere and it is let go", || {
@@ -1995,22 +2021,27 @@ fn an_estimate_is_asked_for_and_let_go_when_the_player_plays_elsewhere() -> anyh
     })?;
     // And an aside asks for nothing, resume or not.
     let aside = fixture.handle.open_reader(&id, None)?;
-    let (aside, _) = read_at(aside, 0, 100)?;
-    assert_eq!(fixture.handle.media_prewant(&id), None);
+    let watched = Instant::now();
+    while watched.elapsed() < QUIET {
+        assert_eq!(
+            fixture.handle.media_prewant(&id),
+            None,
+            "an aside asked ahead"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     drop((reader, aside));
     fixture.stop()
 }
 
-/// How long a "nothing is asked for" claim is watched for: the window the
-/// claim is measured over, never a wait for something to finish.
-const QUIET: Duration = Duration::from_millis(500);
-
-/// **The head comes first**: while the player's read of the file's head is
-/// parked on a piece nobody has, nothing else is asked for -- the swarm's
-/// priority list is shared round robin, and the resume point would halve
-/// the head's share.
+/// **The resume point is asked for while the head is still coming**: the
+/// start and the resume point are both needed before the first frame, so
+/// with the player's read of the file's head parked on a piece nobody has,
+/// the window is being asked for all the same -- and the head read is
+/// still the one the player waits on.
 #[test]
-fn nothing_is_asked_ahead_while_the_head_is_still_coming() -> anyhow::Result<()> {
+fn the_resume_point_is_asked_for_while_the_head_read_is_parked() -> anyhow::Result<()> {
+    let piece = PIECE as u64;
     let fixture = TorrentFixture::start(
         fixture_pins::keep_what_the_fixture_seeded(offline_config()),
         &["film.mkv"],
@@ -2034,21 +2065,27 @@ fn nothing_is_asked_ahead_while_the_head_is_still_coming() -> anyhow::Result<()>
         reader
     });
     until("the head read is parked", || Ok(canceller.is_waiting()))?;
-    let watched = Instant::now();
-    while watched.elapsed() < QUIET {
-        assert_eq!(
-            fixture.handle.media_prewant(&id),
-            None,
-            "asked ahead while the head was still coming"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    until("the resume point is asked for beside it", || {
+        Ok(fixture
+            .handle
+            .media_prewant(&id)
+            .is_some_and(|steps| steps.first() == Some(&(10 * piece..11 * piece))))
+    })?;
+    let wait = fixture.handle.media_read_wait(&id)?;
+    assert_eq!(
+        (wait.waiting_ms.is_some(), wait.offset),
+        (true, Some(0)),
+        "the head read was answered: it was not parked while the window was asked for"
+    );
     canceller.cancel();
     drop(
         parked
             .join()
             .map_err(|_| anyhow::anyhow!("the parked read panicked"))?,
     );
+    until("the reader is gone and nothing is asked for", || {
+        Ok(fixture.handle.media_prewant(&id).is_none())
+    })?;
     fixture.stop()
 }
 
