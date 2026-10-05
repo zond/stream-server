@@ -1201,8 +1201,9 @@ pub type EngineFS = BackendEngineFS<LibrqbitBackend>;
 /// reading that corrects itself, it is a permanent one:
 /// [`BackendEngineFS::playback_is_live`], which the activity light is drawn
 /// from, reads a player for the life of the process, so with sharing off
-/// the session uploads all the same; the housekeeping sweep never removes
-/// the engine; `hand_live_on` counts the file as open; and a selection left
+/// the session uploads all the same; the reconciler reads a body being
+/// delivered and keeps the torrent running; the housekeeping sweep never
+/// removes the engine; `hand_live_on` counts the file as open; and a selection left
 /// behind is unioned back into the want-set on every later reconcile of the
 /// torrent.
 ///
@@ -2346,13 +2347,16 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// torrent it is about to drop for a refused pin; the housekeeping sweep
     /// reads the same registers on its own before it removes an engine.
     ///
-    /// **Nothing that decides whether a torrent runs reads them.** A
-    /// register is written by a request and ended by the request's guard,
-    /// so one that outlived its request would read as "playing" for the
-    /// life of the process, and one ended too early would stop a torrent
-    /// under a body still being delivered. What is playing is a value with
-    /// one writer and no expiry ([`crate::retention::live`]); these count
-    /// responses, for the activity light, the housekeeping sweep and this.
+    /// **One of them decides whether a torrent runs**: the stream-response
+    /// count is a body being delivered, which `held` reads. A register is
+    /// written by a request and ended by the request's guard
+    /// (`StreamStartRollback` before the start returns, the route's guard
+    /// after), so one that outlived its request would keep its torrent
+    /// running, and read as "playing", for the life of the process, and
+    /// one ended too early would stop a torrent under a body still being
+    /// delivered -- which is why both guards exist. These count responses,
+    /// for the reconciler, the activity light, the housekeeping sweep and
+    /// this.
     async fn torrent_activity_registers(
         &self,
         info_hash: &str,
