@@ -371,11 +371,12 @@ impl Layout {
         Some(at as u64 - 1)
     }
 
-    /// **The slot a receiver told to start at `at_us` asks for first**: the
-    /// last whose `sidx` label is at or before it -- the slot holding it for
-    /// a mirrored layout, possibly an earlier one for an estimated layout,
-    /// whose labels are late. What a preparation makes before the receiver
-    /// is told to load.
+    /// **The slot whose `sidx` label is at or before `at_us`**: the slot
+    /// holding it for a mirrored layout, possibly an earlier one for an
+    /// estimated layout, whose labels are late. What a receiver told to
+    /// start there asks for -- or the slot before, for a time on a cut
+    /// (FFmpeg seeks by the time less a frame or two); a preparation makes
+    /// it and its neighbours before the receiver is told to load.
     pub(crate) fn slot_for_time(&self, at_us: i64) -> u64 {
         let late = self.label_late_us;
         let picked = self

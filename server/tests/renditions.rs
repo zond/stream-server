@@ -2039,14 +2039,23 @@ fn slot_holding(knobs: &Knobs, at_us: i64) -> u64 {
     (1..).find(|n| cut(knobs, *n) > at_us).unwrap() as u64 - 1
 }
 
-/// **A preparation makes the header and the receiver's first slot with no
-/// request at all**, and a receiver's requests afterwards are answered
-/// from it: the same run, the slot from the ring.
+/// The slots a preparation for a start in slot `start` makes, besides
+/// slot 0: two before it, it, one after -- the film's ends permitting.
+fn prepared(start: u64, slots: u64) -> Vec<u64> {
+    (start.saturating_sub(2)..=(start + 1).min(slots - 1)).collect()
+}
+
+/// **A preparation makes the header, slot 0 and the receiver's start with
+/// two slots before it and one after, with no request at all**: the
+/// receiver's first range after the load has been for the start's slot,
+/// the one before it (FFmpeg seeks a time on a cut to the slot before:
+/// `docs/design/renditions.md`, *Prepared before the load*) and the one
+/// before that (zond's TV), so whichever it asks is ready.
 #[test]
-fn preparing_makes_the_receivers_start_before_any_request() -> anyhow::Result<()> {
+fn preparing_makes_the_receivers_start_and_its_neighbours() -> anyhow::Result<()> {
     let knobs = Knobs::default();
     let fixture = Fixture::quick(knobs.clone())?;
-    let token = fixture.publish(60_000, 7_500)?;
+    let token = fixture.publish(60_000, 20_500)?;
     assert_eq!(
         fixture.handle.rendition_readiness(&token),
         RenditionReadiness::Index
@@ -2057,37 +2066,134 @@ fn preparing_makes_the_receivers_start_before_any_request() -> anyhow::Result<()
     until("the rendition is ready", || {
         fixture.handle.rendition_readiness(&token) == RenditionReadiness::Ready
     });
-    let start = slot_holding(&knobs, 7_500_000);
+    let start = slot_holding(&knobs, 20_500_000);
     let probe = fixture.probe(&token);
     assert!(probe.init, "the layout, and with it the header, is made");
-    assert!(
-        probe.ring.contains(&start) && probe.ring.contains(&0),
-        "slot 0 and slot {start} in {:?}",
-        probe.ring
+    for slot in std::iter::once(0).chain(prepared(start, 60)) {
+        assert!(
+            probe.ring.contains(&slot),
+            "slot {slot} in {:?}",
+            probe.ring
+        );
+    }
+    assert_eq!(
+        probe.runs_started, 2,
+        "the header's from the start, and one from two before the start"
     );
-    let prepared_runs = probe.runs_started;
+    assert_eq!(
+        fixture.producer.runs()[1].from,
+        asked_from(cut(&knobs, start as i64 - 2))
+    );
     assert_eq!(fixture.handle.lan_media_requests_served(), 0);
     assert!(fixture.handle.prepare_rendition(&token), "a second ask");
+    Ok(())
+}
 
-    // The receiver: its header, its opening read through slot 0, then a
-    // range at the slot it starts in.
-    let header = fixture.header(&token);
-    let opening = fixture.range(&token, 0, header.slots[1].0 - 1);
-    let first = fixture.segment(&token, 0);
+/// **Ready waits for the slot after the start too**: with the source
+/// stalled where that slot ends, the start's slot is made and the
+/// preparation says `start`, not `ready`, for as long as the stall lasts;
+/// once the source goes on, `ready`, with the slot after in the ring.
+#[test]
+fn ready_waits_for_the_slot_after_the_start() -> anyhow::Result<()> {
+    let knobs = Knobs::default();
+    let start = slot_holding(&knobs, 20_500_000);
+    let gate = Gate::new();
+    let fixture = Fixture::quick(Knobs {
+        time_gate: Some((cut(&knobs, start as i64 + 2), gate.clone())),
+        ..knobs.clone()
+    })?;
+    let token = fixture.publish(60_000, 20_500)?;
+    assert!(fixture.handle.prepare_rendition(&token));
+    until("the start's slot is made", || {
+        fixture.probe(&token).ring.contains(&start)
+    });
+    until("the source stalls", || gate.is_parked());
+    std::thread::sleep(STALL_WINDOW);
     assert_eq!(
-        &opening[header.slots[0].0 as usize..][..first.len()],
-        &first[..]
+        fixture.handle.rendition_readiness(&token),
+        RenditionReadiness::Start,
+        "ready without the slot after the start"
     );
-    let slot = header.slots[start as usize];
-    let bytes = fixture.range(&token, slot.0, slot.0 + slot.1 - 1);
-    let fragment = fixture.segment(&token, start);
-    assert_eq!(&bytes[..fragment.len()], &fragment[..]);
-    assert_eq!(
-        fixture.probe(&token).runs_started,
-        prepared_runs,
-        "the receiver was answered from what the preparation made, no new run"
-    );
-    assert_eq!(prepared_runs, 2, "the header's from the start, the jump's");
+    gate.open();
+    until("the rendition is ready", || {
+        fixture.handle.rendition_readiness(&token) == RenditionReadiness::Ready
+    });
+    assert!(fixture.probe(&token).ring.contains(&(start + 1)));
+    Ok(())
+}
+
+/// **The receiver's first range for any prepared slot is answered from the
+/// ring, and the run that made them goes on**: no run is started for it --
+/// the run that made the slots, ahead of it, is moved back to it, not
+/// restarted -- and the receiver reading on into the slots after is
+/// answered by the same run.
+#[test]
+fn a_first_request_for_any_prepared_slot_starts_no_run() -> anyhow::Result<()> {
+    let knobs = Knobs::default();
+    let start = slot_holding(&knobs, 20_500_000);
+    for first in prepared(start, 60) {
+        let fixture = Fixture::quick(knobs.clone())?;
+        let token = fixture.publish(60_000, 20_500)?;
+        assert!(fixture.handle.prepare_rendition(&token));
+        until("the rendition is ready", || {
+            fixture.handle.rendition_readiness(&token) == RenditionReadiness::Ready
+        });
+        let prepared_runs = fixture.probe(&token).runs_started;
+
+        // The receiver: its header, its opening read through slot 0, then
+        // a range from slot `first` on through three slots.
+        let header = fixture.header(&token);
+        fixture.range(&token, 0, header.slots[1].0 - 1);
+        let from = header.slots[first as usize];
+        let to = header.slots[first as usize + 2];
+        let bytes = fixture.range(&token, from.0, to.0 + to.1 - 1);
+        let fragment = fixture.segment(&token, first);
+        assert_eq!(&bytes[..fragment.len()], &fragment[..], "slot {first}");
+        let probe = fixture.probe(&token);
+        assert_eq!(
+            probe.runs_started, prepared_runs,
+            "slot {first}: answered from what the preparation made"
+        );
+        let runs = fixture.producer.runs();
+        assert!(
+            !runs[1].stopped(),
+            "slot {first}: the preparation's run goes on"
+        );
+    }
+    Ok(())
+}
+
+/// **Preparing at the film's ends stays inside it**: a start in slot 0
+/// makes slots 0 and 1, all from the header's run; one in the last slot
+/// makes the three last.
+#[test]
+fn preparing_at_the_films_ends_stays_inside_it() -> anyhow::Result<()> {
+    let knobs = Knobs::default();
+    for (start_ms, slots) in [(0u32, vec![0, 1]), (59_500, vec![57, 58, 59])] {
+        let fixture = Fixture::quick(knobs.clone())?;
+        let token = fixture.publish(60_000, u64::from(start_ms))?;
+        assert!(fixture.handle.prepare_rendition(&token));
+        until("the rendition is ready", || {
+            fixture.handle.rendition_readiness(&token) == RenditionReadiness::Ready
+        });
+        let probe = fixture.probe(&token);
+        assert_eq!(
+            prepared(slot_holding(&knobs, i64::from(start_ms) * 1000), 60),
+            slots
+        );
+        for slot in &slots {
+            assert!(
+                probe.ring.contains(slot),
+                "{start_ms}: slot {slot} in {:?}",
+                probe.ring
+            );
+        }
+        assert_eq!(
+            probe.runs_started,
+            if start_ms == 0 { 1 } else { 2 },
+            "{start_ms}: runs"
+        );
+    }
     Ok(())
 }
 
@@ -2203,6 +2309,47 @@ fn unpublish_ends_a_waiting_preparation() -> anyhow::Result<()> {
         RenditionReadiness::Ended
     );
     assert!(!fixture.handle.prepare_rendition(&token), "not published");
+    Ok(())
+}
+
+/// **Unpublish during a preparation frees everything**: with slot 0 made
+/// and the run for the start's neighbours stalled in its source, the
+/// preparation ends, every run's producer is told to stop and stops, and
+/// the rendition -- its ring with it -- is gone.
+#[test]
+fn unpublish_during_a_preparation_frees_everything() -> anyhow::Result<()> {
+    let gate = Gate::new();
+    let fixture = Fixture::quick(Knobs {
+        run_gate: Some((1, gate.clone())),
+        ..Knobs::default()
+    })?;
+    let token = fixture.publish(60_000, 20_500)?;
+    assert!(fixture.handle.prepare_rendition(&token));
+    until("the neighbours' run waits on its source", || {
+        gate.is_parked()
+    });
+    let probe = fixture.probe(&token);
+    assert!(probe.ring.contains(&0), "slot 0 made: {:?}", probe.ring);
+    assert_eq!(probe.live_runs, 2);
+    assert_eq!(
+        fixture.handle.rendition_readiness(&token),
+        RenditionReadiness::Start
+    );
+    assert_eq!(fixture.handle.renditions_preparing(), 1);
+
+    assert!(fixture.handle.unpublish(&token));
+    until("the preparation ends", || {
+        fixture.handle.renditions_preparing() == 0
+    });
+    for run in fixture.producer.runs() {
+        until("every producer stops", || run.done());
+        assert!(run.stopped());
+    }
+    assert!(fixture.handle.rendition_probe(&token).is_none());
+    assert_eq!(
+        fixture.handle.rendition_readiness(&token),
+        RenditionReadiness::Ended
+    );
     Ok(())
 }
 

@@ -1499,13 +1499,18 @@ impl ServerHandle {
     /// (which waits for the layout: the source's formats and index, for a
     /// Matroska file its Cues, usually at the end), slot 0 (Chrome's
     /// demuxer probes the first fragment before it seeks), and the slot a
-    /// receiver told to start at the spec's `startMs` jumps to. Returns at
-    /// once; the work runs on the server and
+    /// receiver told to start at the spec's `startMs` jumps to, with the two
+    /// slots before it and the one after
+    /// ([`rendition::PREPARED_BEFORE`], [`rendition::PREPARED_AFTER`]):
+    /// FFmpeg seeks a time on a cut to the slot before it, and zond's TV
+    /// asked for one earlier still (`docs/design/renditions.md`, *Prepared
+    /// before the load*). Returns at once; the work runs on the server and
     /// [`Self::rendition_readiness`] says how far it has got, so the app
     /// tells the receiver to load only once its first requests will be
     /// answered at once -- a receiver gives up on a load that stays silent
     /// (measured: a minute for a thin swarm's first piece and Cues). The
-    /// receiver's requests then find all three in the ring.
+    /// receiver's requests then find them in the ring, and the run that
+    /// made them reads on for it.
     ///
     /// No give-up timer: a stalled source is waited for as long as it takes,
     /// and [`Self::unpublish`] ends the wait. A second call is a no-op.

@@ -125,10 +125,14 @@ behind a thin swarm it took a minute. So `ServerHandle::prepare_rendition(&CastT
 asks for what the receiver will ask first, through the same request path --
 the header, slot 0 (the demuxer's probe), and the slot for `startMs` (by
 the `sidx` label: the slot holding the time when mirrored, an earlier one
-when estimated) -- and `rendition_readiness(&CastToken)` says how far it has got:
+when estimated) with the two slots before it and the one after, which one
+run makes in turn: FFmpeg seeks a time on a cut to the slot before it, and
+the Chromecast with Google TV has asked for the one before that -- and
+`rendition_readiness(&CastToken)` says how far it has got:
 `{"phase":"index"}`, `"start"`, `"ready"`, `"failed"` with the `sentence`, or
-`"ended"`. The app loads the receiver at `ready`, and the receiver's requests
-find all three in the ring. No timer gives up: a preparation
+`"ended"`. The app loads the receiver at `ready`, and the receiver's first
+requests find them in the ring; the run that made them is moved back to
+the one asked, not restarted. No timer gives up: a preparation
 waits on a stalled source as long as it takes (its run counts as waited on,
 so it is never let go), and an unpublish ends it.
 

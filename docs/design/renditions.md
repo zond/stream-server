@@ -848,7 +848,12 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   by their `tfdt`. (FFmpeg 6.0 and later already misplace seeks in an
   HEVC film with open GOPs picture-first, and more often chunked: it
   re-reads a `moof` it read in passing, and its leading pictures' decode
-  times are before the sync sample's. Not the TV's 4.4; open.)
+  times are before the sync sample's. Not the TV's 4.4; open.) Found on
+  the way and unchanged by it: an MP4 source whose sound begins before
+  zero (an AAC encoder's priming frame at -21 ms, behind an edit list that
+  leaves the container's start at zero) has that frame put at zero, and
+  the first slot's sound runs a frame late from there; later slots are on
+  time (`rendition_films.rs` pins it).
 * **Prepared before the load** (2026-10-04). zond's phone cast an HEVC
   Matroska film from a torrent with one or two peers: the first piece took
   38 s and the last (the Cues) 26 s before the first run could fix the
@@ -862,7 +867,55 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   (`Layout::slot_for_time`: the last slot whose `sidx` label is at or
   before it). It loads the receiver once `rendition_readiness` says
   `ready`, at the start the preparation asked for. The phone shows the
-  phase meanwhile, paused at that position. (The same
+  phase meanwhile, paused at that position.
+
+  **Which slot the receiver asks first** (2026-10-05). Two loads on
+  zond's TV asked first for a slot before the prepared one, so the
+  preparation was wasted and the start cost a second run: (a) a load at
+  338.000 s, slot 46 prepared (its cut 338.000 s), the first media
+  request for slot 44 (cut 326.292 s); (b) a load at 383 s, slot 63
+  prepared (cut 378.383 s, the next some 6 s later, so it holds 383 s),
+  the first request for slot 62 (cut 372.377 s). The seek path, read and
+  measured: Chrome's `FFmpegDemuxer::Seek` seeks the video stream to the
+  time, backward (`av_seek_frame`, `AVSEEK_FLAG_BACKWARD`);
+  `mov_seek_stream` takes `sc->min_corrected_pts + sc->dts_shift` off it
+  "to search over the DTS timeline" (n4.4 `mov.c:8094`), then
+  `mov_seek_fragment` and `search_frag_timestamp` pick the last fragment
+  whose `sidx` time -- the video's, the track the `sidx` names -- is at or
+  before that, read it, and `av_index_search_timestamp` takes the sync
+  sample at or before it; the sound follows to that sample's time
+  (`mov_read_seek`, `mov.c:8156`). The muxer's decode times are the
+  presentation times sorted, so a film with B-frames has negative
+  composition offsets, and `dts_shift` is the largest of them: a frame or
+  two. Measured with the 4.4 harness and with headless Chrome 154 over
+  HTTP (H.264 with two B-frames, 41.7 ms; HEVC with open GOPs, 83 ms): a
+  start on a cut, or less than `dts_shift` after one, asks for the slot
+  before it; any later time, the slot holding it. That is (a)'s first step
+  back -- 338.000 s is slot 46's cut, and a phone paused after a seek sits
+  on a key frame. It is not (b)'s, nor (a)'s second: neither libavformat
+  4.4 nor Chrome 154 asked two slots back, or one back from the middle of
+  a slot; what did is upstream of the demuxer (the receiver's load,
+  Chrome 92's pipeline), and was not reproducible here -- there is no
+  Chrome 92 on this host, and the TV is not touched by a server change.
+  (Decode times shifted back by the reorder delay, so no offset is
+  negative, would make FFmpeg's seek exact and its picture times too --
+  FFmpeg shows a fragment's video `dts_shift` late; not done.)
+
+  So the preparation makes the slot for the start
+  (`Layout::slot_for_time`) and, zond's decision, **the two slots before
+  it and the one after** (`PREPARED_BEFORE`, `PREPARED_AFTER`), the
+  film's ends permitting: slot 0, then the earliest of them -- a run
+  started there -- and the rest in order, which that run makes as it reads
+  on, so whichever of the three up to the start the receiver asks first
+  is in the ring, and the one after is a slot in hand. A first request
+  for any of them starts no run: it is answered from the ring and moves
+  the run that made them back to it (`RunSlot::covers`,
+  `Inner::note_request`), and its lookahead from there. The ring's cap
+  is unchanged: slot 0 with its run's lookahead and the prepared slots
+  with theirs are nine slots, which fit 96 MiB up to some 10 MB a slot
+  (zond's 8 Mbit/s film's are 7.6 MB); past that the slots farthest from
+  the last one asked -- the earliest prepared -- go first, and a receiver
+  asking for one starts a run there, as before. (The same
   investigation found the torrent stopped under the cast once anything else
   opened; that was the reconciler's guess at "playing", replaced by explicit
   holds -- `docs/storage.md`, *Who keeps a torrent running*.)
@@ -899,7 +952,7 @@ reading of step C holds unchanged.
 | `install_producer(Arc<dyn Producer>)` | Once, by the embedder. Without one, `publish_rendition` refuses `noProducer`. |
 | `publish_rendition(&MediaId, RenditionSpec, Option<PlayToken>) -> anyhow::Result<CastToken>` | As `publish`: refused while the listener is down; holds the id's lease; writes the playlist. Starts no run: the receiver's first request does. |
 | `rendition_state(&CastToken) -> Option<RenditionState>` | `{ producing, segmentsServed, speed, failed: Option<{refused, message}> }`. Cheap, no runtime hop, safe to poll. |
-| `prepare_rendition(&CastToken) -> bool` | Starts the first run and makes the receiver's first slot with no request (§2.8, *Prepared before the load*). |
+| `prepare_rendition(&CastToken) -> bool` | Starts the first run and makes the receiver's first slots with no request -- slot 0, the start's, the two before it and the one after (§2.8, *Prepared before the load*). |
 | `rendition_readiness(&CastToken) -> RenditionReadiness` | `index`, `start`, `ready`, `failed{sentence}` or `ended`. Cheap, safe to poll. |
 | `unpublish(&CastToken) -> bool` | Unchanged; for a rendition it also drops the run and the ring (2.1). |
 

@@ -101,6 +101,11 @@ pub const SPEED_WINDOW: Duration = Duration::from_secs(10);
 pub const SEEK_BACK: Duration = Duration::from_secs(2);
 /// Samples in flight between a producer and its run.
 const SINK_CAPACITY: usize = 32;
+/// How many slots before the receiver's start a preparation makes
+/// ([`crate::ServerHandle::prepare_rendition`]).
+pub const PREPARED_BEFORE: u64 = 2;
+/// How many slots after the receiver's start a preparation makes.
+pub const PREPARED_AFTER: u64 = 1;
 
 /// What the app asks for. Crosses FFI from Dart, so plain data.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -874,20 +879,39 @@ impl Rendition {
     /// one, so nothing here produces anything a request would not: the
     /// header (which waits for the layout: the source's formats and index),
     /// slot 0 (Chrome's FFmpeg demuxer reads on from the header into the
-    /// first fragment before it seeks), then the slot a receiver told to
-    /// start at `spec.start_ms` jumps to ([`layout::Layout::slot_for_time`]).
-    /// Its first requests then find all three in the ring. Waits as long as
-    /// the source takes, as a request does: a run with a request waiting on
-    /// it is never let go, and nothing gives up (the viewer cancels by
-    /// unpublishing, which ends this with [`NotServed::Cut`]).
+    /// first fragment before it seeks), then [`PREPARED_BEFORE`] slots
+    /// before the slot a receiver told to start at `spec.start_ms` jumps to
+    /// ([`layout::Layout::slot_for_time`]), that slot, and
+    /// [`PREPARED_AFTER`] after it -- the film's ends permitting -- in that
+    /// order, so one run makes them all.
+    ///
+    /// Why the slots before it: FFmpeg's MP4 demuxer seeks a time to the
+    /// slot whose label is at or before the time less the picture's
+    /// largest negative composition offset (`dts_shift`, a frame or two of
+    /// a film with B-frames), so a start on a cut -- a phone paused on a
+    /// key frame -- is asked for in the slot before; and zond's TV asked for
+    /// one slot earlier still (`docs/design/renditions.md`, *Prepared
+    /// before the load*). The slot after is a slot in hand once it plays.
+    ///
+    /// Its first requests then find these in the ring -- held by its cap
+    /// like any slot ([`RING_CAP`]: slot 0 with its run's lookahead and the
+    /// prepared slots with theirs, nine slots, fit it up to some 10 MB a
+    /// slot; past that the farthest from the last one asked go first).
+    /// Waits as long as the source takes, as a request does: a run with a
+    /// request waiting on it is never let go, and nothing gives up (the
+    /// viewer cancels by unpublishing, which ends this with
+    /// [`NotServed::Cut`]).
     pub(crate) async fn prepare(self: &Arc<Self>, state: &AppState) -> Result<u64, NotServed> {
         let layout = self.layout(state).await?;
         let start_us = i64::try_from(self.spec.start_ms.saturating_mul(1000))
             .unwrap_or(i64::MAX)
             .min(self.duration_us());
         let slot = layout.slot_for_time(start_us);
+        let last = layout.slots.len() as u64 - 1;
         self.slot(state, 0, Ask::Seek).await?;
-        self.slot(state, slot, Ask::Seek).await?;
+        for prepared in slot.saturating_sub(PREPARED_BEFORE)..=(slot + PREPARED_AFTER).min(last) {
+            self.slot(state, prepared, Ask::Seek).await?;
+        }
         self.prepared.store(true, Ordering::SeqCst);
         self.bump();
         tracing::info!(slot, stage = "rendition_prepared", "rendition prepared");

@@ -86,6 +86,13 @@ pub struct Knobs {
     /// A gate every run waits at after its first sample -- the layout is
     /// fixed by then, the slots not made -- until the test opens it.
     pub start_gate: Option<Arc<Gate>>,
+    /// A gate run `n` (counted from 0) alone waits at after its first
+    /// sample, until the test opens it.
+    pub run_gate: Option<(usize, Arc<Gate>)>,
+    /// A gate every run waits at before it hands over the first sample at
+    /// or after this time, until the test opens it: a source that stalls
+    /// there.
+    pub time_gate: Option<(i64, Arc<Gate>)>,
 }
 
 /// A source that stalls until opened ([`Knobs::index_gate`]), with a probe
@@ -149,6 +156,8 @@ impl Default for Knobs {
             index: Some(IndexKnob::Proportional),
             index_gate: None,
             start_gate: None,
+            run_gate: None,
+            time_gate: None,
         }
     }
 }
@@ -433,14 +442,28 @@ fn produce(knobs: &Knobs, index: usize, job: Job, record: &RunRecord) {
             sample
         };
         let (track, pts) = (sample.track, sample.pts_us);
+        if let Some((at, gate)) = &knobs.time_gate
+            && pts >= *at
+        {
+            let probe = sink.probe();
+            if !gate.pass(|| probe.is_stopped()) {
+                record.stopped.store(true, Ordering::SeqCst);
+                return;
+            }
+        }
         if sink.sample(sample).is_err() {
             record.stopped.store(true, Ordering::SeqCst);
             return;
         }
         record.emitted.lock().unwrap().push((track, pts));
         written += 1;
+        let gate = knobs.start_gate.as_ref().or(knobs
+            .run_gate
+            .as_ref()
+            .filter(|(run, _)| *run == index)
+            .map(|(_, gate)| gate));
         if written == 1
-            && let Some(gate) = &knobs.start_gate
+            && let Some(gate) = gate
         {
             let probe = sink.probe();
             if !gate.pass(|| probe.is_stopped()) {
