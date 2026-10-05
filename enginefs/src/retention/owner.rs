@@ -1436,6 +1436,40 @@ impl<B: Backing> Retention<B> {
         })
     }
 
+    /// **A promise with no read behind it yet**: `pieces` of `key` will be
+    /// read, so nothing may unlink them and the want-set orders them as it
+    /// orders what a parked read waits for -- and no head anywhere. What a
+    /// resumed film's pre-want holds while the player is still reading the
+    /// file's head and index (`Engine::prewant`).
+    ///
+    /// **No head, which is the difference from [`Self::reader_on`]**: where
+    /// a pass measures from, and where the entity is said to be, are the
+    /// reads' own, and a region somebody is about to read is neither. The
+    /// buffering asked is nothing, so the policy is sized as it would have
+    /// been without it. `None` for a key with no entity, or an empty range.
+    /// Dropping the handle ends the promise, as a read's end does.
+    pub fn promise_ahead(self: &Arc<Self>, key: &B::Key, pieces: Range<u32>) -> Option<Reader<B>> {
+        if pieces.is_empty() {
+            return None;
+        }
+        let entity = self.lookup(key)?;
+        let id = ReaderId(self.next_reader.fetch_add(1, Ordering::Relaxed));
+        entity
+            .state
+            .lock()
+            .readers
+            .insert(id, ReaderState::opened(None, Buffering::default()));
+        let reader = Reader {
+            owner: self.clone(),
+            entity,
+            id,
+            opened_at: None,
+            buffering: Buffering::default(),
+        };
+        reader.promises(pieces);
+        Some(reader)
+    }
+
     /// Where a reader of `key` last got to, told without a [`Reader`]: the
     /// entity's head moves and no reader's does. L2 only, never claims the
     /// turn, never installs. A key with no entity is a byte nothing is
@@ -6396,6 +6430,56 @@ mod tests {
             "and the pieces it is waiting for stayed, beside the two this file shares"
         );
         drop(reader);
+    }
+
+    /// **A promise made ahead of any read keeps what it promised and puts
+    /// no head anywhere** -- a resumed film's pre-want, made while the
+    /// player is still reading the file's head. The pieces it names stay
+    /// through a pass that takes everything else nobody shares, the entity
+    /// has no head for it -- the player reading the head is where it is --
+    /// and once it is let go the next pass takes them.
+    #[tokio::test]
+    async fn a_promise_made_ahead_keeps_its_pieces_and_puts_no_head_anywhere() {
+        let (backing, owner, _budget) = torrent();
+        assert_eq!(play(&owner, &backing, 0).await, InstallOutcome::Installed);
+        assert!(owner.promise_ahead(&0, 4..4).is_none(), "an empty promise");
+        assert!(owner.promise_ahead(&7, 4..6).is_none(), "no such entity");
+        let ahead = owner.promise_ahead(&0, 4..6).expect("the entity");
+        assert_eq!(
+            owner.holding(&0).expect("a holding").head,
+            None,
+            "a region somebody is about to read is nobody's head"
+        );
+
+        // The player, reading the file's head.
+        let playing = owner
+            .reader_on(&0, (0, 0), Buffering::default())
+            .expect("the same entity");
+        assert!(playing.note((0, 0)).is_none());
+        backing.read_from(0, 1);
+        assert_eq!(
+            owner.holding(&0).expect("a holding").head,
+            Some((0, 0)),
+            "the entity is where the player is"
+        );
+
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Live).await;
+        assert_eq!(
+            backing.on_disk(),
+            vec![0, 1, 2, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15],
+            "the promised pieces stayed, beside the player's window"
+        );
+
+        drop(ahead);
+        let claim = owner.turn(&0).await.expect("the turn");
+        owner.pass(&0, &(), claim, Mode::Live).await;
+        assert!(
+            !backing.on_disk().contains(&4),
+            "let go, the promise keeps nothing: {:?}",
+            backing.on_disk()
+        );
+        drop(playing);
     }
 
     /// **And a parked read is one of the windows, not only the pass's

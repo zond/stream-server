@@ -2629,6 +2629,35 @@ impl TorrentHandle for LibrqbitHandle {
         }))
     }
 
+    /// A librqbit stream positioned at `start_offset` and never read: its
+    /// lookahead is in the picker's priority list (interleaved with every
+    /// other stream's) for as long as it is held. No [`OpenPosition`]: a
+    /// pre-want is nobody's position, and the startup window a client is
+    /// shown must keep following the player's reader.
+    async fn prefetch(
+        &self,
+        file_idx: usize,
+        start_offset: u64,
+        lookahead_bytes: u64,
+    ) -> Result<Option<crate::backend::Prefetch>> {
+        use tokio::io::AsyncSeekExt;
+        self.await_initialized().await?;
+        let opts = librqbit::FileStreamOptions { lookahead_bytes };
+        let mut stream = self
+            .handle
+            .clone()
+            .stream_with_options(file_idx, opts)
+            .await
+            .context("Failed to stream from librqbit")?;
+        // librqbit opens every stream at the top of the file; the seek is
+        // what moves its lookahead to where the pre-want is.
+        stream
+            .seek(std::io::SeekFrom::Start(start_offset))
+            .await
+            .context("Failed to position the prefetch")?;
+        Ok(Some(Box::new(stream)))
+    }
+
     /// Read off the metadata, rather than the default's walk building every
     /// file's name only to count them: asked on every activation.
     async fn file_count(&self) -> usize {
@@ -6634,6 +6663,58 @@ mod tests {
             "and wanted means missing: the torrent has something to fetch"
         );
         assert_eq!(handle.reselect_pieces(0..3).await.unwrap(), 0);
+    }
+
+    /// **A prefetch is a stream's ask at the offset it is handed, and
+    /// nobody's position.** librqbit will not drop a piece a stream is about
+    /// to want, so what a drop leaves standing is what the prefetch asks
+    /// for: the piece at its offset -- not the file's first, where librqbit
+    /// opens every stream -- and nothing once it is dropped. The startup
+    /// window a client is shown is untouched by it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_prefetch_asks_for_the_pieces_at_its_offset_while_it_is_held() {
+        use crate::backend::{AfterRelease, TorrentHandle};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let payload = dir.join("payload.bin");
+        write_payload(&payload, 96 * 1024).await;
+        let (torrent_bytes, _hash) = make_torrent(&payload).await;
+        let (_backend, handle) = reclaiming_backend_with_torrent(&dir, &torrent_bytes).await;
+        handle.handle.wait_until_initialized().await.unwrap();
+        let window_before = TorrentHandle::stats(&handle).await.files[0].initial_window_bytes;
+
+        assert!(
+            handle.prefetch(0, 3 * 16 * 1024, 0).await.is_err(),
+            "a zero lookahead is refused, so the number handed in is the stream's"
+        );
+        let prefetch = handle
+            .prefetch(0, 3 * 16 * 1024 + 100, 1)
+            .await
+            .expect("a prefetch on a live torrent")
+            .expect("librqbit has streams");
+        assert_eq!(
+            TorrentHandle::stats(&handle).await.files[0].initial_window_bytes,
+            window_before,
+            "a prefetch is nobody's position"
+        );
+        let dropped = handle
+            .drop_pieces(0..6, AfterRelease::LeaveDropped)
+            .await
+            .expect("a live torrent added here can drop")
+            .expect("librqbit keeps a have-set");
+        assert_eq!(
+            dropped.pieces(),
+            &[0, 1, 2, 4, 5],
+            "the piece the prefetch stands on is wanted, and only that one"
+        );
+        drop(dropped);
+        drop(prefetch);
+        let dropped = handle
+            .drop_pieces(3..4, AfterRelease::LeaveDropped)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(dropped.pieces(), &[3], "and nothing once it is let go");
     }
 
     /// **A dropped piece is offered to the next claim, once the last one is

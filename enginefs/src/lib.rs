@@ -5851,6 +5851,10 @@ mod tests {
     struct FakeCounters {
         /// Every split depth the pass has handed down, in order.
         deadline_set: Mutex<Vec<usize>>,
+        /// Every `prefetch` asked, as `(file_idx, start, lookahead)`.
+        prefetches: Mutex<Vec<(usize, u64, u64)>>,
+        /// How many of the prefetches handed out are still held.
+        prefetches_held: Arc<AtomicUsize>,
         /// What the fake reports as its median piece completion.
         deadline_median: Mutex<Option<std::time::Duration>>,
         /// Every `piece_claims_at` the blocked-read probe asked, as
@@ -6954,6 +6958,29 @@ mod tests {
                 },
             );
             Ok(())
+        }
+
+        async fn prefetch(
+            &self,
+            file_idx: usize,
+            start_offset: u64,
+            lookahead_bytes: u64,
+        ) -> Result<Option<crate::backend::Prefetch>> {
+            self.gate().await?;
+            /// Counts itself out of `prefetches_held` when let go.
+            struct Held(Arc<AtomicUsize>);
+            impl Drop for Held {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            self.counters.prefetches.lock().unwrap().push((
+                file_idx,
+                start_offset,
+                lookahead_bytes,
+            ));
+            self.counters.prefetches_held.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(Box::new(Held(self.counters.prefetches_held.clone()))))
         }
 
         async fn get_file_reader(
@@ -13468,6 +13495,49 @@ mod tests {
             (100, 0, 0),
             "every byte of it is still on the disk, and every byte of it is \
              on its way off: {slack:?}"
+        );
+    }
+
+    /// **A pre-want is the backend's ask over the window and a promise on
+    /// the file's pieces, and it is not a read.** The window reaches the
+    /// backend as the offset and the length it is; the entity is promised
+    /// the pieces the window lies in; nothing registers a stream; and
+    /// dropping it ends both halves.
+    #[tokio::test]
+    async fn a_prewant_asks_for_its_window_and_promises_its_pieces_until_let_go() {
+        let (enginefs, counters) = test_enginefs_with_files(vec![("film.mkv".into(), 800)]);
+        counters.pieces_per_file.store(8, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        engine.begin_retention(0).await;
+        assert!(
+            engine.prewant(0, 300..300).await.is_none(),
+            "an empty window"
+        );
+
+        let prewant = engine.prewant(0, 250..520).await.expect("a pre-want");
+        assert_eq!(*counters.prefetches.lock().unwrap(), vec![(0, 250, 270)]);
+        assert_eq!(counters.prefetches_held.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            engine.retention.holding(&0).expect("the entity").promised,
+            vec![2..6],
+            "the pieces 250..520 lie in, promised"
+        );
+        assert_eq!(
+            engine.active_streams.load(Ordering::SeqCst),
+            0,
+            "a pre-want is not a read"
+        );
+
+        drop(prewant);
+        assert_eq!(counters.prefetches_held.load(Ordering::SeqCst), 0);
+        assert!(
+            engine
+                .retention
+                .holding(&0)
+                .expect("the entity")
+                .promised
+                .is_empty(),
+            "and nothing promised once it is let go"
         );
     }
 

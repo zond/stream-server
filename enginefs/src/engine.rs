@@ -3279,6 +3279,70 @@ impl<H: TorrentHandle> Engine<H> {
             reader,
         ))
     }
+
+    /// **Ask the swarm for `window` of `file_idx` now, before any read
+    /// reaches it**, for as long as the answer is held: a resumed film's
+    /// pre-want (`docs/design/media-pipeline.md`, "Pre-want").
+    ///
+    /// Two halves, each the existing mechanism for "somebody is about to
+    /// read this":
+    ///
+    /// * **The backend's ask** ([`TorrentHandle::prefetch`]): a stream over
+    ///   the window that reads nothing, so its pieces are in the picker's
+    ///   priority list beside the player's own streams.
+    /// * **A promise on the file's entity** ([`Retention::promise_ahead`]):
+    ///   nothing unlinks a piece of the window before it is read, and a
+    ///   pass wants it as it wants what a parked read waits for. No head:
+    ///   where the entity is said to be stays the player's reads'.
+    ///
+    /// **It is not a read.** No stream is registered, nothing counts in
+    /// [`Self::active_streams`], no byte is noted: whatever keeps the
+    /// torrent running is the player's own hold, and a pre-want neither
+    /// extends nor replaces it. `None` when the backend has no streams to
+    /// ask through, or the window is empty or past the file.
+    pub async fn prewant(
+        self: &Arc<Self>,
+        file_idx: usize,
+        window: std::ops::Range<u64>,
+    ) -> Option<PreWant<H>> {
+        let span = self.handle.file_pieces(file_idx).await?;
+        let piece_length = self.handle.piece_length().filter(|length| *length > 0)?;
+        if window.is_empty() {
+            return None;
+        }
+        let prefetch = match self
+            .handle
+            .prefetch(file_idx, window.start, window.end - window.start)
+            .await
+        {
+            Ok(prefetch) => prefetch?,
+            Err(error) => {
+                tracing::debug!(
+                    info_hash = %self.info_hash,
+                    file_idx,
+                    error = %format!("{error:#}"),
+                    "the backend would not pre-want the window"
+                );
+                return None;
+            }
+        };
+        let first = crate::retention::playhead_piece(&span, piece_length, window.start);
+        let last = crate::retention::playhead_piece(&span, piece_length, window.end - 1);
+        let promise = self
+            .retention
+            .promise_ahead(&file_idx, first..last.saturating_add(1));
+        Some(PreWant {
+            _prefetch: prefetch,
+            _promise: promise,
+        })
+    }
+}
+
+/// What [`Engine::prewant`] answers: the backend's ask and the entity's
+/// promise, both ended by dropping it.
+pub struct PreWant<H: TorrentHandle> {
+    _prefetch: crate::backend::Prefetch,
+    _promise: Option<crate::retention::owner::Reader<TorrentBacking<H>>>,
 }
 
 #[cfg(test)]

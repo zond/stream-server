@@ -9,6 +9,10 @@ pub mod priorities;
 pub trait FileStreamTrait: AsyncRead + AsyncSeek + Unpin + Send + Sync {}
 impl<T: AsyncRead + AsyncSeek + Unpin + Send + Sync> FileStreamTrait for T {}
 
+/// What [`TorrentHandle::prefetch`] answers: the backend's ask of the swarm,
+/// standing until this is dropped. Opaque on purpose -- nothing reads it.
+pub type Prefetch = Box<dyn std::any::Any + Send + Sync>;
+
 #[derive(Debug, Clone)]
 pub enum TorrentSource {
     Url(String),
@@ -784,6 +788,24 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
         start_offset: u64,
         lookahead_bytes: u64,
     ) -> Result<Box<dyn FileStreamTrait>>;
+    /// **Ask the swarm for `lookahead_bytes` of `file_idx` from
+    /// `start_offset`, as a stream reading there would, for as long as the
+    /// answer is held** -- and read nothing. What a resumed film's pre-want
+    /// is ([`crate::engine::Engine::prewant`]): the region a player will
+    /// read once it has opened the file, asked for while it opens.
+    ///
+    /// Not [`Self::get_file_reader`], whose reader is *where a stream is*:
+    /// the startup window a client is shown follows the newest one, and a
+    /// pre-want is nobody's position. `Ok(None)` is a backend with no
+    /// streams to ask through. Must be positive, as a reader's lookahead.
+    async fn prefetch(
+        &self,
+        _file_idx: usize,
+        _start_offset: u64,
+        _lookahead_bytes: u64,
+    ) -> Result<Option<Prefetch>> {
+        Ok(None)
+    }
     async fn get_files(&self) -> Vec<BackendFileInfo>;
     async fn file_count(&self) -> usize {
         self.get_files().await.len()
