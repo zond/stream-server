@@ -291,8 +291,11 @@ pub(crate) struct Layout {
     pub cuts: std::sync::Arc<[i64]>,
     pub exact: bool,
     /// How far after its cut each slot's `sidx` label is (0 mirrored, a GOP
-    /// for an estimated layout): what [`Self::slot_for_time`] reads.
+    /// for an estimated layout), and how far before it (the indexed track's
+    /// decode times' run ahead, `D` for a picture): what
+    /// [`Self::slot_for_time`] reads.
     pub label_late_us: i64,
+    pub label_ahead_us: i64,
     /// Where the first slot's video begins.
     pub first_us: i64,
 }
@@ -302,11 +305,13 @@ impl Layout {
     /// (a track and its clock, which every track shares, and how far its
     /// decode times run ahead of its presentation times: `D` for a picture,
     /// [`mux::DECODE_AHEAD_US`]), the film `duration_us` long. A slot after
-    /// the first is labelled at its first decode time -- its cut less `D`,
-    /// FFmpeg 4.4 taking the label as that time (the at-label rule) and
-    /// every version seeking by the time less its `dts_shift`, which is
-    /// `D`. An error is the sentence a viewer is shown, for
-    /// a film no `sidx` can describe.
+    /// the first is labelled at its first decode time -- its cut less `D`:
+    /// FFmpeg 4.4 takes the label *as* that time (the at-label rule), so no
+    /// other label shows the slot's first chunk at its own time there. Every
+    /// version picks a slot by its label against the time sought, so a slot
+    /// begins `D` before its sync sample is shown ([`Self::slot_for_time`]).
+    /// An error is the sentence a viewer is shown, for a film no `sidx` can
+    /// describe.
     ///
     /// An estimated layout indexes `sound` (the sound's track beside a
     /// picture) again, in a second `sidx` labelled at each cut less the
@@ -410,6 +415,7 @@ impl Layout {
             cuts: plan.cuts.into(),
             exact: plan.exact,
             label_late_us: plan.label_late_us,
+            label_ahead_us: ahead_us,
             first_us: plan.first_us,
         })
     }
@@ -423,19 +429,24 @@ impl Layout {
         Some(at as u64 - 1)
     }
 
-    /// **The slot whose `sidx` label is at or before `at_us`**: the slot
-    /// holding it for a mirrored layout, possibly an earlier one for an
-    /// estimated layout, whose labels are late. What a receiver told to
-    /// start there asks for (FFmpeg seeks by the time less its
-    /// `dts_shift`, `D`, against labels `D` before each cut: the same); a
-    /// preparation makes it and its neighbours before the receiver is told
-    /// to load.
+    /// **The slot whose `sidx` label is the last at or before `at_us`**:
+    /// what a receiver told to start there asks for -- FFmpeg picks a
+    /// fragment by its label against the time sought
+    /// (`search_frag_timestamp`), nothing taken off it, no composition
+    /// offset being negative. A mirrored slot is labelled `D` before its
+    /// sync sample is shown, so this is the slot holding the time, or the
+    /// next one when the time is in the last `D` before that slot's sync
+    /// sample; an estimated layout's labels are a GOP late, so there it can
+    /// be an earlier one. A preparation makes it and its neighbours before
+    /// the receiver is told to load.
     pub(crate) fn slot_for_time(&self, at_us: i64) -> u64 {
-        let late = self.label_late_us;
-        let picked = self
-            .cuts
-            .partition_point(|cut| cut.saturating_add(late) <= at_us)
-            .saturating_sub(1) as u64;
+        let label = |cut: &i64| {
+            cut.saturating_add(self.label_late_us)
+                .saturating_sub(self.label_ahead_us)
+        };
+        // The first slot's label is the film's start: always at or before.
+        let later = self.cuts.get(1..).unwrap_or_default();
+        let picked = later.partition_point(|cut| label(cut) <= at_us) as u64;
         picked.min(self.slots.len() as u64 - 1)
     }
 
@@ -735,6 +746,57 @@ mod tests {
         assert_eq!(layout.slot_at(layout.slots[3].offset), Some(3));
         assert_eq!(layout.slot_at(layout.total - 1), Some(5));
         assert_eq!(layout.slot_at(layout.total), None);
+    }
+
+    /// **The slot a receiver asks first is the one its time's label picks**:
+    /// the last slot labelled at or before the time, read back from the
+    /// `sidx` the receiver is handed. Keys at 0.04, 1.04, ... 5.04 s, each
+    /// slot labelled half a second (`D`) before its key: 1.0 s is the first
+    /// slot's (its key at 0.04 s), 1.03 s -- a frame before the second
+    /// key -- and 0.6 s -- in the last `D` before it -- are the second's
+    /// already, and 0.5 s is still the first's.
+    #[test]
+    fn the_slot_for_a_time_is_the_last_labelled_at_or_before_it() {
+        let index: Vec<IndexEntry> = (0..6)
+            .map(|k| entry(k * 1_000_000 + 40_000, 1000 + k as u64 * 10_000))
+            .collect();
+        let plan = Plan::new(Some(&index), 70_000, 6_000_000, T);
+        let layout = Layout::new(
+            Bytes::from_static(b"\0\0\0\x08ftyp"),
+            plan,
+            (1, 90_000, mux::DECODE_AHEAD_US),
+            None,
+            6_000_000,
+        )
+        .expect("a layout");
+        let sidx = &layout.header[8..];
+        let mut label = u64::from_be_bytes(sidx[20..28].try_into().unwrap());
+        let labels: Vec<u64> = (0..6)
+            .map(|k| {
+                let at = label;
+                label += u64::from(u32_at(sidx, 40 + 2 * k * 12 + 4));
+                at
+            })
+            .collect();
+        for at_us in [
+            0i64, 40_000, 500_000, 539_000, 540_000, 600_000, 1_000_000, 1_030_000, 1_040_000,
+            1_540_000, 3_300_000, 4_539_000, 4_540_000, 5_900_000, 9_000_000,
+        ] {
+            let ticks = mux::ticks(at_us, 90_000);
+            let by_label = labels
+                .iter()
+                .rposition(|label| *label <= ticks)
+                .unwrap_or(0) as u64;
+            assert_eq!(layout.slot_for_time(at_us), by_label, "{at_us} us");
+        }
+        assert_eq!(layout.slot_for_time(500_000), 0);
+        assert_eq!(
+            layout.slot_for_time(600_000),
+            1,
+            "in the last D before 1.04 s"
+        );
+        assert_eq!(layout.slot_for_time(1_000_000), 1);
+        assert_eq!(layout.slot_for_time(5_900_000), 5);
     }
 
     /// **A film no `sidx` can describe is refused with a sentence**: more

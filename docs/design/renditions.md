@@ -935,32 +935,60 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   open GOP's leading pictures strongly negative, and the shift jumped
   there.
 
-  **The arrangement.** Decode times run `D` (`mux::DECODE_AHEAD_US`,
-  half a second) ahead of presentation: a slot's decode times are its
-  presentation times sorted, moved so that its first sample -- the sync
-  sample -- decodes `D` before it is shown, every other with them; and
-  every composition offset is written as the true one less `D`. So no
-  offset is below `-D` while `D` covers a GOP's leading pictures and its
-  reordering (twelve frames at 24 a second), and the film's first sample
-  has exactly `-D`: the film's first slot decodes from its sync sample's
-  time (nothing decodes before the film's start), its decode times its
-  presentation times sorted and moved back by its reordering, never before
-  that first time and never after a sample's own presentation time
-  (`mux::slot_dts`), so its sync sample's offset is `-D`. FFmpeg reads
-  that sample with the header, before any packet, so
-  `dts_shift` is `D` from the first packet to the last, whichever slot is
-  read first and after any seek, and every picture is shown at its own
-  time. The `sidx` labels a slot after the first at its first decode time
-  -- its cut less `D` -- which is what FFmpeg 4.4 takes for that time (the
-  at-label rule), and every version seeks by the time less `dts_shift`,
-  `D`: a seek lands on the last key at or before its target exactly. The
-  sound has no reordering; FFmpeg seeks it to the sync sample's decode
+  **The arrangement: no composition offset is ever negative.** Decode
+  times run `D` (`mux::DECODE_AHEAD_US`, half a second) ahead of
+  presentation: a slot's decode times are its presentation times sorted,
+  moved so that its first sample -- the sync sample -- decodes `D` before
+  it is shown, every other with them, and every composition offset is the
+  true one, presentation time less decode time. That is `D` for the sync
+  sample and never below nought while `D` covers a GOP's leading pictures
+  and its reordering (twelve frames at 24 a second). With no negative
+  offset FFmpeg's `dts_shift` is nothing, whatever it has read and in
+  whatever order, and it shows a picture at its decode time plus its
+  offset -- which is all the file format says, so a reader without
+  FFmpeg's shift shows the same. The film's first slot cannot decode
+  before the film's start: it decodes from its sync sample's time, its
+  decode times its presentation times sorted and moved back by its
+  reordering, never before that first time and never after a sample's own
+  presentation time (`mux::slot_dts`), and is drawn in to meet the second
+  slot's first decode time (below).
+
+  The `sidx` labels a slot after the first at its first decode time --
+  its cut less `D` -- because FFmpeg 4.4 takes the label *as* that time
+  (the at-label rule): no other label shows the slot's first chunk at its
+  own time on the Chromecast. **And that is where a seek pays for it.**
+  Every version picks a fragment by its label against the time sought
+  (`search_frag_timestamp`), so a slot begins `D` before its sync sample
+  is shown: a seek to the last `D` before a sync sample lands on that sync
+  sample, up to half a second *after* the time asked for, not on the one
+  before it (the app's film, a key every 2.8 s: 330 s lands on the key at
+  330.4 s). The picture starts there and the sound from the time asked
+  for; nothing is skipped that a viewer aimed at with a remote.
+  `Layout::slot_for_time` says the same, so the preparation makes the
+  slot the receiver will ask for.
+
+  The sound has no reordering; FFmpeg seeks it to the sync sample's decode
   time, `D` before the cut, so a segment's sound begins `D` and 64 ms
   before its cut (`run::AUDIO_LEAD_US`, 564 ms). Sound before the film's
   start -- an AAC encoder's priming frame, which an MP4's edit list hides
   -- has no time a fragment can say (`tfdt` counts from nought); it is no
   longer put at nought with the slot's sound a frame late after it, but
   left out (`Cutter`).
+
+  **Tried and dropped the same day: every offset written `D` too small.**
+  Then no offset is below `-D`, the film's first sample -- in the first
+  `moof`, which FFmpeg reads with the header -- has exactly `-D`, so
+  `dts_shift` is `D` from the first packet on and FFmpeg adds back what
+  was taken off; and since it also takes `dts_shift` off the time it seeks
+  by, a seek lands on the last key at or before its target exactly.
+  Measured exact in 4.4, 6.1 and master. Dropped because the file then
+  says something that is not so and is right only through one reader's
+  correction: a reader that takes the offsets as written shows the picture
+  half a second before its sound, and so does FFmpeg for a slot read
+  without the film's first `moof` -- the app's sound test, which plays the
+  header and one slot, measured exactly that (clicks half a second off
+  their flashes). A seek that can land half a second late is the cheaper
+  price.
 
   **Decode times only ever increase** (2026-10-05). Each slot stepped
   its decode times by its frames from its own first one, `D` before its
@@ -994,18 +1022,18 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   pictures than the next has its frames a few per cent shorter -- 3397
   to 3531 ticks for 3600 on the foreman's clip -- and a GOP with fewer
   has them longer. Every packet still shows at its own time: the
-  presentation time is the decode time plus `D` plus the offset, and the
-  offset is written from the decode time placed.
+  presentation time is the decode time plus the offset, and the offset
+  is written from the decode time placed.
 
   `D` against the worst case: a sample's offset is its presentation time
-  less its decode time less `D`; spread over a slot, the decode times
-  rise at most to the next slot's first, so an offset falls below `-D`
-  only where a sample is shown more than `D` before the next slot's first
-  decode time and decoded after it -- a GOP with more than `D` of leading
-  pictures and reordering together (12 frames at 24 a second). There the
-  picture degrades, as before, to `dts_shift` growing (late by the
-  excess), never to decode order going backwards: the decode times are
-  placed first and never moved for an offset. The parameter sets say the
+  less its decode time; spread over a slot, the decode times rise at most
+  to the next slot's first, so an offset falls below nought only where a
+  sample is shown before it is decoded -- a GOP with more than `D` of
+  leading pictures and reordering together (12 frames at 24 a second).
+  There the offset is negative by the excess and FFmpeg shows the picture
+  late by it from then on (`dts_shift`), never with decode order going
+  backwards: the decode times are placed first and never moved for an
+  offset. The parameter sets say the
   bound (`sps_max_num_reorder_pics`, `sps_max_latency_increase` in HEVC;
   `max_num_reorder_frames` in H.264's VUI), but a sync sample's leading
   pictures are a GOP's choice the parameter sets do not bound, and a `D`
@@ -1045,7 +1073,7 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   |---|---|---|---|---|
   | H.264, keys every 6, 3, 2, 2.8 s, 48 kHz | whole | exact | exact | exact |
   | HEVC open GOPs, keys every 6, 3, 2, 2.8 s | whole | exact | exact | exact |
-  | both | seeks to 300, 100, 250, 330, 43, 30, 301, 5 s after reading 16 s | each on the key at or before it, every packet exact | same | same |
+  | both | seeks to 300, 100, 250, 330, 43, 30, 301, 5 s after reading 16 s | each on its slot's key -- the key at or before it, or for 330 s (0.4 s before a key) that key -- every packet exact | same | same |
   | both, before (sorted decode times, one reference a slot) | whole | picture 40-120 ms late, growing | same | same |
   | both, before | after a seek | the rest of the slot skipped | same | same |
 
@@ -1116,8 +1144,10 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   a slot; what did is upstream of the demuxer (the receiver's load,
   Chrome 92's pipeline), and was not reproducible here -- there is no
   Chrome 92 on this host, and the TV is not touched by a server change.
-  (Since answered: *Every sample at its own time*, above -- the seek is
-  exact now, `dts_shift` being `D` throughout.)
+  (Since changed: *Every sample at its own time*, above -- no offset is
+  negative now, so there is no `dts_shift` to take off the time, and the
+  slot a time picks is the last one labelled at or before it, `D` before
+  its cut.)
 
   So the preparation makes the slot for the start
   (`Layout::slot_for_time`) and, zond's decision, **the slots of the 12 s

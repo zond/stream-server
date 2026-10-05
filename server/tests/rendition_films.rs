@@ -29,6 +29,9 @@ use film_producer::{Film, FilmProducer, Look, Picture, Recipe};
 /// The segment length the app asks for.
 const SEGMENT_MS: u32 = 6000;
 
+/// How long before its key is shown a slot begins (`mux::DECODE_AHEAD_US`).
+const DECODE_AHEAD_S: f64 = 0.5;
+
 struct Fixture {
     handle: stream_server::ServerHandle,
     lan: String,
@@ -426,10 +429,9 @@ fn a_seek_into_a_fat_film_reads_on_from_where_it_lands() -> anyhow::Result<()> {
 /// presentation time with the same key flag -- the picture and the sound
 /// alike, so neither is ever late against the other. FFmpeg shows a
 /// picture at its decode time, its composition offset and its
-/// `dts_shift` (the largest negative offset it has read so far): every
-/// offset is written at least `-D`, and the film's first sample at
-/// exactly `-D`, so `dts_shift` is `D` from the first packet to the last
-/// (`mux::DECODE_AHEAD_US`).
+/// `dts_shift` (the largest negative offset it has read so far): no
+/// offset is negative, so there is no shift and the picture is at its own
+/// time (`mux::DECODE_AHEAD_US`).
 ///
 /// The sound's packets are the film's from its start: a frame before it
 /// (the AAC encoder's priming at -21 ms, behind the MP4's edit list) has no
@@ -560,16 +562,22 @@ fn ffprobe_lands(url: &str, before: Option<u32>, seeks: &[u32]) -> anyhow::Resul
     Ok(times[times.len() - seeks.len()..].to_vec())
 }
 
-/// **A seek lands on the sync sample at or before its target** -- the
-/// app's long test film exactly (xtremio `rust/tests/support/film.rs`:
+/// **A seek lands on the sync sample of the slot its time falls in** --
+/// the app's long test film exactly (xtremio `rust/tests/support/film.rs`:
 /// 6 minutes of `testsrc`, a key every 2.8 s, HEVC Main 10 HDR10 with
 /// open GOPs, and H.264), published with the app's 6 s segments:
 /// `ffprobe` seeking to 5:00 lands on the key at 299.6 s in a few
-/// requests, a seek list read after the first 16 s lands each within a
-/// GOP of its target, and `ffmpeg -ss 60` asks for the start and the
-/// target and nothing else; and after a seek -- fresh, and back after
-/// reading -- every packet of the picture and of the sound is the film's,
-/// at its time.
+/// requests, a seek list read after the first 16 s lands each on its
+/// slot's key, and `ffmpeg -ss 60` asks for the start and the target and
+/// nothing else; and after a seek -- fresh, and back after reading --
+/// every packet of the picture and of the sound is the film's, at its
+/// time.
+///
+/// **A slot begins half a second before its key is shown**
+/// (`mux::DECODE_AHEAD_US`: what keeps every offset from being negative,
+/// and the picture at its own time in every reader), so the key a seek
+/// lands on is the last one at or before the time *plus that half second*:
+/// 330 s lands on the key at 330.4 s, not on the one at 327.6 s.
 ///
 /// Cut on the 6 s grid, a slot held two or three GOPs and a seek landed
 /// at the slot's start -- the demuxer knows only the sync samples of the
@@ -577,9 +585,9 @@ fn ffprobe_lands(url: &str, before: Option<u32>, seeks: &[u32]) -> anyhow::Resul
 /// (H.264). With HEVC's open GOPs FFmpeg 6.1 then also sought the sound to
 /// the slot before, and the picture followed it: 288.4 s.
 #[test]
-fn a_seek_lands_on_the_sync_sample_at_or_before_it() -> anyhow::Result<()> {
+fn a_seek_lands_on_its_slots_sync_sample() -> anyhow::Result<()> {
     for picture in [Picture::Hevc, Picture::H264] {
-        if !film_producer::tools_for(picture, "a_seek_lands_on_the_sync_sample_at_or_before_it") {
+        if !film_producer::tools_for(picture, "a_seek_lands_on_its_slots_sync_sample") {
             continue;
         }
         let fixture = Fixture::start(
@@ -601,27 +609,38 @@ fn a_seek_lands_on_the_sync_sample_at_or_before_it() -> anyhow::Result<()> {
             .filter(|packet| packet.track == TrackKind::Video && packet.key)
             .map(|packet| packet.pts_us as f64 / 1e6)
             .collect();
-        let key_before = |at: f64| *keys.iter().rfind(|key| **key <= at).unwrap();
+        // The key of the slot `at` falls in: slots begin `D` before their
+        // keys are shown.
+        let key_of = |at: f64| {
+            *keys
+                .iter()
+                .rfind(|key| **key - DECODE_AHEAD_S <= at)
+                .unwrap()
+        };
         let relay = Relay::start(fixture.lan.parse()?)?;
         let url = relay.url(&token);
 
         let landed = ffprobe_lands(&url, None, &[300])?[0];
         let asked = relay.take();
-        let key = key_before(300.0);
+        let key = key_of(300.0);
         assert!(
-            (key - 0.2..=300.0).contains(&landed),
-            "{picture:?}: 5:00 landed at {landed} s, the key before it is at {key} s"
+            (key - 0.2..=key + 0.001).contains(&landed),
+            "{picture:?}: 5:00 landed at {landed} s, its slot's key is at {key} s"
         );
         assert!(asked.len() <= 6, "{picture:?}: 5:00 asked {asked:?}");
 
         let seeks = [100, 250, 330, 43, 30];
+        assert!(
+            key_of(330.0) > 330.0 && key_of(100.0) <= 100.0,
+            "330 s is in the half second before a key, 100 s is not"
+        );
         let lands = ffprobe_lands(&url, Some(16), &seeks)?;
         relay.take();
         for (at, landed) in seeks.iter().zip(&lands) {
-            let key = key_before(f64::from(*at));
+            let key = key_of(f64::from(*at));
             assert!(
-                (key - 0.2..=f64::from(*at)).contains(landed),
-                "{picture:?}: seeks {seeks:?} landed at {lands:?}"
+                (key - 0.2..=key + 0.001).contains(landed),
+                "{picture:?}: seeks {seeks:?} landed at {lands:?}, {at} s wants {key} s"
             );
         }
 
@@ -655,7 +674,7 @@ fn a_seek_lands_on_the_sync_sample_at_or_before_it() -> anyhow::Result<()> {
             let what = format!("{picture:?} after a seek to {at} s");
             let picture_read = of_track(&read, TrackKind::Video);
             let sound_read = of_track(&read, TrackKind::Audio);
-            let key = (key_before(f64::from(at)) * 1e6).round() as i64;
+            let key = (key_of(f64::from(at)) * 1e6).round() as i64;
             assert!(
                 (picture_read[0].0 - key).abs() <= 12 && picture_read[0].1,
                 "{what}: the picture begins at {:?}, not the key at {key} us",

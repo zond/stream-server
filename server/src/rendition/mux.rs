@@ -36,16 +36,36 @@ use bytes::Bytes;
 pub(crate) const VIDEO_TIMESCALE: u32 = 90_000;
 
 /// **How far a slot's decode times run ahead of its presentation times**
-/// (`D`). FFmpeg shows a picture at its decode time plus its composition
-/// offset plus `dts_shift`, the largest negative offset it has read so far
-/// (`mov_update_dts_shift`; `pkt->pts = pkt->dts + sc->dts_shift + ctts`,
-/// n4.4 `mov.c:8011`). Every offset written is the true one less `D`, so
-/// none is below `-D` while `D` covers a GOP's leading pictures and its
-/// reordering, and the film's first sample -- in the first `moof`, read
-/// with the header -- has exactly `-D`: `dts_shift` is `D` from the first
-/// packet to the last, and every picture is shown at its own time.
+/// (`D`): a slot's sync sample decodes this long before it is shown, and
+/// every sample after it in step, so that **no composition offset is ever
+/// negative** while `D` covers a GOP's leading pictures and its reordering.
+///
+/// That is the whole point of it. FFmpeg shows a picture at its decode
+/// time plus its composition offset plus `dts_shift`, the largest
+/// *negative* offset it has read so far (`mov_update_dts_shift`;
+/// `pkt->pts = pkt->dts + sc->dts_shift + ctts`, n4.4 `mov.c:8011`): one
+/// negative offset anywhere and every picture from there on is late by it,
+/// against a sound that is not. With none, the shift is nothing and a
+/// picture is shown at its decode time plus its offset -- which is also
+/// all the file format says, so a reader that knows nothing of FFmpeg's
+/// shift shows the same.
+///
+/// (Tried and dropped, 2026-10-05: writing every offset `D` too small, so
+/// that FFmpeg's shift is exactly `D` from the film's first `moof` on and
+/// puts it back. Exact in FFmpeg, seeks included -- and half a second out
+/// of step in any reader without the shift, and in FFmpeg itself for a
+/// slot read without the film's first `moof`.)
+///
+/// **What it costs is where a seek lands**: FFmpeg picks a fragment by its
+/// label, and a slot's label is its first decode time, `D` before its sync
+/// sample is shown (4.4, the Chromecast's, takes the label *as* that decode
+/// time). So a seek to the last `D` before a sync sample lands on that sync
+/// sample, up to `D` after the time asked for, not on the one before.
+///
 /// Half a second: twelve frames at 24 a second, more than x264's and
-/// x265's leading pictures and reordering at their defaults.
+/// x265's leading pictures and reordering at their defaults. A GOP that
+/// needs more has negative offsets for the excess, and FFmpeg shows its
+/// pictures late by it -- never out of order.
 pub(crate) const DECODE_AHEAD_US: i64 = 500_000;
 
 /// **How long the first part of a slot is**: its first chunk's `moof`
@@ -1062,7 +1082,7 @@ fn lay_video(samples: &[MuxSample], next_pts: Option<i64>, hevc: bool, first_slo
         };
         last_duration = duration;
         let bytes = length_prefixed(&sample.data, hevc);
-        let offset = pts[index] - dts[index] - ahead;
+        let offset = pts[index] - dts[index];
         entries.push((
             duration as u32,
             bytes.len() as u32,
@@ -1110,13 +1130,11 @@ fn lay_video(samples: &[MuxSample], next_pts: Option<i64>, hevc: bool, first_slo
 /// The film's first slot's natural times are its sorted presentation times
 /// moved back by its reordering, never before its first sample's time (the
 /// first few a millisecond apart from there): none is after its own
-/// sample's presentation time, and its first sample's offset is exactly
-/// `-D`, which is what sets FFmpeg's `dts_shift` to `D` when it reads the
-/// header. A later slot is not held
-/// to that: while `D` covers its leading pictures and its reordering its
-/// times are before its presentation times anyway, and when it does not
-/// the picture is shown late (FFmpeg's `dts_shift` grows) -- never are the
-/// times out of order.
+/// sample's presentation time, so none of its offsets is negative. A later
+/// slot is not held to that: while `D` covers its leading pictures and its
+/// reordering its times are before its presentation times anyway, and when
+/// it does not the excess is a negative offset and the picture is shown
+/// late by it (FFmpeg's `dts_shift`) -- never are the times out of order.
 fn slot_dts(
     pts: &[i64],
     sorted: &[i64],
@@ -1643,25 +1661,35 @@ mod tests {
         }
     }
 
-    /// Decode order I P B B: the decode times are the presentation times
-    /// sorted, and each offset is the difference, negative where a frame is
-    /// shown before the one decoded in its slot.
+    /// Decode order I P B B, in a slot after the film's first: the decode
+    /// times are the presentation times sorted, `D` early, and each offset
+    /// is the true difference -- never negative, though a B-frame is shown
+    /// before the P-frame decoded ahead of it.
     #[test]
-    fn reordered_video_gets_signed_composition_offsets() {
+    fn reordered_video_gets_offsets_that_are_never_negative() {
+        let at = 4_000_000;
         let laid = lay_video(
             &[
-                sample(0, true),
-                sample(120_000, false),
-                sample(40_000, false),
-                sample(80_000, false),
+                sample(at, true),
+                sample(at + 120_000, false),
+                sample(at + 40_000, false),
+                sample(at + 80_000, false),
             ],
-            Some(160_000),
+            Some(at + 160_000),
             false,
             false,
         );
-        assert_eq!(laid.times[0], 0);
+        let ahead = (DECODE_AHEAD_US * 9 / 100) as i32;
+        assert_eq!(
+            laid.times[0],
+            360_000 - ahead as u64,
+            "D before it is shown"
+        );
         let offsets: Vec<i32> = laid.entries.iter().map(|entry| entry.3).collect();
-        assert_eq!(offsets, vec![0, 7200, -3600, -3600]);
+        assert_eq!(
+            offsets,
+            vec![ahead, ahead + 7200, ahead - 3600, ahead - 3600]
+        );
         let durations: Vec<u32> = laid.entries.iter().map(|entry| entry.0).collect();
         assert_eq!(durations, vec![3600, 3600, 3600, 3600]);
         assert_eq!(laid.entries[0].2, 0x0200_0000);
@@ -1997,22 +2025,23 @@ mod tests {
         out
     }
 
-    /// **FFmpeg shows every picture at its own time** -- modelled as it
-    /// computes it (`pkt->pts = pkt->dts + sc->dts_shift + ctts`, n4.4
-    /// `mov.c:8011`, with `dts_shift` the largest negative offset read so
-    /// far, `mov_update_dts_shift`), so it holds on every CI job. The film's
-    /// first slot -- a closed GOP with B-frames, read with the header --
-    /// and a later one of an open GOP (a CRA, two leading pictures shown
-    /// before it, B-frames after), read straight after it or alone after a
-    /// seek: every picture's presentation time is the source's, and
-    /// `dts_shift` is `D` from the first sample on and never grows. Each
-    /// slot's first decode time is its label: the first slot's sync
-    /// sample's time, a later slot's less `D`. With the decode times the
-    /// presentation times sorted and moved to start at the sync sample,
-    /// the open GOP's leading pictures raised `dts_shift` and every picture
-    /// from that slot on was three frames late.
+    /// **Every reader shows every picture at its own time** -- modelled, so
+    /// it holds on every CI job: as FFmpeg computes it (`pkt->pts =
+    /// pkt->dts + sc->dts_shift + ctts`, n4.4 `mov.c:8011`, with `dts_shift`
+    /// the largest negative offset read so far, `mov_update_dts_shift`), and
+    /// as the file format says it (decode time plus offset). The film's
+    /// first slot -- a closed GOP with B-frames -- and a later one of an
+    /// open GOP (a CRA, two leading pictures shown before it, B-frames
+    /// after), read straight after it, after a seek, or with nothing of the
+    /// film read before it: no offset is negative, so FFmpeg's shift is
+    /// nothing whatever it has read, and both show the source's times.
+    /// Each slot's first decode time is its label: the first slot's sync
+    /// sample's time, a later slot's less `D`. (With the decode times the
+    /// presentation times sorted and nothing more, the B-frames' offsets
+    /// were negative and every picture a frame or two late; started at each
+    /// slot's sync sample, an open GOP's leading pictures made it three.)
     #[test]
-    fn ffmpeg_shows_every_picture_at_its_own_time() {
+    fn every_reader_shows_every_picture_at_its_own_time() {
         let formats = Formats {
             video: Some(TrackFormat::H264 {
                 width: 320,
@@ -2068,18 +2097,21 @@ mod tests {
             let mut shift = 0;
             for (k, (samples, want)) in slots.iter().enumerate() {
                 for ((_, dts, offset, _), want) in samples.iter().zip(want) {
+                    assert!(*offset >= 0, "slot {k}: an offset of {offset}");
                     shift = shift.max(-offset);
-                    assert_eq!(shift, ahead, "slot {k}: dts_shift is D, and stays D");
-                    assert_eq!(dts + shift + offset, *want, "slot {k}: shown at its time");
+                    assert_eq!(dts + shift + offset, *want, "slot {k}: as FFmpeg shows it");
+                    assert_eq!(dts + offset, *want, "slot {k}: as the format says it");
                 }
             }
         };
-        // Straight through, and the header's read then a seek to the second.
+        // Straight through; the header's read then a seek to the second;
+        // and the second with nothing read before it.
         read(&[(&slot0, shown(&first)), (&slot1, shown(&open))]);
         read(&[
             (&slot0[..1], shown(&first)[..1].to_vec()),
             (&slot1, shown(&open)),
         ]);
+        read(&[(&slot1, shown(&open))]);
     }
     /// **A slot's first part is always `FIRST_PART` long**: its first
     /// chunk's `moof` padded with a `free` box, the `mdat` right after --
@@ -2136,8 +2168,8 @@ mod tests {
     /// after it, so each slot holds its GOP's frames less the next GOP's
     /// leading pictures, plus its own): each slot's decode times begin `D`
     /// before its sync sample and end before the next slot's begin, every
-    /// one after the one before -- and FFmpeg still shows every picture at
-    /// its time, `dts_shift` `D` throughout. Stepped by the frames from
+    /// one after the one before -- and every picture is still shown at its
+    /// time, no offset negative. Stepped by the frames from
     /// each slot's own beginning, the slot of 3 ran 2 frames past the next
     /// slot's beginning, and the one of 4 left a gap.
     #[test]
@@ -2169,7 +2201,6 @@ mod tests {
             })
             .collect();
         let ahead = DECODE_AHEAD_US * 9 / 100;
-        let mut shift = 0;
         let mut last = i64::MIN;
         for (k, samples) in slots.iter().enumerate() {
             let next = (k < 3).then(|| key(k + 1));
@@ -2190,10 +2221,9 @@ mod tests {
                         "slot {k}: before the next slot's"
                     );
                 }
-                shift = i64::max(shift, -offset);
-                assert_eq!(shift, ahead, "slot {k}: dts_shift is D");
+                assert!(*offset >= 0, "slot {k}: an offset of {offset}");
                 assert_eq!(
-                    dts + shift + offset,
+                    dts + offset,
                     sample.pts_us * 9 / 100,
                     "slot {k}: shown at its time"
                 );

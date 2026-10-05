@@ -575,9 +575,11 @@ impl Segment {
         let mut dts = traf.tfdt as i64;
         let mut out = Vec::new();
         for (&(duration, size, offset), data) in traf.samples.iter().zip(&traf.data) {
-            // As FFmpeg shows it: its `dts_shift` is `D`, which the film's
-            // first sample's offset sets (`mux.rs`).
-            let pts_us = (dts + i64::from(offset) + AHEAD_TICKS) * 1_000_000 / 90_000;
+            // As every reader shows it: the decode time and the offset,
+            // which is never negative (`mux::DECODE_AHEAD_US`), so FFmpeg
+            // adds no `dts_shift` of its own.
+            assert!(offset >= 0, "an offset of {offset}");
+            let pts_us = (dts + i64::from(offset)) * 1_000_000 / 90_000;
             assert_eq!(
                 u32_at(data, 0) as usize,
                 size as usize - 4,
@@ -946,19 +948,26 @@ fn each_segment_is_cut_at_the_first_key_at_or_after_its_time() -> anyhow::Result
     Ok(())
 }
 
-/// **A seek lands on the sync sample at or before its target**, as FFmpeg's
-/// demuxer seeks -- modelled, so it holds on every CI job: the slot whose
-/// `sidx` label is the last at or before the target, its first `moof` read,
-/// and the last sync sample at or before the target among the samples that
-/// `moof` holds (`mov_seek_fragment`, `av_index_search_timestamp`). A film
-/// with a key every 2.4 s, published with six-second segments: cut on the
-/// segment grid, a slot held two or three GOPs, its first `moof` only the
-/// first half second of them, and a seek landed at the slot's start -- up
-/// to a whole slot early. Mirrored, a slot is cut at every sync sample a
-/// second or more apart, whatever the segment length, so it lands within
-/// a GOP.
+/// **A seek lands on the sync sample of the slot its time falls in**, as
+/// FFmpeg's demuxer seeks -- modelled, so it holds on every CI job: the
+/// slot whose `sidx` label is the last at or before the target, its first
+/// `moof` read, and the last sync sample at or before the target among the
+/// samples that `moof` holds (`mov_seek_fragment`,
+/// `av_index_search_timestamp`, both on decode times). A film with a key
+/// every 2.4 s, published with six-second segments: cut on the segment
+/// grid, a slot held two or three GOPs, its first `moof` only the first
+/// half second of them, and a seek landed at the slot's start -- up to a
+/// whole slot early. Mirrored, a slot is cut at every sync sample a second
+/// or more apart, whatever the segment length.
+///
+/// **Which is the sync sample at or before the target, or the next one
+/// when the target is in the last `D` before it**: a slot's label is its
+/// first decode time, `D` before its sync sample is shown
+/// (`mux::DECODE_AHEAD_US` says what that buys), so its slot begins `D`
+/// early. 7.1 s, 33.5 s and 47.9 s are each a tenth of a second before a
+/// key and land on it; the rest land on the key before them.
 #[test]
-fn a_modelled_seek_lands_within_a_gop_of_its_target() -> anyhow::Result<()> {
+fn a_modelled_seek_lands_on_its_slots_sync_sample() -> anyhow::Result<()> {
     let knobs = Knobs {
         gop: 60,
         ..Knobs::default()
@@ -981,9 +990,19 @@ fn a_modelled_seek_lands_within_a_gop_of_its_target() -> anyhow::Result<()> {
             at
         })
         .collect();
-    for target_ms in [1_000i64, 7_100, 11_000, 30_000, 33_500, 47_900, 59_000] {
-        // FFmpeg seeks by the time less its `dts_shift`, `D`.
-        let target = (target_ms * 90 - AHEAD_TICKS) as u64;
+    let ahead_us = AHEAD_TICKS * 1000 / 90;
+    for (target_ms, key) in [
+        (1_000i64, 0),
+        (7_100, 3),
+        (11_000, 4),
+        (30_000, 12),
+        (33_500, 14),
+        (47_900, 20),
+        (59_000, 24),
+    ] {
+        // The time itself: no offset is negative, so FFmpeg takes nothing
+        // off it (its `dts_shift`).
+        let target = (target_ms * 90) as u64;
         let slot = labels.iter().rposition(|label| *label <= target).unwrap();
         let segment = parse_segment(fragment_of(header.slot(&file, slot)));
         let (track, first, _) = segment.chunks[0][0];
@@ -997,11 +1016,13 @@ fn a_modelled_seek_lands_within_a_gop_of_its_target() -> anyhow::Result<()> {
             knobs.is_key(frame),
             "{target_ms} ms: landed on a frame that is no key"
         );
-        let target_us = target_ms * 1000;
-        assert!(
-            landed_us <= target_us && target_us - landed_us < gop_us,
-            "{target_ms} ms landed at {landed_us} us, in slot {slot}"
+        assert_eq!(
+            landed_us,
+            key * gop_us,
+            "{target_ms} ms landed in slot {slot}"
         );
+        // Never more than `D` after what was asked for.
+        assert!(landed_us <= target_ms * 1000 + ahead_us);
     }
     Ok(())
 }
@@ -2256,10 +2277,13 @@ fn dump_for_ffprobe() -> anyhow::Result<()> {
 
 // --- Preparing before the receiver is told to load -------------------------------
 
-/// The slot holding `at_us`, by `knobs`' cuts: what a receiver told to start
-/// there asks for first from a mirrored layout.
+/// The slot `at_us` falls in, by `knobs`' cuts: what a receiver told to
+/// start there asks for first from a mirrored layout -- the last slot
+/// labelled at or before it, and a slot is labelled `D` before its cut
+/// (`Layout::slot_for_time`).
 fn slot_holding(knobs: &Knobs, at_us: i64) -> u64 {
-    (1..).find(|n| cut(knobs, *n) > at_us).unwrap() as u64 - 1
+    let ahead_us = AHEAD_TICKS * 1000 / 90;
+    (1..).find(|n| cut(knobs, *n) - ahead_us > at_us).unwrap() as u64 - 1
 }
 
 /// The slots a preparation for a start at `start_us` makes in `knobs`'
@@ -2398,13 +2422,14 @@ fn a_first_request_for_any_prepared_slot_starts_no_run() -> anyhow::Result<()> {
 
 /// **Preparing at the film's ends stays inside it**: a start in slot 0
 /// makes the slots of the first 6 s, all from the header's run; one in the
-/// last slot makes those of the last 12 s.
+/// last slot makes those of the last 12 s. (A slot begins half a second
+/// before its key: 6.0 s is in the seventh, 47.5 s in the forty-ninth.)
 #[test]
 fn preparing_at_the_films_ends_stays_inside_it() -> anyhow::Result<()> {
     let knobs = Knobs::default();
     for (start_ms, slots) in [
-        (0u32, (0..=5).collect::<Vec<u64>>()),
-        (59_500, (47..=59).collect()),
+        (0u32, (0..=6).collect::<Vec<u64>>()),
+        (59_500, (48..=59).collect()),
     ] {
         let fixture = Fixture::quick(knobs.clone())?;
         let token = fixture.publish(60_000, u64::from(start_ms))?;
