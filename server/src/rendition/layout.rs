@@ -69,6 +69,18 @@ pub(crate) fn headroom(span: u64) -> u64 {
     SLOT_BASE + span / HEADROOM_DIVISOR
 }
 
+/// **The room a slot's chunks take**, for a segment `duration_us` long:
+/// the muxer lays a slot down as a `moof` and an `mdat` per
+/// [`mux::CHUNK_US`] of decode time (`mux::media_segment`), and a segment
+/// that long touches at most `duration_us / CHUNK_US + 2` chunks, so at
+/// most that many less one beyond the first, each [`mux::CHUNK_OVERHEAD`]
+/// bytes. Exact in the count of headers, not a share of the bytes: what
+/// the samples weigh is the same whichever chunk they are in.
+pub(crate) fn interleave_room(duration_us: i64) -> u64 {
+    let chunks = duration_us.max(0) as u64 / mux::CHUNK_US as u64 + 1;
+    chunks * mux::CHUNK_OVERHEAD
+}
+
 /// Where the segments are cut and how long each slot is, from the source;
 /// no header yet.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,12 +116,17 @@ impl Plan {
         let segment_us = segment_us.max(1);
         let duration_us = duration_us.max(1);
         match index.and_then(|index| usable(index, source_len, duration_us)) {
-            Some(candidates) => Self::mirrored(&candidates, source_len, segment_us),
+            Some(candidates) => Self::mirrored(&candidates, source_len, duration_us, segment_us),
             None => Self::estimated(source_len, duration_us, segment_us),
         }
     }
 
-    fn mirrored(candidates: &[IndexEntry], source_len: u64, segment_us: i64) -> Self {
+    fn mirrored(
+        candidates: &[IndexEntry],
+        source_len: u64,
+        duration_us: i64,
+        segment_us: i64,
+    ) -> Self {
         // Segment k's sync sample: the first candidate at or after k x T,
         // never one already taken -- a GOP longer than T makes no empty
         // segment, it makes fewer.
@@ -135,7 +152,11 @@ impl Plan {
             cuts.push(if at == 0 { i64::MIN } else { entry.pts_us });
             let end = chosen.get(at + 1).map_or(source_len, |next| next.pos);
             let span = end - entry.pos;
-            sizes.push(span + headroom(span));
+            let lasts = chosen
+                .get(at + 1)
+                .map_or(duration_us, |next| next.pts_us)
+                .saturating_sub(entry.pts_us);
+            sizes.push(span + headroom(span) + interleave_room(lasts));
         }
         Self {
             cuts,
@@ -164,7 +185,7 @@ impl Plan {
             })
             .collect();
         let sizes = (0..count)
-            .map(|k| scaled(k + 1) - scaled(k) + SLOT_BASE)
+            .map(|k| scaled(k + 1) - scaled(k) + SLOT_BASE + interleave_room(segment_us))
             .collect();
         Self {
             cuts,
@@ -413,11 +434,13 @@ mod tests {
         );
         assert_eq!(plan.first_us, 0);
         let spans = [1_440, 4_000 - 1_440, 5_100 - 4_100];
+        let lasts = [1_440_000, 4_000_000 - 1_440_000, 5_000_000 - 4_000_000];
         assert_eq!(
             plan.sizes,
             spans
                 .iter()
-                .map(|span| span + headroom(*span))
+                .zip(lasts)
+                .map(|(span, lasts)| span + headroom(*span) + interleave_room(lasts))
                 .collect::<Vec<_>>()
         );
     }
@@ -481,17 +504,18 @@ mod tests {
         assert!(!plan.exact);
         assert_eq!(plan.cuts, vec![i64::MIN, 1_000_000, 2_000_000]);
         let slack = |bytes: u64| bytes * (100 + ESTIMATE_SLACK_PERCENT) / 100;
+        let room = interleave_room(T);
         assert_eq!(
             plan.sizes,
             vec![
-                slack(4_000) + SLOT_BASE,
-                slack(8_000) - slack(4_000) + SLOT_BASE,
-                slack(10_000) - slack(8_000) + SLOT_BASE,
+                slack(4_000) + SLOT_BASE + room,
+                slack(8_000) - slack(4_000) + SLOT_BASE + room,
+                slack(10_000) - slack(8_000) + SLOT_BASE + room,
             ]
         );
         assert_eq!(
             plan.sizes.iter().sum::<u64>(),
-            slack(10_000) + 3 * SLOT_BASE
+            slack(10_000) + 3 * (SLOT_BASE + room)
         );
     }
 
@@ -595,6 +619,18 @@ mod tests {
             mirrored.label_late_us, 0,
             "a mirrored cut is the sync sample"
         );
+    }
+
+    /// **A slot's room for its chunks' headers**: 160 bytes for each half
+    /// second its segment lasts, and one more -- the chunks a segment that
+    /// long can touch, less the first.
+    #[test]
+    fn a_slot_has_room_for_its_chunks_headers() {
+        assert_eq!(mux::CHUNK_OVERHEAD, 160);
+        assert_eq!(interleave_room(0), 160);
+        assert_eq!(interleave_room(499_999), 160);
+        assert_eq!(interleave_room(7_500_000), 16 * 160);
+        assert_eq!(interleave_room(-5), 160);
     }
 
     /// A run handed samples from a time makes whole the first slot cut at or

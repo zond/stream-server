@@ -344,14 +344,19 @@ impl Header {
 }
 
 /// A slot's fragment: a `styp` unless the slot opens at its `sidx` label
-/// ([`opens_at_label`]), `moof`, `mdat`, then a `free` box to the slot's
-/// end whose last bytes are zeros.
+/// ([`opens_at_label`]), a `moof` and an `mdat` per chunk, then a `free`
+/// box to the slot's end whose last bytes are zeros.
 fn fragment_of(slot: &[u8]) -> &[u8] {
     let boxes = Boxes::of(slot);
     let kinds: Vec<&str> = boxes.iter().map(|(kind, _)| kind.as_str()).collect();
     let styp = usize::from(kinds[0] == "styp");
-    assert_eq!(kinds[styp..], ["moof", "mdat", "free"]);
-    let free = boxes[styp + 2].1.len() + 8;
+    let last = kinds.len() - 1;
+    assert_eq!(kinds[last], "free", "{kinds:?}");
+    assert!(last > styp, "{kinds:?}");
+    for pair in kinds[styp..last].chunks(2) {
+        assert_eq!(pair, ["moof", "mdat"], "{kinds:?}");
+    }
+    let free = boxes[last].1.len() + 8;
     assert!(
         free >= 24,
         "the padding is at least a header and the zero tail"
@@ -374,86 +379,150 @@ fn opens_at_label(slot: &[u8]) -> bool {
     }
 }
 
-/// One track's run in a segment, as the boxes say it.
+/// One track's samples in a segment, as the boxes say them, every chunk's
+/// run joined.
 #[derive(Debug)]
 struct Traf {
     track_id: u32,
+    /// The first chunk's.
     tfdt: u64,
     /// `(duration, size, composition offset)` per sample.
     samples: Vec<(u32, u32, i32)>,
-    /// From the start of the `moof`.
-    data_offset: usize,
+    /// Each sample's bytes, where its run's data offset says.
+    data: Vec<Vec<u8>>,
 }
 
 struct Segment {
+    /// The first `moof`'s.
     sequence: u32,
     trafs: Vec<Traf>,
-    /// The `moof` and everything after it: what data offsets count from.
-    from_moof: Vec<u8>,
+    /// Per chunk -- a `moof` and its `mdat` -- the `(track, first decode
+    /// time, last decode time)` of each run in it, in the order its bytes
+    /// are in the `mdat`.
+    chunks: Vec<Vec<(u32, u64, u64)>>,
 }
 
+/// A slot's fragment read back: every `moof` and `mdat` pair, each run's
+/// samples taken from where its data offset points (from its own `moof`),
+/// and checked to be the `mdat`'s bytes, front to back, with nothing
+/// between; each chunk's `tfdt` where the track's chunk before it ended,
+/// and the `mfhd` numbers rising by one.
 fn parse_segment(bytes: &[u8]) -> Segment {
     let top = Boxes::of(bytes);
-    let kinds: Vec<&str> = top.iter().map(|(kind, _)| kind.as_str()).collect();
-    let styp = usize::from(kinds[0] == "styp");
-    assert_eq!(kinds[styp..], ["moof", "mdat"]);
-    let moof_at = if styp == 1 { 8 + top[0].1.len() } else { 0 };
-    let moof = top[styp].1;
-    let mut sequence = 0;
-    let mut trafs = Vec::new();
-    for (kind, body) in Boxes::of(moof) {
-        match kind.as_str() {
-            "mfhd" => sequence = u32_at(body, 4),
-            "traf" => {
-                let tfhd = Boxes::find(body, "tfhd");
-                assert_eq!(
-                    u32_at(tfhd, 0) & 0xff_ffff,
-                    0x02_0000,
-                    "default-base-is-moof"
-                );
-                let tfdt = Boxes::find(body, "tfdt");
-                assert_eq!(tfdt[0], 1, "tfdt version 1");
-                let trun = Boxes::find(body, "trun");
-                assert_eq!(trun[0], 1, "trun version 1");
-                let flags = u32_at(trun, 0) & 0xff_ffff;
-                let count = u32_at(trun, 4) as usize;
-                let mut at = 8;
-                let data_offset = if flags & 1 != 0 {
-                    at += 4;
-                    u32_at(trun, 8) as usize
-                } else {
-                    0
-                };
-                let mut samples = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let mut field = |bit: u32| {
-                        (flags & bit != 0).then(|| {
-                            let value = u32_at(trun, at);
-                            at += 4;
-                            value
-                        })
+    let mut at = 0;
+    let mut trafs: Vec<Traf> = Vec::new();
+    let mut chunks = Vec::new();
+    let mut sequences = Vec::new();
+    let mut boxes = top.iter().peekable();
+    if boxes.peek().is_some_and(|(kind, _)| kind == "styp") {
+        at += 8 + boxes.next().unwrap().1.len();
+    }
+    while let Some((kind, moof)) = boxes.next() {
+        assert_eq!(kind, "moof");
+        let moof_at = at;
+        let (mdat_kind, mdat) = boxes.next().expect("an mdat after each moof");
+        assert_eq!(mdat_kind, "mdat");
+        let mdat_at = moof_at + 8 + moof.len() + 8;
+        let mut expected_at = mdat_at;
+        let mut chunk = Vec::new();
+        for (kind, body) in Boxes::of(moof) {
+            match kind.as_str() {
+                "mfhd" => sequences.push(u32_at(body, 4)),
+                "traf" => {
+                    let tfhd = Boxes::find(body, "tfhd");
+                    assert_eq!(
+                        u32_at(tfhd, 0) & 0xff_ffff,
+                        0x02_0000,
+                        "default-base-is-moof"
+                    );
+                    let track_id = u32_at(tfhd, 4);
+                    let tfdt = Boxes::find(body, "tfdt");
+                    assert_eq!(tfdt[0], 1, "tfdt version 1");
+                    let tfdt = u64::from_be_bytes(tfdt[4..12].try_into().unwrap());
+                    let runs: Vec<&[u8]> = Boxes::of(body)
+                        .into_iter()
+                        .filter(|(kind, _)| kind == "trun")
+                        .map(|(_, trun)| trun)
+                        .collect();
+                    assert_eq!(runs.len(), 1, "one trun per traf");
+                    let trun = runs[0];
+                    assert_eq!(trun[0], 1, "trun version 1");
+                    let flags = u32_at(trun, 0) & 0xff_ffff;
+                    let count = u32_at(trun, 4) as usize;
+                    assert!(flags & 1 != 0, "a data offset");
+                    let mut data_at = moof_at + u32_at(trun, 8) as usize;
+                    assert_eq!(data_at, expected_at, "runs back to back in the mdat");
+                    let mut field_at = 12;
+                    let traf = match trafs.iter_mut().find(|traf| traf.track_id == track_id) {
+                        Some(traf) => {
+                            let ended = traf.tfdt
+                                + traf
+                                    .samples
+                                    .iter()
+                                    .map(|sample| u64::from(sample.0))
+                                    .sum::<u64>();
+                            assert_eq!(tfdt, ended, "track {track_id}'s chunks join up");
+                            traf
+                        }
+                        None => {
+                            trafs.push(Traf {
+                                track_id,
+                                tfdt,
+                                samples: Vec::new(),
+                                data: Vec::new(),
+                            });
+                            trafs.last_mut().unwrap()
+                        }
                     };
-                    let duration = field(0x100).expect("durations");
-                    let size = field(0x200).expect("sizes");
-                    let _flags = field(0x400);
-                    let offset = field(0x800).map_or(0, |value| value as i32);
-                    samples.push((duration, size, offset));
+                    let mut last = tfdt;
+                    let mut time = tfdt;
+                    for _ in 0..count {
+                        let mut field = |bit: u32| {
+                            (flags & bit != 0).then(|| {
+                                let value = u32_at(trun, field_at);
+                                field_at += 4;
+                                value
+                            })
+                        };
+                        let duration = field(0x100).expect("durations");
+                        let size = field(0x200).expect("sizes");
+                        let _flags = field(0x400);
+                        let offset = field(0x800).map_or(0, |value| value as i32);
+                        traf.samples.push((duration, size, offset));
+                        last = time;
+                        time += u64::from(duration);
+                        traf.data
+                            .push(bytes[data_at..data_at + size as usize].to_vec());
+                        data_at += size as usize;
+                    }
+                    expected_at = data_at;
+                    chunk.push((track_id, tfdt, last));
                 }
-                trafs.push(Traf {
-                    track_id: u32_at(tfhd, 4),
-                    tfdt: u64::from_be_bytes(tfdt[4..12].try_into().unwrap()),
-                    samples,
-                    data_offset,
-                });
+                other => panic!("an unexpected {other} in the moof"),
             }
-            other => panic!("an unexpected {other} in the moof"),
         }
+        assert_eq!(
+            expected_at,
+            mdat_at + mdat.len(),
+            "the mdat is its runs' bytes and nothing else"
+        );
+        chunks.push(chunk);
+        at = mdat_at + mdat.len();
+    }
+    assert_eq!(at, bytes.len());
+    for pair in sequences.windows(2) {
+        assert_eq!(pair[1], pair[0] + 1, "the mfhd numbers rise by one");
     }
     Segment {
-        sequence,
+        sequence: sequences[0],
         trafs,
-        from_moof: bytes[moof_at..].to_vec(),
+        chunks,
     }
+}
+
+/// The first `moof`'s `mfhd` number in slot `n`: 4096 numbers a slot.
+fn first_sequence(n: u64) -> u32 {
+    (n * 4096 + 1) as u32
 }
 
 impl Segment {
@@ -468,11 +537,9 @@ impl Segment {
             return Vec::new();
         };
         let mut dts = traf.tfdt as i64;
-        let mut at = traf.data_offset;
         let mut out = Vec::new();
-        for &(duration, size, offset) in &traf.samples {
+        for (&(duration, size, offset), data) in traf.samples.iter().zip(&traf.data) {
             let pts_us = (dts + i64::from(offset)) * 1_000_000 / 90_000;
-            let data = &self.from_moof[at..at + size as usize];
             assert_eq!(
                 u32_at(data, 0) as usize,
                 size as usize - 4,
@@ -483,7 +550,6 @@ impl Segment {
             assert_eq!(data[4] == 0x65, knobs.is_key(frame), "an IDR is a key");
             out.push(pts_us);
             dts += i64::from(duration);
-            at += size as usize;
         }
         out
     }
@@ -493,12 +559,11 @@ impl Segment {
             return Vec::new();
         };
         let mut ticks = traf.tfdt as i64;
-        let mut at = traf.data_offset;
         let mut out = Vec::new();
-        for &(duration, size, _) in &traf.samples {
+        for (&(duration, _, _), data) in traf.samples.iter().zip(&traf.data) {
             // The sound is on the video's 90 kHz clock (FFmpeg before 6.0
             // compares the two tracks' times unscaled).
-            let frame = i64::from(u32_at(&self.from_moof, at));
+            let frame = i64::from(u32_at(data, 0));
             let pts_us = Knobs::audio_pts(frame);
             assert_eq!(
                 (pts_us * 90_000 + 500_000) / 1_000_000,
@@ -507,7 +572,6 @@ impl Segment {
             );
             out.push(pts_us);
             ticks += i64::from(duration);
-            at += size as usize;
         }
         out
     }
@@ -541,6 +605,15 @@ fn expected(knobs: &Knobs, n: i64) -> (Vec<i64>, Vec<i64>) {
         .filter(|pts| *pts >= lead(from) && *pts < lead(to))
         .collect();
     (video, audio)
+}
+
+/// The room a slot is given for its chunks' headers, for a segment
+/// `duration_us` long: a segment touches at most one chunk per 500 ms and
+/// one more, and each chunk past the first is a `moof` (with its `mfhd`),
+/// two `traf`s (`tfhd`, `tfdt`, a `trun` header) and an `mdat` header --
+/// 160 bytes.
+fn chunk_room(duration_us: i64) -> u64 {
+    (duration_us as u64 / 500_000 + 1) * 160
 }
 
 /// `cut - SEEK_BACK`, at the film's start at the earliest: what a run made
@@ -641,7 +714,8 @@ fn the_init_segment_says_how_long_the_film_is() -> anyhow::Result<()> {
 
 /// **The `sidx` mirrors the source's index**: one slot per segment, each
 /// the source's bytes from its cut's sync sample to the next one's (the
-/// last to the source's end) plus the headroom; durations from the cuts.
+/// last to the source's end) plus the headroom and the room for its
+/// chunks' headers; durations from the cuts.
 #[test]
 fn the_sidx_mirrors_the_sources_index() -> anyhow::Result<()> {
     let knobs = Knobs::default();
@@ -671,12 +745,16 @@ fn the_sidx_mirrors_the_sources_index() -> anyhow::Result<()> {
         } else {
             place(cut(&knobs, k + 1))
         };
-        assert_eq!(*size, headroom(end - place(start)), "slot {k}'s size");
         let next = if k == 59 {
             60_000_000
         } else {
             cut(&knobs, k + 1)
         };
+        assert_eq!(
+            *size,
+            headroom(end - place(start)) + chunk_room(next - start),
+            "slot {k}'s size"
+        );
         assert_eq!(
             i64::from(*duration),
             (next - start) * 9 / 100,
@@ -704,7 +782,11 @@ fn without_an_index_the_slots_are_estimated() -> anyhow::Result<()> {
     let scaled = |k: u64| k * SOURCE_LEN as u64 * 115 / 1000;
     for (k, (_, size, duration)) in header.slots.iter().enumerate() {
         let k = k as u64;
-        assert_eq!(*size, scaled(k + 1) - scaled(k) + 8 * 1024, "slot {k}");
+        assert_eq!(
+            *size,
+            scaled(k + 1) - scaled(k) + 8 * 1024 + chunk_room(T_US),
+            "slot {k}"
+        );
         // A GOP late (10 s), at the film's end at the latest: the first
         // slot to the end, the rest none.
         assert_eq!(*duration, if k == 0 { 900_000 } else { 0 }, "slot {k}");
@@ -729,7 +811,7 @@ fn without_an_index_the_slots_are_estimated() -> anyhow::Result<()> {
         // moof apart, or FFmpeg 4.4 would time it by the label.
         assert!(!opens_at_label(header.slot(&file, n)), "slot {n}");
         let segment = parse_segment(fragment_of(header.slot(&file, n)));
-        assert_eq!(segment.sequence, n as u32 + 1);
+        assert_eq!(segment.sequence, first_sequence(n as u64));
     }
     Ok(())
 }
@@ -780,7 +862,7 @@ fn each_segment_is_cut_at_the_first_key_at_or_after_its_time() -> anyhow::Result
     fixture.init(&token);
     for n in 0..6i64 {
         let segment = parse_segment(&fixture.segment(&token, n as u64));
-        assert_eq!(segment.sequence, n as u32 + 1);
+        assert_eq!(segment.sequence, first_sequence(n as u64));
         let video = segment.track(1).expect("video in every segment here");
         let key = knobs.key_at_or_after(n * T_US).unwrap();
         assert_eq!(
@@ -791,6 +873,61 @@ fn each_segment_is_cut_at_the_first_key_at_or_after_its_time() -> anyhow::Result
         let (want_video, want_audio) = expected(&knobs, n);
         assert_eq!(segment.video_pts(&knobs), want_video, "segment {n}'s video");
         assert_eq!(segment.audio_pts(), want_audio, "segment {n}'s audio");
+    }
+    Ok(())
+}
+
+/// **A slot lays its picture and its sound down together**, half a second
+/// at a time: a `moof` and an `mdat` per chunk, the chunk's picture --
+/// decode times in one half second of the film's clock -- and then the
+/// sound of the same half second; the sound's lead (64 ms before the cut)
+/// goes with the first picture. A reader going straight through finds the
+/// next sample of either track in the next bytes: FFmpeg's demuxer takes
+/// samples by byte position while the tracks are within a second of each
+/// other, and seeks for each one when they are not -- a request each, on
+/// zond's TV, every half second of an 8 Mbit/s film laid picture-first.
+#[test]
+fn a_slot_lays_its_picture_and_sound_down_together() -> anyhow::Result<()> {
+    let knobs = Knobs::default();
+    let fixture = Fixture::quick(knobs.clone())?;
+    let token = fixture.publish(30_000, 0)?;
+    fixture.init(&token);
+    let half = |ticks: u64| ticks / 45_000;
+    // Slot 12 is cut at 12 s exactly (a key every 0.48 s): its sound's lead
+    // is in the half second before, and goes with the picture all the same.
+    for n in (0..6u64).chain([12]) {
+        let segment = parse_segment(&fixture.segment(&token, n));
+        let (video, audio) = expected(&knobs, n as i64);
+        assert_eq!(segment.video_pts(&knobs), video, "slot {n}'s video");
+        assert_eq!(segment.audio_pts(), audio, "slot {n}'s audio");
+        assert!(
+            segment.chunks.len() >= 2,
+            "slot {n}: one second, two chunks"
+        );
+        let count = segment.chunks.len();
+        let mut previous = None;
+        for (at, chunk) in segment.chunks.iter().enumerate() {
+            let [(1, first, last), (2, sound_first, sound_last)] = chunk[..] else {
+                panic!("slot {n}, chunk {at}: picture then sound, {chunk:?}");
+            };
+            let cell = half(first);
+            assert_eq!(half(last), cell, "slot {n}, chunk {at}: one half second");
+            assert!(previous < Some(cell), "slot {n}: chunks in time order");
+            previous = Some(cell);
+            // The lead goes with the first picture, the sound after the
+            // last picture with the last.
+            if at > 0 {
+                assert_eq!(half(sound_first), cell, "slot {n}, chunk {at}'s sound");
+            } else {
+                assert!(
+                    sound_first <= first && first - sound_first <= 64 * 90,
+                    "slot {n}: the sound's lead goes with the first picture"
+                );
+            }
+            if at + 1 < count {
+                assert_eq!(half(sound_last), cell, "slot {n}, chunk {at}'s sound");
+            }
+        }
     }
     Ok(())
 }
@@ -1442,7 +1579,7 @@ fn an_idle_run_is_released_and_restarted_at_the_rings_edge() -> anyhow::Result<(
         asked_from(knobs.key_at_or_after(3 * T_US).unwrap()),
         "at the ring's edge"
     );
-    assert_eq!(segment.sequence, 4);
+    assert_eq!(segment.sequence, first_sequence(3));
     Ok(())
 }
 

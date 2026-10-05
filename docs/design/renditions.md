@@ -276,9 +276,10 @@ with a producer written in Rust on a plain thread.
 are a short list -- `ftyp`, `moov` (`mvhd`, `mvex`/`trex`/`mehd`, one
 `trak` per track with `avc1`+`avcC`, `hvc1`+`hvcC` or `mp4a`+`esds`) for
 the init segment, and `moof` (`mfhd`, one `traf` per track with
-`tfhd`, `tfdt`, `trun`) and `mdat` per segment, after a `styp` only when
-the segment does not open at its `sidx` label (the mirror layout, below,
-says why). It converts Annex-B
+`tfhd`, `tfdt`, `trun`) and `mdat` per half second of a segment -- the
+picture, then the sound beside it (2.8, *Picture and sound interleaved*)
+-- after a `styp` only when the segment does not open at its `sidx` label
+(the mirror layout, below, says why). It converts Annex-B
 samples (what Android's extractors and encoders hand out, with start
 codes) to length-prefixed, and builds `avcC`/`hvcC` from the parameter
 sets in `csd-0`/`csd-1` -- an `hvcC` keeping the SEI messages beside them
@@ -675,7 +676,10 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   **headroom**, 8 KiB and a 64th of the span: a fragment carries a `moof`
   where a Matroska cluster carries a few bytes per block, and an MP4
   source keeps its sample tables in its `moov`, so the same samples are
-  never quite the same size. The last slot runs to the source's end. The
+  never quite the same size -- and the room for its chunks' headers
+  (`layout::interleave_room`: 160 bytes for each half second the segment
+  lasts, and one more; *Picture and sound interleaved*, below). The last
+  slot runs to the source's end. The
   file's length is the header plus every slot, exact before a byte is
   made; the `sidx`'s durations are the indexed times, exact by
   construction. An index that starts more than a minute into the film, stops
@@ -687,7 +691,7 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
 * **Without one, the slots are estimated**: segments on the `k x T` grid
   (a segment's real start may be up to a GOP later, which the `tfdt`
   says), slot `k` in proportion to time over the source's size, **15%**
-  larger and 8 KiB on top. The `sidx` labels an estimated slot **10 s
+  larger and 8 KiB on top, and the chunks' room for `T`. The `sidx` labels an estimated slot **10 s
   after its cut** (the longest GOP assumed), so the slot a demuxer picks
   for a time began before it: labelled at the cut, Chrome picked a slot
   whose first sync sample was after the target, found none at or before
@@ -772,6 +776,79 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   and headless Chrome one far `Range` per seek. zond's TV, seeking to
   1:00, read on from 0:30 and stalled buffering; that was not this but the
   clocks above (60 x 48/90 = 32 s), and it went on with the lead.
+* **Picture and sound interleaved, half a second at a time**
+  (2026-10-05). A slot was one `moof` and one `mdat` with the whole
+  segment's picture and then its sound. zond's phone cast a 5.7 GB,
+  95-minute Matroska film (8 Mbit/s, 762 slots of some 7.6 MB, 7.5 s
+  GOPs); after the load the TV made a new range request every 0.3 to
+  1 s, each reading 0.9 to 2 MB, alternately creeping through a slot's
+  picture (295272448, 296550400, 296976384, ...) and parked at its sound
+  at the fragment's end (299008000, 299040768, ...), and the cast "worked
+  for a second before failing"; a 4 Mbit/s film with 6 s GOPs (3 MB
+  slots) played. The mechanism, in FFmpeg's MP4 demuxer (n4.4,
+  `libavformat/mov.c`; unchanged to 6.1, `mov.c:8802`):
+  * `mov_find_next_sample` (`mov.c:7808`) takes the next sample of the
+    track whose next sample is **lower in the file while the tracks' next
+    samples are within a second of each other**, and **earlier in time
+    when they are further apart** (`FFABS(best_dts - dts) <=
+    AV_TIME_BASE`, `mov.c:7820-7824`), and `mov_read_packet` seeks its
+    reader to that sample (`avio_seek(sc->pb, sample->pos, SEEK_SET)`,
+    `mov.c:7950`). With the picture first, the picture is read until it
+    is a second ahead of the sound, then the sound at the `mdat`'s end
+    until it has caught up, then the picture again: a seek every second
+    of film, each way, in an 8 MB slot.
+  * Whether a seek is a new request depends on the reader's buffer.
+    `mov_read_header` calls `ff_configure_buffers_for_index`
+    (`mov.c:7796`; `utils.c:2063`, `seek.c:173` in 6.1), which measures
+    how far apart in the file samples a second apart are, and grows the
+    read buffer to **twice that, if that is under 16 MiB** (`1<<24`), and
+    the short-seek threshold to it. Measured on what the header shows --
+    slot 0 -- so a 3 MB slot gets a 6 MB buffer and its hops are inside it
+    (the film that played), and an 8 MB+ slot gets nothing: the 32 KiB
+    buffer, and a seek per hop. Chrome's demuxer reads through its own
+    data source, which loads ahead of where it is asked a megabyte or two:
+    a request per hop past what it had loaded -- the field's pattern.
+  * Measured on this host with `ffmpeg` 6.1 as the client over HTTP
+    (`rendition_films.rs`, an 11 Mbit/s H.264 film with 8 s GOPs, 11 MB
+    slots): a straight read **317 requests** picture-first, alternating
+    between offsets near 1.9 MB and 11.17 MB exactly as on the TV; a seek
+    with `-ss 20` 47. Interleaved: **one** request for the straight read,
+    three for the seek (the start, the slot, the next slot).
+
+  So the muxer lays a slot down in **chunks** (`mux::CHUNK_US`, 500 ms of
+  decode time on the film's clock, a pure function of the slot's
+  samples): per chunk a `moof` and an `mdat`, the chunk's picture in
+  decode order and then the sound of the same half second, the sound
+  held within the picture's chunks (the 64 ms lead goes with the sync
+  sample, sound after the last picture with it). A reader going straight
+  through finds the next sample of either track in the next bytes. Each
+  chunk's `tfdt` is where the track's last chunk ended (the samples'
+  durations summed, so the times are what one run of them said), the
+  slot's `mfhd` numbers are `slot x 4096 + 1` on (a slot spanning more
+  than 4096 half seconds is cut into longer chunks), and the slot's size
+  carries the chunks' headers (`layout::interleave_room`).
+
+  **A `moof` per chunk, not a `trun` per chunk in one `moof`**, which
+  would have kept one `moof` per slot. FFmpeg records, per fragment and
+  track, where its samples begin in the index as it reads each `trun`
+  (`frag_stream_info->index_entry`, `mov.c:4919-4921`), so after several
+  it holds the last one's; a fragment read later from earlier in the
+  file -- a seek back to a slot not read before -- is inserted in front of
+  that last `trun` (`mov.c:4813-4821`), in the middle of the later slot,
+  and the index is out of order. Measured with both shapes on the same
+  films (the `ff7` harness that drives libavformat as Chrome's
+  `FFmpegDemuxer` does, seeks 45, 10, 30, 50, 17, 20, 40, 5 s in turn):
+  with `trun`s, 4.4, 6.1 and master landed the seek to 40 s at 24 s
+  (H.264), and 4.4 the seeks to 50 and 40 s at 30 and 22.7 s (HEVC);
+  with `moof`s every seek landed where the picture-first file's did, in
+  every version for H.264 and in 4.4 for HEVC, at one or two requests
+  each instead of three. The slot's first `moof` is still at the slot's
+  start, where the `sidx` points, so the at-label rule above is
+  unchanged; the later `moof`s have no `sidx` entry and FFmpeg times them
+  by their `tfdt`. (FFmpeg 6.0 and later already misplace seeks in an
+  HEVC film with open GOPs picture-first, and more often chunked: it
+  re-reads a `moof` it read in passing, and its leading pictures' decode
+  times are before the sync sample's. Not the TV's 4.4; open.)
 * **Prepared before the load** (2026-10-04). zond's phone cast an HEVC
   Matroska film from a torrent with one or two peers: the first piece took
   38 s and the last (the Cues) 26 s before the first run could fix the
