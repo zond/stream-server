@@ -851,12 +851,8 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   by their `tfdt`. (FFmpeg 6.0 and later already misplace seeks in an
   HEVC film with open GOPs picture-first, and more often chunked: it
   re-reads a `moof` it read in passing, and its leading pictures' decode
-  times are before the sync sample's. Not the TV's 4.4; open.) Found on
-  the way and unchanged by it: an MP4 source whose sound begins before
-  zero (an AAC encoder's priming frame at -21 ms, behind an edit list that
-  leaves the container's start at zero) has that frame put at zero, and
-  the first slot's sound runs a frame late from there; later slots are on
-  time (`rendition_films.rs` pins it).
+  times are before the sync sample's. Not the TV's 4.4; open -- and
+  answered below, *Every sample at its own time*.)
 * **A slot per sync sample** (2026-10-05). Chunked, the slots regressed
   where a seek lands: the app's test film (6 minutes of `testsrc`, a key
   every 2.8 s, HEVC Main 10 HDR10 with x265's open GOPs; xtremio
@@ -898,10 +894,9 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   apart** (`MIRROR_GRID_US`: the first at or after each second; a film
   over 18 hours on a wider grid, to stay inside the `sidx`'s 65535
   references), whatever the spec's segment length -- which now only sets
-  an estimated layout's grid -- and **a slot's decode times start at its
-  first sample's presentation time** (the sorted times moved on by the
-  leading pictures' span; nothing moves for a closed GOP). A seek's first
-  chunk is then the key before the target. Measured on the same matrix:
+  an estimated layout's grid -- and a slot's first decode time is its
+  label (*Every sample at its own time*, below). A seek's first chunk is
+  then the key before the target. Measured on the same matrix:
   every seek in every version, H.264 and HEVC, lands on the last key at
   or before its target; `ffprobe` on the app's film lands 5:00 at 299.7 s
   in 2 requests (HEVC; 299.6 s, H.264), `ffmpeg -ss 60` makes 2 requests,
@@ -920,11 +915,95 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   (`LOOKAHEAD_TIME`, two slots at least: it was two six-second segments)
   and a preparation is the 12 s before the start and the 6 s after
   (`PREPARED_BEFORE`, `PREPARED_AFTER`). The ring's cap is bytes and
-  unchanged. With open GOPs, FFmpeg shows the picture late by the
-  leading pictures as well as the reordering (`dts_shift` is the largest
-  negative composition offset read so far) -- what 4.4 showed of a slot's
-  first `moof` anyway; 6.1 now shows the same times as 4.4 (keys at
-  2.92 s, 5.72 s, ... of the app's film in both).
+  unchanged.
+* **Every sample at its own time** (2026-10-05). The first answer to the
+  open-GOP seek above started each slot's decode times at its sync
+  sample, and the app's test caught what that cost: every picture from the
+  first open-GOP slot on was 120 ms late against the sound (its 13 s HEVC
+  film: keys at 0, 2.120, 4.120, ... for 0, 2, 4, ...). The mechanism, in
+  every version: FFmpeg shows a picture at its decode time, its
+  composition offset and `dts_shift`
+  (`pkt->pts = pkt->dts + sc->dts_shift + ctts`, n4.4 `mov.c:8011`, 6.1
+  `mov.c:9009`), and `dts_shift` is the largest negative offset read so
+  far (`mov_update_dts_shift`, n4.4 `mov.c:3036`), growing as fragments are
+  read. Any negative offset delays the picture from the fragment that has
+  it on, and a bigger one later delays it more. With the decode times the
+  presentation times sorted, the B-frames' negative offsets made the
+  picture a frame or two late from the first slot on (what the "one or
+  two frames late" note here said; it was an A/V error, not a constant to
+  live with); starting a slot's decode times at its sync sample made an
+  open GOP's leading pictures strongly negative, and the shift jumped
+  there.
+
+  **The arrangement.** Decode times run `D` (`mux::DECODE_AHEAD_US`,
+  half a second) ahead of presentation: a slot's decode times are its
+  presentation times sorted, moved so that its first sample -- the sync
+  sample -- decodes `D` before it is shown, every other with them; and
+  every composition offset is written as the true one less `D`. So no
+  offset is below `-D` while `D` covers a GOP's leading pictures and its
+  reordering (twelve frames at 24 a second), and the film's first sample
+  has exactly `-D`: the film's first slot decodes from its sync sample's
+  time (nothing decodes before the film's start), its decode times drawn
+  in by `D` over the slot's span and never after a sample's own
+  presentation time (`first_slot_dts`), so its sync sample's offset is
+  `-D`. FFmpeg reads that sample with the header, before any packet, so
+  `dts_shift` is `D` from the first packet to the last, whichever slot is
+  read first and after any seek, and every picture is shown at its own
+  time. The `sidx` labels a slot after the first at its first decode time
+  -- its cut less `D` -- which is what FFmpeg 4.4 takes for that time (the
+  at-label rule), and every version seeks by the time less `dts_shift`,
+  `D`: a seek lands on the last key at or before its target exactly. The
+  sound has no reordering; FFmpeg seeks it to the sync sample's decode
+  time, `D` before the cut, so a segment's sound begins `D` and 64 ms
+  before its cut (`run::AUDIO_LEAD_US`, 564 ms). Sound before the film's
+  start -- an AAC encoder's priming frame, which an MP4's edit list hides
+  -- has no time a fragment can say (`tfdt` counts from nought); it is no
+  longer put at nought with the slot's sound a frame late after it, but
+  left out (`Cutter`).
+
+  **Not an edit list.** `edts`/`elst` with `media_time` `D`, every track's
+  times `D` ahead, makes FFmpeg's times exact too (it takes `D` off every
+  decode time, `sc->time_offset`), but it also takes `D` off the time it
+  seeks by (`min_corrected_pts`), so every seek landed one or two keys
+  early in 4.4 and 6.1, and master went to the film's start; and 4.4
+  takes a slot's first decode time from its label less the same `D`, so
+  no label is right for both. Measured, rejected.
+
+  **A slot in two parts.** Checking every packet after a seek, not only
+  the first, found that chunked slots skipped the rest of the slot a seek
+  landed in, in every version: seeking, FFmpeg reads the slot's first
+  `moof`, and seeking each other track it sets where it reads on to the
+  fragment after that one in its index (`mov_seek_fragment`:
+  `next_root_atom = frag_index.item[index + 1].moof_offset`, n4.4
+  `mov.c:8081`); it knows a slot's later chunks only once it has read
+  them, so it went on at the next slot (299.92 s to 302.4 s after a seek
+  to 5:00). So a slot is two `sidx` references: its first part
+  (`mux::FIRST_PART`, 8 KiB: the `styp` if any, the first chunk's `moof`
+  and a `free` box), with the slot's duration, and the rest -- the first
+  chunk's `mdat` and every later chunk -- lasting nothing and labelled at
+  the next slot's time, so a seek never picks it. The fragment after the
+  first `moof` is then the slot's own rest, and FFmpeg reads on through
+  it. A `sidx` counts 65535 references, so 32767 slots.
+
+  **Measured** with libavformat 4.4, 6.1 and master as Chrome drives it,
+  every packet of both tracks against the film's, in decode order:
+
+  | film | read | 4.4 | 6.1 | master |
+  |---|---|---|---|---|
+  | H.264, keys every 6, 3, 2, 2.8 s, 48 kHz | whole | exact | exact | exact |
+  | HEVC open GOPs, keys every 6, 3, 2, 2.8 s | whole | exact | exact | exact |
+  | both | seeks to 300, 100, 250, 330, 43, 30, 301, 5 s after reading 16 s | each on the key at or before it, every packet exact | same | same |
+  | both, before (sorted decode times, one reference a slot) | whole | picture 40-120 ms late, growing | same | same |
+  | both, before | after a seek | the rest of the slot skipped | same | same |
+
+  ("exact": every packet the film's, at its time to the 90 kHz tick, and
+  so picture and sound exactly as far apart as in the film; packets FFmpeg
+  marks to be discarded, a fragment it indexed twice, left out, as a
+  player drops them.) The cost: FFmpeg's guess of the frame rate (from the
+  first slot's decode times, drawn in) is wrong -- `ffprobe` says 50 or 100
+  for a 25 fps film; nothing plays by it. An estimated layout reads whole
+  exactly too; a seek back after reading still walks, as before (*A slot
+  opens with its `moof`*, above: open).
 * **Prepared before the load** (2026-10-04). zond's phone cast an HEVC
   Matroska film from a torrent with one or two peers: the first piece took
   38 s and the last (the Cues) 26 s before the first run could fix the
@@ -968,9 +1047,8 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   a slot; what did is upstream of the demuxer (the receiver's load,
   Chrome 92's pipeline), and was not reproducible here -- there is no
   Chrome 92 on this host, and the TV is not touched by a server change.
-  (Decode times shifted back by the reorder delay, so no offset is
-  negative, would make FFmpeg's seek exact and its picture times too --
-  FFmpeg shows a fragment's video `dts_shift` late; not done.)
+  (Since answered: *Every sample at its own time*, above -- the seek is
+  exact now, `dts_shift` being `D` throughout.)
 
   So the preparation makes the slot for the start
   (`Layout::slot_for_time`) and, zond's decision, **the slots of the 12 s

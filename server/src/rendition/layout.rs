@@ -75,7 +75,7 @@ const INDEX_REACH_US: i64 = 60_000_000;
 pub(crate) const MIRROR_GRID_US: i64 = 1_000_000;
 
 /// The most slots a `sidx` can count.
-const MAX_SLOTS: i64 = u16::MAX as i64;
+const MAX_SLOTS: i64 = u16::MAX as i64 / 2;
 
 /// The grid a mirrored layout of a film `duration_us` long is cut on:
 /// [`MIRROR_GRID_US`], or wider when that would make more slots than a
@@ -93,13 +93,15 @@ pub(crate) fn headroom(span: u64) -> u64 {
 /// **The room a slot's chunks take**, for a segment `duration_us` long:
 /// the muxer lays a slot down as a `moof` and an `mdat` per
 /// [`mux::CHUNK_US`] of decode time (`mux::media_segment`), and a segment
-/// that long touches at most `duration_us / CHUNK_US + 2` chunks, so at
-/// most that many less one beyond the first, each [`mux::CHUNK_OVERHEAD`]
-/// bytes. Exact in the count of headers, not a share of the bytes: what
-/// the samples weigh is the same whichever chunk they are in.
+/// that long touches at most `duration_us / CHUNK_US + 2` chunks, and the
+/// first may be split in two to fit the slot's first part: at most that
+/// many beyond the first, each [`mux::CHUNK_OVERHEAD`] bytes, and the first
+/// part's padding ([`mux::FIRST_PART`]). Exact in the count of headers,
+/// not a share of the bytes: what the samples weigh is the same whichever
+/// chunk they are in.
 pub(crate) fn interleave_room(duration_us: i64) -> u64 {
-    let chunks = duration_us.max(0) as u64 / mux::CHUNK_US as u64 + 1;
-    chunks * mux::CHUNK_OVERHEAD
+    let chunks = duration_us.max(0) as u64 / mux::CHUNK_US as u64 + 2;
+    chunks * mux::CHUNK_OVERHEAD + mux::FIRST_PART as u64
 }
 
 /// Where the segments are cut and how long each slot is, from the source;
@@ -297,8 +299,13 @@ pub(crate) struct Layout {
 
 impl Layout {
     /// The layout for `plan` behind `init`: the `sidx` for `indexed`
-    /// (a track and its clock, which every track shares), the film
-    /// `duration_us` long. An error is the sentence a viewer is shown, for
+    /// (a track and its clock, which every track shares, and how far its
+    /// decode times run ahead of its presentation times: `D` for a picture,
+    /// [`mux::DECODE_AHEAD_US`]), the film `duration_us` long. A slot after
+    /// the first is labelled at its first decode time -- its cut less `D`,
+    /// FFmpeg 4.4 taking the label as that time (the at-label rule) and
+    /// every version seeking by the time less its `dts_shift`, which is
+    /// `D`. An error is the sentence a viewer is shown, for
     /// a film no `sidx` can describe.
     ///
     /// An estimated layout indexes `sound` (the sound's track beside a
@@ -312,13 +319,13 @@ impl Layout {
     pub(crate) fn new(
         init: Bytes,
         plan: Plan,
-        indexed: (u32, u32),
+        indexed: (u32, u32, i64),
         sound: Option<u32>,
         duration_us: i64,
     ) -> Result<Self, String> {
-        let (track, timescale) = indexed;
+        let (track, timescale, ahead_us) = indexed;
         let count = plan.sizes.len();
-        if count == 0 || count > usize::from(u16::MAX) {
+        if count == 0 || 2 * count > usize::from(u16::MAX) {
             return Err("This film is too long to send to the television in one piece.".into());
         }
         if plan.sizes.iter().any(|size| *size >= 1 << 31) {
@@ -328,38 +335,48 @@ impl Layout {
         }
         let earliest = mux::ticks(plan.first_us, timescale);
         let end = mux::ticks(duration_us, timescale).max(earliest);
-        let refs = |late_us: i64| -> Vec<(u32, u32)> {
+        // Two references a slot: its first part, labelled at its time and
+        // lasting to the next slot's, and the rest, lasting nothing --
+        // labelled at the next slot's time, so a seek never picks it, and
+        // there in FFmpeg's index after the first part (`mux::FIRST_PART`).
+        let refs = |late_us: i64, ahead_us: i64| -> Vec<(u32, u32, bool)> {
             let starts: Vec<u64> = (0..count)
                 .map(|k| {
                     if k == 0 {
                         earliest
                     } else {
-                        mux::ticks(plan.cuts[k].saturating_add(late_us), timescale)
-                            .clamp(earliest, end)
+                        mux::ticks(
+                            plan.cuts[k]
+                                .saturating_add(late_us)
+                                .saturating_sub(ahead_us),
+                            timescale,
+                        )
+                        .clamp(earliest, end)
                     }
                 })
                 .collect();
             (0..count)
-                .map(|k| {
+                .flat_map(|k| {
                     let next = starts.get(k + 1).copied().unwrap_or(end);
                     let duration = next.saturating_sub(starts[k]);
-                    (
-                        plan.sizes[k] as u32,
-                        u32::try_from(duration).unwrap_or(u32::MAX),
-                    )
+                    let first = mux::FIRST_PART as u32;
+                    [
+                        (first, u32::try_from(duration).unwrap_or(u32::MAX), true),
+                        ((plan.sizes[k] as u32).saturating_sub(first), 0, false),
+                    ]
                 })
                 .collect()
         };
         let sound = sound
             .filter(|_| plan.label_late_us > 0)
-            .map(|sound| mux::sidx(sound, timescale, earliest, 0, &refs(-run::AUDIO_LEAD_US)));
+            .map(|sound| mux::sidx(sound, timescale, earliest, 0, &refs(-run::AUDIO_LEAD_US, 0)));
         let sound_len = sound.as_ref().map_or(0, Vec::len) as u64;
         let sidx = mux::sidx(
             track,
             timescale,
             earliest,
             sound_len,
-            &refs(plan.label_late_us),
+            &refs(plan.label_late_us, ahead_us),
         );
         let init_len = init.len();
         let mut header = Vec::with_capacity(init_len + sidx.len() + sound_len as usize);
@@ -403,9 +420,10 @@ impl Layout {
     /// **The slot whose `sidx` label is at or before `at_us`**: the slot
     /// holding it for a mirrored layout, possibly an earlier one for an
     /// estimated layout, whose labels are late. What a receiver told to
-    /// start there asks for -- or the slot before, for a time on a cut
-    /// (FFmpeg seeks by the time less a frame or two); a preparation makes
-    /// it and its neighbours before the receiver is told to load.
+    /// start there asks for (FFmpeg seeks by the time less its
+    /// `dts_shift`, `D`, against labels `D` before each cut: the same); a
+    /// preparation makes it and its neighbours before the receiver is told
+    /// to load.
     pub(crate) fn slot_for_time(&self, at_us: i64) -> u64 {
         let late = self.label_late_us;
         let picked = self
@@ -536,7 +554,14 @@ mod tests {
             .map(|(k, pts)| entry(*pts, 1_000 * k as u64))
             .collect();
         let plan = Plan::new(Some(&index), 11_000, 30_000_000, 6 * T);
-        let layout = Layout::new(Bytes::new(), plan, (1, 90_000), None, 30_000_000).unwrap();
+        let layout = Layout::new(
+            Bytes::new(),
+            plan,
+            (1, 90_000, mux::DECODE_AHEAD_US),
+            None,
+            30_000_000,
+        )
+        .unwrap();
         // From slot 0 (at 0.04 s): slots beginning by 12.04 s, the last at
         // 11.24 s (slot 4).
         assert_eq!(layout.reach(0, 12_000_000), 4);
@@ -636,7 +661,14 @@ mod tests {
         let plan = Plan::new(Some(&index), 70_000, 6_000_000, T);
         let sizes = plan.sizes.clone();
         let init = Bytes::from_static(b"\0\0\0\x08ftyp");
-        let layout = Layout::new(init, plan, (1, 90_000), None, 6_000_000).expect("a layout");
+        let layout = Layout::new(
+            init,
+            plan,
+            (1, 90_000, mux::DECODE_AHEAD_US),
+            None,
+            6_000_000,
+        )
+        .expect("a layout");
         let sidx = &layout.header[8..];
         assert_eq!(u32_at(sidx, 0) as usize, sidx.len());
         assert_eq!(&sidx[4..8], b"sidx");
@@ -645,21 +677,42 @@ mod tests {
         assert_eq!(u32_at(sidx, 16), 90_000);
         assert_eq!(&sidx[20..28], &(40_000u64 * 9 / 100).to_be_bytes());
         assert_eq!(&sidx[28..36], &[0; 8], "first_offset");
-        assert_eq!(u16::from_be_bytes([sidx[38], sidx[39]]), 6);
+        assert_eq!(u16::from_be_bytes([sidx[38], sidx[39]]), 12, "two a slot");
         let mut offset = layout.header.len() as u64;
         for (k, size) in sizes.iter().enumerate() {
-            let at = 40 + k * 12;
-            assert_eq!(u64::from(u32_at(sidx, at)), *size, "slot {k}'s size");
+            // The slot's first part, then the rest: lasting nothing, no
+            // SAP, there to be the fragment after the first in FFmpeg's
+            // index (`mux::FIRST_PART`).
+            let at = 40 + 2 * k * 12;
+            let rest = at + 12;
+            assert_eq!(
+                u32_at(sidx, at) as usize,
+                mux::FIRST_PART,
+                "slot {k}'s first part"
+            );
+            assert_eq!(
+                u64::from(u32_at(sidx, at) + u32_at(sidx, rest)),
+                *size,
+                "slot {k}'s size"
+            );
+            assert_eq!(u32_at(sidx, rest + 4), 0, "slot {k}'s rest lasts nothing");
+            assert_eq!(
+                u32_at(sidx, rest + 8),
+                0,
+                "slot {k}'s rest starts with no SAP"
+            );
+            // Labelled half a second (`D`) before each cut, the first at
+            // the first key: the first slot to `D` before the second cut,
+            // the last from `D` before its cut to the film's end.
             let duration = if k == 5 {
-                6_000_000 - 5_040_000
+                6_000_000 - (5_040_000 - 500_000)
             } else {
                 1_000_000
             };
             assert_eq!(
                 u32_at(sidx, at + 4),
                 if k == 0 {
-                    // From the first key to the second cut.
-                    (1_040_000 - 40_000) * 9 / 100
+                    (1_040_000 - 500_000 - 40_000) * 9 / 100
                 } else {
                     duration * 9 / 100
                 },
@@ -689,9 +742,18 @@ mod tests {
             sizes: vec![size; count],
             exact: false,
         };
-        let layout = |plan| Layout::new(Bytes::new(), plan, (1, 90_000), None, 1_000_000);
-        assert!(layout(plan(65_535, 100)).is_ok());
-        assert!(layout(plan(65_536, 100)).is_err());
+        let layout = |plan| {
+            Layout::new(
+                Bytes::new(),
+                plan,
+                (1, 90_000, mux::DECODE_AHEAD_US),
+                None,
+                1_000_000,
+            )
+        };
+        // Two references a slot.
+        assert!(layout(plan(32_767, 10_000)).is_ok());
+        assert!(layout(plan(32_768, 10_000)).is_err());
         assert!(layout(plan(2, (1 << 31) - 1)).is_ok());
         assert!(layout(plan(2, 1 << 31)).is_err());
     }
@@ -703,12 +765,20 @@ mod tests {
     #[test]
     fn an_estimated_slot_is_labelled_a_gop_after_its_cut() {
         let plan = Plan::new(None, 1_000_000, 30_000_000, 6 * T);
-        let layout = Layout::new(Bytes::new(), plan, (1, 1000), None, 30_000_000).unwrap();
+        let layout = Layout::new(
+            Bytes::new(),
+            plan,
+            (1, 1000, mux::DECODE_AHEAD_US),
+            None,
+            30_000_000,
+        )
+        .unwrap();
         let sidx = &layout.header[..];
-        let durations: Vec<u32> = (0..5).map(|k| u32_at(sidx, 40 + k * 12 + 4)).collect();
-        // Slot 0 from 0 to 16 s, slot 1 from 16 to 22, ..., slot 3 from 28
-        // to the end at 30, slot 4 from the end.
-        assert_eq!(durations, vec![16_000, 6_000, 6_000, 2_000, 0]);
+        let durations: Vec<u32> = (0..5).map(|k| u32_at(sidx, 40 + 2 * k * 12 + 4)).collect();
+        // A GOP late less the half second its decode times run ahead (`D`):
+        // slot 0 from 0 to 15.5 s, slot 1 from 15.5 to 21.5, ..., slot 3
+        // from 27.5 to the end at 30, slot 4 from the end.
+        assert_eq!(durations, vec![15_500, 6_000, 6_000, 2_500, 0]);
         let mirrored = Plan::new(
             Some(&[entry(0, 0), entry(6 * T + 40_000, 500), entry(12 * T, 900)]),
             1_000,
@@ -722,15 +792,17 @@ mod tests {
     }
 
     /// **A slot's room for its chunks' headers**: 160 bytes for each half
-    /// second its segment lasts, and one more -- the chunks a segment that
-    /// long can touch, less the first.
+    /// second its segment lasts and two more -- the chunks a segment that
+    /// long can touch less the first, and one the first may be split into
+    /// -- and the slot's first part (`mux::FIRST_PART`).
     #[test]
     fn a_slot_has_room_for_its_chunks_headers() {
         assert_eq!(mux::CHUNK_OVERHEAD, 160);
-        assert_eq!(interleave_room(0), 160);
-        assert_eq!(interleave_room(499_999), 160);
-        assert_eq!(interleave_room(7_500_000), 16 * 160);
-        assert_eq!(interleave_room(-5), 160);
+        assert_eq!(mux::FIRST_PART, 8192);
+        assert_eq!(interleave_room(0), 2 * 160 + 8192);
+        assert_eq!(interleave_room(499_999), 2 * 160 + 8192);
+        assert_eq!(interleave_room(7_500_000), 17 * 160 + 8192);
+        assert_eq!(interleave_room(-5), 2 * 160 + 8192);
     }
 
     /// A run handed samples from a time makes whole the first slot cut at or
@@ -738,7 +810,14 @@ mod tests {
     #[test]
     fn a_run_from_a_time_makes_the_first_slot_cut_after_it() {
         let plan = Plan::new(None, 10_000, 10_000_000, T);
-        let layout = Layout::new(Bytes::new(), plan, (1, 90_000), None, 10_000_000).unwrap();
+        let layout = Layout::new(
+            Bytes::new(),
+            plan,
+            (1, 90_000, mux::DECODE_AHEAD_US),
+            None,
+            10_000_000,
+        )
+        .unwrap();
         assert_eq!(layout.first_slot_from(-5), 0);
         assert_eq!(layout.first_slot_from(0), 0);
         assert_eq!(layout.first_slot_from(1), 1);

@@ -466,23 +466,39 @@ impl Film {
 /// The producer: one thread per run, the film's packets in its order.
 pub struct FilmProducer {
     film: Arc<Film>,
+    /// Whether it reports the film's index when a job wants it: a source
+    /// with none -- a transport stream, a Matroska file without cues -- is
+    /// laid out by estimate.
+    indexed: bool,
 }
 
 impl FilmProducer {
     pub fn new(film: Arc<Film>) -> Arc<Self> {
-        Arc::new(Self { film })
+        Arc::new(Self {
+            film,
+            indexed: true,
+        })
+    }
+
+    /// The producer of a film whose index it does not report.
+    pub fn without_index(film: Arc<Film>) -> Arc<Self> {
+        Arc::new(Self {
+            film,
+            indexed: false,
+        })
     }
 }
 
 impl Producer for FilmProducer {
     fn start(&self, job: Job) -> Result<(), ProducerRefusal> {
         let film = self.film.clone();
-        std::thread::spawn(move || produce(&film, job));
+        let indexed = self.indexed;
+        std::thread::spawn(move || produce(&film, job, indexed));
         Ok(())
     }
 }
 
-fn produce(film: &Film, job: Job) {
+fn produce(film: &Film, job: Job, indexed: bool) {
     let Job {
         reader,
         from,
@@ -498,7 +514,7 @@ fn produce(film: &Film, job: Job) {
             return;
         }
     }
-    if wants_index && sink.index(film.index()).is_err() {
+    if wants_index && indexed && sink.index(film.index()).is_err() {
         return;
     }
     // As a demuxer seeks: to the sync sample at or before `from`, and on

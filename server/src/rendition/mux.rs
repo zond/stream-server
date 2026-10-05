@@ -35,6 +35,40 @@ use bytes::Bytes;
 /// The video clock: 90 kHz, as every MPEG system clock is.
 pub(crate) const VIDEO_TIMESCALE: u32 = 90_000;
 
+/// **How far a slot's decode times run ahead of its presentation times**
+/// (`D`). FFmpeg shows a picture at its decode time plus its composition
+/// offset plus `dts_shift`, the largest negative offset it has read so far
+/// (`mov_update_dts_shift`; `pkt->pts = pkt->dts + sc->dts_shift + ctts`,
+/// n4.4 `mov.c:8011`). Every offset written is the true one less `D`, so
+/// none is below `-D` while `D` covers a GOP's leading pictures and its
+/// reordering, and the film's first sample -- in the first `moof`, read
+/// with the header -- has exactly `-D`: `dts_shift` is `D` from the first
+/// packet to the last, and every picture is shown at its own time.
+/// Half a second: twelve frames at 24 a second, more than x264's and
+/// x265's leading pictures and reordering at their defaults.
+pub(crate) const DECODE_AHEAD_US: i64 = 500_000;
+
+/// **How long the first part of a slot is**: its first chunk's `moof`
+/// (after the `styp`, when there is one), padded with a `free` box; the
+/// slot's second part -- the first chunk's `mdat` and every other chunk --
+/// begins here, and the `sidx` gives each part a reference of its own.
+///
+/// FFmpeg's demuxer, seeking, reads the slot's first `moof` and then, as it
+/// seeks each other track to the sync sample, sets where it reads on to
+/// the fragment after that one in its index (`mov_seek_fragment`:
+/// `next_root_atom = frag_index.item[index + 1].moof_offset`, n4.4
+/// `mov.c:8081`). It knows of a slot's later chunks only once it has read
+/// them, so it went on at the next slot and skipped the rest of the one it
+/// landed in -- seconds of picture after every seek, in every version.
+/// With the second part referenced, the fragment after the first `moof` is
+/// the slot's own second part, and it reads on through the slot.
+pub(crate) const FIRST_PART: usize = 8 * 1024;
+
+/// The most samples of a track in a slot's first chunk, so that its `moof`
+/// fits [`FIRST_PART`] (`styp`, `mfhd` and two `traf`s, sixteen bytes a
+/// video sample and eight a sound one, and a `free` header).
+const FIRST_SAMPLES: usize = 300;
+
 /// The track ids: video is 1, audio is 2 (or 1 when there is no video).
 pub(crate) const VIDEO_TRACK: u32 = 1;
 
@@ -64,6 +98,17 @@ impl Formats {
             (VIDEO_TRACK, VIDEO_TIMESCALE)
         } else {
             (self.audio_track_id(), self.audio_timescale())
+        }
+    }
+
+    /// How far the indexed track's decode times run ahead of its
+    /// presentation times: `D` ([`DECODE_AHEAD_US`]) for a picture, none
+    /// for sound alone.
+    pub(crate) fn decode_ahead_us(&self) -> i64 {
+        if self.video.is_some() {
+            DECODE_AHEAD_US
+        } else {
+            0
         }
     }
 
@@ -868,7 +913,7 @@ pub(crate) fn sidx(
     timescale: u32,
     earliest: u64,
     first_offset: u64,
-    refs: &[(u32, u32)],
+    refs: &[(u32, u32, bool)],
 ) -> Vec<u8> {
     let mut body = Vec::with_capacity(28 + refs.len() * 12);
     body.extend_from_slice(&track.to_be_bytes());
@@ -877,10 +922,10 @@ pub(crate) fn sidx(
     body.extend_from_slice(&first_offset.to_be_bytes());
     body.extend_from_slice(&0u16.to_be_bytes()); // reserved
     body.extend_from_slice(&(refs.len() as u16).to_be_bytes());
-    for &(size, duration) in refs {
+    for &(size, duration, sap) in refs {
         body.extend_from_slice(&(size & 0x7fff_ffff).to_be_bytes());
         body.extend_from_slice(&duration.to_be_bytes());
-        body.extend_from_slice(&(1u32 << 31).to_be_bytes()); // starts with a SAP
+        body.extend_from_slice(&(u32::from(sap) << 31).to_be_bytes()); // starts with a SAP
     }
     full(b"sidx", 1, 0, &[&body])
 }
@@ -985,31 +1030,34 @@ fn sample_flags(key: bool) -> u32 {
     if key { 0x0200_0000 } else { 0x0101_0000 }
 }
 
-fn lay_video(samples: &[MuxSample], next_pts: Option<i64>, hevc: bool) -> Laid {
-    let pts: Vec<u64> = samples
+fn lay_video(samples: &[MuxSample], next_pts: Option<i64>, hevc: bool, first_slot: bool) -> Laid {
+    let pts: Vec<i64> = samples
         .iter()
-        .map(|sample| ticks(sample.pts_us, VIDEO_TIMESCALE))
+        .map(|sample| ticks(sample.pts_us, VIDEO_TIMESCALE) as i64)
         .collect();
-    // Decode times: the presentation times sorted, moved on so that the
-    // first is the first sample's presentation time -- the slot's sync
-    // sample, its `sidx` label. An open GOP's leading pictures (shown
-    // before the sync sample they follow) would otherwise put the slot's
-    // first decode time before its label, and FFmpeg 5.0 and later, which
-    // time a fragment by its `tfdt`, sought the sound to a time in the
-    // slot before (`docs/design/renditions.md`, *A slot per sync sample*).
-    let mut dts = pts.clone();
-    dts.sort_unstable();
-    let lead = match (pts.first(), dts.first()) {
+    let ahead = ticks(DECODE_AHEAD_US, VIDEO_TIMESCALE) as i64;
+    // Decode times: the presentation times sorted, moved so that the slot's
+    // first sample -- its sync sample, at its label -- decodes `D` before
+    // it is shown, and every other with them; none is after its own
+    // presentation time while `D` covers the leading pictures and the
+    // reordering. The film's first slot begins decoding at its first
+    // sample's presentation time instead ([`first_slot_dts`]).
+    let mut sorted = pts.clone();
+    sorted.sort_unstable();
+    let lead = match (pts.first(), sorted.first()) {
         (Some(first), Some(earliest)) => first - earliest,
         _ => 0,
     };
-    for at in &mut dts {
-        *at += lead;
-    }
-    let next = next_pts.map(|pts| ticks(pts, VIDEO_TIMESCALE));
+    let next = next_pts.map(|pts| ticks(pts, VIDEO_TIMESCALE) as i64);
+    let dts: Vec<i64> = if first_slot {
+        first_slot_dts(&pts, &sorted, next.map(|next| (next, next - ahead)))
+    } else {
+        sorted.iter().map(|at| at + lead - ahead).collect()
+    };
+    let next = next.map(|next| next - ahead);
     let mut entries = Vec::with_capacity(samples.len());
     let mut data = Vec::with_capacity(samples.len());
-    let mut last_duration = u64::from(VIDEO_TIMESCALE / 25);
+    let mut last_duration = i64::from(VIDEO_TIMESCALE / 25);
     for (index, sample) in samples.iter().enumerate() {
         let duration = match dts.get(index + 1) {
             Some(following) => following - dts[index],
@@ -1020,7 +1068,7 @@ fn lay_video(samples: &[MuxSample], next_pts: Option<i64>, hevc: bool) -> Laid {
         };
         last_duration = duration;
         let bytes = length_prefixed(&sample.data, hevc);
-        let offset = pts[index] as i64 - dts[index] as i64;
+        let offset = pts[index] - dts[index] - ahead;
         entries.push((
             duration as u32,
             bytes.len() as u32,
@@ -1032,11 +1080,52 @@ fn lay_video(samples: &[MuxSample], next_pts: Option<i64>, hevc: bool) -> Laid {
     Laid::new(
         VIDEO_TRACK,
         VIDEO_TIMESCALE,
-        dts.first().copied().unwrap_or(0),
+        dts.first().map_or(0, |first| (*first).max(0) as u64),
         entries,
         data,
         true,
     )
+}
+
+/// **The film's first slot's decode times**: from its first sample's
+/// presentation time (nothing decodes before the film starts, and that
+/// sample's offset of exactly `-D` is what sets FFmpeg's `dts_shift` to `D`
+/// when it reads the header) to `D` before the next slot's sync sample,
+/// where the next slot's begin (`next`: that sample's presentation time and
+/// its decode time). The presentation times sorted, drawn in by the slot's
+/// span less `D` over its span, and never after a sample's own
+/// presentation time nor after any presentation time still to be decoded
+/// (a B-frame shown before the P-frame decoded ahead of it), one tick
+/// apart where those meet.
+fn first_slot_dts(pts: &[i64], sorted: &[i64], next: Option<(i64, i64)>) -> Vec<i64> {
+    let Some(&start) = sorted.first() else {
+        return Vec::new();
+    };
+    let drawn = |at: i64| -> i64 {
+        match next {
+            Some((shown, decoded)) if shown > start && decoded > start => {
+                start
+                    + ((at - start) as i128 * (decoded - start) as i128 / (shown - start) as i128)
+                        as i64
+            }
+            _ => at,
+        }
+    };
+    // The latest each sample may decode at: before every presentation
+    // time from it on, a tick apart where they meet.
+    let mut caps = vec![0i64; pts.len()];
+    let mut least = i64::MAX;
+    for at in (0..pts.len()).rev() {
+        least = least
+            .min(pts[at])
+            .min(caps.get(at + 1).map_or(i64::MAX, |cap| cap - 1));
+        caps[at] = least;
+    }
+    sorted
+        .iter()
+        .zip(&caps)
+        .map(|(at, cap)| drawn(*at).min(*cap))
+        .collect()
 }
 
 fn lay_audio(
@@ -1222,7 +1311,7 @@ pub(crate) fn media_segment(
     let hevc = matches!(formats.video, Some(TrackFormat::Hevc { .. }));
     let mut laid = Vec::with_capacity(2);
     if formats.video.is_some() && !video.is_empty() {
-        laid.push(lay_video(video, video_next, hevc));
+        laid.push(lay_video(video, video_next, hevc, slot == 0));
     }
     if formats.audio.is_some() && !audio.is_empty() {
         laid.push(lay_audio(
@@ -1242,6 +1331,22 @@ pub(crate) fn media_segment(
     if chunks.is_empty() {
         // Nothing at all: a `moof` with only its `mfhd`, and an empty `mdat`.
         chunks.push(Vec::new());
+    }
+    // The first chunk's `moof` must fit the slot's first part: at most
+    // FIRST_SAMPLES of a track's samples in it, the rest a chunk of their own.
+    let first = chunks[0].clone();
+    if first.iter().any(|range| range.len() > FIRST_SAMPLES) {
+        let kept: Vec<std::ops::Range<usize>> = first
+            .iter()
+            .map(|range| range.start..range.end.min(range.start + FIRST_SAMPLES))
+            .collect();
+        let rest: Vec<std::ops::Range<usize>> = first
+            .iter()
+            .zip(&kept)
+            .map(|(range, kept)| kept.end..range.end)
+            .collect();
+        chunks[0] = kept;
+        chunks.insert(1, rest);
     }
     for (index, ranges) in chunks.iter().enumerate() {
         let mfhd = full(
@@ -1263,7 +1368,14 @@ pub(crate) fn media_segment(
                 .iter()
                 .map(|(track, range)| traf(track, range.clone(), 0).len())
                 .sum::<usize>();
-        let mut offset = (sized + 8) as u32;
+        // The first chunk's `mdat` begins the slot's second part
+        // ([`FIRST_PART`]), a `free` box between.
+        let pad = if index == 0 {
+            FIRST_PART - out.len() - sized
+        } else {
+            0
+        };
+        let mut offset = (sized + pad + 8) as u32;
         let mut trafs = Vec::with_capacity(tracks.len());
         for (track, range) in &tracks {
             trafs.push(traf(track, range.clone(), offset));
@@ -1281,6 +1393,10 @@ pub(crate) fn media_segment(
             .flat_map(|(track, range)| track.data[range.clone()].iter().map(|data| data.as_ref()))
             .collect();
         out.extend_from_slice(&moof);
+        if pad > 0 {
+            out.extend_from_slice(&super::layout::free_header(pad as u64));
+            out.resize(out.len() + pad - 8, 0);
+        }
         out.extend_from_slice(&bx(b"mdat", &payload));
     }
     Bytes::from(out)
@@ -1478,6 +1594,7 @@ mod tests {
                 sample(80_000, false),
             ],
             Some(160_000),
+            false,
             false,
         );
         assert_eq!(laid.times[0], 0);
@@ -1770,16 +1887,70 @@ mod tests {
         assert!(*numbers.last().unwrap() <= 8 * 4096);
     }
 
-    /// **An open GOP's slot begins, in decode time, at its sync sample**:
-    /// decode order CRA (shown at 10 s), two leading pictures shown before
-    /// it, then the rest. The decode times are the presentation times
-    /// sorted and moved on to start at the CRA's: the first `moof`'s `tfdt`
-    /// is the slot's `sidx` label. Before, it was the first leading
-    /// picture's time, 80 ms before the label, and FFmpeg 5.0 and later
-    /// (which time a fragment by its `tfdt`) sought the sound to that time
-    /// -- in the slot before -- and 6.1 landed the picture there too.
+    /// `(track, decode time, composition offset, moof)`.
+    type Timed = (u32, i64, i64, usize);
+
+    /// Every sample of a fragment as FFmpeg's MP4 demuxer times it:
+    /// `(track, decode time, composition offset, moof)` on the 90 kHz clock,
+    /// the decode times from each `moof`'s `tfdt` (5.0 on; 4.4 takes the
+    /// first `moof`'s from the slot's `sidx` label, which the layout makes
+    /// the same).
+    fn timed(fragment: &[u8]) -> Vec<Timed> {
+        let u32_at =
+            |data: &[u8], at: usize| u32::from_be_bytes(data[at..at + 4].try_into().unwrap());
+        let mut out = Vec::new();
+        let mut at = 0;
+        let mut moof = 0;
+        while at < fragment.len() {
+            let size = u32_at(fragment, at) as usize;
+            if &fragment[at + 4..at + 8] == b"moof" {
+                let mut traf = at + 8 + 16;
+                while traf < at + size {
+                    let traf_size = u32_at(fragment, traf) as usize;
+                    let track = u32_at(fragment, traf + 8 + 12);
+                    let tfdt = traf + 8 + 16;
+                    let mut time =
+                        u64::from_be_bytes(fragment[tfdt + 12..tfdt + 20].try_into().unwrap())
+                            as i64;
+                    let trun = tfdt + 20;
+                    let flags = u32_at(fragment, trun + 8) & 0xff_ffff;
+                    let count = u32_at(fragment, trun + 12) as usize;
+                    let step = if flags & 0x800 != 0 { 16 } else { 8 };
+                    for sample in 0..count {
+                        let entry = trun + 20 + sample * step;
+                        let offset = if step == 16 {
+                            u32_at(fragment, entry + 12) as i32 as i64
+                        } else {
+                            0
+                        };
+                        out.push((track, time, offset, moof));
+                        time += i64::from(u32_at(fragment, entry));
+                    }
+                    traf += traf_size;
+                }
+                moof += 1;
+            }
+            at += size;
+        }
+        out
+    }
+
+    /// **FFmpeg shows every picture at its own time** -- modelled as it
+    /// computes it (`pkt->pts = pkt->dts + sc->dts_shift + ctts`, n4.4
+    /// `mov.c:8011`, with `dts_shift` the largest negative offset read so
+    /// far, `mov_update_dts_shift`), so it holds on every CI job. The film's
+    /// first slot -- a closed GOP with B-frames, read with the header --
+    /// and a later one of an open GOP (a CRA, two leading pictures shown
+    /// before it, B-frames after), read straight after it or alone after a
+    /// seek: every picture's presentation time is the source's, and
+    /// `dts_shift` is `D` from the first sample on and never grows. Each
+    /// slot's first decode time is its label: the first slot's sync
+    /// sample's time, a later slot's less `D`. With the decode times the
+    /// presentation times sorted and moved to start at the sync sample,
+    /// the open GOP's leading pictures raised `dts_shift` and every picture
+    /// from that slot on was three frames late.
     #[test]
-    fn an_open_gop_slot_begins_at_its_sync_sample() {
+    fn ffmpeg_shows_every_picture_at_its_own_time() {
         let formats = Formats {
             video: Some(TrackFormat::H264 {
                 width: 320,
@@ -1790,16 +1961,110 @@ mod tests {
             audio: None,
         };
         let frame = 40_000;
-        let order = [0, -2, -1, 3, 1, 2, 6, 4, 5];
-        let video: Vec<MuxSample> = order
-            .iter()
-            .map(|at| sample(10_000_000 + at * frame, *at == 0))
-            .collect();
-        let fragment = media_segment(&formats, 3, true, &video, Some(10_280_000), &[], None);
-        let samples = indexed(&fragment);
-        assert_eq!(samples[0].1, 10_000_000, "the CRA's decode time is its own");
-        let dts: Vec<i64> = samples.iter().map(|sample| sample.1).collect();
-        assert!(dts.windows(2).all(|pair| pair[0] < pair[1]), "{dts:?}");
-        assert_eq!(dts.last(), Some(&(10_000_000 + 8 * frame)));
+        let film = |start: i64, order: &[i64]| -> Vec<MuxSample> {
+            order
+                .iter()
+                .enumerate()
+                .map(|(at, shown)| sample(start + shown * frame, at == 0))
+                .collect()
+        };
+        // Decode order, in frames from the slot's sync sample.
+        let first = film(0, &[0, 3, 1, 2, 6, 4, 5, 9, 7, 8]);
+        let open = film(100 * frame, &[0, -2, -1, 3, 1, 2, 6, 4, 5]);
+        let shown = |samples: &[MuxSample]| -> Vec<i64> {
+            samples
+                .iter()
+                .map(|sample| sample.pts_us * 9 / 100)
+                .collect()
+        };
+        let ahead = DECODE_AHEAD_US * 9 / 100;
+        let slot0 = timed(&media_segment(
+            &formats,
+            0,
+            true,
+            &first,
+            Some(8 * frame),
+            &[],
+            None,
+        ));
+        let slot1 = timed(&media_segment(
+            &formats,
+            1,
+            true,
+            &open,
+            Some(20 * frame),
+            &[],
+            None,
+        ));
+        assert_eq!(slot0[0].1, 0, "the first slot decodes from its sync sample");
+        assert_eq!(
+            slot1[0].1,
+            100 * frame * 9 / 100 - ahead,
+            "a later slot, D before it"
+        );
+        let read = |slots: &[(&[Timed], Vec<i64>)]| {
+            let mut shift = 0;
+            for (k, (samples, want)) in slots.iter().enumerate() {
+                for ((_, dts, offset, _), want) in samples.iter().zip(want) {
+                    shift = shift.max(-offset);
+                    assert_eq!(shift, ahead, "slot {k}: dts_shift is D, and stays D");
+                    assert_eq!(dts + shift + offset, *want, "slot {k}: shown at its time");
+                }
+            }
+        };
+        // Straight through, and the header's read then a seek to the second.
+        read(&[(&slot0, shown(&first)), (&slot1, shown(&open))]);
+        read(&[
+            (&slot0[..1], shown(&first)[..1].to_vec()),
+            (&slot1, shown(&open)),
+        ]);
+    }
+    /// **A slot's first part is always `FIRST_PART` long**: its first
+    /// chunk's `moof` padded with a `free` box, the `mdat` right after --
+    /// however many samples the first half second holds: past
+    /// `FIRST_SAMPLES` of a track they go into a chunk of their own.
+    #[test]
+    fn a_slots_first_part_is_always_the_same_length() {
+        let formats = Formats {
+            video: Some(TrackFormat::H264 {
+                width: 320,
+                height: 240,
+                csd0: Bytes::from_static(X264_SPS),
+                csd1: Bytes::from_static(X264_PPS),
+            }),
+            audio: None,
+        };
+        for count in [1i64, 25, 700] {
+            let video: Vec<MuxSample> = (0..count)
+                .map(|at| sample(4_000_000 + at * 500_000 / count, at == 0))
+                .collect();
+            let fragment = media_segment(&formats, 4, true, &video, Some(4_500_000), &[], None);
+            let moof = u32::from_be_bytes(fragment[0..4].try_into().unwrap()) as usize;
+            assert_eq!(&fragment[moof + 4..moof + 8], b"free", "{count} samples");
+            let free = u32::from_be_bytes(fragment[moof..moof + 4].try_into().unwrap()) as usize;
+            assert_eq!(moof + free, FIRST_PART, "{count} samples");
+            assert_eq!(&fragment[FIRST_PART + 4..FIRST_PART + 8], b"mdat");
+            let samples = timed(&fragment);
+            assert_eq!(samples.len(), count as usize);
+            let first_moof = samples.iter().filter(|sample| sample.3 == 0).count();
+            assert!(
+                first_moof <= FIRST_SAMPLES,
+                "{count}: {first_moof} in the first moof"
+            );
+        }
+        let sound_only = Formats {
+            video: None,
+            audio: Some(TrackFormat::Aac {
+                sample_rate: 48_000,
+                channels: 2,
+                csd0: Bytes::from_static(&[0x11, 0x90]),
+            }),
+        };
+        assert_eq!(
+            sound_only.decode_ahead_us(),
+            0,
+            "sound decodes when it is shown"
+        );
+        assert_eq!(formats.decode_ahead_us(), DECODE_AHEAD_US);
     }
 }

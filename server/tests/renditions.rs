@@ -287,7 +287,9 @@ impl Header {
     /// seeking the sound finds its slot by the video's times, the same slot
     /// -- naming the slots, which begin right after it, or after the
     /// sound's `sidx` when one follows (an estimated layout's: the same
-    /// slots, labelled early), and end where the file does.
+    /// slots, labelled early), and end where the file does. Two references
+    /// a slot: its first part (`mux::FIRST_PART`, 8 KiB), with the slot's
+    /// duration and a SAP, and the rest, lasting nothing, with none.
     fn of(head: &[u8], total: u64) -> Self {
         let size = |at: usize| u32_at(head, at) as usize;
         assert_eq!(&head[4..8], b"ftyp");
@@ -300,7 +302,9 @@ impl Header {
         assert_eq!(u32_at(sidx, 12), 1, "the video track");
         assert_eq!(u32_at(sidx, 16), 90_000, "on the video's clock");
         let after = u64::from_be_bytes(sidx[28..36].try_into().unwrap()) as usize;
-        let count = u16::from_be_bytes([sidx[38], sidx[39]]) as usize;
+        let refs = u16::from_be_bytes([sidx[38], sidx[39]]) as usize;
+        assert_eq!(refs % 2, 0, "two references a slot");
+        let count = refs / 2;
         let sound = (after > 0).then(|| {
             let at = init_len + sidx.len();
             let sound = &head[at..at + size(at)];
@@ -313,11 +317,14 @@ impl Header {
             assert_eq!(u32_at(sound, 12), 2, "the sound's track");
             assert_eq!(u32_at(sound, 16), 90_000, "on the video's clock");
             assert_eq!(&sound[28..36], &[0; 8], "slots begin right after it");
-            assert_eq!(u16::from_be_bytes([sound[38], sound[39]]) as usize, count);
+            assert_eq!(u16::from_be_bytes([sound[38], sound[39]]) as usize, refs);
             let durations = (0..count)
                 .map(|k| {
-                    let at = 40 + k * 12;
-                    assert_eq!(u32_at(sound, at), u32_at(sidx, at), "slot {k}'s size");
+                    let at = 40 + 2 * k * 12;
+                    for part in [at, at + 12] {
+                        assert_eq!(u32_at(sound, part), u32_at(sidx, part), "slot {k}'s size");
+                    }
+                    assert_eq!(u32_at(sound, at + 12 + 4), 0, "slot {k}'s rest");
                     u32_at(sound, at + 4)
                 })
                 .collect();
@@ -329,9 +336,13 @@ impl Header {
         let mut offset = (init_len + sidx.len() + after) as u64;
         let slots = (0..count)
             .map(|k| {
-                let at = 40 + k * 12;
-                let slot_size = u64::from(u32_at(sidx, at));
+                let at = 40 + 2 * k * 12;
+                let rest = at + 12;
+                assert_eq!(u32_at(sidx, at), FIRST_PART, "slot {k}'s first part");
                 assert_eq!(u32_at(sidx, at + 8), 1 << 31, "slot {k} starts with a SAP");
+                assert_eq!(u32_at(sidx, rest + 4), 0, "slot {k}'s rest lasts nothing");
+                assert_eq!(u32_at(sidx, rest + 8), 0, "slot {k}'s rest has no SAP");
+                let slot_size = u64::from(u32_at(sidx, at) + u32_at(sidx, rest));
                 let slot = (offset, slot_size, u32_at(sidx, at + 4));
                 offset += slot_size;
                 slot
@@ -355,16 +366,24 @@ impl Header {
 }
 
 /// A slot's fragment: a `styp` unless the slot opens at its `sidx` label
-/// ([`opens_at_label`]), a `moof` and an `mdat` per chunk, then a `free`
-/// box to the slot's end whose last bytes are zeros.
+/// ([`opens_at_label`]), the first chunk's `moof` and a `free` box to the
+/// slot's first part's end (`FIRST_PART`), that chunk's `mdat`, a `moof`
+/// and an `mdat` per later chunk, then a `free` box to the slot's end whose
+/// last bytes are zeros.
 fn fragment_of(slot: &[u8]) -> &[u8] {
     let boxes = Boxes::of(slot);
     let kinds: Vec<&str> = boxes.iter().map(|(kind, _)| kind.as_str()).collect();
     let styp = usize::from(kinds[0] == "styp");
     let last = kinds.len() - 1;
     assert_eq!(kinds[last], "free", "{kinds:?}");
-    assert!(last > styp, "{kinds:?}");
-    for pair in kinds[styp..last].chunks(2) {
+    assert!(last > styp + 2, "{kinds:?}");
+    assert_eq!(kinds[styp..styp + 3], ["moof", "free", "mdat"], "{kinds:?}");
+    let first_part: usize = boxes[..styp + 2]
+        .iter()
+        .map(|(_, body)| body.len() + 8)
+        .sum();
+    assert_eq!(first_part, FIRST_PART as usize, "the first part");
+    for pair in kinds[styp + 3..last].chunks(2) {
         assert_eq!(pair, ["moof", "mdat"], "{kinds:?}");
     }
     let free = boxes[last].1.len() + 8;
@@ -431,9 +450,15 @@ fn parse_segment(bytes: &[u8]) -> Segment {
     while let Some((kind, moof)) = boxes.next() {
         assert_eq!(kind, "moof");
         let moof_at = at;
-        let (mdat_kind, mdat) = boxes.next().expect("an mdat after each moof");
+        let mut next = boxes.next().expect("an mdat after each moof");
+        let mut padding = 0;
+        if next.0 == "free" {
+            padding = 8 + next.1.len();
+            next = boxes.next().expect("an mdat after the first part");
+        }
+        let (mdat_kind, mdat) = next;
         assert_eq!(mdat_kind, "mdat");
-        let mdat_at = moof_at + 8 + moof.len() + 8;
+        let mdat_at = moof_at + 8 + moof.len() + padding + 8;
         let mut expected_at = mdat_at;
         let mut chunk = Vec::new();
         for (kind, body) in Boxes::of(moof) {
@@ -550,7 +575,9 @@ impl Segment {
         let mut dts = traf.tfdt as i64;
         let mut out = Vec::new();
         for (&(duration, size, offset), data) in traf.samples.iter().zip(&traf.data) {
-            let pts_us = (dts + i64::from(offset)) * 1_000_000 / 90_000;
+            // As FFmpeg shows it: its `dts_shift` is `D`, which the film's
+            // first sample's offset sets (`mux.rs`).
+            let pts_us = (dts + i64::from(offset) + AHEAD_TICKS) * 1_000_000 / 90_000;
             assert_eq!(
                 u32_at(data, 0) as usize,
                 size as usize - 4,
@@ -603,7 +630,7 @@ fn cut(knobs: &Knobs, n: i64) -> i64 {
 /// audio lead (64 ms) early.
 fn expected(knobs: &Knobs, n: i64) -> (Vec<i64>, Vec<i64>) {
     let (from, to) = (cut(knobs, n), cut(knobs, n + 1));
-    let lead = |cut: i64| cut.saturating_sub(64_000);
+    let lead = |cut: i64| cut.saturating_sub(AUDIO_LEAD_US);
     let video = knobs
         .video_frames()
         .into_iter()
@@ -618,13 +645,36 @@ fn expected(knobs: &Knobs, n: i64) -> (Vec<i64>, Vec<i64>) {
     (video, audio)
 }
 
+/// How long a slot's first part is (`mux::FIRST_PART`).
+const FIRST_PART: u32 = 8 * 1024;
+
+/// How far a slot's decode times run ahead of its presentation times
+/// (`D`, `mux::DECODE_AHEAD_US`): half a second, on the 90 kHz clock.
+const AHEAD_TICKS: i64 = 45_000;
+
+/// How far before a segment's cut its sound begins: `D` and 64 ms
+/// (`run::AUDIO_LEAD_US`).
+const AUDIO_LEAD_US: i64 = 564_000;
+
+/// Where a slot whose sync sample is shown at `key_us` begins decoding:
+/// `D` before it -- the film's first slot at it.
+fn decodes_from(key_us: i64) -> u64 {
+    let key = key_us * 90_000 / 1_000_000;
+    if key_us == 0 {
+        0
+    } else {
+        (key - AHEAD_TICKS) as u64
+    }
+}
+
 /// The room a slot is given for its chunks' headers, for a segment
 /// `duration_us` long: a segment touches at most one chunk per 500 ms and
-/// one more, and each chunk past the first is a `moof` (with its `mfhd`),
-/// two `traf`s (`tfhd`, `tfdt`, a `trun` header) and an `mdat` header --
-/// 160 bytes.
+/// one more, the first may be split in two, and each chunk past the first
+/// is a `moof` (with its `mfhd`), two `traf`s (`tfhd`, `tfdt`, a `trun`
+/// header) and an `mdat` header -- 160 bytes; and the first part's padding
+/// (`FIRST_PART`).
 fn chunk_room(duration_us: i64) -> u64 {
-    (duration_us as u64 / 500_000 + 1) * 160
+    (duration_us as u64 / 500_000 + 2) * 160 + u64::from(FIRST_PART)
 }
 
 /// `cut - SEEK_BACK`, at the film's start at the earliest: what a run made
@@ -766,9 +816,19 @@ fn the_sidx_mirrors_the_sources_index() -> anyhow::Result<()> {
             headroom(end - place(start)) + chunk_room(next - start),
             "slot {k}'s size"
         );
+        // Labelled at its first decode time: a slot after the first `D`
+        // before its cut.
+        let label = |k: i64, at: i64| {
+            if k == 0 {
+                at
+            } else {
+                at - AHEAD_TICKS * 100 / 9
+            }
+        };
+        let end = if k == 59 { next } else { label(k + 1, next) };
         assert_eq!(
             i64::from(*duration),
-            (next - start) * 9 / 100,
+            (end - label(k, start)) * 9 / 100,
             "slot {k}'s duration"
         );
     }
@@ -802,12 +862,12 @@ fn without_an_index_the_slots_are_estimated() -> anyhow::Result<()> {
         // slot to the end, the rest none.
         assert_eq!(*duration, if k == 0 { 900_000 } else { 0 }, "slot {k}");
     }
-    // The sound's labels are each cut less its lead (64 ms), not a GOP
-    // late: the slot FFmpeg picks for the sound by the picture's sync
-    // sample is then never one before the picture's.
+    // The sound's labels are each cut less its lead (564 ms: `D` and 64 ms),
+    // not a GOP late: the slot FFmpeg picks for the sound by the picture's
+    // sync sample's decode time is then never one before the picture's.
     let (earliest, durations) = header.sound.as_ref().expect("the sound's sidx");
     assert_eq!(*earliest, 0);
-    let lead = 64 * 90;
+    let lead = (AUDIO_LEAD_US * 9 / 100) as u32;
     for (k, duration) in durations.iter().enumerate() {
         let expected = match k {
             0 => 90_000 - lead,
@@ -876,11 +936,7 @@ fn each_segment_is_cut_at_the_first_key_at_or_after_its_time() -> anyhow::Result
         assert_eq!(segment.sequence, first_sequence(n as u64));
         let video = segment.track(1).expect("video in every segment here");
         let key = knobs.key_at_or_after(n * T_US).unwrap();
-        assert_eq!(
-            video.tfdt,
-            (key * 90_000 / 1_000_000) as u64,
-            "segment {n}'s tfdt"
-        );
+        assert_eq!(video.tfdt, decodes_from(key), "segment {n}'s tfdt");
         let (want_video, want_audio) = expected(&knobs, n);
         assert_eq!(segment.video_pts(&knobs), want_video, "segment {n}'s video");
         assert_eq!(segment.audio_pts(), want_audio, "segment {n}'s audio");
@@ -924,12 +980,16 @@ fn a_modelled_seek_lands_within_a_gop_of_its_target() -> anyhow::Result<()> {
         })
         .collect();
     for target_ms in [1_000i64, 7_100, 11_000, 30_000, 33_500, 47_900, 59_000] {
-        let target = (target_ms * 90) as u64;
+        // FFmpeg seeks by the time less its `dts_shift`, `D`.
+        let target = (target_ms * 90 - AHEAD_TICKS) as u64;
         let slot = labels.iter().rposition(|label| *label <= target).unwrap();
         let segment = parse_segment(fragment_of(header.slot(&file, slot)));
         let (track, first, _) = segment.chunks[0][0];
         assert_eq!(track, 1, "the first moof begins with the picture");
-        let landed_us = first as i64 * 1000 / 90;
+        // The sync sample's decode time is `D` before it is shown -- the
+        // film's first slot's at it.
+        let ahead = if slot == 0 { 0 } else { AHEAD_TICKS };
+        let landed_us = (first as i64 + ahead) * 1000 / 90;
         let frame = landed_us * i64::from(knobs.fps) / 1_000_000;
         assert!(
             knobs.is_key(frame),
@@ -939,6 +999,59 @@ fn a_modelled_seek_lands_within_a_gop_of_its_target() -> anyhow::Result<()> {
         assert!(
             landed_us <= target_us && target_us - landed_us < gop_us,
             "{target_ms} ms landed at {landed_us} us, in slot {slot}"
+        );
+    }
+    Ok(())
+}
+
+/// **After a seek FFmpeg reads on through the slot it landed in** --
+/// modelled, so it holds on every CI job. Seeking, it reads the slot's
+/// first `moof` and then, seeking each other track, goes on from the
+/// fragment after that one in its index (`mov_seek_fragment`:
+/// `next_root_atom = frag_index.item[index + 1].moof_offset`): every slot
+/// has a second `sidx` reference, at the first chunk's `mdat`, so that
+/// fragment is the slot's own rest -- its first chunk's samples and every
+/// later chunk -- and not the next slot. With a slot one reference, the
+/// fragment after its first `moof` was the next slot, and every seek
+/// skipped the rest of the slot it landed in (2.4 s of a film with a key
+/// every 2.8 s, in FFmpeg 4.4, 6.1 and master alike).
+#[test]
+fn after_a_seek_ffmpeg_reads_on_through_the_slot() -> anyhow::Result<()> {
+    let knobs = Knobs {
+        gop: 60,
+        ..Knobs::default()
+    };
+    let fixture = Fixture::quick(knobs.clone())?;
+    let token = fixture
+        .handle
+        .publish_rendition(&fixture.id, spec(60_000, 6000, 0), None)?;
+    let file = fixture.file(&token);
+    let header = Header::of(&file, file.len() as u64);
+    let sidx = &file[header.init_len..];
+    for (k, (offset, size, _)) in header.slots.iter().enumerate() {
+        // The reference after the slot's first: where FFmpeg reads on.
+        let at = 40 + (2 * k + 1) * 12;
+        let first = u64::from(u32_at(sidx, at - 12));
+        let rest = offset + first;
+        assert!(rest < offset + size, "slot {k}'s rest is inside it");
+        assert_eq!(
+            &file[rest as usize + 4..rest as usize + 8],
+            b"mdat",
+            "slot {k}"
+        );
+        // From there on, in the file's order, every sample of the slot.
+        let slot = header.slot(&file, k);
+        let segment = parse_segment(fragment_of(slot));
+        let first_moof = Boxes::of(slot)
+            .iter()
+            .position(|(kind, _)| kind == "moof")
+            .unwrap();
+        assert_eq!(first_moof, 0, "slot {k} opens at its label");
+        assert!(segment.chunks.len() >= 4, "slot {k}: 2.4 s, chunks");
+        assert_eq!(
+            segment.track(1).unwrap().samples.len(),
+            knobs.gop as usize,
+            "slot {k}: the whole GOP"
         );
     }
     Ok(())
@@ -1038,7 +1151,7 @@ fn a_run_discards_what_precedes_its_cut() -> anyhow::Result<()> {
     assert_eq!(want_video.first(), Some(&key));
     assert_eq!(segment.video_pts(&knobs), want_video);
     assert_eq!(segment.audio_pts(), want_audio);
-    assert_eq!(segment.track(1).unwrap().tfdt, (key * 90 / 1000) as u64);
+    assert_eq!(segment.track(1).unwrap().tfdt, decodes_from(key));
     Ok(())
 }
 
@@ -1529,7 +1642,7 @@ fn a_far_request_starts_a_run_and_a_third_takes_the_least_recently_asked() -> an
     let probe = fixture.probe(&token);
     assert_eq!((probe.runs_started, probe.live_runs), (2, 2));
     assert_eq!(probe.run_from, Some(40));
-    assert_eq!(segment.track(1).unwrap().tfdt, (key * 90 / 1000) as u64);
+    assert_eq!(segment.track(1).unwrap().tfdt, decodes_from(key));
     assert!(!runs[0].stopped(), "the first run is left where it is");
 
     fixture.segment(&token, 20);

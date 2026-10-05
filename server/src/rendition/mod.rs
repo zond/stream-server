@@ -921,14 +921,10 @@ impl Rendition {
     /// would jump to ([`layout::Layout::slot_for_time`]) to the one for
     /// [`PREPARED_AFTER`] after it, in order, so one run makes them all.
     ///
-    /// Why the film before it: FFmpeg's MP4 demuxer seeks a time to the
-    /// slot whose label is at or before the time less the picture's
-    /// largest negative composition offset (`dts_shift`, a frame or two of
-    /// a film with B-frames), so a start on a cut -- a phone paused on a
-    /// key frame -- is asked for in the slot before; and zond's TV asked for
-    /// a slot some twelve seconds earlier still (`docs/design/renditions.md`,
-    /// *Prepared before the load*). The film after it is a slot in hand once
-    /// it plays.
+    /// Why the film before it: zond's TV has asked first for a slot up to
+    /// some twelve seconds before the start (`docs/design/renditions.md`,
+    /// *Prepared before the load*), which FFmpeg's seek does not explain.
+    /// The film after it is a slot in hand once it plays.
     ///
     /// Its first requests then find these in the ring -- held by its cap
     /// like any slot ([`RING_CAP`]: slot 0 with its run's lookahead and the
@@ -1103,7 +1099,7 @@ impl Rendition {
                     layout::Layout::new(
                         init,
                         plan,
-                        (track, timescale),
+                        (track, timescale, formats.decode_ahead_us()),
                         formats.sound_beside_picture(),
                         self.duration_us(),
                     )

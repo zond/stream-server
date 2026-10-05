@@ -8,7 +8,6 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -40,6 +39,11 @@ struct Fixture {
 
 impl Fixture {
     fn start(recipe: Recipe, tuning: RenditionTuning) -> anyhow::Result<Self> {
+        Self::start_with(recipe, tuning, true)
+    }
+
+    /// [`Self::start`], the producer reporting the film's index or not.
+    fn start_with(recipe: Recipe, tuning: RenditionTuning, indexed: bool) -> anyhow::Result<Self> {
         let config_dir = tempfile::tempdir()?;
         let cache_dir = tempfile::tempdir()?;
         let files = tempfile::tempdir()?;
@@ -60,7 +64,11 @@ impl Fixture {
             name: None,
         })?;
         handle.set_rendition_tuning(tuning);
-        handle.install_producer(FilmProducer::new(film.clone()));
+        handle.install_producer(if indexed {
+            FilmProducer::new(film.clone())
+        } else {
+            FilmProducer::without_index(film.clone())
+        });
         Ok(Self {
             handle,
             lan: lan.to_string(),
@@ -110,8 +118,8 @@ impl Fixture {
     }
 }
 
-/// The slots of a rendition's file by its `sidx`: `(offset, size, start in
-/// microseconds)` each.
+/// The slots of a rendition's file by its `sidx`: `(offset, size, label
+/// in microseconds)` each.
 fn slots(file: &[u8]) -> Vec<(u64, u64, i64)> {
     let u32_at = |at: usize| u32::from_be_bytes(file[at..at + 4].try_into().unwrap());
     let mut at = 0;
@@ -125,48 +133,109 @@ fn slots(file: &[u8]) -> Vec<(u64, u64, i64)> {
     let first = u64::from_be_bytes(file[sidx + 28..sidx + 36].try_into().unwrap());
     let count = u16::from_be_bytes([file[sidx + 38], file[sidx + 39]]) as usize;
     let mut offset = (sidx + size) as u64 + first;
-    (0..count)
+    // Two references a slot: its first part, and the rest.
+    (0..count / 2)
         .map(|k| {
-            let size = u64::from(u32_at(sidx + 40 + 12 * k) & 0x7fff_ffff);
+            let at = sidx + 40 + 24 * k;
+            let size = u64::from((u32_at(at) & 0x7fff_ffff) + (u32_at(at + 12) & 0x7fff_ffff));
             let slot = (offset, size, time * 1_000_000 / timescale);
             offset += size;
-            time += i64::from(u32_at(sidx + 44 + 12 * k));
+            time += i64::from(u32_at(at + 4)) + i64::from(u32_at(at + 16));
             slot
         })
         .collect()
 }
 
-/// Every packet `ffprobe` lists in `path`: `(track, presentation time in
-/// microseconds)`, each track's sorted.
-fn packets_of(path: &Path) -> anyhow::Result<Vec<(TrackKind, Vec<i64>)>> {
-    let output = Command::new("ffprobe")
+/// The packets `ffprobe` reads from `input` -- with `-read_intervals
+/// intervals` when given -- in the order it reads them: `(track,
+/// presentation time in microseconds, key)`.
+fn read_packets(
+    input: &str,
+    intervals: Option<&str>,
+) -> anyhow::Result<Vec<(TrackKind, i64, bool)>> {
+    let mut command = Command::new("ffprobe");
+    command.args(["-v", "error"]);
+    if let Some(intervals) = intervals {
+        command.args(["-read_intervals", intervals]);
+    }
+    let output = command
         .args([
-            "-v",
-            "error",
             "-of",
             "csv=p=0",
             "-show_entries",
-            "packet=stream_index,pts_time",
+            "packet=stream_index,pts_time,flags",
         ])
-        .arg(path)
+        .arg(input)
         .output()?;
     anyhow::ensure!(output.status.success(), "ffprobe failed");
-    let mut video = Vec::new();
-    let mut audio = Vec::new();
+    let mut out = Vec::new();
     for line in String::from_utf8(output.stdout)?.lines() {
-        let Some((index, pts)) = line.split_once(',') else {
+        let fields: Vec<&str> = line.split(',').collect();
+        let [index, pts, flags, ..] = fields[..] else {
             continue;
         };
-        let pts_us = (pts.parse::<f64>()? * 1_000_000.0).round() as i64;
-        match index {
-            "0" => video.push(pts_us),
-            "1" => audio.push(pts_us),
+        let track = match index {
+            "0" => TrackKind::Video,
+            "1" => TrackKind::Audio,
             other => anyhow::bail!("a stream {other}"),
+        };
+        let pts_us = (pts.parse::<f64>()? * 1_000_000.0).round() as i64;
+        // A packet FFmpeg marks to be discarded (`D`) is one it has
+        // indexed twice -- a fragment read again -- and a player drops.
+        if flags.contains('D') {
+            continue;
         }
+        out.push((track, pts_us, flags.starts_with('K')));
     }
-    video.sort_unstable();
-    audio.sort_unstable();
-    Ok(vec![(TrackKind::Video, video), (TrackKind::Audio, audio)])
+    Ok(out)
+}
+
+/// The film's packets of `track` in decode order -- the order a demuxer
+/// hands them out -- with their key flags: the source a rendition's
+/// packets must be, time for time. The sound from the film's start on: a
+/// frame before it (an AAC encoder's priming) has no time a fragment can
+/// say, and is not carried.
+fn in_decode_order(film: &Film, track: TrackKind) -> Vec<(i64, bool)> {
+    film.packets
+        .iter()
+        .filter(|packet| packet.track == track)
+        .filter(|packet| track == TrackKind::Video || packet.pts_us >= 0)
+        .map(|packet| (packet.pts_us, packet.key))
+        .collect()
+}
+
+/// **`got` is a run of `film`, time for time**: from where its first
+/// packet is in the film, every packet the next one's, at the same
+/// presentation time (within the 90 kHz clock's tick) and with the same
+/// key flag -- not merely a time the film has somewhere, which a picture
+/// late by whole frames would still be.
+fn assert_run(got: &[(i64, bool)], film: &[(i64, bool)], what: &str) {
+    let Some(&(first, _)) = got.first() else {
+        panic!("{what}: no packets");
+    };
+    let from = film
+        .iter()
+        .position(|(pts, _)| (pts - first).abs() <= 12)
+        .unwrap_or_else(|| panic!("{what}: {first} us is no time of the film's"));
+    for (at, ((pts, key), (want, want_key))) in got.iter().zip(&film[from..]).enumerate() {
+        assert!(
+            (pts - want).abs() <= 12 && key == want_key,
+            "{what}: packet {at} after {first} us is at {pts} us ({key}), the film's at {want} us ({want_key})"
+        );
+    }
+    assert!(
+        got.len() <= film.len() - from,
+        "{what}: more packets than the film has"
+    );
+}
+
+/// The packets of `track` in `packets`, as [`assert_run`] takes them.
+fn of_track(packets: &[(TrackKind, i64, bool)], track: TrackKind) -> Vec<(i64, bool)> {
+    packets
+        .iter()
+        .filter(|packet| packet.0 == track)
+        .map(|packet| (packet.1, packet.2))
+        .collect()
 }
 
 /// **A relay that counts requests**: a TCP listener in front of `target`
@@ -350,24 +419,21 @@ fn a_seek_into_a_fat_film_reads_on_from_where_it_lands() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// **A film's rendition decodes whole and keeps every sample's time**:
-/// H.264 with 48 kHz sound and HEVC (open GOPs) with 44.1 kHz, each
-/// decoded by `ffmpeg` without a complaint, and every packet `ffprobe`
-/// reads back at its time in the film -- the sound exactly, the picture
-/// late by no more than five frames and never less than before it: FFmpeg
-/// shows a fragment's video late by the largest negative composition
-/// offset it has read so far (`dts_shift`), so picture and sound are as
-/// far apart as in the film whichever chunk or slot they are in, give or
-/// take that. With open GOPs the offset takes in the leading pictures (a
-/// slot's decode times start at its sync sample's time), as FFmpeg 4.4 --
-/// timing a slot's first `moof` by its label -- always showed.
+/// **A film's rendition decodes whole and shows every sample at its own
+/// time**: H.264 with 48 kHz sound and HEVC (open GOPs) with 44.1 kHz,
+/// each decoded by `ffmpeg` without a complaint, and every packet `ffprobe`
+/// reads back, in the order it reads them, the film's packet at the same
+/// presentation time with the same key flag -- the picture and the sound
+/// alike, so neither is ever late against the other. FFmpeg shows a
+/// picture at its decode time, its composition offset and its
+/// `dts_shift` (the largest negative offset it has read so far): every
+/// offset is written at least `-D`, and the film's first sample at
+/// exactly `-D`, so `dts_shift` is `D` from the first packet to the last
+/// (`mux::DECODE_AHEAD_US`).
 ///
-/// Except the first slot's sound, one AAC frame late throughout: the
-/// film's priming frame is at -21 ms (an MP4's edit list, which leaves the
-/// container's start at zero), a fragment's time cannot be below zero, so
-/// that frame is put at zero and the slot's sound runs on from there. As
-/// it was before the slots were chunked; pinned here so a change to it is
-/// seen.
+/// The sound's packets are the film's from its start: a frame before it
+/// (the AAC encoder's priming at -21 ms, behind the MP4's edit list) has no
+/// time a fragment can say, and is not carried.
 #[test]
 fn a_film_decodes_whole_with_its_times() -> anyhow::Result<()> {
     for (picture, sample_rate) in [(Picture::H264, 48_000), (Picture::Hevc, 44_100)] {
@@ -401,50 +467,12 @@ fn a_film_decodes_whole_with_its_times() -> anyhow::Result<()> {
             "{picture:?}: {}",
             String::from_utf8_lossy(&decoded.stderr)
         );
-        let second_slot = slots(&file)[1].2;
-        let priming = fixture.film.times(TrackKind::Audio)[0];
-        assert!(
-            priming < 0,
-            "{picture:?}: the film's sound starts at {priming} us"
-        );
-        for (track, times) in packets_of(&path)? {
-            let film = fixture.film.times(track);
-            assert_eq!(times.len(), film.len(), "{picture:?}'s {track:?} packets");
-            let shift = times[film.len() - 1] - film[film.len() - 1];
-            if track == TrackKind::Audio {
-                assert!(
-                    shift.abs() <= 12,
-                    "{picture:?}: the sound moved by {shift} us"
-                );
-            } else {
-                assert!(
-                    (0..=5 * 41_667).contains(&shift),
-                    "{picture:?}: the picture moved by {shift} us"
-                );
-            }
-            let mut moved = 0;
-            for (at, (time, was)) in times.iter().zip(&film).enumerate() {
-                if track == TrackKind::Video {
-                    // FFmpeg's `dts_shift` is the largest negative offset
-                    // read so far: the picture's lateness only grows.
-                    let late = time - was;
-                    assert!(
-                        late >= moved - 12 && late <= shift + 12,
-                        "{picture:?}'s video packet {at}: at {time} us, {was} us in the film"
-                    );
-                    moved = moved.max(late);
-                    continue;
-                }
-                let late = if *was < second_slot - 64_000 {
-                    -priming
-                } else {
-                    0
-                };
-                assert!(
-                    (time - was - shift - late).abs() <= 12,
-                    "{picture:?}'s {track:?} packet {at}: at {time} us, {was} us in the film"
-                );
-            }
+        let read = read_packets(path.to_str().unwrap(), None)?;
+        for track in [TrackKind::Video, TrackKind::Audio] {
+            let film = in_decode_order(&fixture.film, track);
+            let got = of_track(&read, track);
+            assert_eq!(got.len(), film.len(), "{picture:?}'s {track:?} packets");
+            assert_run(&got, &film, &format!("{picture:?}'s {track:?}"));
         }
     }
     Ok(())
@@ -539,7 +567,9 @@ fn ffprobe_lands(url: &str, before: Option<u32>, seeks: &[u32]) -> anyhow::Resul
 /// `ffprobe` seeking to 5:00 lands on the key at 299.6 s in a few
 /// requests, a seek list read after the first 16 s lands each within a
 /// GOP of its target, and `ffmpeg -ss 60` asks for the start and the
-/// target and nothing else.
+/// target and nothing else; and after a seek -- fresh, and back after
+/// reading -- every packet of the picture and of the sound is the film's,
+/// at its time.
 ///
 /// Cut on the 6 s grid, a slot held two or three GOPs and a seek landed
 /// at the slot's start -- the demuxer knows only the sync samples of the
@@ -598,6 +628,126 @@ fn a_seek_lands_on_the_sync_sample_at_or_before_it() -> anyhow::Result<()> {
         ffmpeg_reads(&url, &["-ss", "60"], &["-t", "1"])?;
         let asked = relay.take();
         assert_eq!(asked.len(), 2, "{picture:?}: ffmpeg -ss 60 asked {asked:?}");
+
+        // **After a seek, picture and sound are each at their own times**:
+        // into a slot first, and back to one after reading the first 16 s
+        // -- each packet the film's at its time, the sound from at or
+        // before the picture it plays with.
+        let picture_film = in_decode_order(&fixture.film, TrackKind::Video);
+        let sound_film = in_decode_order(&fixture.film, TrackKind::Audio);
+        for (at, before) in [(300, false), (100, false), (43, true), (30, true)] {
+            let intervals = if before {
+                format!("%+16,{at}%+#150")
+            } else {
+                format!("{at}%+#150")
+            };
+            let read = read_packets(&url, Some(&intervals))?;
+            relay.take();
+            let read: Vec<_> = if before {
+                let first = read
+                    .iter()
+                    .rposition(|packet| packet.1 < 17_000_000)
+                    .unwrap();
+                read[first + 1..].to_vec()
+            } else {
+                read
+            };
+            let what = format!("{picture:?} after a seek to {at} s");
+            let picture_read = of_track(&read, TrackKind::Video);
+            let sound_read = of_track(&read, TrackKind::Audio);
+            let key = (key_before(f64::from(at)) * 1e6).round() as i64;
+            assert!(
+                (picture_read[0].0 - key).abs() <= 12 && picture_read[0].1,
+                "{what}: the picture begins at {:?}, not the key at {key} us",
+                picture_read[0]
+            );
+            assert_run(
+                &picture_read,
+                &picture_film,
+                &format!("{what}, the picture"),
+            );
+            assert_run(&sound_read, &sound_film, &format!("{what}, the sound"));
+            assert!(
+                sound_read[0].0 <= key,
+                "{what}: the sound begins at {}",
+                sound_read[0].0
+            );
+        }
+    }
+    Ok(())
+}
+
+/// **An estimated layout shows every sample at its own time too**: the
+/// app's long HEVC film laid out with no index (a transport stream's, a
+/// Matroska file's without cues), read whole and after seeks -- every
+/// packet of the picture and of the sound the film's at its time; each
+/// seek lands on a key at or before its target, within a segment and the
+/// assumed GOP (its slots are labelled 10 s late).
+#[test]
+fn an_estimated_layout_shows_every_sample_at_its_time() -> anyhow::Result<()> {
+    if !film_producer::tools_for(
+        Picture::Hevc,
+        "an_estimated_layout_shows_every_sample_at_its_time",
+    ) {
+        return Ok(());
+    }
+    let fixture = Fixture::start_with(
+        Recipe {
+            picture: Picture::Hevc,
+            look: Look::App,
+            seconds: 120,
+            kbps: 0,
+            gop: 70,
+            sample_rate: 48_000,
+        },
+        RenditionTuning::default(),
+        false,
+    )?;
+    let token = fixture.publish()?;
+    assert_eq!(
+        fixture
+            .handle
+            .rendition_probe(&token)
+            .and_then(|probe| probe.exact),
+        None
+    );
+    let file = fixture.get(&token, None)?;
+    assert_eq!(
+        fixture.handle.rendition_probe(&token).unwrap().exact,
+        Some(false)
+    );
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("rendition.mp4");
+    std::fs::write(&path, &file)?;
+    let picture_film = in_decode_order(&fixture.film, TrackKind::Video);
+    let sound_film = in_decode_order(&fixture.film, TrackKind::Audio);
+    let read = read_packets(path.to_str().unwrap(), None)?;
+    assert_run(
+        &of_track(&read, TrackKind::Video),
+        &picture_film,
+        "the picture",
+    );
+    assert_run(&of_track(&read, TrackKind::Audio), &sound_film, "the sound");
+    assert_eq!(of_track(&read, TrackKind::Video).len(), picture_film.len());
+    assert_eq!(of_track(&read, TrackKind::Audio).len(), sound_film.len());
+    for at in [60i64, 100, 30] {
+        let read = read_packets(path.to_str().unwrap(), Some(&format!("{at}%+#150")))?;
+        let picture_read = of_track(&read, TrackKind::Video);
+        let landed = picture_read[0].0;
+        assert!(
+            picture_read[0].1 && landed <= at * 1_000_000 && landed >= (at - 16) * 1_000_000,
+            "{at} s landed at {landed} us"
+        );
+        assert_run(
+            &picture_read,
+            &picture_film,
+            &format!("after {at} s, the picture"),
+        );
+        assert_run(
+            &of_track(&read, TrackKind::Audio),
+            &sound_film,
+            &format!("after {at} s, the sound"),
+        );
     }
     Ok(())
 }
@@ -612,7 +762,7 @@ fn dump_a_film_rendition() -> anyhow::Result<()> {
         Ok("hevc") => Picture::Hevc,
         _ => Picture::H264,
     };
-    let fixture = Fixture::start(
+    let fixture = Fixture::start_with(
         Recipe {
             picture,
             look: match std::env::var("RENDITION_FILM_LOOK").as_deref() {
@@ -625,6 +775,7 @@ fn dump_a_film_rendition() -> anyhow::Result<()> {
             sample_rate: 48_000,
         },
         RenditionTuning::default(),
+        std::env::var("RENDITION_FILM_NO_INDEX").is_err(),
     )?;
     let token = fixture.publish()?;
     let file = fixture.get(&token, None)?;

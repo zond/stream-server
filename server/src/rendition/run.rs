@@ -23,10 +23,13 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 /// How far before a segment's cut its sound begins: an audio frame that
-/// starts this little before the cut is the segment's. More than one AAC
-/// frame at any rate (HE-AAC at 44.1 kHz is 46 ms), so the frame playing
-/// at the sync sample is in the sync sample's fragment.
-pub(crate) const AUDIO_LEAD_US: i64 = 64_000;
+/// starts this little before the cut is the segment's. FFmpeg seeks the
+/// sound to the sync sample's decode time, which is
+/// [`DECODE_AHEAD_US`](super::mux::DECODE_AHEAD_US) before the cut, and
+/// takes the frame at or before that: it must be in the sync sample's
+/// fragment, so the lead is that and more than one AAC frame at any rate
+/// (HE-AAC at 44.1 kHz is 46 ms).
+pub(crate) const AUDIO_LEAD_US: i64 = super::mux::DECODE_AHEAD_US + 64_000;
 
 /// One segment's samples, as the cut rule assigned them.
 #[derive(Default)]
@@ -95,6 +98,11 @@ impl Cutter {
                 Some(current) if sample.key => current.max(self.segment_of(sample.pts_us)),
                 Some(current) => current,
             },
+            // Sound before the film's start -- an AAC encoder's priming
+            // frame, which a container's edit list hides -- has no time a
+            // fragment can say (`tfdt` counts from nought); its presentation
+            // is nothing, and every later frame keeps its own time.
+            TrackKind::Audio if sample.pts_us < 0 => return Vec::new(),
             TrackKind::Audio if self.has_audio => {
                 self.segment_of(sample.pts_us.saturating_add(AUDIO_LEAD_US))
             }
@@ -578,25 +586,35 @@ mod tests {
     }
 
     /// A run from segment 2, handed the key before it: nothing before the
-    /// first key at or after 2 s, and no audio before 2 s.
+    /// first key at or after 2 s, and no audio before 2 s less the lead.
     #[test]
     fn what_precedes_the_runs_cut_is_discarded() {
         let mut cutter = Cutter::new(grid(), 2, true, true);
         let mut cuts = Vec::new();
-        for frame in 6..8i64 {
+        for frame in 6..7i64 {
             cuts.extend(cutter.push(TrackKind::Audio, sample(frame * 250_000 - 100_000, true)));
             cuts.extend(cutter.push(TrackKind::Video, sample(frame * 250_000, frame % 3 == 0)));
         }
         assert!(cutter.open.is_empty(), "nothing before the cut is kept");
-        for frame in 8..20i64 {
+        for frame in 7..20i64 {
             cuts.extend(cutter.push(TrackKind::Audio, sample(frame * 250_000 - 100_000, true)));
             cuts.extend(cutter.push(TrackKind::Video, sample(frame * 250_000, frame % 3 == 0)));
         }
         cuts.extend(cutter.finish());
         assert_eq!(cuts[0].index, 2);
         assert_eq!(cuts[0].video.first().map(|s| s.pts_us), Some(2_250_000));
-        assert!(cuts[0].audio.iter().all(|s| s.pts_us >= 2_000_000));
-        assert!(cuts[0].audio.iter().all(|s| s.pts_us < 3_000_000));
+        assert!(
+            cuts[0]
+                .audio
+                .iter()
+                .all(|s| s.pts_us >= 2_000_000 - AUDIO_LEAD_US)
+        );
+        assert!(
+            cuts[0]
+                .audio
+                .iter()
+                .all(|s| s.pts_us < 3_000_000 - AUDIO_LEAD_US)
+        );
     }
 
     /// **Cuts from an index**: segment 1 begins at the indexed key at
@@ -620,9 +638,10 @@ mod tests {
             vec![0, 200_000, 400_000, 600_000, 800_000, 1_000_000]
         );
         assert_eq!(pts(&out[1].video).first(), Some(&1_200_000));
-        // The frame 1 us before the cut is within the lead: segment 1's.
-        assert_eq!(pts(&out[0].audio).last(), Some(&999_999));
-        assert_eq!(pts(&out[1].audio).first(), Some(&1_199_999));
+        // The frames within the lead (564 ms) before the cut are segment
+        // 1's: from 0.8 s less a microsecond.
+        assert_eq!(pts(&out[0].audio).last(), Some(&599_999));
+        assert_eq!(pts(&out[1].audio).first(), Some(&799_999));
     }
 
     /// **A segment waits for its audio**: video moving past the next cut
@@ -637,10 +656,10 @@ mod tests {
         out.extend(cutter.push(TrackKind::Audio, sample(0, true)));
         out.extend(cutter.push(TrackKind::Video, sample(1_000_000, true)));
         assert!(out.is_empty(), "audio has not reached the cut");
-        out.extend(cutter.push(TrackKind::Audio, sample(800_000, true)));
+        out.extend(cutter.push(TrackKind::Audio, sample(400_000, true)));
         out.extend(cutter.push(TrackKind::Audio, sample(1_000_000, true)));
         assert_eq!(out.len(), 1);
-        assert_eq!(pts(&out[0].audio), vec![0, 800_000]);
+        assert_eq!(pts(&out[0].audio), vec![0, 400_000]);
     }
 
     /// **A segment's sound begins at or before its picture**: the audio
