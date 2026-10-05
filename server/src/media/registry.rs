@@ -69,6 +69,13 @@ pub(crate) struct Entry {
     /// one id one piece of work: the second waits and finds the first's
     /// answer.
     resolution: tokio::sync::Mutex<Option<Arc<Resolution>>>,
+    /// What [`Self::resolution`] last kept, for the questions asked by id
+    /// ([`Registry::peek`]): read without the lock a resolve holds, so a
+    /// question asked while one is under way -- or while another reader
+    /// holds that lock for the moment it takes to find the kept answer --
+    /// is answered with what the id resolved to, not with nothing. A
+    /// player's last report of where it left a film was dropped that way.
+    resolved: std::sync::Mutex<Option<Arc<Resolution>>>,
     /// The viewer's read-ahead choice for this id, as
     /// [`Registry::set_buffer`] last stated it; `None` until it has. It
     /// outranks a [`PlayToken`]'s buffer, which is only the initial value:
@@ -444,6 +451,7 @@ impl Registry {
             Entry {
                 target,
                 resolution: tokio::sync::Mutex::new(None),
+                resolved: std::sync::Mutex::new(None),
                 buffer: std::sync::Mutex::new(None),
                 resume: std::sync::Mutex::new(None),
                 watch: Arc::default(),
@@ -509,13 +517,13 @@ impl Registry {
         Some((info_hash, file_idx, offset))
     }
 
-    /// What `id` resolved to, if it has been and nothing is resolving it
-    /// now. **A peek**: it resolves nothing and waits for nothing, so the
-    /// questions asked by id -- a panel's numbers, a player's reports --
-    /// never become the I/O `resolve` is.
+    /// What `id` last resolved to, if it has been. **A peek**: it resolves
+    /// nothing and waits for nothing, so the questions asked by id -- a
+    /// panel's numbers, a player's reports -- never become the I/O
+    /// `resolve` is, and none is lost to a resolve under way.
     fn peek(&self, id: &MediaId) -> Option<Arc<Resolution>> {
         let entry = self.entries.get(id.as_str())?;
-        entry.resolution.try_lock().ok()?.clone()
+        entry.resolved()
     }
 
     /// [`crate::stream_numbers::stream_numbers`] for what `id` resolved to.
@@ -1067,8 +1075,24 @@ impl Entry {
             return Ok(resolution.clone());
         }
         let resolution = Arc::new(resolve(state, target).await?);
-        *held = Some(resolution.clone());
+        self.keep(&mut held, resolution.clone());
         Ok(resolution)
+    }
+
+    /// Keep `resolution` as this id's, under the resolve lock `held`.
+    fn keep(&self, held: &mut Option<Arc<Resolution>>, resolution: Arc<Resolution>) {
+        *held = Some(resolution.clone());
+        *self
+            .resolved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(resolution);
+    }
+
+    fn resolved(&self) -> Option<Arc<Resolution>> {
+        self.resolved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -1936,8 +1960,12 @@ mod tests {
                 ))
                 .expect("registered");
             let entry = registry.entry(&id).expect("the entry");
-            *entry.resolution.try_lock().expect("nobody resolving") =
-                Some(Arc::new(member(torrent)));
+            let mut held = entry.resolution.try_lock().expect("nobody resolving");
+            entry.keep(&mut held, Arc::new(member(torrent)));
+            // **Still held**: a resolve under way, or a reader finding the
+            // kept answer, takes no question's answer away.
+            assert_eq!(registry.torrent_file(&id), expected);
+            drop(held);
             drop(entry);
             assert_eq!(registry.torrent_file(&id), expected);
         }
@@ -1967,8 +1995,9 @@ mod tests {
                 ))
                 .expect("registered");
             let entry = registry.entry(&id).expect("the entry");
-            *entry.resolution.try_lock().expect("nobody resolving") =
-                Some(Arc::new(Resolution::Member {
+            entry.keep(
+                &mut entry.resolution.try_lock().expect("nobody resolving"),
+                Arc::new(Resolution::Member {
                     format: Format::Rar,
                     key: "key".to_string(),
                     create: None,
@@ -1976,7 +2005,8 @@ mod tests {
                     len: 1,
                     torrent,
                     sniffed_in: None,
-                }));
+                }),
+            );
             drop(entry);
             assert_eq!(registry.member_files(&id), expected);
         }
