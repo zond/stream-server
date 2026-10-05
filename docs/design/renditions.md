@@ -1149,6 +1149,25 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   slot a time picks is the last one labelled at or before it, `D` before
   its cut.)
 
+  **And the rest of it was Chrome's blocks** (2026-10-05, read off a
+  request log of zond's TV seeking a 9 Mbit/s film from this host). Every
+  seek's request began at a round 32 KiB -- `bytes=139886592-`,
+  `bytes=43646976-`, `bytes=227246080-` -- for a slot some kilobytes
+  further on: Chrome fetches a file in 32 KiB blocks (`kBlockSizeShift`,
+  15, in `url_index.cc`; 92 and today's alike) and asks from the start of
+  the block the demuxer's byte is in. That start was in the slot before,
+  past the 16 bytes of it known to be zero, and bytes there cannot be said
+  without making that slot: the run started a slot early, and a whole GOP
+  was made -- from a torrent, fetched -- before the one wanted, at a load
+  and on every seek. So **every slot after the first begins on a 32 KiB
+  boundary** (`layout::SLOT_ALIGN`): each slot is lengthened, by less than
+  a block, to end where the next must begin; the header's length does not
+  depend on the slots' lengths, so this is done before the `sidx` is
+  written and the layout stays a function of the index alone. The block a
+  seek's byte is in is then the slot's own first, and the run starts at
+  it. Sixteen kilobytes a slot on average: half a per cent of a 3 MB slot,
+  more of a small one (a slot is a second of film at least).
+
   So the preparation makes the slot for the start
   (`Layout::slot_for_time`) and, zond's decision, **the slots of the 12 s
   before it and of the 6 s after** (`PREPARED_BEFORE`, `PREPARED_AFTER`;

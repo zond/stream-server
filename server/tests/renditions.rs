@@ -815,7 +815,11 @@ fn the_sidx_mirrors_the_sources_index() -> anyhow::Result<()> {
         };
         assert_eq!(
             *size,
-            headroom(end - place(start)) + chunk_room(next - start),
+            lengthened(
+                header.slots[k as usize].0,
+                headroom(end - place(start)) + chunk_room(next - start),
+                k == 59
+            ),
             "slot {k}'s size"
         );
         // Labelled at its first decode time: a slot after the first `D`
@@ -857,7 +861,11 @@ fn without_an_index_the_slots_are_estimated() -> anyhow::Result<()> {
         let k = k as u64;
         assert_eq!(
             *size,
-            scaled(k + 1) - scaled(k) + 8 * 1024 + chunk_room(T_US),
+            lengthened(
+                header.slots[k as usize].0,
+                scaled(k + 1) - scaled(k) + 8 * 1024 + chunk_room(T_US),
+                k == 9
+            ),
             "slot {k}"
         );
         // A GOP late (10 s), at the film's end at the latest -- short of it
@@ -1502,21 +1510,70 @@ fn two_seeks_waiting_at_once_take_turns() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A slot's length: what the layout `planned` for it, and for every slot
+/// but the `last` as much more as ends it on a 32 KiB boundary, where the
+/// next begins (`layout::SLOT_ALIGN`: the block Chrome fetches in, so the
+/// block a seek's byte is in is the slot's own).
+fn lengthened(at: u64, planned: u64, last: bool) -> u64 {
+    const BLOCK: u64 = 32 * 1024;
+    let end = at + planned;
+    if last {
+        planned
+    } else {
+        planned + (BLOCK - end % BLOCK) % BLOCK
+    }
+}
+
+/// **A seek's request starts the run at the slot it wants, not the one
+/// before**: Chrome fetches a file in 32 KiB blocks and asks from the start
+/// of the block the demuxer's byte is in, which every slot after the first
+/// begins on. Unaligned, that request began in the tail of the slot before
+/// -- bytes nothing can say without making that slot -- and the run started
+/// there: a whole GOP made, and from a torrent fetched, ahead of the one
+/// wanted, on every seek (zond's TV: `bytes=139886592-`, a round 32 KiB,
+/// for a slot some kilobytes on).
+#[test]
+fn a_seeks_block_aligned_request_starts_the_run_at_its_slot() -> anyhow::Result<()> {
+    const BLOCK: u64 = 32 * 1024;
+    let knobs = Knobs::default();
+    for slot in [20usize, 21, 37] {
+        let fixture = Fixture::quick(knobs.clone())?;
+        let token = fixture.publish(60_000, 0)?;
+        let header = fixture.header(&token);
+        let (at, _, _) = header.slots[slot];
+        let asked = at / BLOCK * BLOCK;
+        fixture.range(&token, asked, asked + 1023);
+        let runs = fixture.producer.runs();
+        assert_eq!(
+            runs.len(),
+            2,
+            "slot {slot}: the header's run and the seek's"
+        );
+        assert_eq!(
+            runs[1].from,
+            asked_from(cut(&knobs, slot as i64)),
+            "slot {slot}: asked from byte {asked}, the slot begins at {at}"
+        );
+    }
+    Ok(())
+}
+
 // --- The overflow rule -------------------------------------------------------------
 
 /// Knobs whose segments overflow the slot an index squeezed: frames big
-/// enough that a segment is mostly its share of the source.
+/// enough that a segment is mostly its share of the source, and more than
+/// the squeezed slot holds even lengthened to its block's end.
 fn squeezed() -> Knobs {
     Knobs {
         length: Duration::from_secs(20),
-        frame_bytes: 2_000,
+        frame_bytes: 4_000,
         index: Some(IndexKnob::Squeezed { at_us: 10 * T_US }),
         ..Knobs::default()
     }
 }
 
 /// The source for [`squeezed`]: about as many bytes as the film's samples.
-const SQUEEZED_LEN: usize = 20 * 60_000;
+const SQUEEZED_LEN: usize = 20 * 110_000;
 
 /// Every video and audio frame in the file's slots, in order.
 fn frames_in(file: &[u8], header: &Header, knobs: &Knobs) -> (Vec<i64>, Vec<i64>) {

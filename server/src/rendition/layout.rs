@@ -28,6 +28,11 @@
 //! over the source's average bytes per second, [`ESTIMATE_SLACK_PERCENT`]
 //! larger, plus [`SLOT_BASE`].
 //!
+//! **Every slot after the first begins on a 32 KiB boundary**
+//! ([`SLOT_ALIGN`]), each lengthened by less than a block to end where the
+//! next begins: the block Chrome asks a seek's byte in is then the slot's
+//! own, not the tail of the one before.
+//!
 //! **The last [`TAIL_ZEROS`] bytes of every slot are zeros**, whatever the
 //! fragment: a fit leaves at least [`MIN_PAD`] (`run.rs`), and a `free`
 //! box's header is eight bytes. A read of a slot's tail -- a demuxer
@@ -55,6 +60,17 @@ pub(crate) const ESTIMATE_SLACK_PERCENT: u64 = 15;
 pub(crate) const ESTIMATE_LABEL_LATE_US: i64 = 10_000_000;
 /// The bytes at the end of every slot that are always zero.
 pub(crate) const TAIL_ZEROS: u64 = 16;
+/// **Every slot after the first begins on a multiple of this**: the block
+/// Chrome fetches a file in (`kBlockSizeShift`, 32 KiB, in the Chromecast's
+/// Chrome 92 and today's). A demuxer seeking to a slot asks for the byte
+/// its `sidx` says, and Chrome asks the server from the start of the block
+/// that byte is in -- up to 32 KiB before it. Unaligned, that was the end
+/// of the slot before, whose bytes there nothing can say without making it:
+/// every seek on zond's TV asked from a round 32 KiB (`bytes=139886592-`
+/// for a slot some kilobytes on) and the run started a slot early, a whole
+/// GOP made and, from a torrent, fetched before the one wanted. Aligned,
+/// the block the demuxer's byte is in begins at the slot.
+pub(crate) const SLOT_ALIGN: u64 = 32 * 1024;
 /// The least room a fragment leaves in its slot: a `free` box's header and
 /// the zero tail.
 pub(crate) const MIN_PAD: u64 = 8 + TAIL_ZEROS;
@@ -333,6 +349,22 @@ impl Layout {
         if count == 0 || 2 * count > usize::from(u16::MAX) {
             return Err("This film is too long to send to the television in one piece.".into());
         }
+        // The header's length does not depend on the slots' sizes (a `sidx`
+        // is 40 bytes and 12 a reference), so each slot can be lengthened
+        // to end where the next must begin ([`SLOT_ALIGN`]) before the
+        // `sidx` is written. The last slot ends the file wherever it ends.
+        let sidx_len = |refs: usize| 40 + 12 * refs as u64;
+        let with_sound = sound.is_some() && plan.label_late_us > 0;
+        let header_len = init.len() as u64 + sidx_len(2 * count) * if with_sound { 2 } else { 1 };
+        let mut sizes = plan.sizes.clone();
+        let mut end = header_len;
+        for size in &mut sizes[..count - 1] {
+            end += *size;
+            let pad = (SLOT_ALIGN - end % SLOT_ALIGN) % SLOT_ALIGN;
+            *size += pad;
+            end += pad;
+        }
+        let plan = Plan { sizes, ..plan };
         if plan.sizes.iter().any(|size| *size >= 1 << 31) {
             return Err(
                 "This film has a stretch too large to send to the television in one piece.".into(),
@@ -394,6 +426,7 @@ impl Layout {
         header.extend_from_slice(&init);
         header.extend_from_slice(&sidx);
         header.extend_from_slice(sound.as_deref().unwrap_or_default());
+        debug_assert_eq!(header.len() as u64, header_len);
         let mut offset = header.len() as u64;
         let slots = plan
             .sizes
@@ -676,7 +709,6 @@ mod tests {
             .map(|k| entry(k * 1_000_000 + 40_000, 1000 + k as u64 * 10_000))
             .collect();
         let plan = Plan::new(Some(&index), 70_000, 6_000_000, T);
-        let sizes = plan.sizes.clone();
         let init = Bytes::from_static(b"\0\0\0\x08ftyp");
         let layout = Layout::new(
             init,
@@ -686,6 +718,9 @@ mod tests {
             6_000_000,
         )
         .expect("a layout");
+        // As lengthened to end on a block
+        // (`every_slot_after_the_first_begins_on_a_block`).
+        let sizes: Vec<u64> = layout.slots.iter().map(|slot| slot.size).collect();
         let sidx = &layout.header[8..];
         assert_eq!(u32_at(sidx, 0) as usize, sidx.len());
         assert_eq!(&sidx[4..8], b"sidx");
@@ -746,6 +781,67 @@ mod tests {
         assert_eq!(layout.slot_at(layout.slots[3].offset), Some(3));
         assert_eq!(layout.slot_at(layout.total - 1), Some(5));
         assert_eq!(layout.slot_at(layout.total), None);
+    }
+
+    /// **Every slot after the first begins on a 32 KiB boundary**, so the
+    /// block Chrome fetches for the byte a seek asks is the slot's own
+    /// first, not the tail of the slot before: each slot is its plan's
+    /// length and less than a block more, the `sidx` says the lengths as
+    /// lengthened, and the last slot ends the file where the plan ends it.
+    #[test]
+    fn every_slot_after_the_first_begins_on_a_block() {
+        let index: Vec<IndexEntry> = (0..6)
+            .map(|k| entry(k * 1_000_000 + 40_000, 1000 + k as u64 * 123_457))
+            .collect();
+        let plan = Plan::new(Some(&index), 800_000, 6_000_000, T);
+        let planned = plan.sizes.clone();
+        let layout = Layout::new(
+            Bytes::from_static(b"\0\0\0\x08ftyp"),
+            plan,
+            (1, 90_000, mux::DECODE_AHEAD_US),
+            None,
+            6_000_000,
+        )
+        .expect("a layout");
+        let sidx = &layout.header[8..];
+        assert_ne!(
+            layout.slots[0].offset % SLOT_ALIGN,
+            0,
+            "the first slot follows the header, wherever that ends"
+        );
+        for (k, (slot, planned)) in layout.slots.iter().zip(&planned).enumerate() {
+            if k > 0 {
+                assert_eq!(slot.offset % SLOT_ALIGN, 0, "slot {k} begins on a block");
+            }
+            let last = k + 1 == planned_len(&layout);
+            assert!(
+                slot.size >= *planned && slot.size < planned + SLOT_ALIGN,
+                "slot {k}: {} for {planned}",
+                slot.size
+            );
+            if last {
+                assert_eq!(slot.size, *planned, "the last slot is not lengthened");
+            }
+            let at = 40 + 2 * k * 12;
+            assert_eq!(
+                u64::from(u32_at(sidx, at) + u32_at(sidx, at + 12)),
+                slot.size,
+                "the sidx says slot {k}'s length as lengthened"
+            );
+        }
+        assert!(
+            layout.slots[..5]
+                .iter()
+                .zip(&planned)
+                .any(|(slot, planned)| slot.size > *planned),
+            "nothing was lengthened: the test's sizes fell on blocks by themselves"
+        );
+        let last = layout.slots[5];
+        assert_eq!(layout.total, last.offset + last.size);
+    }
+
+    fn planned_len(layout: &Layout) -> usize {
+        layout.slots.len()
     }
 
     /// **The slot a receiver asks first is the one its time's label picks**:
@@ -822,8 +918,12 @@ mod tests {
         // Two references a slot.
         assert!(layout(plan(32_767, 10_000)).is_ok());
         assert!(layout(plan(32_768, 10_000)).is_err());
-        assert!(layout(plan(2, (1 << 31) - 1)).is_ok());
-        assert!(layout(plan(2, 1 << 31)).is_err());
+        // The last slot's length is the plan's; one before it may be up
+        // to a block longer, to end where the next begins.
+        assert!(layout(plan(1, (1 << 31) - 1)).is_ok());
+        assert!(layout(plan(1, 1 << 31)).is_err());
+        assert!(layout(plan(2, (1 << 31) - SLOT_ALIGN)).is_ok());
+        assert!(layout(plan(2, (1 << 31) - 1)).is_err());
     }
 
     /// **An estimated slot's time in the `sidx` is a GOP late**: its segment
