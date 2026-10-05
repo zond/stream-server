@@ -961,7 +961,7 @@ impl<B: TorrentBackend + 'static> Housekeeping<B> {
                 Some(register)
             } else if self.live.is_torrent(&hash) {
                 Some("playing")
-            } else if self.live.holds().holds(&hash) {
+            } else if self.live.holds().holds_any(&hash) {
                 Some("held")
             } else {
                 None
@@ -1025,7 +1025,7 @@ impl<B: TorrentBackend + 'static> Housekeeping<B> {
             && engine.active_streams.load(Ordering::SeqCst) == 0
             && age_secs > INACTIVE_TORRENT_REMOVE_TIMEOUT.as_secs()
             && !self.live.is_torrent(&hash)
-            && !self.live.holds().holds(&hash);
+            && !self.live.holds().holds_any(&hash);
         if !still_idle {
             tracing::debug!(
                 info_hash = %hash,
@@ -1667,6 +1667,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     ///   open on it, from its first request until the screen says it is
     ///   gone, paused or stalled alike; a cast of it, from publish to
     ///   unpublish;
+    /// * **a viewer's idle share of it, while idle sharing is allowed**:
+    ///   what the viewer watched last, from leaving it (the screen released,
+    ///   the cast unpublished) until they start watching something else --
+    ///   counted only while [`Self::idle_sharing_allowed`], asked now, so
+    ///   the setting going off or the app holding idle sharing back stops
+    ///   the torrent at the next reconcile and the reverse runs it again,
+    ///   the share standing throughout;
     /// * **a body being delivered off it**: a stream response registered on
     ///   it ([`Self::on_stream_start`] to [`Self::on_stream_end`], which every
     ///   route that opens a torrent reader brackets its response with), or
@@ -1693,6 +1700,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     async fn held(&self, engine: &Arc<Engine<B::Handle>>) -> bool {
         let info_hash = &engine.info_hash;
         if self.live.holds().holds(info_hash) {
+            return true;
+        }
+        if self.idle_sharing_allowed() && self.live.holds().idle_shares(info_hash) {
             return true;
         }
         if engine.retention.readers() > 0 {
@@ -3031,7 +3041,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     ) {
         if engine.handle.run_state() == RunState::Error
             && !engine.is_pinned()
-            && !self.live.is_torrent(&engine.info_hash)
+            && !self.errored_torrent_is_used(&engine.info_hash).await
         {
             let lock = self.pin_lock(&engine.info_hash);
             if let Ok(guard) = lock.mutex().try_lock() {
@@ -3059,12 +3069,30 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
     }
 
+    /// Whether something keeps an errored torrent from being removed with
+    /// its files: a hold of any kind -- a screen, a cast, a viewer's idle
+    /// share, whether idle sharing is allowed now or not -- or a stream
+    /// response still registered on it. Its holder is served by the
+    /// reconciler's restart out of the error (`RestartFromError`, when the
+    /// error was the disk and there is room again), never by removing the
+    /// torrent from under it. The liveness cell is not asked: it names the
+    /// last thing opened, not anything that declared a use.
+    async fn errored_torrent_is_used(&self, info_hash: &str) -> bool {
+        self.live.holds().holds_any(info_hash)
+            || self
+                .active_streams
+                .read()
+                .await
+                .get(info_hash)
+                .is_some_and(|count| *count > 0)
+    }
+
     /// The Error arm of [`Self::retain_engine`], with the hash's pin lock
     /// held: the pin set and the cell asked once more under it, then the
     /// torrent and its files removed and the engine dropped from the
     /// registry -- while it is still this engine.
     async fn remove_errored_engine_locked(&self, engine: &Arc<Engine<B::Handle>>) {
-        if engine.is_pinned() || self.live.is_torrent(&engine.info_hash) {
+        if engine.is_pinned() || self.errored_torrent_is_used(&engine.info_hash).await {
             debug!(
                 info_hash = %engine.info_hash,
                 "an errored torrent was pinned or opened before its removal took the lock; kept"
@@ -3380,6 +3408,16 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         self.idle_sharing_held.load(Ordering::Relaxed)
     }
 
+    /// **Whether idle sharing is allowed now**: the setting on
+    /// ([`Self::set_seeding_enabled`]) and the app not holding it back
+    /// ([`Self::set_idle_sharing_held`]). Read where it is used, never
+    /// stored: the upload switch and the reconciler's `held` (an idle
+    /// share runs its torrent only while this is true) both ask it at the
+    /// moment they decide.
+    pub fn idle_sharing_allowed(&self) -> bool {
+        self.seeding_enabled() && !self.idle_sharing_held()
+    }
+
     /// How many streams have started since the process did -- see the
     /// field. The activity light reads it beside [`Self::playback_is_live`]
     /// so that a playback that began and ended between two of its readings
@@ -3431,7 +3469,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// Under the lock the later caller reads the later registers.
     async fn apply_upload_switch(&self) {
         let _turn = self.upload_switch.lock().await;
-        let idle_allowed = self.seeding_enabled() && !self.idle_sharing_held();
+        let idle_allowed = self.idle_sharing_allowed();
         let enabled = idle_allowed
             || self.playback_is_live().await
             || self.a_torrent_download_is_running().await;
@@ -3709,8 +3747,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// **And it is the screen's hold** ([`crate::retention::holds`]): the
     /// torrent the request names is held for the token's screen from now
     /// until [`Self::release_player`] -- paused, stalled or with no read open
-    /// -- and a proxied stream lets the screen's hold go. An older screen's
-    /// request holds nothing, as it moves nothing.
+    /// -- and a proxied stream lets the screen's hold go. Either way the
+    /// viewer is watching something now, so their idle share
+    /// ([`crate::retention::holds`]) goes, or, for the same torrent, becomes
+    /// the screen's hold again. An older screen's request holds nothing, as
+    /// it moves nothing.
     pub fn note_player(
         &self,
         token: &str,
@@ -3733,7 +3774,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     self.live.holds().hold_for_player(token, info_hash, files);
                 }
                 crate::retention::sessions::Played::Elsewhere => {
-                    self.live.holds().release_player(token);
+                    self.live.holds().moved_elsewhere(token);
                 }
             }
         }
@@ -3755,9 +3796,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
 
     /// **The player screen `token` is gone** -- the viewer left it: the
     /// torrent its requests held ([`Self::note_player`]) is released, if no
-    /// newer screen of the viewer has taken the hold since. What runs it
-    /// afterwards is whatever else holds it, a pin, or the idle-sharing
-    /// policy, at the next reconcile. Whether a hold was released.
+    /// newer screen of the viewer has taken the hold since -- into the
+    /// viewer's idle share ([`crate::retention::holds`]): it is what they
+    /// watched last, and it goes on running while idle sharing is allowed,
+    /// until they start watching something else. Whether a hold was
+    /// released.
     pub fn release_player(&self, token: &str) -> bool {
         self.live.holds().release_player(token)
     }
@@ -8577,8 +8620,9 @@ mod tests {
         // The viewer, whichever of its screens the test was on: a token
         // with no screen number is always current.
         enginefs.note_player("tv", crate::retention::sessions::Played::Elsewhere);
-        // And the reconciler fixture's screen is gone.
-        enginefs.release_player(FIXTURE_SCREEN);
+        // And the reconciler fixture's screen has moved on to it too: its
+        // hold goes, and it leaves no idle share behind.
+        enginefs.holds().moved_elsewhere(FIXTURE_SCREEN);
     }
 
     /// Every call the reconciler could make and does not, in one place.
@@ -19077,7 +19121,10 @@ mod tests {
 
     /// **A torrent stopped while its play session was on it announces
     /// nothing stale when it starts again.** The viewer went back to the
-    /// board (the screen let its hold go); another stream took the cell, the torrent stopped, and its
+    /// board (the screen let its hold go, into the viewer's idle share), a
+    /// cast of a link was published with the viewer's token (which lets
+    /// the idle share go, before its receiver's first request moves the
+    /// session), another stream took the cell, the torrent stopped, and its
     /// file's slack pass took the draw with the bytes -- while the fork kept
     /// the advertised set. The viewer opens the film again: the torrent
     /// starts, and the fake's check at the start fails a test whose torrent
@@ -19101,9 +19148,11 @@ mod tests {
         let advertised = fake_advertises(&counters);
         assert!(!advertised.is_empty());
 
-        // The viewer left the screen -- its hold goes -- and another stream
+        // The viewer left the screen -- its hold goes, into the idle share
+        // -- a cast of a link lets the idle share go, and another stream
         // takes the cell; the viewer's session stays.
         enginefs.release_player(PLAYER);
+        enginefs.holds().watching_elsewhere(PLAYER);
         enginefs.live().open(
             crate::retention::live::LiveEntity::Proxy {
                 dir: "/elsewhere".into(),
@@ -19920,6 +19969,151 @@ mod tests {
         assert!(!engine.shares_to_end().await);
     }
 
+    /// The film of [`one_of_two_torrents_played`] running, then left: its
+    /// response ends, the viewer's screen is released, and a body through
+    /// `/proxy` with no player token takes the liveness cell. What is left
+    /// holding the film is the viewer's idle share and nothing else.
+    async fn the_film_left_behind() -> (TwoEngines, Arc<Engine<FakeHandle>>, std::path::PathBuf) {
+        let (two, engine, bucket) = one_of_two_torrents_played().await;
+        let enginefs = &two.enginefs;
+        enginefs.reconcile_tick().await;
+        assert_eq!(engine.handle.run_state(), RunState::Live);
+        enginefs.on_stream_end(TEST_HASH, 0).await;
+        assert!(enginefs.release_player(PLAYER));
+        enginefs.live().open(
+            crate::retention::live::LiveEntity::Proxy {
+                dir: "/a-link".into(),
+            },
+            false,
+        );
+        assert_eq!(
+            enginefs.holds().holders(TEST_HASH),
+            vec![crate::retention::holds::Holder::IdleShare("tv".into())]
+        );
+        (two, engine, bucket)
+    }
+
+    /// **What the viewer watched last goes on running and giving back its
+    /// draw after they leave it, while idle sharing is allowed**, and
+    /// nothing else opened -- a link through `/proxy`, another torrent's
+    /// stream with no player token -- stops it.
+    #[tokio::test(start_paused = true)]
+    async fn the_film_left_behind_keeps_sharing_its_draw_while_idle_sharing_is_allowed() {
+        let (two, engine, bucket) = the_film_left_behind().await;
+        let enginefs = &two.enginefs;
+        let film = &two.counters[0];
+        for _ in 0..3 {
+            enginefs.reconcile_tick().await;
+        }
+        enginefs.drop_slack().await;
+        // Another torrent's stream with no player token, read and ended.
+        enginefs.on_stream_start(OTHER_HASH, 1).await;
+        enginefs.reconcile_tick().await;
+        enginefs.on_stream_end(OTHER_HASH, 1).await;
+        enginefs.reconcile_tick().await;
+
+        assert_eq!(engine.handle.run_state(), RunState::Live);
+        assert_eq!(
+            film.stop_torrent.load(Ordering::SeqCst),
+            0,
+            "the film the viewer left stopped while idle sharing was allowed"
+        );
+        assert!(!engine.shares_to_end().await);
+        assert_eq!(fake_advertises(film), vec![1], "its draw, announced");
+        assert!(bucket.join("1").is_file(), "and its bytes kept");
+    }
+
+    /// **Starting another film lets the idle share go, and the film left
+    /// behind stops as a move stops it**: out of the swarm first, its draw
+    /// ended and its bytes gone, and not started again.
+    #[tokio::test(start_paused = true)]
+    async fn starting_another_film_ends_the_idle_share_as_a_move_does() {
+        let (two, engine, bucket) = the_film_left_behind().await;
+        let enginefs = &two.enginefs;
+        let film = &two.counters[0];
+        let starts = film.start_torrent.load(Ordering::SeqCst);
+
+        enginefs.note_player("tv.2", played(OTHER_HASH, 0));
+        enginefs.on_stream_start(OTHER_HASH, 0).await;
+        assert!(enginefs.holds().holders(TEST_HASH).is_empty());
+        enginefs.drop_slack().await;
+        enginefs.reconcile_tick().await;
+
+        assert_eq!(film.stop_torrent.load(Ordering::SeqCst), 1);
+        assert_eq!(engine.handle.run_state(), RunState::Paused);
+        assert!(fake_advertises(film).is_empty(), "its draw ended");
+        assert!(!bucket.join("1").exists(), "and its bytes went");
+        assert_eq!(film.start_torrent.load(Ordering::SeqCst), starts);
+        enginefs.on_stream_end(OTHER_HASH, 0).await;
+    }
+
+    /// **Starting the same film again never stops it**: the idle share
+    /// becomes the new screen's hold in one step.
+    #[tokio::test(start_paused = true)]
+    async fn starting_the_same_film_again_never_stops_it() {
+        let (two, engine, _bucket) = the_film_left_behind().await;
+        let enginefs = &two.enginefs;
+        let film = &two.counters[0];
+
+        enginefs.note_player("tv.2", played(TEST_HASH, 0));
+        assert_eq!(
+            enginefs.holds().holders(TEST_HASH),
+            vec![crate::retention::holds::Holder::Player("tv.2".into())]
+        );
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+        enginefs.reconcile_tick().await;
+        enginefs.drop_slack().await;
+
+        assert_eq!(film.stop_torrent.load(Ordering::SeqCst), 0);
+        assert_eq!(engine.handle.run_state(), RunState::Live);
+        assert_eq!(fake_advertises(film), vec![1]);
+        enginefs.on_stream_end(TEST_HASH, 0).await;
+    }
+
+    /// **An idle share runs its torrent only while idle sharing is
+    /// allowed**, asked at each reconcile: `seedingEnabled` off stops it,
+    /// on runs it again; the app holding idle sharing back stops it, and
+    /// letting go runs it again. The share outlives every one of those,
+    /// and so do its draw and its bytes: what it announces when it runs
+    /// again is what it announced before.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_share_runs_only_while_idle_sharing_is_allowed() {
+        let (two, engine, bucket) = the_film_left_behind().await;
+        let enginefs = &two.enginefs;
+        let film = &two.counters[0];
+
+        enginefs.set_seeding_enabled(false).await;
+        enginefs.reconcile_tick().await;
+        assert_eq!(engine.handle.run_state(), RunState::Paused, "sharing off");
+        assert_eq!(film.stop_torrent.load(Ordering::SeqCst), 1);
+        enginefs.set_seeding_enabled(true).await;
+        tokio::time::advance(RECONCILE_MIN_DWELL).await;
+        enginefs.reconcile_tick().await;
+        assert_eq!(engine.handle.run_state(), RunState::Live, "sharing on");
+
+        enginefs.set_idle_sharing_held(true).await;
+        tokio::time::advance(RECONCILE_MIN_DWELL).await;
+        enginefs.reconcile_tick().await;
+        assert_eq!(
+            engine.handle.run_state(),
+            RunState::Paused,
+            "the app in the background"
+        );
+        assert_eq!(film.stop_torrent.load(Ordering::SeqCst), 2);
+        enginefs.drop_slack().await;
+        enginefs.set_idle_sharing_held(false).await;
+        tokio::time::advance(RECONCILE_MIN_DWELL).await;
+        enginefs.reconcile_tick().await;
+        assert_eq!(engine.handle.run_state(), RunState::Live, "and back");
+
+        assert_eq!(
+            enginefs.holds().holders(TEST_HASH),
+            vec![crate::retention::holds::Holder::IdleShare("tv".into())]
+        );
+        assert_eq!(fake_advertises(film), vec![1]);
+        assert!(bucket.join("1").is_file());
+    }
+
     /// **A download is shared whole, from the pin, and keeps being shared
     /// once it has finished.** Nothing a play session does ends it: it is
     /// in what the torrent shares for as long as the pin stands, so the
@@ -20389,9 +20583,9 @@ mod tests {
             "the ladder decided Run and its start is inside the backend"
         );
 
-        // The viewer leaves the screen and opens something else, in the
-        // gap: after the ladder has read, before the pass has.
-        enginefs.release_player(PLAYER);
+        // The viewer's screen opens something else, in the gap: after the
+        // ladder has read, before the pass has.
+        enginefs.note_player(PLAYER, crate::retention::sessions::Played::Elsewhere);
         enginefs.live().open(
             crate::retention::live::LiveEntity::Proxy {
                 dir: "/elsewhere".into(),
@@ -21463,8 +21657,8 @@ mod tests {
         assert_eq!(registered.pinned_file_indices(), vec![0]);
     }
 
-    /// **And once it holds the lock, the removal asks the pin set and the
-    /// cell again.**
+    /// **And once it holds the lock, the removal asks the pin set, the
+    /// holds and the registered streams again.**
     ///
     /// `retain_engine` reads both before it takes the hash's pin lock. No
     /// await separates that reading from the `try_lock`, but a pin running
@@ -21495,6 +21689,29 @@ mod tests {
 
         // A stream that opened in the same gap.
         engine.pinned_files.write().remove(&0);
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        enginefs.remove_errored_engine_locked(&engine).await;
+        assert!(
+            removed().is_empty(),
+            "a torrent opened before the lock was taken was removed with its files"
+        );
+        assert!(enginefs.peek_engine(TEST_HASH).await.is_some());
+        enginefs.on_stream_end(TEST_HASH, 0).await;
+
+        // A viewer's idle share -- the screen left, and idle sharing held
+        // back, so it does not run the torrent: it still keeps it.
+        enginefs.set_idle_sharing_held(true).await;
+        enginefs.holds().hold_for_player(PLAYER, TEST_HASH, vec![0]);
+        enginefs.release_player(PLAYER);
+        enginefs.remove_errored_engine_locked(&engine).await;
+        assert!(
+            removed().is_empty(),
+            "a torrent a viewer's idle share holds was removed with its files"
+        );
+        enginefs.holds().watching_elsewhere(PLAYER);
+
+        // With none of them, it goes, though the liveness cell still names
+        // it: the refusals above were the checks', and the cell is none.
         enginefs.live().open(
             crate::retention::live::LiveEntity::Torrent {
                 info_hash: TEST_HASH.to_string(),
@@ -21502,15 +21719,6 @@ mod tests {
             },
             false,
         );
-        enginefs.remove_errored_engine_locked(&engine).await;
-        assert!(
-            removed().is_empty(),
-            "a torrent opened before the lock was taken was removed with its files"
-        );
-        assert!(enginefs.peek_engine(TEST_HASH).await.is_some());
-
-        // With neither, it goes: the two refusals above were the checks'.
-        nothing_torrent_is_playing(&enginefs);
         enginefs.remove_errored_engine_locked(&engine).await;
         assert_eq!(removed(), vec![TEST_HASH.to_string()]);
         assert!(enginefs.peek_engine(TEST_HASH).await.is_none());
@@ -21561,12 +21769,13 @@ mod tests {
     ///
     /// This is the largest delete in the process -- a torrent and every
     /// byte of it -- and the state it is decided from is one a playback
-    /// start is in the middle of leaving: `on_stream_start` writes the cell
+    /// start is in the middle of leaving: `on_stream_start` registers the
+    /// stream (and a player's request took its screen's hold before that)
     /// and asks the reconciler for a restart, and until that restart lands
     /// the run state still says `Error`. A removal decided from the tick's
     /// reading takes the files out from under the request that asked for
-    /// them. So this one delete asks the cell itself, at the instant, like
-    /// every unlink below it.
+    /// them. So this one delete asks the holds and the registered streams
+    /// itself, at the instant.
     #[tokio::test(start_paused = true)]
     async fn an_errored_torrent_started_since_the_reading_is_not_removed() {
         let (mut enginefs, counters) = test_enginefs_for_reconciler(1);
@@ -21578,13 +21787,7 @@ mod tests {
         // The tick's reading, taken before its first engine.
         let tick = enginefs.live().reading();
         // The viewer opens it, and the restart has not happened yet.
-        enginefs.live().open(
-            crate::retention::live::LiveEntity::Torrent {
-                info_hash: TEST_HASH.to_string(),
-                file_idx: 0,
-            },
-            false,
-        );
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
         enginefs.retain_engine(&engine, &tick).await;
 
         assert!(
@@ -23073,7 +23276,7 @@ mod tests {
             let hash = hash.to_string();
             async move { engines.read().await.contains_key(&hash) }
         };
-        let hold = enginefs.holds().hold(TEST_HASH, None);
+        let hold = enginefs.holds().hold(TEST_HASH, None, None);
         tokio::time::sleep(INACTIVE_TORRENT_REMOVE_TIMEOUT + Duration::from_secs(30)).await;
         assert!(present(TEST_HASH).await, "a held engine was swept as idle");
         assert!(
@@ -23082,6 +23285,18 @@ mod tests {
         );
 
         drop(hold);
+        // A viewer's idle share keeps it too, whether idle sharing is
+        // allowed now or not: the share is still there to run it again.
+        enginefs.set_idle_sharing_held(true).await;
+        enginefs.holds().hold_for_player(PLAYER, TEST_HASH, vec![0]);
+        enginefs.release_player(PLAYER);
+        tokio::time::sleep(INACTIVE_TORRENT_REMOVE_TIMEOUT + Duration::from_secs(30)).await;
+        assert!(
+            present(TEST_HASH).await,
+            "an engine a viewer's idle share holds was swept as idle"
+        );
+
+        enginefs.holds().watching_elsewhere(PLAYER);
         tokio::time::sleep(INACTIVE_TORRENT_REMOVE_TIMEOUT + Duration::from_secs(30)).await;
         assert!(
             !present(TEST_HASH).await,

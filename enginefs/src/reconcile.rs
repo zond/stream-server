@@ -137,7 +137,8 @@ pub struct Conditions {
     pub settled: bool,
     /// Something said it is using this torrent: an explicit hold (a player
     /// screen open on it, a cast of it published --
-    /// [`crate::retention::holds`]), a body being delivered off it (a
+    /// [`crate::retention::holds`]), a viewer's idle share of it while idle
+    /// sharing is allowed, a body being delivered off it (a
     /// stream response registered on it, or a read not yet ended), or it
     /// is the last thing a stream opened on ([`crate::retention::live`]).
     /// `EngineFS::held` reads it.

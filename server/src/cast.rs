@@ -218,9 +218,19 @@ impl Casts {
             "the LAN media listener is not running; start it with set_lan_media(true) first"
         );
         let is_rendition = rendition.is_some();
-        let hold = lease
-            .torrent_now()
-            .map(|(info_hash, files)| holds.hold(&info_hash, files));
+        let player = play.as_ref().map(|play| play.token.as_str());
+        let hold = match lease.torrent_now() {
+            Some((info_hash, files)) => Some(holds.hold(&info_hash, files, player)),
+            // Not a torrent: a cast of the viewer's all the same, so the
+            // viewer is watching something else now and their idle share
+            // goes. Nothing is held for it.
+            None => {
+                if let Some(player) = player {
+                    holds.watching_elsewhere(player);
+                }
+                None
+            }
+        };
         published.insert(
             token.0.clone(),
             Arc::new(Publication {

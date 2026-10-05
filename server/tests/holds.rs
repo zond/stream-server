@@ -4,8 +4,11 @@
 //! is gone (`ServerHandle::release_player`), paused, stalled or with nothing
 //! open; a cast holds it from publish to unpublish, direct or rendition
 //! alike, and takes the hold while the screen's is still there; a newer
-//! screen of the viewer lets the older one's go; and once nothing holds a
-//! torrent -- and the cell names something else -- the reconciler stops it.
+//! screen of the viewer lets the older one's go; what the viewer left --
+//! the screen released, the cast unpublished -- is their idle share,
+//! which keeps it running while idle sharing is allowed, until they watch
+//! something else; and once nothing holds a torrent -- and the cell names
+//! something else -- the reconciler stops it.
 //!
 //! What this replaced, and what each test would have caught: the
 //! reconciler read "playing" off the liveness cell -- the last entity a
@@ -238,8 +241,10 @@ fn read_exact(reader: &mut stream_server::MediaReader, buf: &mut [u8]) -> anyhow
 
 /// **A player screen holds its torrent until it is left**: paused with no
 /// read open, and with something else opened since, the torrent is still
-/// the screen's and runs; the screen's goodbye lets it go, and the
-/// reconciler stops it.
+/// the screen's and runs; the screen's goodbye leaves it as the viewer's
+/// idle share, which runs it while idle sharing is allowed (the default)
+/// and not while the app holds idle sharing back; and the viewer starting
+/// something else lets it go, and the reconciler stops it.
 #[test]
 fn a_player_screen_holds_its_torrent_until_it_is_left() -> anyhow::Result<()> {
     let fixture = Fixture::start()?;
@@ -257,13 +262,23 @@ fn a_player_screen_holds_its_torrent_until_it_is_left() -> anyhow::Result<()> {
     );
 
     assert!(fixture.handle.release_player("viewer.1"));
-    assert_eq!(fixture.holders_of_a(), Vec::<Holder>::new());
+    assert_eq!(
+        fixture.holders_of_a(),
+        vec![Holder::IdleShare("viewer".into())]
+    );
     assert_eq!(
         fixture.verdict_on_a()?,
-        Decision::Stop,
-        "a torrent nothing holds, which is not the last played, kept running"
+        Decision::Run,
+        "what the viewer watched last stopped sharing while idle sharing was allowed"
     );
-    fixture.stop()
+    fixture.handle.set_idle_sharing_held(true)?;
+    assert_eq!(fixture.verdict_on_a()?, Decision::Stop, "held back");
+    fixture.handle.set_idle_sharing_held(false)?;
+    assert_eq!(fixture.verdict_on_a()?, Decision::Run, "and given back");
+
+    drop(fixture.play(&fixture.b, "viewer.2")?);
+    assert_eq!(fixture.holders_of_a(), Vec::<Holder>::new());
+    fixture.until_a_stops()
 }
 
 /// **A newer screen of the viewer lets the older one's torrent go**: the
@@ -316,10 +331,16 @@ fn a_cast_holds_its_torrent_from_publish_to_unpublish() -> anyhow::Result<()> {
     assert_eq!(served.as_ref(), &fixture.a.bytes[8 * PIECE..]);
 
     assert!(fixture.handle.unpublish(&token));
-    assert_eq!(fixture.holders_of_a(), Vec::<Holder>::new());
-    // The receiver's reads made `a` the last thing opened again: what
-    // follows is the idle-sharing policy's, until something else opens.
+    // The cast was what the viewer watched last: their idle share now.
+    assert_eq!(
+        fixture.holders_of_a(),
+        vec![Holder::IdleShare("viewer".into())]
+    );
+    // Something else opened is not something else watched.
     fixture.open_something_else()?;
+    assert_eq!(fixture.verdict_on_a()?, Decision::Run);
+    // The viewer starting another film is.
+    drop(fixture.play(&fixture.b, "viewer.2")?);
     fixture.until_a_stops()
 }
 
@@ -367,10 +388,16 @@ fn a_rendition_holds_its_torrent_and_its_bytes_from_publish_to_unpublish() -> an
     assert!(!slot.is_empty());
 
     assert!(fixture.handle.unpublish(&token));
-    assert_eq!(fixture.holders_of_a(), Vec::<Holder>::new());
-    // The receiver's reads made `a` the last thing opened again: what
-    // follows is the idle-sharing policy's, until something else opens.
+    // The cast was what the viewer watched last: their idle share now.
+    assert_eq!(
+        fixture.holders_of_a(),
+        vec![Holder::IdleShare("viewer".into())]
+    );
+    // Something else opened is not something else watched.
     fixture.open_something_else()?;
+    assert_eq!(fixture.verdict_on_a()?, Decision::Run);
+    // The viewer starting another film is.
+    drop(fixture.play(&fixture.b, "viewer.2")?);
     fixture.until_a_stops()
 }
 
@@ -398,4 +425,30 @@ fn made(
             }
         }
     })
+}
+
+/// **A cast of something that is not a torrent, published with the
+/// viewer's token, is the viewer watching something else**: their idle
+/// share goes, and the torrent it kept stops.
+#[test]
+fn a_cast_of_a_link_ends_the_viewers_idle_share() -> anyhow::Result<()> {
+    let fixture = Fixture::start()?;
+    drop(fixture.watch_a("viewer.1")?);
+    assert!(fixture.handle.release_player("viewer.1"));
+    assert_eq!(
+        fixture.holders_of_a(),
+        vec![Holder::IdleShare("viewer".into())]
+    );
+    let link = fixture
+        .handle
+        .register(MediaSpec::StreamingUrl(url::Url::parse(
+            "http://127.0.0.1:9/film.mkv",
+        )?))?;
+    let token = fixture.handle.publish(&link, Some(play("viewer.2")))?;
+    assert_eq!(fixture.holders_of_a(), Vec::<Holder>::new());
+    fixture.handle.unpublish(&token);
+    // The liveness cell still names `a`, and keeps it running while the
+    // reconciler reads it; something else opened moves it.
+    fixture.open_something_else()?;
+    fixture.until_a_stops()
 }
