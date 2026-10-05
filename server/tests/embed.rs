@@ -5642,28 +5642,24 @@ fn an_archive_body_keeps_its_torrent_running_while_it_is_open() -> anyhow::Resul
 }
 
 /// And the torrent an archive member was read out of is stopped again once
-/// something else is the one being played.
+/// the read is done.
 ///
-/// The read is a playback: `routes::archive::stream_file` tells the server
-/// a stream opened, which makes that torrent the entity being played and
-/// so one the ladder keeps running -- with no clock on it, so a viewer who
-/// pauses keeps it. What ends that is not the body ending but *another*
-/// stream opening, and from that moment the torrent behind the archive is
-/// one nobody is playing: stopped, and its cache the retention owner's.
+/// The read has no player token, so nothing holds the torrent but the
+/// read itself: `routes::archive::stream_file` registers a stream, which
+/// is a body being delivered (`EngineFS::held`), and the ladder keeps the
+/// torrent running for exactly as long as that lasts. What ends it is the
+/// registration ending -- an aside `TorrentSource`'s drop, a spawned
+/// `on_stream_end`, since a `Drop` cannot await the async locks itself --
+/// and without it every archive member ever read would keep its torrent
+/// running for the life of the process. The liveness cell still names the
+/// torrent afterwards, and keeps nothing running.
 ///
-/// So there are two claims here, and the second is the one that is easy to
-/// leave out of the code. The first is the switch: the pair of readings
-/// either side of it, which is the policy a viewer can see. The second is
-/// still an aside `TorrentSource`'s drop, a spawned `on_stream_end` -- a `Drop`
-/// cannot await the async locks itself -- and without it every archive
-/// member ever read leaves a stream registered for the life of the process.
-/// That does not stop the reconciler from doing anything (what it reads
-/// is the cell), so the oracle for it is the register itself, on the wire
+/// The oracle for the registration is the register itself, on the wire
 /// the embedder reads it off: `background_traffic().playing` is
 /// `enginefs::EngineFS::playback_is_live`, which is the open file readers
 /// **or** the stream registrations. The reader goes with the body either
 /// way, so a light that goes out when the body ends is one where the
-/// registration was ended too.
+/// registration was ended too; and then the timer's verdict is `Stop`.
 #[test]
 fn an_archive_member_read_lets_the_torrent_be_stopped_again_when_it_is_done() -> anyhow::Result<()>
 {
@@ -5684,22 +5680,6 @@ fn an_archive_member_read_lets_the_torrent_be_stopped_again_when_it_is_done() ->
         // `archive_member_server`).
         offline_config(),
     )?;
-    let client = bearer_client(&handle)?;
-
-    // A second torrent, seeded whole, for the viewer to move on to.
-    let other_content = src.path().join("Other");
-    std::fs::create_dir_all(&other_content)?;
-    write_payload(&other_content.join("other.bin"), 64 * 1024);
-    let (other_torrent, other_hash) = real_torrent(&other_content);
-    let cache_root = resolved(&cache_dir.path().join("cache"));
-    seed_piece_store(&cache_root, &other_torrent, &other_content);
-    client
-        .post(format!("{base}/create"))
-        .json(&serde_json::json!({ "torrent": hex::encode(&other_torrent) }))
-        .send()?
-        .error_for_status()?;
-    let other_stats = stats_after_check(&handle, &other_hash)?;
-    let other_idx = file_index(&other_stats, "other.bin");
 
     // The member, read to its end out of the torrent.
     let anonymous = reqwest::blocking::Client::new();
@@ -5717,11 +5697,8 @@ fn an_archive_member_read_lets_the_torrent_be_stopped_again_when_it_is_done() ->
     // Bounded rather than immediate because that end is spawned.
     //
     // This waits *before* the assertion below, and that order is the whole
-    // point of it. With a registration still open the reconciler reads
-    // `playing` off the reader count and answers `Run` for a reason that
-    // has nothing to do with what is being tested; only once the register
-    // is provably empty can a `Run` come from anywhere but the liveness
-    // cell, which is the claim.
+    // point of it: with a registration still open the reconciler answers
+    // `Run`, rightly, for the body being delivered.
     let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
     while handle.background_traffic()?.playing {
         anyhow::ensure!(
@@ -5734,27 +5711,18 @@ fn an_archive_member_read_lets_the_torrent_be_stopped_again_when_it_is_done() ->
     assert_eq!(
         handle.reconcile_as_timer(&info_hash)?,
         Some(enginefs::reconcile::Verdict {
-            decision: enginefs::reconcile::Decision::Run,
+            decision: enginefs::reconcile::Decision::Stop,
             for_space: false,
         }),
-        "the read left the torrent running, and stopping reading is not \
-         playing something else"
+        "the read is over and nothing holds the torrent, yet it is kept \
+         running"
     );
-    assert!(
-        !swarm_paused(&handle, &info_hash)?,
-        "and having decided that, the timer must have left it running"
-    );
-
-    // The viewer moves on: the second torrent is the one being played now.
-    anonymous
-        .get(format!("{base}/{other_hash}/{other_idx}"))
-        .send()?
-        .error_for_status()?;
+    // And the server's own timer stops it, with nothing else opened.
     let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
     while !swarm_paused(&handle, &info_hash)? {
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
-            "the torrent the viewer left is still running"
+            "the torrent the read is over with is still running"
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }

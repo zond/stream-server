@@ -31,8 +31,10 @@
 //! # Reading it
 //!
 //! A reader takes a [`Reading`] -- a copy -- and every consumer of one tick
-//! is handed the same copy, so the reconciler's ladder and the retention
-//! pass cannot disagree about what is playing inside one tick. Between
+//! is handed the same copy, so the retention passes of one tick cannot
+//! disagree about what is playing. (The reconciler's ladder does not read
+//! it at all: whether a torrent runs is what its holds, its pins and the
+//! bodies being delivered off it say -- [`crate::retention::holds`].) Between
 //! tasks the value can move, which is why every delete asks its door again
 //! at the instant of the unlink ([`crate::retention::owner::Door`]) rather
 //! than trusting the reading it started from.
@@ -80,15 +82,15 @@ pub struct Switch {
 /// "am I the one being played?".
 ///
 /// It starts empty and a restart empties it: nothing is playing in a
-/// process that has served nothing, which is the honest reading and also
-/// the one that makes the first tick after a restart stop every unpinned
-/// torrent.
+/// process that has served nothing, which is the honest reading. (The
+/// first tick after a restart stops every unpinned torrent because a
+/// restart has no holds either -- [`crate::retention::holds`].)
 #[derive(Debug)]
 pub struct Live {
     cell: tokio::sync::watch::Sender<Option<LiveEntity>>,
     /// **Which files the viewer's players are playing**, which is not this
     /// cell: the cell follows every stream a request opens, and decides
-    /// windows and runs; the sessions follow only the player's own `p=`
+    /// windows; the sessions follow only the player's own `p=`
     /// requests, and decide what is shared ([`PlaySessions`]). Here so that
     /// everything that holds the cell holds them too.
     sessions: PlaySessions,
@@ -256,8 +258,8 @@ impl Live {
     }
 
     /// A copy of the value, for a caller that will ask several questions of
-    /// one reading -- a reconciler tick hands the same copy to its ladder
-    /// and to its retention pass, so the two cannot disagree.
+    /// one reading -- a reconciler tick hands the same copy to every
+    /// retention pass it runs, so they cannot disagree.
     pub fn reading(&self) -> Reading {
         Reading(self.cell.borrow().clone())
     }

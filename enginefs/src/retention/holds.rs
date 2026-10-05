@@ -1,7 +1,7 @@
 //! **Who keeps a torrent running, said by the holder**: explicit holds,
 //! each with an owner and a lifetime, which the reconciler combines with
-//! the pins and the idle-sharing policy rather than guessing from what
-//! happens to be reading.
+//! the pins and the bodies being delivered rather than guessing from what
+//! was opened last.
 //!
 //! The question "should this torrent run?" used to be answered from two
 //! inferences: the liveness cell ([`crate::retention::live`]) -- the last

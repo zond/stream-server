@@ -7,8 +7,8 @@
 //! screen of the viewer lets the older one's go; what the viewer left --
 //! the screen released, the cast unpublished -- is their idle share,
 //! which keeps it running while idle sharing is allowed, until they watch
-//! something else; and once nothing holds a torrent -- and the cell names
-//! something else -- the reconciler stops it.
+//! something else; and once nothing holds a torrent the reconciler stops
+//! it, whatever the liveness cell names.
 //!
 //! What this replaced, and what each test would have caught: the
 //! reconciler read "playing" off the liveness cell -- the last entity a
@@ -447,8 +447,5 @@ fn a_cast_of_a_link_ends_the_viewers_idle_share() -> anyhow::Result<()> {
     let token = fixture.handle.publish(&link, Some(play("viewer.2")))?;
     assert_eq!(fixture.holders_of_a(), Vec::<Holder>::new());
     fixture.handle.unpublish(&token);
-    // The liveness cell still names `a`, and keeps it running while the
-    // reconciler reads it; something else opened moves it.
-    fixture.open_something_else()?;
     fixture.until_a_stops()
 }

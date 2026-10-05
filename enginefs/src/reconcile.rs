@@ -87,9 +87,9 @@ pub enum Decision {
 /// answering a person, while a decision taken by the timer is answering
 /// nobody.
 ///
-/// Nothing below the free-space arm reads the trigger -- what is playing
-/// is a value written before anything asks ([`crate::retention::live`]) --
-/// so the ladder answers the same question to everyone.
+/// Nothing below the free-space arm reads the trigger -- what holds a
+/// torrent is declared before anything asks ([`Conditions::held`]) -- so
+/// the ladder answers the same question to everyone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
     /// The reconciler's own tick, over every torrent.
@@ -138,10 +138,11 @@ pub struct Conditions {
     /// Something said it is using this torrent: an explicit hold (a player
     /// screen open on it, a cast of it published --
     /// [`crate::retention::holds`]), a viewer's idle share of it while idle
-    /// sharing is allowed, a body being delivered off it (a
-    /// stream response registered on it, or a read not yet ended), or it
-    /// is the last thing a stream opened on ([`crate::retention::live`]).
-    /// `EngineFS::held` reads it.
+    /// sharing is allowed, or a body being delivered off it (a stream
+    /// response registered on it, or a read not yet ended).
+    /// `EngineFS::held` reads it. Never the liveness cell
+    /// ([`crate::retention::live`]), which any open moves and nobody
+    /// declared.
     ///
     /// Declared, not inferred, and not a clock: a viewer who pauses for an
     /// hour still has the screen open, a television still has the cast, and
@@ -272,8 +273,10 @@ pub struct Conditions {
 ///    delivered ([`crate::retention::holds`]) -- and nothing a request leaves
 ///    behind. A viewer who pauses keeps their torrent running for as long
 ///    as they like, and so does a television the film was handed to,
-///    whatever else a stream opens meanwhile; the last torrent a stream
-///    opened on stays up after that too.
+///    whatever else a stream opens meanwhile; and what a viewer watched
+///    last goes on running after they leave it, as their idle share, while
+///    idle sharing is allowed and until they watch something else. Once
+///    nothing holds it, it stops.
 ///    Otherwise seeding is what a *pinned* torrent does, and pins are
 ///    kept: with nothing held and nothing pinned there is nothing to
 ///    seed from, because the bytes are going.
@@ -355,9 +358,10 @@ pub fn verdict(conditions: &Conditions, trigger: Trigger) -> Verdict {
         });
     }
     // Nothing below reads the trigger. A `PlaybackStart` is a caller
-    // saying somebody is about to open a reader on this torrent: the
-    // liveness cell is written by `on_stream_start` before it asks
-    // anything, so the answer is the same whoever is asking, and
+    // saying somebody is about to open a reader on this torrent: its
+    // stream is registered by `on_stream_start` before it asks anything
+    // (and a player's hold taken before that), so `held` says so and the
+    // answer is the same whoever is asking, and
     // `focus_torrent` -- which registers nothing at all -- is safe on its
     // own account rather than by running two lines after something else.
     arm(if conditions.held || conditions.pinned {
@@ -918,10 +922,10 @@ mod tests {
     /// recently it was watched.
     ///
     /// There is no grace period and no clock. A viewer who pauses is still
-    /// playing this torrent -- the liveness value says so until they open
-    /// something else -- so there is no wait for "a player between two
-    /// segment reads" to cover: that reading came from a register going
-    /// quiet, which this arm does not consult.
+    /// playing this torrent -- the screen's hold says so until the screen
+    /// is left -- so there is no wait for "a player between two segment
+    /// reads" to cover: that reading came from the reads going quiet, and
+    /// a hold does not.
     #[test]
     fn a_torrent_nobody_plays_and_nobody_pinned_is_stopped() {
         let left = Conditions {
