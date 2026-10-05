@@ -1562,10 +1562,10 @@ impl ServerHandle {
     /// Matroska file its Cues, usually at the end), slot 0 (Chrome's
     /// demuxer probes the first fragment before it seeks), and the slot a
     /// receiver told to start at the spec's `startMs` jumps to, with the
-    /// slots of the 12 s before it and the 6 s after
-    /// ([`rendition::PREPARED_BEFORE`], [`rendition::PREPARED_AFTER`]):
-    /// zond's TV has asked first for a slot up to some 12 s before the
-    /// start (`docs/design/renditions.md`, *Prepared before the load*). Returns at once; the work runs on the server and
+    /// slots of the 6 s after it ([`rendition::PREPARED_AFTER`]) -- and
+    /// nothing before it: a receiver asks for the file's start and then
+    /// that slot (`docs/design/renditions.md`, *Prepared before the
+    /// load*). Returns at once; the work runs on the server and
     /// [`Self::rendition_readiness`] says how far it has got, so the app
     /// tells the receiver to load only once its first requests will be
     /// answered at once -- a receiver gives up on a load that stays silent

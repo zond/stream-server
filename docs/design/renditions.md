@@ -913,9 +913,8 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   43 KB of header); what counted slots now counts time -- the lookahead
   is the slots beginning within 12 s of the last asked
   (`LOOKAHEAD_TIME`, two slots at least: it was two six-second segments)
-  and a preparation is the 12 s before the start and the 6 s after
-  (`PREPARED_BEFORE`, `PREPARED_AFTER`). The ring's cap is bytes and
-  unchanged.
+  and a preparation is the start's slot and the 6 s after it
+  (`PREPARED_AFTER`). The ring's cap is bytes and unchanged.
 * **Every sample at its own time** (2026-10-05). The first answer to the
   open-GOP seek above started each slot's decode times at its sync
   sample, and the app's test caught what that cost: every picture from the
@@ -1170,22 +1169,26 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   it. Sixteen kilobytes a slot on average: half a per cent of a 3 MB slot,
   more of a small one (a slot is a second of film at least).
 
-  So the preparation makes the slot for the start
-  (`Layout::slot_for_time`) and, zond's decision, **the slots of the 12 s
-  before it and of the 6 s after** (`PREPARED_BEFORE`, `PREPARED_AFTER`;
-  two six-second segments before and one after, when slots were
-  segments), the film's ends permitting: slot 0, then the earliest of
-  them -- a run started there -- and the rest in order, which that run
-  makes as it reads on, so whichever slot up to the start the receiver
-  asks first is in the ring, and the ones after are film in hand. A first request
-  for any of them starts no run: it is answered from the ring and moves
-  the run that made them back to it (`RunSlot::covers`,
-  `Inner::note_request`), and its lookahead from there. The ring's cap
-  is unchanged: slot 0 with its run's lookahead and the prepared slots
-  with theirs are some 42 s of film, which fit 96 MiB up to some
-  18 Mbit/s (zond's film is 8); past that the slots farthest from
-  the last one asked -- the earliest prepared -- go first, and a receiver
-  asking for one starts a run there, as before. (The same
+  So for a while the preparation made, zond's decision, the slots of the
+  12 s before the start as well as the start's and the 6 s after it, so
+  that whichever slot the receiver asked first was in the ring. **With
+  slots on Chrome's blocks it makes nothing before the start's slot**
+  (2026-10-05): three loads on zond's TV, at 123.0 s, 97.3 s (the last
+  half second before a key, so the next slot's) and 45.0 s, each asked
+  for the file's start and then for exactly the slot
+  `Layout::slot_for_time` names, and nothing else. The film before the
+  start was film a torrent had to fetch before the cast could begin. The
+  preparation is slot 0, then the start's slot -- a run started there --
+  and the slots of the 6 s after it (`PREPARED_AFTER`), which that run
+  makes as it reads on: film in hand when it begins to play. A first
+  request for any of them starts no run: it is answered from the ring and
+  moves the run that made them back to it (`RunSlot::covers`,
+  `Inner::note_request`), and its lookahead from there. The ring's cap is
+  unchanged: slot 0 with its run's lookahead and the prepared slots with
+  theirs are some 30 s of film, which fit 96 MiB up to some 25 Mbit/s
+  (zond's film is 8); past that the slots farthest from the last one
+  asked go first, and a receiver asking for one starts a run there, as
+  before. (The same
   investigation found the torrent stopped under the cast once anything else
   opened; that was the reconciler's guess at "playing", replaced by explicit
   holds -- `docs/storage.md`, *Who keeps a torrent running*.)
@@ -1222,7 +1225,7 @@ reading of step C holds unchanged.
 | `install_producer(Arc<dyn Producer>)` | Once, by the embedder. Without one, `publish_rendition` refuses `noProducer`. |
 | `publish_rendition(&MediaId, RenditionSpec, Option<PlayToken>) -> anyhow::Result<CastToken>` | As `publish`: refused while the listener is down; holds the id's lease; writes the playlist. Starts no run: the receiver's first request does. |
 | `rendition_state(&CastToken) -> Option<RenditionState>` | `{ producing, segmentsServed, speed, failed: Option<{refused, message}> }`. Cheap, no runtime hop, safe to poll. |
-| `prepare_rendition(&CastToken) -> bool` | Starts the first run and makes the receiver's first slots with no request -- slot 0, and the slots of the 12 s before the start to the 6 s after (§2.8, *Prepared before the load*). |
+| `prepare_rendition(&CastToken) -> bool` | Starts the first run and makes the receiver's first slots with no request -- slot 0, and the start's slot with those of the 6 s after it (§2.8, *Prepared before the load*). |
 | `rendition_readiness(&CastToken) -> RenditionReadiness` | `index`, `start`, `ready`, `failed{sentence}` or `ended`. Cheap, safe to poll. |
 | `unpublish(&CastToken) -> bool` | Unchanged; for a rendition it also drops the run and the ring (2.1). |
 

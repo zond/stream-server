@@ -2344,22 +2344,24 @@ fn slot_holding(knobs: &Knobs, at_us: i64) -> u64 {
 }
 
 /// The slots a preparation for a start at `start_us` makes in `knobs`'
-/// 60 s film, besides slot 0: those of the 12 s before it to the 6 s after
-/// it -- the film's ends permitting.
+/// 60 s film, besides slot 0: the one the receiver asks for and those of
+/// the 6 s after it -- the film's end permitting.
 fn prepared(knobs: &Knobs, start_us: i64) -> Vec<u64> {
-    let first = slot_holding(knobs, (start_us - 12_000_000).max(0));
+    let first = slot_holding(knobs, start_us);
     let last = slot_holding(knobs, (start_us + 6_000_000).min(59_999_999));
     (first..=last).collect()
 }
 
 /// **A preparation makes the header, slot 0 and the receiver's start with
-/// the slots of the 12 s before it and the 6 s after, with no request at
-/// all**: the receiver's first range after the load has been for the
-/// start's slot, the one before it (FFmpeg seeks a time on a cut to the
-/// slot before: `docs/design/renditions.md`, *Prepared before the load*)
-/// and one some 12 s earlier (zond's TV), so whichever it asks is ready.
+/// the slots of the 6 s after it, with no request at all -- and nothing
+/// before the start's slot**: a receiver asks for the file's start and
+/// then for the slot its start falls in (`Layout::slot_for_time`), which
+/// begins on the block Chrome asks in, so that is the slot the run starts
+/// at. The 12 s before it were made too while the TV's first request, a
+/// block early, fell in the slot before: film a torrent had to fetch
+/// before the cast could begin.
 #[test]
-fn preparing_makes_the_receivers_start_and_its_neighbours() -> anyhow::Result<()> {
+fn preparing_makes_the_receivers_start_and_the_film_after_it() -> anyhow::Result<()> {
     let knobs = Knobs::default();
     let fixture = Fixture::quick(knobs.clone())?;
     let token = fixture.publish(60_000, 20_500)?;
@@ -2377,7 +2379,13 @@ fn preparing_makes_the_receivers_start_and_its_neighbours() -> anyhow::Result<()
     let probe = fixture.probe(&token);
     assert!(probe.init, "the layout, and with it the header, is made");
     let slots = prepared(&knobs, 20_500_000);
-    assert!(slots.contains(&start) && slots.len() > 12, "{slots:?}");
+    assert_eq!(slots[0], start, "{slots:?}");
+    assert!(slots.len() >= 6, "the 6 s after it: {slots:?}");
+    assert!(
+        !probe.ring.contains(&(start - 1)),
+        "nothing before the start's slot: {:?}",
+        probe.ring
+    );
     for slot in std::iter::once(0).chain(slots.iter().copied()) {
         assert!(
             probe.ring.contains(&slot),
@@ -2387,7 +2395,7 @@ fn preparing_makes_the_receivers_start_and_its_neighbours() -> anyhow::Result<()
     }
     assert_eq!(
         probe.runs_started, 2,
-        "the header's from the start, and one from 12 s before the start"
+        "the header's from the film's start, and one from the start's slot"
     );
     assert_eq!(
         fixture.producer.runs()[1].from,
@@ -2479,15 +2487,12 @@ fn a_first_request_for_any_prepared_slot_starts_no_run() -> anyhow::Result<()> {
 
 /// **Preparing at the film's ends stays inside it**: a start in slot 0
 /// makes the slots of the first 6 s, all from the header's run; one in the
-/// last slot makes those of the last 12 s. (A slot begins half a second
-/// before its key: 6.0 s is in the seventh, 47.5 s in the forty-ninth.)
+/// last slot makes that slot and nothing past the film. (A slot begins
+/// half a second before its key: 6.0 s is in the seventh.)
 #[test]
 fn preparing_at_the_films_ends_stays_inside_it() -> anyhow::Result<()> {
     let knobs = Knobs::default();
-    for (start_ms, slots) in [
-        (0u32, (0..=6).collect::<Vec<u64>>()),
-        (59_500, (48..=59).collect()),
-    ] {
+    for (start_ms, slots) in [(0u32, (0..=6).collect::<Vec<u64>>()), (59_500, vec![59])] {
         let fixture = Fixture::quick(knobs.clone())?;
         let token = fixture.publish(60_000, u64::from(start_ms))?;
         assert!(fixture.handle.prepare_rendition(&token));

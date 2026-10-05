@@ -124,10 +124,12 @@ Chromecast default receiver gives up on a load that stays silent that long:
 behind a thin swarm it took a minute. So `ServerHandle::prepare_rendition(&CastToken)`
 asks for what the receiver will ask first, through the same request path --
 the header, slot 0 (the demuxer's probe), and the slot for `startMs` (by
-the `sidx` label: the slot holding the time when mirrored, an earlier one
-when estimated) with the slots of the 12 s before it and the 6 s after,
-which one run makes in turn: the Chromecast with Google TV has asked
-first for a slot up to some 12 s before the start -- and
+the `sidx` label: the slot the time falls in when mirrored -- a slot
+begins half a second before its key is shown -- an earlier one when
+estimated) with the slots of the 6 s after it, which one run makes in
+turn, and nothing before it: a receiver asks for the file's start and
+then for exactly that slot, which begins on the 32 KiB block Chrome asks
+in -- and
 `rendition_readiness(&CastToken)` says how far it has got:
 `{"phase":"index"}`, `"start"`, `"ready"`, `"failed"` with the `sentence`, or
 `"ended"`. The app loads the receiver at `ready`, and the receiver's first

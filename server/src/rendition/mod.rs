@@ -109,12 +109,11 @@ pub const SPEED_WINDOW: Duration = Duration::from_secs(10);
 pub const SEEK_BACK: Duration = Duration::from_secs(2);
 /// Samples in flight between a producer and its run.
 const SINK_CAPACITY: usize = 32;
-/// How much of the film before the receiver's start a preparation makes
+/// How much of the film after the receiver's start a preparation makes
 /// ([`crate::ServerHandle::prepare_rendition`]): the slots from the one
-/// holding the start less this.
-pub const PREPARED_BEFORE: Duration = Duration::from_secs(12);
-/// How much of the film after the receiver's start a preparation makes:
-/// the slots to the one holding the start plus this.
+/// the receiver will ask for to the one holding the start plus this, so
+/// it has this much film in hand when it begins to play. Nothing before
+/// that slot: see [`Rendition::prepare`].
 pub const PREPARED_AFTER: Duration = Duration::from_secs(6);
 
 /// What the app asks for. Crosses FFI from Dart, so plain data.
@@ -917,19 +916,25 @@ impl Rendition {
     /// header (which waits for the layout: the source's formats and index),
     /// slot 0 (Chrome's FFmpeg demuxer reads on from the header into the
     /// first fragment before it seeks), then every slot from the one a
-    /// receiver told to start [`PREPARED_BEFORE`] before `spec.start_ms`
-    /// would jump to ([`layout::Layout::slot_for_time`]) to the one for
+    /// receiver told to start at `spec.start_ms` jumps to
+    /// ([`layout::Layout::slot_for_time`]) to the one for
     /// [`PREPARED_AFTER`] after it, in order, so one run makes them all.
     ///
-    /// Why the film before it: zond's TV has asked first for a slot up to
-    /// some twelve seconds before the start (`docs/design/renditions.md`,
-    /// *Prepared before the load*), which FFmpeg's seek does not explain.
+    /// **Nothing before the start's slot.** zond's TV used to ask first for
+    /// a slot before it, and for a while the 12 s before the start were
+    /// prepared against that. It was Chrome asking from the start of the
+    /// 32 KiB block the slot's first byte was in -- the tail of the slot
+    /// before -- and slots begin on those blocks now
+    /// ([`layout::SLOT_ALIGN`]): three loads on the TV at 123.0 s, 97.3 s
+    /// (the last half second before a key) and 45.0 s each asked for the
+    /// file's start and then this slot, nothing else. Film before the
+    /// start is film a torrent would have to fetch before the cast begins.
     /// The film after it is a slot in hand once it plays.
     ///
     /// Its first requests then find these in the ring -- held by its cap
     /// like any slot ([`RING_CAP`]: slot 0 with its run's lookahead and the
-    /// prepared slots with theirs are some 42 s of film, which fit it up to
-    /// some 18 Mbit/s; past that the farthest from the last one asked go
+    /// prepared slots with theirs are some 30 s of film, which fit it up to
+    /// some 25 Mbit/s; past that the farthest from the last one asked go
     /// first). Waits as long as the source takes, as a request does: a run
     /// with a request waiting on it is never let go, and nothing gives up
     /// (the viewer cancels by unpublishing, which ends this with
@@ -939,10 +944,9 @@ impl Rendition {
         let us = |duration: Duration| i64::try_from(duration.as_micros()).unwrap_or(i64::MAX);
         let start_us = us(Duration::from_millis(self.spec.start_ms)).min(self.duration_us());
         let slot = layout.slot_for_time(start_us);
-        let first = layout.slot_for_time(start_us.saturating_sub(us(PREPARED_BEFORE)));
         let last = layout.slot_for_time(start_us.saturating_add(us(PREPARED_AFTER)));
         self.slot(state, 0, Ask::Seek).await?;
-        for prepared in first..=last.max(slot) {
+        for prepared in slot..=last.max(slot) {
             self.slot(state, prepared, Ask::Seek).await?;
         }
         self.prepared.store(true, Ordering::SeqCst);
