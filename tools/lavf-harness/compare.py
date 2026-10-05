@@ -8,14 +8,17 @@ video stream, backward -- and holds it against the film it was made from
 (read with the system ffprobe):
 
   straight   every packet of picture and of sound is the film's at its time
-             (to 12 us), and decode times strictly increase;
+             (to 12 us), decode times strictly increase, and the reader is
+             never asked to seek (a seek past what a receiver holds is a
+             new request there);
   each seek  after reading 16 s: where the picture lands against the key of
              the slot the time falls in (slots begin --ahead-us before their
              key is shown), then 3 s of both tracks against the film's.
 
 --shift-us is what the producer adds to every time: xtremio's shifts a
 Matroska film by its sound's priming (21 ms for AAC at 48 kHz).
-One line a version; anything but "ok" and "+0.00" is a finding.
+One line a version; anything but "ok", "+0.00" and no reader seek is a
+finding.
 """
 import argparse, bisect, os, subprocess, sys
 
@@ -56,7 +59,8 @@ film, keys = film_packets()
 bad = False
 for v in a.versions.split(","):
     probe = os.path.join(a.dir, "ad-" + v)
-    out = subprocess.run([probe, a.rendition, "0", "-", "0"], capture_output=True, text=True).stdout
+    ran = subprocess.run([probe, a.rendition, "0", "-", "0"], capture_output=True, text=True)
+    out, jumps = ran.stdout, sum(1 for line in ran.stderr.split("\n") if line.startswith("J "))
     read, dts = {0: [], 1: []}, []
     for line in out.split("\n"):
         p = line.split()
@@ -80,7 +84,7 @@ for v in a.versions.split(","):
         elif p[0] == "S" and cur and int(p[1]) in cur[2]:
             cur[2][int(p[1])].append(round(float(p[2]) * 1e6))
     close()
-    line = "%-7s straight: decode steps <= 0: %d  picture: %s  sound: %s | seeks: %s" % (v, back, whole[0], whole[1], " ".join(results))
+    line = "%-7s straight: decode steps <= 0: %d  reader seeks: %d  picture: %s  sound: %s | seeks: %s" % (v, back, jumps, whole[0], whole[1], " ".join(results))
     print(line, flush=True)
-    bad = bad or back or whole != ["ok", "ok"] or any("+0.00/ok/ok" not in r for r in results)
+    bad = bad or back or jumps or whole != ["ok", "ok"] or any("+0.00/ok/ok" not in r for r in results)
 sys.exit(1 if bad else 0)

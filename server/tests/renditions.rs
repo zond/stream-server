@@ -366,27 +366,43 @@ impl Header {
 }
 
 /// A slot's fragment: a `styp` unless the slot opens at its `sidx` label
-/// ([`opens_at_label`]), the first chunk's `moof` and a `free` box to the
+/// ([`opens_at_label`]), the first chunk's `moof` and padding to the
 /// slot's first part's end (`FIRST_PART`), that chunk's `mdat`, a `moof`
-/// and an `mdat` per later chunk, then a `free` box to the slot's end whose
-/// last bytes are zeros.
+/// and an `mdat` per later chunk, then padding to the slot's end whose last
+/// bytes are zeros. **Padding is `free` boxes no demuxer seeks over**: each
+/// under 2 KiB, so libavformat reads its way across however much there is
+/// (`layout::PAD_BOX`).
 fn fragment_of(slot: &[u8]) -> &[u8] {
     let boxes = Boxes::of(slot);
     let kinds: Vec<&str> = boxes.iter().map(|(kind, _)| kind.as_str()).collect();
+    for (kind, body) in &boxes {
+        if kind == "free" {
+            assert!(body.len() + 8 < 2048, "a free box of {}", body.len() + 8);
+            assert!(body.iter().all(|byte| *byte == 0));
+        }
+    }
     let styp = usize::from(kinds[0] == "styp");
-    let last = kinds.len() - 1;
-    assert_eq!(kinds[last], "free", "{kinds:?}");
-    assert!(last > styp + 2, "{kinds:?}");
-    assert_eq!(kinds[styp..styp + 3], ["moof", "free", "mdat"], "{kinds:?}");
-    let first_part: usize = boxes[..styp + 2]
-        .iter()
-        .map(|(_, body)| body.len() + 8)
-        .sum();
+    let padded = kinds.len()
+        - kinds
+            .iter()
+            .rev()
+            .take_while(|kind| **kind == "free")
+            .count();
+    assert!(padded < kinds.len(), "a slot ends with padding: {kinds:?}");
+    assert_eq!(kinds[styp..styp + 2], ["moof", "free"], "{kinds:?}");
+    let mdat = styp
+        + 1
+        + kinds[styp + 1..]
+            .iter()
+            .take_while(|kind| **kind == "free")
+            .count();
+    assert!(mdat < padded && kinds[mdat] == "mdat", "{kinds:?}");
+    let first_part: usize = boxes[..mdat].iter().map(|(_, body)| body.len() + 8).sum();
     assert_eq!(first_part, FIRST_PART as usize, "the first part");
-    for pair in kinds[styp + 3..last].chunks(2) {
+    for pair in kinds[mdat + 1..padded].chunks(2) {
         assert_eq!(pair, ["moof", "mdat"], "{kinds:?}");
     }
-    let free = boxes[last].1.len() + 8;
+    let free: usize = boxes[padded..].iter().map(|(_, body)| body.len() + 8).sum();
     assert!(
         free >= 24,
         "the padding is at least a header and the zero tail"
@@ -452,8 +468,8 @@ fn parse_segment(bytes: &[u8]) -> Segment {
         let moof_at = at;
         let mut next = boxes.next().expect("an mdat after each moof");
         let mut padding = 0;
-        if next.0 == "free" {
-            padding = 8 + next.1.len();
+        while next.0 == "free" {
+            padding += 8 + next.1.len();
             next = boxes.next().expect("an mdat after the first part");
         }
         let (mdat_kind, mdat) = next;
@@ -903,7 +919,7 @@ fn without_an_index_the_slots_are_estimated() -> anyhow::Result<()> {
 
 /// **The file is the header and every slot in order**: `video/mp4`, its
 /// length and ranges offered, one body counted; each slot the fragment a
-/// range asks for, then a `free` box to the slot's end.
+/// range asks for, then padding to the slot's end.
 #[test]
 fn the_file_is_the_header_and_every_slot_padded() -> anyhow::Result<()> {
     let fixture = Fixture::quick(Knobs {

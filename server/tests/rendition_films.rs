@@ -349,10 +349,10 @@ fn fat_film(picture: Picture) -> Recipe {
 }
 
 /// **A straight read of a film whose slots are 11 MB reads it front to
-/// back**: the requests go forward only, at most one per slot (the `free`
-/// box between two slots is a forward skip a reader may make a request
-/// of, as its socket's window says) -- not one per hop between a slot's
-/// picture and its sound, the field bug: on zond's TV an 8 Mbit/s film
+/// back**: one request -- a slot's padding is boxes a reader steps over
+/// without a seek (`layout::PAD_BOX`), not a skip it may make a request
+/// of -- and not one per hop between a slot's picture and its sound, the
+/// field bug: on zond's TV an 8 Mbit/s film
 /// with 7.5 s GOPs made a request every 0.3 to 1 s, alternately creeping
 /// through a slot's picture and parked at its sound, and the cast stopped
 /// after a second. Laid picture-first, this film made `ffmpeg` (6.1) ask
@@ -371,10 +371,8 @@ fn a_straight_read_of_a_fat_film_reads_it_front_to_back() -> anyhow::Result<()> 
     let relay = Relay::start(fixture.lan.parse()?)?;
     ffmpeg_reads(&relay.url(&token), &[], &[])?;
     let starts = starts_of(&relay.take());
-    assert!(
-        starts.len() <= file_slots.len() && starts.windows(2).all(|pair| pair[0] < pair[1]),
-        "a straight read asked for {starts:?}"
-    );
+    assert!(file_slots.len() >= 4, "the film has slots to cross");
+    assert_eq!(starts, [0], "a straight read asked once");
     Ok(())
 }
 
@@ -393,8 +391,8 @@ fn starts_of(ranges: &[String]) -> Vec<u64> {
 }
 
 /// **A seek reads on from where it lands**: `ffmpeg -ss` into a fat film's
-/// third slot asks for the file's start, then the slot, then forward only,
-/// at most once per slot boundary it reads across. Picture-first, the same
+/// third slot asks for the file's start, then the slot, and reads on
+/// across the next slot's boundary without asking again. Picture-first, the same
 /// seek asked 47 times, back and forth.
 #[test]
 fn a_seek_into_a_fat_film_reads_on_from_where_it_lands() -> anyhow::Result<()> {
@@ -415,10 +413,7 @@ fn a_seek_into_a_fat_film_reads_on_from_where_it_lands() -> anyhow::Result<()> {
         starts.len() >= 2 && starts[1] == file_slots[2].0,
         "the seek asked for {starts:?}"
     );
-    assert!(
-        starts.len() <= 4 && starts[1..].windows(2).all(|pair| pair[0] < pair[1]),
-        "the seek asked for {starts:?}"
-    );
+    assert_eq!(starts.len(), 2, "the seek asked for {starts:?}");
     Ok(())
 }
 

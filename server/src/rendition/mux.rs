@@ -1449,7 +1449,7 @@ pub(crate) fn media_segment(
                 .map(|(track, range)| traf(track, range.clone(), 0).len())
                 .sum::<usize>();
         // The first chunk's `mdat` begins the slot's second part
-        // ([`FIRST_PART`]), a `free` box between.
+        // ([`FIRST_PART`]), padding between.
         let pad = if index == 0 {
             FIRST_PART - out.len() - sized
         } else {
@@ -1474,8 +1474,7 @@ pub(crate) fn media_segment(
             .collect();
         out.extend_from_slice(&moof);
         if pad > 0 {
-            out.extend_from_slice(&super::layout::free_header(pad as u64));
-            out.resize(out.len() + pad - 8, 0);
+            super::layout::padding(pad as u64, 0, pad as u64, &mut out);
         }
         out.extend_from_slice(&bx(b"mdat", &payload));
     }
@@ -2114,7 +2113,7 @@ mod tests {
         read(&[(&slot1, shown(&open))]);
     }
     /// **A slot's first part is always `FIRST_PART` long**: its first
-    /// chunk's `moof` padded with a `free` box, the `mdat` right after --
+    /// chunk's `moof` and its padding, the `mdat` right after --
     /// however many samples the first half second holds: past
     /// `FIRST_SAMPLES` of a track they go into a chunk of their own.
     #[test]
@@ -2133,10 +2132,12 @@ mod tests {
                 .map(|at| sample(4_000_000 + at * 500_000 / count, at == 0))
                 .collect();
             let fragment = media_segment(&formats, 4, true, &video, Some(4_500_000), &[], None);
-            let moof = u32::from_be_bytes(fragment[0..4].try_into().unwrap()) as usize;
-            assert_eq!(&fragment[moof + 4..moof + 8], b"free", "{count} samples");
-            let free = u32::from_be_bytes(fragment[moof..moof + 4].try_into().unwrap()) as usize;
-            assert_eq!(moof + free, FIRST_PART, "{count} samples");
+            let mut at = u32::from_be_bytes(fragment[0..4].try_into().unwrap()) as usize;
+            assert_eq!(&fragment[at + 4..at + 8], b"free", "{count} samples");
+            while &fragment[at + 4..at + 8] == b"free" {
+                at += u32::from_be_bytes(fragment[at..at + 4].try_into().unwrap()) as usize;
+            }
+            assert_eq!(at, FIRST_PART, "{count} samples");
             assert_eq!(&fragment[FIRST_PART + 4..FIRST_PART + 8], b"mdat");
             let samples = timed(&fragment);
             assert_eq!(samples.len(), count as usize);

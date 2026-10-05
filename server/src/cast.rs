@@ -455,26 +455,16 @@ impl FileReader {
 }
 
 /// Bytes `from..=to` of a slot `size` long holding `fragment`: the
-/// fragment, a `free` box header, zeros.
+/// fragment, then its padding ([`crate::rendition::layout::padding`]).
 fn slot_bytes(fragment: &Bytes, size: u64, from: u64, to: u64) -> Bytes {
     let len = fragment.len() as u64;
     let pad = size - len;
-    let header = crate::rendition::layout::free_header(pad);
     let mut out = Vec::with_capacity((to + 1 - from) as usize);
-    let mut at = from;
-    while at <= to {
-        if at < len {
-            let upto = (to + 1).min(len);
-            out.extend_from_slice(&fragment[at as usize..upto as usize]);
-            at = upto;
-        } else if at < len + 8 {
-            let upto = (to + 1).min(len + 8);
-            out.extend_from_slice(&header[(at - len) as usize..(upto - len) as usize]);
-            at = upto;
-        } else {
-            out.resize(out.len() + (to + 1 - at) as usize, 0);
-            at = to + 1;
-        }
+    if from < len {
+        out.extend_from_slice(&fragment[from as usize..(to + 1).min(len) as usize]);
+    }
+    if to >= len {
+        crate::rendition::layout::padding(pad, from.max(len) - len, to + 1 - len, &mut out);
     }
     Bytes::from(out)
 }

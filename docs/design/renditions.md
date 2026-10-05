@@ -590,8 +590,8 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
 `slots.rs`, `run.rs` and `cast.rs`:
 
 * **The header** is the init segment and the `sidx`. Then **one slot per
-  segment**: slot `k` holds segment `k`'s fragment, padded with a `free`
-  box to the slot's end. The `sidx` gives each slot's size and duration,
+  segment**: slot `k` holds segment `k`'s fragment, padded with `free`
+  boxes to the slot's end. The `sidx` gives each slot's size and duration,
   so FFmpeg jumps to the slot that holds a time. **The video's `sidx`,
   and every track on its 90 kHz clock** (the sound's `mdhd` too). FFmpeg
   finds a stream the `sidx` does not index by the indexed track's times
@@ -1059,11 +1059,32 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   them, so it went on at the next slot (299.92 s to 302.4 s after a seek
   to 5:00). So a slot is two `sidx` references: its first part
   (`mux::FIRST_PART`, 8 KiB: the `styp` if any, the first chunk's `moof`
-  and a `free` box), with the slot's duration, and the rest -- the first
+  and its padding), with the slot's duration, and the rest -- the first
   chunk's `mdat` and every later chunk -- lasting nothing and labelled at
   the next slot's time, so a seek never picks it. The fragment after the
   first `moof` is then the slot's own rest, and FFmpeg reads on through
   it. A `sidx` counts 65535 references, so 32767 slots.
+
+  **Padding a demuxer reads its way over.** A slot is as long as its
+  share of the source -- every track's bytes, with headroom -- and its
+  fragment carries one picture and one sound, so the padding is whatever
+  the film's other tracks and its original sound weighed: tens of
+  kilobytes to megabytes a slot. As one `free` box, libavformat stepped
+  over it with a seek (a step of more than its buffer and
+  `short_seek_threshold`, 4096 bytes in 4.4: `avio_seek`), once a slot in
+  every version. Chrome answers a seek into what has arrived from what it
+  holds, and one past it with a new request: a television that had
+  buffered ahead read on in one request, and one that had not -- after a
+  seek, on a film near what the link carries -- asked again every slot,
+  each time waiting out a round trip it had no buffer to cover (zond's
+  10 GB film: a request every two to four seconds for half a minute
+  after each seek, then one request for the next 80 MB). So padding is
+  `free` boxes of 1 KiB, the last under two (`layout::padding`,
+  `PAD_BOX`), the first part's too: each is stepped over inside the
+  buffer, the demuxer never asks its reader to seek in a straight read
+  (`tools/lavf-harness`, 4.4, 6.1 and master: 17 seeks in 17 slots
+  before, none after, the same packets), and the padding's bytes -- which
+  a receiver reading ahead was sent anyway -- are read through.
 
   **Measured** with libavformat 4.4, 6.1 and master as Chrome drives it
   (`tools/lavf-harness`: the probe, how to build it against a tag, and the

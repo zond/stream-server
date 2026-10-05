@@ -8,8 +8,8 @@
 //! has been produced. That is this layout: the header (`ftyp` + `moov` +
 //! `sidx`), then one **slot** per segment, each holding that segment's
 //! fragment (`moof` + `mdat`, after a `styp` unless the slot opens at its
-//! `sidx` label: `mux::media_segment`) padded with a `free` box to the
-//! slot's end. Slot sizes are decided here, from the source, and never
+//! `sidx` label: `mux::media_segment`) padded with `free` boxes to the
+//! slot's end ([`padding`]). Slot sizes are decided here, from the source, and never
 //! change; what goes in a slot is the run's business (`run.rs`), which
 //! makes it fit.
 //!
@@ -74,6 +74,16 @@ pub(crate) const SLOT_ALIGN: u64 = 32 * 1024;
 /// The least room a fragment leaves in its slot: a `free` box's header and
 /// the zero tail.
 pub(crate) const MIN_PAD: u64 = 8 + TAIL_ZEROS;
+/// The length of a `free` box in a run of padding, the last of a run
+/// under twice it ([`padding`]). A demuxer steps over a `free` box, and
+/// libavformat makes of a step past what it holds read -- by more than its
+/// `short_seek_threshold`, 4096 bytes in the 4.4 a Chromecast with Google
+/// TV runs -- a seek; Chrome's reader makes of a seek past what has
+/// arrived a new request. Boxes this short are stepped over by reading,
+/// whatever the padding's length (measured: `tools/lavf-harness`).
+pub(crate) const PAD_BOX: u64 = 1024;
+// The longest step over one, under libavformat 4.4's threshold.
+const _: () = assert!(2 * PAD_BOX - 8 <= 4096);
 /// How far from the film's end an index may stop and still be one: a GOP
 /// is seconds, so an index that stops minutes short is a few entries a
 /// demuxer added as it read, not the source's index.
@@ -511,12 +521,42 @@ impl Layout {
     }
 }
 
-/// The `free` box header for `pad` bytes of padding (`pad >= MIN_PAD`).
-pub(crate) fn free_header(pad: u64) -> [u8; 8] {
+/// A `free` box's header, the box `size` long.
+fn free_header(size: u64) -> [u8; 8] {
     let mut out = [0u8; 8];
-    out[..4].copy_from_slice(&(pad as u32).to_be_bytes());
+    out[..4].copy_from_slice(&(size as u32).to_be_bytes());
     out[4..].copy_from_slice(b"free");
     out
+}
+
+/// How many [`PAD_BOX`]-long boxes `pad` bytes of padding begin with; one
+/// more, the rest, ends them.
+fn pad_boxes(pad: u64) -> u64 {
+    (pad / PAD_BOX).saturating_sub(1)
+}
+
+/// Bytes `from..to` of `pad` bytes of padding (`pad >= 8`, `to <= pad`),
+/// appended to `out`: `free` boxes [`PAD_BOX`] long, the last one the rest
+/// -- under two of them -- and every body zeros.
+pub(crate) fn padding(pad: u64, from: u64, to: u64, out: &mut Vec<u8>) {
+    let whole = pad_boxes(pad);
+    let mut at = from;
+    while at < to {
+        let index = (at / PAD_BOX).min(whole);
+        let start = index * PAD_BOX;
+        let size = if index < whole { PAD_BOX } else { pad - start };
+        if at < start + 8 {
+            let upto = to.min(start + 8);
+            out.extend_from_slice(
+                &free_header(size)[(at - start) as usize..(upto - start) as usize],
+            );
+            at = upto;
+        } else {
+            let upto = to.min(start + size);
+            out.resize(out.len() + (upto - at) as usize, 0);
+            at = upto;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -524,6 +564,57 @@ mod tests {
     use super::*;
 
     const T: i64 = 1_000_000;
+
+    /// **Padding is boxes a demuxer reads its way over**: `free` boxes
+    /// that fill it exactly, none two [`PAD_BOX`] long -- libavformat 4.4
+    /// seeks over a step past its buffer of more than 4096 bytes, and a
+    /// receiver with nothing buffered then asks again, once a slot -- the
+    /// last holding the zero tail, and any range of it the same bytes.
+    #[test]
+    fn padding_is_short_boxes_whatever_its_length() {
+        for pad in [
+            8,
+            MIN_PAD,
+            PAD_BOX - 1,
+            PAD_BOX,
+            2 * PAD_BOX - 1,
+            2 * PAD_BOX,
+            2 * PAD_BOX + 1,
+            3 * PAD_BOX + 7,
+            700_000,
+        ] {
+            let mut whole = Vec::new();
+            padding(pad, 0, pad, &mut whole);
+            assert_eq!(whole.len() as u64, pad);
+            let mut at = 0;
+            let mut last = 0;
+            while at < whole.len() {
+                let size = u32::from_be_bytes(whole[at..at + 4].try_into().unwrap()) as usize;
+                assert_eq!(&whole[at + 4..at + 8], b"free", "{pad} at {at}");
+                assert!(
+                    size >= 8 && (size as u64) < 2 * PAD_BOX,
+                    "{pad}: a box of {size}"
+                );
+                assert!(whole[at + 8..at + size].iter().all(|byte| *byte == 0));
+                last = size;
+                at += size;
+            }
+            assert_eq!(at as u64, pad, "{pad}: the boxes fill it");
+            if pad >= MIN_PAD {
+                assert!(last as u64 >= MIN_PAD, "{pad}: the tail is zeros");
+            }
+            for (from, to) in [(0, 1), (3, 9), (PAD_BOX - 2, PAD_BOX + 5), (pad / 2, pad)] {
+                let (from, to) = (from.min(pad), to.min(pad));
+                let mut part = Vec::new();
+                padding(pad, from, to, &mut part);
+                assert_eq!(
+                    part,
+                    whole[from as usize..to as usize],
+                    "{pad}: {from}..{to}"
+                );
+            }
+        }
+    }
 
     fn entry(pts_us: i64, pos: u64) -> IndexEntry {
         IndexEntry { pts_us, pos }

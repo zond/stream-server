@@ -23,13 +23,14 @@ tools/lavf-harness/compare.py film.mp4 rendition.mp4
   `AVSEEK_FLAG_BACKWARD`, which is `FFmpegDemuxer::Seek`), and prints every
   packet it is handed: stream, presentation time, key flag, decode time.
   Packets FFmpeg marks to be discarded are left out, as a player drops
-  them.
+  them. On stderr, every seek libavformat asks its reader to make.
 * `build.sh <tag>...` -- a minimal static libavformat of each FFmpeg tag
   and `av_dump` linked against it.
 * `compare.py <film> <rendition>` -- per version: every packet of picture
-  and of sound against the film's, decode times strictly increasing, and
-  for each seek where the picture lands and the three seconds after it.
-  Exits 1 on any finding.
+  and of sound against the film's, decode times strictly increasing, no
+  seek asked of the reader in a straight read, and for each seek where
+  the picture lands and the three seconds after it. Exits 1 on any
+  finding.
 
 Where a rendition to measure comes from:
 
@@ -46,3 +47,8 @@ What it cannot say: anything above the demuxer. Whether a receiver asks
 for a byte in one request or a hundred is Chrome's reader -- its 32 KiB
 blocks are why slots begin on 32 KiB boundaries -- and is read off a
 request log of a real cast (`adb reverse` to a relay that logs `Range`).
+What it can say is where the demuxer gives that reader a reason: a seek
+in a straight read. A slot padded with one `free` box was one a slot, and
+a television with nothing buffered asked again at each (zond's 10 GB
+film, a request every two seconds after a seek); padded with boxes of
+1 KiB (`layout::PAD_BOX`) there are none.

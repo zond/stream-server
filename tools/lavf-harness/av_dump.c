@@ -3,6 +3,9 @@
 // av_seek_frame(video, T, BACKWARD) for each seek; prints every packet
 // "S <stream> <pts> <K|.>" (straight read: all; after a seek: until every
 // stream is after_s past its first packet), "L <T> <first video pts>".
+// On stderr, "J <from> <to>" for every seek libavformat asks its reader to
+// make to somewhere other than where it is: Chrome's reader answers one
+// past what has arrived with a new request.
 #include <libavformat/avformat.h>
 #include <stdio.h>
 #include <string.h>
@@ -11,6 +14,7 @@ static int rd(void *o, uint8_t *b, int n) { size_t r = fread(b, 1, n, f); pos +=
 static int64_t sk(void *o, int64_t off, int wh) {
     if (wh == AVSEEK_SIZE) return fsize; wh &= ~AVSEEK_FORCE;
     int64_t t = wh == SEEK_SET ? off : wh == SEEK_CUR ? pos + off : fsize + off;
+    if (t != pos) fprintf(stderr, "J %lld %lld\n", (long long)pos, (long long)t);
     fseeko(f, t, SEEK_SET); pos = t; return t; }
 int main(int argc, char **argv) {
     f = fopen(argv[1], "rb"); fseeko(f, 0, SEEK_END); fsize = ftello(f); fseeko(f, 0, SEEK_SET);
