@@ -1067,6 +1067,26 @@ impl<B: TorrentBackend + 'static> Housekeeping<B> {
 /// `BackendEngineFS::dormant_pins`.
 type DormantPins = Arc<parking_lot::Mutex<BTreeMap<String, std::collections::BTreeSet<usize>>>>;
 
+/// The maximal runs of `span` that miss every piece of `announced`, in
+/// order: what a per-file delete may take while those pieces stay.
+fn unannounced_runs(
+    span: std::ops::Range<u32>,
+    announced: &std::collections::BTreeSet<u32>,
+) -> Vec<std::ops::Range<u32>> {
+    let mut runs = Vec::new();
+    let mut start = span.start;
+    for &piece in announced.range(span.clone()) {
+        if start < piece {
+            runs.push(start..piece);
+        }
+        start = piece + 1;
+    }
+    if start < span.end {
+        runs.push(start..span.end);
+    }
+    runs
+}
+
 #[derive(Debug, Clone)]
 struct MultiFileActiveSelection {
     file_idx: usize,
@@ -1695,7 +1715,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         probed: &mut bool,
         ending_shares: bool,
     ) -> Option<crate::reconcile::Verdict> {
-        let _guard = self.reconcile_locks.lock(&engine.info_hash).await;
+        let guard = self.reconcile_locks.lock(&engine.info_hash).await;
         // **A torrent out of the swarm announces nothing stale when it comes
         // back.** The fork keeps the advertised set across a pause and an
         // error, and a play session's draw can go -- its slack pass takes
@@ -1839,12 +1859,26 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         // **On a task of its own, never awaited here**: this reconcile is the
         // next episode's, holding its request and the hash's lock, and its
         // reader must not wait on a single unlink of the last episode.
+        //
+        // **Except for an explicit delete's end, which awaits it**, after
+        // the lock: the deleted file's pieces are among those bytes, and the
+        // delete measures the disk next. A claim is exclusive, so a drop
+        // still on its way when the delete makes its own leaves the delete
+        // nothing to take and a disk that has not changed yet -- a delete
+        // that answered "nothing freed" for bytes that left a moment later.
+        // Nobody waits on a delete's answer for a stream.
         if ended {
             let engine = engine.clone();
             let registry = self.registry.clone();
-            tokio::spawn(async move {
+            let slack = async move {
                 engine.drop_slack(&registry).await;
-            });
+            };
+            if ending_shares {
+                drop(guard);
+                slack.await;
+            } else {
+                tokio::spawn(slack);
+            }
         }
         Some(verdict)
     }
@@ -4910,36 +4944,63 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             // this file itself is the one thing that defers it, and the
             // caller has waited that out.
             self.reconcile_hash_ending_shares(&engine.info_hash).await;
-            // **Unless something of the file is still announced** after
-            // that: the end refused by the backend with the torrent still in
-            // the swarm, or a boundary piece a still-pinned neighbour shares.
-            // A piece a peer may have been told of cannot leave the disk
-            // while the torrent is in the swarm, so the file's pieces stay,
-            // and go with the torrent's next `EndShares` like any unpinned
-            // file's. What leaves the disk now is reported, and that is not
-            // them.
-            let announced = engine.handle.run_state() == RunState::Live
-                && match (span.clone(), engine.handle.advertised_pieces().await) {
-                    (Some(span), Some(advertised)) => {
-                        advertised.iter().any(|piece| span.contains(piece))
-                    }
-                    _ => false,
+            // **Except what of the file is still announced** after that: a
+            // boundary piece a still-pinned neighbour shares, or the whole
+            // file when the backend refused the end with the torrent still
+            // in the swarm. A piece a peer may have been told of cannot
+            // leave the disk while the torrent is in the swarm, so those
+            // stay, and go with the torrent's next `EndShares` like any
+            // unpinned file's. **The rest of the file goes now**, run by
+            // run around them: one announced piece is no reason to keep the
+            // other hundred, and nothing else would take them while another
+            // file of the torrent is being played. What leaves the disk now
+            // is reported, and the announced pieces are not.
+            let announced: std::collections::BTreeSet<u32> =
+                match (engine.handle.run_state(), span.clone()) {
+                    (RunState::Live, Some(span)) => engine
+                        .handle
+                        .advertised_pieces()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|piece| span.contains(piece))
+                        .collect(),
+                    _ => std::collections::BTreeSet::new(),
                 };
-            let dropped = match announced {
-                true => {
+            let dropped = match span.clone() {
+                Some(span) if !announced.is_empty() => {
                     tracing::info!(
                         info_hash = %engine.info_hash,
                         file_idx,
-                        "the deleted download's pieces are still announced; they go once the \
-                         torrent leaves the swarm"
+                        announced = announced.len(),
+                        "some of the deleted download's pieces are still announced; they go \
+                         once the torrent leaves the swarm, and the rest go now"
                     );
-                    Ok(None)
+                    let mut claims = Vec::new();
+                    let mut error = None;
+                    for run in unannounced_runs(span, &announced) {
+                        match engine
+                            .handle
+                            .drop_pieces(run, crate::backend::AfterRelease::Reselect)
+                            .await
+                        {
+                            Ok(claim) => claims.extend(claim),
+                            Err(e) => error = Some(e),
+                        }
+                    }
+                    match error {
+                        Some(error) => Err((error, claims)),
+                        None => Ok(claims),
+                    }
                 }
-                false => engine.handle.drop_file_pieces(file_idx).await,
+                _ => match engine.handle.drop_file_pieces(file_idx).await {
+                    Ok(claim) => Ok(claim.into_iter().collect()),
+                    Err(error) => Err((error, Vec::new())),
+                },
             };
             let dropped = match dropped {
                 Ok(dropped) => dropped,
-                Err(error) => {
+                Err((error, dropped)) => {
                     tracing::warn!(
                         info_hash = %engine.info_hash,
                         file_idx,
@@ -4948,7 +5009,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                          next restart it will report the file complete, advertise its pieces, \
                          and a re-pin will download nothing"
                     );
-                    None
+                    dropped
                 }
             };
             // Truncated before it is unlinked: an unlink alone frees nothing
@@ -5002,18 +5063,18 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             // -- so without this the caller would be told the disk had come
             // back while every piece of the file was still in the store,
             // staying there until a tick found the torrent unplayed.
-            let pieces_freed = match dropped {
-                // The claim goes with the pieces, into the one place that
-                // orders the unlink against the have-set
-                // ([`crate::retention::take_claimed`]) -- and is released
-                // there, once the bytes are gone.
-                Some(claim) => {
-                    crate::retention::take_claimed(&self.registry, &engine.info_hash, claim).await
-                }
-                // No claim, so no list of pieces to take and no right to
-                // take them: the backend still believes it has them.
-                None => 0,
-            };
+            //
+            // Each claim goes with its pieces, into the one place that
+            // orders the unlink against the have-set
+            // ([`crate::retention::take_claimed`]) -- and is released there,
+            // once the bytes are gone. No claim, no list of pieces to take
+            // and no right to take them: the backend still believes it has
+            // them.
+            let mut pieces_freed = 0;
+            for claim in dropped {
+                pieces_freed +=
+                    crate::retention::take_claimed(&self.registry, &engine.info_hash, claim).await;
+            }
             let deleted = file_removed
                 || pieces_freed > 0
                 || self.held_of_file(engine, file_idx).await < held_before;
@@ -5766,11 +5827,23 @@ mod tests {
     /// the thread the bytes really went on.
     struct ClaimProbe {
         released_on: Arc<Mutex<Option<std::thread::ThreadId>>>,
+        /// What this claim holds of `FakeCounters::claimed`, given back on
+        /// release.
+        holds: Option<(ClaimedPieces, Vec<u32>)>,
     }
+
+    /// The fake's record of what its outstanding claims hold.
+    type ClaimedPieces = Arc<Mutex<std::collections::BTreeSet<u32>>>;
 
     impl Drop for ClaimProbe {
         fn drop(&mut self) {
             *self.released_on.lock().unwrap() = Some(std::thread::current().id());
+            if let Some((claimed, pieces)) = self.holds.take() {
+                let mut claimed = claimed.lock().unwrap();
+                for piece in pieces {
+                    claimed.remove(&piece);
+                }
+            }
         }
     }
 
@@ -5927,6 +6000,33 @@ mod tests {
                 tokio::sync::oneshot::Receiver<()>,
             )>,
         >,
+        /// Test knob: park the next `drop_pieces` call made with
+        /// [`crate::backend::AfterRelease::Reselect`] -- a per-file delete's
+        /// -- before it claims anything. A drop of the other kind passes.
+        reselect_drop_gate: Mutex<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                tokio::sync::oneshot::Receiver<()>,
+            )>,
+        >,
+        /// Test knob: park the next `drop_pieces` call made with
+        /// [`crate::backend::AfterRelease::LeaveDropped`] -- a retention
+        /// pass's -- **after** it has claimed its pieces and before it hands
+        /// the claim back: a reclaim with the pieces claimed and not yet
+        /// unlinked.
+        claimed_drop_gate: Mutex<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                tokio::sync::oneshot::Receiver<()>,
+            )>,
+        >,
+        /// Test knob: claims are exclusive, as librqbit's are: a piece an
+        /// outstanding claim holds is skipped by every later drop until
+        /// that claim is released (`ChunkTracker::drop_pieces`).
+        exclusive_claims: AtomicBool,
+        /// The pieces a claim this fake handed out still holds, kept under
+        /// `exclusive_claims`.
+        claimed: ClaimedPieces,
         /// Test knob: park the next `read_file_head` call, the way
         /// `drop_gate` parks a drop: where a play session's draw waits on
         /// the file's first bytes, with the file's turn held.
@@ -6623,6 +6723,13 @@ mod tests {
                 let _ = entered.send(());
                 let _ = release.await;
             }
+            if after == crate::backend::AfterRelease::Reselect {
+                let gate = self.counters.reselect_drop_gate.lock().unwrap().take();
+                if let Some((entered, release)) = gate {
+                    let _ = entered.send(());
+                    let _ = release.await;
+                }
+            }
             let asked = pieces.clone();
             self.counters
                 .dropped_ranges
@@ -6635,11 +6742,27 @@ mod tests {
             if self.counters.refuses_drop.load(Ordering::SeqCst) {
                 anyhow::bail!("this fake will not forget a piece it has");
             }
-            let dropped: Vec<u32> = if self.counters.drops_what_it_is_asked.load(Ordering::SeqCst) {
-                asked.collect()
+            let mut dropped: Vec<u32> =
+                if self.counters.drops_what_it_is_asked.load(Ordering::SeqCst) {
+                    asked.collect()
+                } else {
+                    self.counters.drops_pieces.lock().unwrap().clone()
+                };
+            let holds = if self.counters.exclusive_claims.load(Ordering::SeqCst) {
+                let mut claimed = self.counters.claimed.lock().unwrap();
+                dropped.retain(|piece| !claimed.contains(piece));
+                claimed.extend(dropped.iter().copied());
+                Some((self.counters.claimed.clone(), dropped.clone()))
             } else {
-                self.counters.drops_pieces.lock().unwrap().clone()
+                None
             };
+            if after == crate::backend::AfterRelease::LeaveDropped {
+                let gate = self.counters.claimed_drop_gate.lock().unwrap().take();
+                if let Some((entered, release)) = gate {
+                    let _ = entered.send(());
+                    let _ = release.await;
+                }
+            }
             self.counters
                 .dropped
                 .lock()
@@ -6665,6 +6788,7 @@ mod tests {
                     dropped,
                     ClaimProbe {
                         released_on: self.counters.claim_released_on.clone(),
+                        holds,
                     },
                 )
                 .witnessed_by(move |gone| {
@@ -19630,6 +19754,160 @@ mod tests {
             outcome.unpinned && outcome.deleted_files,
             "the disk came back, and the delete said it had not: {outcome:?}"
         );
+    }
+
+    /// **A delete answers for the bytes its own end of shares let go.**
+    ///
+    /// Deleting a download a still-pinned neighbour keeps the torrent
+    /// running for stops the torrent, makes its advertised set again and
+    /// starts it -- and the end of shares takes the ended sessions' bytes
+    /// with a slack drop. That drop and the delete's own both want the
+    /// deleted file's pieces, and a claim is exclusive: when the slack drop
+    /// claimed them first, the delete's drop came back empty and the delete
+    /// measured the disk while the slack drop's unlink was still on its
+    /// way. It answered `deleted_files: false` for a delete whose bytes left
+    /// a moment later -- the flake xtremio's `offline_downloads_lifecycle`
+    /// hit once in a hundred runs, logged as `download_unpinned ...
+    /// deleted=false` straight after `torrent_started_by_reconciler`.
+    ///
+    /// The gates hold the slack drop with its pieces claimed and not yet
+    /// unlinked, and the delete's drop before it claims, and the test lets
+    /// them go in whichever order the delete allows.
+    #[tokio::test]
+    async fn a_delete_answers_for_the_bytes_its_end_of_shares_took() {
+        let (enginefs, counters) = test_enginefs_with_file_count(2);
+        counters.pieces_per_file.store(4, Ordering::SeqCst);
+        counters
+            .drops_what_it_is_asked
+            .store(true, Ordering::SeqCst);
+        counters.exclusive_claims.store(true, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        *counters.output_folder.lock().unwrap() = Some(fake_engine_root().join("placed"));
+        nothing_torrent_is_playing(&enginefs);
+        enginefs
+            .apply_pins(Some(crate::piece_store::PinSet::from([(
+                TEST_HASH.to_string(),
+                vec![0usize, 1],
+            )])))
+            .await;
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in 0u32..8 {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+
+        let (delete_entered_tx, mut delete_entered) = tokio::sync::oneshot::channel();
+        let (delete_release, delete_release_rx) = tokio::sync::oneshot::channel();
+        *counters.reselect_drop_gate.lock().unwrap() = Some((delete_entered_tx, delete_release_rx));
+        let (slack_entered_tx, mut slack_entered) = tokio::sync::oneshot::channel();
+        let (slack_release, slack_release_rx) = tokio::sync::oneshot::channel();
+        *counters.claimed_drop_gate.lock().unwrap() = Some((slack_entered_tx, slack_release_rx));
+
+        let enginefs = Arc::new(enginefs);
+        let mut deleting = tokio::spawn({
+            let enginefs = enginefs.clone();
+            async move { enginefs.unpin_download(TEST_HASH, 0, true).await }
+        });
+        let outcome = tokio::select! {
+            biased;
+            // The delete's drop came first: the slack drop claims under it,
+            // and the delete answers with that claim still standing.
+            _ = &mut delete_entered => {
+                slack_entered.await.expect("the slack drop claimed the pieces");
+                delete_release.send(()).unwrap();
+                let outcome = (&mut deleting).await.expect("the delete task");
+                slack_release.send(()).unwrap();
+                outcome
+            }
+            // The slack drop came first: let it finish, then the delete's.
+            _ = &mut slack_entered => {
+                slack_release.send(()).unwrap();
+                delete_entered.await.expect("the delete's own drop");
+                delete_release.send(()).unwrap();
+                deleting.await.expect("the delete task")
+            }
+        };
+        let outcome = outcome.expect("the unpin");
+        assert!(
+            outcome.unpinned && outcome.deleted_files,
+            "the delete freed the disk and said it had not: {outcome:?}"
+        );
+        assert!(
+            (0u32..4).all(|piece| !bucket.join(piece.to_string()).exists()),
+            "the deleted file's pieces are gone by the time the delete answers"
+        );
+        assert!((4u32..8).all(|piece| bucket.join(piece.to_string()).is_file()));
+    }
+
+    /// **A delete of a file that shares a piece with a still-pinned
+    /// neighbour frees the rest of the file now**, and keeps the piece the
+    /// neighbour shares: that one is the neighbour's, and announced for it.
+    ///
+    /// The second episode (pieces 4..9) shares piece 8 with the third,
+    /// which is pinned. The torrent restarts announcing the third episode
+    /// whole, piece 8 with it; the delete used to read "something of the
+    /// file is still announced" as "none of it may go", drop nothing, and
+    /// answer `deleted_files: false` -- the rest of the file left only if a
+    /// slack drop happened to take it, and not at all while another file of
+    /// the torrent was being played.
+    #[tokio::test]
+    async fn a_delete_beside_a_pinned_neighbour_keeps_the_shared_piece_and_frees_the_rest() {
+        let (enginefs, counters) = a_neighbour_the_backend_does_not_want_yet();
+        *counters.wanted_files.lock().unwrap() = Some([1, 2].into_iter().collect());
+        *counters.output_folder.lock().unwrap() = Some(fake_engine_root().join("placed"));
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs
+            .apply_pins(Some(crate::piece_store::PinSet::from([(
+                TEST_HASH.to_string(),
+                vec![1usize, 2],
+            )])))
+            .await;
+        let bucket = enginefs.piece_store().torrent_dir(TEST_HASH).join("0");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for piece in 4u32..13 {
+            std::fs::write(bucket.join(piece.to_string()), [7u8; 25]).unwrap();
+        }
+        let _store = seeded_store(&enginefs, &engine);
+        // Another file of the torrent is being played: no slack drop takes
+        // anything of it, so what leaves the disk is the delete's own doing.
+        play_file(&enginefs, &engine, 0).await;
+        assert_eq!(engine.handle.run_state(), RunState::Live);
+
+        let outcome = enginefs
+            .unpin_download(TEST_HASH, 1, true)
+            .await
+            .expect("the unpin");
+        assert!(
+            outcome.unpinned && outcome.deleted_files,
+            "the file's own pieces left the disk: {outcome:?}"
+        );
+        assert!(
+            (4u32..8).all(|piece| !bucket.join(piece.to_string()).exists()),
+            "the pieces only the deleted file lies in are gone"
+        );
+        assert!(
+            (8u32..13).all(|piece| bucket.join(piece.to_string()).is_file()),
+            "the piece the pinned neighbour shares stays, with the neighbour's own"
+        );
+        assert!(
+            fake_advertises(&counters).contains(&8),
+            "and stays announced for the neighbour"
+        );
+    }
+
+    /// What a per-file delete takes around the announced pieces: every run
+    /// between them, none of them, and nothing outside the file.
+    #[test]
+    fn the_unannounced_runs_go_round_every_announced_piece() {
+        let announced = std::collections::BTreeSet::from([2u32, 3, 6, 9, 20]);
+        assert_eq!(unannounced_runs(0..10, &announced), vec![0..2, 4..6, 7..9]);
+        assert_eq!(unannounced_runs(4..6, &announced), vec![4..6]);
+        assert_eq!(
+            unannounced_runs(2..4, &announced),
+            Vec::<std::ops::Range<u32>>::new()
+        );
+        assert_eq!(unannounced_runs(0..4, &Default::default()), vec![0..4]);
     }
 
     /// **One reading of what is being played, for the whole tick.**
