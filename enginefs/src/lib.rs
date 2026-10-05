@@ -14388,21 +14388,16 @@ mod tests {
         );
         assert_eq!(handed().len(), 3);
 
-        // A pre-want's stream beside the reader's: the depth is widened by
-        // as many pieces again, the pre-want's step being longer than that,
-        // so the reader's share of the split head stays three -- and it
-        // comes back down, a piece a pass, once the pre-want is gone.
+        // A pre-want's stream beside the reader's changes nothing: it is a
+        // background stream, which the backend never puts in the split
+        // head, so the depth is the reader's alone -- not widened while it
+        // stands, and nothing to come back down from once it is gone.
         let one_step = std::iter::once(100..200).collect();
         let prewant = engine.prewant(0, one_step).await.expect("a pre-want");
         pass().await;
-        assert_eq!(
-            handed().last(),
-            Some(&6),
-            "three for the reader, three beside"
-        );
         drop(prewant);
         pass().await;
-        assert_eq!(handed().last(), Some(&5), "down a piece a pass");
+        assert_eq!(handed().len(), 3, "nothing handed down for a pre-want");
     }
 
     /// **A piece that arrives under the pass, outside the window, does not

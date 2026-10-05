@@ -933,10 +933,6 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
             asking.seconds,
             streams.deadline.stalls(),
         );
-        // And as many again while a pre-want's stream stands beside the
-        // readers', so the readers' own share of the split head is what it
-        // was without it.
-        let asked = crate::retention::deadline::beside(asked, streams.deadline.standing_beside());
         if let Some(depth) = streams.settle_deadline(domain.file_idx, asked, now) {
             self.handle.set_deadline_pieces(depth);
             crate::retention::trace::deadline_depth(
@@ -3312,11 +3308,10 @@ impl<H: TorrentHandle> Engine<H> {
     ///
     /// * **The backend's ask** ([`TorrentHandle::prefetch`]): one stream at
     ///   a time, on the piece the walk is waiting for and reaching to the
-    ///   end of its step ([`walk_prewant`]). One stream whatever the
-    ///   window's size, because the backend shares its priority list
-    ///   between streams one piece each in turn: the pre-want never has
-    ///   more than a step of pieces there, and a read blocked on a piece
-    ///   keeps its turn at the head of every ask.
+    ///   end of its step ([`walk_prewant`]). A background stream: the
+    ///   backend fetches its pieces whole and never at the head of its
+    ///   lookahead, so a read blocked on a piece is offered every peer
+    ///   before any of them, and the readers' split depth is theirs alone.
     /// * **An asker on the file's entity** ([`Retention::ask_ahead`]),
     ///   which wants and holds nothing: a piece this fetches is cached data
     ///   like any other once the walk has moved on -- kept while there is
@@ -3329,10 +3324,8 @@ impl<H: TorrentHandle> Engine<H> {
     /// **It is not a read.** No stream is registered, nothing counts in
     /// [`Self::active_streams`], no byte is noted, and the asker keeps no
     /// entity live: whatever keeps the torrent running is the player's own
-    /// hold, and a pre-want neither extends nor replaces it. While it
-    /// stands, the split depth handed to the backend is widened so the
-    /// readers keep theirs ([`crate::retention::deadline::beside`]). `None`
-    /// when there is nothing to ask for, or no pieces to ask in.
+    /// hold, and a pre-want neither extends nor replaces it. `None` when
+    /// there is nothing to ask for, or no pieces to ask in.
     pub async fn prewant(
         self: &Arc<Self>,
         file_idx: usize,
@@ -3341,13 +3334,9 @@ impl<H: TorrentHandle> Engine<H> {
         let span = self.handle.file_pieces(file_idx).await?;
         let piece_length = self.handle.piece_length().filter(|length| *length > 0)?;
         let steps: Vec<Range<u64>> = steps.into_iter().filter(|step| !step.is_empty()).collect();
-        let reach = steps.iter().map(|step| step.end - step.start).max()?;
-        // What the stream has at the head of the lookahead at most: a step
-        // in pieces, and one more for a position inside a piece.
-        let beside = usize::try_from(reach.div_ceil(piece_length))
-            .unwrap_or(usize::MAX)
-            .saturating_add(1);
-        self.streams.lock().deadline.stand_beside(beside);
+        if steps.is_empty() {
+            return None;
+        }
         let walk = tokio::spawn(walk_prewant(PreWalk {
             handle: self.handle.clone(),
             file_idx,
@@ -3357,11 +3346,7 @@ impl<H: TorrentHandle> Engine<H> {
             span,
             piece_length,
         }));
-        Some(PreWant {
-            walk,
-            streams: self.streams.clone(),
-            beside,
-        })
+        Some(PreWant { walk })
     }
 }
 
@@ -3550,16 +3535,11 @@ async fn walk_prewant<H: TorrentHandle>(walk: PreWalk<H>) {
 /// the entity's asker in it, ended by dropping this.
 pub struct PreWant {
     walk: tokio::task::JoinHandle<()>,
-    streams: Arc<parking_lot::Mutex<crate::retention::streams::Streams>>,
-    /// What this pre-want stood beside the readers with; see
-    /// [`crate::retention::deadline::beside`].
-    beside: usize,
 }
 
 impl Drop for PreWant {
     fn drop(&mut self) {
         self.walk.abort();
-        self.streams.lock().deadline.step_away(self.beside);
     }
 }
 

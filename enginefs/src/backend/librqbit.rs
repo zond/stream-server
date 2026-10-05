@@ -297,6 +297,19 @@ impl Drop for OpenPosition {
     }
 }
 
+/// The options every librqbit stream here is opened with: the caller's
+/// lookahead, and whether it is a **background** stream -- one nobody is
+/// reading yet, which a pre-want is. librqbit fetches a background stream's
+/// pieces whole and never at the head of its lookahead, so a read blocked
+/// on a piece is offered every peer before any of them, and the split depth
+/// handed down is the readers' alone.
+fn stream_options(lookahead_bytes: u64, background: bool) -> librqbit::FileStreamOptions {
+    librqbit::FileStreamOptions {
+        lookahead_bytes,
+        background,
+    }
+}
+
 /// librqbit's stream, carrying its [`OpenPosition`] out to whoever reads
 /// it and dropping it with the stream.
 struct PositionedStream<S> {
@@ -2616,11 +2629,10 @@ impl TorrentHandle for LibrqbitHandle {
         self.await_initialized().await?;
         // The caller's number, not librqbit's fixed 32 MiB default: the
         // intent's cap, cut to the retention window's reach when one stands.
-        let opts = librqbit::FileStreamOptions { lookahead_bytes };
         let stream = self
             .handle
             .clone()
-            .stream_with_options(file_idx, opts)
+            .stream_with_options(file_idx, stream_options(lookahead_bytes, false))
             .await
             .context("Failed to stream from librqbit")?;
         Ok(Box::new(PositionedStream {
@@ -2629,12 +2641,14 @@ impl TorrentHandle for LibrqbitHandle {
         }))
     }
 
-    /// A librqbit stream positioned at `start_offset`: its lookahead is in
-    /// the picker's priority list (interleaved with every other stream's,
-    /// one piece each in turn) for as long as it is held, wherever its
-    /// holder seeks it. No [`OpenPosition`]: a pre-want is nobody's
-    /// position, and the startup window a client is shown must keep
-    /// following the player's reader.
+    /// A librqbit stream positioned at `start_offset`, opened in the
+    /// background (`FileStreamOptions::background`): its lookahead is
+    /// fetched for as long as it is held, wherever its holder seeks it, but
+    /// whole, one peer a piece, and never at the head of the picker's
+    /// lookahead -- a read blocked on a piece is offered every peer first,
+    /// and past the readers' head their pieces and these take turns. No
+    /// [`OpenPosition`]: a pre-want is nobody's position, and the startup
+    /// window a client is shown must keep following the player's reader.
     async fn prefetch(
         &self,
         file_idx: usize,
@@ -2643,11 +2657,10 @@ impl TorrentHandle for LibrqbitHandle {
     ) -> Result<Option<crate::backend::Prefetch>> {
         use tokio::io::AsyncSeekExt;
         self.await_initialized().await?;
-        let opts = librqbit::FileStreamOptions { lookahead_bytes };
         let mut stream = self
             .handle
             .clone()
-            .stream_with_options(file_idx, opts)
+            .stream_with_options(file_idx, stream_options(lookahead_bytes, true))
             .await
             .context("Failed to stream from librqbit")?;
         // librqbit opens every stream at the top of the file; the seek is

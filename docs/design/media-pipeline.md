@@ -701,7 +701,7 @@ same day, zond's decision.)*
   after about `2d`. For a memory the first two steps are the 32 MiB behind
   the remembered byte -- mpv's buffer, where its picture was -- the half
   nearer that byte first.
-* **How** (`Engine::prewant`): **one** librqbit stream at a time
+* **How** (`Engine::prewant`): **one** librqbit background stream at a time
   (`TorrentHandle::prefetch`; no `OpenPosition`, so the startup window a
   client is shown still follows the player), walked through the steps: it
   is put on a piece, reaching to the end of the step and no further, and a
@@ -748,27 +748,26 @@ same day, zond's decision.)*
   denied it: on a cache that covers the file there is no bound at all;
   under a policy nothing is asked for until the first pass has measured
   (the next tick, at most two seconds after the open).
-* **What a blocked read keeps.** librqbit has no notion of one stream
-  ranking below another: its priority list is one piece of each open stream
-  in turn, in an order shuffled per ask, and a peer takes the first piece
-  there it can -- a free one, or a share of one in flight inside the split
-  head. So beside one reader, the piece a read is blocked on is first or
-  second in every peer's ask, and while both it and the pre-want's first
-  piece have shares to give a peer takes whichever the shuffle put first:
-  **about half of the asks each** (one part in `readers + 1` to the
-  pre-want), never less, and all of them once the other's shares are taken.
-  That is the whole of what the pre-want can cost a real read, **whatever
-  the window's size**, because it is one stream with one step of reach --
-  five pieces of 4 MiB in the priority list, not 256 MiB of them -- and
-  past the blocked piece the reader's own lookahead and the pre-want's
-  alternate piece for piece. The split depth (`retention::deadline`) is
-  counted over that same interleaving, so while a pre-want stands the depth
-  handed down is widened by as many pieces as the pre-want has there
-  (`deadline::beside`): the readers' share of the split head is what it was
-  without it, and at a depth of one the blocked piece is never handed whole
-  to one peer for the shuffle having put the pre-want first. Ranking the
-  pre-want strictly below the player's reads needs a priority on librqbit's
-  streams -- a fork change, not done.
+* **What a blocked read keeps: all of it.** The pre-want's stream is a
+  librqbit **background** stream (`FileStreamOptions::background`, the
+  fork's `CLAIMS.md`, "Background streams"): a stream nobody is reading
+  yet. librqbit takes the head of its lookahead -- the split depth
+  (`retention::deadline`) -- from the readers' streams alone, so the piece
+  a read is blocked on is offered to every peer before any piece of the
+  pre-want's is offered to one, and the pre-want's pieces are never split,
+  never fetched twice, never stolen for and never asked for between the
+  chunks of other work. A blocked read gets **every share a peer can
+  take**, as it would with no pre-want, **whatever the window's size**.
+  Past the readers' head the readers' deeper lookahead and the pre-want's
+  step take turns, a reader's piece first, each piece whole with one peer:
+  that is the share of the swarm the pre-want has, and the readers' own
+  read-ahead is what it takes it from. The split depth handed down is the
+  readers' and nothing else. *(First built with the pre-want an ordinary
+  stream, which librqbit interleaved with the readers' one piece each in
+  turn, about half of a blocked read's asks going to the pre-want, and the
+  depth widened by the pre-want's pieces to make up for it
+  (`deadline::beside`); replaced the same day by the fork's background
+  streams.)*
 * **Let go** when the player reads inside the window (its own stream reads
   ahead from there), when one run of reads -- from an open or a seek --
   delivers 16 MiB outside it (the player is playing elsewhere: a wrong
