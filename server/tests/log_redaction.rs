@@ -240,6 +240,27 @@ fn a_caller_supplied_url_is_logged_as_its_origin_only() -> anyhow::Result<()> {
         logs.contains("rendition_run_start"),
         "the rendition's run was logged at all: {logs}"
     );
+    // Each publication ends with its totals: the rendition's two bodies
+    // and a HEAD, the plain one's two refused requests (the POST reached
+    // no handler). Read in the JSON file; the text one says the same.
+    let ends: Vec<&str> = logs
+        .lines()
+        .filter(|line| line.starts_with('{') && line.contains("cast_publication_end"))
+        .collect();
+    assert_eq!(ends.len(), 2, "one line per publication: {ends:?}");
+    assert!(
+        ends.iter().any(|line| line.contains("\"rendition\":true")
+            && line.contains("\"requests\":3")
+            && line.contains("\"bodies\":2")
+            && line.contains("\"runs\":")),
+        "the rendition's totals: {ends:?}"
+    );
+    assert!(
+        ends.iter().any(|line| line.contains("\"rendition\":false")
+            && line.contains("\"requests\":2")
+            && line.contains("\"bodies\":0")),
+        "the plain publication's totals: {ends:?}"
+    );
     for token in [token.as_str(), rendition.as_str(), unknown] {
         assert!(
             !logs.contains(token),

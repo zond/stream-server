@@ -196,6 +196,66 @@ The addresses in those log lines are private ones on the user's own LAN;
 the bearer token is never on this listener, and a cast token is never in a
 log line.
 
+**What one publication has served** is a third reading, per token rather
+than per session: `ServerHandle::cast_numbers(&CastToken)` answers
+`CastNumbers` -- what the app's cast panel draws -- or `None` once the token
+is unpublished. Counts that only grow and positions as they are now, no
+rate and no clock: two answers and the time between them make every rate.
+Cheap (atomics and one look under the rendition's lock, no runtime hop),
+safe to poll once a second.
+
+```json
+{
+  "kind": "rendition",
+  "contentType": "video/mp4",
+  "delivery": {"requests": 7, "bodiesBegun": 6, "bodiesEnded": 5, "bodiesOpen": 1,
+               "bytes": 48213004, "lastRequestAt": 1180672, "furthestAt": 1311744},
+  "source": {"kind": "torrent", "bytesRead": 51003392, "opens": 2, "seeks": 14},
+  "rendition": {
+    "video": "copy", "audio": {"aacStereo": {"bitrate": 192000}},
+    "videoOut": {"codec": "hevc", "width": 1920, "height": 1040, "channels": null, "sampleRate": null},
+    "audioOut": {"codec": "aac", "width": null, "height": null, "channels": 2, "sampleRate": 48000},
+    "layout": {"slots": 3363, "slotMs": null, "exact": true, "total": 2471230464},
+    "runs": [{"from": 63, "fromMs": 126040, "produced": 67}],
+    "runsStarted": 2, "slotsMade": 70, "filmMadeMs": 139800,
+    "askedSlot": 64, "askedMs": 128040, "madeTo": 129, "madeToMs": 262000
+  }
+}
+```
+
+* `kind` is `plain` (the source as it is, at `/cast/{token}`) or
+  `rendition`; `contentType` what the receiver is answered with -- a plain
+  publication's once a request has resolved its source, `null` before.
+* `delivery`: every `GET` and `HEAD` under the token, answered with bytes
+  or not; the responses that began a body (as `lan_media_bodies_served`
+  counts them), those ended -- whole, cut by an unpublish, or let go by
+  the receiver -- and the difference; the bytes sent; the byte the latest
+  body began at; and one past the furthest byte any body has sent. A
+  healthy receiver makes a request per seek, so requests rising while
+  nobody seeks is the number to watch.
+* `source`: what was read for the receiver -- every body of a plain
+  publication (each one open, its bytes the bytes sent), every run of a
+  rendition (each one open, and a seek for every reopen at another offset
+  its producer makes). `kind` is the first source opened: `torrent`,
+  `member` (a file inside an archive), or `http` for every source read
+  through the shared reader -- a link, a Drive file, a file on this device.
+* `rendition`, for a rendition: the spec's plans and the tracks the first
+  run reported making; the layout once it is fixed (`slotMs` only when
+  every slot holds the same film, an estimated layout's grid); the live
+  runs, each with the slot it began at and how many it has made; runs
+  begun since the publish; every slot made and the film they hold (a slot
+  dropped from the ring and asked again is made again, and counted again
+  -- `filmMadeMs` over the wall time between two answers is the production
+  speed); the slot the receiver last asked for (a range's first slot, or
+  one it read on into); and `madeTo`/`madeToMs`, the end of the unbroken
+  run of slots in the ring from that one, which is how far ahead of the
+  receiver the film is made. Every absence is `null`.
+
+A publication's end -- unpublished, or every token at the listener's stop
+-- writes one INFO line with its totals (`stage="cast_publication_end"`:
+requests, bodies, bytes, runs started, and the source's bytes read, opens
+and seeks) and nothing that names what it was or where.
+
 **Stopping closes the door and stops the bytes.**
 `set_lan_media(false)` unpublishes every token -- which cuts every cast body
 in flight -- then aborts the serving task and awaits it, so by the time the

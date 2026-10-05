@@ -492,6 +492,109 @@ pub struct RenditionProbe {
     pub truncated: Vec<u64>,
 }
 
+/// **What a rendition has made, and where**, for the app's cast panel
+/// ([`crate::cast::CastNumbers`]): what is sent, the layout, the live runs,
+/// and counts that only grow. No rate and no clock: the app takes two and
+/// divides by the time between them.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenditionNumbers {
+    /// What the app asked for: the picture copied or converted, the sound
+    /// copied or converted.
+    pub video: VideoPlan,
+    pub audio: AudioPlan,
+    /// What the first run reported it makes, once it has: the tracks the
+    /// init segment describes.
+    pub video_out: Option<TrackOut>,
+    pub audio_out: Option<TrackOut>,
+    /// The file's layout, once the first run has fixed it.
+    pub layout: Option<LayoutNumbers>,
+    /// The runs live now.
+    pub runs: Vec<RunNumbers>,
+    /// Runs begun since the publish: one more for every seek that started
+    /// one, every restart after an idle release.
+    pub runs_started: u64,
+    /// Slots made since the publish, every making counted (a slot dropped
+    /// from the ring and asked for again is made again), and the film
+    /// they hold, in milliseconds.
+    pub slots_made: u64,
+    pub film_made_ms: u64,
+    /// The slot the receiver last asked for -- the first slot of a range,
+    /// or one a range read on into -- and where it begins on the film's
+    /// clock.
+    pub asked_slot: Option<u64>,
+    pub asked_ms: Option<u64>,
+    /// The last slot of the unbroken run of slots in the ring from
+    /// [`Self::asked_slot`] on, and where it ends on the film's clock: how
+    /// far ahead of the receiver the film is made. `None` when the slot
+    /// asked for is not in the ring.
+    pub made_to: Option<u64>,
+    pub made_to_ms: Option<u64>,
+}
+
+/// A track a rendition makes, as its run reported it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackOut {
+    /// `h264`, `hevc` or `aac`.
+    pub codec: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub channels: Option<u32>,
+    pub sample_rate: Option<u32>,
+}
+
+impl TrackOut {
+    fn of(format: &TrackFormat) -> Self {
+        let (codec, width, height, channels, sample_rate) = match format {
+            TrackFormat::H264 { width, height, .. } => {
+                ("h264", Some(*width), Some(*height), None, None)
+            }
+            TrackFormat::Hevc { width, height, .. } => {
+                ("hevc", Some(*width), Some(*height), None, None)
+            }
+            TrackFormat::Aac {
+                sample_rate,
+                channels,
+                ..
+            } => ("aac", None, None, Some(*channels), Some(*sample_rate)),
+        };
+        Self {
+            codec: codec.to_string(),
+            width,
+            height,
+            channels,
+            sample_rate,
+        }
+    }
+}
+
+/// A rendition's layout, in numbers.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LayoutNumbers {
+    pub slots: u64,
+    /// How much film every slot holds, when they all hold the same (an
+    /// estimated layout's grid); `None` for slots of their own lengths.
+    pub slot_ms: Option<u64>,
+    /// Mirrored from the source's index, or estimated.
+    pub exact: bool,
+    /// The file's length in bytes.
+    pub total: u64,
+}
+
+/// A live run, in numbers.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunNumbers {
+    /// The slot it began at, and where that is on the film's clock (`None`
+    /// before the layout is fixed).
+    pub from: u64,
+    pub from_ms: Option<u64>,
+    /// How many slots it has made.
+    pub produced: u64,
+}
+
 /// Why a request under a rendition is not answered with bytes.
 #[derive(Debug, PartialEq, Eq)]
 pub enum NotServed {
@@ -667,6 +770,10 @@ pub(crate) struct Inner {
     failed: Option<String>,
     plan: SlotPlan,
     runs_started: u64,
+    /// Slots made and the film they hold, since the publish
+    /// ([`RenditionNumbers`]).
+    slots_made: u64,
+    film_made_us: i64,
 }
 
 impl Inner {
@@ -793,6 +900,8 @@ pub(crate) struct Rendition {
     tuning: RenditionTuning,
     /// The publication's cut: every run's stop is a child of it.
     cut: CancellationToken,
+    /// What every run's reader reads, counted for the publication.
+    pub(crate) source: Arc<crate::media::reader::SourceTally>,
     inner: Mutex<Inner>,
     /// Bumped on every change a request or a run may be waiting for.
     version: watch::Sender<u64>,
@@ -810,6 +919,7 @@ impl Rendition {
         producer: Arc<dyn Producer>,
         tuning: RenditionTuning,
         cut: CancellationToken,
+        source: Arc<crate::media::reader::SourceTally>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             spec.segment_ms > 0,
@@ -826,6 +936,7 @@ impl Rendition {
             producer,
             tuning,
             cut,
+            source,
             inner: Mutex::new(Inner {
                 formats: None,
                 layout: None,
@@ -837,6 +948,8 @@ impl Rendition {
                 failed: None,
                 plan: SlotPlan::default(),
                 runs_started: 0,
+                slots_made: 0,
+                film_made_us: 0,
             }),
             version: watch::channel(0).0,
             prepare_begun: AtomicBool::new(false),
@@ -953,6 +1066,81 @@ impl Rendition {
         self.bump();
         tracing::info!(slot, stage = "rendition_prepared", "rendition prepared");
         Ok(slot)
+    }
+
+    /// Where slot `slot` ends on the film's clock: where the next begins,
+    /// or the film's end.
+    fn slot_end_us(&self, layout: &layout::Layout, slot: u64) -> i64 {
+        if slot + 1 >= layout.slots.len() as u64 {
+            self.duration_us()
+        } else {
+            slot_start_us(layout, slot + 1)
+        }
+    }
+
+    /// **What it has made, and where** ([`RenditionNumbers`]), with
+    /// `asked` the slot the receiver last asked for. One look under the
+    /// lock; nothing waits.
+    pub(crate) fn numbers(&self, asked: Option<u64>) -> RenditionNumbers {
+        let inner = self.inner();
+        let layout = inner.layout.as_deref();
+        let ms = |us: i64| (us.max(0) / 1000) as u64;
+        let at_ms = |slot: u64| layout.map(|layout| ms(slot_start_us(layout, slot)));
+        let made_to = asked
+            .filter(|slot| inner.ring.contains_key(slot))
+            .map(|asked| {
+                let mut to = asked;
+                for slot in inner.ring.range(asked + 1..).map(|(slot, _)| *slot) {
+                    if slot != to + 1 {
+                        break;
+                    }
+                    to = slot;
+                }
+                to
+            });
+        RenditionNumbers {
+            video: self.spec.video.clone(),
+            audio: self.spec.audio.clone(),
+            video_out: inner
+                .formats
+                .as_ref()
+                .and_then(|formats| formats.video.as_ref())
+                .map(TrackOut::of),
+            audio_out: inner
+                .formats
+                .as_ref()
+                .and_then(|formats| formats.audio.as_ref())
+                .map(TrackOut::of),
+            layout: layout.map(|layout| LayoutNumbers {
+                slots: layout.slots.len() as u64,
+                slot_ms: uniform_ms(layout),
+                exact: layout.exact,
+                total: layout.total,
+            }),
+            runs: inner
+                .runs
+                .iter()
+                .map(|run| RunNumbers {
+                    from: run.from,
+                    from_ms: at_ms(run.from),
+                    produced: run.next_out.saturating_sub(run.from),
+                })
+                .collect(),
+            runs_started: inner.runs_started,
+            slots_made: inner.slots_made,
+            film_made_ms: ms(inner.film_made_us),
+            asked_slot: asked,
+            asked_ms: asked.and_then(at_ms),
+            made_to,
+            made_to_ms: made_to
+                .zip(layout)
+                .map(|(slot, layout)| ms(self.slot_end_us(layout, slot))),
+        }
+    }
+
+    /// Runs begun since the publish.
+    pub(crate) fn runs_started(&self) -> u64 {
+        self.inner().runs_started
     }
 
     pub(crate) fn probe(&self) -> RenditionProbe {
@@ -1156,6 +1344,11 @@ impl Rendition {
             let mut inner = self.inner();
             inner.run_mut(generation)?.next_out = slot + 1;
             let count = inner.layout.as_ref().map_or(0, |layout| layout.slots.len()) as u64;
+            inner.slots_made += 1;
+            if let Some(layout) = &inner.layout {
+                let span = self.slot_end_us(layout, slot) - slot_start_us(layout, slot);
+                inner.film_made_us = inner.film_made_us.saturating_add(span.max(0));
+            }
             let end = filled.end_now(slot + 1 >= count || inner.plan.decided(slot + 1));
             let recorded = *inner.plan.ends.entry(slot).or_insert(end);
             inner.insert(slot, filled.fragment);
@@ -1302,6 +1495,24 @@ impl Rendition {
     }
 }
 
+/// Where slot `slot` begins on the film's clock: its cut, the first slot
+/// from the film's first sync sample.
+fn slot_start_us(layout: &layout::Layout, slot: u64) -> i64 {
+    match slot {
+        0 => layout.first_us,
+        _ => layout.cuts.get(slot as usize).copied().unwrap_or(i64::MAX),
+    }
+}
+
+/// How much film each slot after the first holds, in milliseconds, when
+/// every one holds the same: an estimated layout's grid.
+fn uniform_ms(layout: &layout::Layout) -> Option<u64> {
+    let cuts = layout.cuts.get(1..layout.slots.len())?;
+    let step = cuts.get(1)?.checked_sub(*cuts.first()?)?;
+    (step > 0 && cuts.windows(2).all(|pair| pair[1] - pair[0] == step))
+        .then_some((step / 1000) as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1348,6 +1559,8 @@ mod tests {
             failed: None,
             plan: SlotPlan::default(),
             runs_started: 0,
+            slots_made: 0,
+            film_made_us: 0,
         };
         for (generation, at) in runs.iter().enumerate() {
             inner.runs.push(RunSlot {

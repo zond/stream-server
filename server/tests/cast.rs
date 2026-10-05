@@ -880,3 +880,90 @@ fn a_publication_holds_its_id_until_unpublished() -> anyhow::Result<()> {
     assert!(error.contains("not running"), "{error}");
     stop(handle)
 }
+
+// --- What the cast panel is told -------------------------------------------------
+
+/// **What a plain publication tells the app's panel**
+/// (`ServerHandle::cast_numbers`): a `HEAD` is a request and no body; a
+/// range that begins mid-file is a body from there, its bytes sent and
+/// read from the source; a receiver that lets go partway ends its body
+/// with what it took, not the range's length.
+#[test]
+fn the_cast_numbers_count_a_range_mid_file_and_a_body_the_receiver_cut() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let files = tempfile::tempdir()?;
+    let handle = stream_server::start(lan_config(ServerConfig {
+        http_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_dir.path().join("cache")),
+        ..offline_config()
+    }))?;
+    let lan = start_lan(&handle)?;
+    // Longer than a loopback socket's buffers hold, so a receiver that
+    // stops reading is one the server is still sending to.
+    let len = 32 << 20;
+    let path = files.path().join("film.mkv");
+    std::fs::write(&path, payload(len))?;
+    let id = handle.register(MediaSpec::Local {
+        file: stream_server::LocalFile::Path(path),
+        name: None,
+    })?;
+    let token = handle.publish(&id, None)?;
+    let numbers = || handle.cast_numbers(&token).expect("the token is published");
+    let fresh = numbers();
+    assert_eq!(fresh.kind, stream_server::CastKind::Plain);
+    assert_eq!(fresh.rendition, None);
+    assert_eq!(fresh.content_type, None, "nothing resolved it yet");
+    assert_eq!(fresh.source.kind, None);
+
+    let head = reqwest::blocking::Client::new()
+        .head(format!("{lan}/cast/{}", token.as_str()))
+        .send()?;
+    assert_eq!(head.status(), reqwest::StatusCode::OK);
+    let after_head = numbers();
+    assert_eq!(after_head.delivery.requests, 1);
+    assert_eq!(after_head.delivery.bodies_begun, 0, "a HEAD is no body");
+    assert_eq!(after_head.content_type.as_deref(), Some("video/x-matroska"));
+
+    let (first, last) = (1_000_000u64, 1_099_999u64);
+    let response = fetch(&lan, &token, Some(&format!("bytes={first}-{last}")))?;
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.bytes()?.len(), 100_000);
+    until("the range's body ends", || {
+        Ok(numbers().delivery.bodies_ended == 1)
+    })?;
+    let ranged = numbers();
+    assert_eq!(ranged.delivery.requests, 2);
+    assert_eq!(ranged.delivery.bodies_begun, 1);
+    assert_eq!(ranged.delivery.bodies_open, 0);
+    assert_eq!(ranged.delivery.bytes, 100_000);
+    assert_eq!(ranged.delivery.last_request_at, Some(first));
+    assert_eq!(ranged.delivery.furthest_at, Some(last + 1));
+    assert_eq!(ranged.source.kind.as_deref(), Some("http"));
+    assert_eq!(ranged.source.opens, 1, "one body, one open");
+    assert_eq!(ranged.source.bytes_read, 100_000);
+    assert_eq!(ranged.source.seeks, 0);
+
+    // The whole file, let go of after a little.
+    let mut whole = fetch(&lan, &token, None)?;
+    assert_eq!(whole.status(), reqwest::StatusCode::OK);
+    let mut taken = vec![0u8; 64 * 1024];
+    whole.read_exact(&mut taken)?;
+    drop(whole);
+    until("the cut body ends", || {
+        Ok(numbers().delivery.bodies_ended == 2)
+    })?;
+    let cut = numbers();
+    assert_eq!(cut.delivery.bodies_begun, 2);
+    assert_eq!(cut.delivery.bodies_open, 0);
+    assert_eq!(cut.delivery.last_request_at, Some(0));
+    let sent = cut.delivery.bytes - 100_000;
+    assert!(
+        sent >= taken.len() as u64 && sent < len as u64,
+        "the cut body sent {sent} of {len}"
+    );
+    assert_eq!(cut.source.opens, 2);
+    assert_eq!(cut.source.bytes_read, cut.delivery.bytes);
+    stop(handle)
+}

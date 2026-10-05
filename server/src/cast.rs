@@ -49,11 +49,12 @@
 //! no `stream.mp4` (`404`); a rendition's token serves it and, like a
 //! plain one, the source as it is at `/cast/{token}`.
 
+use crate::media::reader::SourceTally;
 use crate::media::registry::Entry;
 use crate::media::{MediaId, PlayToken, Refusal};
 use crate::rendition::{
-    Ask, NotServed, Producer, Rendition, RenditionReadiness, RenditionSpec, RenditionState,
-    RenditionTuning,
+    Ask, NotServed, Producer, Rendition, RenditionNumbers, RenditionReadiness, RenditionSpec,
+    RenditionState, RenditionTuning,
 };
 use crate::routes::{compat, util};
 use crate::sources::ReadHint;
@@ -72,6 +73,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
@@ -114,12 +116,150 @@ impl From<String> for CastToken {
     }
 }
 
+/// **What a publication has served so far, and how**: what the app's cast
+/// panel is told ([`crate::ServerHandle::cast_numbers`]). Counts that only
+/// grow and positions as they are now -- no rate and no clock: the app takes
+/// two and divides by the time between them. Every absence is `null`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CastNumbers {
+    /// `plain` -- the source as it is, at `/cast/{token}` -- or
+    /// `rendition`, the file made from it at `/cast/{token}/stream.mp4`.
+    pub kind: CastKind,
+    /// The type the receiver is answered with: a plain publication's
+    /// source's, once a request has resolved it; `video/mp4` for a
+    /// rendition.
+    pub content_type: Option<String>,
+    pub delivery: DeliveryNumbers,
+    pub source: SourceNumbers,
+    /// What the rendition has made, for a rendition.
+    pub rendition: Option<RenditionNumbers>,
+}
+
+/// What a publication is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CastKind {
+    Plain,
+    Rendition,
+}
+
+/// What the receiver has been sent under one token.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryNumbers {
+    /// Requests under the token, `GET` and `HEAD`, answered with bytes or
+    /// not.
+    pub requests: u64,
+    /// Responses that began a body, ended ones, and the difference: the
+    /// bodies being read now.
+    pub bodies_begun: u64,
+    pub bodies_ended: u64,
+    pub bodies_open: u64,
+    /// Bytes sent, over every body.
+    pub bytes: u64,
+    /// The byte the latest `GET` began at.
+    pub last_request_at: Option<u64>,
+    /// One past the furthest byte any body has sent.
+    pub furthest_at: Option<u64>,
+}
+
+/// What was read from the source for the receiver: every body of a plain
+/// publication, every run of a rendition.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceNumbers {
+    /// `torrent`, `http` (a link or Drive file through the cache) or
+    /// `member` (a file inside an archive); `None` before the first open.
+    pub kind: Option<String>,
+    pub bytes_read: u64,
+    /// Opens: one a body for a plain publication, one a run for a
+    /// rendition.
+    pub opens: u64,
+    /// Reopens at another offset inside one open: a rendition's producer
+    /// seeking in the file.
+    pub seeks: u64,
+}
+
+/// What every body under one token adds to: the delivery half of
+/// [`CastNumbers`]. Atomics, so a body's poll takes no lock; a position is
+/// stored one past itself, so a zero is "none yet".
+#[derive(Default)]
+struct Tally {
+    requests: AtomicU64,
+    bodies: AtomicU64,
+    ended: AtomicU64,
+    bytes: AtomicU64,
+    last_request: AtomicU64,
+    furthest: AtomicU64,
+    /// The rendition slot the receiver last asked for, one past it.
+    asked: AtomicU64,
+    content_type: std::sync::OnceLock<String>,
+    source: Arc<SourceTally>,
+}
+
+fn stored(position: u64) -> u64 {
+    position.saturating_add(1)
+}
+
+fn loaded(stored: u64) -> Option<u64> {
+    stored.checked_sub(1)
+}
+
+impl Tally {
+    fn request(&self) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A body begins at byte `start`.
+    fn body(&self, start: u64) {
+        self.bodies.fetch_add(1, Ordering::Relaxed);
+        self.last_request.store(stored(start), Ordering::Relaxed);
+    }
+
+    /// A body sent `len` more bytes, up to `end` (exclusive).
+    fn sent(&self, len: u64, end: u64) {
+        self.bytes.fetch_add(len, Ordering::Relaxed);
+        self.furthest.fetch_max(end, Ordering::Relaxed);
+    }
+
+    fn asked(&self, slot: u64) {
+        self.asked.store(stored(slot), Ordering::Relaxed);
+    }
+
+    fn delivery(&self) -> DeliveryNumbers {
+        let begun = self.bodies.load(Ordering::Relaxed);
+        let ended = self.ended.load(Ordering::Relaxed);
+        DeliveryNumbers {
+            requests: self.requests.load(Ordering::Relaxed),
+            bodies_begun: begun,
+            bodies_ended: ended,
+            bodies_open: begun.saturating_sub(ended),
+            bytes: self.bytes.load(Ordering::Relaxed),
+            last_request_at: loaded(self.last_request.load(Ordering::Relaxed)),
+            furthest_at: Some(self.furthest.load(Ordering::Relaxed)).filter(|end| *end > 0),
+        }
+    }
+
+    fn source(&self) -> SourceNumbers {
+        let (bytes_read, opens, seeks) = self.source.counts();
+        SourceNumbers {
+            kind: self.source.kind().map(str::to_string),
+            bytes_read,
+            opens,
+            seeks,
+        }
+    }
+}
+
 /// What one token names: the id, the viewer's play if the cast is one, the
 /// lease that keeps the id, and the cut every body under it polls.
 struct Publication {
     id: MediaId,
     play: Option<PlayToken>,
     cut: CancellationToken,
+    /// What its bodies have sent, and what its source has read.
+    tally: Arc<Tally>,
     /// The stream behind the token, for a rendition. Its runs' stops
     /// are children of `cut`, so the cut ends them; its ring goes with the
     /// last holder -- the map, a request in flight, a run task -- each of
@@ -142,6 +282,49 @@ impl Publication {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+    }
+
+    /// What it has served so far ([`CastNumbers`]).
+    fn numbers(&self) -> CastNumbers {
+        let delivery = self.tally.delivery();
+        CastNumbers {
+            kind: if self.rendition.is_some() {
+                CastKind::Rendition
+            } else {
+                CastKind::Plain
+            },
+            content_type: match &self.rendition {
+                Some(_) => Some("video/mp4".to_string()),
+                None => self.tally.content_type.get().cloned(),
+            },
+            source: self.tally.source(),
+            rendition: self.rendition.as_ref().map(|rendition| {
+                rendition.numbers(loaded(self.tally.asked.load(Ordering::Relaxed)))
+            }),
+            delivery,
+        }
+    }
+
+    /// The line a publication ends with: its totals, and nothing that names
+    /// what it was or where.
+    fn log_end(&self) {
+        let delivery = self.tally.delivery();
+        let (read, opens, seeks) = self.tally.source.counts();
+        tracing::info!(
+            rendition = self.rendition.is_some(),
+            requests = delivery.requests,
+            bodies = delivery.bodies_begun,
+            bytes = delivery.bytes,
+            runs = self
+                .rendition
+                .as_ref()
+                .map_or(0, |rendition| rendition.runs_started()),
+            source_read = read,
+            source_opens = opens,
+            source_seeks = seeks,
+            stage = "cast_publication_end",
+            "cast publication ended"
+        );
     }
 }
 
@@ -189,6 +372,7 @@ impl Casts {
     ) -> anyhow::Result<CastToken> {
         let token = CastToken::random()?;
         let cut = CancellationToken::new();
+        let tally = Arc::new(Tally::default());
         let rendition = match rendition {
             None => None,
             Some(spec) => {
@@ -209,6 +393,7 @@ impl Casts {
                     producer,
                     tuning,
                     cut.clone(),
+                    tally.source.clone(),
                 )?))
             }
         };
@@ -237,6 +422,7 @@ impl Casts {
                 id,
                 play,
                 cut,
+                tally,
                 rendition,
                 hold: std::sync::Mutex::new(hold),
                 _lease: lease,
@@ -263,6 +449,7 @@ impl Casts {
         publication.release();
         publication.cut.cancel();
         tracing::info!("cast unpublished");
+        publication.log_end();
         true
     }
 
@@ -272,6 +459,7 @@ impl Casts {
         for publication in &all {
             publication.release();
             publication.cut.cancel();
+            publication.log_end();
         }
         if !all.is_empty() {
             tracing::info!(unpublished = all.len(), "every cast unpublished");
@@ -327,6 +515,13 @@ impl Casts {
         self.get(token.as_str())
             .and_then(|publication| publication.rendition.clone())
             .map(|rendition| rendition.probe())
+    }
+
+    /// What the publication under `token` has served so far, `None` for a
+    /// token that is not published.
+    pub(crate) fn numbers(&self, token: &CastToken) -> Option<CastNumbers> {
+        self.get(token.as_str())
+            .map(|publication| publication.numbers())
     }
 
     /// The rendition published as `token`, if it is one.
@@ -395,6 +590,7 @@ static ZEROS: [u8; 64 * 1024] = [0; 64 * 1024];
 struct FileReader {
     state: AppState,
     rendition: Arc<Rendition>,
+    tally: Arc<Tally>,
     layout: Arc<crate::rendition::layout::Layout>,
     next: u64,
     end: u64,
@@ -432,6 +628,7 @@ impl FileReader {
         let fragment = match self.first.take() {
             Some((first, fragment)) if first == slot => fragment,
             _ => {
+                self.tally.asked(slot);
                 let asked = self.rendition.slot(&self.state, slot, self.ask).await;
                 match asked {
                     Ok(fragment) => fragment,
@@ -503,6 +700,7 @@ async fn serve_stream(state: &AppState, token: &str, headers: &HeaderMap, body: 
     let Some(rendition) = publication.rendition.clone() else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    publication.tally.request();
     let layout = match rendition.layout(state).await {
         Ok(layout) => layout,
         Err(reason) => return not_served(reason),
@@ -534,6 +732,7 @@ async fn serve_stream(state: &AppState, token: &str, headers: &HeaderMap, body: 
             if !layout.slots[slot as usize]
                 .in_tail(framing.start - layout.slots[slot as usize].offset) =>
         {
+            publication.tally.asked(slot);
             match rendition.slot(state, slot, Ask::Seek).await {
                 Ok(fragment) => Some((slot, fragment)),
                 Err(reason) => return not_served(reason),
@@ -542,6 +741,7 @@ async fn serve_stream(state: &AppState, token: &str, headers: &HeaderMap, body: 
         _ => None,
     };
     state.lan_media.record_body();
+    publication.tally.body(framing.start);
     // The first slot a range reaches is one it asked for, wherever the
     // range began: a read from the header on into slot 0 (Chrome's demuxer
     // probing the first fragment) is as much the receiver's request as a
@@ -550,6 +750,7 @@ async fn serve_stream(state: &AppState, token: &str, headers: &HeaderMap, body: 
     let reader = FileReader {
         state: state.clone(),
         rendition,
+        tally: publication.tally.clone(),
         layout,
         next: framing.start,
         end: framing.end,
@@ -577,8 +778,11 @@ async fn serve_stream(state: &AppState, token: &str, headers: &HeaderMap, body: 
         ended: false,
         cut_seen: false,
         delivered: 0,
+        start: framing.start,
         length,
         kind: "rendition",
+        tally: publication.tally.clone(),
+        source: None,
         _held: Box::new(()),
     };
     (framing.status(), res_headers, Body::from_stream(body)).into_response()
@@ -627,10 +831,15 @@ async fn serve(state: &AppState, token: &str, headers: &HeaderMap, body: bool) -
         tracing::info!("cast request for a token that is not published");
         return StatusCode::NOT_FOUND.into_response();
     };
+    publication.tally.request();
     let resolved = match state.media.resolve(state, &publication.id).await {
         Ok(resolved) => resolved,
         Err(refusal) => return refused(refusal),
     };
+    let _ = publication
+        .tally
+        .content_type
+        .set(resolved.content_type.clone());
     // An origin that will not range can be read forward by a player
     // through `/proxy` on loopback, never by a receiver: nothing here can
     // seek it.
@@ -674,6 +883,8 @@ async fn serve(state: &AppState, token: &str, headers: &HeaderMap, body: bool) -
         Err(error) => return refused(crate::media::reader::refusal_of(&error)),
     };
     state.lan_media.record_body();
+    publication.tally.body(framing.start);
+    publication.tally.source.opened(source.kind());
     tracing::info!(
         source = source.kind(),
         start = framing.start,
@@ -688,8 +899,11 @@ async fn serve(state: &AppState, token: &str, headers: &HeaderMap, body: bool) -
         ended: false,
         cut_seen: false,
         delivered: 0,
+        start: framing.start,
         length,
         kind: source.kind(),
+        tally: publication.tally.clone(),
+        source: Some(publication.tally.source.clone()),
         _held: Box::new((source, entry)),
     };
     (framing.status(), res_headers, Body::from_stream(body)).into_response()
@@ -711,8 +925,16 @@ struct CastBody {
     ended: bool,
     cut_seen: bool,
     delivered: u64,
+    /// The byte the body began at.
+    start: u64,
     length: u64,
     kind: &'static str,
+    /// The publication's counts, which every chunk adds to and the drop
+    /// ends a body in.
+    tally: Arc<Tally>,
+    /// The source's, for a body read straight from it: a plain
+    /// publication's, whose every byte sent is a byte read.
+    source: Option<Arc<SourceTally>>,
     _held: Box<dyn Send>,
 }
 
@@ -731,7 +953,14 @@ impl Stream for CastBody {
         }
         let next = this.chunks.as_mut().poll_next(cx);
         match &next {
-            Poll::Ready(Some(Ok(chunk))) => this.delivered += chunk.len() as u64,
+            Poll::Ready(Some(Ok(chunk))) => {
+                let len = chunk.len() as u64;
+                this.delivered += len;
+                this.tally.sent(len, this.start + this.delivered);
+                if let Some(source) = &this.source {
+                    source.read(len);
+                }
+            }
             Poll::Ready(None) | Poll::Ready(Some(Err(_))) => this.ended = true,
             Poll::Pending => {}
         }
@@ -741,6 +970,7 @@ impl Stream for CastBody {
 
 impl Drop for CastBody {
     fn drop(&mut self) {
+        self.tally.ended.fetch_add(1, Ordering::Relaxed);
         tracing::info!(
             source = self.kind,
             delivered = self.delivered,

@@ -356,6 +356,7 @@ async fn drive(
         Err(refusal) => return Outcome::Failed(refusal.to_string()),
     };
     let source_len = reader.len();
+    reader.count_into(rendition.source.clone());
     let reader_waits = reader.waits();
     let _cancel_reader = CancelOnDrop(reader.canceller());
     let (tx, mut rx) = mpsc::channel(SINK_CAPACITY);

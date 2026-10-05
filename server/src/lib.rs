@@ -22,14 +22,16 @@ pub use routes::downloads::{DownloadInfo, PinKey, ProxyDownloadRequest};
 // that cannot name it cannot construct or match the case that matters.
 /// What [`ServerHandle::publish`] answers: the last segment of a cast URL.
 pub use cast::CastToken;
+pub use cast::{CastKind, CastNumbers, DeliveryNumbers, SourceNumbers};
 pub use media::PinError;
 pub use media::{
     Canceller, GrantSupplier, LocalFile, MediaId, MediaReader, MediaSpec, MemberInfo, PlayToken,
     ReadWait, Refusal, Resolved, ResumeHint,
 };
 pub use rendition::{
-    AudioPlan, IndexEntry, Job, Producer, ProducerRefusal, RenditionReadiness, RenditionSpec,
-    RenditionState, Sample, SampleSink, Stopped, TrackFormat, TrackKind, VideoPlan,
+    AudioPlan, IndexEntry, Job, LayoutNumbers, Producer, ProducerRefusal, RenditionNumbers,
+    RenditionReadiness, RenditionSpec, RenditionState, RunNumbers, Sample, SampleSink, Stopped,
+    TrackFormat, TrackKind, TrackOut, VideoPlan,
 };
 pub use routes::drive::{DriveFileOpened, DriveOpenError};
 #[doc(hidden)]
@@ -1614,6 +1616,19 @@ impl ServerHandle {
     /// hop, safe to poll.
     pub fn rendition_readiness(&self, token: &CastToken) -> RenditionReadiness {
         self.state.lan_media.casts().rendition_readiness(token)
+    }
+
+    /// **What a publication has served so far, and how** -- requests,
+    /// bodies, bytes, where the receiver last asked, what was read from the
+    /// source, and for a rendition its layout, its runs and how far ahead of
+    /// the receiver it has made the film ([`CastNumbers`]): what the app's
+    /// cast panel shows. Counts that only grow and positions as they are
+    /// now, no rate and no clock -- two answers and the time between them
+    /// make the rates. `None` for a token not published (any more). Cheap:
+    /// atomics and one look under the rendition's lock, no runtime hop,
+    /// safe to poll.
+    pub fn cast_numbers(&self, token: &CastToken) -> Option<CastNumbers> {
+        self.state.lan_media.casts().numbers(token)
     }
 
     /// How many preparations are waiting now. For the tests: an unpublish

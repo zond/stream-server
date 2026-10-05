@@ -2708,3 +2708,177 @@ fn a_preparation_that_fails_reads_failed_with_its_sentence() -> anyhow::Result<(
     });
     Ok(())
 }
+
+// --- What the cast panel is told -------------------------------------------------
+
+/// Where slot `n` of `knobs`' mirrored layout begins on the film's clock:
+/// the film's start for the first.
+fn slot_start(knobs: &Knobs, n: u64) -> i64 {
+    if n == 0 { 0 } else { cut(knobs, n as i64) }
+}
+
+/// **What a rendition's publication is told to the app's panel**
+/// (`ServerHandle::cast_numbers`): every request under the token and every
+/// body, the bytes sent and where the latest began, what the runs read of
+/// the source; a range that begins inside a slot is the receiver asking
+/// for that slot, and the film made from it on, unbroken, is how far
+/// ahead of the receiver it is; a far range is a seek, a second run where
+/// it asked, and the film made counts every slot made.
+#[test]
+fn the_cast_numbers_count_bodies_runs_and_the_film_made_ahead() -> anyhow::Result<()> {
+    let knobs = Knobs {
+        read_stride: Some(4096),
+        ..Knobs::default()
+    };
+    let fixture = Fixture::quick(knobs.clone())?;
+    let token = fixture.publish(60_000, 0)?;
+    let numbers = || {
+        fixture
+            .handle
+            .cast_numbers(&token)
+            .expect("the token is published")
+    };
+    let fresh = numbers();
+    assert_eq!(fresh.kind, stream_server::CastKind::Rendition);
+    assert_eq!(fresh.content_type.as_deref(), Some("video/mp4"));
+    assert_eq!(fresh.delivery.requests, 0);
+    assert_eq!(fresh.delivery.last_request_at, None);
+    assert_eq!(fresh.delivery.furthest_at, None);
+    let rendition = fresh.rendition.expect("a rendition's numbers");
+    assert_eq!(rendition.layout, None, "nothing asked, nothing laid out");
+    assert_eq!(rendition.asked_slot, None);
+    assert_eq!(rendition.video, VideoPlan::Copy);
+
+    // A HEAD and four ranges inside the header: requests, four bodies, and
+    // no slot asked for.
+    let header = fixture.header(&token);
+    let header_bytes = 8 + 8 + 40 + header.slots[0].0;
+    // From inside slot 3 on into slot 4: the receiver asked for both.
+    let (offset, _, _) = header.slots[3];
+    let (next, _, _) = header.slots[4];
+    fixture.range(&token, offset + 100, next + 99);
+    until("slot 4's lookahead is made", || {
+        fixture.probe(&token).ring.contains(&6)
+    });
+    until("every body has ended", || {
+        numbers().delivery.bodies_open == 0
+    });
+    let ahead = numbers();
+    assert_eq!(ahead.delivery.requests, 6);
+    assert_eq!(ahead.delivery.bodies_begun, 5);
+    assert_eq!(ahead.delivery.bodies_ended, 5);
+    assert_eq!(ahead.delivery.bytes, header_bytes + next - offset);
+    assert_eq!(ahead.delivery.last_request_at, Some(offset + 100));
+    assert_eq!(ahead.delivery.furthest_at, Some(next + 100));
+    // The shape the app parses: camelCase, absences as nulls.
+    let json = serde_json::to_value(&ahead)?;
+    assert_eq!(json["kind"], "rendition");
+    assert_eq!(json["delivery"]["bodiesOpen"], 0);
+    assert_eq!(json["source"]["kind"], "http");
+    assert_eq!(json["rendition"]["video"], "copy");
+    assert_eq!(json["rendition"]["videoOut"]["codec"], "h264");
+    assert_eq!(json["rendition"]["audioOut"]["codec"], "aac");
+    assert_eq!(
+        json["rendition"]["layout"]["slotMs"],
+        serde_json::Value::Null
+    );
+    assert_eq!(json["rendition"]["madeTo"], 6);
+    assert!(json["rendition"]["madeToMs"].is_u64());
+    assert!(json["rendition"]["filmMadeMs"].is_u64());
+    let rendition = ahead.rendition.expect("a rendition's numbers");
+    let layout = rendition.layout.expect("laid out");
+    assert_eq!(layout.slots, header.slots.len() as u64);
+    assert!(layout.exact);
+    assert_eq!(layout.slot_ms, None, "a slot per sync sample, each its own");
+    assert_eq!(layout.total, header.total);
+    assert_eq!(rendition.asked_slot, Some(4));
+    assert_eq!(
+        rendition.asked_ms,
+        Some((slot_start(&knobs, 4) / 1000) as u64)
+    );
+    assert_eq!(rendition.made_to, Some(6), "4, 5 and 6 are in the ring");
+    assert_eq!(
+        rendition.made_to_ms,
+        Some((slot_start(&knobs, 7) / 1000) as u64),
+        "made to where slot 7 begins"
+    );
+    assert_eq!(rendition.runs_started, 1);
+    assert_eq!(ahead.source.opens, 1, "one run, one open");
+    assert!(ahead.source.bytes_read > 0 && ahead.source.seeks > 0);
+
+    // A seek: a second run, from slot 40.
+    let (far, _, _) = header.slots[40];
+    fixture.range(&token, far, far + 99);
+    until("every body has ended", || {
+        numbers().delivery.bodies_open == 0
+    });
+    let seeked = numbers();
+    let rendition = seeked.rendition.clone().expect("a rendition's numbers");
+    assert_eq!(rendition.runs_started, 2);
+    assert_eq!(seeked.source.opens, 2, "a second run, a second open");
+    assert!(seeked.source.bytes_read >= ahead.source.bytes_read);
+    let from_40 = rendition
+        .runs
+        .iter()
+        .find(|run| run.from == 40)
+        .expect("a run from slot 40");
+    assert_eq!(
+        from_40.from_ms,
+        Some((slot_start(&knobs, 40) / 1000) as u64)
+    );
+    assert!(from_40.produced >= 1);
+    assert_eq!(rendition.asked_slot, Some(40));
+    assert_eq!(seeked.delivery.requests, 7);
+    assert_eq!(seeked.delivery.last_request_at, Some(far));
+    assert_eq!(seeked.delivery.furthest_at, Some(far + 100));
+    assert_eq!(seeked.delivery.bytes, header_bytes + next - offset + 100);
+
+    // Both runs at their lookahead's end, so nothing more is made; every
+    // slot made once, nothing dropped: the slots made are the ring, and the
+    // film made is theirs.
+    until("slot 40's lookahead is made", || {
+        fixture.probe(&token).ring.contains(&42)
+    });
+    let ring = fixture.probe(&token).ring;
+    assert_eq!(ring, vec![0, 1, 2, 3, 4, 5, 6, 40, 41, 42]);
+    let film_us: i64 = ring
+        .iter()
+        .map(|slot| slot_start(&knobs, slot + 1) - slot_start(&knobs, *slot))
+        .sum();
+    let rendition = numbers().rendition.expect("a rendition's numbers");
+    assert_eq!(rendition.slots_made, ring.len() as u64);
+    assert_eq!(rendition.film_made_ms, (film_us / 1000) as u64);
+    Ok(())
+}
+
+/// **An estimated layout's slots each hold the segment length**, and the
+/// panel is told so.
+#[test]
+fn the_cast_numbers_say_an_estimated_slots_length() -> anyhow::Result<()> {
+    let fixture = Fixture::quick(Knobs {
+        index: None,
+        ..Knobs::default()
+    })?;
+    let token = fixture.publish(60_000, 0)?;
+    fixture.header(&token);
+    let layout = fixture
+        .handle
+        .cast_numbers(&token)
+        .and_then(|numbers| numbers.rendition)
+        .and_then(|rendition| rendition.layout)
+        .expect("laid out");
+    assert!(!layout.exact);
+    assert_eq!(layout.slot_ms, Some(u64::from(T_MS)));
+    Ok(())
+}
+
+/// **An unpublished token has no numbers.**
+#[test]
+fn an_unpublished_token_has_no_cast_numbers() -> anyhow::Result<()> {
+    let fixture = Fixture::quick(Knobs::default())?;
+    let token = fixture.publish(60_000, 0)?;
+    assert!(fixture.handle.cast_numbers(&token).is_some());
+    assert!(fixture.handle.unpublish(&token));
+    assert_eq!(fixture.handle.cast_numbers(&token), None);
+    Ok(())
+}

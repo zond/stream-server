@@ -118,6 +118,51 @@ struct Shown {
     /// how long the source kept a rendition's producer
     /// (`crate::rendition::speed`), which its speed leaves out.
     waits: Arc<crate::rendition::WaitClock>,
+    /// Where the task counts what it reads and how often it reopens, once
+    /// somebody asked ([`MediaReader::count_into`]): a cast's panel.
+    tally: std::sync::OnceLock<Arc<SourceTally>>,
+}
+
+/// **What a source has been asked for**, summed over every reader counted
+/// into it ([`MediaReader::count_into`]) -- every run of a rendition, every
+/// body of a plain cast: the bytes read, the opens, and the seeks (each a
+/// reopen at another offset). Monotonic; the caller makes the rates.
+#[derive(Default)]
+pub(crate) struct SourceTally {
+    kind: std::sync::OnceLock<&'static str>,
+    read: std::sync::atomic::AtomicU64,
+    opens: std::sync::atomic::AtomicU64,
+    seeks: std::sync::atomic::AtomicU64,
+}
+
+impl SourceTally {
+    /// One open of a source of `kind` (`torrent`, `http`, `member`).
+    pub(crate) fn opened(&self, kind: &'static str) {
+        let _ = self.kind.set(kind);
+        self.opens.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn read(&self, bytes: u64) {
+        self.read.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn seeked(&self) {
+        self.seeks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The kind of the first source opened, `None` before one was.
+    pub(crate) fn kind(&self) -> Option<&'static str> {
+        self.kind.get().copied()
+    }
+
+    /// Bytes read, opens, seeks.
+    pub(crate) fn counts(&self) -> (u64, u64, u64) {
+        (
+            self.read.load(Ordering::Relaxed),
+            self.opens.load(Ordering::Relaxed),
+            self.seeks.load(Ordering::Relaxed),
+        )
+    }
 }
 
 /// A blocking reader over a registered id: what mpv's `stream_cb` and a
@@ -130,6 +175,8 @@ pub struct MediaReader {
     commands: mpsc::Sender<Command>,
     cancel: CancellationToken,
     len: u64,
+    /// What the source is (`Source::kind`).
+    kind: &'static str,
     /// The runtime the task runs on. Entered while the reader is dropped,
     /// so nothing a drop does could ever spawn off a runtime.
     runtime: tokio::runtime::Handle,
@@ -341,6 +388,14 @@ impl MediaReader {
     pub(crate) fn waits(&self) -> Arc<crate::rendition::WaitClock> {
         self.shown.waits.clone()
     }
+
+    /// Count this reader's open, and from now on its reads and seeks, into
+    /// `tally`. Once: a second tally is ignored. Called before the reader
+    /// is handed on, so no read goes uncounted.
+    pub(crate) fn count_into(&self, tally: Arc<SourceTally>) {
+        tally.opened(self.kind);
+        let _ = self.shown.tally.set(tally);
+    }
 }
 
 impl Drop for MediaReader {
@@ -368,6 +423,7 @@ pub(crate) async fn open(
 ) -> Result<MediaReader, Refusal> {
     let reader = source.open(0).await.map_err(|error| refusal_of(&error))?;
     let len = source.bytes().len();
+    let kind = source.kind();
     let shown = Arc::new(Shown::default());
     let (prewant, steps) = match prewant {
         Some(Planned { tracker, steps }) => (Some(tracker), steps),
@@ -398,6 +454,7 @@ pub(crate) async fn open(
         commands,
         cancel,
         len,
+        kind,
         runtime: tokio::runtime::Handle::current(),
         shown,
     })
@@ -569,6 +626,9 @@ impl Task {
         buf.truncate(read);
         self.position += read as u64;
         self.delivered += read as u64;
+        if let Some(tally) = self.shown.tally.get() {
+            tally.read(read as u64);
+        }
         Ok(Bytes::from(buf))
     }
 
@@ -599,6 +659,9 @@ impl Task {
         self.reader = self.source.open(offset).await?;
         self.position = offset;
         self.seeks += 1;
+        if let Some(tally) = self.shown.tally.get() {
+            tally.seeked();
+        }
         if let Some(tracker) = self.prewant.as_mut() {
             tracker.seeked();
         }
