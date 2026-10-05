@@ -275,38 +275,54 @@ fn fat_film(picture: Picture) -> Recipe {
     }
 }
 
-/// **A straight read of a film whose slots are 11 MB is one request**, not
-/// one per hop between a slot's picture and its sound -- the field bug: on
-/// zond's TV an 8 Mbit/s film with 7.5 s GOPs made a request every 0.3 to
-/// 1 s, alternately creeping through a slot's picture and parked at its
-/// sound, and the cast stopped after a second. Laid picture-first, this
-/// film made `ffmpeg` (6.1) ask 317 times; chunked, once.
+/// **A straight read of a film whose slots are 11 MB reads it front to
+/// back**: the requests go forward only, at most one per slot (the `free`
+/// box between two slots is a forward skip a reader may make a request
+/// of, as its socket's window says) -- not one per hop between a slot's
+/// picture and its sound, the field bug: on zond's TV an 8 Mbit/s film
+/// with 7.5 s GOPs made a request every 0.3 to 1 s, alternately creeping
+/// through a slot's picture and parked at its sound, and the cast stopped
+/// after a second. Laid picture-first, this film made `ffmpeg` (6.1) ask
+/// 317 times, back and forth; chunked, once.
 #[test]
-fn a_straight_read_of_a_fat_film_is_one_request() -> anyhow::Result<()> {
+fn a_straight_read_of_a_fat_film_reads_it_front_to_back() -> anyhow::Result<()> {
     if !film_producer::tools_for(
         Picture::H264,
-        "a_straight_read_of_a_fat_film_is_one_request",
+        "a_straight_read_of_a_fat_film_reads_it_front_to_back",
     ) {
         return Ok(());
     }
     let fixture = Fixture::start(fat_film(Picture::H264), RenditionTuning::default())?;
     let token = fixture.publish()?;
+    let file_slots = slots(&fixture.get(&token, Some((0, 64 * 1024 - 1)))?);
     let relay = Relay::start(fixture.lan.parse()?)?;
     ffmpeg_reads(&relay.url(&token), &[], &[])?;
-    let ranges = relay.take();
+    let starts = starts_of(&relay.take());
     assert!(
-        ranges.len() <= 2,
-        "a straight read asked {} times: {ranges:?}",
-        ranges.len()
+        starts.len() <= file_slots.len() && starts.windows(2).all(|pair| pair[0] < pair[1]),
+        "a straight read asked for {starts:?}"
     );
     Ok(())
 }
 
+/// Where each `Range` a relay saw begins (`-` for none, the file's start).
+fn starts_of(ranges: &[String]) -> Vec<u64> {
+    ranges
+        .iter()
+        .map(|range| {
+            range
+                .strip_prefix("bytes=")
+                .and_then(|range| range.split('-').next())
+                .and_then(|start| start.parse().ok())
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
 /// **A seek reads on from where it lands**: `ffmpeg -ss` into a fat film's
-/// third slot asks for the file's start, the slot, and at most one
-/// request per slot boundary it reads across -- the `free` box between
-/// two slots is a skip a reader may make a request of. Picture-first, the
-/// same seek asked 47 times.
+/// third slot asks for the file's start, then the slot, then forward only,
+/// at most once per slot boundary it reads across. Picture-first, the same
+/// seek asked 47 times, back and forth.
 #[test]
 fn a_seek_into_a_fat_film_reads_on_from_where_it_lands() -> anyhow::Result<()> {
     if !film_producer::tools_for(
@@ -320,14 +336,15 @@ fn a_seek_into_a_fat_film_reads_on_from_where_it_lands() -> anyhow::Result<()> {
     let file_slots = slots(&fixture.get(&token, Some((0, 64 * 1024 - 1)))?);
     let relay = Relay::start(fixture.lan.parse()?)?;
     ffmpeg_reads(&relay.url(&token), &["-ss", "20"], &["-t", "3"])?;
-    let ranges = relay.take();
-    // 20 s is in slot 2 (16 to 24 s), and three seconds on stay in it.
-    let landed = format!("bytes={}-", file_slots[2].0);
-    assert!(ranges.contains(&landed), "{ranges:?}");
+    // 20 s is in slot 2 (16 to 24 s); three seconds on read into slot 3.
+    let starts = starts_of(&relay.take());
     assert!(
-        ranges.len() <= 3,
-        "the seek asked {} times: {ranges:?}",
-        ranges.len()
+        starts.len() >= 2 && starts[1] == file_slots[2].0,
+        "the seek asked for {starts:?}"
+    );
+    assert!(
+        starts.len() <= 4 && starts[1..].windows(2).all(|pair| pair[0] < pair[1]),
+        "the seek asked for {starts:?}"
     );
     Ok(())
 }
