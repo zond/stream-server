@@ -1066,8 +1066,10 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   first `moof` is then the slot's own rest, and FFmpeg reads on through
   it. A `sidx` counts 65535 references, so 32767 slots.
 
-  **Measured** with libavformat 4.4, 6.1 and master as Chrome drives it,
-  every packet of both tracks against the film's, in decode order:
+  **Measured** with libavformat 4.4, 6.1 and master as Chrome drives it
+  (`tools/lavf-harness`: the probe, how to build it against a tag, and the
+  comparison), every packet of both tracks against the film's, in decode
+  order:
 
   | film | read | 4.4 | 6.1 | master |
   |---|---|---|---|---|

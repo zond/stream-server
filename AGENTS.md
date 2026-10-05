@@ -45,6 +45,7 @@ root `Cargo.toml` are identical and the comment there says why.
 | `enginefs/src/backend/librqbit.rs` | The sole torrent backend and the one place `bt*` settings reach librqbit (`SessionTuning`, `bt_settings_support()` -- a truth table a test keeps complete). `dht_bootstrap.rs` resolves bootstrap names itself. |
 | `enginefs/src/lib.rs`, `engine.rs`, `reconcile.rs`, `retention.rs`, `retention/` | `EngineFS` (the engine and magnet-add registries) and one `Engine`; the reconciler that makes every start and stop; the retention owner and the read-pattern detector (`retention/streams.rs`), shared with the proxy. `docs/design/read-pattern-retention.md` is the design. |
 | `enginefs/src/piece_store/`, `chunk_store.rs` | The session's storage, one file per piece, and the store both adapters sit on. |
+| `tools/lavf-harness/` | Not built by cargo: a probe that reads a rendition as Chrome's `FFmpegDemuxer` does, a recipe to link it against any FFmpeg tag (4.4 is the Chromecast's), and a script that holds what each version reads against the film. Run it before changing anything in `rendition/mux.rs` or `layout.rs` that a demuxer can see; its README says how. |
 | `docs/` | The reference behind the README, one file per topic (the README's Layout section lists them); `docs/known-issues.md`, the open list and the standing hazards; `docs/design/`, design notes for built features, each written against a rev. |
 
 ## Toolchain, build, CI
