@@ -701,19 +701,53 @@ same day, zond's decision.)*
   after about `2d`. For a memory the first two steps are the 32 MiB behind
   the remembered byte -- mpv's buffer, where its picture was -- the half
   nearer that byte first.
-* **How** (`Engine::prewant`): **one** librqbit stream, reaching one step
-  ahead of where it stands (`TorrentHandle::prefetch`; no `OpenPosition`,
-  so the startup window a client is shown still follows the player), walked
-  through the steps: it is put on a piece and a read of one byte parks
-  there until the piece has arrived, then the next piece, then the next
-  step. Forward its reach runs into the following step, which is the one it
-  would have asked for next, and at the window's end up to one step past
-  it. Each step is promised on the file's entity as it is begun
-  (`Retention::promise_ahead`, no head), so nothing unlinks a fetched piece
-  before it is read and a pass wants it as it wants what a parked read
-  waits for. It is **not a read**: no stream registered, nothing in
-  `active_streams`, nothing noted. What keeps the torrent running is the
-  player's own hold.
+* **How** (`Engine::prewant`): **one** librqbit stream at a time
+  (`TorrentHandle::prefetch`; no `OpenPosition`, so the startup window a
+  client is shown still follows the player), walked through the steps: it
+  is put on a piece, reaching to the end of the step and no further, and a
+  read of one byte parks there until the piece has arrived; then a stream
+  on the next piece, then the next step. So a step's pieces are asked for
+  together, nothing past the step is, and nothing in flight is ever left
+  outside a stream's reach. It is **not a read**: no stream registered,
+  nothing in `active_streams`, nothing noted, and no entity kept live. What
+  keeps the torrent running is the player's own hold.
+* **It wants, and holds nothing** (`Retention::ask_ahead`; zond's rule,
+  "cache keeps everything", one eviction order). A read's promise does two
+  things at once: it has the piece fetched, and it exempts it from every
+  unlink until it is read. A pre-want's pieces get only the first -- *(first
+  built as promises, with a quarter of the cache as their bound; changed
+  the same day)* -- so once one is on the disk and the walk has moved on it
+  is cached data like any other outside every reader's window: kept while
+  there is room, and given back by the same order as everything else when
+  there is not (`retention::ledger`: by when it was last any use, which for
+  a piece nothing has read is when it arrived -- exactly where a piece read
+  once at that moment stands; not first to go, not last). It is protected
+  again only when the player reads inside the window and its reads promise
+  their pieces, as any read's do. The one thing a pass does hold is the
+  step being asked for *now*, as it holds a reading stream's lookahead and
+  for the same reason: the backend will not forget a piece a stream is
+  asking for, so offering it to a reclaim frees nothing, and what of it has
+  not arrived is fill the disk must have room for.
+* **A piece that could not be kept is not asked for** (`owner::Room`). Each
+  pass measures how many pieces an asker may have asked for in all: what
+  the entity may hold -- the budget, or what the volume gives, less the
+  readers' own fill to come -- less every piece the readers hold that no
+  reclaim can give back (what they are fetched for, their promises, their
+  streams' lookaheads, the committed set). The walk counts every piece it
+  has asked for against that. A step the room has only part of is asked
+  for in part, nearest the centre; with no room for another piece the walk
+  lets its stream go and asks for nothing until a pass finds more. So a
+  pre-want never fetches a piece for the next pass to take, never pushes
+  out the pieces nearest the resume point to fetch ones further out, and
+  can never be what takes a reader's piece or puts the disk over its
+  budget: inside its room everything it asked for fits beside everything
+  the readers hold, and what has to go to make that room is whatever the
+  one order says is coldest -- older data before the pre-want's, or the
+  pre-want's own first pieces before data read again and again, as the
+  order has it. No share of the cache is set aside for it and none is
+  denied it: on a cache that covers the file there is no bound at all;
+  under a policy nothing is asked for until the first pass has measured
+  (the next tick, at most two seconds after the open).
 * **What a blocked read keeps.** librqbit has no notion of one stream
   ranking below another: its priority list is one piece of each open stream
   in turn, in an order shuffled per ask, and a peer takes the first piece
@@ -735,11 +769,6 @@ same day, zond's decision.)*
   to one peer for the shuffle having put the pre-want first. Ranking the
   pre-want strictly below the player's reads needs a priority on librqbit's
   streams -- a fork change, not done.
-* **Bounded by the cache.** What a pre-want holds is promised, so no pass
-  can give it back while it stands: it asks for whole steps, in order, up
-  to a quarter of the cache (`PREWANT_CACHE_SHARE`) and no further. On a
-  10 GiB cache that is the whole window; on a 150 MB one, the first two
-  steps.
 * **Let go** when the player reads inside the window (its own stream reads
   ahead from there), when one run of reads -- from an open or a seek --
   delivers 16 MiB outside it (the player is playing elsewhere: a wrong

@@ -466,6 +466,14 @@ impl Asking {
     /// What the whole entity may hold on the disk, committed set and all:
     /// the cap or the volume, less the margin the fill needs.
     fn disk(&self, piece: u64, held: usize) -> u64 {
+        self.within(piece, held, self.margin)
+    }
+
+    /// [`Self::disk`] with the margin stated: what the entity may hold
+    /// while leaving `margin` bytes for what arrives before the next pass.
+    /// What the room an asker may fill is measured from, with the margin
+    /// that is not the asker's own ([`Retention::ask_ahead`]).
+    pub fn within(&self, piece: u64, held: usize, margin: u64) -> u64 {
         let held = (held as u64).saturating_mul(piece);
         let available = match (self.budget, self.headroom) {
             (CacheBudget::Unbounded, _) => u64::MAX,
@@ -476,7 +484,7 @@ impl Asking {
         };
         // An allowance that spent the whole budget would sit a stride over
         // it for as long as anything is downloading.
-        available.saturating_sub(self.margin)
+        available.saturating_sub(margin)
     }
 
     /// How many pieces the committed set holds.
@@ -1031,6 +1039,11 @@ struct State<B: Backing> {
     /// to keep would stand still at the pieces the pass took. So the pin
     /// exit wants the entity whole when this is set, and clears it.
     slacked: bool,
+    /// **How many pieces an asker may have asked for in all**, as the last
+    /// pass measured it, with the budget it was measured under
+    /// ([`Reader::room`]): what the entity may hold less everything its
+    /// readers hold that no reclaim can give back.
+    room: Option<(CacheBudget, u64)>,
     /// The draw that decides which of this entity's pieces this process
     /// offers to the swarm ([`Buffering::seed`]).
     ///
@@ -1081,6 +1094,15 @@ struct ReaderState<B: Backing> {
     /// The pieces this read has promised off the disk and not yet
     /// delivered. Nothing may unlink one of them.
     promised: Range<u32>,
+    /// **The pieces a stream of this reader's is asking the backend for
+    /// now, with no promise to read them** ([`Reader::asks`]): a pre-want's
+    /// reach. Nothing a pass keeps once the stream has moved on -- a piece
+    /// fetched this way is cached data like any other -- but while it is
+    /// being asked for it is a fact about the backend, as a reading
+    /// stream's lookahead is: the backend will not forget a piece a stream
+    /// is asking for, and what of it has not arrived is about to. Empty for
+    /// every reader that reads.
+    asking: Range<u32>,
     /// The piece this reader's last pass ran at, so one reader playing on
     /// does not spend another's throttle.
     passed_at: Option<u32>,
@@ -1123,6 +1145,7 @@ impl<B: Backing> ReaderState<B> {
             playhead: None,
             opened_at,
             promised: 0..0,
+            asking: 0..0,
             passed_at: None,
             buffering,
         }
@@ -1213,6 +1236,8 @@ pub struct Holding<B: Backing> {
     pub windows: Vec<Range<u32>>,
     /// Every non-empty promise of an open read.
     pub promised: Vec<Range<u32>>,
+    /// What every asker is asking the backend for now ([`Reader::asks`]).
+    pub asking: Vec<Range<u32>>,
     /// Some reader has delivered a byte and has not ended.
     pub live_playhead: bool,
     /// Where the entity is being consumed: the detector's answer from the
@@ -1344,6 +1369,7 @@ impl<B: Backing> Retention<B> {
                         draw_waiting_since: None,
                         content: None,
                         slacked: false,
+                        room: None,
                         opens: 0,
                         seed: share_seed(),
                     })),
@@ -1436,22 +1462,28 @@ impl<B: Backing> Retention<B> {
         })
     }
 
-    /// **A promise with no read behind it yet**: `pieces` of `key` will be
-    /// read, so nothing may unlink them and the want-set orders them as it
-    /// orders what a parked read waits for -- and no head anywhere. What a
-    /// resumed film's pre-want holds while the player is still reading the
-    /// file's head and index (`Engine::prewant`).
+    /// **An asker: something that fetches pieces of `key` nobody has
+    /// promised to read** -- a resumed film's pre-want, asking for the
+    /// resume point while the player is still on the file's head
+    /// (`Engine::prewant`). The handle says what its stream is asking the
+    /// backend for now ([`Reader::asks`]) and is told how much it may ask
+    /// for in all ([`Reader::room`]).
     ///
-    /// **No head, which is the difference from [`Self::reader_on`]**: where
-    /// a pass measures from, and where the entity is said to be, are the
-    /// reads' own, and a region somebody is about to read is neither. The
-    /// buffering asked is nothing, so the policy is sized as it would have
-    /// been without it. `None` for a key with no entity, or an empty range.
-    /// Dropping the handle ends the promise, as a read's end does.
-    pub fn promise_ahead(self: &Arc<Self>, key: &B::Key, pieces: Range<u32>) -> Option<Reader<B>> {
-        if pieces.is_empty() {
-            return None;
-        }
+    /// **It wants, and it holds nothing.** A read's promise does two things
+    /// at once: it has the piece fetched and it exempts it from every
+    /// unlink until it is read. An asker's pieces get only the first. Once
+    /// one is on the disk and the asker has moved on it is cached data like
+    /// any other outside every reader's window: kept while there is room,
+    /// given back by the same order as everything else when there is not
+    /// (`retention::ledger`), and protected again only when a real read
+    /// promises it. That is why an asker needs no share of the cache set
+    /// aside for it, and why it may not ask for what could not be kept.
+    ///
+    /// **No head either**: where a pass measures from, and where the entity
+    /// is said to be, are the reads' own. It is not an observed reader, so
+    /// it keeps no entity live. `None` for a key with no entity, which is
+    /// one nothing bounds. Dropping the handle ends the asking.
+    pub fn ask_ahead(self: &Arc<Self>, key: &B::Key) -> Option<Reader<B>> {
         let entity = self.lookup(key)?;
         let id = ReaderId(self.next_reader.fetch_add(1, Ordering::Relaxed));
         entity
@@ -1459,15 +1491,13 @@ impl<B: Backing> Retention<B> {
             .lock()
             .readers
             .insert(id, ReaderState::opened(None, Buffering::default()));
-        let reader = Reader {
+        Some(Reader {
             owner: self.clone(),
             entity,
             id,
             opened_at: None,
             buffering: Buffering::default(),
-        };
-        reader.promises(pieces);
-        Some(reader)
+        })
     }
 
     /// Where a reader of `key` last got to, told without a [`Reader`]: the
@@ -2675,6 +2705,7 @@ impl<B: Backing> Retention<B> {
         // headroom is what the volume will still give; what turns those two
         // into this entity's allowance is what this entity holds -- the
         // listing above -- and that is the backing's to price.
+        let (held_by_readers, readers_margin);
         let asking = {
             let state = entity.state.lock();
             let (buffering, stride, domain) =
@@ -2690,6 +2721,12 @@ impl<B: Backing> Retention<B> {
                 .readers
                 .values()
                 .map(|reader| reader.promised.clone())
+                .filter(|range| !range.is_empty())
+                .collect();
+            let asking: Vec<Range<u32>> = state
+                .readers
+                .values()
+                .map(|reader| reader.asking.clone())
                 .filter(|range| !range.is_empty())
                 .collect();
             let lookaheads: Vec<Range<u32>> = state
@@ -2708,6 +2745,16 @@ impl<B: Backing> Retention<B> {
                 })
                 .collect();
             holding.extend(lookaheads.iter().cloned());
+            // What the readers hold, before the askers' reach joins it:
+            // what an asker's room is measured against.
+            held_by_readers = holding.clone();
+            // **An asker's reach is a lookahead for these two purposes and
+            // no other**: the backend refuses to forget a piece a stream is
+            // asking for, so offering one to the reclaim frees nothing; and
+            // what of it has not arrived is about to, so the margin has to
+            // leave it room. It is in no want-set and no promise, and the
+            // moment the asker moves on it is in neither of these.
+            holding.extend(asking.iter().cloned());
             drop(state);
             // What the open streams will still fetch: their lookaheads, in
             // this entity's extent, less what the listing already found.
@@ -2717,13 +2764,20 @@ impl<B: Backing> Retention<B> {
             // `Maximum` a first open's lookahead is the whole cap, so it
             // was an allowance of nothing for the life of the stream.
             let extent = B::extent(&domain);
-            let unfetched = lookaheads
-                .iter()
-                .flat_map(|run| run.start.max(extent.start)..run.end.min(extent.end))
-                .filter(|piece| !held.contains(piece))
-                .collect::<BTreeSet<u32>>()
-                .len() as u64;
+            let still_to_come = |runs: &[Range<u32>]| {
+                runs.iter()
+                    .flat_map(|run| run.start.max(extent.start)..run.end.min(extent.end))
+                    .filter(|piece| !held.contains(piece))
+                    .collect::<BTreeSet<u32>>()
+            };
+            let to_readers = still_to_come(&lookaheads);
+            let unfetched = to_readers.union(&still_to_come(&asking)).count() as u64;
             let piece_length = B::piece_length(&domain).unwrap_or(0);
+            // The margin the readers' own fill needs, without the askers':
+            // what their room is measured under.
+            readers_margin = (to_readers.len() as u64)
+                .max(u64::from(stride))
+                .saturating_mul(piece_length);
             Asking {
                 budget: begin.budget,
                 headroom: self.budget.headroom(),
@@ -2756,7 +2810,27 @@ impl<B: Backing> Retention<B> {
                     .saturating_mul(piece_length),
             }
         };
+        // What an asker's room is measured from, kept beside the asking
+        // the backing is about to take.
+        let measure = asking.clone();
         let consumers = self.backing.reading(&begin.domain, &held, asking);
+        // **How much an asker may ask for in all** ([`Room`]): what the
+        // entity may hold, less every piece its readers hold that no
+        // reclaim can give back -- what they are fetched for, what they
+        // promised, what their streams reach, and the committed set.
+        let room = {
+            let extent = B::extent(&begin.domain);
+            let piece = B::piece_length(&begin.domain).unwrap_or(0).max(1);
+            let kept = consumers
+                .want
+                .iter()
+                .chain(&held_by_readers)
+                .chain(&measure.committed)
+                .flat_map(|run| run.start.max(extent.start)..run.end.min(extent.end))
+                .collect::<BTreeSet<u32>>()
+                .len() as u64;
+            (measure.within(piece, held.len(), readers_margin) / piece).saturating_sub(kept)
+        };
         // 5. **The deciding reading, taken after the listing.** Read before
         // the walk the head is the older half of the pair: the window is
         // drawn round where playback *was*, everything the fill wrote ahead
@@ -3062,6 +3136,7 @@ impl<B: Backing> Retention<B> {
                 reader.passed_at = Some(at);
             }
             state.conclude(&mut claim.guard, conclusion.windows.clone());
+            state.room = Some((begin.budget, room));
         }
         // Whether this pass swallowed the trigger for the next one. A
         // delivered byte while a pass is running starts none and does not
@@ -3727,6 +3802,12 @@ impl<B: Backing> State<B> {
                 .map(|reader| reader.promised.clone())
                 .filter(|range| !range.is_empty())
                 .collect(),
+            asking: self
+                .readers
+                .values()
+                .map(|reader| reader.asking.clone())
+                .filter(|range| !range.is_empty())
+                .collect(),
             live_playhead: self
                 .readers
                 .values()
@@ -3774,6 +3855,28 @@ fn stride_for<B: Backing>(window: u32) -> u32 {
         }
         Trigger::External => 1,
     }
+}
+
+/// **How many pieces of an entity an asker may have asked for in all**
+/// ([`Reader::room`]): the rule that a piece which could not be kept is not
+/// asked for.
+///
+/// What the entity may hold, less everything its readers hold that no
+/// reclaim can give back -- their windows, their promises, their streams'
+/// lookaheads, the committed set. An asker that stays inside it can always
+/// be kept beside them, whatever else has to go to make the room; one that
+/// went past it would be fetching pieces for the next pass to take, or
+/// pushing out the pieces it fetched first. Measured by each pass, from the
+/// budget and what is held then; no fixed share of anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Room {
+    /// Nothing bounds the entity: a budget that covers it, or a pin.
+    Unbounded,
+    /// This many pieces, counting every one the asker has asked for so far.
+    Pieces(u64),
+    /// A policy bounds the entity and no pass has measured it under that
+    /// policy yet: the next one will, and until then nothing is asked for.
+    Unmeasured,
 }
 
 /// One open read: a handle that holds its promise and carries its playhead.
@@ -3837,6 +3940,33 @@ impl<B: Backing> Reader<B> {
             .entry(self.id)
             .or_insert_with(|| ReaderState::opened(self.opened_at, self.buffering))
             .promised = pieces;
+    }
+
+    /// **This asker's stream is asking the backend for `pieces` now**, and
+    /// for nothing else: what it asked for before and has left is no
+    /// longer its own ([`Retention::ask_ahead`]). An empty range is a
+    /// stream that asks for nothing.
+    pub fn asks(&self, pieces: Range<u32>) {
+        self.entity
+            .state
+            .lock()
+            .readers
+            .entry(self.id)
+            .or_insert_with(|| ReaderState::opened(self.opened_at, self.buffering))
+            .asking = pieces;
+    }
+
+    /// **How much an asker may ask for**, as the entity stands; see
+    /// [`Room`].
+    pub fn room(&self) -> Room {
+        let state = self.entity.state.lock();
+        match (&state.installed, state.room) {
+            (None, _) => Room::Unbounded,
+            (Some(installed), Some((budget, pieces))) if budget == installed.budget => {
+                Room::Pieces(pieces)
+            }
+            _ => Room::Unmeasured,
+        }
     }
 
     /// A byte at `at` of this entity has reached a player.
@@ -6432,54 +6562,235 @@ mod tests {
         drop(reader);
     }
 
-    /// **A promise made ahead of any read keeps what it promised and puts
-    /// no head anywhere** -- a resumed film's pre-want, made while the
-    /// player is still reading the file's head. The pieces it names stay
-    /// through a pass that takes everything else nobody shares, the entity
-    /// has no head for it -- the player reading the head is where it is --
-    /// and once it is let go the next pass takes them.
-    #[tokio::test]
-    async fn a_promise_made_ahead_keeps_its_pieces_and_puts_no_head_anywhere() {
-        let (backing, owner, _budget) = torrent();
+    /// A sixteen-piece film under a budget of eight, its viewer reading at
+    /// the top: the viewer's window is 0..3, the disk may hold seven pieces
+    /// -- the budget less a stride of room -- and the play session's draw
+    /// is pieces 0, 1, 5 and 9, which the tests over this keep off the
+    /// disk past the first two so that what is held by nothing is plain.
+    async fn film_with_a_viewer_at_the_top() -> (
+        Arc<Torrent>,
+        Arc<Retention<Torrent>>,
+        Arc<RetentionBudget>,
+        Reader<Torrent>,
+    ) {
+        let backing = Torrent::new([domain(0, 0..16)]);
+        let budget = Arc::new(RetentionBudget::default());
+        budget.set(Some(8 * PIECE), None);
+        let owner = Retention::new(backing.clone(), budget.clone());
         assert_eq!(play(&owner, &backing, 0).await, InstallOutcome::Installed);
-        assert!(owner.promise_ahead(&0, 4..4).is_none(), "an empty promise");
-        assert!(owner.promise_ahead(&7, 4..6).is_none(), "no such entity");
-        let ahead = owner.promise_ahead(&0, 4..6).expect("the entity");
-        assert_eq!(
-            owner.holding(&0).expect("a holding").head,
-            None,
-            "a region somebody is about to read is nobody's head"
-        );
-
-        // The player, reading the file's head.
-        let playing = owner
+        let viewer = owner
             .reader_on(&0, (0, 0), Buffering::default())
-            .expect("the same entity");
-        assert!(playing.note((0, 0)).is_none());
-        backing.read_from(0, 1);
-        assert_eq!(
-            owner.holding(&0).expect("a holding").head,
-            Some((0, 0)),
-            "the entity is where the player is"
-        );
+            .expect("the entity the play made");
+        assert!(viewer.note((0, 0)).is_none());
+        (backing, owner, budget, viewer)
+    }
 
+    /// A live pass over the film at `now`, its viewer having just read a
+    /// byte at the top.
+    async fn pass_with_the_viewer_reading(
+        backing: &Torrent,
+        owner: &Arc<Retention<Torrent>>,
+        now: Instant,
+    ) {
+        backing.note_read(1, 0, 1, now);
         let claim = owner.turn(&0).await.expect("the turn");
-        owner.pass(&0, &(), claim, Mode::Live).await;
+        owner
+            .pass_at(&0, &(), claim, Mode::Live, now)
+            .await
+            .concluded
+            .expect("a pass over a film being watched");
+    }
+
+    /// **What an asker fetched is cached data like any other once it has
+    /// moved on: held by nothing, and given back in the one order
+    /// everything is given back in.** A pre-want's pieces, in the scenario
+    /// they are for -- a viewer at the top of the film, an asker fetching
+    /// further in.
+    ///
+    /// While the asker is asking for a piece, no reclaim is offered it: the
+    /// backend will not forget what a stream is asking for. The moment it
+    /// asks for something else, what it left is ranked by when it arrived,
+    /// exactly as a piece that was read is ranked by when it was read: not
+    /// first to go -- data that arrived before it goes first -- and not
+    /// last -- data that arrived after it outlives it. The viewer's window
+    /// and the draw are never among what goes, and the disk is never left
+    /// over what it may hold.
+    #[tokio::test]
+    async fn what_an_asker_fetched_is_cached_data_like_any_other_once_it_has_moved_on() {
+        let (backing, owner, _budget, _viewer) = film_with_a_viewer_at_the_top().await;
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        // The viewer's three pieces, and one that has been lying on the
+        // disk since before anything here: never read, held by nothing.
+        *backing.held.lock() = [0, 1, 2, 6].into_iter().collect();
+        pass_with_the_viewer_reading(&backing, &owner, at(0)).await;
+
+        let asker = owner.ask_ahead(&0).expect("the film's entity");
+        assert!(owner.ask_ahead(&7).is_none(), "no such entity");
+        asker.asks(10..12);
+        let holding = owner.holding(&0).expect("a holding");
+        assert_eq!(holding.asking, vec![10..12]);
+        assert!(holding.promised.is_empty(), "an asker promises nothing");
+        assert_eq!(holding.head, Some((0, 0)), "and is nobody's head");
+        assert_eq!(owner.readers_of(&0), 1, "nor a reader of the film");
+
+        // Its pieces arrive, and it moves on to the next two.
+        backing.holds([10, 11]);
+        pass_with_the_viewer_reading(&backing, &owner, at(10)).await;
+        asker.asks(12..14);
+        backing.holds([12, 13]);
+        // Eight on a disk that may hold seven: one has to go, and it is
+        // the oldest thing nothing holds -- the piece that was there first,
+        // not the asker's, which arrived after it.
+        pass_with_the_viewer_reading(&backing, &owner, at(20)).await;
         assert_eq!(
             backing.on_disk(),
-            vec![0, 1, 2, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15],
-            "the promised pieces stayed, beside the player's window"
+            vec![0, 1, 2, 10, 11, 12, 13],
+            "older cached data went before what the asker fetched"
         );
 
-        drop(ahead);
-        let claim = owner.turn(&0).await.expect("the turn");
-        owner.pass(&0, &(), claim, Mode::Live).await;
-        assert!(
-            !backing.on_disk().contains(&4),
-            "let go, the promise keeps nothing: {:?}",
-            backing.on_disk()
+        // On again -- back, this time, as a walk outward goes -- and
+        // something else arrives with its piece. Nine on the disk: two have
+        // to go, and now the oldest thing nothing holds is what the asker
+        // fetched first.
+        asker.asks(7..8);
+        backing.holds([7, 14]);
+        pass_with_the_viewer_reading(&backing, &owner, at(30)).await;
+        assert_eq!(
+            backing.on_disk(),
+            vec![0, 1, 2, 7, 12, 13, 14],
+            "the asker's own first pieces went, held by nothing; what arrived \
+             after them stayed, and so did everything the viewer holds"
         );
-        drop(playing);
+
+        // And what it is asking for is not offered while it asks. Three
+        // more arrive, so three have to go: the asker's second pair, and
+        // then, of the two that came together, not the one its stream is
+        // on -- the first in the file, which is how a tie goes -- but the
+        // other.
+        backing.holds([6, 8, 15]);
+        pass_with_the_viewer_reading(&backing, &owner, at(40)).await;
+        assert_eq!(
+            backing.on_disk(),
+            vec![0, 1, 2, 6, 7, 8, 15],
+            "a piece a stream is asking for was offered to the reclaim"
+        );
+        // Let go, that piece is the oldest of what is left, and the first
+        // to go.
+        drop(asker);
+        assert!(owner.holding(&0).expect("a holding").asking.is_empty());
+        backing.holds([10, 11]);
+        pass_with_the_viewer_reading(&backing, &owner, at(50)).await;
+        assert_eq!(
+            backing.on_disk(),
+            vec![0, 1, 2, 8, 10, 11, 15],
+            "the piece it was asking for went once it was not"
+        );
+    }
+
+    /// **What an asker has yet to receive is room the disk keeps for it,
+    /// and it is never a reader's piece that makes that room**: a reach
+    /// that has not arrived is fill to come, as a reading stream's
+    /// lookahead is, so the pass makes the room before the pieces land and
+    /// the disk is not over its line when they do -- and what goes for it
+    /// is what nothing holds, never the viewer's window nor what a parked
+    /// read was promised, however old.
+    #[tokio::test]
+    async fn what_an_asker_is_still_to_receive_is_room_kept_for_it() {
+        let (backing, owner, _budget, _viewer) = film_with_a_viewer_at_the_top().await;
+        let t0 = Instant::now();
+        // Seven on the disk, which is what it may hold; a second read is
+        // parked on the oldest of them outside the viewer's window.
+        *backing.held.lock() = [0, 1, 2, 4, 6, 7, 8].into_iter().collect();
+        let parked = owner
+            .reader_on(&0, (0, 4 * PIECE), Buffering::default())
+            .expect("the same entity");
+        parked.promises(4..5);
+        pass_with_the_viewer_reading(&backing, &owner, t0).await;
+        assert_eq!(backing.on_disk().len(), 7);
+
+        let asker = owner.ask_ahead(&0).expect("the film's entity");
+        asker.asks(10..13);
+        pass_with_the_viewer_reading(&backing, &owner, t0 + Duration::from_secs(10)).await;
+        assert_eq!(
+            backing.on_disk(),
+            vec![0, 1, 2, 4, 8],
+            "three pieces are on their way: the disk made room for three, not \
+             for a stride, out of what no reader holds"
+        );
+        backing.holds(10..13);
+        assert_eq!(backing.on_disk().len(), 8, "arrived, and inside the budget");
+        drop(parked);
+    }
+
+    /// **An asker may ask for what could be kept beside everything the
+    /// readers hold, and no more** ([`Room`]): what the entity may hold
+    /// less the viewer's window, the draw, and every promise and lookahead
+    /// of an open read -- measured by each pass, and by nothing else.
+    #[tokio::test]
+    async fn an_askers_room_is_what_the_readers_do_not_hold() {
+        let (backing, owner, budget, viewer) = film_with_a_viewer_at_the_top().await;
+        let t0 = Instant::now();
+        // The viewer's three, and a piece of the draw further in.
+        *backing.held.lock() = [0, 1, 2, 5].into_iter().collect();
+        let asker = owner.ask_ahead(&0).expect("the film's entity");
+        assert_eq!(
+            asker.room(),
+            Room::Unmeasured,
+            "a policy bounds the film and no pass has measured it"
+        );
+        // Twice: the first pass is the one that commits what of the draw
+        // is on the disk, and the second measures with it committed.
+        pass_with_the_viewer_reading(&backing, &owner, t0).await;
+        pass_with_the_viewer_reading(&backing, &owner, t0).await;
+        assert_eq!(
+            asker.room(),
+            Room::Pieces(3),
+            "seven the disk may hold; three are the viewer's and one more is committed"
+        );
+        // What the asker itself is asking for takes nothing from its room:
+        // the room is for it.
+        asker.asks(12..14);
+        pass_with_the_viewer_reading(&backing, &owner, t0).await;
+        assert_eq!(asker.room(), Room::Pieces(3));
+
+        // A second read parks further in, promising two pieces: all but
+        // one of the rest is spoken for.
+        let seeking = owner
+            .reader_on(&0, (0, 8 * PIECE), Buffering::default())
+            .expect("the same entity");
+        seeking.promises(8..10);
+        pass_with_the_viewer_reading(&backing, &owner, t0).await;
+        assert_eq!(asker.room(), Room::Pieces(1));
+        // And a viewer whose own stream reaches further leaves none: what
+        // eviction cannot give, an asker may not ask for.
+        drop(viewer);
+        let _viewer = owner
+            .reader_on(
+                &0,
+                (0, 0),
+                Buffering {
+                    lookahead_bytes: 4 * PIECE,
+                    ..Buffering::default()
+                },
+            )
+            .expect("the same entity");
+        pass_with_the_viewer_reading(&backing, &owner, t0).await;
+        assert_eq!(asker.room(), Room::Pieces(0));
+        drop(seeking);
+
+        // A new budget is a new policy: what was measured under the old one
+        // says nothing until a pass has measured this one.
+        budget.set(Some(10 * PIECE), None);
+        assert_eq!(owner.install(0, 0).await, InstallOutcome::Resized);
+        assert_eq!(asker.room(), Room::Unmeasured);
+        pass_with_the_viewer_reading(&backing, &owner, t0).await;
+        assert!(matches!(asker.room(), Room::Pieces(_)));
+        // And a budget that covers the film bounds nothing.
+        budget.set(Some(16 * PIECE), None);
+        owner.install(0, 0).await;
+        assert!(owner.holding(&0).expect("a holding").installed.is_none());
+        assert_eq!(asker.room(), Room::Unbounded);
     }
 
     /// **And a parked read is one of the windows, not only the pass's
