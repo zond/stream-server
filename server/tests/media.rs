@@ -16,7 +16,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use stream_server::{MediaId, MediaReader, MediaSpec, PlayToken, Refusal, ServerConfig};
+use stream_server::{
+    MediaId, MediaReader, MediaSpec, PlayToken, ReadWait, Refusal, ResumeHint, ServerConfig,
+};
 
 /// Why a test that seeds its own torrent data runs with the pin set
 /// unknown, and which tests may not (see the module).
@@ -178,6 +180,12 @@ impl TorrentFixture {
             films,
             _dirs: [config_dir, cache_dir, src],
         })
+    }
+
+    /// The server's config directory, where `settings.json` and the
+    /// memory of where play sessions ended are kept.
+    fn config_dir(&self) -> std::path::PathBuf {
+        self._dirs[0].path().join("config")
     }
 
     fn index(&self, name: &str) -> usize {
@@ -1841,6 +1849,264 @@ fn a_member_of_a_rar_set_played_by_id_shares_its_bytes_in_every_volume() -> anyh
             "{name} does not commit its own pieces of the set's draw"
         );
     }
+    drop(reader);
+    fixture.stop()
+}
+
+// --- Pre-want and the read-wait readout -----------------------------------
+
+/// The viewer's play, as the app registers it.
+fn viewer() -> Option<PlayToken> {
+    Some(PlayToken {
+        token: "tv.1".to_string(),
+        buffer: Default::default(),
+    })
+}
+
+/// The pre-want's numbers, shrunk to the fixtures' sixteen-kilobyte pieces
+/// so a window is a few pieces of a film of thirty-two.
+fn piece_rules() -> stream_server::media::prewant::Rules {
+    let piece = PIECE as u64;
+    stream_server::media::prewant::Rules {
+        min_half: 2 * piece,
+        half_per_mille: 0,
+        max_half: 2 * piece,
+        behind: 2 * piece,
+        ahead: piece,
+        near_ms: 60_000,
+        elsewhere: 4 * piece,
+    }
+}
+
+/// Seek `reader` to `at` and read until `len` bytes have come back, on a
+/// thread with no runtime; answers the reader and where the reads ended.
+fn read_at(reader: MediaReader, at: u64, len: usize) -> anyhow::Result<(MediaReader, u64)> {
+    within("a read", move || {
+        let mut reader = reader;
+        reader.seek(at)?;
+        let mut got = 0;
+        let mut buf = vec![0u8; len];
+        while got < len {
+            match reader.read(&mut buf[got..])? {
+                0 => break,
+                n => got += n,
+            }
+        }
+        Ok::<_, std::io::Error>((reader, at + got as u64))
+    })?
+    .map_err(Into::into)
+}
+
+/// **A play session ended at an offset is where the next playback resuming
+/// near it asks first.** The first session reads at twenty pieces in and
+/// leaves at 1000 s, which is remembered beside the settings with the byte
+/// it was last served to; the next, resuming at 1010 s with no length
+/// known, asks for the region around that byte -- only once the head is in
+/// -- and lets it go when the player reads inside it.
+#[test]
+fn a_session_ended_at_an_offset_is_asked_for_first_by_the_next_playback_near_it()
+-> anyhow::Result<()> {
+    let piece = PIECE as u64;
+    let fixture = TorrentFixture::start(
+        fixture_pins::keep_what_the_fixture_seeded(offline_config()),
+        &["film.mkv"],
+        32 * PIECE,
+        |_| true,
+    )?;
+    fixture.handle.set_prewant_rules(piece_rules());
+
+    let first = fixture.register("film.mkv")?;
+    let reader = fixture.handle.open_reader(&first, viewer())?;
+    let (reader, left) = read_at(reader, 20 * piece, 1000)?;
+    fixture
+        .handle
+        .note_media_position(&first, Duration::from_secs(1000))?;
+    drop(reader);
+    let kept = std::fs::read_to_string(fixture.config_dir().join("read-positions.json"))?;
+    assert!(
+        kept.contains(&fixture.info_hash) && kept.contains(&left.to_string()),
+        "remembered on the disk: {kept}"
+    );
+
+    let next = fixture.register("film.mkv")?;
+    fixture.handle.set_resume(
+        &next,
+        Some(ResumeHint {
+            at_ms: 1_010_000,
+            runtime_ms: None,
+        }),
+    )?;
+    let reader = fixture.handle.open_reader(&next, viewer())?;
+    assert_eq!(
+        fixture.handle.media_prewant(&next),
+        None,
+        "nothing is asked for before the head is in"
+    );
+    let (reader, _) = read_at(reader, 0, 100)?;
+    let window = left - 2 * piece..left + piece;
+    until("the remembered region is asked for", || {
+        Ok(fixture.handle.media_prewant(&next) == Some(window.clone()))
+    })?;
+    let (reader, _) = read_at(reader, left - piece, 100)?;
+    until("the player reached it and it is let go", || {
+        Ok(fixture.handle.media_prewant(&next).is_none())
+    })?;
+    drop(reader);
+    fixture.stop()
+}
+
+/// **Without a memory, the resume time's share of the file**, and a player
+/// that plays elsewhere -- a run of reads the length of the threshold,
+/// outside the window -- lets it go: a wrong estimate keeps nothing.
+#[test]
+fn an_estimate_is_asked_for_and_let_go_when_the_player_plays_elsewhere() -> anyhow::Result<()> {
+    let piece = PIECE as u64;
+    let fixture = TorrentFixture::start(
+        fixture_pins::keep_what_the_fixture_seeded(offline_config()),
+        &["film.mkv"],
+        32 * PIECE,
+        |_| true,
+    )?;
+    fixture.handle.set_prewant_rules(piece_rules());
+    let id = fixture.register("film.mkv")?;
+    // 500 s of 1600 is ten pieces of thirty-two.
+    fixture.handle.set_resume(
+        &id,
+        Some(ResumeHint {
+            at_ms: 500_000,
+            runtime_ms: Some(1_600_000),
+        }),
+    )?;
+    let reader = fixture.handle.open_reader(&id, viewer())?;
+    let (reader, _) = read_at(reader, 0, 100)?;
+    until("the estimate is asked for", || {
+        Ok(fixture.handle.media_prewant(&id) == Some(8 * piece..12 * piece))
+    })?;
+    let (reader, _) = read_at(reader, 20 * piece, 3 * PIECE)?;
+    let (reader, _) = read_at(reader, 16 * piece, PIECE)?;
+    assert_eq!(
+        fixture.handle.media_prewant(&id),
+        Some(8 * piece..12 * piece),
+        "an index read's worth elsewhere, and another after a seek, let nothing go"
+    );
+    let (reader, _) = read_at(reader, 24 * piece, 4 * PIECE)?;
+    until("the player played elsewhere and it is let go", || {
+        Ok(fixture.handle.media_prewant(&id).is_none())
+    })?;
+    // And an aside asks for nothing, resume or not.
+    let aside = fixture.handle.open_reader(&id, None)?;
+    let (aside, _) = read_at(aside, 0, 100)?;
+    assert_eq!(fixture.handle.media_prewant(&id), None);
+    drop((reader, aside));
+    fixture.stop()
+}
+
+/// How long a "nothing is asked for" claim is watched for: the window the
+/// claim is measured over, never a wait for something to finish.
+const QUIET: Duration = Duration::from_millis(500);
+
+/// **The head comes first**: while the player's read of the file's head is
+/// parked on a piece nobody has, nothing else is asked for -- the swarm's
+/// priority list is shared round robin, and the resume point would halve
+/// the head's share.
+#[test]
+fn nothing_is_asked_ahead_while_the_head_is_still_coming() -> anyhow::Result<()> {
+    let fixture = TorrentFixture::start(
+        fixture_pins::keep_what_the_fixture_seeded(offline_config()),
+        &["film.mkv"],
+        32 * PIECE,
+        |piece| piece != 0,
+    )?;
+    fixture.handle.set_prewant_rules(piece_rules());
+    let id = fixture.register("film.mkv")?;
+    fixture.handle.set_resume(
+        &id,
+        Some(ResumeHint {
+            at_ms: 500_000,
+            runtime_ms: Some(1_600_000),
+        }),
+    )?;
+    let reader = fixture.handle.open_reader(&id, viewer())?;
+    let canceller = reader.canceller();
+    let parked = std::thread::spawn(move || {
+        let mut reader = reader;
+        let _ = reader.read(&mut [0u8; 64]);
+        reader
+    });
+    until("the head read is parked", || Ok(canceller.is_waiting()))?;
+    let watched = Instant::now();
+    while watched.elapsed() < QUIET {
+        assert_eq!(
+            fixture.handle.media_prewant(&id),
+            None,
+            "asked ahead while the head was still coming"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    canceller.cancel();
+    drop(
+        parked
+            .join()
+            .map_err(|_| anyhow::anyhow!("the parked read panicked"))?,
+    );
+    fixture.stop()
+}
+
+/// **The read-wait readout says the player is waiting while a read is
+/// parked, and nothing once it is not**: a read served off the disk leaves
+/// nothing waiting, a read parked on a piece nobody has is shown waiting at
+/// its offset, and the cancel that wakes it takes the wait away. What the
+/// player's "buffering" card is shown from when mpv itself says nothing.
+#[test]
+fn the_read_wait_readout_follows_a_parked_read() -> anyhow::Result<()> {
+    const FILM_LEN: usize = 4 * PIECE;
+    let parked_at = (3 * PIECE + 10) as u64;
+    let fixture = TorrentFixture::start(
+        fixture_pins::keep_what_the_fixture_seeded(offline_config()),
+        &["film.mkv"],
+        FILM_LEN,
+        |piece| piece != 3,
+    )?;
+    let id = fixture.register("film.mkv")?;
+    let reader = fixture.handle.open_reader(&id, viewer())?;
+    let (reader, _) = read_at(reader, 0, 100)?;
+    assert_eq!(
+        fixture.handle.media_read_wait(&id)?,
+        ReadWait::default(),
+        "a read served off the disk leaves nothing waiting"
+    );
+    let reader = within("a seek into the missing piece", move || {
+        let mut reader = reader;
+        reader.seek(parked_at).map(|_| reader)
+    })??;
+    let canceller = reader.canceller();
+    let parked = std::thread::spawn(move || {
+        let mut reader = reader;
+        let _ = reader.read(&mut [0u8; 64]);
+        reader
+    });
+    until("the read is parked", || Ok(canceller.is_waiting()))?;
+    let wait = fixture.handle.media_read_wait(&id)?;
+    assert!(
+        wait.waiting_ms.is_some(),
+        "a parked read is a wait: {wait:?}"
+    );
+    assert_eq!(wait.offset, Some(parked_at));
+    canceller.cancel();
+    let reader = parked
+        .join()
+        .map_err(|_| anyhow::anyhow!("the parked read panicked"))?;
+    assert_eq!(
+        fixture.handle.media_read_wait(&id)?,
+        ReadWait::default(),
+        "the read is answered, so nothing waits"
+    );
+    assert_eq!(
+        fixture
+            .handle
+            .media_read_wait(&MediaId::from("feedface".to_string())),
+        Err(Refusal::UnknownId)
+    );
     drop(reader);
     fixture.stop()
 }

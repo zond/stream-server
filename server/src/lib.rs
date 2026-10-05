@@ -25,7 +25,7 @@ pub use cast::CastToken;
 pub use media::PinError;
 pub use media::{
     Canceller, GrantSupplier, LocalFile, MediaId, MediaReader, MediaSpec, MemberInfo, PlayToken,
-    Refusal, Resolved,
+    ReadWait, Refusal, Resolved, ResumeHint,
 };
 pub use rendition::{
     AudioPlan, IndexEntry, Job, Producer, ProducerRefusal, RenditionReadiness, RenditionSpec,
@@ -702,6 +702,66 @@ impl ServerHandle {
         self.block_on_server(
             async move { engine.on_duration(&info_hash, file_idx, duration).await },
         )
+    }
+
+    /// **Where the playback `id` is opened for resumes**, and how long the
+    /// film is if the app knows -- `None` for a playback from the top. Set
+    /// before [`Self::open_reader`], as [`Self::set_buffer`] can be: a
+    /// torrent file read with a play then asks the swarm for the resume
+    /// point once the file's head is in, beside the index read, instead of
+    /// only when the player blocks on it (`docs/design/media-pipeline.md`,
+    /// "Pre-want"). Where the last session on the file ended
+    /// ([`Self::note_media_position`]) places the window when it is near
+    /// the resume time; the resume time's share of the file does
+    /// otherwise. Nothing for anything but a torrent file.
+    pub fn set_resume(&self, id: &MediaId, resume: Option<ResumeHint>) -> Result<(), Refusal> {
+        self.state.media.set_resume(id, resume)
+    }
+
+    /// **The player of `id` is leaving at `position`** of the film:
+    /// remembered with the byte its reader was last served to, per torrent
+    /// file and across restarts (`read-positions.json` beside
+    /// `settings.json`), so the next playback resuming near there asks for
+    /// that region first ([`Self::set_resume`]). A no-op for anything but a
+    /// torrent file read with a play, and before its first byte.
+    pub fn note_media_position(
+        &self,
+        id: &MediaId,
+        position: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        let Some((info_hash, file_idx, offset)) = self.state.media.left_at(id) else {
+            return Ok(());
+        };
+        let memory = self.state.read_memory.clone();
+        let at = media::prewant::Remembered {
+            offset,
+            at_ms: position.as_millis() as u64,
+        };
+        self.block_on_server(async move { memory.remember(&info_hash, file_idx, at).await })
+    }
+
+    /// **Whether the player of `id` is waiting on a read now**, and for how
+    /// long: the truth behind a player's "buffering" card while its own
+    /// engine reports no stall -- mpv blocked in a read of a piece the
+    /// swarm has not delivered shows a frozen picture and says nothing.
+    /// No I/O; cheap enough to poll every half second. See [`ReadWait`].
+    pub fn media_read_wait(&self, id: &MediaId) -> Result<ReadWait, Refusal> {
+        self.state.media.read_wait(id)
+    }
+
+    /// The window a reader of `id` is pre-wanting now: a probe for the
+    /// tests of [`Self::set_resume`], and nothing a client decides from.
+    #[doc(hidden)]
+    pub fn media_prewant(&self, id: &MediaId) -> Option<std::ops::Range<u64>> {
+        self.state.media.prewanting(id)
+    }
+
+    /// Plan pre-wants with `rules`: a test's, so a fixture of a few pieces
+    /// can tell a window from its whole file. Not part of the embeddable
+    /// API.
+    #[doc(hidden)]
+    pub fn set_prewant_rules(&self, rules: media::prewant::Rules) {
+        self.state.media.set_prewant_rules(rules);
     }
 
     /// [`Self::note_player_opened`] for the torrent `id` resolved to; a
@@ -1929,6 +1989,9 @@ pub async fn run(
     state.http_addr = public_http_addr;
     state.auth_token = Some(Arc::from(cfg.auth.resolve()?));
     state.lan_media = Arc::new(lan_media::LanMedia::new(cfg.lan_media_addr));
+    state.read_memory = Arc::new(media::memory::ReadMemory::load(
+        config_dir.join(media::memory::MEMORY_FILE),
+    ));
     // Where a Drive file's two services are, fixed at the server rather
     // than named per request -- see `routes::drive::DriveEndpoints`. A
     // build whose embedder named no pairing service keeps `None` and

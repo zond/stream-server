@@ -15,8 +15,9 @@
 //! * a cancel is the token, never a command, and every read and seek the
 //!   task makes is raced against it.
 
-use super::Refusal;
+use super::prewant::{Step, Tracker};
 use super::registry::Entry;
+use super::{ReadWait, Refusal};
 use crate::sources::{ByteSource, MemberView, ReadHint, SeekableReader, TorrentSource};
 use crate::translators::session::{Lease, TranslatedSession};
 use bytes::Bytes;
@@ -159,6 +160,67 @@ impl Canceller {
     }
 }
 
+/// **What an id's reader tasks show of their reads**, kept on its registry
+/// entry: which of them is waiting on a read and since when
+/// ([`ReadWait`]), where the viewer's playback was last served to, and the
+/// window a pre-want is asking for. Written by the tasks, read by the
+/// handle's cheap questions; no clock is read here but the one handed in.
+#[derive(Default)]
+pub(crate) struct ReadWatch {
+    /// The reads in flight: the task's number, since when, and where.
+    waiting: std::sync::Mutex<Vec<(u64, std::time::Instant, u64)>>,
+    /// The end of the last read served to a played reader.
+    served: std::sync::Mutex<Option<u64>>,
+    /// The window being pre-wanted now.
+    prewant: Arc<std::sync::Mutex<Option<std::ops::Range<u64>>>>,
+}
+
+/// Numbers the reader tasks, so each can take its own entry out of
+/// [`ReadWatch::waiting`].
+static NEXT_TASK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl ReadWatch {
+    fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn enter(&self, task: u64, now: std::time::Instant, offset: u64) {
+        Self::lock(&self.waiting).push((task, now, offset));
+    }
+
+    fn leave(&self, task: u64) {
+        Self::lock(&self.waiting).retain(|(waiting, ..)| *waiting != task);
+    }
+
+    fn served(&self, end: u64) {
+        *Self::lock(&self.served) = Some(end);
+    }
+
+    /// The oldest wait in flight, as of `now`.
+    pub(crate) fn wait(&self, now: std::time::Instant) -> ReadWait {
+        let waiting = Self::lock(&self.waiting);
+        let Some((_, since, offset)) = waiting.iter().min_by_key(|(_, since, _)| *since) else {
+            return ReadWait::default();
+        };
+        ReadWait {
+            waiting_ms: Some(now.saturating_duration_since(*since).as_millis() as u64),
+            offset: Some(*offset),
+        }
+    }
+
+    /// Where a played reader was last served to.
+    pub(crate) fn last_served(&self) -> Option<u64> {
+        *Self::lock(&self.served)
+    }
+
+    /// The window being pre-wanted now.
+    pub(crate) fn prewanting(&self) -> Option<std::ops::Range<u64>> {
+        Self::lock(&self.prewant).clone()
+    }
+}
+
 fn interrupted() -> io::Error {
     io::Error::new(io::ErrorKind::Interrupted, "the read was cancelled")
 }
@@ -286,11 +348,21 @@ impl Drop for MediaReader {
 /// Open `source` at the top and hand the reader to a task of its own.
 /// Called on the runtime: the registration a torrent's first open makes is
 /// made here, before the caller has its reader.
-pub(crate) async fn open(entry: Lease<Entry>, source: Source) -> Result<MediaReader, Refusal> {
+///
+/// `prewant` is the played torrent reader's pre-want, planned by the
+/// registry, which the task applies as its reads are served (see
+/// [`Tracker`]).
+pub(crate) async fn open(
+    entry: Lease<Entry>,
+    source: Source,
+    prewant: Option<Tracker>,
+) -> Result<MediaReader, Refusal> {
     let reader = source.open(0).await.map_err(|error| refusal_of(&error))?;
     let len = source.bytes().len();
     let shown = Arc::new(Shown::default());
     let task = Task {
+        number: NEXT_TASK.fetch_add(1, Ordering::Relaxed),
+        watch: entry.watch.clone(),
         entry,
         source,
         reader,
@@ -299,6 +371,8 @@ pub(crate) async fn open(entry: Lease<Entry>, source: Source) -> Result<MediaRea
         delivered: 0,
         seeks: 0,
         shown: shown.clone(),
+        prewant,
+        prewanting: None,
     };
     show_buffer(&task.source, &task.shown).await;
     let (commands, received) = mpsc::channel(1);
@@ -329,6 +403,10 @@ pub(crate) fn refusal_of(error: &io::Error) -> Refusal {
 
 /// Everything one open reader holds, owned by its task.
 struct Task {
+    /// This task's number in [`ReadWatch::waiting`].
+    number: u64,
+    /// The entry's [`ReadWatch`], which this task writes.
+    watch: Arc<ReadWatch>,
     /// The registry entry, leased: an id being read is not evicted.
     entry: Lease<Entry>,
     source: Source,
@@ -340,6 +418,12 @@ struct Task {
     /// Reopens, for the close line.
     seeks: u64,
     shown: Arc<Shown>,
+    /// When to ask for the resume point and when to let it go; `None` for
+    /// a reader with nothing to pre-want.
+    prewant: Option<Tracker>,
+    /// The pre-want standing now: dropping the guard cancels the task that
+    /// holds it, which lets the engine's ask go.
+    prewanting: Option<tokio_util::sync::DropGuard>,
 }
 
 impl Task {
@@ -351,13 +435,24 @@ impl Task {
                     // is touched, so every call after a cancel is
                     // `Interrupted` at once -- the stickiness is the token's.
                     self.shown.waiting.store(true, Ordering::SeqCst);
+                    let begin = self.position;
+                    self.watch
+                        .enter(self.number, std::time::Instant::now(), begin);
                     let answer = tokio::select! {
                         biased;
                         () = cancel.cancelled() => Err(interrupted()),
                         read = self.read(max) => read,
                     };
+                    self.watch.leave(self.number);
                     self.shown.waiting.store(false, Ordering::SeqCst);
+                    let end = match &answer {
+                        Ok(bytes) => begin + bytes.len() as u64,
+                        Err(_) => begin,
+                    };
                     let _ = reply.send(answer);
+                    // After the answer: the player has its bytes before
+                    // anything is asked of the swarm on their account.
+                    self.served(begin, end);
                 }
                 Command::Seek { offset, reply } => {
                     // Biased: a cancelled token answers before the source
@@ -386,6 +481,58 @@ impl Task {
             stage = "media_reader_closed",
             "media reader closed"
         );
+    }
+
+    /// A read was served from `begin` to `end`: where the viewer's playback
+    /// has got to, and what the pre-want makes of it.
+    fn served(&mut self, begin: u64, end: u64) {
+        if end <= begin {
+            return;
+        }
+        let Source::Torrent(torrent) = &self.source else {
+            return;
+        };
+        if !torrent.is_played() {
+            return;
+        }
+        self.watch.served(end);
+        let Some(tracker) = self.prewant.as_mut() else {
+            return;
+        };
+        match tracker.served(begin, end) {
+            Step::Stay => {}
+            Step::Start(window) => {
+                let shown = self.watch.prewant.clone();
+                let stop = CancellationToken::new();
+                let Some(asking) = torrent.prewant(window.clone()) else {
+                    return;
+                };
+                let stopped = stop.clone();
+                tokio::spawn(async move {
+                    let Some(held) = asking.await else {
+                        return;
+                    };
+                    *ReadWatch::lock(&shown) = Some(window.clone());
+                    tracing::info!(
+                        start = window.start,
+                        end = window.end,
+                        stage = "prewant_started",
+                        "the head is in: asking for the resume point"
+                    );
+                    stopped.cancelled().await;
+                    drop(held);
+                    *ReadWatch::lock(&shown) = None;
+                    tracing::info!(
+                        start = window.start,
+                        end = window.end,
+                        stage = "prewant_ended",
+                        "the resume point is no longer asked for ahead of the player"
+                    );
+                });
+                self.prewanting = Some(stop.drop_guard());
+            }
+            Step::Stop => self.prewanting = None,
+        }
     }
 
     async fn read(&mut self, max: usize) -> io::Result<Bytes> {
@@ -428,6 +575,9 @@ impl Task {
         self.reader = self.source.open(offset).await?;
         self.position = offset;
         self.seeks += 1;
+        if let Some(tracker) = self.prewant.as_mut() {
+            tracker.seeked();
+        }
         show_buffer(&self.source, &self.shown).await;
         Ok(offset)
     }

@@ -661,6 +661,60 @@ first planned: `GET /cast/{token}/hls/index.m3u8` and `GET /cast/{token}/hls/{n}
 F gets its own design note before it is built; this section fixes only
 what it must not break.
 
+### 2.11 Pre-want: the resume point asked for while the player opens
+
+*(Built 2026-10-05, after the steps above; written against the code.)*
+A torrent film resumed halfway is read three times before its first frame:
+the file's head (the container's header), its index -- wherever the
+container keeps it, which mpv asks for and nothing here guesses -- and the
+data at the resume point. Each used to be fetched only once mpv blocked on
+it: on a weak swarm, measured on a phone, 38 s for the head, 26 s for the
+index at the end, then seconds per piece at 152 s, each in turn.
+
+The resume point is the one the server can know ahead, so a played torrent
+reader asks for it once the head is in, beside the index read:
+
+* **Told, not inferred.** The app states where the playback resumes and,
+  if it knows, how long the film is (`ServerHandle::set_resume(id,
+  ResumeHint)`, before `open_reader`, like `set_buffer`), and where it was
+  when the player left (`note_media_position(id, position)`). The second is
+  remembered per torrent file with the byte the reader was last served to,
+  in `read-positions.json` beside `settings.json` (`media::memory`, the
+  last 64 files).
+* **Where** (`media::prewant::window`): a memory within a minute of the
+  resume time places it -- 48 MiB behind the remembered byte to 16 MiB past
+  it, since mpv's last read was ahead of its picture by its own buffer --
+  moved by the gap in time at the film's rate when the length is known;
+  otherwise the resume time's share of the file, ±3% of the file or ±64
+  MiB, whichever is larger, and never more than ±128 MiB.
+* **When** (`media::prewant::Tracker`): after the first read that delivers
+  a byte. librqbit interleaves every stream's lookahead round robin and has
+  no notion of one stream ranking below another, so asking alongside the
+  head would halve the head's share; asked after it, the window shares with
+  the index read, which the resume point needed next anyway. Ranking it
+  strictly below the player's reads needs a priority on librqbit's streams
+  -- a fork change, not done here.
+* **How** (`Engine::prewant`): a librqbit stream over the window that reads
+  nothing (`TorrentHandle::prefetch`; no `OpenPosition`, so the startup
+  window a client is shown still follows the player), and a promise on the
+  file's entity with no head (`Retention::promise_ahead`), so nothing
+  unlinks a fetched piece before it is read and a pass wants it as it wants
+  what a parked read waits for. It is **not a read**: no stream registered,
+  nothing in `active_streams`, nothing noted. What keeps the torrent running
+  is the player's own hold.
+* **Let go** when the player reads inside the window (its own stream reads
+  ahead from there), when one run of reads -- from an open or a seek --
+  delivers 16 MiB outside it (the player is playing elsewhere: a wrong
+  estimate keeps nothing), and when the reader closes.
+
+**The read-wait readout.** mpv blocked in a `stream_cb` read reports neither
+a stall nor a cache to wait for: its picture stops, and the app used to
+guess from a position that had not moved for five seconds.
+`ServerHandle::media_read_wait(id)` answers, off the reader tasks and with no
+I/O, how long the oldest read of the id still waiting has waited and where
+(`ReadWait`); the player shows its "Buffering from the torrent…" card from
+it.
+
 ## 3. Routes and the contract with the client
 
 **stremio-core sees nothing change.** Every core-protocol route and every
@@ -676,6 +730,7 @@ capability is a method, never a control route):
 | `resolve(&MediaId) -> Result<Resolved, Refusal>` | Adds/finds, probes, sniffs; cached on the entry. |
 | `open_reader(&MediaId, Option<PlayToken>) -> Result<MediaReader, Refusal>` | 2.4. Blocking calls on the reader; never an async API across FFI. |
 | `set_buffer(&MediaId, BufferProfile)` | Applies to the reader's next open. |
+| `set_resume(&MediaId, Option<ResumeHint>)` / `note_media_position(&MediaId, Duration)` / `media_read_wait(&MediaId) -> Result<ReadWait, Refusal>` | 2.11. |
 | `publish(&MediaId, Option<PlayToken>) -> Result<CastToken>` / `unpublish(&CastToken) -> bool` | 2.7. *(Done, step C.)* |
 | `pin(&MediaId) -> Result<DownloadInfo, PinError>` / `unpin(&MediaId, bool) -> UnpinOutcome` | 2.6. |
 | `stream_numbers`, `note_duration`, `note_player_opened`, `note_player_stalled`, `close_streams` | As today, keyed by id. |

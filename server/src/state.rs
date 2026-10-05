@@ -49,6 +49,11 @@ pub struct AppState {
     /// and what resolving each found (`crate::media`). Memory only: a
     /// restart forgets them, and the app registers at open.
     pub(crate) media: crate::media::registry::Registry,
+    /// Where the last play session on each torrent file ended, kept beside
+    /// `settings.json` (`crate::media::memory`): what a resumed film's
+    /// pre-want asks for first. `run` loads it; a hand-built state keeps it
+    /// for the process only.
+    pub(crate) read_memory: Arc<crate::media::memory::ReadMemory>,
     /// Where a Drive file's two services are, or `None` for a server whose
     /// embedder named no pairing service -- which is every server but the
     /// app's, and which refuses a create rather than guessing
@@ -124,6 +129,7 @@ impl AppState {
                 crate::translators::session::SESSION_CAP,
             ),
             media: crate::media::registry::Registry::new(),
+            read_memory: Arc::default(),
             drive: None,
             proxy_streams: Arc::new(crate::proxy_streams::ProxyStreams::new()),
             proxy_cache,
@@ -269,7 +275,7 @@ impl SettingsFile {
 /// Write `bytes` to `path` through a uniquely named temporary file in the
 /// same directory and a rename, so a crash leaves the old file intact and
 /// concurrent writers never see each other's temporary file.
-async fn write_whole(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+pub(crate) async fn write_whole(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;

@@ -48,10 +48,13 @@
 //!   The task holds the pieces of `AppState` it needs; the reader holds
 //!   the runtime's `Handle`.
 
+pub mod memory;
+pub mod prewant;
 pub mod reader;
 pub mod registry;
 mod sniff;
 
+pub use prewant::ResumeHint;
 pub use reader::{Canceller, Command, MediaReader};
 pub use registry::MEDIA_ID_CAP;
 
@@ -157,6 +160,25 @@ pub struct PlayToken {
     /// The read-ahead choice for this playback; settable later with
     /// [`crate::ServerHandle::set_buffer`].
     pub buffer: BufferProfile,
+}
+
+/// **Whether the player is waiting on a read of an id right now**
+/// ([`crate::ServerHandle::media_read_wait`]): what a player shows its
+/// "buffering" card from when its own engine says nothing -- mpv blocked
+/// in a read reports neither a stall nor a cache to wait for, and its
+/// picture simply stops.
+///
+/// Read off the reader tasks, no I/O: cheap enough to poll every half
+/// second. A read served off the disk returns in microseconds, so a wait a
+/// second long is a read parked on a piece the swarm has not delivered.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadWait {
+    /// How long the oldest read still waiting has waited, in milliseconds;
+    /// `None` when no reader of the id is waiting on one.
+    pub waiting_ms: Option<u64>,
+    /// Where in the file that read is.
+    pub offset: Option<u64>,
 }
 
 /// The member a container resolved to: what an archive URL names, or a

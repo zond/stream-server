@@ -16,9 +16,11 @@
 //! nobody reads is, once enough newer ones are registered, and resolving it
 //! then is [`Refusal::UnknownId`] -- which costs the app one `register`.
 
+use super::prewant::{self, ResumeHint, Rules, Tracker};
+use super::reader::ReadWatch;
 use super::reader::{self, MediaReader, Source};
 use super::sniff::{self, Sniffed};
-use super::{GrantSupplier, MediaId, MediaSpec, PlayToken, Refusal, Resolved};
+use super::{GrantSupplier, MediaId, MediaSpec, PlayToken, ReadWait, Refusal, Resolved};
 use crate::routes::archive::{self, ArchiveCreateRequest, Format};
 use crate::routes::compat;
 use crate::sources::held::HeldSource;
@@ -51,6 +53,9 @@ pub(crate) struct Registry {
     /// unsniffed: [`sniff::SNIFF_BOUND`], or what a test set
     /// ([`Registry::set_sniff_bound`]). Milliseconds.
     sniff_bound: Arc<std::sync::atomic::AtomicU64>,
+    /// The numbers the pre-want runs on: [`Rules::default`], or what a
+    /// test set ([`Registry::set_prewant_rules`]).
+    prewant_rules: Arc<std::sync::Mutex<Rules>>,
 }
 
 /// One id: what it names, parsed at registration, and what resolving it
@@ -70,6 +75,13 @@ pub(crate) struct Entry {
     /// a reader opens with this one when there is one, and applies it at
     /// every reopen.
     pub(super) buffer: std::sync::Mutex<Option<BufferProfile>>,
+    /// Where the playback this id is opened for resumes, as
+    /// [`Registry::set_resume`] last stated it: what a played torrent
+    /// reader's pre-want is planned from (`super::prewant`).
+    resume: std::sync::Mutex<Option<ResumeHint>>,
+    /// What this id's reader tasks show of their reads: who is waiting,
+    /// where the player was last served, what is pre-wanted.
+    pub(super) watch: Arc<ReadWatch>,
 }
 
 /// What a spec names, read by the routes' own parsers.
@@ -373,7 +385,24 @@ impl Registry {
             sniff_bound: Arc::new(std::sync::atomic::AtomicU64::new(
                 sniff::SNIFF_BOUND.as_millis() as u64,
             )),
+            prewant_rules: Arc::default(),
         }
+    }
+
+    fn prewant_rules(&self) -> Rules {
+        *self
+            .prewant_rules
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Plan pre-wants with `rules` instead: a test's, so a fixture of a few
+    /// pieces can tell a window from the whole file.
+    pub(crate) fn set_prewant_rules(&self, rules: Rules) {
+        *self
+            .prewant_rules
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = rules;
     }
 
     /// How long `resolve` waits for a file's head before it answers the
@@ -416,6 +445,8 @@ impl Registry {
                 target,
                 resolution: tokio::sync::Mutex::new(None),
                 buffer: std::sync::Mutex::new(None),
+                resume: std::sync::Mutex::new(None),
+                watch: Arc::default(),
             },
         ));
         Ok(id)
@@ -444,6 +475,38 @@ impl Registry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(buffer);
         Ok(())
+    }
+
+    /// Record where the playback `id` is opened for resumes (`None`: from
+    /// the top). Read by the next [`Self::open_reader`] with a play.
+    pub(crate) fn set_resume(&self, id: &MediaId, hint: Option<ResumeHint>) -> Result<(), Refusal> {
+        let entry = self.entry(id)?;
+        *entry
+            .resume
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = hint;
+        Ok(())
+    }
+
+    /// Whether a reader of `id` is waiting on a read now. See [`ReadWait`].
+    pub(crate) fn read_wait(&self, id: &MediaId) -> Result<ReadWait, Refusal> {
+        Ok(self.entry(id)?.watch.wait(std::time::Instant::now()))
+    }
+
+    /// The window a reader of `id` is pre-wanting now, if any: a probe for
+    /// the tests of the pre-want.
+    pub(crate) fn prewanting(&self, id: &MediaId) -> Option<std::ops::Range<u64>> {
+        self.entries.get(id.as_str())?.watch.prewanting()
+    }
+
+    /// The torrent file `id` plays and where a played reader of it was last
+    /// served to: what a play session's end is remembered as
+    /// (`ServerHandle::note_media_position`). `None` for anything but a
+    /// torrent file read as the viewer's playback.
+    pub(crate) fn left_at(&self, id: &MediaId) -> Option<(String, usize, u64)> {
+        let (info_hash, file_idx) = self.torrent_file(id)?;
+        let offset = self.entries.get(id.as_str())?.watch.last_served()?;
+        Some((info_hash, file_idx, offset))
     }
 
     /// What `id` resolved to, if it has been and nothing is resolving it
@@ -558,8 +621,50 @@ impl Registry {
         id: &MediaId,
         play: Option<PlayToken>,
     ) -> Result<MediaReader, Refusal> {
+        let played = play.is_some();
         let (entry, source) = self.open_source(state, id, play).await?;
-        reader::open(entry, source).await
+        let prewant = if played {
+            self.plan_prewant(state, id, &entry, &source)
+        } else {
+            None
+        };
+        reader::open(entry, source, prewant).await
+    }
+
+    /// The pre-want a played torrent reader over `id` is opened with: where
+    /// its playback resumes ([`Self::set_resume`]), against where the last
+    /// session on the file ended (`AppState::read_memory`) or the file's
+    /// length. `None` for anything else, a playback from the top, or one
+    /// with nothing to place a window by.
+    fn plan_prewant(
+        &self,
+        state: &AppState,
+        id: &MediaId,
+        entry: &Entry,
+        source: &Source,
+    ) -> Option<Tracker> {
+        let Source::Torrent(torrent) = source else {
+            return None;
+        };
+        let hint = (*entry
+            .resume
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))?;
+        let (info_hash, file_idx) = self.torrent_file(id)?;
+        let remembered = state.read_memory.recall(&info_hash, file_idx);
+        let rules = self.prewant_rules();
+        let (window, basis) = prewant::window(torrent.len(), hint, remembered, rules)?;
+        tracing::info!(
+            info_hash = %info_hash,
+            file_idx,
+            resume_ms = hint.at_ms,
+            start = window.start,
+            end = window.end,
+            ?basis,
+            stage = "prewant_planned",
+            "a resumed playback will ask for its resume point once the head is in"
+        );
+        Some(Tracker::new(window, rules))
     }
 
     /// A lease on `id`'s entry, so it is not evicted while it is held: what
