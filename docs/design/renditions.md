@@ -943,10 +943,11 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   offset is below `-D` while `D` covers a GOP's leading pictures and its
   reordering (twelve frames at 24 a second), and the film's first sample
   has exactly `-D`: the film's first slot decodes from its sync sample's
-  time (nothing decodes before the film's start), its decode times drawn
-  in by `D` over the slot's span and never after a sample's own
-  presentation time (`first_slot_dts`), so its sync sample's offset is
-  `-D`. FFmpeg reads that sample with the header, before any packet, so
+  time (nothing decodes before the film's start), its decode times its
+  presentation times sorted and moved back by its reordering, never before
+  that first time and never after a sample's own presentation time
+  (`mux::slot_dts`), so its sync sample's offset is `-D`. FFmpeg reads
+  that sample with the header, before any packet, so
   `dts_shift` is `D` from the first packet to the last, whichever slot is
   read first and after any seek, and every picture is shown at its own
   time. The `sidx` labels a slot after the first at its first decode time
@@ -960,6 +961,58 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   -- has no time a fragment can say (`tfdt` counts from nought); it is no
   longer put at nought with the slot's sound a frame late after it, but
   left out (`Cutter`).
+
+  **Decode times only ever increase** (2026-10-05). Each slot stepped
+  its decode times by its frames from its own first one, `D` before its
+  sync sample; with open GOPs a slot holds its GOP's frames less the next
+  GOP's leading pictures (shown before the next sync sample, decoded after
+  it) plus its own, so where the next GOP had fewer than this one the
+  slot's times ran past the next slot's first and decode order went
+  backwards there (the foreman's clip, x265 open GOPs every 2 s: back 7200
+  ticks three times, 3600 once, level once), and where it had more they
+  left a gap. FFmpeg 6.1's own muxer refuses such a file ("non
+  monotonically increasing dts"). The rule now (`mux::slot_dts`): a
+  slot's decode times fill exactly its own span, from its first, `D`
+  before its sync sample, to the next slot's first, `D` before the next
+  sync sample (known from the first sample left over, or the run's next
+  sample). They are the natural times -- presentation times sorted, moved
+  `D` back -- while those fit; when the last would reach the next slot's
+  first, the slot's times from its start (the film's first slot: from its
+  first natural time after its first chunk, so the times FFmpeg guesses a
+  frame rate from are the natural ones as far as they can be) are drawn
+  in towards it in proportion, every step shrunk by one factor, until the
+  last is a step before the next slot's first; and a millisecond (90
+  ticks) at least between any two, where rounding or the first slot's
+  limits meet. In proportion, not shifted: a shift would move the whole
+  shortfall onto the slot's last frames as one squeezed run, and a
+  proportional draw is a function of the slot's samples and the next cut
+  alone, so a slot is the same bytes whichever run makes it. The last slot has no next and keeps
+  its natural times. (A span too short for its samples a millisecond
+  apart would need the next sync sample within a millisecond a sample of
+  this one.) Durations change with it: a slot's are
+  the steps between its decode times, so a GOP with more leading
+  pictures than the next has its frames a few per cent shorter -- 3397
+  to 3531 ticks for 3600 on the foreman's clip -- and a GOP with fewer
+  has them longer. Every packet still shows at its own time: the
+  presentation time is the decode time plus `D` plus the offset, and the
+  offset is written from the decode time placed.
+
+  `D` against the worst case: a sample's offset is its presentation time
+  less its decode time less `D`; spread over a slot, the decode times
+  rise at most to the next slot's first, so an offset falls below `-D`
+  only where a sample is shown more than `D` before the next slot's first
+  decode time and decoded after it -- a GOP with more than `D` of leading
+  pictures and reordering together (12 frames at 24 a second). There the
+  picture degrades, as before, to `dts_shift` growing (late by the
+  excess), never to decode order going backwards: the decode times are
+  placed first and never moved for an offset. The parameter sets say the
+  bound (`sps_max_num_reorder_pics`, `sps_max_latency_increase` in HEVC;
+  `max_num_reorder_frames` in H.264's VUI), but a sync sample's leading
+  pictures are a GOP's choice the parameter sets do not bound, and a `D`
+  that varied with the film would change the slots' labels and the
+  sound's lead with it; a fixed half second covers every encoder default
+  measured (x264 three B-frames, x265 open GOPs with four leading
+  pictures), so it stays fixed.
 
   **Not an edit list.** `edts`/`elst` with `media_time` `D`, every track's
   times `D` ahead, makes FFmpeg's times exact too (it takes `D` off every
@@ -999,9 +1052,25 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   ("exact": every packet the film's, at its time to the 90 kHz tick, and
   so picture and sound exactly as far apart as in the film; packets FFmpeg
   marks to be discarded, a fragment it indexed twice, left out, as a
-  player drops them.) The cost: FFmpeg's guess of the frame rate (from the
-  first slot's decode times, drawn in) is wrong -- `ffprobe` says 50 or 100
-  for a 25 fps film; nothing plays by it. An estimated layout reads whole
+  player drops them.) Decode times strictly increase in every version,
+  the H.264 and HEVC films with GOPs of 50 and 70 and the foreman's
+  open-GOP clip (whose leading pictures go 0, 3, 1, 0, 0, 1, 1, 4, ...)
+  alike; its steps in ticks, read whole: 3600 x448, 3397 x87, 3398 x69,
+  3463 x42, 3531 x39, 2759 x30, 3530 x11, 3462 x9, 14400 x3, 3333 x3,
+  90 x2, and one each of 3420, 2758, 2672, 3396, 3461 and 7200 -- none at
+  nought or below (the 90s are the film's first frames, the 14400s and
+  7200 the clip's own gaps). The cost: FFmpeg's guess of the frame rate.
+  `r_frame_rate` is right again (25 for 25) on the HEVC films and 50 for
+  H.264's; `avg_frame_rate` (FFmpeg 6.1 takes it from the durations of the
+  first fragment read with the header, `mov.c:8674`) is 29.2 on the
+  foreman's clip and 28.8 on the HEVC films, 26.9 for H.264 (it was 33.3
+  at f03138e and 25 before the decode times ran ahead): the film's first
+  sample decodes at its own time, and the B-frames after it may decode no
+  later than they are shown, so the first fragment's frames are squeezed
+  by the film's reordering. Exact would need a decode time before the
+  film's start. Nothing plays by either: Chrome's `FFmpegDemuxer` and
+  `ffmpeg_common.cc` read neither (92.0.4515.159, the TV's, and main
+  today); it takes a packet's duration, which is the step to the next. An estimated layout reads whole
   exactly too; a seek back after reading still walks, as before (*A slot
   opens with its `moof`*, above: open).
 * **Prepared before the load** (2026-10-04). zond's phone cast an HEVC

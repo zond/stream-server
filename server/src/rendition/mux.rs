@@ -1040,21 +1040,15 @@ fn lay_video(samples: &[MuxSample], next_pts: Option<i64>, hevc: bool, first_slo
     // first sample -- its sync sample, at its label -- decodes `D` before
     // it is shown, and every other with them; none is after its own
     // presentation time while `D` covers the leading pictures and the
-    // reordering. The film's first slot begins decoding at its first
-    // sample's presentation time instead ([`first_slot_dts`]).
+    // reordering ([`slot_dts`]: inside the slot's own span).
     let mut sorted = pts.clone();
     sorted.sort_unstable();
     let lead = match (pts.first(), sorted.first()) {
         (Some(first), Some(earliest)) => first - earliest,
         _ => 0,
     };
-    let next = next_pts.map(|pts| ticks(pts, VIDEO_TIMESCALE) as i64);
-    let dts: Vec<i64> = if first_slot {
-        first_slot_dts(&pts, &sorted, next.map(|next| (next, next - ahead)))
-    } else {
-        sorted.iter().map(|at| at + lead - ahead).collect()
-    };
-    let next = next.map(|next| next - ahead);
+    let next = next_pts.map(|pts| ticks(pts, VIDEO_TIMESCALE) as i64 - ahead);
+    let dts = slot_dts(&pts, &sorted, lead, ahead, first_slot, next);
     let mut entries = Vec::with_capacity(samples.len());
     let mut data = Vec::with_capacity(samples.len());
     let mut last_duration = i64::from(VIDEO_TIMESCALE / 25);
@@ -1087,46 +1081,114 @@ fn lay_video(samples: &[MuxSample], next_pts: Option<i64>, hevc: bool, first_slo
     )
 }
 
-/// **The film's first slot's decode times**: from its first sample's
-/// presentation time (nothing decodes before the film starts, and that
-/// sample's offset of exactly `-D` is what sets FFmpeg's `dts_shift` to `D`
-/// when it reads the header) to `D` before the next slot's sync sample,
-/// where the next slot's begin (`next`: that sample's presentation time and
-/// its decode time). The presentation times sorted, drawn in by the slot's
-/// span less `D` over its span, and never after a sample's own
-/// presentation time nor after any presentation time still to be decoded
-/// (a B-frame shown before the P-frame decoded ahead of it), one tick
-/// apart where those meet.
-fn first_slot_dts(pts: &[i64], sorted: &[i64], next: Option<(i64, i64)>) -> Vec<i64> {
-    let Some(&start) = sorted.first() else {
+/// **A slot's decode times**, strictly increasing and inside the slot's
+/// own span: from its first decode time -- its sync sample's presentation
+/// time less `D` (`ahead`), or for the film's first slot that time itself
+/// (nothing decodes before the film starts) -- to before `end`, the next
+/// slot's first decode time (its sync sample's presentation time less `D`,
+/// which the layout's cuts give, whatever run makes which slot).
+///
+/// **The rule.** The natural times: the presentation times sorted, moved
+/// so that the first is the slot's first decode time -- one frame apart
+/// where the frames are. They fit while the last is before `end`, and are
+/// kept (the last sample lasts to `end`). They do not fit when the slot
+/// has more samples than frames between its first decode time and the
+/// next slot's: an open GOP whose leading pictures outnumber the next
+/// GOP's (x265 varies them), or the film's first slot, which begins `D`
+/// later than the rest would have it begin. Then the times past a pivot
+/// are drawn in towards it in proportion -- each keeps its share of the
+/// distance from the pivot, so the steps all shrink by one factor -- until
+/// the last is a mean step before `end`:
+/// the pivot is the slot's first decode time, or for the film's first
+/// slot its first chunk's end ([`CHUNK_US`] later), so that the first
+/// `moof` FFmpeg reads -- with the header, the one it takes its average
+/// frame rate from -- keeps the natural steps. Drawn in, a time is earlier
+/// than natural, never later, so no sample decodes later than it would
+/// have; a millisecond apart at least ([`MIN_STEP`]) where rounding or the
+/// first slot's limits below meet.
+///
+/// The film's first slot's natural times are its sorted presentation times
+/// moved back by its reordering, never before its first sample's time (the
+/// first few a millisecond apart from there): none is after its own
+/// sample's presentation time, and its first sample's offset is exactly
+/// `-D`, which is what sets FFmpeg's `dts_shift` to `D` when it reads the
+/// header. A later slot is not held
+/// to that: while `D` covers its leading pictures and its reordering its
+/// times are before its presentation times anyway, and when it does not
+/// the picture is shown late (FFmpeg's `dts_shift` grows) -- never are the
+/// times out of order.
+fn slot_dts(
+    pts: &[i64],
+    sorted: &[i64],
+    lead: i64,
+    ahead: i64,
+    first_slot: bool,
+    end: Option<i64>,
+) -> Vec<i64> {
+    let count = sorted.len();
+    if count == 0 {
         return Vec::new();
-    };
-    let drawn = |at: i64| -> i64 {
-        match next {
-            Some((shown, decoded)) if shown > start && decoded > start => {
-                start
-                    + ((at - start) as i128 * (decoded - start) as i128 / (shown - start) as i128)
-                        as i64
-            }
-            _ => at,
-        }
-    };
-    // The latest each sample may decode at: before every presentation
-    // time from it on, a tick apart where they meet.
-    let mut caps = vec![0i64; pts.len()];
-    let mut least = i64::MAX;
-    for at in (0..pts.len()).rev() {
-        least = least
-            .min(pts[at])
-            .min(caps.get(at + 1).map_or(i64::MAX, |cap| cap - 1));
-        caps[at] = least;
     }
-    sorted
-        .iter()
-        .zip(&caps)
-        .map(|(at, cap)| drawn(*at).min(*cap))
-        .collect()
+    let mut dts: Vec<i64> = if first_slot {
+        // The film's first slot: the sorted times moved back by its
+        // reordering (the most any is after its own sample's presentation
+        // time), so none is after its presentation time and the steps stay
+        // a frame -- what FFmpeg guesses the frame rate from -- but never
+        // before the first sample's time (the first few then a millisecond
+        // apart from there, below).
+        let reorder = sorted
+            .iter()
+            .zip(pts)
+            .map(|(at, shown)| at + lead - shown)
+            .max()
+            .unwrap_or(0)
+            .max(0);
+        sorted
+            .iter()
+            .map(|time| (time + lead - reorder).max(pts[0]))
+            .collect()
+    } else {
+        sorted.iter().map(|at| at + lead - ahead).collect()
+    };
+    let start = dts[0];
+    if let Some(end) = end
+        && dts[count - 1] >= end
+        && end > start
+    {
+        // The first chunk's end: the first natural time at or after it,
+        // which keeps its own time, so the first chunk's durations add up
+        // to its frames' -- no later than halfway to `end`.
+        let chunk_end = start + ticks(CHUNK_US, VIDEO_TIMESCALE) as i64;
+        let pivot = if first_slot {
+            let at = dts.partition_point(|at| *at < chunk_end);
+            dts.get(at)
+                .copied()
+                .unwrap_or(chunk_end)
+                .min(start + (end - start) / 2)
+        } else {
+            start
+        };
+        let from = dts.partition_point(|at| *at < pivot);
+        let last = dts[count - 1];
+        if from < count && last > pivot {
+            let room = end - pivot;
+            let step = room / (count - from + 1) as i64;
+            let span = (room - step) as i128;
+            let natural = (last - pivot) as i128;
+            for at in &mut dts[from..] {
+                *at = pivot + ((*at - pivot) as i128 * span / natural) as i64;
+            }
+        }
+    }
+    for at in 1..count {
+        dts[at] = dts[at].max(dts[at - 1] + MIN_STEP);
+    }
+    dts
 }
+
+/// The least two decode times are apart: a millisecond, so that times
+/// read in milliseconds still rise (90 ticks of the 90 kHz clock).
+const MIN_STEP: i64 = 90;
 
 fn lay_audio(
     track_id: u32,
@@ -2066,5 +2128,126 @@ mod tests {
             "sound decodes when it is shown"
         );
         assert_eq!(formats.decode_ahead_us(), DECODE_AHEAD_US);
+    }
+    /// **Decode times only ever increase, across every slot, whatever the
+    /// leading pictures** -- modelled, so it holds on every CI job. An
+    /// open-GOP film of four slots, a second a GOP, whose GOPs have 0, 3,
+    /// 1 and 4 leading pictures (shown before their sync sample, decoded
+    /// after it, so each slot holds its GOP's frames less the next GOP's
+    /// leading pictures, plus its own): each slot's decode times begin `D`
+    /// before its sync sample and end before the next slot's begin, every
+    /// one after the one before -- and FFmpeg still shows every picture at
+    /// its time, `dts_shift` `D` throughout. Stepped by the frames from
+    /// each slot's own beginning, the slot of 3 ran 2 frames past the next
+    /// slot's beginning, and the one of 4 left a gap.
+    #[test]
+    fn decode_times_increase_across_slots_whatever_the_leading_pictures() {
+        let formats = Formats {
+            video: Some(TrackFormat::H264 {
+                width: 320,
+                height: 240,
+                csd0: Bytes::from_static(X264_SPS),
+                csd1: Bytes::from_static(X264_PPS),
+            }),
+            audio: None,
+        };
+        let frame = 40_000i64;
+        let leading = [0i64, 3, 1, 4];
+        let key = |k: usize| k as i64 * 25 * frame;
+        let slots: Vec<Vec<MuxSample>> = (0..4)
+            .map(|k| {
+                let mut order = vec![key(k)];
+                // The leading pictures, latest first (as x265 decodes them).
+                order.extend((1..=leading[k]).rev().map(|n| key(k) - n * frame));
+                let next_leading = leading.get(k + 1).copied().unwrap_or(0);
+                order.extend((1..25 - next_leading).map(|n| key(k) + n * frame));
+                order
+                    .iter()
+                    .enumerate()
+                    .map(|(at, pts)| sample(*pts, at == 0))
+                    .collect()
+            })
+            .collect();
+        let ahead = DECODE_AHEAD_US * 9 / 100;
+        let mut shift = 0;
+        let mut last = i64::MIN;
+        for (k, samples) in slots.iter().enumerate() {
+            let next = (k < 3).then(|| key(k + 1));
+            let fragment = media_segment(&formats, k as u64, true, samples, next, &[], None);
+            let timed = timed(&fragment);
+            let first = if k == 0 {
+                key(0) * 9 / 100
+            } else {
+                key(k) * 9 / 100 - ahead
+            };
+            assert_eq!(timed[0].1, first, "slot {k} begins at its label");
+            for ((_, dts, offset, _), sample) in timed.iter().zip(samples) {
+                assert!(*dts > last, "slot {k}: decode time {dts} after {last}");
+                last = *dts;
+                if let Some(next) = next {
+                    assert!(
+                        *dts < next * 9 / 100 - ahead,
+                        "slot {k}: before the next slot's"
+                    );
+                }
+                shift = i64::max(shift, -offset);
+                assert_eq!(shift, ahead, "slot {k}: dts_shift is D");
+                assert_eq!(
+                    dts + shift + offset,
+                    sample.pts_us * 9 / 100,
+                    "slot {k}: shown at its time"
+                );
+            }
+        }
+    }
+    /// **The film's first slot**: its first sample decodes at its own time,
+    /// no sample after its own presentation time, any two a millisecond
+    /// apart at least -- and its first chunk keeps whole frames' steps once
+    /// past the reordering, though the slot is drawn in by `D` to meet the
+    /// next. A film starting at 21 ms with x264's B-frames (I0 P3 B1 B2
+    /// ...), the next sync sample at 2 s. Stepped by a tick, two decode
+    /// times read in milliseconds were equal and FFmpeg's muxer refused
+    /// them ("4 >= 4"); drawn in from the start, the first chunk's frame
+    /// rate read high.
+    #[test]
+    fn the_first_slot_decodes_from_its_first_sample_at_whole_steps() {
+        let frame = 3600i64;
+        let first = 1890i64;
+        // Decode order: the key, then each mini-GOP's P before its B-frames.
+        let mut order = vec![0i64];
+        for group in 0..16 {
+            let base = group * 3;
+            order.extend([base + 3, base + 1, base + 2]);
+        }
+        let pts: Vec<i64> = order.iter().map(|n| first + n * frame).collect();
+        let mut sorted = pts.clone();
+        sorted.sort_unstable();
+        let ahead = 45_000;
+        let next = first + 50 * frame;
+        let dts = slot_dts(&pts, &sorted, 0, ahead, true, Some(next - ahead));
+        assert_eq!(dts[0], pts[0], "the first sample decodes at its own time");
+        for (at, (decode, shown)) in dts.iter().zip(&pts).enumerate() {
+            assert!(
+                decode <= shown,
+                "sample {at}: decoded at {decode}, shown at {shown}"
+            );
+        }
+        for (at, pair) in dts.windows(2).enumerate() {
+            assert!(pair[1] - pair[0] >= 90, "sample {}: {pair:?}", at + 1);
+        }
+        assert!(
+            *dts.last().unwrap() < next - ahead,
+            "before the next slot's first"
+        );
+        // Past the reordering (two frames), the first chunk's half second
+        // steps a whole frame.
+        let chunk = CHUNK_US * 9 / 100;
+        let steps: Vec<i64> = dts
+            .windows(2)
+            .filter(|pair| pair[1] < dts[0] + chunk)
+            .map(|pair| pair[1] - pair[0])
+            .collect();
+        assert!(steps.len() >= 10, "{steps:?}");
+        assert!(steps[3..].iter().all(|step| *step == frame), "{steps:?}");
     }
 }

@@ -43,6 +43,11 @@ pub enum Look {
     /// second, `ultrafast`; H.264 with two B-frames, or HEVC Main 10 tagged
     /// HDR10 with three B-frames and x265's open GOPs. No bitrate.
     App,
+    /// The foreman's open-GOP clip: `testsrc2` at 1280x720, 25 frames a
+    /// second, x265 at its default preset with open GOPs -- whose number
+    /// of leading pictures varies from GOP to GOP (0, 3, 1, 0, 0, 1, 1, 4,
+    /// ... measured). HEVC only; no bitrate.
+    OpenGop,
 }
 
 /// What to encode.
@@ -232,6 +237,7 @@ impl Film {
         let source = match recipe.look {
             Look::Noise => "testsrc2=size=640x360:rate=24,noise=alls=60:allf=t",
             Look::App => "testsrc=size=320x240:rate=25",
+            Look::OpenGop => "testsrc2=size=1280x720:rate=25",
         };
         let kbps = recipe.kbps.to_string();
         let gop = recipe.gop.to_string();
@@ -308,6 +314,19 @@ impl Film {
                     "2",
                 ]);
             }
+            (Picture::Hevc, Look::OpenGop) => {
+                command.args([
+                    "-c:v",
+                    "libx265",
+                    "-tag:v",
+                    "hvc1",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-x265-params",
+                    &format!("keyint={gop}:min-keyint={gop}:open-gop=1:log-level=error"),
+                ]);
+            }
+            (Picture::H264, Look::OpenGop) => anyhow::bail!("the open-GOP clip is HEVC"),
             (Picture::Hevc, Look::App) => {
                 command.args([
                     "-c:v",
@@ -416,6 +435,26 @@ impl Film {
             audio,
             duration_ms,
         })
+    }
+
+    /// How many leading pictures each GOP has: the samples after its sync
+    /// sample in decode order shown before it.
+    pub fn leading_pictures(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut key = None;
+        for packet in self
+            .packets
+            .iter()
+            .filter(|packet| packet.track == TrackKind::Video)
+        {
+            if packet.key {
+                out.push(0);
+                key = Some(packet.pts_us);
+            } else if key.is_some_and(|key| packet.pts_us < key) {
+                *out.last_mut().unwrap() += 1;
+            }
+        }
+        out
     }
 
     /// The video's sync samples, where the file has them.

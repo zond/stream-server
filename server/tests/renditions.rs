@@ -858,9 +858,11 @@ fn without_an_index_the_slots_are_estimated() -> anyhow::Result<()> {
             scaled(k + 1) - scaled(k) + 8 * 1024 + chunk_room(T_US),
             "slot {k}"
         );
-        // A GOP late (10 s), at the film's end at the latest: the first
-        // slot to the end, the rest none.
-        assert_eq!(*duration, if k == 0 { 900_000 } else { 0 }, "slot {k}");
+        // A GOP late (10 s), at the film's end at the latest -- short of it
+        // by a tick a slot still to come, so no slot's first part lasts
+        // nothing: the first slot to the end less nine ticks, the rest a
+        // tick each.
+        assert_eq!(*duration, if k == 0 { 900_000 - 9 } else { 1 }, "slot {k}");
     }
     // The sound's labels are each cut less its lead (564 ms: `D` and 64 ms),
     // not a GOP late: the slot FFmpeg picks for the sound by the picture's

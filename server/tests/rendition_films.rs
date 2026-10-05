@@ -752,6 +752,93 @@ fn an_estimated_layout_shows_every_sample_at_its_time() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The video packets' decode times `ffprobe` reads from `path`, in ticks
+/// of the 90 kHz clock, in the order it reads them, with their durations.
+fn video_decode_times(path: &str) -> anyhow::Result<Vec<(i64, i64)>> {
+    let output = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v", "-of", "csv=p=0"])
+        .args(["-show_entries", "packet=dts,duration,flags", path])
+        .output()?;
+    anyhow::ensure!(output.status.success(), "ffprobe failed");
+    let mut out = Vec::new();
+    for line in String::from_utf8(output.stdout)?.lines() {
+        let fields: Vec<&str> = line.split(',').collect();
+        let [dts, duration, flags, ..] = fields[..] else {
+            continue;
+        };
+        if flags.contains('D') {
+            continue;
+        }
+        out.push((dts.parse()?, duration.parse()?));
+    }
+    Ok(out)
+}
+
+/// **Decode times only ever increase, across every slot and every chunk**
+/// -- the foreman's open-GOP clip (`testsrc2` 1280x720, x265 with open
+/// GOPs every 2 s, whose leading pictures vary: 0, 3, 1, 0, 0, 1, 1, 4,
+/// ...), in 6 s segments, read whole by `ffprobe`: every packet's decode
+/// time after the one before's, every duration above nought, and every
+/// packet of picture and sound the film's at its time. A slot whose GOP
+/// has more leading pictures than the next has more samples than frames
+/// between its first decode time and the next slot's; stepped by the
+/// frames' durations from its own first decode time its times ran past the
+/// next slot's -- back 7200 ticks at the boundaries of that clip.
+#[test]
+fn decode_times_only_ever_increase() -> anyhow::Result<()> {
+    if !film_producer::tools_for(Picture::Hevc, "decode_times_only_ever_increase") {
+        return Ok(());
+    }
+    let fixture = Fixture::start(
+        Recipe {
+            picture: Picture::Hevc,
+            look: Look::OpenGop,
+            seconds: 30,
+            kbps: 0,
+            gop: 50,
+            sample_rate: 48_000,
+        },
+        RenditionTuning::default(),
+    )?;
+    let leading = fixture.film.leading_pictures();
+    assert!(
+        leading.windows(2).any(|pair| pair[0] > pair[1])
+            && leading.windows(2).any(|pair| pair[0] < pair[1]),
+        "the film's leading pictures must vary both ways: {leading:?}"
+    );
+    let token = fixture.publish()?;
+    let file = fixture.get(&token, None)?;
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("rendition.mp4");
+    std::fs::write(&path, &file)?;
+    let path = path.to_str().unwrap();
+    let times = video_decode_times(path)?;
+    for (at, pair) in times.windows(2).enumerate() {
+        assert!(
+            pair[1].0 > pair[0].0,
+            "packet {}: decode time {:?} after {:?}",
+            at + 1,
+            pair[1],
+            pair[0]
+        );
+    }
+    assert!(
+        times.iter().all(|(_, duration)| *duration > 0),
+        "a duration of nought"
+    );
+    let read = read_packets(path, None)?;
+    for track in [TrackKind::Video, TrackKind::Audio] {
+        let film = in_decode_order(&fixture.film, track);
+        assert_eq!(
+            of_track(&read, track).len(),
+            film.len(),
+            "{track:?} packets"
+        );
+        assert_run(&of_track(&read, track), &film, &format!("{track:?}"));
+    }
+    Ok(())
+}
+
 /// **By hand**: a rendition of a film written to `RENDITION_FILM_DUMP` for
 /// FFmpeg probes of other versions (`docs/design/renditions.md`).
 #[test]
@@ -767,6 +854,7 @@ fn dump_a_film_rendition() -> anyhow::Result<()> {
             picture,
             look: match std::env::var("RENDITION_FILM_LOOK").as_deref() {
                 Ok("app") => Look::App,
+                Ok("open") => Look::OpenGop,
                 _ => Look::Noise,
             },
             seconds: std::env::var("RENDITION_FILM_SECONDS").map_or(Ok(60), |s| s.parse())?,

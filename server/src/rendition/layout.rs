@@ -351,7 +351,13 @@ impl Layout {
                                 .saturating_sub(ahead_us),
                             timescale,
                         )
-                        .clamp(earliest, end)
+                        // Short of the film's end by a tick a slot still to
+                        // come, so every slot's first part lasts something:
+                        // only a slot's rest lasts nothing.
+                        .clamp(
+                            earliest,
+                            end.saturating_sub((count - k) as u64).max(earliest),
+                        )
                     }
                 })
                 .collect();
@@ -777,8 +783,9 @@ mod tests {
         let durations: Vec<u32> = (0..5).map(|k| u32_at(sidx, 40 + 2 * k * 12 + 4)).collect();
         // A GOP late less the half second its decode times run ahead (`D`):
         // slot 0 from 0 to 15.5 s, slot 1 from 15.5 to 21.5, ..., slot 3
-        // from 27.5 to the end at 30, slot 4 from the end.
-        assert_eq!(durations, vec![15_500, 6_000, 6_000, 2_500, 0]);
+        // from 27.5 to the end at 30 less a tick, slot 4 that last tick --
+        // a slot's first part never lasts nothing, which marks its rest.
+        assert_eq!(durations, vec![15_500, 6_000, 6_000, 2_499, 1]);
         let mirrored = Plan::new(
             Some(&[entry(0, 0), entry(6 * T + 40_000, 500), entry(12 * T, 900)]),
             1_000,
