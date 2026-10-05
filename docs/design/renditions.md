@@ -669,9 +669,12 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   libavformat's index (Matroska cues, an MP4's sample tables, an AVI's
   `idx1`), refined for Matroska with each cue's `CueRelativePosition` --
   when the job asks for them (`Job::wants_index`, the first run only).
-  Segment `k` is cut at the first indexed sync sample at or after `k x T`
-  (each a different one: a GOP longer than `T` makes one segment, not an
-  empty one), and slot `k` is the source's bytes from that sync sample to
+  Segment `k` is cut at the first indexed sync sample at or after
+  `k` seconds (`layout::MIRROR_GRID_US`; each a different one: a GOP
+  longer than a second makes one segment, not an empty one -- so **a slot
+  per sync sample** for any film whose sync samples are a second or more
+  apart, and the spec's `T` is not used: *A slot per sync sample*, below),
+  and slot `k` is the source's bytes from that sync sample to
   the next segment's -- the same samples, so about the same bytes -- plus
   **headroom**, 8 KiB and a 64th of the span: a fragment carries a `moof`
   where a Matroska cluster carries a few bytes per block, and an MP4
@@ -854,6 +857,74 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   leaves the container's start at zero) has that frame put at zero, and
   the first slot's sound runs a frame late from there; later slots are on
   time (`rendition_films.rs` pins it).
+* **A slot per sync sample** (2026-10-05). Chunked, the slots regressed
+  where a seek lands: the app's test film (6 minutes of `testsrc`, a key
+  every 2.8 s, HEVC Main 10 HDR10 with x265's open GOPs; xtremio
+  `rust/tests/support/film.rs`) in 6 s segments had `ffprobe -read_intervals
+  300%+#1` land at 288.4 s instead of the key at 299.6 s. Two things:
+  * **A seek lands at a slot's start.** FFmpeg's demuxer knows the sync
+    samples of the fragments it has read. A seek picks the slot by its
+    `sidx` label (`mov_seek_fragment`), reads that slot's first `moof`, and
+    takes the last sync sample at or before the target among what it knows
+    (`av_index_search_timestamp`). With one `moof` per slot it knew every
+    key of the slot; with a `moof` per half second it knows the first
+    chunk's only, which holds the slot's first key -- so a slot of two or
+    three GOPs is landed at its start, up to a slot early. Measured with
+    libavformat 4.4, 6.1 and master as Chrome drives it (the `ff7`
+    harness), on H.264 (closed GOPs) and HEVC (open), keys every 6, 3, 2
+    and 2.8 s in 6 s segments (one, two, three and two or three GOPs a
+    slot), seeks to 300, 100, 250, 330 and 43 s alone and in turn after
+    reading 16 s: one-GOP slots land on the key before the target in every
+    version, multi-GOP slots at the slot's start (2 to 5.6 s early) in
+    every version.
+  * **With open GOPs, FFmpeg 5.0 and later go a slot further back.** The
+    decode times were the presentation times sorted, so a slot of an open
+    GOP began, in decode time, at its first leading picture -- shown
+    before the sync sample, decoded after it -- a frame or three before
+    the slot's label. FFmpeg 4.4 times a slot's first `moof` by its label
+    (the at-label rule above) and never saw this; 5.0 and later time it by
+    its `tfdt`. `mov_read_seek` then seeks the sound to the sync sample's
+    decode time, which by the labels is in the slot before
+    (`search_frag_timestamp` finds the sound's fragment by the picture's
+    `sidx` times), reads that slot, and 6.1 lands the picture there too:
+    one slot back for one-GOP slots, the slot before the one holding the
+    target for multi-GOP slots (288.4 s for 5:00). Master lands the
+    picture right but went wrong otherwise (a film with a key every 3 s
+    landed at the film's start). Not the TV's 4.4: there it lands as the
+    one-`moof` slots did. Not `dts_shift` either: that moves the seek's
+    time back a frame or two, this moves the sound's fragment.
+
+  So **a mirrored layout cuts a slot at every sync sample a second or more
+  apart** (`MIRROR_GRID_US`: the first at or after each second; a film
+  over 18 hours on a wider grid, to stay inside the `sidx`'s 65535
+  references), whatever the spec's segment length -- which now only sets
+  an estimated layout's grid -- and **a slot's decode times start at its
+  first sample's presentation time** (the sorted times moved on by the
+  leading pictures' span; nothing moves for a closed GOP). A seek's first
+  chunk is then the key before the target. Measured on the same matrix:
+  every seek in every version, H.264 and HEVC, lands on the last key at
+  or before its target; `ffprobe` on the app's film lands 5:00 at 299.7 s
+  in 2 requests (HEVC; 299.6 s, H.264), `ffmpeg -ss 60` makes 2 requests,
+  and the seek list 100, 250, 330, 43, 30 lands each on its key. What the
+  alternatives do: a `moof` per GOP in six-second slots changes nothing
+  (only the slot's first `moof` is read); a second level of `sidx`
+  (reference type 1) is refused by 4.4 (`avpriv_request_sample`,
+  `AVERROR_PATCHWELCOME`); an `mfra`/`tfra` is not read by 4.4 unless
+  asked for (`use_mfra_for`) nor by 6.x; per-slot indexes elsewhere are
+  read by nothing. More `sidx` references are what a demuxer reads.
+
+  The costs, counted: a slot is a GOP, two to ten seconds, so the
+  `sidx` has a reference per GOP (a two-hour film with 2 s GOPs: 3600,
+  43 KB of header); what counted slots now counts time -- the lookahead
+  is the slots beginning within 12 s of the last asked
+  (`LOOKAHEAD_TIME`, two slots at least: it was two six-second segments)
+  and a preparation is the 12 s before the start and the 6 s after
+  (`PREPARED_BEFORE`, `PREPARED_AFTER`). The ring's cap is bytes and
+  unchanged. With open GOPs, FFmpeg shows the picture late by the
+  leading pictures as well as the reordering (`dts_shift` is the largest
+  negative composition offset read so far) -- what 4.4 showed of a slot's
+  first `moof` anyway; 6.1 now shows the same times as 4.4 (keys at
+  2.92 s, 5.72 s, ... of the app's film in both).
 * **Prepared before the load** (2026-10-04). zond's phone cast an HEVC
   Matroska film from a torrent with one or two peers: the first piece took
   38 s and the last (the Cues) 26 s before the first run could fix the
@@ -902,18 +973,19 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   FFmpeg shows a fragment's video `dts_shift` late; not done.)
 
   So the preparation makes the slot for the start
-  (`Layout::slot_for_time`) and, zond's decision, **the two slots before
-  it and the one after** (`PREPARED_BEFORE`, `PREPARED_AFTER`), the
-  film's ends permitting: slot 0, then the earliest of them -- a run
-  started there -- and the rest in order, which that run makes as it reads
-  on, so whichever of the three up to the start the receiver asks first
-  is in the ring, and the one after is a slot in hand. A first request
+  (`Layout::slot_for_time`) and, zond's decision, **the slots of the 12 s
+  before it and of the 6 s after** (`PREPARED_BEFORE`, `PREPARED_AFTER`;
+  two six-second segments before and one after, when slots were
+  segments), the film's ends permitting: slot 0, then the earliest of
+  them -- a run started there -- and the rest in order, which that run
+  makes as it reads on, so whichever slot up to the start the receiver
+  asks first is in the ring, and the ones after are film in hand. A first request
   for any of them starts no run: it is answered from the ring and moves
   the run that made them back to it (`RunSlot::covers`,
   `Inner::note_request`), and its lookahead from there. The ring's cap
   is unchanged: slot 0 with its run's lookahead and the prepared slots
-  with theirs are nine slots, which fit 96 MiB up to some 10 MB a slot
-  (zond's 8 Mbit/s film's are 7.6 MB); past that the slots farthest from
+  with theirs are some 42 s of film, which fit 96 MiB up to some
+  18 Mbit/s (zond's film is 8); past that the slots farthest from
   the last one asked -- the earliest prepared -- go first, and a receiver
   asking for one starts a run there, as before. (The same
   investigation found the torrent stopped under the cast once anything else
@@ -952,7 +1024,7 @@ reading of step C holds unchanged.
 | `install_producer(Arc<dyn Producer>)` | Once, by the embedder. Without one, `publish_rendition` refuses `noProducer`. |
 | `publish_rendition(&MediaId, RenditionSpec, Option<PlayToken>) -> anyhow::Result<CastToken>` | As `publish`: refused while the listener is down; holds the id's lease; writes the playlist. Starts no run: the receiver's first request does. |
 | `rendition_state(&CastToken) -> Option<RenditionState>` | `{ producing, segmentsServed, speed, failed: Option<{refused, message}> }`. Cheap, no runtime hop, safe to poll. |
-| `prepare_rendition(&CastToken) -> bool` | Starts the first run and makes the receiver's first slots with no request -- slot 0, the start's, the two before it and the one after (§2.8, *Prepared before the load*). |
+| `prepare_rendition(&CastToken) -> bool` | Starts the first run and makes the receiver's first slots with no request -- slot 0, and the slots of the 12 s before the start to the 6 s after (§2.8, *Prepared before the load*). |
 | `rendition_readiness(&CastToken) -> RenditionReadiness` | `index`, `start`, `ready`, `failed{sentence}` or `ended`. Cheap, safe to poll. |
 | `unpublish(&CastToken) -> bool` | Unchanged; for a rendition it also drops the run and the ring (2.1). |
 

@@ -2,8 +2,8 @@
 //! the reader, hands the producer its [`Job`], and takes the samples off
 //! the sink's channel -- applying the cut rule ([`Cutter`]), muxing each
 //! segment as it completes and putting it in the ring -- while it judges
-//! the run's speed, stops taking samples once [`LOOKAHEAD`](super::LOOKAHEAD) segments are
-//! ahead of the last request, and lets the run go when it has been idle for
+//! the run's speed, stops taking samples once its lookahead
+//! ([`LOOKAHEAD_TIME`](super::LOOKAHEAD_TIME)) is made past the last request, and lets the run go when it has been idle for
 //! the release period. Dropping the task's channel is what makes the sink
 //! answer [`super::Stopped`]; cancelling the reader is what wakes a
 //! producer parked in a read.

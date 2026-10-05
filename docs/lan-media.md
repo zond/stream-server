@@ -67,7 +67,7 @@ it is refused with `noProducer` until the embedder has called
 
 | Path | Answers |
 |---|---|
-| `GET /cast/{token}/stream.mp4` | `video/mp4`, `Cache-Control: no-store`, a `Content-Length` and `Accept-Ranges: bytes`, with the range framing every media route shares (`200`, `206` with `Content-Range`, `416` naming the length): **a file whose every byte is fixed before it is made** -- the header (`ftyp` + `moov` + `sidx`), then one slot per segment, each that segment's fragment -- a `styp` unless the slot opens at its `sidx` label, then a `moof` + `mdat` per half second, the picture and then the sound beside it -- padded with a `free` box to the slot's end. Waits for the first run's formats and the source's index, which fix the length. A range that begins in a slot waits for that slot's fragment before it answers, so a rendition that cannot make it is `503` `{"refused":"renditionFailed","message":...}` (or `{"refused":"unpublished"}` for one the unpublish woke); a range that begins in the header answers at once. After that, a failure or the cut breaks the body with an error. Nothing times it out |
+| `GET /cast/{token}/stream.mp4` | `video/mp4`, `Cache-Control: no-store`, a `Content-Length` and `Accept-Ranges: bytes`, with the range framing every media route shares (`200`, `206` with `Content-Range`, `416` naming the length): **a file whose every byte is fixed before it is made** -- the header (`ftyp` + `moov` + `sidx`), then one slot per segment -- per sync sample when the source has an index, a segment of `segmentMs` estimated when it has none -- each that segment's fragment -- a `styp` unless the slot opens at its `sidx` label, then a `moof` + `mdat` per half second, the picture and then the sound beside it -- padded with a `free` box to the slot's end. Waits for the first run's formats and the source's index, which fix the length. A range that begins in a slot waits for that slot's fragment before it answers, so a rendition that cannot make it is `503` `{"refused":"renditionFailed","message":...}` (or `{"refused":"unpublished"}` for one the unpublish woke); a range that begins in the header answers at once. After that, a failure or the cut breaks the body with an error. Nothing times it out |
 | `HEAD /cast/{token}/stream.mp4` | The same headers; waits for the length as a `GET` does (starting the first run) |
 
 **The receiver seeks by bytes.** The init segment carries the film's
@@ -125,9 +125,10 @@ behind a thin swarm it took a minute. So `ServerHandle::prepare_rendition(&CastT
 asks for what the receiver will ask first, through the same request path --
 the header, slot 0 (the demuxer's probe), and the slot for `startMs` (by
 the `sidx` label: the slot holding the time when mirrored, an earlier one
-when estimated) with the two slots before it and the one after, which one
-run makes in turn: FFmpeg seeks a time on a cut to the slot before it, and
-the Chromecast with Google TV has asked for the one before that -- and
+when estimated) with the slots of the 12 s before it and the 6 s after,
+which one run makes in turn: FFmpeg seeks a time on a cut to the slot
+before it, and the Chromecast with Google TV has asked for one some 12 s
+earlier -- and
 `rendition_readiness(&CastToken)` says how far it has got:
 `{"phase":"index"}`, `"start"`, `"ready"`, `"failed"` with the `sentence`, or
 `"ended"`. The app loads the receiver at `ready`, and the receiver's first

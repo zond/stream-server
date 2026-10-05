@@ -63,6 +63,27 @@ pub(crate) const MIN_PAD: u64 = 8 + TAIL_ZEROS;
 /// demuxer added as it read, not the source's index.
 const INDEX_REACH_US: i64 = 60_000_000;
 
+/// **How far apart a mirrored layout's cuts are at least**: a slot is
+/// cut at the first indexed sync sample at or after each `k` x this, so a
+/// film whose sync samples are a second or more apart has **a slot per
+/// sync sample** -- what a seek lands on (FFmpeg's demuxer knows the sync
+/// samples of the fragments it has read, and a seek reads one slot's first
+/// chunk: the slot's start is where it lands) -- and one whose sync
+/// samples are closer has slots of about a second. The spec's segment
+/// length is not used: it was the receiver's landing a whole segment early
+/// (`docs/design/renditions.md`, *A slot per sync sample*).
+pub(crate) const MIRROR_GRID_US: i64 = 1_000_000;
+
+/// The most slots a `sidx` can count.
+const MAX_SLOTS: i64 = u16::MAX as i64;
+
+/// The grid a mirrored layout of a film `duration_us` long is cut on:
+/// [`MIRROR_GRID_US`], or wider when that would make more slots than a
+/// `sidx` counts (a film over 18 hours).
+pub(crate) fn mirror_grid(duration_us: i64) -> i64 {
+    MIRROR_GRID_US.max(duration_us / (MAX_SLOTS - 1) + 1)
+}
+
 /// The room a mirrored slot gets beyond its source span: [`SLOT_BASE`] and
 /// a [`HEADROOM_DIVISOR`]th of the span.
 pub(crate) fn headroom(span: u64) -> u64 {
@@ -116,7 +137,12 @@ impl Plan {
         let segment_us = segment_us.max(1);
         let duration_us = duration_us.max(1);
         match index.and_then(|index| usable(index, source_len, duration_us)) {
-            Some(candidates) => Self::mirrored(&candidates, source_len, duration_us, segment_us),
+            Some(candidates) => Self::mirrored(
+                &candidates,
+                source_len,
+                duration_us,
+                mirror_grid(duration_us),
+            ),
             None => Self::estimated(source_len, duration_us, segment_us),
         }
     }
@@ -265,6 +291,8 @@ pub(crate) struct Layout {
     /// How far after its cut each slot's `sidx` label is (0 mirrored, a GOP
     /// for an estimated layout): what [`Self::slot_for_time`] reads.
     pub label_late_us: i64,
+    /// Where the first slot's video begins.
+    pub first_us: i64,
 }
 
 impl Layout {
@@ -359,6 +387,7 @@ impl Layout {
             cuts: plan.cuts.into(),
             exact: plan.exact,
             label_late_us: plan.label_late_us,
+            first_us: plan.first_us,
         })
     }
 
@@ -384,6 +413,24 @@ impl Layout {
             .partition_point(|cut| cut.saturating_add(late) <= at_us)
             .saturating_sub(1) as u64;
         picked.min(self.slots.len() as u64 - 1)
+    }
+
+    /// Where slot `slot` begins on the film's clock: its cut, the first
+    /// slot from the film's first sync sample.
+    fn start_us(&self, slot: u64) -> i64 {
+        match slot {
+            0 => self.first_us,
+            _ => self.cuts.get(slot as usize).copied().unwrap_or(i64::MAX),
+        }
+    }
+
+    /// **The last slot that begins at most `ahead_us` after slot `slot`
+    /// does** (`slot` itself at least): how far a run's lookahead reaches
+    /// from it, and a preparation's from a start.
+    pub(crate) fn reach(&self, slot: u64, ahead_us: i64) -> u64 {
+        let until = self.start_us(slot).saturating_add(ahead_us);
+        let last = (self.cuts.partition_point(|cut| *cut <= until) as u64).saturating_sub(1);
+        last.max(slot)
     }
 
     /// The first slot whose cut is at or after `from_us`: the first a run
@@ -444,6 +491,58 @@ mod tests {
                 .map(|(span, lasts)| span + headroom(*span) + interleave_room(lasts))
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// **Mirrored, a slot per sync sample, whatever the segment length**:
+    /// keys every 2.8 s in 6 s segments are a slot each -- a seek lands on
+    /// a slot's start, so the slot must start at the key before the target
+    /// -- and keys every 0.4 s make slots of about a second, the first key
+    /// at or after each second. A film too long for a `sidx`'s count of
+    /// slots at one a second is cut on a wider grid.
+    #[test]
+    fn a_mirrored_layout_has_a_slot_per_sync_sample() {
+        let keys: Vec<i64> = (0..11).map(|k| k * 2_800_000).collect();
+        let index: Vec<IndexEntry> = keys
+            .iter()
+            .enumerate()
+            .map(|(k, pts)| entry(*pts, 1_000 * k as u64))
+            .collect();
+        let plan = Plan::new(Some(&index), 11_000, 30_000_000, 6 * T);
+        assert!(plan.exact);
+        assert_eq!(plan.cuts[1..], keys[1..]);
+
+        let dense: Vec<IndexEntry> = (0..75)
+            .map(|k| entry(k * 400_000, 100 * k as u64))
+            .collect();
+        let plan = Plan::new(Some(&dense), 7_500, 30_000_000, 6 * T);
+        assert_eq!(
+            plan.cuts[1..6],
+            [1_200_000, 2_000_000, 3_200_000, 4_000_000, 5_200_000]
+        );
+
+        assert_eq!(mirror_grid(3_600_000_000), MIRROR_GRID_US);
+        let days = 2 * 24 * 3_600_000_000;
+        assert!(days / mirror_grid(days) < 65_535);
+    }
+
+    /// **How far a lookahead reaches**: the last slot beginning within the
+    /// time of the slot it is counted from, that slot at least.
+    #[test]
+    fn reach_is_the_last_slot_beginning_within_the_time() {
+        let keys: Vec<i64> = (0..11).map(|k| 40_000 + k * 2_800_000).collect();
+        let index: Vec<IndexEntry> = keys
+            .iter()
+            .enumerate()
+            .map(|(k, pts)| entry(*pts, 1_000 * k as u64))
+            .collect();
+        let plan = Plan::new(Some(&index), 11_000, 30_000_000, 6 * T);
+        let layout = Layout::new(Bytes::new(), plan, (1, 90_000), None, 30_000_000).unwrap();
+        // From slot 0 (at 0.04 s): slots beginning by 12.04 s, the last at
+        // 11.24 s (slot 4).
+        assert_eq!(layout.reach(0, 12_000_000), 4);
+        assert_eq!(layout.reach(2, 12_000_000), 6);
+        assert_eq!(layout.reach(2, 0), 2);
+        assert_eq!(layout.reach(10, 12_000_000), 10);
     }
 
     /// Entries that share a position (several keys in one cluster) or go

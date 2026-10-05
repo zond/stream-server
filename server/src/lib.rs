@@ -1561,11 +1561,11 @@ impl ServerHandle {
     /// (which waits for the layout: the source's formats and index, for a
     /// Matroska file its Cues, usually at the end), slot 0 (Chrome's
     /// demuxer probes the first fragment before it seeks), and the slot a
-    /// receiver told to start at the spec's `startMs` jumps to, with the two
-    /// slots before it and the one after
+    /// receiver told to start at the spec's `startMs` jumps to, with the
+    /// slots of the 12 s before it and the 6 s after
     /// ([`rendition::PREPARED_BEFORE`], [`rendition::PREPARED_AFTER`]):
     /// FFmpeg seeks a time on a cut to the slot before it, and zond's TV
-    /// asked for one earlier still (`docs/design/renditions.md`, *Prepared
+    /// asked for one some 12 s earlier still (`docs/design/renditions.md`, *Prepared
     /// before the load*). Returns at once; the work runs on the server and
     /// [`Self::rendition_readiness`] says how far it has got, so the app
     /// tells the receiver to load only once its first requests will be

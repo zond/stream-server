@@ -106,7 +106,7 @@ impl Fixture {
     }
 
     fn quick(knobs: Knobs) -> anyhow::Result<Self> {
-        Self::start(knobs, RenditionTuning::default())
+        Self::start(knobs, tuning())
     }
 
     fn publish(&self, duration_ms: u64, start_ms: u64) -> anyhow::Result<CastToken> {
@@ -194,12 +194,23 @@ impl Fixture {
     }
 }
 
+/// The tuning these tests run by: the lookahead in slots alone
+/// ([`stream_server::rendition::LOOKAHEAD`]), as the cut rule's one-second
+/// slots here make the reasoning about which run makes which slot plain;
+/// the lookahead by time has tests of its own.
+fn tuning() -> RenditionTuning {
+    RenditionTuning {
+        lookahead: Duration::ZERO,
+        ..RenditionTuning::default()
+    }
+}
+
 /// A ring that keeps only the slots a run is making: anything read again
 /// is made again.
 fn small_ring() -> RenditionTuning {
     RenditionTuning {
         ring_cap: 1,
-        ..RenditionTuning::default()
+        ..tuning()
     }
 }
 
@@ -877,6 +888,62 @@ fn each_segment_is_cut_at_the_first_key_at_or_after_its_time() -> anyhow::Result
     Ok(())
 }
 
+/// **A seek lands on the sync sample at or before its target**, as FFmpeg's
+/// demuxer seeks -- modelled, so it holds on every CI job: the slot whose
+/// `sidx` label is the last at or before the target, its first `moof` read,
+/// and the last sync sample at or before the target among the samples that
+/// `moof` holds (`mov_seek_fragment`, `av_index_search_timestamp`). A film
+/// with a key every 2.4 s, published with six-second segments: cut on the
+/// segment grid, a slot held two or three GOPs, its first `moof` only the
+/// first half second of them, and a seek landed at the slot's start -- up
+/// to a whole slot early. Mirrored, a slot is cut at every sync sample a
+/// second or more apart, whatever the segment length, so it lands within
+/// a GOP.
+#[test]
+fn a_modelled_seek_lands_within_a_gop_of_its_target() -> anyhow::Result<()> {
+    let knobs = Knobs {
+        gop: 60,
+        ..Knobs::default()
+    };
+    let fixture = Fixture::quick(knobs.clone())?;
+    let token = fixture
+        .handle
+        .publish_rendition(&fixture.id, spec(60_000, 6000, 0), None)?;
+    let header = fixture.header(&token);
+    let file = fixture.file(&token);
+    let gop_us = 2_400_000;
+    assert_eq!(header.slots.len(), 25, "a slot per key");
+    let mut label = header.earliest;
+    let labels: Vec<u64> = header
+        .slots
+        .iter()
+        .map(|(_, _, duration)| {
+            let at = label;
+            label += u64::from(*duration);
+            at
+        })
+        .collect();
+    for target_ms in [1_000i64, 7_100, 11_000, 30_000, 33_500, 47_900, 59_000] {
+        let target = (target_ms * 90) as u64;
+        let slot = labels.iter().rposition(|label| *label <= target).unwrap();
+        let segment = parse_segment(fragment_of(header.slot(&file, slot)));
+        let (track, first, _) = segment.chunks[0][0];
+        assert_eq!(track, 1, "the first moof begins with the picture");
+        let landed_us = first as i64 * 1000 / 90;
+        let frame = landed_us * i64::from(knobs.fps) / 1_000_000;
+        assert!(
+            knobs.is_key(frame),
+            "{target_ms} ms: landed on a frame that is no key"
+        );
+        let target_us = target_ms * 1000;
+        assert!(
+            landed_us <= target_us && target_us - landed_us < gop_us,
+            "{target_ms} ms landed at {landed_us} us, in slot {slot}"
+        );
+    }
+    Ok(())
+}
+
 /// **A slot lays its picture and its sound down together**, half a second
 /// at a time: a `moof` and an `mdat` per chunk, the chunk's picture --
 /// decode times in one half second of the film's clock -- and then the
@@ -1070,7 +1137,7 @@ fn a_receiver_told_to_start_late_gets_slot_0_and_its_start() -> anyhow::Result<(
         RenditionTuning {
             // No release can stand in for a run the reads need.
             idle_release: Duration::from_secs(3600),
-            ..RenditionTuning::default()
+            ..tuning()
         },
     )?;
     let token = fixture.publish(60_000, 30_500)?;
@@ -1113,7 +1180,7 @@ fn a_body_waiting_on_a_stalled_slot_keeps_its_run_and_gets_it() -> anyhow::Resul
         },
         RenditionTuning {
             idle_release: WAITED_RELEASE,
-            ..RenditionTuning::default()
+            ..tuning()
         },
     )?;
     let token = fixture.publish(60_000, 0)?;
@@ -1145,7 +1212,7 @@ fn a_read_left_open_does_not_take_the_run_back() -> anyhow::Result<()> {
         Knobs::default(),
         RenditionTuning {
             idle_release: Duration::from_secs(3600),
-            ..RenditionTuning::default()
+            ..tuning()
         },
     )?;
     let token = fixture.publish(60_000, 0)?;
@@ -1180,7 +1247,7 @@ fn three_seeks_waiting_at_once_take_turns() -> anyhow::Result<()> {
         RenditionTuning {
             idle_release: Duration::from_millis(300),
             speed_window: Duration::from_secs(3600),
-            ..RenditionTuning::default()
+            ..tuning()
         },
     )?;
     let token = fixture.publish(60_000, 0)?;
@@ -1222,7 +1289,7 @@ fn two_readers_reading_on_far_apart_each_keep_a_run() -> anyhow::Result<()> {
         },
         RenditionTuning {
             idle_release: Duration::from_secs(3600),
-            ..RenditionTuning::default()
+            ..tuning()
         },
     )?;
     let token = fixture.publish(60_000, 0)?;
@@ -1269,7 +1336,7 @@ fn two_seeks_waiting_at_once_take_turns() -> anyhow::Result<()> {
         },
         RenditionTuning {
             idle_release: Duration::from_millis(300),
-            ..RenditionTuning::default()
+            ..tuning()
         },
     )?;
     let token = fixture.publish(60_000, 0)?;
@@ -1393,7 +1460,7 @@ fn an_overflowing_segment_spills_into_the_next_slot() -> anyhow::Result<()> {
 #[test]
 fn an_overflow_into_a_decided_slot_is_truncated() -> anyhow::Result<()> {
     let knobs = squeezed();
-    let fixture = Fixture::start_with(knobs.clone(), RenditionTuning::default(), SQUEEZED_LEN)?;
+    let fixture = Fixture::start_with(knobs.clone(), tuning(), SQUEEZED_LEN)?;
     let token = fixture.publish(20_000, 0)?;
     let header = fixture.header(&token);
     let (at, size, _) = header.slots[11];
@@ -1426,7 +1493,7 @@ fn an_overflowing_last_slot_is_truncated() -> anyhow::Result<()> {
         index: Some(IndexKnob::Squeezed { at_us: 19 * T_US }),
         ..squeezed()
     };
-    let fixture = Fixture::start_with(knobs.clone(), RenditionTuning::default(), SQUEEZED_LEN)?;
+    let fixture = Fixture::start_with(knobs.clone(), tuning(), SQUEEZED_LEN)?;
     let token = fixture.publish(20_000, 0)?;
     let file = fixture.file(&token);
     let header = Header::of(&file, file.len() as u64);
@@ -1537,6 +1604,47 @@ fn the_lookahead_blocks_the_producer() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// **The lookahead is 12 s of film, never fewer than two slots**: with the
+/// cut rule's one-second slots, a run asked for slot 0 makes every slot
+/// that begins within 12 s of it -- slot 12, cut at 12.0 s, the last -- and
+/// blocks before slot 13; asked for slot 1 (cut at 1.44 s), it makes on to
+/// the last slot beginning by 13.44 s. Counted in slots (two), a slot per
+/// sync sample a second or two long would run two or four seconds ahead
+/// of the receiver, where six-second segments ran twelve.
+#[test]
+fn the_lookahead_is_twelve_seconds_of_film() -> anyhow::Result<()> {
+    let knobs = Knobs::default();
+    let fixture = Fixture::start(knobs.clone(), RenditionTuning::default())?;
+    let token = fixture.publish(60_000, 0)?;
+    fixture.init(&token);
+    let run = fixture.producer.runs()[0].clone();
+    let last_within = |from_us: i64| {
+        (1..60)
+            .take_while(|n| cut(&knobs, *n) <= from_us + 12_000_000)
+            .last()
+            .unwrap() as u64
+    };
+    let held = |last: u64| {
+        let probe = fixture.probe(&token);
+        probe.ring == (0..=last).collect::<Vec<_>>()
+            && probe.in_production == Some(last + 1)
+            && run.probe.is_blocked()
+    };
+    let from_zero = last_within(0);
+    assert_eq!(from_zero, 12);
+    until("the producer blocks 12 s ahead of slot 0", || {
+        held(from_zero)
+    });
+    fixture.segment(&token, 1);
+    let from_one = last_within(cut(&knobs, 1));
+    assert!(from_one > from_zero, "{from_one}");
+    until("the producer blocks 12 s ahead of slot 1", || {
+        held(from_one)
+    });
+    assert!(!run.stopped());
+    Ok(())
+}
+
 /// **An idle run is let go**: after the release period with no request
 /// the run is dropped (its sink answers `Stopped`) and the ring kept; the
 /// next request, at the ring's edge, starts a new run there.
@@ -1547,7 +1655,7 @@ fn an_idle_run_is_released_and_restarted_at_the_rings_edge() -> anyhow::Result<(
         knobs.clone(),
         RenditionTuning {
             idle_release: Duration::from_millis(300),
-            ..RenditionTuning::default()
+            ..tuning()
         },
     )?;
     let token = fixture.publish(60_000, 0)?;
@@ -1599,7 +1707,7 @@ fn unpublish_wakes_a_waiting_range_and_stops_the_producer() -> anyhow::Result<()
         RenditionTuning {
             speed_window: Duration::from_secs(3600),
             idle_release: Duration::from_secs(3600),
-            ..RenditionTuning::default()
+            ..tuning()
         },
     )?;
     let token = fixture.publish(60_000, 0)?;
@@ -1655,7 +1763,7 @@ fn unpublish_breaks_a_body_partway() -> anyhow::Result<()> {
         RenditionTuning {
             speed_window: Duration::from_secs(3600),
             idle_release: Duration::from_secs(3600),
-            ..RenditionTuning::default()
+            ..tuning()
         },
     )?;
     let token = fixture.publish(60_000, 0)?;
@@ -1685,7 +1793,7 @@ fn a_producer_slower_than_real_time_fails_the_rendition() -> anyhow::Result<()> 
         },
         RenditionTuning {
             speed_window: Duration::from_secs(1),
-            ..RenditionTuning::default()
+            ..tuning()
         },
     )?;
     let token = fixture.publish(60_000, 0)?;
@@ -1729,7 +1837,7 @@ fn a_rendition_that_fails_partway_breaks_its_body() -> anyhow::Result<()> {
         },
         RenditionTuning {
             speed_window: Duration::from_secs(1),
-            ..RenditionTuning::default()
+            ..tuning()
         },
     )?;
     let token = fixture.publish(60_000, 0)?;
@@ -1757,7 +1865,7 @@ fn a_producer_faster_than_real_time_is_not_failed() -> anyhow::Result<()> {
         },
         RenditionTuning {
             speed_window: Duration::from_secs(1),
-            ..RenditionTuning::default()
+            ..tuning()
         },
     )?;
     let token = fixture.publish(60_000, 0)?;
@@ -1853,7 +1961,7 @@ fn a_slow_source_is_not_a_slow_producer() -> anyhow::Result<()> {
         },
         RenditionTuning {
             speed_window: Duration::from_secs(1),
-            ..RenditionTuning::default()
+            ..tuning()
         },
     )?;
     let origin = slow_origin()?;
@@ -2039,18 +2147,21 @@ fn slot_holding(knobs: &Knobs, at_us: i64) -> u64 {
     (1..).find(|n| cut(knobs, *n) > at_us).unwrap() as u64 - 1
 }
 
-/// The slots a preparation for a start in slot `start` makes, besides
-/// slot 0: two before it, it, one after -- the film's ends permitting.
-fn prepared(start: u64, slots: u64) -> Vec<u64> {
-    (start.saturating_sub(2)..=(start + 1).min(slots - 1)).collect()
+/// The slots a preparation for a start at `start_us` makes in `knobs`'
+/// 60 s film, besides slot 0: those of the 12 s before it to the 6 s after
+/// it -- the film's ends permitting.
+fn prepared(knobs: &Knobs, start_us: i64) -> Vec<u64> {
+    let first = slot_holding(knobs, (start_us - 12_000_000).max(0));
+    let last = slot_holding(knobs, (start_us + 6_000_000).min(59_999_999));
+    (first..=last).collect()
 }
 
 /// **A preparation makes the header, slot 0 and the receiver's start with
-/// two slots before it and one after, with no request at all**: the
-/// receiver's first range after the load has been for the start's slot,
-/// the one before it (FFmpeg seeks a time on a cut to the slot before:
-/// `docs/design/renditions.md`, *Prepared before the load*) and the one
-/// before that (zond's TV), so whichever it asks is ready.
+/// the slots of the 12 s before it and the 6 s after, with no request at
+/// all**: the receiver's first range after the load has been for the
+/// start's slot, the one before it (FFmpeg seeks a time on a cut to the
+/// slot before: `docs/design/renditions.md`, *Prepared before the load*)
+/// and one some 12 s earlier (zond's TV), so whichever it asks is ready.
 #[test]
 fn preparing_makes_the_receivers_start_and_its_neighbours() -> anyhow::Result<()> {
     let knobs = Knobs::default();
@@ -2069,7 +2180,9 @@ fn preparing_makes_the_receivers_start_and_its_neighbours() -> anyhow::Result<()
     let start = slot_holding(&knobs, 20_500_000);
     let probe = fixture.probe(&token);
     assert!(probe.init, "the layout, and with it the header, is made");
-    for slot in std::iter::once(0).chain(prepared(start, 60)) {
+    let slots = prepared(&knobs, 20_500_000);
+    assert!(slots.contains(&start) && slots.len() > 12, "{slots:?}");
+    for slot in std::iter::once(0).chain(slots.iter().copied()) {
         assert!(
             probe.ring.contains(&slot),
             "slot {slot} in {:?}",
@@ -2078,47 +2191,53 @@ fn preparing_makes_the_receivers_start_and_its_neighbours() -> anyhow::Result<()
     }
     assert_eq!(
         probe.runs_started, 2,
-        "the header's from the start, and one from two before the start"
+        "the header's from the start, and one from 12 s before the start"
     );
     assert_eq!(
         fixture.producer.runs()[1].from,
-        asked_from(cut(&knobs, start as i64 - 2))
+        asked_from(cut(&knobs, slots[0] as i64))
     );
     assert_eq!(fixture.handle.lan_media_requests_served(), 0);
     assert!(fixture.handle.prepare_rendition(&token), "a second ask");
     Ok(())
 }
 
-/// **Ready waits for the slot after the start too**: with the source
-/// stalled where that slot ends, the start's slot is made and the
-/// preparation says `start`, not `ready`, for as long as the stall lasts;
-/// once the source goes on, `ready`, with the slot after in the ring.
+/// **Ready waits for the 6 s after the start too**: with the source
+/// stalled where the last of their slots ends, every slot to the one
+/// before it is made and the preparation says `start`, not `ready`, for as
+/// long as the stall lasts; once the source goes on, `ready`, with that
+/// last slot in the ring.
 #[test]
-fn ready_waits_for_the_slot_after_the_start() -> anyhow::Result<()> {
+fn ready_waits_for_the_film_after_the_start() -> anyhow::Result<()> {
     let knobs = Knobs::default();
     let start = slot_holding(&knobs, 20_500_000);
+    let last = *prepared(&knobs, 20_500_000).last().unwrap();
+    assert!(
+        last >= start + 5,
+        "6 s of one-second slots after {start}: {last}"
+    );
     let gate = Gate::new();
     let fixture = Fixture::quick(Knobs {
-        time_gate: Some((cut(&knobs, start as i64 + 2), gate.clone())),
+        time_gate: Some((cut(&knobs, last as i64 + 1), gate.clone())),
         ..knobs.clone()
     })?;
     let token = fixture.publish(60_000, 20_500)?;
     assert!(fixture.handle.prepare_rendition(&token));
-    until("the start's slot is made", || {
-        fixture.probe(&token).ring.contains(&start)
+    until("the slot before the last is made", || {
+        fixture.probe(&token).ring.contains(&(last - 1))
     });
     until("the source stalls", || gate.is_parked());
     std::thread::sleep(STALL_WINDOW);
     assert_eq!(
         fixture.handle.rendition_readiness(&token),
         RenditionReadiness::Start,
-        "ready without the slot after the start"
+        "ready without the film after the start"
     );
     gate.open();
     until("the rendition is ready", || {
         fixture.handle.rendition_readiness(&token) == RenditionReadiness::Ready
     });
-    assert!(fixture.probe(&token).ring.contains(&(start + 1)));
+    assert!(fixture.probe(&token).ring.contains(&last));
     Ok(())
 }
 
@@ -2130,8 +2249,7 @@ fn ready_waits_for_the_slot_after_the_start() -> anyhow::Result<()> {
 #[test]
 fn a_first_request_for_any_prepared_slot_starts_no_run() -> anyhow::Result<()> {
     let knobs = Knobs::default();
-    let start = slot_holding(&knobs, 20_500_000);
-    for first in prepared(start, 60) {
+    for first in prepared(&knobs, 20_500_000) {
         let fixture = Fixture::quick(knobs.clone())?;
         let token = fixture.publish(60_000, 20_500)?;
         assert!(fixture.handle.prepare_rendition(&token));
@@ -2164,12 +2282,15 @@ fn a_first_request_for_any_prepared_slot_starts_no_run() -> anyhow::Result<()> {
 }
 
 /// **Preparing at the film's ends stays inside it**: a start in slot 0
-/// makes slots 0 and 1, all from the header's run; one in the last slot
-/// makes the three last.
+/// makes the slots of the first 6 s, all from the header's run; one in the
+/// last slot makes those of the last 12 s.
 #[test]
 fn preparing_at_the_films_ends_stays_inside_it() -> anyhow::Result<()> {
     let knobs = Knobs::default();
-    for (start_ms, slots) in [(0u32, vec![0, 1]), (59_500, vec![57, 58, 59])] {
+    for (start_ms, slots) in [
+        (0u32, (0..=5).collect::<Vec<u64>>()),
+        (59_500, (47..=59).collect()),
+    ] {
         let fixture = Fixture::quick(knobs.clone())?;
         let token = fixture.publish(60_000, u64::from(start_ms))?;
         assert!(fixture.handle.prepare_rendition(&token));
@@ -2177,10 +2298,7 @@ fn preparing_at_the_films_ends_stays_inside_it() -> anyhow::Result<()> {
             fixture.handle.rendition_readiness(&token) == RenditionReadiness::Ready
         });
         let probe = fixture.probe(&token);
-        assert_eq!(
-            prepared(slot_holding(&knobs, i64::from(start_ms) * 1000), 60),
-            slots
-        );
+        assert_eq!(prepared(&knobs, i64::from(start_ms) * 1000), slots);
         for slot in &slots {
             assert!(
                 probe.ring.contains(slot),
@@ -2240,10 +2358,11 @@ fn preparing_waits_on_a_stalled_source_and_reports_its_phase() -> anyhow::Result
         },
         RenditionTuning {
             idle_release: Duration::from_millis(30),
-            ..RenditionTuning::default()
+            ..tuning()
         },
     )?;
-    let token = fixture.publish(60_000, 7_500)?;
+    // Far enough in that the preparation's run is not the header's.
+    let token = fixture.publish(60_000, 30_000)?;
     assert!(fixture.handle.prepare_rendition(&token));
     until("the run waits on the source's index", || {
         index_gate.is_parked()

@@ -25,7 +25,7 @@ use torrent_fixtures::offline_config;
 
 #[path = "support/film_producer.rs"]
 mod film_producer;
-use film_producer::{Film, FilmProducer, Picture, Recipe};
+use film_producer::{Film, FilmProducer, Look, Picture, Recipe};
 
 /// The segment length the app asks for.
 const SEGMENT_MS: u32 = 6000;
@@ -268,6 +268,7 @@ fn ffmpeg_reads(url: &str, before: &[&str], after: &[&str]) -> anyhow::Result<()
 fn fat_film(picture: Picture) -> Recipe {
     Recipe {
         picture,
+        look: Look::Noise,
         seconds: 32,
         kbps: 11_000,
         gop: 192,
@@ -353,10 +354,13 @@ fn a_seek_into_a_fat_film_reads_on_from_where_it_lands() -> anyhow::Result<()> {
 /// H.264 with 48 kHz sound and HEVC (open GOPs) with 44.1 kHz, each
 /// decoded by `ffmpeg` without a complaint, and every packet `ffprobe`
 /// reads back at its time in the film -- the sound exactly, the picture
-/// all by one constant: FFmpeg shows a fragment's video late by its
-/// largest negative composition offset (`dts_shift`), the same for every
-/// frame, so picture and sound are as far apart as in the film whichever
-/// chunk or slot they are in.
+/// late by no more than five frames and never less than before it: FFmpeg
+/// shows a fragment's video late by the largest negative composition
+/// offset it has read so far (`dts_shift`), so picture and sound are as
+/// far apart as in the film whichever chunk or slot they are in, give or
+/// take that. With open GOPs the offset takes in the leading pictures (a
+/// slot's decode times start at its sync sample's time), as FFmpeg 4.4 --
+/// timing a slot's first `moof` by its label -- always showed.
 ///
 /// Except the first slot's sound, one AAC frame late throughout: the
 /// film's priming frame is at -21 ms (an MP4's edit list, which leaves the
@@ -373,6 +377,7 @@ fn a_film_decodes_whole_with_its_times() -> anyhow::Result<()> {
         let fixture = Fixture::start(
             Recipe {
                 picture,
+                look: Look::Noise,
                 seconds: 20,
                 kbps: 4_000,
                 gop: 96,
@@ -413,12 +418,24 @@ fn a_film_decodes_whole_with_its_times() -> anyhow::Result<()> {
                 );
             } else {
                 assert!(
-                    (0..=3 * 41_667).contains(&shift),
+                    (0..=5 * 41_667).contains(&shift),
                     "{picture:?}: the picture moved by {shift} us"
                 );
             }
+            let mut moved = 0;
             for (at, (time, was)) in times.iter().zip(&film).enumerate() {
-                let late = if track == TrackKind::Audio && *was < second_slot - 64_000 {
+                if track == TrackKind::Video {
+                    // FFmpeg's `dts_shift` is the largest negative offset
+                    // read so far: the picture's lateness only grows.
+                    let late = time - was;
+                    assert!(
+                        late >= moved - 12 && late <= shift + 12,
+                        "{picture:?}'s video packet {at}: at {time} us, {was} us in the film"
+                    );
+                    moved = moved.max(late);
+                    continue;
+                }
+                let late = if *was < second_slot - 64_000 {
                     -priming
                 } else {
                     0
@@ -450,6 +467,7 @@ fn every_slot_is_the_same_bytes_whichever_run_makes_it() -> anyhow::Result<()> {
         let fixture = Fixture::start(
             Recipe {
                 picture,
+                look: Look::Noise,
                 seconds: 30,
                 kbps: 4_000,
                 gop: 72,
@@ -491,6 +509,99 @@ fn every_slot_is_the_same_bytes_whichever_run_makes_it() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The first video packet's time after each of `seeks` (seconds), in one
+/// `ffprobe` of `url` that reads `before` seconds first -- the TV's remote
+/// seeks, forward then back.
+fn ffprobe_lands(url: &str, before: Option<u32>, seeks: &[u32]) -> anyhow::Result<Vec<f64>> {
+    let intervals: Vec<String> = before
+        .map(|first| format!("%+{first}"))
+        .into_iter()
+        .chain(seeks.iter().map(|at| format!("{at}%+#1")))
+        .collect();
+    let output = Command::new("ffprobe")
+        .args(["-v", "error", "-read_intervals", &intervals.join(",")])
+        .args(["-select_streams", "v", "-show_entries", "packet=pts_time"])
+        .args(["-of", "csv=p=0", url])
+        .output()?;
+    anyhow::ensure!(output.status.success(), "ffprobe failed");
+    let times: Vec<f64> = String::from_utf8(output.stdout)?
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect();
+    anyhow::ensure!(times.len() >= seeks.len(), "{times:?}");
+    Ok(times[times.len() - seeks.len()..].to_vec())
+}
+
+/// **A seek lands on the sync sample at or before its target** -- the
+/// app's long test film exactly (xtremio `rust/tests/support/film.rs`:
+/// 6 minutes of `testsrc`, a key every 2.8 s, HEVC Main 10 HDR10 with
+/// open GOPs, and H.264), published with the app's 6 s segments:
+/// `ffprobe` seeking to 5:00 lands on the key at 299.6 s in a few
+/// requests, a seek list read after the first 16 s lands each within a
+/// GOP of its target, and `ffmpeg -ss 60` asks for the start and the
+/// target and nothing else.
+///
+/// Cut on the 6 s grid, a slot held two or three GOPs and a seek landed
+/// at the slot's start -- the demuxer knows only the sync samples of the
+/// chunks it has read, and it reads the slot's first: 294.0 s for 5:00
+/// (H.264). With HEVC's open GOPs FFmpeg 6.1 then also sought the sound to
+/// the slot before, and the picture followed it: 288.4 s.
+#[test]
+fn a_seek_lands_on_the_sync_sample_at_or_before_it() -> anyhow::Result<()> {
+    for picture in [Picture::Hevc, Picture::H264] {
+        if !film_producer::tools_for(picture, "a_seek_lands_on_the_sync_sample_at_or_before_it") {
+            continue;
+        }
+        let fixture = Fixture::start(
+            Recipe {
+                picture,
+                look: Look::App,
+                seconds: 360,
+                kbps: 0,
+                gop: 70,
+                sample_rate: 48_000,
+            },
+            RenditionTuning::default(),
+        )?;
+        let token = fixture.publish()?;
+        let keys: Vec<f64> = fixture
+            .film
+            .packets
+            .iter()
+            .filter(|packet| packet.track == TrackKind::Video && packet.key)
+            .map(|packet| packet.pts_us as f64 / 1e6)
+            .collect();
+        let key_before = |at: f64| *keys.iter().rfind(|key| **key <= at).unwrap();
+        let relay = Relay::start(fixture.lan.parse()?)?;
+        let url = relay.url(&token);
+
+        let landed = ffprobe_lands(&url, None, &[300])?[0];
+        let asked = relay.take();
+        let key = key_before(300.0);
+        assert!(
+            (key - 0.2..=300.0).contains(&landed),
+            "{picture:?}: 5:00 landed at {landed} s, the key before it is at {key} s"
+        );
+        assert!(asked.len() <= 6, "{picture:?}: 5:00 asked {asked:?}");
+
+        let seeks = [100, 250, 330, 43, 30];
+        let lands = ffprobe_lands(&url, Some(16), &seeks)?;
+        relay.take();
+        for (at, landed) in seeks.iter().zip(&lands) {
+            let key = key_before(f64::from(*at));
+            assert!(
+                (key - 0.2..=f64::from(*at)).contains(landed),
+                "{picture:?}: seeks {seeks:?} landed at {lands:?}"
+            );
+        }
+
+        ffmpeg_reads(&url, &["-ss", "60"], &["-t", "1"])?;
+        let asked = relay.take();
+        assert_eq!(asked.len(), 2, "{picture:?}: ffmpeg -ss 60 asked {asked:?}");
+    }
+    Ok(())
+}
+
 /// **By hand**: a rendition of a film written to `RENDITION_FILM_DUMP` for
 /// FFmpeg probes of other versions (`docs/design/renditions.md`).
 #[test]
@@ -504,7 +615,11 @@ fn dump_a_film_rendition() -> anyhow::Result<()> {
     let fixture = Fixture::start(
         Recipe {
             picture,
-            seconds: 60,
+            look: match std::env::var("RENDITION_FILM_LOOK").as_deref() {
+                Ok("app") => Look::App,
+                _ => Look::Noise,
+            },
+            seconds: std::env::var("RENDITION_FILM_SECONDS").map_or(Ok(60), |s| s.parse())?,
             kbps: std::env::var("RENDITION_FILM_KBPS").map_or(Ok(8000), |kbps| kbps.parse())?,
             gop: std::env::var("RENDITION_FILM_GOP").map_or(Ok(180), |gop| gop.parse())?,
             sample_rate: 48_000,

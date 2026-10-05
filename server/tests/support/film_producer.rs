@@ -32,15 +32,29 @@ pub enum Picture {
     Hevc,
 }
 
+/// What the picture shows, and how it is encoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Look {
+    /// Moving noise at 640x360, 24 frames a second, at [`Recipe::kbps`]:
+    /// a film big enough per second that where the sound lies matters.
+    Noise,
+    /// The app's own test film (xtremio `rust/tests/support/film.rs`,
+    /// `make_with` for a long film): `testsrc` at 320x240, 25 frames a
+    /// second, `ultrafast`; H.264 with two B-frames, or HEVC Main 10 tagged
+    /// HDR10 with three B-frames and x265's open GOPs. No bitrate.
+    App,
+}
+
 /// What to encode.
 #[derive(Clone, Copy, Debug)]
 pub struct Recipe {
     pub picture: Picture,
+    pub look: Look,
     /// Seconds of film.
     pub seconds: u32,
-    /// The picture's bitrate, kbit/s.
+    /// The picture's bitrate, kbit/s ([`Look::Noise`]).
     pub kbps: u32,
-    /// Frames between sync samples, at 24 frames a second.
+    /// Frames between sync samples, at the look's frame rate.
     pub gop: u32,
     /// The sound's sample rate.
     pub sample_rate: u32,
@@ -215,8 +229,12 @@ impl Film {
     /// Encode `recipe` into `dir` and read it back.
     pub fn make(dir: &Path, recipe: Recipe) -> anyhow::Result<Self> {
         let path = dir.join("film.mp4");
-        let source = "testsrc2=size=640x360:rate=24,noise=alls=60:allf=t";
+        let source = match recipe.look {
+            Look::Noise => "testsrc2=size=640x360:rate=24,noise=alls=60:allf=t",
+            Look::App => "testsrc=size=320x240:rate=25",
+        };
         let kbps = recipe.kbps.to_string();
+        let gop = recipe.gop.to_string();
         let mut command = Command::new("ffmpeg");
         command.args([
             "-hide_banner",
@@ -234,8 +252,8 @@ impl Film {
             recipe.sample_rate
         ));
         command.args(["-t", &recipe.seconds.to_string()]);
-        match recipe.picture {
-            Picture::H264 => {
+        match (recipe.picture, recipe.look) {
+            (Picture::H264, Look::Noise) => {
                 command.args([
                     "-c:v",
                     "libx264",
@@ -246,16 +264,16 @@ impl Film {
                     "-x264-params",
                     "b-adapt=0",
                     "-g",
-                    &recipe.gop.to_string(),
+                    &gop,
                     "-keyint_min",
-                    &recipe.gop.to_string(),
+                    &gop,
                     "-sc_threshold",
                     "0",
                 ]);
                 command.args(["-b:v", &format!("{kbps}k"), "-maxrate", &format!("{kbps}k")]);
                 command.args(["-bufsize", &format!("{kbps}k")]);
             }
-            Picture::Hevc => {
+            (Picture::Hevc, Look::Noise) => {
                 command.args([
                     "-c:v",
                     "libx265",
@@ -268,8 +286,44 @@ impl Film {
                     "-x265-params",
                     &format!(
                         "keyint={gop}:min-keyint={gop}:scenecut=0:bframes=2:open-gop=1:\
-                         vbv-maxrate={kbps}:vbv-bufsize={kbps}:log-level=error",
-                        gop = recipe.gop
+                         vbv-maxrate={kbps}:vbv-bufsize={kbps}:log-level=error"
+                    ),
+                ]);
+            }
+            (Picture::H264, Look::App) => {
+                command.args([
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-g",
+                    &gop,
+                    "-keyint_min",
+                    &gop,
+                    "-sc_threshold",
+                    "0",
+                    "-bf",
+                    "2",
+                ]);
+            }
+            (Picture::Hevc, Look::App) => {
+                command.args([
+                    "-c:v",
+                    "libx265",
+                    "-preset",
+                    "ultrafast",
+                    "-tag:v",
+                    "hvc1",
+                    "-pix_fmt",
+                    "yuv420p10le",
+                    "-x265-params",
+                    &format!(
+                        "log-level=error:keyint={gop}:min-keyint={gop}:scenecut=0:bframes=3:\
+                         colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:\
+                         master-display=G(13250,34500)B(7500,3000)R(34000,16000)\
+                         WP(15635,16450)L(10000000,1):max-cll=1000,400"
                     ),
                 ]);
             }

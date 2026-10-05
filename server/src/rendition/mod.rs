@@ -26,7 +26,7 @@
 //!
 //! * **Nothing on disk.** Fragments live in a ring in memory -- two behind
 //!   as many as [`RING_CAP`](crate::rendition::RING_CAP) holds, the farthest from where any run is asked
-//!   dropped first, never the [`LOOKAHEAD`](crate::rendition::LOOKAHEAD) ahead of one -- and are
+//!   dropped first, never the lookahead ahead of one -- and are
 //!   dropped.
 //! * **Every byte is the same however often it is made**: the layout is
 //!   frozen with the first run's formats and the source's index, the
@@ -34,19 +34,22 @@
 //!   producer for [`SEEK_BACK`](crate::rendition::SEEK_BACK) before its first cut, so a slot's samples do
 //!   not depend on where its run started.
 //! * **The cut rule**: segment N begins at the first video sync sample at or
-//!   after its cut -- an indexed sync sample's time, or N x T -- and ends
+//!   after its cut -- an indexed sync sample's time (every one a second or
+//!   more apart: `layout::MIRROR_GRID_US`), or N x T -- and ends
 //!   where N+1 begins; an audio sample belongs to the segment whose cuts its
 //!   presentation time falls between. What a run is handed before its first
 //!   cut is discarded. A slot is produced whole before it is sent.
 //! * **A request for slot N** is answered from the ring; or waits, when N is
-//!   the slot in production or at most [`LOOKAHEAD`](crate::rendition::LOOKAHEAD) past it (and joins that
+//!   the slot in production or within the lookahead past it (and joins that
 //!   production, never restarts it); or is a seek: the run is dropped and a
 //!   new one starts at N -- except that a read never takes the run back from
 //!   a later one ([`Ask`](crate::rendition::Ask)). **Requests, and nothing
 //!   else, make slots**: never where a player was told to start.
-//! * **The lookahead blocks the producer**: a run completes at most
-//!   [`LOOKAHEAD`](crate::rendition::LOOKAHEAD) slots past the last request, then stops reading its
-//!   sink, and the producer's next write blocks.
+//! * **The lookahead blocks the producer**: a run completes the slots
+//!   that begin within [`LOOKAHEAD_TIME`](crate::rendition::LOOKAHEAD_TIME)
+//!   of the last request's, and at least [`LOOKAHEAD`](crate::rendition::LOOKAHEAD)
+//!   past it, then stops reading its sink, and the producer's next write
+//!   blocks.
 //! * **An idle run is let go** after [`IDLE_RELEASE`](crate::rendition::IDLE_RELEASE) without a request,
 //!   and never while a request waits for it to make a slot (a source that
 //!   stalls is waited for, however long); the ring is kept and the next
@@ -79,9 +82,14 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) use speed::WaitClock;
 
-/// Segments produced past the last request before the producer is made to
-/// wait (`L`, §2.1).
+/// The fewest slots produced past the last request before the producer is
+/// made to wait (`L`, §2.1).
 pub const LOOKAHEAD: u64 = 2;
+/// How much of the film is produced past the last request before the
+/// producer is made to wait, when that is more than [`LOOKAHEAD`] slots: a
+/// mirrored layout has a slot per sync sample, a few seconds each, and the
+/// lookahead was two six-second segments when it was counted in slots.
+pub const LOOKAHEAD_TIME: Duration = Duration::from_secs(12);
 /// How many runs may be live at once: two reads far apart (a receiver's
 /// demuxer reading one place while its data source fills another) each
 /// have one, rather than take one from each other in turn.
@@ -101,11 +109,13 @@ pub const SPEED_WINDOW: Duration = Duration::from_secs(10);
 pub const SEEK_BACK: Duration = Duration::from_secs(2);
 /// Samples in flight between a producer and its run.
 const SINK_CAPACITY: usize = 32;
-/// How many slots before the receiver's start a preparation makes
-/// ([`crate::ServerHandle::prepare_rendition`]).
-pub const PREPARED_BEFORE: u64 = 2;
-/// How many slots after the receiver's start a preparation makes.
-pub const PREPARED_AFTER: u64 = 1;
+/// How much of the film before the receiver's start a preparation makes
+/// ([`crate::ServerHandle::prepare_rendition`]): the slots from the one
+/// holding the start less this.
+pub const PREPARED_BEFORE: Duration = Duration::from_secs(12);
+/// How much of the film after the receiver's start a preparation makes:
+/// the slots to the one holding the start plus this.
+pub const PREPARED_AFTER: Duration = Duration::from_secs(6);
 
 /// What the app asks for. Crosses FFI from Dart, so plain data.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -113,7 +123,11 @@ pub const PREPARED_AFTER: u64 = 1;
 pub struct RenditionSpec {
     /// The film's duration, from mpv: how many segments there are.
     pub duration_ms: u64,
-    /// Target segment length (6000; `docs/design/renditions.md` §6).
+    /// Target segment length (6000; `docs/design/renditions.md` §6), for a
+    /// source without an index, whose slots are estimated on this grid. A
+    /// source with one is cut at its sync samples
+    /// (`docs/design/renditions.md`, *A slot per sync sample*), whatever
+    /// this says.
     pub segment_ms: u32,
     /// Where the receiver will be told to start. Production never reads it
     /// -- the receiver's requests decide what is made -- only a preparation
@@ -380,8 +394,8 @@ impl SampleSink {
         self.send(SinkMessage::Index(entries))
     }
 
-    /// One access unit. Blocks while the run is [`LOOKAHEAD`] segments
-    /// ahead of the last request (the pause), and answers [`Stopped`] once
+    /// One access unit. Blocks while the run is its lookahead
+    /// ([`LOOKAHEAD_TIME`]) ahead of the last request (the pause), and answers [`Stopped`] once
     /// the run is dropped.
     pub fn sample(&self, sample: Sample) -> Result<(), Stopped> {
         self.send(SinkMessage::Sample(sample))
@@ -437,6 +451,9 @@ pub struct RenditionTuning {
     pub speed_window: Duration,
     /// The ring's cap in bytes ([`RING_CAP`]).
     pub ring_cap: usize,
+    /// How much of the film a run makes past its last request
+    /// ([`LOOKAHEAD_TIME`]); never fewer than [`LOOKAHEAD`] slots.
+    pub lookahead: Duration,
 }
 
 impl Default for RenditionTuning {
@@ -445,6 +462,7 @@ impl Default for RenditionTuning {
             idle_release: IDLE_RELEASE,
             speed_window: SPEED_WINDOW,
             ring_cap: RING_CAP,
+            lookahead: LOOKAHEAD_TIME,
         }
     }
 }
@@ -601,18 +619,6 @@ impl RunSlot {
     fn unwaited(&self) -> bool {
         self.joined == 0
     }
-
-    /// Whether a request for `slot` waits for this run: the slot in
-    /// production or within the lookahead past it.
-    fn joins(&self, slot: u64) -> bool {
-        slot >= self.next_out && slot <= self.next_out + LOOKAHEAD
-    }
-
-    /// Whether this run made `slot` or is making it: what a request
-    /// answered from the ring moves the lookahead of.
-    fn covers(&self, slot: u64) -> bool {
-        slot >= self.from && slot <= self.next_out + LOOKAHEAD
-    }
 }
 
 /// The decisions that make a slot the same every time it is made
@@ -657,6 +663,8 @@ pub(crate) struct Inner {
     /// The live runs, at most [`MAX_RUNS`].
     runs: Vec<RunSlot>,
     ring_cap: usize,
+    /// [`RenditionTuning::lookahead`], in microseconds.
+    lookahead_us: i64,
     failed: Option<String>,
     plan: SlotPlan,
     runs_started: u64,
@@ -682,12 +690,36 @@ impl Inner {
         }
     }
 
+    /// **The last slot of the lookahead from slot `slot`**: the last
+    /// whose start is at most [`RenditionTuning::lookahead`] after
+    /// `slot`'s, and never fewer than [`LOOKAHEAD`] slots on -- in slots
+    /// alone before the layout is fixed.
+    fn ahead(&self, slot: u64) -> u64 {
+        let least = slot + LOOKAHEAD;
+        match &self.layout {
+            Some(layout) => layout.reach(slot, self.lookahead_us).max(least),
+            None => least,
+        }
+    }
+
+    /// Whether a request for `slot` waits for `run`: the slot in production
+    /// or within the lookahead past it.
+    fn joins(&self, run: &RunSlot, slot: u64) -> bool {
+        slot >= run.next_out && slot <= self.ahead(run.next_out)
+    }
+
+    /// Whether `run` made `slot` or is making it: what a request answered
+    /// from the ring moves the lookahead of.
+    fn covers(&self, run: &RunSlot, slot: u64) -> bool {
+        slot >= run.from && slot <= self.ahead(run.next_out)
+    }
+
     /// Whether run `generation` must wait for a request before it makes
-    /// slot `next_out`: it is [`LOOKAHEAD`] past the last one asked of it,
-    /// or the ring is full and it is past that.
+    /// slot `next_out`: it is past the lookahead from the last one asked of
+    /// it, or the ring is full and it is past that.
     pub(crate) fn gated(&self, generation: u64, next_out: u64) -> bool {
         self.run(generation).is_none_or(|run| {
-            next_out > run.last_request + LOOKAHEAD
+            next_out > self.ahead(run.last_request)
                 || (self.ring_bytes >= self.ring_cap && next_out > run.last_request)
         })
     }
@@ -714,7 +746,11 @@ impl Inner {
     /// first; none at or ahead of a run's last request within its
     /// lookahead.
     fn trim(&mut self) {
-        let anchors: Vec<u64> = self.runs.iter().map(|run| run.last_request).collect();
+        let anchors: Vec<(u64, u64)> = self
+            .runs
+            .iter()
+            .map(|run| (run.last_request, self.ahead(run.last_request)))
+            .collect();
         while self.ring_bytes > self.ring_cap {
             let far = self
                 .ring
@@ -723,12 +759,12 @@ impl Inner {
                 .filter(|key| {
                     !anchors
                         .iter()
-                        .any(|anchor| key >= anchor && *key <= anchor + LOOKAHEAD)
+                        .any(|(anchor, ahead)| key >= anchor && key <= ahead)
                 })
                 .max_by_key(|key| {
                     anchors
                         .iter()
-                        .map(|anchor| key.abs_diff(*anchor))
+                        .map(|(anchor, _)| key.abs_diff(*anchor))
                         .min()
                         .unwrap_or(u64::MAX)
                 });
@@ -798,6 +834,7 @@ impl Rendition {
                 ring_bytes: 0,
                 runs: Vec::new(),
                 ring_cap: tuning.ring_cap,
+                lookahead_us: i64::try_from(tuning.lookahead.as_micros()).unwrap_or(i64::MAX),
                 failed: None,
                 plan: SlotPlan::default(),
                 runs_started: 0,
@@ -879,37 +916,37 @@ impl Rendition {
     /// one, so nothing here produces anything a request would not: the
     /// header (which waits for the layout: the source's formats and index),
     /// slot 0 (Chrome's FFmpeg demuxer reads on from the header into the
-    /// first fragment before it seeks), then [`PREPARED_BEFORE`] slots
-    /// before the slot a receiver told to start at `spec.start_ms` jumps to
-    /// ([`layout::Layout::slot_for_time`]), that slot, and
-    /// [`PREPARED_AFTER`] after it -- the film's ends permitting -- in that
-    /// order, so one run makes them all.
+    /// first fragment before it seeks), then every slot from the one a
+    /// receiver told to start [`PREPARED_BEFORE`] before `spec.start_ms`
+    /// would jump to ([`layout::Layout::slot_for_time`]) to the one for
+    /// [`PREPARED_AFTER`] after it, in order, so one run makes them all.
     ///
-    /// Why the slots before it: FFmpeg's MP4 demuxer seeks a time to the
+    /// Why the film before it: FFmpeg's MP4 demuxer seeks a time to the
     /// slot whose label is at or before the time less the picture's
     /// largest negative composition offset (`dts_shift`, a frame or two of
     /// a film with B-frames), so a start on a cut -- a phone paused on a
     /// key frame -- is asked for in the slot before; and zond's TV asked for
-    /// one slot earlier still (`docs/design/renditions.md`, *Prepared
-    /// before the load*). The slot after is a slot in hand once it plays.
+    /// a slot some twelve seconds earlier still (`docs/design/renditions.md`,
+    /// *Prepared before the load*). The film after it is a slot in hand once
+    /// it plays.
     ///
     /// Its first requests then find these in the ring -- held by its cap
     /// like any slot ([`RING_CAP`]: slot 0 with its run's lookahead and the
-    /// prepared slots with theirs, nine slots, fit it up to some 10 MB a
-    /// slot; past that the farthest from the last one asked go first).
-    /// Waits as long as the source takes, as a request does: a run with a
-    /// request waiting on it is never let go, and nothing gives up (the
-    /// viewer cancels by unpublishing, which ends this with
+    /// prepared slots with theirs are some 42 s of film, which fit it up to
+    /// some 18 Mbit/s; past that the farthest from the last one asked go
+    /// first). Waits as long as the source takes, as a request does: a run
+    /// with a request waiting on it is never let go, and nothing gives up
+    /// (the viewer cancels by unpublishing, which ends this with
     /// [`NotServed::Cut`]).
     pub(crate) async fn prepare(self: &Arc<Self>, state: &AppState) -> Result<u64, NotServed> {
         let layout = self.layout(state).await?;
-        let start_us = i64::try_from(self.spec.start_ms.saturating_mul(1000))
-            .unwrap_or(i64::MAX)
-            .min(self.duration_us());
+        let us = |duration: Duration| i64::try_from(duration.as_micros()).unwrap_or(i64::MAX);
+        let start_us = us(Duration::from_millis(self.spec.start_ms)).min(self.duration_us());
         let slot = layout.slot_for_time(start_us);
-        let last = layout.slots.len() as u64 - 1;
+        let first = layout.slot_for_time(start_us.saturating_sub(us(PREPARED_BEFORE)));
+        let last = layout.slot_for_time(start_us.saturating_add(us(PREPARED_AFTER)));
         self.slot(state, 0, Ask::Seek).await?;
-        for prepared in slot.saturating_sub(PREPARED_BEFORE)..=(slot + PREPARED_AFTER).min(last) {
+        for prepared in first..=last.max(slot) {
             self.slot(state, prepared, Ask::Seek).await?;
         }
         self.prepared.store(true, Ordering::SeqCst);
@@ -1208,7 +1245,7 @@ impl Rendition {
                     let covering = inner
                         .runs
                         .iter()
-                        .filter(|run| run.covers(slot))
+                        .filter(|run| inner.covers(run, slot))
                         .max_by_key(|run| run.from)
                         .map(|run| run.generation);
                     if let Some(generation) = covering
@@ -1223,7 +1260,7 @@ impl Rendition {
                 let joins = inner
                     .runs
                     .iter()
-                    .find(|run| run.joins(slot))
+                    .find(|run| inner.joins(run, slot))
                     .map(|run| run.generation);
                 let unwaited = inner.runs.iter().filter(|run| run.unwaited()).count();
                 let start = ask.start(first, inner.runs.len(), unwaited);
@@ -1307,6 +1344,7 @@ mod tests {
             ring_bytes: 0,
             runs: Vec::new(),
             ring_cap: usize::MAX,
+            lookahead_us: 0,
             failed: None,
             plan: SlotPlan::default(),
             runs_started: 0,

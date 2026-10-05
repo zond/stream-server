@@ -990,8 +990,22 @@ fn lay_video(samples: &[MuxSample], next_pts: Option<i64>, hevc: bool) -> Laid {
         .iter()
         .map(|sample| ticks(sample.pts_us, VIDEO_TIMESCALE))
         .collect();
+    // Decode times: the presentation times sorted, moved on so that the
+    // first is the first sample's presentation time -- the slot's sync
+    // sample, its `sidx` label. An open GOP's leading pictures (shown
+    // before the sync sample they follow) would otherwise put the slot's
+    // first decode time before its label, and FFmpeg 5.0 and later, which
+    // time a fragment by its `tfdt`, sought the sound to a time in the
+    // slot before (`docs/design/renditions.md`, *A slot per sync sample*).
     let mut dts = pts.clone();
     dts.sort_unstable();
+    let lead = match (pts.first(), dts.first()) {
+        (Some(first), Some(earliest)) => first - earliest,
+        _ => 0,
+    };
+    for at in &mut dts {
+        *at += lead;
+    }
     let next = next_pts.map(|pts| ticks(pts, VIDEO_TIMESCALE));
     let mut entries = Vec::with_capacity(samples.len());
     let mut data = Vec::with_capacity(samples.len());
@@ -1754,5 +1768,38 @@ mod tests {
         );
         assert!(numbers.windows(2).all(|pair| pair[1] == pair[0] + 1));
         assert!(*numbers.last().unwrap() <= 8 * 4096);
+    }
+
+    /// **An open GOP's slot begins, in decode time, at its sync sample**:
+    /// decode order CRA (shown at 10 s), two leading pictures shown before
+    /// it, then the rest. The decode times are the presentation times
+    /// sorted and moved on to start at the CRA's: the first `moof`'s `tfdt`
+    /// is the slot's `sidx` label. Before, it was the first leading
+    /// picture's time, 80 ms before the label, and FFmpeg 5.0 and later
+    /// (which time a fragment by its `tfdt`) sought the sound to that time
+    /// -- in the slot before -- and 6.1 landed the picture there too.
+    #[test]
+    fn an_open_gop_slot_begins_at_its_sync_sample() {
+        let formats = Formats {
+            video: Some(TrackFormat::H264 {
+                width: 320,
+                height: 240,
+                csd0: Bytes::from_static(X264_SPS),
+                csd1: Bytes::from_static(X264_PPS),
+            }),
+            audio: None,
+        };
+        let frame = 40_000;
+        let order = [0, -2, -1, 3, 1, 2, 6, 4, 5];
+        let video: Vec<MuxSample> = order
+            .iter()
+            .map(|at| sample(10_000_000 + at * frame, *at == 0))
+            .collect();
+        let fragment = media_segment(&formats, 3, true, &video, Some(10_280_000), &[], None);
+        let samples = indexed(&fragment);
+        assert_eq!(samples[0].1, 10_000_000, "the CRA's decode time is its own");
+        let dts: Vec<i64> = samples.iter().map(|sample| sample.1).collect();
+        assert!(dts.windows(2).all(|pair| pair[0] < pair[1]), "{dts:?}");
+        assert_eq!(dts.last(), Some(&(10_000_000 + 8 * frame)));
     }
 }
