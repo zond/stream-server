@@ -257,8 +257,9 @@ pub struct ServerSettings {
     pub trackers_source_url: String,
 
     /// When true (default), the server uploads to peers all the time.
-    /// When false, it uploads only while a player is reading from it;
-    /// downloading is not affected either way
+    /// When false, it uploads only while a player is reading a torrent from
+    /// it or a torrent download is on its way; downloading is not affected
+    /// either way
     /// (`BackendEngineFS::apply_upload_switch`).
     #[serde(rename = "seedingEnabled", default = "default_seeding_enabled")]
     pub seeding_enabled: bool,

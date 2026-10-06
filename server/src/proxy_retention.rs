@@ -2,8 +2,9 @@
 //! promised, and the window that follows the one and never takes the other.
 //!
 //! This is the proxy's adapter over [`enginefs::retention::owner`], the one
-//! retention owner both drivers run: the same budget, the same
-//! 90%-ahead-10%-behind window, the same rule about what may be reclaimed,
+//! retention owner both drivers run: the same budget, a window per
+//! consumer the read-pattern detector finds (`enginefs::retention::streams`),
+//! the same rule about what may be reclaimed,
 //! and the same pass -- what is here is what makes a chunk directory an
 //! entity of it ([`ProxyBacking`]), and what gives a proxied stream a
 //! playhead. The route serves ranges and always knows the offset, but
@@ -1531,9 +1532,10 @@ impl ProxyRetention {
 
     /// [`Self::reader`], or a **quiet** one: a reader that is not a viewer.
     /// A download's filler reads an entity nobody is watching, and a reader
-    /// that claimed the live entity would tell the reconciler the viewer
-    /// had moved on -- stopping the torrent they are watching -- and its
-    /// playhead would draw a window round bytes nobody is going to read.
+    /// that claimed the live entity would move it off what the viewer is
+    /// playing -- and the switch would take that file's window as slack --
+    /// and its playhead would draw a window round bytes nobody is going to
+    /// read.
     /// Quiet, it claims nothing and notes nothing; its promises still
     /// stand, which is harmless (the entity is pinned) and cheap.
     pub(crate) fn reader_with(
@@ -2277,8 +2279,8 @@ mod tests {
     /// `protected == total` over a cache above its limit is being told the
     /// shortfall has no remedy when the remedy is the pass already running.
     /// A download's filler reads through a **quiet** reader: it claims no
-    /// live entity -- claiming one would tell the reconciler the viewer had
-    /// moved on -- and leaves no playhead. A player's reader does both.
+    /// live entity -- claiming one would move it off what the viewer is
+    /// playing -- and leaves no playhead. A player's reader does both.
     #[tokio::test]
     async fn a_quiet_reader_is_not_a_viewer() {
         let tmp = tempfile::tempdir().unwrap();

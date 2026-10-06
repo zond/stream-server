@@ -20,7 +20,7 @@
 //! would not: a member whose only checksum is BLAKE2sp, or none, which the
 //! crate marks ineligible because *it* cannot verify such a member out of
 //! order. Verification is the fetcher's (`docs/design/translated-sources.md`
-//! §2.2.4): the bytes are piece-checked or they are what the origin served,
+//! §2.2, rule 4): the bytes are piece-checked or they are what the origin served,
 //! and a checksum over a member is a read of the whole member.
 //!
 //! LICENSING: `unrar-rs` is GPL-3.0-or-later, and this module is what the

@@ -9,8 +9,8 @@
 //!
 //! So this is a whole second listener rather than a wider bind on the first
 //! one, and it serves **published cast tokens and nothing else**
-//! (`crate::cast`): `/cast/{token}` for each id the app published, every
-//! other path a `404`. No route that fetches a caller-named URL, none that
+//! (`crate::cast`): `/cast/{token}` for each id the app published (and a
+//! rendition's `/cast/{token}/stream.mp4`), every other path a `404`. No route that fetches a caller-named URL, none that
 //! starts a torrent, none that names a file, and no control route at any
 //! level, not even behind the bearer middleware, so there is no bearer
 //! token to guess, leak or brute-force. Both listeners share one

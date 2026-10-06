@@ -24,10 +24,10 @@
 //!
 //! # The rules this keeps
 //!
-//! * **Nothing on disk.** Fragments live in a ring in memory -- two behind
-//!   as many as [`RING_CAP`](crate::rendition::RING_CAP) holds, the farthest from where any run is asked
-//!   dropped first, never the lookahead ahead of one -- and are
-//!   dropped.
+//! * **Nothing on disk.** Fragments live in a ring in memory of at most
+//!   [`RING_CAP`](crate::rendition::RING_CAP) bytes; over it, the slot
+//!   farthest from where any run was last asked goes first, never one
+//!   within the lookahead ahead of a run's last request.
 //! * **Every byte is the same however often it is made**: the layout is
 //!   frozen with the first run's formats and the source's index, the
 //!   overflow rule's decision per slot is recorded, and a run asks its
@@ -41,10 +41,12 @@
 //!   cut is discarded. A slot is produced whole before it is sent.
 //! * **A request for slot N** is answered from the ring; or waits, when N is
 //!   the slot in production or within the lookahead past it (and joins that
-//!   production, never restarts it); or is a seek: the run is dropped and a
-//!   new one starts at N -- except that a read never takes the run back from
-//!   a later one ([`Ask`](crate::rendition::Ask)). **Requests, and nothing
-//!   else, make slots**: never where a player was told to start.
+//!   production, never restarts it); or starts a run at N -- beside the
+//!   others while fewer than [`MAX_RUNS`](crate::rendition::MAX_RUNS) are
+//!   live, else in place of the least recently asked one nobody is waiting
+//!   on ([`Ask`](crate::rendition::Ask)). **Requests make slots** -- the
+//!   receiver's, or a preparation's asking in its place through the same
+//!   path -- never where a player was told to start.
 //! * **The lookahead blocks the producer**: a run completes the slots
 //!   that begin within [`LOOKAHEAD_TIME`](crate::rendition::LOOKAHEAD_TIME)
 //!   of the last request's, and at least [`LOOKAHEAD`](crate::rendition::LOOKAHEAD)

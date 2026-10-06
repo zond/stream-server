@@ -89,8 +89,9 @@
 //! Nothing outside this owner bounds it, and a proxied stream at 20 MB/s
 //! writes a gigabyte a minute. So the same retention policy the piece store
 //! is under bounds this too --
-//! `enginefs::piece_store::policy`, one budget, a window roughly 90% ahead
-//! of the playhead and 10% behind it -- driven by
+//! `enginefs::piece_store::policy`, one budget, with a window per consumer
+//! the read-pattern detector finds (`enginefs::retention::streams`) --
+//! driven by
 //! [`crate::proxy_retention`]. The only input it was missing is the
 //! playhead: a proxied stream serves ranges, so the reads were always here,
 //! but nothing recorded where playback had got to. It is recorded now, in

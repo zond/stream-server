@@ -26,7 +26,8 @@
 //! `downloaded` is librqbit's `progress_bytes`, the have-bytes, which the
 //! initial check drives from 0 to the payload's length without a peer
 //! being asked for anything, and the peer-received counter the light reads
-//! (`fetched_bytes`) is exposed nowhere else. So on a restart with saved
+//! (`fetched_bytes`) is reported elsewhere only per torrent, as a playback
+//! panel's `transfer.downloadedBytes` (`server`'s `stream_numbers`). So on a restart with saved
 //! torrents the stats show `downloaded` growing while the light stays
 //! dark, and that disagreement is the point: one describes the disk, the
 //! other the connection. What the two do share is the set of torrents they

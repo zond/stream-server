@@ -158,7 +158,7 @@ pub struct DeliveryNumbers {
     pub bodies_open: u64,
     /// Bytes sent, over every body.
     pub bytes: u64,
-    /// The byte the latest `GET` began at.
+    /// The byte the latest body began at (a refused `GET` moves nothing).
     pub last_request_at: Option<u64>,
     /// One past the furthest byte any body has sent.
     pub furthest_at: Option<u64>,
@@ -169,8 +169,10 @@ pub struct DeliveryNumbers {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceNumbers {
-    /// `torrent`, `http` (a link or Drive file through the cache) or
-    /// `member` (a file inside an archive); `None` before the first open.
+    /// `torrent`, `member` (a file inside an archive) or `http` -- every
+    /// other source, read through the shared reader: a link, a Drive file,
+    /// a finished download, a file on this device. `None` before the first
+    /// open.
     pub kind: Option<String>,
     pub bytes_read: u64,
     /// Opens: one a body for a plain publication, one a run for a
@@ -669,7 +671,7 @@ fn slot_bytes(fragment: &Bytes, size: u64, from: u64, to: u64) -> Bytes {
 /// **A rendition's file**: one progressive fragmented MP4 with a length
 /// and ranges (`docs/design/renditions.md`, "Seeking by bytes") -- the
 /// header (`ftyp` + `moov` + `sidx`), then one slot per segment, each its
-/// fragment padded with a `free` box, every byte the same however often
+/// fragment padded with `free` boxes of 1 KiB (`layout::padding`), every byte the same however often
 /// and in whatever order it is asked for. A receiver plays it as a file
 /// (`<video src>`), not through Media Source, and seeks in it by bytes:
 /// it finds the time in the `sidx` and asks for a `Range` there.

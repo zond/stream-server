@@ -10856,8 +10856,8 @@ mod tests {
     /// all.
     ///
     /// So this one is multi-file, and reads the two registers directly,
-    /// not through the reconciler: what the ladder reads is the liveness
-    /// cell, which this rollback deliberately does not touch. The
+    /// not through the reconciler: the liveness cell, which decides the
+    /// windows, is what this rollback deliberately does not touch. The
     /// registers still have to be undone, because nothing ages one out
     /// and the want-set is planned from them: a file still registered as
     /// the active one is unioned back into `only_files` on every later

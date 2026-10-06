@@ -312,9 +312,9 @@ impl MetadataResolutionGuard {
     /// metadata yet -- ask the engine's reconciler whether it should now
     /// be running.
     ///
-    /// **Only without metadata.** The ladder reads `playing` from the
-    /// liveness cell and the reads open on the torrent, and this runs
-    /// before the stream open writes the cell, so for a torrent that has
+    /// **Only without metadata.** The ladder reads `held` -- the holds,
+    /// and the streams being delivered -- and this runs before the stream
+    /// open registers its stream, so for a torrent that has
     /// its metadata the question is about one nobody has claimed yet. A
     /// torrent the viewer is coming back to -- still running from before
     /// the last switch, not yet stopped by the timer -- is neither playing

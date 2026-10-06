@@ -17,13 +17,14 @@
 //! then the sound beside it, so a reader going straight through never
 //! goes back and forth between the two.
 //!
-//! **Times.** Video is on a 90 kHz clock, audio on its sample rate, both
-//! from the producer's microseconds. A video sample's decode time is not
-//! reported (`MediaExtractor` has only a presentation time), so the decode
-//! times of a segment are its presentation times sorted -- the reorder
-//! window is at most a segment, which starts at a sync sample -- and each
-//! sample's composition offset is the difference, signed (`trun` version
-//! 1). With no reordering, every offset is zero.
+//! **Times.** Video is on a 90 kHz clock, and audio too when there is a
+//! picture (its sample rate when there is none), both from the producer's
+//! microseconds. A video sample's decode time is not reported (only a
+//! presentation time is), so the decode times of a slot are its
+//! presentation times sorted, run `D` ([`DECODE_AHEAD_US`], half a second)
+//! ahead and fitted to the slot's span (`slot_dts`), and each sample's
+//! composition offset is the difference, in a version-1 `trun`: never
+//! negative while `D` covers the slot's reordering.
 //!
 //! **Samples** come in Annex-B (start codes) and leave length-prefixed
 //! with four-byte lengths, access unit delimiters dropped; a sample that
@@ -69,7 +70,7 @@ pub(crate) const VIDEO_TIMESCALE: u32 = 90_000;
 pub(crate) const DECODE_AHEAD_US: i64 = 500_000;
 
 /// **How long the first part of a slot is**: its first chunk's `moof`
-/// (after the `styp`, when there is one), padded with a `free` box; the
+/// (after the `styp`, when there is one), padded with `free` boxes; the
 /// slot's second part -- the first chunk's `mdat` and every other chunk --
 /// begins here, and the `sidx` gives each part a reference of its own.
 ///

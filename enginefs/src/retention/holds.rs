@@ -17,7 +17,8 @@
 //! or a cast of it is published. So it says so, and the hold lasts exactly
 //! as long as that is true.
 //!
-//! Two kinds, and nothing else writes here:
+//! Three kinds, and nothing else writes here but a file's deletion, which
+//! takes a screen's hold and an idle share off it ([`Holds::forget_file`]):
 //!
 //! * **A player screen** ([`Holds::hold_for_player`]): the torrent the
 //!   viewer's newest screen's own requests named -- the same told play
@@ -313,8 +314,8 @@ impl Holds {
 
     /// **`file_idx` of `info_hash` was deleted**: a player screen's hold on
     /// it goes -- the screen plays a file that no longer exists, and the
-    /// torrent must not run on its account. A cast's stays until its
-    /// unpublish.
+    /// torrent must not run on its account -- and so does an idle share of
+    /// it. A cast's stays until its unpublish.
     pub fn forget_file(&self, info_hash: &str, file_idx: usize) {
         let names = |on: &On| {
             on.info_hash == info_hash

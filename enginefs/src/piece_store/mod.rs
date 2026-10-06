@@ -172,11 +172,11 @@
 //! torrent refuses to take an announcement back. [`crate::retention`] is the
 //! wiring that performs the policy.
 //!
-//! All three are exercised rather than assumed. The storage is driven through
+//! The settled points are exercised rather than assumed. The storage is driven through
 //! a real librqbit session's own initial check below, and through a real
 //! *persisted* session across a restart in `backend::librqbit`'s
 //! `a_restart_on_the_piece_store_finds_its_data_and_the_reconciler_starts_it`.
-//! The third is exercised over two real sessions on the wire, in the same
+//! The last is exercised over two real sessions on the wire, in the same
 //! module's `a_peer_is_never_told_about_a_piece_we_later_reclaim`: what the
 //! peer ends up holding is what we announced, and every one of those pieces
 //! is still on our disk when the stream is over.

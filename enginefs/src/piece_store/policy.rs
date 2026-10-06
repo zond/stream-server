@@ -103,7 +103,8 @@
 //! budget adopts the draw whole, over its capacity and all
 //! ([`RetentionPolicy::carry_into`]). The draw ends with the play session:
 //! the torrent leaves the swarm first, and only then are its pieces deleted
-//! (`crate::BackendEngineFS`'s `EndShares`).
+//! (the reconciler's [`crate::reconcile::Decision::EndShares`], which
+//! `BackendEngineFS` carries out).
 //!
 //! **The set under-fills, and that is correct.** It is never fetched for: we
 //! commit what we hold, and we hold what the viewer's window fetched, so a

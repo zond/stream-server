@@ -23,7 +23,9 @@
 //! and the play session's move (a torrent's `TorrentStream`), and the
 //! lease on the registry entry. The foreign side -- the thread mpv calls
 //! in on -- owns a [`MediaReader`]: a command sender, a cancellation token,
-//! a length and the runtime's handle. Nothing else.
+//! a length, the source's kind, the runtime's handle and the counters it
+//! shares with the task (whether a read waits, for how long, what was
+//! read). Nothing whose drop spawns.
 //!
 //! * **Nothing a foreign thread drops can spawn.** A torrent source's end
 //!   (`StreamLifecycleGuard::notify_end`, an aside's `on_stream_end`) calls
@@ -150,9 +152,10 @@ impl std::fmt::Display for MediaId {
 /// The viewer's player behind a reader: the token `p=` carries today
 /// (`<viewer>.<screen>`) and its read-ahead choice. Whether the file
 /// shares is decided here, not by the app: a torrent file shares unless it
-/// is an archive or a disc image played as itself; a member of a
-/// single-file container in a torrent shares its own extent of it; a
-/// multi-volume set's member, or a container behind links, shares nothing.
+/// is an archive or a disc image played as itself; a member of a container
+/// in a torrent shares its own bytes -- its extent of a single container
+/// file, or its bytes in every volume of a multi-volume set, drawn once for
+/// the set; a container behind links shares nothing.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlayToken {
     /// `<viewer>.<screen>`, as `p=` carries it.

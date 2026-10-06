@@ -16,8 +16,10 @@
 //!   protocol uses. A fresh connection id is obtained per scrape (they expire
 //!   after about a minute) on a socket of our own, never one librqbit holds.
 //!
-//! These functions are one-shot: they ask once and answer, doing no caching
-//! and no rate limiting of their own.
+//! The scrape functions are one-shot: they ask once and answer. Caching,
+//! rate limiting and the per-torrent aggregate are [`SwarmScraper`]'s
+//! ([`MIN_SCRAPE_INTERVAL`] between two scrapes of one tracker and hash,
+//! backoff on failure).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

@@ -255,8 +255,10 @@ pub struct ServerConfig {
     /// Settings and logs. `None` uses the platform config dir (needs
     /// `HOME`/`XDG_*`); embedders must set it explicitly.
     pub config_dir: Option<PathBuf>,
-    /// Torrent data (the piece store), the proxy cache and the session's
-    /// DHT and resume state. `None`
+    /// The default torrent-data root (`settings.cacheRoot`): the piece
+    /// store, the proxy cache and the session's DHT and resume state live
+    /// under its `media-cache`, and a `cacheRoot` saved in `settings.json`
+    /// takes its place. `None`
     /// means `config_dir/cache` when `config_dir` is set, otherwise the
     /// platform cache dir. No environment variable is consulted once
     /// `config_dir` is given.
@@ -301,7 +303,8 @@ pub struct ServerConfig {
     /// [`TorrentListenPort::Loopback`].
     pub torrent_listen_port: TorrentListenPort,
     /// Where the LAN media listener binds when it runs: a second HTTP
-    /// listener serving `/cast/{token}` and nothing else -- the ids the app
+    /// listener serving `/cast/{token}` (and a rendition's
+    /// `/cast/{token}/stream.mp4`) and nothing else -- what the app
     /// published with [`ServerHandle::publish`] -- so a Chromecast or other
     /// receiver on the local network can fetch the bytes of what this
     /// device casts while the control API and every other route stays on
@@ -617,9 +620,10 @@ impl ServerHandle {
     /// has. With `play`, its reads are the viewer's playback: the play
     /// session moves to the file, and a torrent file shares unless it is
     /// an archive played as itself (decided here, as the stream route
-    /// decides it for `p=`); a member of a single-file container in a
-    /// torrent shares its own extent of that file, and a member of a set
-    /// or of a container behind links shares nothing. Without one they are an aside, which moves nothing and shares
+    /// decides it for `p=`); a member of a container in a torrent shares
+    /// its own bytes -- its extent of a single container file, or its bytes
+    /// in every volume of a multi-volume set, drawn once for the set -- and
+    /// a member of a container behind links shares nothing. Without one they are an aside, which moves nothing and shares
     /// nothing. The stream is registered before this returns. A reader
     /// holds no `ServerHandle`: stopping the server under it makes its
     /// calls answer an error. See [`media::reader`].
@@ -830,9 +834,10 @@ impl ServerHandle {
     /// ratio taken from them must be labelled as one.
     ///
     /// It creates nothing and does not count as a poll, so it cannot hold a
-    /// torrent out of the idle sweep; it is not free, though, since the
-    /// window is counted from a listing of the stream's own directories on
-    /// the blocking pool. Ask it while a panel is open, not for the life of
+    /// torrent out of the idle sweep; it is not free, though: a torrent's
+    /// answer copies its store's held bits, and a proxied entity's first
+    /// ask lists its chunk directories on the blocking pool to seed the
+    /// owner's held set. Ask it while a panel is open, not for the life of
     /// the process.
     pub fn stream_numbers(
         &self,
@@ -1400,8 +1405,8 @@ impl ServerHandle {
 
     /// Start or stop the LAN media listener (see [`crate::lan_media`]): a
     /// second HTTP listener on [`ServerConfig::lan_media_addr`] serving
-    /// `/cast/{token}` and nothing else -- the ids published with
-    /// [`Self::publish`] -- for handing the bytes of what this device casts
+    /// `/cast/{token}` (and a rendition's `/cast/{token}/stream.mp4`) and
+    /// nothing else -- what was published with [`Self::publish`] -- for handing the bytes of what this device casts
     /// to a Chromecast or other receiver on the local network. Returns the address it is bound to afterwards --
     /// `Some` after a successful start, `None` after a stop.
     ///

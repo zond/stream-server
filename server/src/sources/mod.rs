@@ -11,8 +11,7 @@
 //! member is made of is refused rather than extracted; see
 //! `docs/design/translated-sources.md`.
 //!
-//! What is here is the seam itself and the two sources a fetcher exists
-//! for:
+//! What is here is the seam itself and the sources behind it:
 //!
 //! * [`ByteSource`](crate::sources::ByteSource), with [`ReadHint`](crate::sources::ReadHint) -- the two ways bytes are asked for,
 //!   an index read and a body read, which are different enough that a
@@ -27,6 +26,8 @@
 //!   own access token, since a film outlives one;
 //! * [`local::LocalSource`](crate::sources::local::LocalSource) over a file on this device, a path or an fd,
 //!   which nothing fetches and nothing retains;
+//! * `held::HeldSource` over a complete proxy-cache entry with no origin
+//!   behind it -- a finished link or Drive download, played offline;
 //! * `testing` (test builds only) -- a source over a `Vec<u8>` and a wrapper that counts what
 //!   was asked of the one underneath, which is how a test proves that
 //!   reading an index read no more than the index.

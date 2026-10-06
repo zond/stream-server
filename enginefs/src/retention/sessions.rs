@@ -36,9 +36,10 @@
 //! ([`PlaySessions::may_end_now`]).
 //!
 //! It is not the liveness cell ([`crate::retention::live`]): that one
-//! still decides which file's window is kept and whether a torrent runs,
-//! from every stream a request opens. This decides only what is shared,
-//! and when a share ends.
+//! follows every stream a request opens and decides only which file's
+//! window is kept. Whether a torrent runs is its holds'
+//! ([`crate::retention::holds`]). This decides only what is shared, and
+//! when a share ends.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;

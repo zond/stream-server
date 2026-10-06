@@ -66,13 +66,13 @@ pub enum Decision {
     Leave,
     /// The torrent advertises pieces nobody shares any more
     /// ([`Conditions::shares_to_end`]): stop it -- it leaves the swarm, its
-    /// peers are disconnected -- then take the ended play session's bytes
-    /// and make its advertised set again from what is still shared
-    /// (`Engine::end_shares`), and only then decide again, which starts it
-    /// once more if it is still wanted: the same torrent's next episode, a
-    /// download.
+    /// peers are disconnected -- then make its advertised set again from
+    /// what is still shared (`Engine::end_shares`), and decide again, which
+    /// starts it once more if it is still wanted: the same torrent's next
+    /// episode, a download. The ended play session's bytes are taken after
+    /// that (`Engine::drop_slack`), no longer advertised.
     ///
-    /// Its own decision because it is two calls and a deletion between
+    /// Its own decision because it is two calls and a rebuild between
     /// them, made under the hash's reconcile lock so that nothing starts
     /// the torrent in between. There is no un-Have in BitTorrent: an
     /// announcement ends only with the torrent leaving the swarm, so this

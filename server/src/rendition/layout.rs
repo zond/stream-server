@@ -105,7 +105,7 @@ const MAX_SLOTS: i64 = u16::MAX as i64 / 2;
 
 /// The grid a mirrored layout of a film `duration_us` long is cut on:
 /// [`MIRROR_GRID_US`], or wider when that would make more slots than a
-/// `sidx` counts (a film over 18 hours).
+/// `sidx` counts at two references a slot (a film over about nine hours).
 pub(crate) fn mirror_grid(duration_us: i64) -> i64 {
     MIRROR_GRID_US.max(duration_us / (MAX_SLOTS - 1) + 1)
 }

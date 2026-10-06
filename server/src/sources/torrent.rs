@@ -28,8 +28,10 @@
 //!   to watch, and the retention owner unable to keep any of it.
 //! * **The stream registration lasts as long as the source, not the
 //!   handle.** Every route that opens a reader on a torrent registers a
-//!   stream first (AGENTS.md), because the reconciler pauses a torrent
-//!   nobody is playing -- mid-body, dropping its peers -- and because a
+//!   stream first (AGENTS.md), because the reconciler stops a torrent
+//!   nothing holds, and a registered stream is what holds it while a body
+//!   is delivered -- without one, a torrent nothing else holds stops
+//!   mid-body, dropping its peers -- and because a
 //!   request arriving on a torrent an earlier pass stopped gets a reader
 //!   that parks on pieces nobody is fetching. A source holds that
 //!   registration (and, with a play, the play session's move) for its

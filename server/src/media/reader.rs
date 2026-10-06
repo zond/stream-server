@@ -11,7 +11,8 @@
 //!   position, and the lease on the registry entry, and drops all of them
 //!   on the runtime when the command channel ends;
 //! * the [`MediaReader`] owns the sender, the [`CancellationToken`], the
-//!   length and the runtime's `Handle` -- nothing whose drop spawns;
+//!   length, the source's kind, the counters it shares with the task and
+//!   the runtime's `Handle` -- nothing whose drop spawns;
 //! * a cancel is the token, never a command, and every read and seek the
 //!   task makes is raced against it.
 
@@ -57,8 +58,10 @@ pub enum Command {
 pub(crate) enum Source {
     /// One per reader: its stream registration and play are this reader's.
     Torrent(Box<TorrentSource>),
-    /// Shared with the registry entry: a proxied or Drive entity, whose
-    /// source holds no registration of its own.
+    /// Shared with the registry entry: a link, a Drive file, a finished
+    /// download read off the cache, or a file on this device -- whose
+    /// source holds no registration of its own. Its kind is `http` for
+    /// every one of them.
     Shared(Arc<dyn ByteSource>),
     /// A member of a container: the view over its volumes, the volumes
     /// opened as the viewer's playback (none for an aside or a container

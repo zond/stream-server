@@ -1,10 +1,11 @@
 //! Bounding the streaming cache, and telling the truth about what we hold.
 //!
 //! [`crate::piece_store::policy`] is the arithmetic -- a budget, a piece
-//! length, the pieces of one file, where the playhead is, and out of it a
-//! window to keep, a set to share and a set to give back. [`owner`] is the
-//! owner: it keeps one policy per file, resident and never taken out, and
-//! runs the pass that feeds it the playhead a reader actually reached. This
+//! length, the pieces of one file, what the readers were granted -- and out
+//! of it a set to share and a set to give back; the windows to keep are the
+//! detector's ([`streams`]), from the runs of disk the reads caused. [`owner`]
+//! is the owner: it keeps one policy per file, resident and never taken
+//! out, and runs the pass over what the reads show. This
 //! module is the torrent's half of the wiring under both -- the budget cell
 //! the server publishes into, the bell that says the volume is running low,
 //! and the calls that make a policy's answers true --

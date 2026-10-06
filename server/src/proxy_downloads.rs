@@ -20,7 +20,8 @@
 //!   is one narrowed, conditional fetch that lands in the cache, which is
 //!   exactly what `/proxy` does for a player and is why nothing here writes
 //!   a chunk itself. Quiet, because a reader that claimed the live entity
-//!   would tell the reconciler the viewer had moved on.
+//!   would move it off what the viewer is playing, and the switch would
+//!   take that file's bytes as slack.
 //!
 //! What a pin names is the identity the cache already keys on: the final
 //! target URL with the `h=` request headers for an addon link, the vouched

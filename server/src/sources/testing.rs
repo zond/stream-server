@@ -1,14 +1,10 @@
 //! Sources a test can hold in its hand: bytes in memory, and a wrapper
 //! that counts what was asked of the source underneath.
 //!
-//! **Not behind `#[cfg(test)]`.** What [`CountingSource`] is for is the
-//! claim the whole design rests on -- that reading a container's index
-//! reads the index and not the film -- and that claim is made by the
-//! integration tests as well as the unit ones. A source that only existed
-//! in unit builds would have the end-to-end tests proving nothing about it.
-//! Nothing here reads a file, opens a socket or writes a byte, so carrying
-//! it in a release build costs a few hundred bytes of text and buys one
-//! definition instead of two.
+//! **Test builds only** (`#[cfg(test)]` in `sources/mod.rs`). What
+//! [`CountingSource`] is for is the claim the whole design rests on --
+//! that reading a container's index reads the index and not the film --
+//! and every translator's unit tests make it through this one definition.
 
 use super::{ByteSource, ReadHint, SeekableReader};
 use std::io;

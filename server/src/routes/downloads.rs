@@ -35,10 +35,10 @@ pub struct DownloadInfo {
     /// is a torrent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<crate::proxy_downloads::ProxyPinKey>,
-    /// Where a finished proxy download plays from: the `/proxy` URL of the
-    /// stream, which a complete entry answers off the disk. A torrent's is
-    /// its media route, which the client already knows; a Drive file's is
-    /// the session route the client opens, so both are `None` here.
+    /// Where a proxy download plays from: `/downloads/{key}/stream`, which
+    /// serves the pinned entry by range off the disk, for a link and a
+    /// Drive file alike. A torrent's is its media route, which the client
+    /// already knows, so it is `None` here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub play_url: Option<String>,
     /// What the torrent backend calls this file, when it knows.

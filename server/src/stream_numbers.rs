@@ -28,8 +28,9 @@
 //!
 //! [`StreamStore`] is an interface, not a layer. Both stores are already
 //! correctly keyed by something this server maintains for other reasons, and
-//! each implementation answers from a live reading of its own -- a listing of
-//! the piece directories, a listing of the chunk directories -- and remembers
+//! each implementation answers from a reading of its own store taken at the
+//! call -- the piece store's held bits, the proxy owner's held set (seeded
+//! once from a listing of the entity's chunk directories) -- and remembers
 //! nothing between calls. A route with bookkeeping of its own would have been
 //! a third thing to keep true, and the readings it cached would be claims
 //! about a past by the time anybody read them.
@@ -52,8 +53,9 @@
 //! * **no [`StreamNumbers`] at all** -- this server is not holding that
 //!   stream;
 //! * **no [`StreamNumbers::window`]** -- no reader has been anywhere inside
-//!   the stream in this process, so there is no playhead to measure from
-//!   (and, for a proxied stream, it is not the one being played). **The
+//!   the torrent stream in this process, so there is no playhead to
+//!   measure from. A proxied stream that is not being played, or that no
+//!   byte has reached a player of yet, has no answer at all. **The
 //!   budget has nothing to do with it**: a stream the budget covers, one
 //!   no budget has been published for and a pinned file each have a
 //!   window, which is then whatever has been fetched round the playhead --
@@ -118,8 +120,9 @@ pub struct Sharing {
     /// fetching 1.6 GB to play a hundred megabytes legible, and they stay
     /// for that reason.
     ///
-    /// Never absent: every torrent stream has an engine, and a proxied
-    /// response, which has none, has no sharing row at all.
+    /// Never absent while the torrent's store is live: a proxied response,
+    /// which has no engine, has no sharing row at all, and a torrent in
+    /// error, or whose store is not seeded yet, can answer nothing at all.
     pub refused_reclaims: usize,
 }
 
