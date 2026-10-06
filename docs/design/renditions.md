@@ -95,7 +95,8 @@ stream-server `29e377e`, which is after step C (`113a556`), and
 `_castUrl` (`player_screen_casting.dart:439`) still rebuilds the loopback
 URL on the LAN base, which that server answers `404`; nothing in xtremio's
 `lib/` or `rust/src/` calls `publish`. Renditions publish too, so the app
-half of C is step F's first dependency (F0, §5).
+half of C is step F's first dependency (F0, §5). *(Built since: F0 is
+xtremio `56d4bda`, whose `_castUrl` publishes.)*
 
 ## 2. The abstraction
 
