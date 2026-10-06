@@ -13,8 +13,8 @@ tokens and nothing else**.
 
 | | |
 |---|---|
-| **What it exposes** | `GET`/`HEAD` `/cast/{token}` ([`server/src/cast.rs`](../server/src/cast.rs)), and for a rendition its file at `/cast/{token}/stream.mp4` ([Renditions](#renditions)). The app publishes a media id for a cast (`ServerHandle::publish(&MediaId, Option<PlayToken>) -> CastToken`) and hands the receiver `<lan_media_base_url>/cast/<token>`; the route serves what the id resolves to -- a torrent file, a link through `/proxy`'s cache, a Google Drive file, a finished download, a member of an archive -- with the range framing every media route shares (`200`/`206`/`416`, `Content-Range`, `HEAD`, the DLNA headers). An unknown token is a `404`. A link whose origin will not serve ranges is refused (`501`, `{"refused":"noRanges"}`): nothing here can seek it for a receiver |
-| **What it does not** | Every other path is a `404`, every method: the control router is **not mounted at all** (a control path answers `404`, never the `401` that would confirm the route exists and only a bearer token is missing), and neither is any loopback media route -- not the torrent routes, the archive routes, `/proxy`, `/ftp`, `/drive/stream`, `/downloads/{key}/stream` or `/local-addon` |
+| **What it exposes** | `GET`/`HEAD` `/cast/{token}` ([`server/src/cast.rs`](../server/src/cast.rs)), and for a rendition its file at `/cast/{token}/stream.mp4` ([Renditions](#renditions)). The app publishes a media id for a cast (`ServerHandle::publish(&MediaId, Option<PlayToken>) -> CastToken`) and hands the receiver `<lan_media_base_url>/cast/<token>`; the route serves what the id resolves to -- a torrent file, a link through `/proxy`'s cache, a Google Drive file, a finished download, a file on this device, a member of an archive -- with the range framing every media route shares (`200`/`206`/`416`, `Content-Range`, `HEAD`, the DLNA headers). An unknown token is a `404`. A link whose origin will not serve ranges is refused (`501`, `{"refused":"noRanges"}`): nothing here can seek it for a receiver. Every refusal is the archive routes' `{"refused","message"}` -- `404` for `unknownId`, `noSuchFile` or `unrecognisedUrl`, `422` a malformed container and `415` another translator refusal, `501` `noRanges`, `noReader` or `notYet`, `507` `insufficientDiskSpace`, `503` `serverStopped`, `502` the rest -- and is logged as `cast refused` with its kind |
+| **What it does not** | Another method on a cast path is a `405`. Every other path is a `404`, every method: the control router is **not mounted at all** (a control path answers `404`, never the `401` that would confirm the route exists and only a bearer token is missing), and neither is any loopback media route -- not the torrent routes, the archive routes, `/proxy`, `/ftp`, `/drive/stream`, `/downloads/{key}/stream` or `/local-addon` |
 | **Where it binds** | `ServerConfig::lan_media_addr: Option<SocketAddr>` -- `None` by default, so nothing changes unless an embedder asks for it. `Some(0.0.0.0:0)` lets the OS pick the port |
 | **When it runs** | `ServerHandle::set_lan_media(true)` starts it, `set_lan_media(false)` stops it -- meant to bracket a cast session, so the LAN surface exists only while something is casting. Nothing is bound at startup, whatever the configuration: a port already in use fails the cast that asked for the listener, never the server |
 | **How it is switched off entirely** | The `lanMediaEnabled` setting (`POST /settings`, **`false` by default**). While it is false, `set_lan_media(true)` is refused; setting it back to false also stops a listener that is already running, which unpublishes every token |
@@ -67,39 +67,47 @@ it is refused with `noProducer` until the embedder has called
 
 | Path | Answers |
 |---|---|
-| `GET /cast/{token}/stream.mp4` | `video/mp4`, `Cache-Control: no-store`, a `Content-Length` and `Accept-Ranges: bytes`, with the range framing every media route shares (`200`, `206` with `Content-Range`, `416` naming the length): **a file whose every byte is fixed before it is made** -- the header (`ftyp` + `moov` + `sidx`), then one slot per segment -- per sync sample when the source has an index, a segment of `segmentMs` estimated when it has none -- each that segment's fragment -- a `styp` unless the slot opens at its `sidx` label, then a `moof` + `mdat` per half second, the picture and then the sound beside it -- padded with a `free` box to the slot's end. Waits for the first run's formats and the source's index, which fix the length. A range that begins in a slot waits for that slot's fragment before it answers, so a rendition that cannot make it is `503` `{"refused":"renditionFailed","message":...}` (or `{"refused":"unpublished"}` for one the unpublish woke); a range that begins in the header answers at once. After that, a failure or the cut breaks the body with an error. Nothing times it out |
+| `GET /cast/{token}/stream.mp4` | `video/mp4`, `Cache-Control: no-store`, a `Content-Length` and `Accept-Ranges: bytes`, with the range framing every media route shares (`200`, `206` with `Content-Range`, `416` naming the length): **a file whose every byte is fixed before it is made** -- the header (`ftyp` + `moov` + `sidx`, and a second `sidx` for the sound in an estimated layout with sound), then one slot per segment -- per sync sample when the source has an index and its sync samples are a second or more apart (about a second each when they are closer), slots of `segmentMs`, estimated, when it has none -- each that segment's fragment -- a `styp` unless the slot opens at its `sidx` label, then a `moof` + `mdat` per half second, the picture and then the sound beside it -- padded to the slot's end with `free` boxes of 1 KiB, the last under 2 KiB (`layout::padding`, `PAD_BOX`), so a demuxer reads its way over them instead of seeking. Waits for the first run's formats and the source's index, which fix the length. A range that begins in a slot waits for that slot's fragment before it answers, so a rendition that cannot make it is `503` `{"refused":"renditionFailed","message":...}` (or `{"refused":"unpublished","message":...}` for one the unpublish woke); a range that begins in the header answers at once. After that, a failure or the cut breaks the body with an error. Nothing times it out |
 | `HEAD /cast/{token}/stream.mp4` | The same headers; waits for the length as a `GET` does (starting the first run) |
 
 **The receiver seeks by bytes.** The init segment carries the film's
 length (`mvhd`, `tkhd`, and each track's `mdhd` on its own clock, which is
-the one a receiver's demuxer reads), and the video's `sidx` one reference
-per slot -- its size and its time -- so a seek, in every stream (the sound
-finds its slot by the video's times), is one `Range` straight at the slot
-that holds the time (measured on zond's TV:
+the one a receiver's demuxer reads), and the video's `sidx` two references
+per slot -- the slot's first 8 KiB, labelled at its time, and the rest,
+which lasts nothing -- so a seek, in every stream, is one `Range` straight
+at the slot that holds the time (a mirrored layout's sound finds its slot
+by the video's times; an estimated layout with sound has a `sidx` of its
+own for the sound, labelled at each cut less the sound's lead) (measured on zond's TV:
 [design/renditions.md](design/renditions.md), "Seeking by bytes"). With
 the source's index (Matroska cues, an MP4's sample tables, an AVI's
 `idx1`) the layout **mirrors** it: segment `n` is cut at the first indexed
-sync sample at or after `n x T`, and its slot is as long as the source's
-bytes from that sync sample to the next segment's, plus a little headroom
-(8 KiB and a 64th); without one (a transport stream, an MKV with no cues)
-the slots are **estimated**: on the `n x T` grid, in proportion to time
-over the source's size, 15% larger and 8 KiB on top, each
-labelled in the `sidx` 10 s after its cut (its first sync sample may be
-up to a GOP late). A segment holds the
+sync sample at or after `n` seconds (a wider grid for a film over about
+nine hours), and its slot is as long as the source's bytes from that sync
+sample to the next segment's, plus a little headroom (8 KiB and a 64th),
+plus room for a `moof` and `mdat` header every half second and the 8 KiB
+first part (`layout::interleave_room`); without one (a transport stream,
+an MKV with no cues) the slots are **estimated**: on the `segmentMs`
+grid, in proportion to time over the source's size, 15% larger, with the
+same 8 KiB and header room on top, each labelled in the `sidx` 10 s after
+its cut less the picture's half-second decode lead (its first sync sample
+may be up to a GOP late). Every slot is then lengthened to end on a 32 KiB
+boundary, the block Chrome asks in (`SLOT_ALIGN`). A segment holds the
 video from its sync sample to the next segment's and the audio between
-the two cuts, 64 ms early (so the frame playing at the sync sample is in
-its fragment, where a demuxer seeking the sound looks). One that does not fit its slot keeps what fits and
-**spills** the rest into the next slot -- or, when the next slot is
-already made, **drops** it (logged) -- a decision made once and kept, so a
+the two cuts, 564 ms early -- half a second for the picture's decode lead
+and 64 ms more -- so the frame playing at the sync sample is in its
+fragment, where a demuxer seeking the sound looks. One that does not fit its slot keeps what fits and
+**spills** the rest into the next slot -- or, when the next slot's start is
+already decided (something of it made, or a run started at it), **drops** it (`rendition_slot_truncated`) -- a decision made once and kept, so a
 slot made again is the same bytes. The last 16 bytes of every slot are
 zeros and are answered without making anything (a demuxer peeking at the
 file's end for an `mfra`).
 
 A plain token has no `stream.mp4` (`404`); a rendition's token serves it
 and, like a plain one, the source as it is at `/cast/{token}`. Each `GET`
-counts as one body (`lan_media_bodies_served`). Up to two runs are live at once,
-each producing at most two slots past the one last asked of it and then
-waiting; a range at a slot no run will make soon starts a run there, two
+that begins sending bytes counts as one body (`lan_media_bodies_served`); a
+`416` or a `503` does not. Up to two runs are live at once,
+each producing the slots that begin within 12 s of the one last asked of
+it, two at least, and then waiting; a range at a slot no run will make soon starts a run there, two
 seconds before the slot's cut (so a run started there makes exactly what
 one passing through makes), beside the other or in place of the least
 recently asked one nobody is waiting on -- only a range's first look at
@@ -115,7 +123,7 @@ seconds of its own work -- leaving out the time it waited for the receiver
 and for the source -- fails the rendition with a sentence, which
 `ServerHandle::rendition_state(&CastToken)` reports
 (`{"state":"failed","sentence":...}`; otherwise `producing`, `idle`, or
-`ended` for a token not published).
+`ended` for a token not published, or not a rendition).
 
 **Prepare before the receiver is told to load.** A receiver's first answer
 waits for the layout (the first run's formats and the source's index -- a
@@ -169,7 +177,7 @@ routable address is cellular is still offered it rather than nothing.
 **A cast that never starts leaves no other trace**, which is why this
 listener reports on itself. Every answer `lan_media_base_url` gives is logged
 at INFO -- the peer, the interface picked and the URL -- as is each of the ways
-it can answer `None`, and so is every request that reaches the listener
+it can answer `None` (an authority it cannot parse at WARN), and so is every request that reaches the listener
 (method, path with the token elided, peer). Two counts read the same
 session from the outside, both reset by every start (whether or not a
 listener was already running, since starting a cast to a second receiver
@@ -189,7 +197,7 @@ seconds after the receiver was told to load, has **three readings**:
 | Requests | Bodies | Reading | What to do |
 |---|---|---|---|
 | 0 | 0 | Nothing reached this device: the address is wrong (another interface, a client-isolated Wi-Fi, a firewall). | End the session and say the receiver cannot reach this device. |
-| > 0 | 0 | The receiver reached this device and was served nothing: a token it was not given, or an id that would not open (the refusal is in the log). | End the session and say so -- the network is fine. |
+| > 0 | 0 | The receiver reached this device and was served nothing yet: a token it was not given, an id that would not open (the refusal is in the log), or a stream that has not come. | Say so -- the network is fine. xtremio puts a note on the remote and asks again rather than ending a cast whose stream may still come. |
 | > 0 | > 0 | The network and the server did their part. | Leave it to the media. |
 
 The addresses in those log lines are private ones on the user's own LAN;
@@ -209,7 +217,7 @@ safe to poll once a second.
   "kind": "rendition",
   "contentType": "video/mp4",
   "delivery": {"requests": 7, "bodiesBegun": 6, "bodiesEnded": 5, "bodiesOpen": 1,
-               "bytes": 48213004, "lastRequestAt": 1180672, "furthestAt": 1311744},
+               "bytes": 48213004, "lastRequestAt": 47022080, "furthestAt": 48496640},
   "source": {"kind": "torrent", "bytesRead": 51003392, "opens": 2, "seeks": 14},
   "rendition": {
     "video": "copy", "audio": {"aacStereo": {"bitrate": 192000}},
@@ -238,10 +246,15 @@ safe to poll once a second.
   rendition (each one open, and a seek for every reopen at another offset
   its producer makes). `kind` is the first source opened: `torrent`,
   `member` (a file inside an archive), or `http` for every source read
-  through the shared reader -- a link, a Drive file, a file on this device.
+  through the shared reader -- a link, a Drive file, a finished download, a
+  file on this device: `http` names the reader, not the network. A rendition
+  token's bodies at `/cast/{token}` count here too, as a plain
+  publication's do.
 * `rendition`, for a rendition: the spec's plans and the tracks the first
-  run reported making; the layout once it is fixed (`slotMs` only when
-  every slot holds the same film, an estimated layout's grid); the live
+  run reported making; the layout once it is fixed (`slotMs` when every slot
+  but the last holds the same film -- an estimated layout's grid, or a
+  mirrored one whose sync samples are evenly spaced -- and `null` with
+  fewer than three slots); the live
   runs, each with the slot it began at and how many it has made; runs
   begun since the publish; every slot made and the film they hold (a slot
   dropped from the ring and asked again is made again, and counted again
@@ -253,8 +266,13 @@ safe to poll once a second.
 
 A publication's end -- unpublished, or every token at the listener's stop
 -- writes one INFO line with its totals (`stage="cast_publication_end"`:
-requests, bodies, bytes, runs started, and the source's bytes read, opens
-and seeks) and nothing that names what it was or where.
+`rendition`, `requests`, `bodies` (begun), `bytes`, `runs` (begun; `0` for
+a plain one), `source_read`, `source_opens`, `source_seeks`) and nothing
+that names what it was or where. Each plain body writes
+`stage="cast_body_start"` (`source`, `start`, `length`, `played`) and
+`stage="cast_body_end"` (`source`, `delivered`, `length`, `cut`), `source`
+being the kind above; a rendition's body writes no start line, and its end
+line says `source="rendition"`.
 
 **Stopping closes the door and stops the bytes.**
 `set_lan_media(false)` unpublishes every token -- which cuts every cast body
