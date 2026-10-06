@@ -1042,11 +1042,11 @@ impl Entry {
     /// member not resolved yet -- which a cast never is, since the player
     /// resolved it to play it.
     pub(crate) fn torrent_now(&self) -> Option<(String, Option<Vec<usize>>)> {
-        let resolved = self
-            .resolution
-            .try_lock()
-            .ok()
-            .and_then(|held| held.clone());
+        // What the id last resolved to, read without the resolve lock
+        // ([`Self::resolved`]): asked while a reader held that lock for a
+        // moment, this answered as if nothing had resolved, and a cast of
+        // a member got no hold, a cast of a torrent file the whole torrent.
+        let resolved = self.resolved();
         match resolved.as_deref() {
             Some(Resolution::Torrent {
                 info_hash,
@@ -1960,12 +1960,21 @@ mod tests {
                 ))
                 .expect("registered");
             let entry = registry.entry(&id).expect("the entry");
+            let in_torrent = torrent.is_some();
             let mut held = entry.resolution.try_lock().expect("nobody resolving");
             entry.keep(&mut held, Arc::new(member(torrent)));
             // **Still held**: a resolve under way, or a reader finding the
-            // kept answer, takes no question's answer away.
+            // kept answer, takes no question's answer away -- not from the
+            // reports by id, and not from what a cast holds.
             assert_eq!(registry.torrent_file(&id), expected);
+            let held_now = entry.torrent_now();
             drop(held);
+            assert_eq!(entry.torrent_now(), held_now, "the same hold either way");
+            assert_eq!(
+                held_now.is_some(),
+                in_torrent,
+                "a member in a torrent is held by it, one elsewhere by nothing"
+            );
             drop(entry);
             assert_eq!(registry.torrent_file(&id), expected);
         }
