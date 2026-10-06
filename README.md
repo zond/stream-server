@@ -13,7 +13,7 @@ Stream Server is the torrent-streaming half of [xtremio](https://github.com/zond
 
 Its goal is narrower than a `server.js` replacement's: a **headless torrent-streaming server with no system-library requirements**. A Rust toolchain and a C compiler build it (the C is what `aws-lc-sys` bundles, under rustls and librqbit's SHA-1); at run time it spawns no external program. It deliberately does not transcode -- the client plays containers and codecs directly through libmpv -- so the server's only job is getting torrent, archive, remote and Drive bytes onto an HTTP connection efficiently, and keeping what it fetched inside a bounded cache.
 
-The torrent engine is [`librqbit`](https://github.com/ikatson/rqbit), the sole backend, through a fork ([`zond/rqbit`](https://github.com/zond/rqbit), pinned to one git rev in both crates) that follows upstream and adds what a bounded streaming cache needs from the engine: a per-stream lookahead window, piece reclaim (the engine forgets a piece so its storage may delete it), announcing only the pieces something chose to share and never taking an announcement back, a runtime per-torrent peer cap, a session-wide upload switch, per-piece chunk progress and a count of connected seeders, a flat re-dial schedule for a thin swarm's proven peers, and Mozilla's compiled-in TLS roots.
+The torrent engine is [`librqbit`](https://github.com/ikatson/rqbit), the sole backend, through a fork ([`zond/rqbit`](https://github.com/zond/rqbit), pinned to one git rev in both crates) that follows upstream and adds what a bounded streaming cache needs from the engine: a per-stream lookahead window, a background stream (one that fetches ahead without being anybody's position, for the resume pre-want), piece reclaim (the engine forgets a piece so its storage may delete it), announcing only the pieces something chose to share and never taking an announcement back, a runtime per-torrent peer cap, a session-wide upload switch, per-piece chunk progress and a count of connected seeders, a flat re-dial schedule for a thin swarm's proven peers, and Mozilla's compiled-in TLS roots.
 
 ---
 
@@ -26,12 +26,13 @@ Stremio's own server, and the upstream fork, exist to serve a web-based player: 
 | **Build and run** | Rust toolchain + C compiler; no system libraries; nothing spawned at run time | FFmpeg/FFprobe at run time; upstream: `libtorrent` (C++) or `librqbit` |
 | **Transcoding** | None -- direct play; codecs and subtitles are the client's | HLS transcoding, probing, hwaccel profiles |
 | **Control surface** | The embed API (`ServerHandle`, over FFI); HTTP only for players and the handful of routes stremio-core calls, behind a per-launch bearer token -- see [The HTTP surface](#the-http-surface) | Dozens of HTTP routes, open |
+| **Playback** | By opaque media id (`register`, `open_reader`): a blocking reader over a torrent file, a link, a Drive file, a download, an archive member or a file on the device, with no HTTP in between -- see [Library API](docs/api.md#library-api) | URLs only |
 | **Cache** | One torrent-data root, bounded by `cacheSize` and the volume's free space; one retention owner per entity, windowed round the playhead; nothing is ever pre-allocated -- see [What bounds the cache](docs/storage.md#what-bounds-the-cache) | Files written whole; a periodic cache cleaner |
 | **Offline downloads** | A pin on the same cache, for a torrent file, an addon link or a Google Drive file; one file per piece, played back through the media routes -- see [Offline downloads](docs/storage.md#offline-downloads) | -- |
 | **Remote streams** | `/proxy` caches in 256 KiB chunks, is bounded by the same retention, and reads ahead of a player exactly as a torrent stream is -- see [Proxied remote streams](docs/proxy.md#proxied-remote-streams) | Relayed, nothing kept |
 | **Google Drive** | A paired account's files as byte sources, the grant spent inside the server, downloadable and playable offline -- see [Google Drive files](docs/proxy.md#google-drive-files) | -- |
 | **Archives** | ZIP, 7Z, TAR, RAR and ISO 9660/UDF read as byte ranges of wherever the archive lives -- nothing downloaded, nothing extracted; a member that would have to be decoded is refused with a sentence -- see [Archive members](docs/api.md#archive-members) | Extracted through native readers |
-| **Casting** | A second listener a cast session turns on and off, serving only the ids the app published for it, each under a random token that unpublishing (or the listener's stop) cuts mid-body -- see [LAN media listener](docs/lan-media.md) | SSDP discovery and a casting API |
+| **Casting** | A second listener a cast session turns on and off, serving only the ids the app published for it, each under a random token that unpublishing (or the listener's stop) cuts mid-body; for a receiver that cannot decode the file, a rendition -- one fragmented MP4 the server muxes in memory from what the embedder's `Producer` makes -- see [LAN media listener](docs/lan-media.md) | SSDP discovery and a casting API |
 | **Startup honesty** | `phase`, the in-flight piece, tracker scrapes of the swarm, DHT health -- see [Startup phases](docs/stats.md#startup-phases-in-statsjson) | Progress percentages |
 | **Thin swarms** | A proven peer of a starving torrent is re-dialled on a flat 60 s -- see [thin-swarm redial](docs/design/thin-swarm-redial.md) | -- |
 
@@ -51,7 +52,7 @@ stream_server = { package = "server", path = "../stream-server/server" }
 
 ```rust
 let handle = stream_server::start(stream_server::ServerConfig {
-    // Where settings.json and logs/ go. An embedder must set this: the
+    // Where settings.json, read-positions.json and logs/ go. An embedder must set this: the
     // default reads the platform config dir, which needs HOME/XDG_* to be
     // set.
     config_dir: Some(config_dir),
@@ -73,7 +74,7 @@ let token = handle.auth_token().map(str::to_string); // control-route bearer
 
 ## What a client can read
 
-`ServerHandle::engine_stats` / `file_stats` (and the core's `stats.json`) report a startup `phase`, the progress of the one piece a starting stream waits on, tracker-scraped swarm counts and an error sentence when something failed; `stream_numbers` answers a playback panel, `background_traffic` a "working in the background" light, and `dht_status` whether the DHT ever came up. Each number is measured or absent, never a zero standing for "unknown" -- [docs/stats.md](docs/stats.md) says what each means and how to draw it.
+`ServerHandle::engine_stats` / `file_stats` (and the core's `stats.json`) report a startup `phase`, the progress of the one piece a starting stream waits on, tracker-scraped swarm counts and an error sentence when something failed; `stream_numbers` (or `media_stream_numbers` for an id) answers a playback panel, `media_read_wait` whether a player is stuck in a read, `cast_numbers` what a cast publication has served, `background_traffic` a "working in the background" light, and `dht_status` whether the DHT ever came up. Each number is measured or absent, never a zero standing for "unknown" -- [docs/stats.md](docs/stats.md) says what each means and how to draw it.
 
 ---
 
@@ -81,7 +82,7 @@ let token = handle.auth_token().map(str::to_string); // control-route bearer
 
 **The app does not speak HTTP to this server.** It calls `ServerHandle` methods, in-process, over FFI. HTTP exists for exactly two callers, and `build_router()` (`server/src/lib.rs`) is split along that line:
 
-- **Players fetch media by URL** -- mpv, or a Chromecast receiver through the [LAN media listener](docs/lan-media.md), which serves `/cast/{token}` for the ids the app published and nothing else. They cannot attach a header, so the **media routes are open**: torrent streams, archive members, `/proxy`, `/drive/stream`, `/ftp`, a finished download's `/downloads/{key}/stream`, and the `/local-addon` stub stremio-core's default profile asks for.
+- **Players fetch media by URL** -- a Chromecast receiver through the [LAN media listener](docs/lan-media.md), which serves `/cast/{token}` (and a rendition's `/cast/{token}/stream.mp4`) for the ids the app published and nothing else, and mpv for what xtremio still plays by URL: `/ftp`, and a link whose host will not serve ranges, which `resolve` answers with a `/proxy` URL. Everything else xtremio plays by media id, through `ServerHandle::open_reader`, with no HTTP at all. They cannot attach a header, so the **media routes are open**: torrent streams, archive members, `/proxy`, `/drive/stream`, `/ftp`, a finished download's `/downloads/{key}/stream`, and the `/local-addon` stub stremio-core's default profile asks for.
 - **stremio-core's `StreamingServer` model speaks Stremio's streaming-server protocol** through the app's `Env::fetch`, which attaches the bearer. Those paths -- `/settings`, `/create`, `/{infoHash}/create`, `/{infoHash}/{fileIdx}/stats.json`, `/network-info`, `/device-info`, `/get-https`, `/casting`, `/casting/{devID}/player` -- are the whole of the **control routes**, and every one requires `Authorization: Bearer <token>`, in the header only.
 
 **There is no third caller, and no control route is added.** A new capability is a `ServerHandle` method; a new byte-serving URL for a player is a media route; a path joins the control routes only when the stremio-core fork starts calling it, which is a change to that fork first. The control routes that mirrored the embed API are gone ([Removed routes](docs/api.md#removed-routes)).
@@ -119,7 +120,7 @@ ZIP, 7Z, TAR and ISO streaming are always built in and not gated by any feature 
 | Clippy and Tests | `cargo clippy --all-targets --all-features`, `cargo doc --no-deps --all-features` (public and `--document-private-items`) and `cargo test`; the workspace lints in `Cargo.toml` deny every warning and all of `clippy::all` |
 | MIT build (no RAR) | `cargo test -p server --no-default-features` -- the only place the `cfg(not(feature = "rar"))` paths compile |
 | Android check (armv7, aarch64) | `cargo ndk -t armeabi-v7a -t arm64-v8a check -p server --all-targets --locked`, with the runner's NDK: a check, not a build -- nothing links and no test runs |
-| Windows Build and Test | `cargo build` and `cargo test` -- the only job that compiles the `cfg(windows)` half of `diagnostics` |
+| Windows Build and Test | `cargo build` and `cargo test` -- the only job that compiles any `cfg(windows)` path: the crash filter in `diagnostics::logging`, `resolved_path`, and the piece store's and local source's file handling |
 
 Nothing builds or tests macOS, and `ci.yml` is the only workflow there is: this crate publishes nothing, so there is no release build, no packaging and no tag matrix.
 
@@ -130,9 +131,12 @@ Nothing builds or tests macOS, and `ci.yml` is the only workflow there is: this 
 ```
 stream-server/
 ├── server/           # The library: ServerConfig, start/run, ServerHandle (src/lib.rs),
-│                     # the media and control routers, the proxy cache, sources/ translators/ images/
+│                     # the media and control routers, the proxy cache, media/ (ids and the
+│                     # reader), cast and rendition/, sources/ translators/ images/
 ├── enginefs/         # The torrent engine: the librqbit backend, the piece store,
-│                     # the retention owner, the reconciler
+│                     # the retention owner, the holds, the reconciler
+├── tools/lavf-harness/ # Not built by cargo: reads a rendition as a Cast receiver's
+│                     # libavformat does
 └── docs/             # The reference behind this README, and design notes
 ```
 
@@ -145,22 +149,30 @@ Two crates, and neither builds a binary: `server` is the library an embedder lin
 | [docs/api.md](docs/api.md) | Every HTTP route, who calls it and what it answers; the `ServerHandle` methods; archive members; removed routes |
 | [docs/stats.md](docs/stats.md) | What a client is told: `stats.json` fields, the playback panel, the background light, DHT health |
 | [docs/settings.md](docs/settings.md) | Every settings key, the buffer profiles, the `bt*` torrent settings |
-| [docs/storage.md](docs/storage.md) | Offline downloads, what bounds the cache, cache usage and cleaning |
+| [docs/storage.md](docs/storage.md) | Offline downloads, what bounds the cache, who keeps a torrent running, sharing, cache usage and cleaning |
 | [docs/proxy.md](docs/proxy.md) | `/proxy` (redirects, playlists, credentials, caching, read-ahead), ending a proxied stream, Google Drive |
-| [docs/lan-media.md](docs/lan-media.md) | The listener a cast session turns on: published tokens, and nothing else |
+| [docs/lan-media.md](docs/lan-media.md) | The listener a cast session turns on: published tokens and renditions, and nothing else; what a publication has served |
 | [docs/known-issues.md](docs/known-issues.md) | What is open, and the standing hazards of working in this repo |
-| [docs/design/](docs/design/) | Design notes for built features: [read-pattern retention](docs/design/read-pattern-retention.md), [translated sources](docs/design/translated-sources.md), [generic downloads](docs/design/generic-downloads.md), [thin-swarm redial](docs/design/thin-swarm-redial.md); proposed: [media pipeline](docs/design/media-pipeline.md) |
+| [docs/design/read-pattern-retention.md](docs/design/read-pattern-retention.md) | Design, built: what the cache keeps and fetches, from what the reads are doing |
+| [docs/design/translated-sources.md](docs/design/translated-sources.md) | Design, built: archives and disc images as byte ranges of a fetched file, nothing on disk |
+| [docs/design/generic-downloads.md](docs/design/generic-downloads.md) | Design, built: downloads of links and Drive files, a pin on the proxy cache and a filler |
+| [docs/design/thin-swarm-redial.md](docs/design/thin-swarm-redial.md) | Design, built in the rqbit fork: why a download goes quiet for minutes, and the re-dial |
+| [docs/design/media-pipeline.md](docs/design/media-pipeline.md) | Design, built (steps A-E): media ids, the in-process reader, casting by published token, pins by id, the sniff, the resume pre-want |
+| [docs/design/renditions.md](docs/design/renditions.md) | Design, partly built: a cast the receiver can decode, one fragmented MP4 made on demand (the server side and the copy and sound paths built; video transcode not) |
+| [tools/lavf-harness/README.md](tools/lavf-harness/README.md) | How a rendition is measured the way a Chromecast's libavformat reads it |
 
 ---
 
 ## Upgrade notes
 
+- **2026-10-05. What runs a torrent is declared.** A player screen's `p=` requests (or an `open_reader` with its `PlayToken`) hold its torrent until `ServerHandle::release_player(token)`; a cast holds from `publish` to `unpublish`; the last thing a viewer watched stays their idle share while idle sharing is allowed; a stream response holds only while it is delivered. Nothing else runs a torrent -- in particular not the last thing a stream opened. Call `release_player` when a player screen closes. See [docs/storage.md](docs/storage.md), *Who keeps a torrent running*.
+- **2026-10-05. A resumed film asks ahead of its reads.** `ServerHandle::set_resume` before `open_reader` has the reader ask the swarm for the resume point at its open; `note_media_position` remembers where a session on a torrent file ended, in `read-positions.json` beside `settings.json`.
 - **2026-10-01. The cache directory is `<cacheRoot>/media-cache`**, renamed from `rqbit-downloads` with **no migration**: the first boot that finds `rqbit-downloads` deletes it whole (renamed aside before the session opens, deleted after), offline downloads included -- a torrent pin the embedder hands in then reports held-nothing (`complete: false`, no `error`) and is downloaded again when pinned again. `ServerConfig::pins` is now one `Option<Vec<PinKey>>` for both stores, replacing `pins` (a torrent `PinSet`) and `proxy_pins`; `None` keeps its meaning. `ServerHandle::pin(&MediaId)` / `unpin(&MediaId, delete_files)` pin by media id. See [docs/storage.md](docs/storage.md#offline-downloads).
 - **2026-09-28. A torrent download on its way always uploads**, whatever `seedingEnabled` says: downloading is activity, not idling. The setting now governs what was played or downloaded before, and `ServerHandle::set_idle_sharing_held` holds it off for the run without writing the setting -- call it with `true` while the app is in the background on a device where that should stop idle sharing, and `false` on the way back. The activity light's down half now also lights for addon-link and Drive downloads.
 - **2026-09-26. Proxied and Drive streams are read ahead of.** A stream a player reads through `/proxy` (with its `p=` token) or `/drive/stream` now fetches the retention window ahead of the player -- or the rest of the file, where the budget covers it whole. Origin traffic per stream goes up by that much, on Drive against the file's quota; requests without a player token fetch exactly what they ask for.
 - **2026-09-26. The app-facing control routes are gone** ([docs/api.md](docs/api.md#removed-routes) lists them). An embedder that called one over HTTP calls the matching `ServerHandle` method instead; the core-protocol routes and every media route are unchanged.
-- **2026-09-08. Torrent data is stored one file per piece**, under `<cacheRoot>/rqbit-downloads/.pieces/<infoHash>/`, for the streaming cache and offline downloads alike. **There is no migration**: a download from before this is re-fetched as pieces, and any leftover whole file is removed by the first launch handed a pin set (`piece_store::sweep_legacy_downloads`) -- see [What bounds the cache](docs/storage.md#what-bounds-the-cache). `DownloadInfo::path` keeps its shape but names a file that will not appear; play a download through the media routes.
-- **2026-09-04.** `<cacheRoot>/rqbit-downloads/dht-bootstrap.json` caches the addresses the DHT bootstrap names last resolved to. It is a fallback for a network whose DNS is broken and safe to delete.
+- **2026-09-08. Torrent data is stored one file per piece**, under `<cacheRoot>/rqbit-downloads/.pieces/<infoHash>/` (`media-cache` since 2026-10-01), for the streaming cache and offline downloads alike. **There is no migration**: a download from before this is re-fetched as pieces, and any leftover whole file is removed by the first launch handed a pin set (`piece_store::sweep::sweep_legacy_downloads`) -- see [What bounds the cache](docs/storage.md#what-bounds-the-cache). `DownloadInfo::path` keeps its shape but names a file that will not appear; play a download through the media routes.
+- **2026-09-04.** `<cacheRoot>/rqbit-downloads/dht-bootstrap.json` (`media-cache` since 2026-10-01) caches the addresses the DHT bootstrap names last resolved to. It is a fallback for a network whose DNS is broken and safe to delete.
 - **2026-09-03.** Offline downloads add one `<infoHash>.bitv` per torrent beside the session state (fastresume bitfields; the first start after upgrading still hash-checks each torrent once). The pin set is the embedder's, handed in at startup. `settings.downloadsDir` is gone -- the one torrent-data root is `settings.cacheRoot` -- and a client that still sends it gets what any unknown key gets: nothing. A stray `pinned-downloads.json` is kept where it lies.
 
 ---
