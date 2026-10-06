@@ -16,16 +16,15 @@ line each. Of the review logs' last open rows, the two ASKs of 2026-09-14
 were found resolved in the code (#28: rqbit logs the resume-data clearing at
 `debug` under piece reclaim; #78: xtremio's TEMPORARY mpv log instrumentation
 is gone), and the one question left open in a 2026-09-19 status (#100) is
-carried in below.
+carried in below. On 2026-10-07 every name, test, log field and code path
+here was checked against `1e2554e` (after the explicit holds of
+2026-10-04/05) and corrected where it had moved; the measurements were not
+re-run.
 
 ## Open
 
 - **The piece-commit failure paths are unmeasured on a device** -- see
   *Readable before durable* below.
-- **A stale-looking name, kept on purpose**:
-  `enginefs/src/retention/scenario.rs`'s `CONTAINER_METADATA_LOOKAHEAD` and
-  `PLAYBACK_LOOKAHEAD` keep the field's numbers under the names of constants
-  that no longer exist -- a scenario stays the measurement it was taken from.
 - **A set's draw advertised by a sibling can still land between the
   door's reading and an unlink** (2026-10-01, what is left of review H1).
   The door now refuses every piece of a recorded draw of a played entity
@@ -70,7 +69,10 @@ rename takes 100 ms or more, with `sync_ms`, `rename_ms` and `queued_ms`;
 `stage="piece_commit_backpressure"` (info) when a completion waited 100 ms
 or more for room in the queue -- that one is a reader waiting again, and
 a device that cannot keep up with the download. `stage=
-"piece_commit_failed"` (error) is the case below. Not measured on the
+"piece_commit_failed"` (error) is the case below, and
+`stage="piece_commit_abandoned"` (error) a queued commit whose committer
+died before running it: nothing on the disk is touched, and the store fails
+its next write the same way. Not measured on the
 device yet; the next field log should show whether head pieces still
 wait, and how long the flushes really are. On a desktop NVMe, 4 MiB
 pieces completed every 400 ms beside a writer dirtying pages flat out, a
@@ -136,10 +138,11 @@ process.
   field, and to do it for every workspace -- this one, xtremio's `rust/`,
   and rqbit's.
 
-* **An engine with no reader fetches for one reconcile interval and is then
+* **An engine nothing holds fetches for one reconcile interval and is then
   stopped -- unless nobody told the server what is pinned, in which case it
-  fetches the lot.** A new engine wants every file, and the want set only
-  narrows when a stream arrives, so anything that creates an engine early --
+  fetches the lot.** A new engine wants the file its create named
+  (`fileMustInclude`/`guessFileIdx`, since `52f42d7`), or every file when
+  it named none, so anything that creates one before a player holds it --
   `/{hash}/create`, `/create`, a stats request that lands before the stream
   request -- fetches at whatever rate its peers give it until something
   stops it. What stops it is the reconciler's timer, and which of the two
@@ -149,11 +152,13 @@ process.
   `ServerConfig::pins: Some(Default::default())` is what xtremio publishes
   for a user who has pinned nothing (`rust/src/server.rs` ->
   `downloads::pins()`), and under it the ladder's last arm
-  (`reconcile::desired`: `if conditions.playing || conditions.pinned`)
-  answers `Stop` for a torrent with no reader and no pin. Measured
+  (`reconcile::desired`: `if conditions.held || conditions.pinned`)
+  answers `Stop` for a torrent nothing holds, nothing is being delivered
+  off, and nothing pins. Measured
   2026-09-21 against a real local seeder: the stop lands **2.0 s after the
   add** -- one `reconcile::RECONCILE_INTERVAL`, with no dwell, since the
-  dwell guards only `start_if_stopped` -- and nothing arrives after it. In
+  dwell holds back only the timer's starts (`start_if_stopped`,
+  `restart_if_the_dwell_allows`), never a stop -- and nothing arrives after it. In
   those 2.0 s it took 5.7 to 6.5 MiB (fourteen runs) from a seeder held to
   2 MiB/s, and 186 MiB of a 256 MiB torrent with the limiter off. **The bound is the window, not the
   byte count**: on a fast link one interval is a hundred megabytes and more.
@@ -178,7 +183,7 @@ process.
   and never read -- ~100 MB on the field's 50 MB/s link, and the pieces are
   then reclaimed, so it is spent bandwidth rather than spent disk. It is not
   hit hard today because the player's stream request follows its open by
-  ~160 ms, so a reader is registered long before the tick and the want set
+  ~160 ms, so the player's hold is taken long before the tick and the want set
   narrows; what pays it in full is a `/create` nobody follows with a play.
   Making it smaller means adding a discover-only state, which is why "start
   the engine when a source is picked" was not done for the cold start:
@@ -194,13 +199,13 @@ process.
 
   The cold start itself (field 2026-09-17 16:36, on the phone) was a slow
   peer ramp -- peers found in 2 s, 2 connected for 10 s, 32 after 50 s --
-  not discovery; the `stream_progress` line now carries `queued`, `unique`
-  and `connection_tries` to tell "nothing found" from "nothing answering".
+  not discovery; the `stream_progress` line carries `queued`, `connecting`,
+  `unique` and `known` to tell "nothing found" from "nothing answering".
 
-* **A torrent nobody is playing keeps nothing, about two seconds after the
-  last reader leaves -- so a test that seeds its own torrent data must run
-  with the pin set unknown.** Measured 2026-09-20 writing the RAR set tests,
-  established 2026-09-20 (review #103): under
+* **A torrent no open names keeps nothing, one reconcile interval after its
+  initial check -- so a test that seeds its own torrent data must run with
+  the pin set unknown.** Found 2026-09-20 writing the RAR set tests (review
+  #103): under
   `ServerConfig::pins: Some(Default::default())` -- "an embedder that keeps a
   pin record and has named nothing in it" -- a freshly added forty-piece
   fixture held forty pieces and then none, one
@@ -209,8 +214,9 @@ process.
   What takes them is `Engine::reclaim_rest` (`enginefs/src/engine.rs`),
   reached from `EngineFS::reconcile_tick` -> `retain_engine` ->
   `Engine::retain` whenever `!live.is_torrent(hash)`: it takes **every held
-  piece outside every holding extent**, and a torrent with no reader has no
-  extent. Proved causally by returning 0 from `reclaim_rest` alone, which
+  piece outside every holding extent** that the torrent does not advertise,
+  and a torrent with no reader has no extent (it takes nothing under
+  `PinsUnknown`, or while the liveness cell names the torrent). Proved causally by returning 0 from `reclaim_rest` alone, which
   leaves the fixture whole. It asks no volume and no cap, which is why
   `pretend_volume_space(root, u64::MAX)` does not save anything -- what it
   acts on is "nobody wants this", not "the disk is short".
@@ -219,8 +225,9 @@ process.
   from the swarm. It is worth knowing anyway, because the empty record is the
   ordinary state of the ordinary install -- xtremio's `downloads::pins_in`
   over a registry with no downloads in it answers exactly
-  `Some(<empty>)` -- so every viewer who has pinned nothing re-fetches their
-  buffer a couple of seconds after they stop. `embed.rs`'s
+  `Some(<empty>)` -- so a viewer who has pinned nothing loses their buffer
+  the moment they open something else; while they only stop, their idle
+  share keeps its window. `embed.rs`'s
   `an_embedder_that_has_pinned_nothing_keeps_no_torrent_nobody_plays` states
   it.
 
@@ -228,8 +235,8 @@ process.
   after the pass parks for ever. `pins: None` ("nobody said", which sets
   `PinsUnknown` and reads as every file pinned) is the only cure, and
   `server/tests/support/fixture_pins.rs` is the one place that says so;
-  `embed.rs::seeded_fixture_config` and `iso.rs::offline_config` are built
-  from it, and the tests that read seeded bytes use them. A test *about*
+  every test that reads seeded bytes wraps its config in
+  `fixture_pins::keep_what_the_fixture_seeded`. A test *about*
   retention, idle pausing, the reconciler or the pin routes keeps the empty
   record and controls the timer itself -- under `None` a torrent is reported
   as pinned, so it is also exempt from idle removal and the reconciler keeps
@@ -255,7 +262,8 @@ process.
   `deleting_a_volume_keeps_the_piece_it_shares_with_a_sibling_shared`.
 
 - 2026-10-01 -- **Review of the member-sharing commits (`39a9105`,
-  `1d0d109`)**, fixed on `review-fixes`. B1: a move to another member of
+  `1d0d109`)**, fixed in `b194495` (B1, H4), `32990ae` (B2), `42cc28b`
+  (H1) and `77a7920` (H2). B1: a move to another member of
   the same container kept the first member's draw (a draw now records what
   it was made for, `DrawnFor`; a new member on the same file is a move);
   test `a_move_to_another_member_of_the_same_container_ends_the_first_members_draw`.
@@ -288,22 +296,14 @@ process.
   of the live set is live to the passes. Test:
   `a_rar_set_read_across_its_volumes_keeps_the_volumes_it_read`.
 - 2026-09-28 -- **Sharing did not follow the rule "publish once, never
-  withdraw"** (zond, 2026-09-28): a play session -- one per player token,
-  started and moved only by a request carrying it (`p=`), never by an
-  aside or an archive's translated source -- now shares a set drawn once,
-  against the stream's real read-ahead (it waits for the player to state
-  the film's length), a download is
-  shared whole, nothing is announced that nothing chose (rqbit's
-  `explicit_piece_advertising`, which keeps the set across a restart from
-  error), nothing is ever withdrawn from a live torrent, and a session's
-  announced pieces are deleted only after its torrent is stopped
-  (`Decision::EndShares`: stop, rebuild, start, then delete) -- and, while
-  the torrent is played, only the one player on it moving does that; an
-  unpin without a delete, or another player's move, waits. A delete does
-  not: it is an explicit request and happens at once, whatever the sharing
-  setting and whoever's session is on the torrent, waiting only for a read
-  of that very file (a cast) to end.
-  See [Sharing](storage.md#sharing).
+  withdraw"** (zond): a play session shares a set drawn once, a download is
+  shared whole, nothing is withdrawn from a live torrent, and a session's
+  announced pieces go only after its torrent has left the swarm. The rule
+  is [Sharing](storage.md#sharing).
+- 2026-09 -- **`scenario.rs`'s `CONTAINER_METADATA_LOOKAHEAD` and
+  `PLAYBACK_LOOKAHEAD`** keep the field's numbers under the names of
+  retired constants on purpose: a scenario stays the measurement it was
+  taken from (the comments there say so).
 - 2026-09-28 -- **Whether a tight budget should leave the sharing draw
   room**: no. zond: if it is impossible to share and play, stop sharing --
   the lookahead floor wins and the committed set yields to nothing.
