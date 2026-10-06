@@ -67,6 +67,11 @@ pub trait ByteSource: Send + Sync {
 }
 ```
 
+*(As built, `sources/mod.rs`: `open` answers a `Box<dyn SeekableReader>`,
+and the trait has two more methods with defaults -- `is_empty`, and
+`is_live(&Reading)`, whether the entity being played is this source's own
+file, which §2.4's session rule asks.)*
+
 Two methods rather than one because the two uses differ: an index is a
 handful of reads at offsets the format dictates (the end of a ZIP, the start
 of a RAR volume, sector 16 of an ISO), and a body is one long read the
@@ -86,6 +91,9 @@ Implementations, in order of need:
   *(Both since replaced by `TorrentSource`, whose open is the stream
   route's; see [media-pipeline.md](media-pipeline.md) §2.2.)*
 * **`ProxySource { entry: proxy_cache::Entry, client, total, validator, content_type }`.**
+  *(As built: an `Arc` of the cache, URL, credentials, total, content type
+  and validator; the cache entry is taken per read, and the probe is always
+  a `GET` of `bytes=0-0`.)*
   Built by one `HEAD` (or a `GET` of `bytes=0-0`) through the proxy's own
   request builder, which is how it learns `total`, the validator and
   whether the origin honours `Range` -- **an origin that answers `200` to a
@@ -104,7 +112,9 @@ Implementations, in order of need:
   another translator's member: an ISO inside a RAR, a ZIP inside a torrent
   inside nothing. Nothing is built for that case; it falls out.
 * **Test sources:** `MemorySource(Bytes)` and `FileSource(File)`, plus a
-  counting wrapper that records every `read_at`/`open` for the tests that
+  counting wrapper *(as built, `sources::testing`: `MemorySource` and
+  `CountingSource`; no `FileSource` -- a file on this device is
+  `sources::local::LocalSource`, which is not a test source)* that records every `read_at`/`open` for the tests that
   prove "no byte was read that the range did not need".
 
 Later, and outside this plan: `DriveSource` (Google Drive; ranged `GET`
@@ -230,7 +240,8 @@ The formats, and what each one's translator is:
   (`.z01`) -> `Malformed("split zip")` for now. `async_zip` can read the
   directory over `AsyncBufRead + AsyncSeek`; if its buffering reads more
   than the bound allows, the directory is parsed by hand -- it is a fixed
-  layout and the code for the local header already is.
+  layout and the code for the local header already is. *(It is parsed by
+  hand: `translators/zip.rs`.)*
 * **TAR.** Walk 512-byte headers from offset 0, skipping each entry's data
   by its size (rounded to 512): one small read per member. Every regular
   file is `Direct(one extent)`. GNU long names and PAX headers are read as
@@ -247,7 +258,9 @@ The formats, and what each one's translator is:
   `EncryptedStore` -> `Encrypted`; `Ineligible(reason)` -> `Compressed` or
   `Malformed` by the reason; `is_solid` volumes -> `Solid`;
   header-encrypted volumes (`is_encrypted` at the volume level) ->
-  `Encrypted` before any member is looked at. **Multi-volume sets are the
+  `Encrypted` before any member is looked at. *(As built: a solid volume
+  refuses the whole archive, `Solid`; header encryption arrives as the
+  parse's `EncryptedArchive` and is `Encrypted`.)* **Multi-volume sets are the
   ordinary case** (`.part1.rar`/`.part2.rar`, or `.rar`/`.r00`/`.r01`): from
   an addon, the `rarUrls` list *is* the volume list, in order; from a
   torrent, the volumes are the sibling files of the named one, by the two
@@ -295,11 +308,15 @@ to `extent.offset + (p - extent.start)`; a seek into another extent, or
 crossing one's end, opens the next source's reader. What keeps a read
 inside the member is the run of the extent it is in, not the source
 stopping: a source's reader is a handle on the whole container.
-`MemberWindow` is this with one extent, and is replaced by it.
+`MemberWindow` is this with one extent, and was replaced by it. *(As built,
+`sources/view.rs`: `MemberView` holds an `Arc` of the member -- its name,
+sources, extents and starts -- and is a `ByteSource`; `MemberView::reader`
+hands out the `MemberReader` that implements `AsyncRead + AsyncSeek`.)*
 
 For the response body, the stream route's own range framing is reused:
-`Content-Length`, `Content-Range`, `206`/`416`, `HEAD`, the same functions
-`routes::stream` uses, over a `MemberView` instead of a `FileHandle`. Nothing
+`Content-Length`, `Content-Range`, `206`/`416`, `HEAD`, the same
+`routes::util::MediaRange` the stream route uses, over a `MemberView`
+instead of a `FileHandle`. Nothing
 about a member's HTTP behaviour is allowed to differ from a plain file's.
 
 ### 2.4 Sessions: an index, in memory, leased
@@ -308,8 +325,10 @@ about a member's HTTP behaviour is allowed to differ from a plain file's.
 `archives::sessions`) stays as the map; the
 session becomes `{ origin, sources, index, selected: Option<usize> }` and
 owns **no file**. A *torrent-backed* session holds the hash and path
-rather than the source: a `TorrentFileSource` registers a stream for as
-long as it lives, and holding one for the session's life would keep a
+rather than the source *(as built: `SessionSources::Torrent { info_hash,
+paths, hold }`, the hold a `SetHold` over a set's volumes; and a `Kept`
+variant for bytes already on this device)*: a `TorrentSource` registers a
+stream for as long as it lives, and holding one for the session's life would keep a
 torrent the viewer left running, so each
 body opens its own -- a file lookup and a reconcile, not a fetch. The
 index, which is what was expensive to read, is what the session is for. It is created by `/{fmt}/create` (from URLs) or on first use by
@@ -333,7 +352,7 @@ container is not a different question from the bytes in it. So:
   `ProxySource`s' keys, because a body crosses volumes while it reads);
 * every other session goes when the live entity moves. `Sessions<T>` holds
   no rule of its own and runs no janitor: `Sessions::retain` is handed the
-  rule by the switch task in `server::run`, the same signal the two
+  rule by the switch task in `stream_server::run`, the same signal the two
   retention owners drop their slack on;
 * the backstop is a **cap on entries** (`SESSION_CAP`, 32) evicting the
   least recently used unleased session, not a longer timeout. A count, not
@@ -351,7 +370,8 @@ nothing else is opened.
 
 Nothing the client sends changes.
 
-* `POST/GET /{rar|zip|7zip|tar|iso}/create` with the `lz`-encoded
+* `POST/GET /{rar|zip|7zip|tar|tgz|iso}/create` (`tgz` answers `415` for
+  every member) with the `lz`-encoded
   `{ urls, fileIdx, fileMustInclude }` (what stremio-core builds from
   `rarUrls`/`zipUrls` -- `types/resource/stream.rs`): every URL becomes a
   `ProxySource` (probe, refuse a non-ranging origin with `501` and a
@@ -360,19 +380,25 @@ Nothing the client sends changes.
   redirects to `./stream/{key}/{member}` as today. A selected member that
   is `Opaque` answers **`415 Unsupported Media Type`** with a JSON body
   `{ "refused": "<Refusal>", "message": "<one sentence>" }`; the player
-  shows the message (xtremio's `archive_sniff` already has the place for it).
+  shows the message (xtremio's `archive_sniff` had the place for it; since
+  step E the sniff is the server's, [media-pipeline.md](media-pipeline.md)
+  §2.9).
 * `GET/HEAD /{fmt}/stream/{key}/{member}`: `MemberView` + the shared range
   framing, on loopback. A Cast receiver no longer reads this route: the
   LAN listener serves published cast tokens and nothing else
   (`docs/design/media-pipeline.md` §2.7), and a member is cast by
   publishing its media id, whose body is the same view and framing.
 * The `torrent:` key form (`torrent:<hash>/<path in torrent>`): the source
-  is `TorrentFileSource`, the format is the path's suffix, sibling volumes
+  is `TorrentSource`, opened per body, the format is the path's suffix, sibling volumes
   are found in the torrent's file list; otherwise identical. `iso` joins
   the prefixes.
 * `/{fmt}/create/{key}` (client-chosen key) keeps its `409` rule.
 
-Error mapping, once, in one function: `Refusal::Compressed|Encrypted|Solid`
+Error mapping *(as built, three functions in `routes/archive.rs`:
+`refusal_response` for a `Refusal`, `source_error_response` for a source
+that failed -- `noRanges` `501`, an origin's `404` as `404`, any other
+origin or fetch failure `502`, shared with `routes::drive` -- and
+`no_reader_response`)*: `Refusal::Compressed|Encrypted|Solid|Unsupported`
 -> `415`; `NoRandomAccess` -> `415`; `Malformed` -> `422`; an origin that
 will not range -> `501` with `refused: "noRanges"` (it is *this server* that
 declines to do the work), and a build with no reader for the format -> `501`
@@ -488,7 +514,7 @@ never kept beside it.
    metadata partition map first of all, so a Blu-ray image today answers
    `415` with "this UDF image uses a type 2 partition map (...), which
    remaps logical blocks; that is not supported yet". `images::Refusal` maps
-   as `Unsupported`/`Encrypted` -> `415`, `Malformed`/`NotAnImage` ->
+   as `Unsupported` -> `415`, `Malformed`/`NotAnImage` ->
    `422`, `Unreadable` -> `Malformed` carrying the read error, as
    `translators::Budget` words one. The images module's own 8 MiB
    `Budget` is the bound; the translator adds no second counter.
@@ -527,8 +553,8 @@ never kept beside it.
   else** (`name.partN.rar` ascending N; `name.rar`, `name.r00`, `name.r01`
   ...). A set named any other way is one volume, and if that volume's chain
   is open it is `Malformed`, saying which volume it wanted.
-* **UDF comes after ISO 9660.** Blu-ray images are UDF-only; until that
-  step a BD image is refused with a message that says so.
+* **UDF came after ISO 9660**, and is built except the metadata partition
+  map: a Blu-ray image is refused `415 unsupported`, naming the map (step 6).
 
 ## 7. What this does not do
 

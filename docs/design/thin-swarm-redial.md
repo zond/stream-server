@@ -1,8 +1,9 @@
 # Thin swarms: why a download goes quiet for minutes
 
 Design, 2026-09-26, against rqbit `d02b73a2` and stream-server `300673e`.
-**Built the same day** in the rqbit fork (see the end of §4 for what was built
-as designed, what was tightened, and what was dropped).
+**Built the same day**: rqbit `9006fb84`, and stream-server `a3eade9` (the
+pin and the progress line). See the end of §4 for what was built as
+designed, what was tightened, and what was dropped.
 
 ## 1. What a thin swarm is
 
@@ -27,11 +28,11 @@ many addresses answered. So this is not a cap (`effective_connection_limits`
 floors at 40 per torrent; the background footprint is 8) and not the piece
 picker. It is what happens **after** the few reachable peers hang up.
 
-## 2. What rqbit does today
+## 2. What rqbit did, at `d02b73a2`
 
 Read from the fork, so each point is checkable:
 
-1. **An address enters the peer table once.** `Peers::add_if_not_seen`
+1. **An address enters the peer table once.** `PeerStates::add_if_not_seen`
    (`torrent_state/live/peers/mod.rs`) inserts on `Vacant` and returns
    `None` on `Occupied`. A tracker or DHT reply naming an address that is
    already in the table -- in any state, including `Dead` -- does nothing.
@@ -56,6 +57,8 @@ Read from the fork, so each point is checkable:
    the app is backgrounded) drops every `Dead` and `NotNeeded` entry --
    which does let a later sighting re-add them, but also loses their
    backoff and "was useful" history.
+
+Points 1, 2 and 5 are what §4 changed; see the end of §4 for what was built.
 
 ## 3. How those combine into a ten-minute stall
 
@@ -164,7 +167,7 @@ from the queue, not from the table.
   predicate and the burst cap as unit tests; and two end-to-end tests with
   a real seeder that hangs up (`e2e_thin_swarm.rs`) -- three deaths, each
   followed by a re-dial within the flat retry, and a sighting that brings a
-  parked peer forward.
+  dead proven peer forward.
 
 ## 5. What this does not fix, stated
 
@@ -186,7 +189,8 @@ rqbit, as patches shaped for upstream (the fork follows upstream monthly):
 user. The "starving" floor is policy, so it is a torrent option with a
 default (`ManagedTorrent::set_starving_retry`). 4.3's re-announce was
 dropped (above). stream-server's `download progress` line
-(`routes/downloads.rs`) carries `starving`, `dead` and `next_retry_secs`.
+(`server/src/routes/downloads.rs`) carries `starving`, `dead`, `proven_dead`
+and `next_retry_secs`.
 The field check still owed: a thin torrent on the phone, where the progress
 line should show `peers=0` for no longer than the short retry while a
 proven peer is still online.

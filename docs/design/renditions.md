@@ -1,6 +1,6 @@
 # Renditions: a cast the receiver can decode, produced on demand, nothing on disk
 
-Design, 2026-10-01; §2.8 2026-10-02. **F1 (the server side) is built, F0 landed in the app, F1½ answered (libavformat), F2's producer built and its file seekable by bytes (§2.8), F3's sound conversion built in the app (2026-10-04, not on the TV yet); F4 and F5 are not.**
+Design, 2026-10-01; §2.8 2026-10-02 to 2026-10-05. **F0, F1 and F1½ are done (F1½ answered libavformat). F2 is built: a Rust producer in xtremio over libavformat, its file seekable by bytes (§2.8). F3's sound conversion is built in the app (2026-10-04). F4 is not built: the producer refuses an H.264 plan with a sentence. F5 is built in part, in the app: a row per receiver model judged by the name the receiver announces (xtremio `0daab79`, `5b05898`; no eureka_info lookup), the channel count in the stats poll (`2fe3b2e`), and a cast whose receiver shows no picture ended (`50d1f55`). What a publication has served is `cast_numbers` (§3).**
 
 > **Amended in F2 (zond, 2026-10-01): a rendition is ONE progressive
 > fragmented MP4, not HLS.** Measured on zond's Chromecast with Google TV
@@ -114,7 +114,7 @@ A rendition is a publication (`cast::Publication`), with the same token
 rules -- 128 random bits, memory only, a lease on the id, cut by
 `unpublish` and by the listener's stop, never logged (`log_path` already
 elides everything under `/cast`, and its test already spells
-`/cast/0011/hls/master.m3u8`, `routes/util.rs:406`). What it adds is a
+`/cast/0011/stream.mp4`, `routes/util.rs`). What it adds is a
 `Rendition` beside the id:
 
 ```rust
@@ -122,12 +122,13 @@ elides everything under `/cast`, and its test already spells
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RenditionSpec {
-    /// The film's duration, from mpv: the playlist is written from it.
+    /// The film's duration, from mpv: the layout's length in time.
     pub duration_ms: u64,
-    /// Target segment length (6000; §6).
+    /// Target segment length (6000; §6), for a source without an index;
+    /// one with an index is cut at its sync samples (§2.8).
     pub segment_ms: u32,
-    /// Where the receiver will start: the first run begins at this
-    /// segment, so the init segment and the first segment come from one run.
+    /// Where the receiver will be told to start. Only a preparation reads
+    /// it (`prepare_rendition`); what is made is what the receiver asks for.
     pub start_ms: u64,
     pub video: VideoPlan,
     pub audio: AudioPlan,
@@ -206,8 +207,8 @@ pause from the viewer having walked away, and both are answered the same.
 **The init segment** needs the tracks' codec configuration (SPS/PPS,
 AudioSpecificConfig), which exists only once a run has produced -- an
 encoder reports its output format with its first output. A request for
-`init.mp4` before any run starts the first run at `start_ms`'s segment and
-waits for the formats. **The first run's formats are frozen into the init
+`init.mp4` before any run starts the first run *(as built: from the film's
+start)* and waits for the formats. **The first run's formats are frozen into the init
 segment**; a later run (a seek) whose formats differ fails the rendition
 with a sentence (2.5) rather than serving segments the init segment does
 not describe (§8 for why that could happen and what `avc3` would buy).
@@ -239,10 +240,13 @@ pub struct Job {
     /// (`Registry::open_reader`): the reads are the viewer's playback.
     pub reader: MediaReader,
     pub spec: RenditionSpec,
-    /// Start here: N x T for a run that begins at segment N. The producer
-    /// starts at the sync sample at or before it; the server discards what
-    /// precedes the cut (2.1).
+    /// Start here: `SEEK_BACK` (2 s) before the cut of the first segment
+    /// the run makes. The producer starts at the sync sample at or before
+    /// it; the server discards what precedes the cut (2.1).
     pub from: Duration,
+    /// The layout is not fixed yet: report the source's index
+    /// (`SampleSink::index`) before the first sample.
+    pub wants_index: bool,
     pub sink: SampleSink,
 }
 
@@ -253,8 +257,12 @@ impl SampleSink {
     /// A track's format: codec, codec configuration bytes (`csd-0`,
     /// `csd-1` as `MediaFormat` carries them), size or rate and channels.
     pub fn format(&self, track: TrackKind, format: TrackFormat) -> Result<(), Stopped>;
-    /// One access unit. Blocks while the run is L segments ahead of the
-    /// last request (the pause), returns `Stopped` once the run is dropped.
+    /// The video's sync samples as `IndexEntry { pts_us, pos }`, before
+    /// the first sample, when the job `wants_index`.
+    pub fn index(&self, entries: Vec<IndexEntry>) -> Result<(), Stopped>;
+    /// One access unit. Blocks while the run is its lookahead
+    /// (`LOOKAHEAD_TIME`, 12 s, and at least two slots) ahead of the last
+    /// request (the pause), returns `Stopped` once the run is dropped.
     pub fn sample(&self, sample: Sample) -> Result<(), Stopped>;
     /// The source ended: the last segment is whatever is buffered.
     pub fn end(self);
@@ -291,7 +299,9 @@ HLG on BT.2020 as the Matroska `Colour` element said it. Copied H.264 or HEVC wi
 decode time per sample, which `MediaExtractor` does not report (only a
 presentation time); the muxer derives decode times as the sorted
 presentation times of the reorder window, and writes composition offsets
-in a version-1 `trun` (signed). Encoded video is asked for no B-frames,
+in a version-1 `trun` (signed). *(As built since §2.8: the slot's
+presentation times sorted, run `D` (half a second) ahead and fitted to the
+slot's span, `mux::slot_dts`, so the offsets are never negative.)* Encoded video is asked for no B-frames,
 so there decode time is presentation time. No new dependency, nothing
 native, and `cargo test` covers it -- which a muxer on the Kotlin side
 would not be.
@@ -681,7 +691,8 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   source keeps its sample tables in its `moov`, so the same samples are
   never quite the same size -- and the room for its chunks' headers
   (`layout::interleave_room`: 160 bytes for each half second the segment
-  lasts, and one more; *Picture and sound interleaved*, below). The last
+  lasts and two more, and the first part's 8 KiB, `mux::FIRST_PART`;
+  *Picture and sound interleaved*, below). The last
   slot runs to the source's end. The
   file's length is the header plus every slot, exact before a byte is
   made; the `sidx`'s durations are the indexed times, exact by
@@ -695,7 +706,8 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   (a segment's real start may be up to a GOP later, which the `tfdt`
   says), slot `k` in proportion to time over the source's size, **15%**
   larger and 8 KiB on top, and the chunks' room for `T`. The `sidx` labels an estimated slot **10 s
-  after its cut** (the longest GOP assumed), so the slot a demuxer picks
+  after its cut** (the longest GOP assumed; since `D`, 10 s less `D`, 9.5 s
+  with a picture -- *Every sample at its own time*, below), so the slot a demuxer picks
   for a time began before it: labelled at the cut, Chrome picked a slot
   whose first sync sample was after the target, found none at or before
   it, and decoded forward from the start of what it had read -- 24 s to
@@ -767,7 +779,8 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   60 s). The speed rule and the absence of any give-up timer (a stalled
   source is waited for) are unchanged.
 * **A segment's sound begins 64 ms before its cut** (`AUDIO_LEAD_US`, more
-  than one AAC frame): the audio frame playing at the sync sample is in the
+  than one AAC frame; since `D`, `D` and 64 ms, 564 ms -- *Every sample at
+  its own time*, below): the audio frame playing at the sync sample is in the
   sync sample's fragment. FFmpeg n6's `mov_read_seek` seeks the video, then
   every other stream to the sync sample's time, backward: with each
   fragment's sound cut at or after the sync sample -- up to a frame later
@@ -816,13 +829,16 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
     slots): a straight read **317 requests** picture-first, alternating
     between offsets near 1.9 MB and 11.17 MB exactly as on the TV; a seek
     with `-ss 20` 47. Interleaved: **one** request for the straight read,
-    three for the seek (the start, the slot, the next slot).
+    three for the seek (the start, the slot, the next slot). *(With a slot
+    in two parts and padded in 1 KiB boxes, the seek is two: the start and
+    the slot, read on into the next slot without asking again --
+    `rendition_films.rs`.)*
 
   So the muxer lays a slot down in **chunks** (`mux::CHUNK_US`, 500 ms of
   decode time on the film's clock, a pure function of the slot's
   samples): per chunk a `moof` and an `mdat`, the chunk's picture in
   decode order and then the sound of the same half second, the sound
-  held within the picture's chunks (the 64 ms lead goes with the sync
+  held within the picture's chunks (the sound's lead, 564 ms since `D`, goes with the sync
   sample, sound after the last picture with it). A reader going straight
   through finds the next sample of either track in the next bytes. Each
   chunk's `tfdt` is where the track's last chunk ended (the samples'
@@ -839,7 +855,7 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
   file -- a seek back to a slot not read before -- is inserted in front of
   that last `trun` (`mov.c:4813-4821`), in the middle of the later slot,
   and the index is out of order. Measured with both shapes on the same
-  films (the `ff7` harness that drives libavformat as Chrome's
+  films (the `ff7` harness, since committed as `tools/lavf-harness`, that drives libavformat as Chrome's
   `FFmpegDemuxer` does, seeks 45, 10, 30, 50, 17, 20, 40, 5 s in turn):
   with `trun`s, 4.4, 6.1 and master landed the seek to 40 s at 24 s
   (H.264), and 4.4 the seeks to 50 and 40 s at 30 and 22.7 s (HEVC);
@@ -892,8 +908,8 @@ approved, **the mirror layout**, built in `rendition/layout.rs`,
 
   So **a mirrored layout cuts a slot at every sync sample a second or more
   apart** (`MIRROR_GRID_US`: the first at or after each second; a film
-  over 18 hours on a wider grid, to stay inside the `sidx`'s 65535
-  references), whatever the spec's segment length -- which now only sets
+  over about nine hours on a wider grid, to stay inside the `sidx`'s
+  32767 slots, two references each), whatever the spec's segment length -- which now only sets
   an estimated layout's grid -- and a slot's first decode time is its
   label (*Every sample at its own time*, below). A seek's first chunk is
   then the key before the target. Measured on the same matrix:
@@ -1223,40 +1239,42 @@ What a TV hand test of this is, before the app: §5, F2.
 ## 3. Routes and the contract with the client
 
 **On the LAN listener**, under the same token and the same cut, beside
-`/cast/{token}` and nothing else:
+`/cast/{token}` and nothing else. *(As built since F2, which removed HLS:
+the three `hls/` routes first planned here are one.)*
 
 | Route | Answers |
 |---|---|
-| `GET/HEAD /cast/{token}/hls/index.m3u8` | The playlist, `application/vnd.apple.mpegurl`. Written at publish; never waits. |
-| `GET/HEAD /cast/{token}/hls/init.mp4` | The init segment, `video/mp4`. Waits for the first run's formats. |
-| `GET/HEAD /cast/{token}/hls/{n}.m4s` | Segment `n`, `video/mp4`, ranged by `MediaRange` over the whole segment in memory. `404` past the last; `503` with `{refused, message}` once the rendition has failed. |
+| `GET/HEAD /cast/{token}/stream.mp4` | The rendition's file, `video/mp4`, `Cache-Control: no-store`; its length is the layout's total, framed `200`/`206`/`416` by `MediaRange`. `HEAD` and every `GET` wait for the layout; a range that begins in a slot waits for that slot's fragment. A failure is `503` `{refused: "renditionFailed", message}`, or `{refused: "unpublished", message}` once the cast was cut. A plain token's `stream.mp4` is `404`. |
 
-A rendition token's `/cast/{token}` is `404`, and a plain token's `/hls/...`
-is `404`: a token names one or the other. The LAN CORS layer already
-allows `Range` and exposes `Content-Length`/`Content-Range`
-(`lan_cors_layer`, `lib.rs:2186`), which a receiver's segment fetches
-need. Every response under a rendition token counts as a request; a
-segment body counts as a body (`record_body`), so the three-way watchdog
-reading of step C holds unchanged.
+A rendition's token serves the source as it is at `/cast/{token}` too. The
+LAN CORS layer already allows `Range` and exposes
+`Content-Length`/`Content-Range` (`lan_cors_layer` in `lib.rs`), which a
+receiver's fetches need. Every response under a rendition token counts as a
+request; a `GET` that begins a body counts as a body (`record_body`), so
+the three-way watchdog reading of step C holds unchanged. The reference
+for all of this is [docs/lan-media.md](../lan-media.md#renditions).
 
 **`ServerHandle` methods** (a capability is a method, never a route):
 
 | Method | Does |
 |---|---|
 | `install_producer(Arc<dyn Producer>)` | Once, by the embedder. Without one, `publish_rendition` refuses `noProducer`. |
-| `publish_rendition(&MediaId, RenditionSpec, Option<PlayToken>) -> anyhow::Result<CastToken>` | As `publish`: refused while the listener is down; holds the id's lease; writes the playlist. Starts no run: the receiver's first request does. |
-| `rendition_state(&CastToken) -> Option<RenditionState>` | `{ producing, segmentsServed, speed, failed: Option<{refused, message}> }`. Cheap, no runtime hop, safe to poll. |
+| `publish_rendition(&MediaId, RenditionSpec, Option<PlayToken>) -> anyhow::Result<CastToken>` | As `publish`: refused while the listener is down; holds the id's lease. Starts no run: the receiver's first request does, or `prepare_rendition`. |
+| `rendition_state(&CastToken) -> RenditionState` | `{"state": "producing"}`, `"idle"`, `"failed"` with the `sentence`, or `"ended"` (not published, or not a rendition). Cheap, no runtime hop, safe to poll. *(First designed as an `Option` of a struct with `segmentsServed` and `speed`; those were not built, and the counts are `cast_numbers`'.)* |
 | `prepare_rendition(&CastToken) -> bool` | Starts the first run and makes the receiver's first slots with no request -- slot 0, and the start's slot with those of the 6 s after it (§2.8, *Prepared before the load*). |
 | `rendition_readiness(&CastToken) -> RenditionReadiness` | `index`, `start`, `ready`, `failed{sentence}` or `ended`. Cheap, safe to poll. |
-| `unpublish(&CastToken) -> bool` | Unchanged; for a rendition it also drops the run and the ring (2.1). |
+| `cast_numbers(&CastToken) -> Option<CastNumbers>` | What a publication has served (`f8bd561`): requests, bodies begun, ended and open, bytes sent, where the latest body began and the furthest byte sent; what was read from the source (its kind, bytes, opens, seeks); and for a rendition its plans and output tracks, its layout, its live runs, runs begun, slots and film made, the slot last asked and how far past it the film is made. Counts that only grow, no rate and no clock: the app divides two answers by the time between them. `None` for a token not published. Cheap, safe to poll. The fields are in [docs/lan-media.md](../lan-media.md). |
+| `unpublish(&CastToken) -> bool` | Unchanged; for a rendition it also drops the run and the ring (2.1). A publication's end writes one `cast_publication_end` line with its totals. |
 
 `Producer`, `Job`, `SampleSink` and `TrackFormat` are Rust API for the
-embedder's crate; FRB never sees them. `RenditionSpec` and `RenditionState`
-cross to Dart and are `serde`.
+embedder's crate; FRB never sees them. `RenditionSpec`, `RenditionState`,
+`RenditionReadiness` and `CastNumbers` cross to Dart and are `serde`.
 
 **Dart**: `ReceiverCaps` and the table, the eureka_info fetch,
 `CastRendition`, the channel count in the stats poll, the HLS fields on
-`CastMedia`, and `rendition_state` in the watchdog.
+`CastMedia`, and `rendition_state` in the watchdog. *(Since then HLS is gone,
+and the app judges a receiver by its announced name, with no eureka_info
+fetch: xtremio `5b05898`.)*
 
 ## 4. What is deleted and what changes
 
@@ -1275,7 +1293,7 @@ cross to Dart and are `serde`.
   replaces it, and with it the "leans permissive over HEVC" paragraph,
   which described the bug this fixes.
 * `CastMedia` gains the HLS fields; `GoogleCastClient.load` passes them.
-* `cast::router()` gains three routes; `Publication` gains an optional
+* `cast::router()` gains three routes *(one since F2: `stream.mp4`)*; `Publication` gains an optional
   rendition. Nothing else in the server changes shape.
 * **Not deleted**: the as-is path. A stream the receiver can play
   untouched is served as it is, with ranges, exactly as step C serves it;
@@ -1322,7 +1340,9 @@ F1. **Server: the rendition route, the muxer, the ring, the trait, with a
    producer set them) and 282 audio packets (6.016 s), and the playlist as
    a 30 s HLS input; its only complaints are about the fake slice payloads.
    No Shaka or Cast receiver has played it. Where the code differs from
-   the sections above:*
+   the sections above -- as built at F1 (`5b4aec0`); §2.8 has since
+   replaced the routes, the cut grid, the decode times, the lookahead and
+   the ring:*
    * *`rendition_state` answers a `RenditionState` -- `producing`,
      `idle`, `failed {sentence}`, `ended` (not published, or not a
      rendition) -- not an `Option` of a struct with `segmentsServed` and
@@ -1486,8 +1506,8 @@ F3. **Audio to stereo AAC** (M). `MediaCodec` decode when the phone has a
      the 90 kHz clock; the audio lead and the per-track clock are
      untouched.*
    * *The decision converts every sound that is not AAC (AAC with more than
-     two channels is still copied until the stats poll has a channel
-     count), in Matroska and QuickTime, and in an MP4 or M4V whose sound
+     two channels is converted too since xtremio `2fe3b2e`, which reads the
+     channel count; a count mpv has not reported yet is copied), in Matroska and QuickTime, and in an MP4 or M4V whose sound
      the receiver would play silent or not at all.*
    * *Measured on a desktop (`rust/tests/rendition_sound.rs`): E-AC3 5.1,
      AC3 5.1, DTS 5.1 and TrueHD 5.1 in Matroska and AC3 in MP4 come back
@@ -1664,13 +1684,15 @@ the sentence.
 
 ## 9. Verified, and not
 
-**Verified in the tree or the build artifacts**: `cast::router` and
+**Verified in the tree or the build artifacts** (the line numbers are as
+of 2026-10-01 and have moved since; the names are what to search for):
+`cast::router` and
 `Publication` (`cast.rs:106`, `:194`); `CastBody` polls the cut first
 (`cast.rs:337`); `Registry::open_reader`, `open_source` and `lease`
 (`media/registry.rs:552-575`); `MediaReader`'s blocking calls refuse a
 runtime thread (`media/reader.rs:233`) and its `Canceller`;
 `MediaRange` (`routes/util.rs:63`); `log_path` elides `/cast/...`
-including an `/hls/` path (`routes/util.rs:173`, test at `:406`);
+including a rendition's path (`routes/util.rs:173`, test at `:406`);
 `lan_cors_layer` (`lib.rs:2186`); `publish`/`unpublish` and
 `block_on_server` (`lib.rs:1408`, `:1420`, `:1445` -- §8 of the pipeline
 note still says `:1097`); no trait-object hook exists in `ServerConfig`

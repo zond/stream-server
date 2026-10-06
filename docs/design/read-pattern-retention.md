@@ -157,7 +157,9 @@ unconditionally at top priority, whatever the rate says. Without it the rate
 is a starvation loop in the other direction: a blocked stream consumes
 nothing, so a rate-sized window is empty, so it stays blocked. This set is
 also the natural producer for the deadline pieces librqbit now splits across
-peers (`rqbit` `3b387e11`, `7892816e`).
+peers (`rqbit` `3b387e11`, `7892816e`). A pre-want's background stream
+([media-pipeline.md §2.11](media-pipeline.md)) never takes the head of the
+lookahead and is never split; the split depth is the readers' alone.
 
 **One piece past the current one.** A sequential reader that is given only
 the piece it is sitting in reads to the boundary and blocks -- literally the
@@ -186,7 +188,9 @@ case the allocation has to be shaped around.
 ## 3. Retention
 
 One number per piece: `last_useful = max(fetched_at, last_read_at)`. Evict
-the lowest first. `last_read_at` is new bookkeeping; nothing tracks it today.
+the lowest first. `last_read_at` was new bookkeeping; it is the ledger's
+now (`retention/ledger.rs`, `Use::last_useful`, which is the read when there
+was one and the fetch otherwise).
 
 Two tiers sit above the LRU and are not evicted while they hold:
 
@@ -263,7 +267,7 @@ want-windows, `Door::windows_now`, `RetentionPolicy::window_at`,
 
 One name on that list survives its subject: `playback_intent_for_request`
 (`server/src/routes/stream.rs`) still exists, reading nothing but the
-priority and the download flag and answering a `Fetching` of `Streaming`
+download flag and answering a `Fetching` of `Streaming`
 or `Download`. It classifies no geometry, and the range is not read at all.
 
 **And the told playhead entirely**: `note_playhead` on `ServerHandle` and the
@@ -277,11 +281,11 @@ sizes the stream's own read-ahead too, not only the disk's window.
 
 That deletion crossed the repo boundary -- xtremio reported the playhead once
 a second (`_reportPlayhead`, `PlayheadReport`, `PlayheadReporter`) and its pin
-would have stopped compiling. The two changes landed together, in stage D.
+would have stopped compiling. The two changes landed together, in stage 8.
 
 ## 6. Open
 
-Nothing about the shape, and nothing about the staging: stage D landed with
+Nothing about the shape, and nothing about the staging: stage 8 landed with
 xtremio, and the lookahead cap does apply to the sum of the streams --
 `Streams::want` scales every stream's demand by `budget / asked` when the
 disk cannot cover them all, which is what makes the shares equal in seconds
@@ -341,10 +345,10 @@ guess about byte geometry:
 Three invariants, each found by reproducing the field session rather than by
 reasoning about it (`enginefs/src/retention/scenarios.rs`).
 
-**Selection must describe the disk the pass leaves behind.** Today a pass
-computes what to keep wanting and what to delete from one listing taken
-before the reclaim, so it tells the backend to keep wanting a piece and then
-unlinks it. The stream's own read pulls it back, the next pass deletes it
+**Selection must describe the disk the pass leaves behind.** Before the
+swap a pass computed what to keep wanting and what to delete from one
+listing taken before the reclaim, so it told the backend to keep wanting a
+piece and then unlinked it. The stream's own read pulls it back, the next pass deletes it
 again, and round it goes -- fifteen passes out of fifteen in the scenario,
 every one of them taking the second track's pieces off the disk. On a swarm
 that keeps up this costs only bandwidth, continuously; on the field's
@@ -415,7 +419,8 @@ Order:
    is also the invariant the common owner was built for -- it owns every
    filesystem mutation, so the mirror is derivable and authoritative, and
    the one honest `read_dir` left is the one that seeds it at startup.
-   Chunk_store.rs:510 records what the listing costs when it lies: a
+   `ChunkDir::held_in_bucket`'s doc (`enginefs/src/chunk_store.rs`)
+   records what the listing costs when it lies: a
    transient directory error read as "empty" withdrew every committed piece
    of a file from what we announce, after peers had been told, and there is
    no un-Have.
@@ -447,7 +452,9 @@ Order:
 
 ### Where this stands
 
-**Landed.** 0-8: the detector, the ledger, the exempt bitmap, the disk
+**Landed.** 0-8, with one part of 0 open: the proxy's pass reads its
+in-memory held set (`proxy_retention::Held`), but the cache lookup on the
+read path (`Entry::look_up`) still lists the bucket it walks. The detector, the ledger, the exempt bitmap, the disk
 budget -- as `occupied + available - floor`, with `cacheSize` kept as an
 operator cap over it rather than retired as section 4 opens by proposing
 -- and the swap. What a pass keeps, fetches and gives back is now an
@@ -485,8 +492,10 @@ stream reads ahead *before a duration has been stated*
 a fetch no player will ever state one for). That is the first open of a
 session and any file a player can put no length on: there is no
 seconds-to-bytes conversion without a duration, and a constant is the only
-other basis there has ever been. Nothing else asks it -- not what is kept,
-not what is reclaimed, not which reader is the viewer. `Reading` did not
+other basis there has ever been. It also decides one step: whether a
+stream's open at the head calls librqbit's `prepare_file_for_streaming`.
+Nothing in retention asks it -- not what is kept, not what is reclaimed,
+not which reader is the viewer. `Reading` did not
 survive; where the entity is being consumed is `Consumers::at`, from the
 bytes each detected stream has eaten, and an entity's own last delivered
 byte is the fallback under it. `Shape` survives as the sharing draw and the
@@ -508,11 +517,38 @@ session adopts the draw; a seek or a budget that moves grows or shrinks
 nothing, and nothing is ever withdrawn. When playback moves to anything
 else, the play session's announced pieces end only once the torrent has
 left the swarm: the reconciler's `EndShares` stops it, the advertised set
-is made again from what is still shared, the torrent starts again if it is
-still wanted, and then the session's bytes go. Nothing but the one player on
-a torrent moving stops it: an unpin, or another player's move, waits for
-no player to be on it.
+is made again from what is still shared, the torrent starts again if
+something still holds it or a file of it is pinned, and then the session's
+bytes go. A torrent being played is stopped only when its one player moves;
+anything else -- an unpin, another player's move, what a restart left
+advertised -- waits until no play session is on the torrent and no read of
+it is open, or for shutdown or the next start.
 See [Sharing](../storage.md#sharing).
+
+**What runs a torrent is not this design's question** (2026-10). The
+reconciler runs a torrent while something holds it or a file of it is
+pinned: a player screen, from its first `p=` request until it is left; a
+cast, from publish to unpublish; the viewer's idle share of what they
+watched last, while idle sharing is allowed; or a response being delivered
+(`retention::holds`, `reconcile::Conditions::held`). The liveness cell runs
+nothing. It names the last file a stream opened and decides only which
+file's window is kept, and a held file keeps its window (`Mode::Live`)
+whatever the cell names.
+
+**A resumed film asks ahead of its reads** (the pre-want,
+[media-pipeline.md §2.11](media-pipeline.md)): one librqbit background
+stream at a time, and an asker on the entity (`Retention::ask_ahead`) that
+wants and holds nothing. What it fetches is ordinary cache content under
+the one eviction order, protected only once a real read promises it, and
+it asks for no piece that could not be kept beside what the readers hold
+(`owner::Room`). It is not a read: no stream is registered, and it keeps no
+torrent running.
+
+**The clock is a parameter.** The detector and the pass take `now`
+(`Streams::want`, `Stream::dormant`, `Retention::pass_at`); reads are
+stamped where they are served, and `Retention::pass` is the one place that
+reads the clock, handing it to `pass_at`. That is what lets
+`retention/scenarios.rs` replay a field session second by second.
 
 **Measured, not claimed.** The disk peaks at 71 pieces of a 64-piece budget
 on the torrent -- a stream's own lookahead is never taken, and what the

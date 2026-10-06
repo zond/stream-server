@@ -3,10 +3,14 @@
 Design, 2026-09-26. Written against stream-server `9334c93`, xtremio
 `be034e6`, rqbit `d02b73a2`.
 
-**Status: built, all of it** (2026-09-26): the proxy pin set
-(`ServerConfig::proxy_pins`), `ProxyBacking::keeps_everything`, the filler,
-the embed calls (`ServerHandle::{pin_proxy_download, unpin_proxy_download,
-proxy_download_key}`, rows in `downloads()` with `source` and `playUrl`),
+**Status: built, all of it** (2026-09-26): the proxy half of the pin set
+(since 2026-10-01 one `ServerConfig::pins: Option<Vec<PinKey>>`, whose
+`Url`/`Drive` keys `PinKey::proxy_pins` hands to `ProxyDownloads::install`;
+built first as a separate `proxy_pins`), `ProxyBacking::keeps_everything`,
+the filler (`proxy_downloads::Filler`), the embed calls
+(`ServerHandle::{pin_proxy_download, unpin_proxy_download,
+proxy_download_key}`, and `pin`/`unpin` by media id over them, rows in
+`downloads()` with `source` and `playUrl`),
 offline Drive playback, and read-ahead (§4). Where the build departed from
 the design, the section says so. `server/tests/proxy_downloads.rs` and
 `server/tests/drive.rs` measure it.
@@ -33,7 +37,8 @@ HTTP streams, which they lacked.
 ## 1. What the two sides share
 
 The proxy cache (`proxy_cache`, `proxy_retention`, `sources::*`) keeps one
-file per 256 KiB chunk under `<key-sha256>/<validator>/` (since 2026-10-01
+file per 256 KiB chunk under `<key>/<length>_<content type>_<validator>/<bucket>/`
+(`proxy_cache`'s module doc; since 2026-10-01
 the entity's *identity*, never absent: a Drive file's checksum, else the
 origin's validator, else its length -- Drive names no validator, and under
 the old rule a Drive download kept nothing; see `docs/proxy.md`), and the same
@@ -81,6 +86,12 @@ at load -- the registry already has a version field). `_streamKey`,
 `names`, `pin_is_shared` and the replace logic compare `Source`s; none of
 them cares what is inside.
 
+*Departed:* no `Source` enum was built. A row keeps `infoHash`/`fileIdx`;
+for a link or Drive file `infoHash` is the server's key name
+(`proxy_download_key`, 64 hex), rows are told apart by `is_proxy_key`, and
+the `ProxyPinKey` is derived again from the stored stream
+(`proxy_pin_of_stream`).
+
 ## 3. The server side: five pieces, in dependency order
 
 ### 3.1 A proxy pin set that outlives the run
@@ -101,6 +112,10 @@ pub struct ServerConfig {
 pub enum ProxyPinKey { Url { target, headers }, Drive { file_id } }
 ```
 
+*Built as one field since 2026-10-01:* `pins: Option<Vec<PinKey>>` covers
+torrents, links and Drive files (first built as a separate `proxy_pins`).
+`ProxyPinKey` is in `proxy_downloads.rs`, its `headers` a `BTreeMap`.
+
 `proxy_cache::sweep` takes the resolved set of key directories and keeps
 them -- every entity generation under a pinned key, since the validator
 that names the generation is not known until the origin is asked. With
@@ -118,6 +133,9 @@ fn keeps_everything(&self, key: &PathBuf) -> bool {
     self.pins.read().contains(key_dir_of(key))     // copy-out read, no owner lock; same shape as the torrent's
 }
 ```
+
+*(As built: the pin set holds `key.parent()`, the entity's key directory,
+and a `None` set exempts nothing.)*
 
 The owner already does the rest: a kept entity's chunks are committed,
 not slack; the pass never plans them; the out-of-space rule refuses a new
@@ -165,6 +183,17 @@ in-flight add, so Cancel is immediate here too. On restart the filler
 resumes from the holes: the disk is the truth, nothing about progress is
 persisted, and a chunk a kill was writing was never renamed into place.
 
+*Built differently* (`proxy_downloads::Filler`): the walk is offset 0 to
+the end in `FILL_STRIDE` (32 MiB) steps through `proxy_retention::read_through`
+over the pin's quiet `ProxySource`, so a span the disk holds costs no
+request. It checks the pin before every stride. A failed read is logged
+(`download filler: a read failed; asking again shortly`) and asked again
+after `FILL_RETRY` (15 s); the end is logged as `download filler: reached
+the end`, with `whole`. A validator change is not restarted from byte 0:
+the ranged read fails (the origin answered `200` to it) and is asked again.
+One filler per key directory lives in `ProxyDownloads`, not in a
+progress-logger slot.
+
 Rate: unlimited by default; a later setting can cap it. The filler counts
 as background traffic for the sharing light (it *is* "using your
 connection while you are not watching"), through the same
@@ -175,11 +204,12 @@ connection while you are not watching"), through the same
 The HTTP routes sketched here were built and removed the same day with every
 other app-facing control route; the app speaks FFI. `DownloadInfo` gains
 `source` and `playUrl` and keeps `length`, `downloaded`, `complete`,
-`error`; `downloaded` for a proxy entity is *held chunks x CHUNK_BYTES*, off
-the held set -- exact, and free. The `download progress` line gets its proxy
-twin: `moved`, `still_secs`, bytes held / total, the hole being fetched, and
-`origin` as the source describes itself (`ByteSource::describe`: never a
-URL, never a credential).
+`error`. *(As built: `downloaded` for a proxy entity is the bytes of the
+chunks the disk holds (`Entry::held_facts`, a listing of the entity's
+buckets per row -- exact, one disk walk per listing); `phase` is `ready`
+when whole, `buffering` while a filler runs, `checking` for a pin with no
+filler. There is no proxy twin of the `download progress` line: the filler
+logs a failed read and its end.)*
 
 ### 3.5 Playing a finished download
 
@@ -231,7 +261,10 @@ reconciler, and a proxied entity nobody is playing has no window to fill.
   groups a `_StreamDownloads` after all -- the reason it did not (no
   torrent the server could keep) is gone.
 * `pins()` publishes both sets to `ServerConfig` at boot; `pins_in`
-  splits rows by `Source`.
+  splits rows by `Source`. *(As built: `pins()` hands `ServerConfig::pins`
+  one `Vec<PinKey>` -- `pin_keys_in`, `pins_in`'s torrent rows and
+  `proxy_pins_in`'s link and Drive rows, `None` if either half is unknown;
+  `source_of` answers a `TorrentSource`, and there is no `Source` enum, §2.)*
 * The replace and cancel logic, the notification and the library's
   Downloaded pill are source-agnostic already: they read `Entry::state`
   and `wants_pin`, never `info_hash`.

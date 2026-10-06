@@ -1,6 +1,15 @@
 # Media pipeline: fetchers, their caches, translation, and three ways out
 
-Design, 2026-09-30. **Proposed; nothing here is built yet.** Written
+Design, 2026-09-30. **Status: A built (`559102b` one torrent open and
+`TorrentSource`; `4c64d4f`, `fe95501` the ids, the reader task, the handle
+methods, finished downloads offline; `39a9105` a member shares its own
+extent), A2 (`1d0d109`), B (`041c600`), C (`113a556`), D (`29e377e`) and E
+(`410a1e2`) built; A' built in xtremio (`d6913a7`, `3ae49e6`, `fd0c1a6`,
+`56d4bda`); §2.11's pre-want built 2026-10-05 (`c61f03d`, `cd07bbc`,
+`54a1ae4`, `ee09180`); F is [renditions.md](renditions.md)'s. Not built:
+an explicit volume list for a set behind links or Drive (E), and `/ftp` by
+id, which still resolves `notYet`.** Each step's note in §5 says where the
+build departed. Written
 against stream-server `95bd0c0`, xtremio `22814b1`, the stremio-core fork
 `f2cc08bf9`, and the xtremio spike branch `spike/mpv-stream-cb` (`13206ba`,
 `0d2c187`). Where this and the code disagree once steps land, the code is the
@@ -8,7 +17,7 @@ answer, as for every note in this directory.
 
 Most of this pipeline exists. Bytes come from a **fetcher** -- a torrent
 through librqbit, an HTTP origin (a debrid link, an addon's CDN), a Google
-Drive file, and, once step B lands, a local file. A fetcher that should
+Drive file, and a file on this device (step B). A fetcher that should
 keep what it fetched has its **own disk cache** inside it -- the piece store
 under a torrent, the proxy chunk store under HTTP and Drive -- and that
 cache is where **pins** (offline downloads) live. Between a fetched file
@@ -19,8 +28,8 @@ is one of three **outputs**: mpv in this process, a cast receiver on the
 LAN, and -- step F -- a transcoded rendition for a receiver that cannot
 decode the original.
 
-What does not exist is a name for "a thing the app plays" that is not a URL.
-Every output today reaches the bytes through an HTTP route whose shape
+What did not exist, at `95bd0c0`, was a name for "a thing the app plays"
+that is not a URL. Every output then reached the bytes through an HTTP route whose shape
 encodes what the bytes are, and the app rewrites those URLs (`p=`,
 `buffer=`, `/proxy/d=`) to steer the server. This note replaces the URL
 with an opaque id handed out by one registration call, puts mpv on a
@@ -42,7 +51,11 @@ deleted as each lands.
 | Archive the app sniffed (a debrid `.rar`, a torrent whose file is a `.zip` or `.iso`) | mpv fails, `archive_sniff.dart` reads the first `0x8006` bytes, `archive_route.dart` posts `/{fmt}/create` (or the `torrent:` key form) and replays on the member URL. | The member URL is on `archive_stream_routes()`, which the LAN mounts. Works, sharing nothing. |
 | Local file (SAF, Downloads folder) | Not offered by the server. | -- |
 
-*(Since step C the "Cast" column is history: every row with an id casts by
+*(Since A' (xtremio `56d4bda`) the first column is history as well: every
+row plays as `xtremio://<id>`, except an origin that will not range (its
+`/proxy` URL) and `/ftp`, which has no id yet. The watchdog paragraph below
+is history too: the app reads both counts, §2.7. Since step C the "Cast"
+column is history: every row with an id casts by
 publishing it (`ServerHandle::publish`, §2.7), served under one token
 route; only an origin that will not range is refused there, `501`
 `noRanges`, since nothing on the device can seek it for a receiver.)*
@@ -130,6 +143,11 @@ pub struct Play {
 }
 ```
 
+*(As built: `token: String`, plus `member: Option<MemberExtent>`, the
+member's extent or its bytes in each volume (2.8). Across FFI the app passes
+`PlayToken { token, buffer }`; `shares` is the server's decision, never the
+app's.)*
+
 With a play, an open does exactly what `stream_video_with` does between
 resolving the file and building the body, in the same order and for the
 same reasons (each is commented there): `note_player` moves the play
@@ -139,8 +157,11 @@ with no await between the registration and the guard; the disk gate
 (`ensure_disk_ready_or_refuse`); `focus_torrent`; and the shared reader
 (`try_get_file_with_intent`) for the current screen of a file that shares,
 `try_get_file_unshared` for everything else. The guard's drop is
-`on_stream_end`. Without a play it is today's aside: registration through
-`TorrentMemberStream`, `try_get_file_unshared`, no session touched.
+`on_stream_end`. Without a play it is an aside: `TorrentSource::aside`
+registers the stream with `on_stream_start` before any reader,
+`try_get_file_unshared`, no session touched, and the source's drop ends it.
+*(As built, an aside's scattered index reads seek one kept reader rather
+than reopen; a reader's seek reopens as below.)*
 
 The route keeps its HTTP framing and calls the factored open; the reader
 task (2.4) calls the same function. One open, two callers, and a test that
@@ -186,7 +207,8 @@ Two calls, because they cost differently:
 /// What the app hands the server to play. Parsed, never fetched.
 pub enum MediaSpec {
     /// A URL stremio-core built (`streaming_url`): a torrent, `/proxy`,
-    /// an archive `/create`, `/ftp`. Parsed by the routes' own parsers.
+    /// an archive `/create`, `/ftp` (as built, `/ftp` registers but
+    /// resolves `notYet`). Parsed by the routes' own parsers.
     StreamingUrl(Url),
     /// A Google Drive file, and where its grant comes from (the server
     /// keeps no refresh token; xtremio's `ServerState::drive_grant` does).
@@ -210,6 +232,8 @@ pub struct Resolved {
     pub member: Option<MemberInfo>,
     /// `false` only for an HTTP origin that will not range (2.5).
     pub in_process: bool,
+    /// The `/proxy` URL to hand a player when `in_process` is false.
+    pub proxy_url: Option<String>,
     /// Whether the server looked for a container (2.9); `false` when it
     /// could not read the head in time.
     pub sniffed: bool,
@@ -225,6 +249,14 @@ content_type}`; that is `resolve`'s answer instead, because a magnet's name
 is not known until its metadata is, which can be ninety seconds, and the
 app wants the id before it knows whether to wait. `ByteSource` still carries
 no name or MIME; `Resolved` is where they live.
+
+*(As built: the kept answer is made again when it has gone stale -- a dead
+Drive grant, a held download unpinned, a sniffed member whose source went
+stale. The questions asked by id (stream numbers, the duration and player
+reports, the position) never resolve: they read what the id last resolved
+to without waiting on a resolve under way (`Registry::peek`, which reads
+`Entry::resolved`, a copy kept beside the resolve lock, `1e2554e`), and
+answer nothing for an id not resolved yet.)*
 
 **The core's URL is parsed in Rust, by the parsers the routes already use**
 (`PlaybackQuery::parse`, `compat::resolve_file_idx` with `-1` and `f=`, the
@@ -242,9 +274,9 @@ threads. They never poll a future themselves. **One runtime task per open
 reader owns the reader**, and the foreign thread talks to it over a channel.
 Three reasons, each from the code:
 
-1. Dropping a reader spawns: `TorrentMemberStream::drop`
+1. Dropping a reader spawns: `TorrentSource`'s drop for an aside
    (`sources/torrent.rs`) and `StreamLifecycleGuard::notify_end`
-   (`routes/stream.rs:216`) both call `tokio::spawn`, which panics off a
+   (`routes/stream.rs`) both call `tokio::spawn`, which panics off a
    runtime. A reader dropped on mpv's thread would do exactly that.
 2. A read parked on a missing piece has no cancellation today. HTTP relies
    on the socket closing, which drops the body future. mpv's `cancel_fn` runs
@@ -361,7 +393,10 @@ What moves from the URL to the id, in the app:
 an HLS playlist, a live channel -- is not a `ByteSource` and never will be;
 `resolve` answers `in_process: false` with the `/proxy` URL, and mpv reads
 that as today. That is the only reason `proxiedThroughServer` survives step
-A', and it survives only as "the URL `resolve` handed back".
+A', and it survives only as "the URL `resolve` handed back". *(As built,
+xtremio `56d4bda`: `proxiedThroughServer` also wraps a link on another host
+in `/proxy`, with the screen's token, before it is registered, and the
+result is registered as an id like any `/proxy` URL.)*
 
 **A risk this changes.** A read over HTTP is bounded by mpv's
 `network-timeout` and, past that, by the app's false-end re-open. A
@@ -440,7 +475,15 @@ source and the id's lease and polls the token's cut before every chunk.
 Publishing is refused while the listener is not running, so a token never
 outlives the stop that would have unpublished it; the publication's lease
 keeps the id from eviction. A link whose host will not range is `501`
-`noRanges` on the route.)*
+`noRanges` on the route. A body logs `cast_body_start` and `cast_body_end`
+with `source` from `Source::kind()`: `torrent`, `member`, or `http` for
+every shared source -- a proxied link, a Drive file, a held download and a
+file on this device alike, so `http` says the bytes came through the shared
+reader, not over the network. A publication of a torrent id holds its
+torrent from publish to unpublish (`retention::holds`, since `bcdd6a0`);
+one of anything else marks the viewer as watching elsewhere. What is built
+is described in [docs/lan-media.md](../lan-media.md), which is the
+reference; the rules below are the reasoning.)*
 
 The LAN listener mounts **one** route, `GET/HEAD /cast/{token}`, which
 serves the id the token was published for with the shared range framing
@@ -448,6 +491,8 @@ serves the id the token was published for with the shared range framing
 reader opened from the resolved source. It replaces `lan_media_routes()`
 (`lib.rs:2042`: `lan_stream_routes()` and `archive_stream_routes()`) whole.
 `lan_media.rs` is route-agnostic and keeps its start, stop and base URL.
+*(Since F2 there is a second route, `/cast/{token}/stream.mp4`, under the
+same token and cut: [renditions.md](renditions.md).)*
 
 What this fixes: every case in §1 casts, because every case is an id. The
 four `404`s go. **Drive stops being a privacy exception**: the receiver sees
@@ -478,7 +523,9 @@ it: **bodies served**, counted when a `/cast` response begins a body. The
 app's 20 s check then has three answers where it had two: no requests (the
 address is unreachable: end the session, as now), requests but no body (the
 receiver asked for something this device would not serve: end the session
-and say so), bodies (leave it to the media). The brief's "count only served
+and say so), bodies (leave it to the media). *(As built in the app, `56d4bda`: requests
+with no body put a note on the remote and ask again; they do not end the
+session.)* The brief's "count only served
 bodies" would have turned the first diagnosis into the second.
 
 ### 2.8 What sharing does for an archive member
@@ -555,8 +602,8 @@ volume's stream takes a rate from it. The torrent-wide rules need nothing
 new: `announced_now`, `announced_in_swarm` and `reclaim_rest` read the
 advertised set, which holds the union.
 
-**A draw is made for a member** (review of `39a9105`/`1d0d109`, fixed on
-`review-fixes`). The draw records what it was made for -- the member's
+**A draw is made for a member** (review of `39a9105`/`1d0d109`, fixed in
+`b194495`, `77a7920`, `42cc28b`). The draw records what it was made for -- the member's
 extent, or the set -- and counts as shared only while the sessions on its
 file play that (`DrawnFor`, `Engine::shares_now`). A move to another member
 of the same container, from the container played as itself to a member, or
@@ -627,6 +674,14 @@ field when something supplies one); until then such a set resolves to
 the RAR translator's missing-volume refusal.
 
 ### 2.10 Renditions (step F): transcode for a receiver, on demand, no disk
+
+*(Superseded: [renditions.md](renditions.md) is the design and the status.
+A rendition is one progressive fragmented MP4 at
+`/cast/{token}/stream.mp4`, not HLS, and the producer is xtremio's, over
+libavformat, not Kotlin `MediaCodec` (renditions.md §5, F1½ and F2). What
+this section fixed still holds: nothing on disk, the same token and
+cut-on-unpublish, and the producer an embedder-installed trait object so
+the server stays an `rlib`. The rest is kept as it was proposed.)*
 
 For a receiver that cannot decode the original (the per-model table; on
 zond's TV, AC3/E-AC3 over Bluetooth audio is **silent**), the cast is a VOD
@@ -798,14 +853,15 @@ capability is a method, never a control route):
 | `set_buffer(&MediaId, BufferProfile)` | Applies to the reader's next open. |
 | `set_resume(&MediaId, Option<ResumeHint>)` / `note_media_position(&MediaId, Duration)` / `media_read_wait(&MediaId) -> Result<ReadWait, Refusal>` | 2.11. |
 | `publish(&MediaId, Option<PlayToken>) -> Result<CastToken>` / `unpublish(&CastToken) -> bool` | 2.7. *(Done, step C.)* |
-| `pin(&MediaId) -> Result<DownloadInfo, PinError>` / `unpin(&MediaId, bool) -> UnpinOutcome` | 2.6. |
-| `stream_numbers`, `note_duration`, `note_player_opened`, `note_player_stalled`, `close_streams` | As today, keyed by id. |
+| `pin(&MediaId) -> Result<Vec<DownloadInfo>, PinError>` / `unpin(&MediaId, bool) -> Result<UnpinOutcome, PinError>` | 2.6. |
+| `media_stream_numbers`, `note_media_duration`, `note_media_player_opened`, `note_media_player_stalled` | By id, from what the id last resolved to; nothing for one not resolved yet. There is no `close_streams` by id: `close_proxy_streams(token)` stays, by token, for a non-ranging origin read over HTTP. |
+| `install_producer`, `publish_rendition`, `prepare_rendition`, `rendition_state`, `rendition_readiness`, `cast_numbers` | [renditions.md](renditions.md), [lan-media.md](../lan-media.md). |
 
 `MediaReader`'s blocking methods (`read`, `seek`, `cancel`, `len`, drop as
 close) are what xtremio's `stream_cb` shim and later its JNI exports call;
 FRB never sees a reader.
 
-**Media routes**: the LAN listener serves `/cast/{token}` and nothing else. The loopback media routes stay for the core and
+**Media routes**: the LAN listener serves `/cast/{token}` and a rendition's `/cast/{token}/stream.mp4`, and nothing else. The loopback media routes stay for the core and
 for the in-process `/proxy` leftovers until their callers are gone (§4).
 
 Refusals keep translated-sources' mapping (`415`/`422`/`501` with
@@ -842,10 +898,14 @@ As each step lands, not beside it:
   (except as 2.5's non-ranging leftover), `withBufferAhead`,
   `withPlayerToken`, `isProxiedByServer`-based decisions, `_reopenForBuffer`,
   and `_castUrl`'s rebuild-on-the-LAN-base. The brief counted ~97 URL
-  assertions across 18 player test files that move to ids.
+  assertions across 18 player test files that move to ids. *(Done in
+  xtremio `56d4bda`, except as noted in §2.5: `proxiedThroughServer` stays
+  for links on another host, and `_reopenForBuffer` is a `setBuffer` call
+  that reopens nothing.)*
 * **The name `rqbit-downloads`**, by step D, and the data under it at first
   boot (2.6).
 * **`archive_sniff.dart`'s fail-then-sniff**, after step E has shipped.
+  *(Done in xtremio `56d4bda`.)*
 * **Not deleted**: `/proxy`, `/ftp`, `/drive/stream`, `/downloads/{key}/stream`
   and the archive routes on loopback. stremio-core builds some of these
   URLs and the non-ranging case needs `/proxy`; the rest go when nothing
@@ -857,7 +917,9 @@ its wiring, the reconciler, the liveness cell and the RAR set hold
 thing, by step A's third slice and for 2.8 alone: a play session on a
 member names its extent (`Backing::played_member`), and the draw is made
 over that extent (`Backing::narrowed`) with the content check skipped;
-nothing else about its policies changed.
+nothing else about its policies changed. *(Since `bcdd6a0` a published
+torrent id takes an explicit hold, which is how a cast keeps its torrent
+running; the liveness cell runs no torrent since `cb2be0e`.)*
 
 ## 5. Steps, in order, each shippable
 
@@ -893,10 +955,10 @@ A. **Server: one torrent source, ids, the reader task.** (L.) Factor the
    draws over `Backing::narrowed` -- the member's pieces, the member's
    length for the rate. A set's volumes opened `shares: false` (until
    A2); a container behind links is `Played::Elsewhere` with read-ahead. The HTTP route's
-   `played_through_a_translator` stays. Not done here: the stream's own
-   lookahead grant (`Retention::bitrate`) is still the container's length
-   over the duration; for a single film in a container the difference is
-   the headers, for a season in one ZIP it overstates the read-ahead.)*
+   `played_through_a_translator` stays. The stream's own lookahead for a
+   container then got the container's length over the episode's duration;
+   since `32990ae` a member's duration goes to its files for the draw
+   alone, and the container's stream has no rate.)*
 
 A2. **Play sessions understand sets.** (M.) `Played::Torrent` over a set of
    files, mirroring `Live::hold_set`; a move inside the set ends nothing;
@@ -909,17 +971,20 @@ A2. **Play sessions understand sets.** (M.) `Played::Torrent` over a set of
    `shares: true`; the film's duration for a set's id goes to its volumes
    for the draw alone (`EngineFS::on_set_duration`). The HTTP route's
    `played_through_a_translator` and the liveness cell's `hold_set` stay.
-   Left: a delete of one volume while its set plays ends that volume's
-   record of the draw but not its siblings', so that volume's drawn pieces
-   stay advertised (not held) until the set is left; the stream's own
-   read-ahead for a volume still has no rate.)*
+   A delete of one volume while its set plays narrows the set's draw by
+   that volume (`f229ae6`, `Engine::withdraw_deleted_volume`). A volume's
+   stream has no rate of its own, by design (2.8).)*
 
 A'. **App: mpv on `xtremio://<id>`.** (L.) The vendored media_kit patch
    (2.5); the `stream_cb` shim in xtremio's crate over `MediaReader`; torrent,
    URL, Drive, download and member streams through ids; `p=`, `buffer=`,
    `force-seekable`, stream numbers and stream close by id; the
    `network-timeout` dependence of 2.5 moved first. The URL assertions in
-   the player tests move.
+   the player tests move. *(Done in xtremio: `d6913a7` vendored media_kit
+   1.2.6, `3ae49e6` the `stream_cb` shim over `MediaReader`, `fd0c1a6`
+   torrents as `xtremio://<id>`, `56d4bda` every stream by id, the archive
+   fallback deleted, and a buffer change is `setBuffer` with nothing
+   reopened. `/ftp` and YouTube still play their URL.)*
 
 B. **Local source.** (S.) A path, or on Android an fd from
    `ParcelFileDescriptor.detachFd()`. A pipe fd from a cloud SAF provider is
@@ -932,7 +997,7 @@ B. **Local source.** (S.) A path, or on Android an fd from
    play does, so a torrent played before goes slack. The pipe refusal is
    `Refusal::NotSeekable`. `server/tests/media_local.rs` holds the tests,
    including that no route names a `MediaSpec` and none can deserialize
-   one. Pins of a local id are step D's question.)*
+   one. A local id does not pin: `PinError::NothingToDownload`, step D.)*
 
 C. **Publish and the cast route.** (M.) 2.7 whole: tokens, `/cast/{token}`,
    the body wrapper, `set_lan_media(false)` unpublishing, `log_path`, the
@@ -941,8 +1006,9 @@ C. **Publish and the cast route.** (M.) 2.7 whole: tokens, `/cast/{token}`,
    ends a body mid-stream; no token reaches a log line. *(Done:
    `server/src/cast.rs`, `ServerHandle::{publish, unpublish,
    lan_media_bodies_served}`, `server/tests/cast.rs`; the three-way reading
-   is in `docs/lan-media.md`. Left for the app: publishing per cast instead
-   of rebuilding a URL on the LAN base, and the three-way check.)*
+   is in `docs/lan-media.md`. The app's half is xtremio `56d4bda`:
+   `_castUrl` publishes, and the watchdog reads both counts -- requests with
+   no body put a note on the remote and ask again rather than end.)*
 
 D. **Pins by id; one pin set; the directory.** (S-M.) `pin(id)`,
    `PinKey`, the rename, the boot delete, `NOT_OURS`, and the held-nothing
@@ -966,18 +1032,20 @@ D. **Pins by id; one pin set; the directory.** (S-M.) `pin(id)`,
 E. **The sniff in `resolve`.** (S; M more for explicit volume lists on URL
    and Drive sets.) 2.9, then the app's fallback deleted. *(Server half
    done: `server/src/media/sniff.rs`, `Resolved::sniffed`,
-   `server/tests/media_sniff.rs`; the HTTP routes are unchanged and the
-   app's fallback stays until A' slice 2. The explicit volume list for
+   `server/tests/media_sniff.rs`; the HTTP routes are unchanged, and the
+   app's fallback was deleted with A' slice 2 (xtremio `56d4bda`). The explicit volume list for
    link and Drive sets is not done.)*
 
 F. **Renditions.** (Server route M; Kotlin producer L.) Its own design note
    first (2.10): `docs/design/renditions.md`, whose §5 splits it into
    F0-F5. *(F1, the server side, done: `server/src/rendition/`
    (`Producer`, `Job`, `SampleSink`, the run task, the cut rule, the ring,
-   speed, the fMP4 muxer), the three `hls/` routes in `cast.rs`,
-   `ServerHandle::{install_producer, publish_rendition, rendition_state}`,
-   `server/tests/renditions.rs` with a Rust test producer. The Kotlin
-   producer (F2-F4) and the app's half (F0, F5) are not.)*
+   speed, the fMP4 muxer), `ServerHandle::{install_producer,
+   publish_rendition, rendition_state}`, `server/tests/renditions.rs` with
+   a Rust test producer. Since then: the route is
+   `/cast/{token}/stream.mp4` (HLS removed in `1c0c6e6`), the producer is
+   xtremio's over libavformat rather than Kotlin, and the status of F0-F5
+   is kept in `renditions.md`.)*
 
 ## 6. Decisions taken here, for zond to overrule
 
@@ -1018,8 +1086,8 @@ It does not make a non-ranging origin a source. An HLS playlist or a live
 channel goes to mpv through `/proxy` as it does now; step C does not cast
 one (it is not an id with a reader), which stays as today.
 
-It does not make play sessions understand sets; that is the named gap of
-2.8. It does not make a compressed member playable, and it does not
+Play sessions understanding sets was the named gap of 2.8, and A2 closed
+it. It does not make a compressed member playable, and it does not
 transcode for this device's own player: renditions are for receivers.
 
 ## 8. Brief vs code
