@@ -67,6 +67,7 @@ cargo clippy --all-targets --all-features   # as CI; the workspace lints deny wa
 cargo doc --no-deps --all-features && cargo doc --no-deps --all-features --document-private-items   # links must resolve in both views
 cargo test
 cargo test -p server --no-default-features               # the MIT build; the only place cfg(not(feature = "rar")) compiles
+cargo run -p server --example embed_thread               # the embedding example, run as CI runs it
 cargo ndk -t armeabi-v7a -t arm64-v8a check -p server --all-targets --locked   # needs an NDK; CI runs it
 ```
 

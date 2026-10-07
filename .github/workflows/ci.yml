@@ -77,6 +77,12 @@ jobs:
       - name: Test
         run: cargo test
 
+      # Clippy's `--all-targets` compiles the example; this runs it, so a
+      # route it asks for that is gone fails here (it once asked for the
+      # removed `/heartbeat` and compiled fine).
+      - name: Run the embedding example
+        run: cargo run -p server --example embed_thread
+
   mit-build:
     name: MIT build (no RAR)
     runs-on: ubuntu-24.04
