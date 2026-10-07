@@ -1563,6 +1563,12 @@ pub struct EngineStats {
     pub peers: u64,
     pub queued: u64,
     pub unique: u64,
+    /// **Always `0`.** Kept because stremio-core's `Statistics` requires it
+    /// (a `u64` with no default, so neither absent nor `null` parses), and
+    /// that fork is changed as little as possible. librqbit counts
+    /// connection attempts per peer only, so a total would mean a per-peer
+    /// snapshot on every stats poll; nothing reads the number, xtremio
+    /// included.
     pub connection_tries: u64,
     pub peer_search_running: bool,
     pub stream_len: u64,

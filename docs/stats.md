@@ -4,7 +4,7 @@ What the server says about a stream while a client waits for it or plays it: the
 
 ## Startup phases in `stats.json`
 
-`ServerHandle::engine_stats` / `file_stats` and the core's `/{infoHash}/{fileIdx}/stats.json` keep the server.js-compatible shape stremio-core parses and add these camelCase fields so a client can show honest pre-playback progress:
+`ServerHandle::engine_stats` / `file_stats` and the core's `/{infoHash}/{fileIdx}/stats.json` keep the server.js-compatible shape stremio-core parses and add these camelCase fields so a client can show honest pre-playback progress. (Of that shape, `connectionTries` is always `0` -- the one zero here that is not a measurement: stremio-core's `Statistics` requires the number, so it cannot be absent or `null`, and librqbit keeps no total of connection attempts.)
 
 | Field | Meaning |
 |---|---|
