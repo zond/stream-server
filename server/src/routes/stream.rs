@@ -582,7 +582,11 @@ fn available_space_for_path(path: &FsPath) -> Option<u64> {
 ///
 /// A volume that cannot be probed is an error here rather than a pass,
 /// unlike in the reconciler: this runs before a byte is written, and the
-/// caller retries once the volume has been probed again.
+/// caller retries once the volume has been probed again. The published cap
+/// reads the same failure the other way on purpose -- as unknown, leaving
+/// `cacheSize` alone (`cache_budget::available_space`) -- because there
+/// "no room" would evict a healthy cache, while here it only declines to
+/// start writing; each reader takes the answer whose mistake costs nothing.
 ///
 /// It writes nothing: librqbit's own first write is what tests whether the
 /// root is writable, which is not what the floor is for.
