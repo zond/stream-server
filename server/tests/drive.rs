@@ -377,12 +377,22 @@ impl Fixture {
     /// (`ServerHandle::pin_proxy_download` with a Drive file and the
     /// grant), and answers the row.
     fn download(&self, refresh_token: &str) -> anyhow::Result<stream_server::DownloadInfo> {
+        self.pin_drive(FILE_ID, Some(refresh_token))
+    }
+
+    /// A Drive pin of `file_id` with whatever grant is given, `None`
+    /// included; a refusal is the error, a `ProxyPinError` inside.
+    fn pin_drive(
+        &self,
+        file_id: &str,
+        refresh_token: Option<&str>,
+    ) -> anyhow::Result<stream_server::DownloadInfo> {
         self.handle
             .pin_proxy_download(stream_server::ProxyDownloadRequest {
                 url: None,
                 headers: Default::default(),
-                drive_file_id: Some(FILE_ID.to_string()),
-                refresh_token: Some(refresh_token.to_string()),
+                drive_file_id: Some(file_id.to_string()),
+                refresh_token: refresh_token.map(str::to_string),
                 name: Some("A Film.mkv".to_string()),
             })
     }
@@ -759,6 +769,23 @@ fn a_drive_download_plays_from_the_disk_with_no_network() -> anyhow::Result<()> 
         before,
         "nothing offline reached for the grant"
     );
+    // A whole download needs no grant at all: a re-pin with none, or an
+    // empty one, is the same row -- and a file that is not whole, with no
+    // grant to fetch it, is refused as exactly that.
+    for no_grant in [None, Some("")] {
+        let again = offline.pin_drive(FILE_ID, no_grant)?;
+        assert!(again.complete, "{again:?}");
+        let refused = offline
+            .pin_drive("not-downloaded", no_grant)
+            .expect_err("a file the disk does not hold needs a grant");
+        assert!(
+            matches!(
+                refused.downcast_ref::<stream_server::ProxyPinError>(),
+                Some(stream_server::ProxyPinError::NoGrant)
+            ),
+            "{refused:?}"
+        );
+    }
 
     // And a file that is *not* downloaded is refused as unreachable, not
     // answered from somewhere -- offline means offline for what is not

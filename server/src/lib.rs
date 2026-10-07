@@ -942,7 +942,9 @@ impl ServerHandle {
 
     /// Pins an addon URL or a Drive file as an offline download (see
     /// `routes::downloads::pin_proxy_download` and `crate::proxy_downloads`). The row's `info_hash` is the key to
-    /// drop it by ([`Self::unpin_proxy_download`]).
+    /// drop it by ([`Self::unpin_proxy_download`]). A Drive file already
+    /// whole on the disk needs no `refresh_token`; one that is not, with
+    /// none (or an empty one), is [`ProxyPinError::NoGrant`].
     pub fn pin_proxy_download(
         &self,
         request: routes::downloads::ProxyDownloadRequest,

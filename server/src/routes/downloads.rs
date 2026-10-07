@@ -679,14 +679,14 @@ pub async fn pin_proxy_download(
             .await?
         }
         (None, Some(file_id)) => {
-            let token = request.refresh_token.as_deref().unwrap_or("");
-            if token.is_empty() {
-                return Err(crate::proxy_downloads::ProxyPinError::Unkeyable(
-                    "a Drive download wants a refreshToken",
-                ));
-            }
-            crate::proxy_downloads::pin_drive(state, file_id, Some(token), request.name.clone())
-                .await?
+            // An empty grant is no grant. `pin_drive` asks for one only
+            // when the file is not whole on the disk yet, and refuses with
+            // `NoGrant` then -- a finished download re-pins without one.
+            let token = request
+                .refresh_token
+                .as_deref()
+                .filter(|token| !token.is_empty());
+            crate::proxy_downloads::pin_drive(state, file_id, token, request.name.clone()).await?
         }
         _ => {
             return Err(crate::proxy_downloads::ProxyPinError::Unkeyable(
