@@ -18,7 +18,7 @@ What `GET`/`POST /settings` and `ServerHandle::settings`/`update_settings` read 
 | `bt*` (27 keys) | see [BitTorrent settings](#bittorrent-settings) | Torrent session knobs; the response's `btSettings` says which applied live, which wait for a restart and which librqbit has no knob for |
 | `trackersSourceUrl`, `cachedTrackers`, `trackersLastUpdated` | [ngosang `trackers_best.txt`](https://github.com/ngosang/trackerslist), `[]`, `0` | The public tracker list: fetched from `trackersSourceUrl` when the cached one is more than a day old (checked hourly), the 20 fastest by RTT cached in `cachedTrackers`, and added to every torrent the server adds. `POST /settings` does not change these; they live in `settings.json` |
 | `proxyStreamsEnabled`, `remoteHttps` | `false`, `null` | Accepted and persisted for stremio-core's settings shape; nothing in the server reads them |
-| `appPath`, `serverVersion` | the executable's path, the crate version | Reported, not settable. Written into `settings.json` and read back from it, so they name the build that first wrote the file |
+| `appPath`, `serverVersion` | the executable's path, the crate version | Reported, not settable. Written into `settings.json`, but replaced from the running binary at every load, so they name the build that is running, not the one that wrote the file |
 
 ## Buffer profiles
 

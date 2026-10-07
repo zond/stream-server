@@ -234,6 +234,11 @@ impl SettingsFile {
             }
         };
         tracing::info!("Loaded settings from {:?}", self.path);
+        // Reported, not settable: they describe the running binary, so the
+        // file's copy -- written by whichever build saved last -- is not
+        // the answer after an upgrade or a move.
+        settings.app_path = defaults.app_path.clone();
+        settings.server_version = defaults.server_version.clone();
         // Respect the file, but a cache_root it does not name is the
         // runtime's to fill in.
         if settings.cache_root.is_empty() {
@@ -592,5 +597,25 @@ mod tests {
         unlimited["cacheSize"] = serde_json::Value::Null;
         std::fs::write(file.path(), unlimited.to_string()).unwrap();
         assert_eq!(file.load(&defaults).cache_size, None, "a null is kept");
+    }
+
+    /// `appPath` and `serverVersion` name the running binary, not the one
+    /// that last wrote the file: after an upgrade the file's old values are
+    /// replaced at load.
+    #[test]
+    fn app_path_and_server_version_are_the_running_binarys() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = SettingsFile::new(dir.path().join("settings.json"));
+        let defaults = defaults(dir.path());
+        let old_build = ServerSettings {
+            app_path: "/old/place/stremio-server".to_string(),
+            server_version: "0.0.1".to_string(),
+            ..defaults.clone()
+        };
+        std::fs::write(file.path(), serde_json::to_vec(&old_build).unwrap()).unwrap();
+
+        let loaded = file.load(&defaults);
+        assert_eq!(loaded.app_path, defaults.app_path);
+        assert_eq!(loaded.server_version, defaults.server_version);
     }
 }
