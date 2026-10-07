@@ -443,6 +443,21 @@ impl SampleSink {
     }
 }
 
+/// When a request reached a run, and so when the run goes idle: tokio's
+/// clock, because the run task sleeps until that deadline with
+/// `tokio::time::sleep_until` and then asks whether it has passed
+/// (`run.rs`'s `drive`), and a `std` reading there disagrees with the
+/// sleep under paused tokio time. Outside a paused test the two read the
+/// same. The speed rule's busy time is the producer threads' real work,
+/// measured and compared on `std` alone (`speed.rs`), and never slept on.
+pub(crate) type RequestInstant = tokio::time::Instant;
+
+/// Now, on [`RequestInstant`]'s clock: what the request edges
+/// ([`Rendition::slot`], `start_run`, `freeze`) hand `Inner::note_request`.
+pub(crate) fn request_now() -> RequestInstant {
+    tokio::time::Instant::now()
+}
+
 /// The durations a rendition runs by, settable for the tests so a release
 /// or a speed window is not a minute of a test's life.
 #[doc(hidden)]
@@ -710,7 +725,7 @@ pub(crate) struct RunSlot {
     /// The last slot a request asked of it -- the lookahead counts from
     /// here -- and when.
     last_request: u64,
-    last_request_at: Instant,
+    last_request_at: RequestInstant,
     /// Requests waiting for it to make their slot: while any is, it is not
     /// idle, however long the making takes (a source that stalls is waited
     /// for).
@@ -791,7 +806,7 @@ impl Inner {
 
     /// A request for `slot` reached run `generation`: its lookahead counts
     /// from there, and it is not idle.
-    fn note_request(&mut self, generation: u64, slot: u64, now: Instant) {
+    fn note_request(&mut self, generation: u64, slot: u64, now: RequestInstant) {
         if let Some(run) = self.run_mut(generation) {
             run.last_request = slot;
             run.last_request_at = now;
@@ -845,7 +860,7 @@ impl Inner {
 
     /// When run `generation` is idle: `release` after the last request asked
     /// of it -- or never, while a request waits for it to make a slot.
-    pub(crate) fn idle_at(&self, generation: u64, release: Duration) -> Option<Instant> {
+    pub(crate) fn idle_at(&self, generation: u64, release: Duration) -> Option<RequestInstant> {
         self.run(generation)
             .and_then(|run| (run.joined == 0).then(|| run.last_request_at + release))
     }
@@ -1232,7 +1247,7 @@ impl Rendition {
             from: from_slot,
             next_out: from_slot,
             last_request: from_slot,
-            last_request_at: Instant::now(),
+            last_request_at: request_now(),
             joined: 0,
             stop: stop.clone(),
         });
@@ -1324,7 +1339,7 @@ impl Rendition {
                 run.from = slot;
                 run.next_out = slot;
             }
-            inner.note_request(generation, slot, Instant::now());
+            inner.note_request(generation, slot, request_now());
         }
         drop(inner);
         self.bump();
@@ -1432,7 +1447,7 @@ impl Rendition {
                 if slot >= count {
                     return Err(NotServed::NotFound);
                 }
-                let now = Instant::now();
+                let now = request_now();
                 if inner.ring.contains_key(&slot) {
                     joined.set(&mut inner, None);
                     // A read from the ring moves the lookahead of the run
@@ -1570,7 +1585,7 @@ mod tests {
                 from: *at,
                 next_out: *at,
                 last_request: *at,
-                last_request_at: Instant::now(),
+                last_request_at: request_now(),
                 joined: 0,
                 stop: CancellationToken::new(),
             });
@@ -1603,7 +1618,7 @@ mod tests {
     #[test]
     fn the_run_replaced_is_the_least_recently_asked_unwaited() {
         let mut inner = inner_with(&[4, 30], &[], usize::MAX);
-        let now = Instant::now();
+        let now = request_now();
         inner.runs[0].last_request_at = now - Duration::from_secs(5);
         inner.runs[1].last_request_at = now;
         assert_eq!(inner.replaced(false), Some(0));

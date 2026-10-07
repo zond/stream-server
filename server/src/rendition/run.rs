@@ -336,6 +336,23 @@ impl Making {
     }
 }
 
+/// Sleeps until the idle deadline `at` -- forever, with none -- on the
+/// clock it was read on ([`super::RequestInstant`]).
+async fn until(at: Option<super::RequestInstant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Whether the idle deadline `at` has passed, on the same clock [`until`]
+/// slept on: with two clocks, a sleep under paused tokio time ends at a
+/// deadline the comparison says is still ahead, and the run is never
+/// released.
+fn passed(at: Option<super::RequestInstant>) -> bool {
+    at.is_some_and(|at| super::request_now() >= at)
+}
+
 async fn drive(
     rendition: &Arc<Rendition>,
     state: &AppState,
@@ -406,18 +423,13 @@ async fn drive(
         tokio::select! {
             biased;
             () = stop.cancelled() => return Outcome::Stopped,
-            () = async {
-                match idle_at {
-                    Some(at) => tokio::time::sleep_until(at.into()).await,
-                    None => std::future::pending().await,
-                }
-            } => {
+            () = until(idle_at) => {
                 // Looked at again under the lock: a request may have come
                 // in, or begun waiting, since the deadline was read.
                 let idle_at = rendition
                     .inner()
                     .idle_at(generation, rendition.tuning.idle_release);
-                if idle_at.is_some_and(|at| Instant::now() >= at) {
+                if passed(idle_at) {
                     return Outcome::Released;
                 }
             }
@@ -549,6 +561,21 @@ mod tests {
             key,
             data: Bytes::new(),
         }
+    }
+
+    /// **An idle deadline has passed once the sleep on it ends**, under
+    /// paused tokio time too: the deadline, the sleep and the check are one
+    /// clock.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_deadline_has_passed_once_its_sleep_ends() {
+        let at = Some(super::super::request_now() + Duration::from_secs(30));
+        assert!(!passed(at));
+        until(at).await;
+        assert!(
+            passed(at),
+            "the sleep ended and the deadline is still ahead"
+        );
+        assert!(!passed(None), "no deadline never passes");
     }
 
     /// Cuts every T, as an estimated layout makes them.
