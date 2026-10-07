@@ -192,6 +192,12 @@ impl SettingsFile {
 
     /// The settings on disk, or `defaults` when there is no file.
     ///
+    /// The file is read over `defaults`: every key it has is kept and every
+    /// key it lacks takes the default, so a file written before a setting
+    /// existed loads with all it says (and a missing `cacheSize` is the
+    /// default cap, not `null`'s unlimited -- only a `null` the file holds
+    /// is that).
+    ///
     /// A file that is there but will not parse is a different case from a
     /// missing one and is treated as such: the defaults still stand in, but
     /// at WARN rather than INFO, and the file is moved aside to
@@ -214,7 +220,7 @@ impl SettingsFile {
                 return defaults.clone();
             }
         };
-        let mut settings = match serde_json::from_str::<ServerSettings>(&content) {
+        let mut settings = match over_defaults(&content, defaults) {
             Ok(settings) => settings,
             Err(error) => {
                 let set_aside = self.set_aside_corrupt();
@@ -270,6 +276,20 @@ impl SettingsFile {
             }
         }
     }
+}
+
+/// `content`, a settings file, read over `defaults`: each top-level key the
+/// file has replaces the default's, and a key it lacks keeps the default.
+/// Anything that is not a JSON object, or a key whose value is the wrong
+/// type, is an error -- the file does not parse.
+fn over_defaults(content: &str, defaults: &ServerSettings) -> serde_json::Result<ServerSettings> {
+    let file: serde_json::Map<String, serde_json::Value> = serde_json::from_str(content)?;
+    let mut merged = match serde_json::to_value(defaults)? {
+        serde_json::Value::Object(map) => map,
+        _ => unreachable!("ServerSettings serializes as an object"),
+    };
+    merged.extend(file);
+    serde_json::from_value(serde_json::Value::Object(merged))
 }
 
 /// Write `bytes` to `path` through a uniquely named temporary file in the
@@ -532,5 +552,45 @@ mod tests {
         file.save(&settings).await.unwrap();
         assert!(file.path().exists());
         assert!(set_aside[0].exists());
+    }
+
+    /// A file written before a setting existed -- here one with no
+    /// `btMaxConnections` and no `cacheSize` -- keeps every key it has and
+    /// takes the default for the rest: it is not set aside, a missing
+    /// `cacheSize` is the default cap rather than unlimited, and a `null`
+    /// the file does hold is still unlimited.
+    #[test]
+    fn a_settings_file_missing_keys_keeps_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = SettingsFile::new(dir.path().join("settings.json"));
+        let defaults = defaults(dir.path());
+
+        let mut written = serde_json::to_value(ServerSettings {
+            seeding_enabled: !defaults.seeding_enabled,
+            bt_request_timeout: defaults.bt_request_timeout + 1,
+            cache_size: Some(1.0),
+            ..defaults.clone()
+        })
+        .unwrap();
+        let object = written.as_object_mut().unwrap();
+        object.remove("btMaxConnections").unwrap();
+        object.remove("cacheSize").unwrap();
+        std::fs::write(file.path(), written.to_string()).unwrap();
+
+        let loaded = file.load(&defaults);
+        assert!(file.path().exists(), "a missing key is not a corrupt file");
+        assert_eq!(loaded.seeding_enabled, !defaults.seeding_enabled);
+        assert_eq!(loaded.bt_request_timeout, defaults.bt_request_timeout + 1);
+        assert_eq!(loaded.bt_max_connections, defaults.bt_max_connections);
+        assert_eq!(
+            loaded.cache_size, defaults.cache_size,
+            "a missing cacheSize is the default cap, not unlimited"
+        );
+        assert!(defaults.cache_size.is_some());
+
+        let mut unlimited = serde_json::to_value(&defaults).unwrap();
+        unlimited["cacheSize"] = serde_json::Value::Null;
+        std::fs::write(file.path(), unlimited.to_string()).unwrap();
+        assert_eq!(file.load(&defaults).cache_size, None, "a null is kept");
     }
 }
