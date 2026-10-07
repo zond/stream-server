@@ -1,6 +1,6 @@
 version: 2
 updates:
-  # Rust crates across the whole Cargo workspace (enginefs, server, bindings, ...)
+  # Rust crates across the whole Cargo workspace (its two crates: server, enginefs)
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
@@ -15,7 +15,7 @@ updates:
           - "minor"
           - "patch"
 
-  # Actions used by the release workflow (.github/workflows/*.yml)
+  # Actions used by CI (.github/workflows/ci.yml, the only workflow)
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
