@@ -525,6 +525,12 @@ impl Task {
                         Ok(bytes) => begin + bytes.len() as u64,
                         Err(_) => begin,
                     };
+                    // Where the playback has got to is written before the
+                    // answer goes: a report made the moment a read returns
+                    // (a player leaving, `note_media_position`) must see
+                    // this read, not the one before -- CI saw the first
+                    // session's end remembered as nothing, twice.
+                    self.watch_served(begin, end);
                     let _ = reply.send(answer);
                     // After the answer: the player has its bytes before
                     // anything is asked of the swarm on their account.
@@ -597,19 +603,26 @@ impl Task {
         self.prewanting = Some(stop.drop_guard());
     }
 
-    /// A read was served from `begin` to `end`: where the viewer's playback
-    /// has got to, and whether the pre-want is let go for it.
+    /// Whether a read from `begin` to `end` of this reader is where the
+    /// viewer's playback has got to: a played torrent's, and not empty.
+    fn playback_read(&self, begin: u64, end: u64) -> bool {
+        end > begin && matches!(&self.source, Source::Torrent(torrent) if torrent.is_played())
+    }
+
+    /// A read was served to `end`: where the viewer's playback has got to,
+    /// for the reports asked by id. Before the answer goes.
+    fn watch_served(&self, begin: u64, end: u64) {
+        if self.playback_read(begin, end) {
+            self.watch.served(end);
+        }
+    }
+
+    /// A read was served from `begin` to `end`: whether the pre-want is let
+    /// go for it. After the answer has gone.
     fn served(&mut self, begin: u64, end: u64) {
-        if end <= begin {
+        if !self.playback_read(begin, end) {
             return;
         }
-        let Source::Torrent(torrent) = &self.source else {
-            return;
-        };
-        if !torrent.is_played() {
-            return;
-        }
-        self.watch.served(end);
         if self
             .prewant
             .as_mut()
