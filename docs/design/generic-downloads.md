@@ -189,8 +189,17 @@ over the pin's quiet `ProxySource`, so a span the disk holds costs no
 request. It checks the pin before every stride. A failed read is logged
 (`download filler: a read failed; asking again shortly`) and asked again
 after `FILL_RETRY` (15 s); the end is logged as `download filler: reached
-the end`, with `whole`. A validator change is not restarted from byte 0:
-the ranged read fails (the origin answered `200` to it) and is asked again.
+the end`, with `whole`. A read the origin answers with something that is
+not the span (a `200` or a `416`: its `If-Range` found the file changed, or
+the file is shorter now) opens the source again, which is the
+revalidation: a new identity or length is a new generation -- the open
+retires the old one, the walk starts again from byte 0 of the new file,
+logged once as `download filler: the origin's file changed; downloading it
+again from the start`; an origin that no longer ranges is refused as at
+pin time, the filler stops and the row's `error` says why (its `phase` is
+then `checking`); the same entity, or no answer, is asked again after
+`FILL_RETRY`. *(Until 2026-10-07 a validator change was asked again every
+`FILL_RETRY` for as long as the pin stood.)*
 One filler per key directory lives in `ProxyDownloads`, not in a
 progress-logger slot.
 

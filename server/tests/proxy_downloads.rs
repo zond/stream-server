@@ -18,6 +18,37 @@ fn byte_at(offset: usize) -> u8 {
 const ORIGIN_LENGTH: usize = 3 * 256 * 1024 + 12_345;
 const ORIGIN_ETAG: &str = "\"the-download\"";
 
+/// One version of the origin's file: what it is called, how long it is,
+/// and what is at each offset.
+struct Generation {
+    etag: &'static str,
+    length: usize,
+    byte: fn(usize) -> u8,
+}
+
+/// The file every origin serves unless it is told the file changes.
+const THE_FILE: Generation = Generation {
+    etag: ORIGIN_ETAG,
+    length: ORIGIN_LENGTH,
+    byte: byte_at,
+};
+
+/// A file longer than one filler stride (32 MiB), so the filler holds the
+/// first stride of it before it asks for the rest.
+const LONG_FILE: Generation = Generation {
+    etag: "\"the-long-one\"",
+    length: 32 * 1024 * 1024 + 12_345,
+    byte: byte_at,
+};
+
+/// What [`LONG_FILE`] is replaced by at the origin: another identity,
+/// another length, other bytes.
+const REPLACED_FILE: Generation = Generation {
+    etag: "\"the-replacement\"",
+    length: 2 * 256 * 1024 + 777,
+    byte: |offset| (offset % 241) as u8 ^ 0x5a,
+};
+
 #[derive(Clone, Debug)]
 struct Request {
     headers: Vec<(String, String)>,
@@ -55,7 +86,22 @@ impl Origin {
         Self::start_answering(true, true)
     }
 
+    /// An origin that serves [`LONG_FILE`] for its first `after` requests
+    /// and [`REPLACED_FILE`] from then on -- by range, or not at all when
+    /// `ranges_after` is off.
+    fn start_changing(after: usize, ranges_after: bool) -> anyhow::Result<Self> {
+        Self::start_with(true, false, Some((after, ranges_after)))
+    }
+
     fn start_answering(ranges: bool, stingy: bool) -> anyhow::Result<Self> {
+        Self::start_with(ranges, stingy, None)
+    }
+
+    fn start_with(
+        ranges: bool,
+        stingy: bool,
+        change: Option<(usize, bool)>,
+    ) -> anyhow::Result<Self> {
         let answered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
@@ -87,11 +133,14 @@ impl Origin {
                     }
                     let request = Request { headers };
                     let _ = sender.send(request.clone());
-                    let first = answered.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
-                    if stingy && !first {
-                        answer_nothing(&request, &mut stream);
-                    } else {
-                        answer(&request, &mut stream, ranges);
+                    let index = answered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    match change {
+                        Some((after, ranges_after)) if index >= after => {
+                            answer_as(&request, &mut stream, &REPLACED_FILE, ranges_after)
+                        }
+                        Some(_) => answer_as(&request, &mut stream, &LONG_FILE, ranges),
+                        None if stingy && index > 0 => answer_nothing(&request, &mut stream),
+                        None => answer(&request, &mut stream, ranges),
                     }
                 });
             }
@@ -131,24 +180,46 @@ fn answer_nothing(request: &Request, socket: &mut TcpStream) {
 }
 
 fn answer(request: &Request, socket: &mut TcpStream, ranges: bool) {
-    let served = ranges.then(|| request.range()).flatten().and_then(|value| {
-        let (first, last) = value.trim_start_matches("bytes=").split_once('-')?;
-        let first: usize = first.parse().ok()?;
-        let last: usize = if last.is_empty() {
-            ORIGIN_LENGTH - 1
-        } else {
-            last.parse().ok()?
-        };
-        Some((first, last.min(ORIGIN_LENGTH - 1)))
-    });
+    answer_as(request, socket, &THE_FILE, ranges)
+}
+
+/// `file`, by range when `ranges` is on: a `206` of the span asked for, a
+/// `416` for a span past its end, and the whole of it (`200`) for a request
+/// with no range or an `If-Range` that names another version.
+fn answer_as(request: &Request, socket: &mut TcpStream, file: &Generation, ranges: bool) {
+    let Generation { etag, length, byte } = *file;
+    let current = request
+        .header("if-range")
+        .is_none_or(|validator| validator == etag);
+    let served = (ranges && current)
+        .then(|| request.range())
+        .flatten()
+        .and_then(|value| {
+            let (first, last) = value.trim_start_matches("bytes=").split_once('-')?;
+            let first: usize = first.parse().ok()?;
+            let last: usize = if last.is_empty() {
+                length - 1
+            } else {
+                last.parse().ok()?
+            };
+            Some((first, last.min(length - 1)))
+        });
     let (head, body) = match served {
+        Some((first, _)) if first >= length => (
+            format!(
+                "HTTP/1.1 416 Range Not Satisfiable\r\nETag: {etag}\r\n\
+                 Content-Range: bytes */{length}\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+            Vec::new(),
+        ),
         Some((first, last)) => {
-            let body: Vec<u8> = (first..=last).map(byte_at).collect();
+            let body: Vec<u8> = (first..=last).map(byte).collect();
             (
                 format!(
                     "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\n\
-                     Content-Type: video/mp4\r\nETag: {ORIGIN_ETAG}\r\n\
-                     Content-Range: bytes {first}-{last}/{ORIGIN_LENGTH}\r\n\
+                     Content-Type: video/mp4\r\nETag: {etag}\r\n\
+                     Content-Range: bytes {first}-{last}/{length}\r\n\
                      Content-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 ),
@@ -156,11 +227,11 @@ fn answer(request: &Request, socket: &mut TcpStream, ranges: bool) {
             )
         }
         None => {
-            let body: Vec<u8> = (0..ORIGIN_LENGTH).map(byte_at).collect();
+            let body: Vec<u8> = (0..length).map(byte).collect();
             (
                 format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nETag: {ORIGIN_ETAG}\r\n\
-                     Content-Length: {ORIGIN_LENGTH}\r\nConnection: close\r\n\r\n"
+                    "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nETag: {etag}\r\n\
+                     Content-Length: {length}\r\nConnection: close\r\n\r\n"
                 ),
                 body,
             )
@@ -487,6 +558,83 @@ fn an_origin_that_will_not_range_is_refused() -> anyhow::Result<()> {
         1,
         "one probe, and no fill: {:?}",
         origin.asked()
+    );
+    fixture.stop()?;
+    Ok(())
+}
+
+/// **A file that changed at the origin mid-download is downloaded again,
+/// from the start**, as the new file: the filler holds the first stride of
+/// the old one when the origin starts answering for another, the read that
+/// finds it fails, and the filler opens the source again -- which retires
+/// the old generation -- and fills the new one. It does not ask the old
+/// question every fifteen seconds for as long as the pin stands.
+#[test]
+fn a_file_changed_at_the_origin_is_downloaded_again_from_the_start() -> anyhow::Result<()> {
+    // The probe and the first stride see the long file; the second stride
+    // finds the replacement.
+    let origin = Origin::start_changing(2, true)?;
+    let fixture = Fixture::start(Some(Vec::new()))?;
+    let row = fixture.pin_url(&origin.url("/films/changing.mp4"))?;
+    let key = row["infoHash"].as_str().expect("a key").to_string();
+
+    let done = fixture.wait_complete(&key)?;
+    assert_eq!(done["length"], REPLACED_FILE.length as u64, "{done}");
+    assert_eq!(done["downloaded"], REPLACED_FILE.length as u64, "{done}");
+    assert!(done["error"].is_null(), "{done}");
+    let generations = std::fs::read_dir(fixture.proxy_root().join(&key))?.count();
+    assert_eq!(generations, 1, "the old generation was retired");
+
+    let play = done["playUrl"].as_str().expect("a play URL").to_string();
+    let body = reqwest::blocking::Client::new()
+        .get(&play)
+        .header(reqwest::header::RANGE, "bytes=0-")
+        .send()?
+        .bytes()?;
+    assert_eq!(body.len(), REPLACED_FILE.length);
+    assert!(
+        body.iter()
+            .enumerate()
+            .all(|(i, byte)| *byte == (REPLACED_FILE.byte)(i)),
+        "the bytes kept are the new file's"
+    );
+    fixture.stop()?;
+    Ok(())
+}
+
+/// A file that changed into one the origin will not range is refused as
+/// it would have been at pin time: the filler stops, and the row says why
+/// rather than sitting at `buffering`.
+#[test]
+fn a_file_changed_into_one_that_will_not_range_stops_the_download_with_a_reason()
+-> anyhow::Result<()> {
+    let origin = Origin::start_changing(2, false)?;
+    let fixture = Fixture::start(Some(Vec::new()))?;
+    let row = fixture.pin_url(&origin.url("/films/unranged.mp4"))?;
+    let key = row["infoHash"].as_str().expect("a key").to_string();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let stopped = loop {
+        let rows = fixture.downloads()?;
+        if let Some(row) = rows
+            .iter()
+            .find(|row| row["infoHash"] == key && !row["error"].is_null())
+        {
+            break row.clone();
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "the download never said why it stopped: {rows:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(stopped["phase"], "checking", "{stopped}");
+    assert_eq!(stopped["complete"], false, "{stopped}");
+    assert!(
+        stopped["error"]
+            .as_str()
+            .is_some_and(|why| why.contains("byte ranges")),
+        "{stopped}"
     );
     fixture.stop()?;
     Ok(())

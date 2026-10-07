@@ -534,7 +534,14 @@ async fn dormant_downloads(engine_fs: &enginefs::EngineFS) -> Vec<DownloadInfo> 
 async fn proxy_downloads(state: &AppState) -> Vec<DownloadInfo> {
     let pinned = state.proxy_downloads.snapshot();
     let mut rows = Vec::with_capacity(pinned.len());
-    for (dir, key, name, filling) in pinned {
+    for crate::proxy_downloads::PinnedRow {
+        dir,
+        key,
+        name,
+        filling,
+        failure,
+    } in pinned
+    {
         let entry = state
             .proxy_cache
             .entry_for_key_dir(dir.clone(), Arc::from(""))
@@ -576,10 +583,11 @@ async fn proxy_downloads(state: &AppState) -> Vec<DownloadInfo> {
             } else {
                 // Pinned, nothing fetching: a Drive pin the app has not
                 // re-pinned with a pairing since boot, or a URL pin whose
-                // filler stopped. The bytes are kept.
+                // filler stopped (then `error` may say why). The bytes are
+                // kept.
                 StartupPhase::Checking
             },
-            error: None,
+            error: failure,
         });
     }
     rows
@@ -773,8 +781,8 @@ pub async fn stream_proxy_download(
         .proxy_downloads
         .snapshot()
         .into_iter()
-        .find(|(pinned, ..)| *pinned == dir)
-        .map(|(_, key, name, _)| (key, name))
+        .find(|pinned| pinned.dir == dir)
+        .map(|pinned| (pinned.key, pinned.name))
     else {
         return StatusCode::NOT_FOUND.into_response();
     };

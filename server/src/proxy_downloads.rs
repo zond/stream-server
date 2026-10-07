@@ -154,12 +154,28 @@ const FILL_STRIDE: u64 = 32 * 1024 * 1024;
 const FILL_RETRY: Duration = Duration::from_secs(15);
 
 /// One pinned proxy download the process knows more about than its key:
-/// what it is called, and the filler running for it, if one is.
+/// what it is called, the filler running for it, if one is, and why the
+/// last one gave up, if it did.
 struct Pinned {
     key: ProxyPinKey,
     name: String,
     filler: Option<tokio::task::AbortHandle>,
+    /// Set by a filler that stopped for good ([`Filler::run`]); what the
+    /// row's `error` says. A new filler -- the next pin with a source --
+    /// starts with a fresh one.
+    failure: Arc<std::sync::OnceLock<String>>,
 }
+
+/// How a filler opens its source again when a read finds the origin's file
+/// changed: what the pin opened it with, as a call. The open is the
+/// revalidation ([`ProxySource::open`] retires every other generation), and
+/// it answers the source quiet ([`ProxySource::for_filling`]) but not
+/// counting -- the filler counts.
+pub(crate) type Reopen = Arc<
+    dyn Fn() -> futures_util::future::BoxFuture<'static, Result<ProxySource, ProxyPinError>>
+        + Send
+        + Sync,
+>;
 
 /// The pinned proxy downloads, by key directory.
 #[derive(Default)]
@@ -214,15 +230,16 @@ impl ProxyDownloads {
                 key: key.clone(),
                 name: key.default_name(),
                 filler: None,
+                failure: Default::default(),
             });
         }
         state.proxy_cache.retention().set_pins(Some(dirs.clone()));
         Some(dirs)
     }
 
-    /// Records the pin and, given a `source`, starts (or keeps) the filler
-    /// that fetches what the entry does not hold yet; answers the key
-    /// directory. Idempotent: a second pin of a running download changes
+    /// Records the pin and, given a `source` (with the way to open it
+    /// again), starts (or keeps) the filler that fetches what the entry
+    /// does not hold yet; answers the key directory. Idempotent: a second pin of a running download changes
     /// nothing but the name. `None` is a pin over
     /// an entry that is already whole ([`held_complete`]): nothing to fetch,
     /// so nothing is opened and the origin is not asked -- which is what
@@ -234,7 +251,7 @@ impl ProxyDownloads {
         key: ProxyPinKey,
         name: Option<String>,
         entry: Entry,
-        source: Option<ProxySource>,
+        source: Option<(ProxySource, Reopen)>,
     ) -> PathBuf {
         let dir = entry.dir().to_path_buf();
         // The table first, and the retention owner told under it -- here
@@ -249,6 +266,7 @@ impl ProxyDownloads {
             name: name.clone().unwrap_or_else(|| key.default_name()),
             key: key.clone(),
             filler: None,
+            failure: Default::default(),
         });
         if let Some(name) = name {
             record.name = name;
@@ -257,10 +275,14 @@ impl ProxyDownloads {
             .filler
             .as_ref()
             .is_some_and(|filler| !filler.is_finished());
-        if let Some(source) = source.filter(|_| !running) {
+        if let Some((source, reopen)) = source.filter(|_| !running) {
+            record.failure = Default::default();
             let filler = Filler {
                 entry: entry.quiet(),
                 source: Arc::new(source.counting_into(self.fetched.clone())),
+                reopen,
+                fetched: self.fetched.clone(),
+                failure: record.failure.clone(),
                 retention: state.proxy_cache.retention().clone(),
                 dir: dir.clone(),
             };
@@ -299,24 +321,34 @@ impl ProxyDownloads {
         (was_pinned, freed)
     }
 
-    /// Every pinned proxy download as a listing sees it: `(key directory,
-    /// key, name, whether a filler is running)`.
-    pub(crate) fn snapshot(&self) -> Vec<(PathBuf, ProxyPinKey, String, bool)> {
+    /// Every pinned proxy download as a listing sees it.
+    pub(crate) fn snapshot(&self) -> Vec<PinnedRow> {
         self.table()
             .iter()
-            .map(|(dir, pinned)| {
-                (
-                    dir.clone(),
-                    pinned.key.clone(),
-                    pinned.name.clone(),
-                    pinned
-                        .filler
-                        .as_ref()
-                        .is_some_and(|filler| !filler.is_finished()),
-                )
+            .map(|(dir, pinned)| PinnedRow {
+                dir: dir.clone(),
+                key: pinned.key.clone(),
+                name: pinned.name.clone(),
+                filling: pinned
+                    .filler
+                    .as_ref()
+                    .is_some_and(|filler| !filler.is_finished()),
+                failure: pinned.failure.get().cloned(),
             })
             .collect()
     }
+}
+
+/// One pinned proxy download as [`ProxyDownloads::snapshot`] answers it.
+pub(crate) struct PinnedRow {
+    /// The key directory.
+    pub(crate) dir: PathBuf,
+    pub(crate) key: ProxyPinKey,
+    pub(crate) name: String,
+    /// Whether a filler is running for it.
+    pub(crate) filling: bool,
+    /// Why its last filler stopped for good, if it did.
+    pub(crate) failure: Option<String>,
 }
 
 /// Pins an addon URL as a download. Probes the origin the way a translated
@@ -339,12 +371,21 @@ pub(crate) async fn pin_url(
     if held_complete(state, &entry).await {
         return Ok(state.proxy_downloads.pin(state, key, name, entry, None));
     }
-    let source =
-        ProxySource::open(state.proxy_cache.clone(), state.http_addr, url, headers).await?;
-    let source = source.for_filling();
+    let reopen: Reopen = {
+        let (cache, self_addr) = (state.proxy_cache.clone(), state.http_addr);
+        Arc::new(move || {
+            let (cache, url, headers) = (cache.clone(), url.clone(), headers.clone());
+            Box::pin(async move {
+                Ok(ProxySource::open(cache, self_addr, url, headers)
+                    .await?
+                    .for_filling())
+            })
+        })
+    };
+    let source = reopen().await?;
     Ok(state
         .proxy_downloads
-        .pin(state, key, name, entry, Some(source)))
+        .pin(state, key, name, entry, Some((source, reopen))))
 }
 
 /// Whether the cache already holds every byte of `entry`'s entity: the
@@ -460,28 +501,53 @@ pub(crate) async fn pin_drive(
     if held_complete(state, &entry).await {
         return Ok(state.proxy_downloads.pin(state, key, name, entry, None));
     }
-    let pairing = endpoints.pairing(file_id, refresh_token.ok_or(ProxyPinError::NoGrant)?);
-    let source = crate::sources::drive::DriveSource::open(state, pairing)
-        .await
-        .map_err(crate::routes::drive::DriveOpenError::Drive)?;
+    let refresh_token = refresh_token.ok_or(ProxyPinError::NoGrant)?.to_string();
+    let source =
+        crate::sources::drive::DriveSource::open(state, endpoints.pairing(file_id, &refresh_token))
+            .await
+            .map_err(crate::routes::drive::DriveOpenError::Drive)?;
     let name = name.or_else(|| source.name().map(str::to_string));
     let source = source.filling_source();
+    // Opened again with the same grant, which the filler holds in memory
+    // for as long as it runs -- as the source it reads through already does.
+    let reopen: Reopen = {
+        let (cache, self_addr) = (state.proxy_cache.clone(), state.http_addr);
+        let (endpoints, file_id) = (endpoints.clone(), file_id.to_string());
+        Arc::new(move || {
+            let pairing = endpoints.pairing(&file_id, &refresh_token);
+            let cache = cache.clone();
+            Box::pin(async move {
+                Ok(
+                    crate::sources::drive::DriveSource::open_against(cache, self_addr, pairing)
+                        .await
+                        .map_err(crate::routes::drive::DriveOpenError::Drive)?
+                        .filling_source(),
+                )
+            })
+        })
+    };
     Ok(state
         .proxy_downloads
-        .pin(state, key, name, entry, Some(source)))
+        .pin(state, key, name, entry, Some((source, reopen))))
 }
 
 /// The task that fetches a pinned download's holes until it is whole.
 struct Filler {
     entry: Entry,
     source: Arc<ProxySource>,
+    /// How the source is opened again when the origin's file changed.
+    reopen: Reopen,
+    /// What a reopened source counts into ([`ProxySource::counting_into`]).
+    fetched: Arc<std::sync::atomic::AtomicU64>,
+    /// Where a filler that stops for good says why ([`Pinned::failure`]).
+    failure: Arc<std::sync::OnceLock<String>>,
     retention: Arc<crate::proxy_retention::ProxyRetention>,
     dir: PathBuf,
 }
 
 impl Filler {
-    async fn run(self) {
-        let total = self.source.len();
+    async fn run(mut self) {
+        let mut total = self.source.len();
         let mut pos = 0u64;
         let mut sink = vec![0u8; 256 * 1024];
         loop {
@@ -498,6 +564,21 @@ impl Filler {
             // through.
             match crate::proxy_retention::read_through(&self.source, pos, until, &mut sink).await {
                 Ok(()) => pos = until,
+                // The origin answered with something that is not the span:
+                // usually its file changed (the `If-Range` failed), and
+                // asking the same question again would get the same answer
+                // for as long as the pin stands. Open the source again --
+                // the revalidation -- and let that say what happened.
+                Err(error) if crate::sources::proxy::is_not_the_span(&error) => {
+                    match self.reopen_after(&error).await {
+                        Reopened::NewGeneration => {
+                            total = self.source.len();
+                            pos = 0;
+                        }
+                        Reopened::Same => tokio::time::sleep(FILL_RETRY).await,
+                        Reopened::Refused => return,
+                    }
+                }
                 Err(error) => {
                     tracing::warn!(
                         dir = %self.dir.display(),
@@ -524,4 +605,75 @@ impl Filler {
             "download filler: reached the end"
         );
     }
+
+    /// Opens the source again after a read the origin answered with
+    /// something other than the span, and says what it found.
+    ///
+    /// **A file that changed at the origin is a new download**: a different
+    /// identity or length is a new generation, the open has already retired
+    /// what the cache held of the old one, and the walk starts again from
+    /// the first byte of the new one -- logged once, not hidden. An origin
+    /// that will not range any more cannot be a download at all, as at pin
+    /// time: the filler stops and the row's `error` says why. Anything else
+    /// -- the same entity, or no answer -- is asked again after
+    /// [`FILL_RETRY`], as any failed read is.
+    async fn reopen_after(&mut self, error: &std::io::Error) -> Reopened {
+        match (self.reopen)().await {
+            Ok(fresh)
+                if fresh.validator() != self.source.validator()
+                    || fresh.len() != self.source.len() =>
+            {
+                tracing::info!(
+                    dir = %self.dir.display(),
+                    origin = %ByteSource::describe(&fresh),
+                    old_length = self.source.len(),
+                    new_length = fresh.len(),
+                    "download filler: the origin's file changed; downloading it again from the start"
+                );
+                self.source = Arc::new(fresh.counting_into(self.fetched.clone()));
+                Reopened::NewGeneration
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    dir = %self.dir.display(),
+                    origin = %ByteSource::describe(&*self.source),
+                    %error,
+                    "download filler: the origin did not answer the range, and its file is the same; asking again shortly"
+                );
+                Reopened::Same
+            }
+            Err(ProxyPinError::Source(
+                refusal @ crate::sources::proxy::ProxySourceError::WillNotRange,
+            )) => {
+                tracing::warn!(
+                    dir = %self.dir.display(),
+                    origin = %ByteSource::describe(&*self.source),
+                    %refusal,
+                    "download filler: the origin will not range any more; the download stops"
+                );
+                let _ = self.failure.set(refusal.to_string());
+                Reopened::Refused
+            }
+            Err(reopen) => {
+                tracing::warn!(
+                    dir = %self.dir.display(),
+                    origin = %ByteSource::describe(&*self.source),
+                    %error,
+                    %reopen,
+                    "download filler: a read failed and the origin could not be opened again; asking again shortly"
+                );
+                Reopened::Same
+            }
+        }
+    }
+}
+
+/// What [`Filler::reopen_after`] found.
+enum Reopened {
+    /// The origin's file changed: a new source, read from byte 0.
+    NewGeneration,
+    /// Nothing to go on; wait and ask again.
+    Same,
+    /// The origin refused the download for good; the filler stops.
+    Refused,
 }

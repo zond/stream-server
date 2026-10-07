@@ -622,10 +622,10 @@ impl Entity {
                     // arrived is not the span that was asked for, and the
                     // one thing this must not do is read from the top of
                     // the file until it reaches the bytes it wanted.
-                    return Err(io::Error::other(format!(
+                    return Err(io::Error::other(NotTheSpan(format!(
                         "{} answered {status} to a ranged read",
                         self.describe
-                    )));
+                    ))));
                 }
                 let body = origin_body(response);
                 let body = match &self.fetched {
@@ -639,6 +639,31 @@ impl Entity {
             }
         }
     }
+}
+
+/// A ranged read the origin answered with something that is not the span
+/// asked for: it no longer ranges, or -- the usual case -- the `If-Range`
+/// found the entity changed and it sent the whole of a new one. Carried
+/// inside the read's `io::Error` so a caller that reads on (a download's
+/// filler) can tell it from an origin it could not reach
+/// ([`is_not_the_span`]) and open the source again, which says which.
+#[derive(Debug)]
+pub(crate) struct NotTheSpan(String);
+
+impl std::fmt::Display for NotTheSpan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotTheSpan {}
+
+/// Whether `error` is a read the origin answered with something other than
+/// the span ([`NotTheSpan`]).
+pub(crate) fn is_not_the_span(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<NotTheSpan>())
 }
 
 /// `body`, with the length of every chunk added to `counter` as it goes
