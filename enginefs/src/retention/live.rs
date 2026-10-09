@@ -257,6 +257,14 @@ impl Live {
         })
     }
 
+    /// **A cache clear: nothing is being played**, whatever was. The cell
+    /// names nothing until the next stream opens, so no window is kept for
+    /// what was live -- the last thing played included. Whether it moved.
+    pub fn forget_all(&self) -> bool {
+        self.cell
+            .send_if_modified(|current| current.take().is_some())
+    }
+
     /// A copy of the value, for a caller that will ask several questions of
     /// one reading -- a reconciler tick hands the same copy to every
     /// retention pass it runs, so they cannot disagree.

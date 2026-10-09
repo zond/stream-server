@@ -851,3 +851,97 @@ fn a_url_download_lights_the_way_down_and_a_players_read_does_not() -> anyhow::R
     fixture.stop()?;
     Ok(())
 }
+
+/// Every file under the key directory `key` of the proxy cache: its chunks.
+fn files_under(fixture: &Fixture, key: &str) -> usize {
+    fn walk(dir: &std::path::Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| match entry.file_type() {
+                Ok(kind) if kind.is_dir() => walk(&entry.path()),
+                Ok(_) => 1,
+                Err(_) => 0,
+            })
+            .sum()
+    }
+    walk(&fixture.proxy_root().join(key))
+}
+
+/// **A clear takes every proxied entry no download pins, and keeps the
+/// download.** A link a player streamed to its end is the entity played
+/// last, so the gentle clean keeps its chunks -- it is somebody's window --
+/// and a clear takes them; a kept download of another link keeps every
+/// chunk and stays complete. The report counts what left the disk.
+#[test]
+fn a_clear_takes_every_proxied_entry_but_a_kept_download() -> anyhow::Result<()> {
+    let origin = Origin::start(true)?;
+    let fixture = Fixture::start(Some(Vec::new()))?;
+    let base = format!("http://{}", fixture.handle.http_addr());
+
+    let row = fixture.pin_url(&origin.url("/films/kept.mp4"))?;
+    let kept = row["infoHash"].as_str().expect("a key").to_string();
+    fixture.wait_complete(&kept)?;
+    let kept_chunks = files_under(&fixture, &kept);
+    assert!(kept_chunks > 0, "the download is on the disk");
+
+    let played_url = origin.url("/films/played.mp4");
+    let response = reqwest::blocking::Client::new()
+        .get(format!(
+            "{base}/proxy/?d={}",
+            urlencoding::encode(&played_url)
+        ))
+        .header(reqwest::header::RANGE, "bytes=0-")
+        .send()?;
+    assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while fixture.handle.proxy_cache_reads() > 0 {
+        assert!(Instant::now() < deadline, "the read never ended");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    fixture
+        .handle
+        .proxy_cache_settled(Duration::from_secs(60))?;
+    // The stream's entry is the one key directory that is not the download's.
+    let played = std::fs::read_dir(fixture.proxy_root())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .find(|name| *name != kept && files_under(&fixture, name) > 0)
+        .expect("the stream was cached");
+    fixture.handle.clean_cache_now()?;
+    assert!(
+        files_under(&fixture, &played) > 0,
+        "the gentle clean keeps the stream played last"
+    );
+
+    let report = fixture.handle.clear_cache()?;
+    fixture
+        .handle
+        .proxy_cache_settled(Duration::from_secs(60))?;
+
+    assert_eq!(
+        files_under(&fixture, &played),
+        0,
+        "every chunk went: {report:?}"
+    );
+    assert_eq!(
+        files_under(&fixture, &kept),
+        kept_chunks,
+        "the download kept every one"
+    );
+    assert!(
+        report.freed >= ORIGIN_LENGTH as u64 / 2,
+        "what left the disk is counted: {report:?}"
+    );
+    assert!(report.deleted > 0, "{report:?}");
+    assert_eq!(report.stopped, 0, "no torrent was running: {report:?}");
+    assert_eq!(report.total, fixture.handle.cache_usage()?.total_bytes);
+    assert_eq!(
+        fixture.wait_complete(&kept)?["downloaded"],
+        ORIGIN_LENGTH as u64
+    );
+    fixture.stop()?;
+    Ok(())
+}

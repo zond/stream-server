@@ -118,6 +118,10 @@ pub struct TorrentSource {
     /// a seek cheaply, and opening a reader is a `prepare_file_for_
     /// streaming` and a retention install each time.
     index_reader: tokio::sync::Mutex<Option<Box<dyn SeekableReader>>>,
+    /// The engine's [`enginefs::EngineFS::clear_generation`] when this
+    /// source was made: a cache clear since stopped what it was streaming,
+    /// and it opens nothing more ([`Self::reader`]).
+    cleared_at: u64,
 }
 
 impl TorrentSource {
@@ -182,6 +186,7 @@ impl TorrentSource {
         // pieces nobody is fetching.
         engine.on_stream_start(&info_hash, file_idx).await;
         Ok(Self {
+            cleared_at: engine.clear_generation(),
             engine,
             info_hash,
             file_idx,
@@ -206,6 +211,7 @@ impl TorrentSource {
         let files = Self::files(&state.engine, &info_hash).await?;
         let file = Self::file(&info_hash, file_idx, &files)?;
         Ok(Self {
+            cleared_at: state.engine.clear_generation(),
             engine: state.engine.clone(),
             len: file.length,
             name: file.name.clone(),
@@ -348,6 +354,15 @@ impl TorrentSource {
     /// policy to keep what it pulls. A [`ReadHint`] is therefore spent on
     /// nothing at all here (see [`ByteSource::open`]).
     async fn reader(&self, offset: u64) -> io::Result<Box<dyn SeekableReader>> {
+        // **A source a cache clear stopped stays stopped.** The clear failed
+        // the reads it had open (`enginefs::Engine::cut_reads`); a seek is a
+        // new open, and one that succeeded would fetch again behind a
+        // player that was told its stream had ended -- on a torrent the
+        // clear stopped, for a stream it no longer counts. Whoever wants it
+        // again opens a new source, which is a new ask.
+        if self.engine.clear_generation() != self.cleared_at {
+            return Err(enginefs::files::cleared_error());
+        }
         let torrent = Self::torrent(&self.engine, &self.info_hash).await?;
         let Some(played) = &self.play else {
             // **Unshared.** An aside's read is not a player's: it draws

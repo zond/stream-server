@@ -18,7 +18,8 @@
 //! as long as that is true.
 //!
 //! Three kinds, and nothing else writes here but a file's deletion, which
-//! takes a screen's hold and an idle share off it ([`Holds::forget_file`]):
+//! takes a screen's hold and an idle share off it ([`Holds::forget_file`]),
+//! and a cache clear, which overrides every one of them ([`Holds::clear`]):
 //!
 //! * **A player screen** ([`Holds::hold_for_player`]): the torrent the
 //!   viewer's newest screen's own requests named -- the same told play
@@ -55,6 +56,15 @@
 //!   allowed (`seedingEnabled` on and not held back by the app), read at
 //!   the moment it asks, so the share outlives the setting going off and
 //!   back on.
+//!
+//! **A cache clear overrides every hold, and says so** ([`Holds::clear`]):
+//! the user asked for everything that streams to stop. Each screen's hold
+//! goes -- the screen is not retired, so its next request holds again --
+//! every idle share goes, and every cast's hold is set aside: still owned
+//! by its publication, it holds nothing from then on, and its unpublish
+//! leaves no idle share. A new hold is never overridden by an old clear:
+//! whoever asks after it -- a screen's request, a cast published -- holds
+//! at once.
 //!
 //! **What releases a hold the holder forgot.** Holds live in this process's
 //! memory only, and the server lives inside the app's process: an app that
@@ -116,6 +126,20 @@ struct Inner {
     /// screen published reads with the screen's token, and must not bring
     /// the screen's hold back after the screen was left. One per viewer.
     closed: HashMap<String, u64>,
+    /// The casts' holds a cache clear set aside ([`Holds::clear`]), by id:
+    /// still in `held` until their publication drops them, holding nothing.
+    set_aside: std::collections::HashSet<u64>,
+}
+
+impl Inner {
+    /// The casts' holds that hold something: every one a clear has not set
+    /// aside.
+    fn casts(&self) -> impl Iterator<Item = &(Option<String>, On)> {
+        self.held
+            .iter()
+            .filter(|(id, _)| !self.set_aside.contains(id))
+            .map(|(_, held)| held)
+    }
 }
 
 /// Every explicit hold on every torrent. Cheap to clone: one shared map.
@@ -135,13 +159,18 @@ impl Drop for TorrentHold {
     /// of theirs holds a torrent, or another cast of theirs is published.
     fn drop(&mut self) {
         let mut inner = self.holds.0.lock();
-        let Some((Some(viewer), on)) = inner.held.remove(&self.id) else {
+        let held = inner.held.remove(&self.id);
+        // A cast a clear set aside was stopped already: what it leaves is
+        // nothing.
+        if inner.set_aside.remove(&self.id) {
+            return;
+        }
+        let Some((Some(viewer), on)) = held else {
             return;
         };
         let watching = inner.players.contains_key(&viewer)
             || inner
-                .held
-                .values()
+                .casts()
                 .any(|(other, _)| other.as_deref() == Some(viewer.as_str()));
         if !watching {
             let info_hash = on.info_hash.clone();
@@ -292,8 +321,7 @@ impl Holds {
         }
         let released = inner.players.remove(&parsed.viewer);
         let casting = inner
-            .held
-            .values()
+            .casts()
             .any(|(viewer, _)| viewer.as_deref() == Some(parsed.viewer.as_str()));
         let idle = match &released {
             Some((_, on)) if idles && !casting => {
@@ -329,12 +357,56 @@ impl Holds {
         inner.idle.retain(|_, on| !names(on));
     }
 
+    /// **A cache clear: every hold is overridden**, until whoever holds
+    /// asks again. Each viewer's screen hold goes -- without retiring the
+    /// screen, so a request of it after this holds again -- every idle
+    /// share goes, and every cast's hold is set aside: its publication
+    /// still owns it, it holds nothing, and its unpublish leaves no idle
+    /// share. A cast published after this holds as any does. Answers how
+    /// many holds were overridden, and logs each torrent it let go.
+    pub fn clear(&self) -> usize {
+        let mut inner = self.0.lock();
+        let mut released: Vec<(String, &'static str)> = Vec::new();
+        released.extend(
+            inner
+                .players
+                .drain()
+                .map(|(_, (_, on))| (on.info_hash, "player")),
+        );
+        released.extend(
+            inner
+                .idle
+                .drain()
+                .map(|(_, on)| (on.info_hash, "idle_share")),
+        );
+        let casts: Vec<(u64, String)> = inner
+            .held
+            .iter()
+            .filter(|(id, _)| !inner.set_aside.contains(id))
+            .map(|(id, (_, on))| (*id, on.info_hash.clone()))
+            .collect();
+        for (id, info_hash) in casts {
+            inner.set_aside.insert(id);
+            released.push((info_hash, "cast"));
+        }
+        drop(inner);
+        for (info_hash, holder) in &released {
+            tracing::info!(
+                info_hash = %info_hash,
+                holder,
+                reason = "cache_clear",
+                "torrent_released"
+            );
+        }
+        released.len()
+    }
+
     /// Whether something is using `info_hash` (lowercase) now: a player
     /// screen on it or a cast of it. Not an idle share -- see
     /// [`Self::idle_shares`].
     pub fn holds(&self, info_hash: &str) -> bool {
         let inner = self.0.lock();
-        inner.held.values().any(|(_, on)| on.info_hash == info_hash)
+        inner.casts().any(|(_, on)| on.info_hash == info_hash)
             || inner
                 .players
                 .values()
@@ -362,10 +434,7 @@ impl Holds {
     /// keeps that file's retention window whatever the liveness cell names.
     pub fn holds_file(&self, info_hash: &str, file_idx: usize) -> bool {
         let inner = self.0.lock();
-        inner
-            .held
-            .values()
-            .any(|(_, on)| on.file(info_hash, file_idx))
+        inner.casts().any(|(_, on)| on.file(info_hash, file_idx))
             || inner
                 .players
                 .values()
@@ -389,8 +458,7 @@ impl Holds {
             .collect();
         holders.extend(
             inner
-                .held
-                .values()
+                .casts()
                 .filter(|(_, on)| on.info_hash == info_hash)
                 .map(|_| Holder::Cast),
         );
@@ -577,5 +645,42 @@ mod tests {
         assert!(holds.holds("bb"), "another file was deleted");
         holds.forget_file("bb", 0);
         assert!(!holds.holds("bb"), "the file the screen plays was deleted");
+    }
+
+    /// **A cache clear overrides every hold until it is asked for again**:
+    /// a screen's hold, an idle share and a cast's all stop holding; the
+    /// screen is not retired, so its next request holds again; the set-
+    /// aside cast leaves no idle share when it is unpublished; and a cast
+    /// published after the clear holds as any does.
+    #[test]
+    fn a_clear_overrides_every_hold_until_it_is_asked_for_again() {
+        let holds = Holds::default();
+        assert!(holds.hold_for_player("v.1", "aa", vec![0]));
+        assert!(holds.hold_for_player("w.1", "bb", vec![0]));
+        assert!(holds.release_player("w.1"));
+        let cast = holds.hold("cc", None, Some("x.1"));
+        assert!(holds.holds("aa") && holds.idle_shares("bb") && holds.holds("cc"));
+
+        assert_eq!(holds.clear(), 3, "a screen, an idle share and a cast");
+        for info_hash in ["aa", "bb", "cc"] {
+            assert!(!holds.holds_any(info_hash), "{info_hash} is still held");
+            assert!(!holds.holds_file(info_hash, 0));
+            assert_eq!(holds.holders(info_hash), Vec::<Holder>::new());
+        }
+        assert_eq!(holds.clear(), 0, "nothing is left to override");
+
+        // The set-aside cast, unpublished, leaves its viewer nothing.
+        drop(cast);
+        assert!(!holds.idle_shares("cc"));
+
+        // The screen that was playing asks again: it holds again.
+        assert!(holds.hold_for_player("v.1", "aa", vec![0]));
+        assert!(holds.holds("aa"));
+        // And a cast published after the clear holds, and leaves its
+        // viewer's idle share when it goes.
+        let cast = holds.hold("cc", None, Some("x.2"));
+        assert!(holds.holds("cc"));
+        drop(cast);
+        assert!(holds.idle_shares("cc"));
     }
 }

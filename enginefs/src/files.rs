@@ -168,8 +168,14 @@ fn torrent_piece(offset: u64, file_start: Option<u64>, piece_length: Option<u64>
 pub struct FileHandle<H: TorrentHandle> {
     pub size: u64,
     pub name: String,
-    pub stream: Box<dyn FileStreamTrait>,
     pub engine: Arc<crate::engine::Engine<H>>,
+    /// The backend stream and this read's head on the file's entity, which
+    /// a cache clear takes away from outside ([`Engine::cut_reads`]): the
+    /// slot is shared with the engine, and an empty one is a read that was
+    /// stopped. See [`OpenRead`].
+    ///
+    /// [`Engine::cut_reads`]: crate::engine::Engine::cut_reads
+    open: CutSlot<H>,
     /// Which file of the torrent, for the blocked-read log.
     file_idx: usize,
     cursor: ReadCursor,
@@ -179,6 +185,26 @@ pub struct FileHandle<H: TorrentHandle> {
     ///
     /// [`Engine::refuse_reads_for_space`]: crate::engine::Engine::refuse_reads_for_space
     reader_id: u64,
+    /// Which park of this read a probe is armed for, or zero for none; see
+    /// [`Self::arm_blocked_probe`]. Set to a fresh generation when the read
+    /// parks, cleared when it is served, and read by the probe task before
+    /// it logs: a task from an earlier park finds a different generation
+    /// and says nothing. A flag is not enough -- a read served within a
+    /// second and parked again on the next piece would have the first
+    /// park's task log the old offset against the new wait.
+    probe: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// **What an open read holds that a cache clear takes away**: the backend
+/// stream, whose lookahead librqbit will not let a piece be dropped from
+/// while it stands, and the read's head on the file's entity, which keeps
+/// a window and a promise. Both live in a slot the engine can empty
+/// ([`crate::engine::Engine::cut_reads`]) without the handle being
+/// polled: a player's reader sits idle between its reads for as long as it
+/// likes, and a clear that waited for the next read to notice would leave
+/// the pieces round it on the disk until then.
+pub(crate) struct OpenRead<H: TorrentHandle> {
+    stream: Box<dyn FileStreamTrait>,
     /// This read, as the retention owner sees it: its own playhead on the
     /// file's entity, moved by every byte that really goes out and gone
     /// when this handle is. Two handles on one file -- a seek is a second
@@ -193,15 +219,26 @@ pub struct FileHandle<H: TorrentHandle> {
     /// for, and this handle does not exist until after that await. See
     /// there for what runs in the gap.
     reader: Option<crate::retention::owner::Reader<crate::engine::TorrentBacking<H>>>,
-    /// Which park of this read a probe is armed for, or zero for none; see
-    /// [`Self::arm_blocked_probe`]. Set to a fresh generation when the read
-    /// parks, cleared when it is served, and read by the probe task before
-    /// it logs: a task from an earlier park finds a different generation
-    /// and says nothing. A flag is not enough -- a read served within a
-    /// second and parked again on the next piece would have the first
-    /// park's task log the old offset against the new wait.
-    probe: Arc<std::sync::atomic::AtomicU64>,
 }
+
+/// The error a read fails with once a cache clear has stopped it
+/// ([`crate::engine::Engine::cut_reads`]) -- `ConnectionAborted`, so a
+/// caller that looks at the kind sees a stream that was ended for it, not a
+/// disk or a torrent that failed.
+pub fn cleared_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::ConnectionAborted,
+        "the cache was cleared: this stream was stopped",
+    )
+}
+
+/// The slot an [`OpenRead`] lives in, shared by the handle and its engine.
+/// `None` once a clear has taken it.
+pub(crate) type CutSlot<H> = Arc<parking_lot::Mutex<Option<OpenRead<H>>>>;
+
+/// What the engine keeps of a [`CutSlot`]: the handle owns the slot, and a
+/// handle that is gone leaves nothing to stop.
+pub(crate) type WeakCutSlot<H> = std::sync::Weak<parking_lot::Mutex<Option<OpenRead<H>>>>;
 
 /// What one read of one file is: where in the torrent, where in the file,
 /// how far ahead it will be fetched, and how much of the film its viewer
@@ -342,20 +379,22 @@ impl<H: TorrentHandle> FileHandle<H> {
             ..
         } = opening;
         let reader_id = engine.next_reader_id();
+        // Where the file lies in the torrent is the entity's: the reader
+        // has it, and a handle with no entity names no piece.
+        let cursor = ReadCursor::new(
+            start_offset,
+            reader.as_ref().map(|reader| reader.domain().file_offset()),
+        );
+        let open = Arc::new(parking_lot::Mutex::new(Some(OpenRead { stream, reader })));
+        engine.register_open_read(reader_id, &open);
         Self {
             size,
             name,
-            stream,
             engine,
+            open,
             file_idx,
-            // Where the file lies in the torrent is the entity's: the
-            // reader has it, and a handle with no entity names no piece.
-            cursor: ReadCursor::new(
-                start_offset,
-                reader.as_ref().map(|reader| reader.domain().file_offset()),
-            ),
+            cursor,
             reader_id,
-            reader,
             probe: Arc::default(),
         }
     }
@@ -456,10 +495,11 @@ impl<H: TorrentHandle> FileHandle<H> {
 
 impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
         // A torrent stopped for space is not downloading the piece this
         // read may be about to park on, and the backend wakes a parked read
         // only when its piece arrives. So the engine says whether reads are
@@ -469,21 +509,33 @@ impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
         // function has an arrival to clear and none inherits the last
         // read's. Latched, not assigned: this runs again on every wake-up
         // of a read that parked.
-        if !self.cursor.has_arrived() {
-            self.cursor.arrive(Instant::now());
+        if !this.cursor.has_arrived() {
+            this.cursor.arrive(Instant::now());
         }
-        if self.engine.reads_refused() {
-            self.cursor.resume(Instant::now(), 0);
+        if this.engine.reads_refused() {
+            this.cursor.resume(Instant::now(), 0);
             return Poll::Ready(Err(Self::stopped_for_space_error()));
         }
+        // The slot's lock is held across the backend's poll and the notes
+        // below, and never taken by anything that holds another lock of
+        // ours: a clear empties it under this lock alone and drops what it
+        // took after letting go ([`crate::engine::Engine::cut_reads`]).
+        let slot = this.open.clone();
+        let mut open = slot.lock();
+        let Some(open) = open.as_mut() else {
+            // A cache clear stopped this read: it was woken to find its
+            // stream gone, or asked again after.
+            this.cursor.resume(Instant::now(), 0);
+            return Poll::Ready(Err(cleared_error()));
+        };
         let before = buf.filled().len();
-        let polled = Pin::new(&mut self.stream).poll_read(cx, buf);
+        let polled = Pin::new(&mut open.stream).poll_read(cx, buf);
         match polled {
             Poll::Pending => {
-                self.engine
-                    .register_read_waker(self.reader_id, cx.waker().clone());
-                self.cursor.park(Instant::now());
-                self.arm_blocked_probe();
+                this.engine
+                    .register_read_waker(this.reader_id, cx.waker().clone());
+                this.cursor.park(Instant::now());
+                this.arm_blocked_probe();
                 // **What this read is blocked on**, which is the one thing
                 // the swarm should be fetching before anything else.
                 //
@@ -493,22 +545,22 @@ impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
                 // the pass orders ahead of every window it holds. On the
                 // torrent side this is the only caller that names what a
                 // reader is *stuck on*, rather than merely near.
-                if let Some(reader) = &self.reader {
-                    reader.promises_at((self.file_idx, self.cursor.position));
+                if let Some(reader) = &open.reader {
+                    reader.promises_at((this.file_idx, this.cursor.position));
                 }
             }
             Poll::Ready(ref result) => {
-                self.probe.store(0, std::sync::atomic::Ordering::SeqCst);
+                this.probe.store(0, std::sync::atomic::Ordering::SeqCst);
                 let delivered = if result.is_ok() {
                     buf.filled().len().saturating_sub(before) as u64
                 } else {
                     0
                 };
-                let served = self.cursor.resume(Instant::now(), delivered);
+                let served = this.cursor.resume(Instant::now(), delivered);
                 if let Some(waited) = served.waited
                     && waited >= BLOCKED_READ_LOG_THRESHOLD
                 {
-                    self.log_blocked_read(served, waited);
+                    this.log_blocked_read(served, waited);
                 }
                 // **What the reads of this file look like**, which is what
                 // a pass fetches, keeps and gives back by. Fed from here
@@ -517,9 +569,9 @@ impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
                 // than to anything on this handle because a stream survives
                 // the response that was carrying it.
                 if delivered > 0 {
-                    self.engine.note_read(
-                        self.file_idx,
-                        self.reader_id,
+                    this.engine.note_read(
+                        this.file_idx,
+                        this.reader_id,
                         crate::retention::streams::Read {
                             begin: served.begin,
                             end: served.end,
@@ -533,9 +585,9 @@ impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
                 // on the file's entity. Written after the read rather than
                 // before it, so a read that failed or parked moves nothing.
                 if delivered > 0
-                    && let Some(reader) = &self.reader
+                    && let Some(reader) = &open.reader
                 {
-                    let claim = reader.note((self.file_idx, served.end));
+                    let claim = reader.note((this.file_idx, served.end));
                     debug_assert!(
                         claim.is_none(),
                         "a delivered byte claimed a torrent file's turn; the tick is its trigger"
@@ -554,19 +606,27 @@ impl<H: TorrentHandle> Drop for FileHandle<H> {
         // up, or as held by nobody, ten seconds later.
         self.probe.store(0, std::sync::atomic::Ordering::SeqCst);
         self.engine.forget_read_waker(self.reader_id);
+        self.engine.forget_open_read(self.reader_id);
         self.engine.active_streams.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
 impl<H: TorrentHandle> AsyncSeek for FileHandle<H> {
-    fn start_seek(mut self: Pin<&mut Self>, position: std::io::SeekFrom) -> std::io::Result<()> {
-        Pin::new(&mut self.stream).start_seek(position)
+    fn start_seek(self: Pin<&mut Self>, position: std::io::SeekFrom) -> std::io::Result<()> {
+        match self.open.lock().as_mut() {
+            Some(open) => Pin::new(&mut open.stream).start_seek(position),
+            None => Err(cleared_error()),
+        }
     }
 
-    fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<u64>> {
-        let polled = Pin::new(&mut self.stream).poll_complete(cx);
+    fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<u64>> {
+        let this = self.get_mut();
+        let polled = match this.open.lock().as_mut() {
+            Some(open) => Pin::new(&mut open.stream).poll_complete(cx),
+            None => Poll::Ready(Err(cleared_error())),
+        };
         if let Poll::Ready(Ok(position)) = polled {
-            self.cursor.seek_to(position);
+            this.cursor.seek_to(position);
         }
         polled
     }

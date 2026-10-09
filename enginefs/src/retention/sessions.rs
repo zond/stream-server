@@ -389,6 +389,21 @@ impl PlaySessions {
             .contains(&(info_hash.to_string(), file_idx))
     }
 
+    /// **A cache clear: every viewer's session is on nothing now**, as
+    /// though each had moved to something that is not a torrent
+    /// ([`Played::Elsewhere`]): no draw is shared any more, and the next
+    /// request of a screen puts its session where it asks, as a move. The
+    /// newest screen each viewer was heard from is kept, so an older
+    /// screen's request is still [`Heard::Stale`]. Nothing waits to end:
+    /// the clear ends it all.
+    pub fn clear(&self) {
+        let mut inner = self.0.lock();
+        for session in inner.by_viewer.values_mut() {
+            session.played = Played::Elsewhere;
+        }
+        inner.left_alone.clear();
+    }
+
     /// `info_hash`'s shares have been ended: nothing it left is waiting.
     pub fn ended(&self, info_hash: &str) {
         self.0
@@ -509,6 +524,28 @@ mod tests {
             (2, 0),
             "a mark for a torrent nobody is on"
         );
+    }
+
+    /// **A clear puts every session on nothing**: no file is covered or
+    /// played, nothing waits to end, the next request of the playing screen
+    /// is a move back, and an older screen's is still stale.
+    #[test]
+    fn a_clear_puts_every_session_on_nothing() {
+        let sessions = PlaySessions::default();
+        sessions.play("tv.1", file("t", 0));
+        sessions.play("tv.2", file("t", 1));
+        sessions.play("phone.1", file("u", 0));
+        assert!(sessions.may_end_now("t", 0));
+
+        sessions.clear();
+        assert!(!sessions.on_torrent("t") && !sessions.on_torrent("u"));
+        assert!(!sessions.covers("t", 1) && !sessions.covers("u", 0));
+        assert!(!sessions.may_end_now("t", 0), "nothing waits to end");
+        assert_eq!(sessions.of("tv.2"), Some(Played::Elsewhere));
+
+        assert_eq!(sessions.play("tv.1", file("t", 0)), Heard::Stale);
+        assert_eq!(sessions.play("tv.2", file("t", 1)), CURRENT);
+        assert!(sessions.covers("t", 1));
     }
 
     /// **Only `shares` changing is no move**: nothing is left behind.

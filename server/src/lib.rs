@@ -5,7 +5,7 @@ use axum::{
     http::{StatusCode, header},
     routing::{get, post},
 };
-pub use cache_cleaner::{CacheUsage, EvictionReport};
+pub use cache_cleaner::{CacheClearReport, CacheUsage, EvictionReport};
 use enginefs::EngineFS;
 pub use enginefs::backend::{EngineStats, TorrentListenPort};
 pub use enginefs::piece_store::PinSet;
@@ -1102,6 +1102,35 @@ impl ServerHandle {
     pub fn clean_cache_now(&self) -> anyhow::Result<EvictionReport> {
         let state = self.state.clone();
         self.block_on_server(async move { cache_cleaner::drop_slack(&state).await })
+    }
+
+    /// **Clear the cache, now**: stop every torrent that streams and take
+    /// every byte no download keeps off the disk, and say what that freed
+    /// and how many torrents it stopped. What [`Self::clean_cache_now`]
+    /// will not do, on purpose -- it gives back only what nobody plays --
+    /// and what a user asks for when they want the space back whatever is
+    /// playing (an app's "Clear the cache", or its update making room).
+    ///
+    /// In order (`cache_cleaner::clear`): every hold on every torrent is
+    /// overridden -- a player screen's, a cast's, an idle share -- and every
+    /// read open on a torrent fails at once, so the player that was reading
+    /// gets a read error (`ConnectionAborted`, "the cache was cleared");
+    /// every torrent stops but one a kept download is on, which goes on
+    /// downloading; every piece no download keeps is taken through the
+    /// retention layer's own deletes, the last-played title's window
+    /// included; then every proxy-cache entry no download pins and no body
+    /// is reading now. Untouched: kept downloads, the settings, where each
+    /// file was last played (`read-positions.json`), and anything that is
+    /// not this server's (an app's image cache).
+    ///
+    /// After it, whoever asks is served as a first ask is: a player
+    /// opening a stream holds its torrent again and it starts, a cast
+    /// published holds. A reader or cast opened before the clear stays
+    /// stopped -- a seek in it fails too -- so a player shows the error
+    /// it shows for any failed read rather than quietly fetching again.
+    pub fn clear_cache(&self) -> anyhow::Result<CacheClearReport> {
+        let state = self.state.clone();
+        self.block_on_server(async move { cache_cleaner::clear(&state).await })
     }
 
     /// The cap the budget publisher last stated, as the owners of the cache

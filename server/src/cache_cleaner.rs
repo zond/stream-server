@@ -58,6 +58,42 @@ pub(crate) async fn drop_slack(state: &AppState) -> EvictionReport {
     }
 }
 
+/// **Clear the cache**: stop everything that streams a torrent and take
+/// every byte no download keeps off the disk -- what
+/// `ServerHandle::clear_cache` answers. Not a request for slack, as
+/// [`drop_slack`] is: the user asked for the space back, and what a player
+/// was in the middle of is part of it.
+///
+/// The torrents first (`enginefs::BackendEngineFS::clear_cache`): every
+/// hold overridden, every read stopped, every torrent stopped but a
+/// download's, every piece no pin covers taken. That also leaves the
+/// liveness cell naming nothing, so the proxy cache's slack pass that
+/// follows takes the stream played last as well -- every entity but a
+/// pinned download and one a body is being read off now, whose chunks are
+/// promised to it (a link a player is still streaming goes on, and its
+/// window goes once its read has closed). The cap is restated after both.
+pub(crate) async fn clear(state: &AppState) -> CacheClearReport {
+    let before = usage(state).await;
+    let torrents = state.engine.clear_cache().await;
+    let proxied = state.proxy_cache.retention().drop_slack().await;
+    crate::cache_budget::publish_now(state).await;
+    let after = usage(state).await;
+    let report = CacheClearReport {
+        freed: before.total_bytes.saturating_sub(after.total_bytes),
+        stopped: torrents.stopped,
+        deleted: torrents.deleted + proxied,
+        total: after.total_bytes,
+    };
+    tracing::info!(
+        freed = report.freed,
+        stopped = report.stopped,
+        deleted = report.deleted,
+        total = report.total,
+        "cache_clear_report"
+    );
+    report
+}
+
 /// What the cache currently occupies against its configured limit
 /// ([`CacheUsage`]), from the owners that hold it rather than from a walk
 /// of it.
@@ -239,6 +275,25 @@ pub struct EvictionReport {
     /// left to choose victims, this is what says a cache over its cap is
     /// over it because a pin and a live window are holding it.
     pub over_limit: u64,
+}
+
+/// What one [`clear`] did, in occupancy bytes
+/// ([`enginefs::chunk_store::occupied_bytes`]). `serde`-serializable so it
+/// crosses the `ServerHandle::clear_cache` boundary (FFI, as JSON) as is.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheClearReport {
+    /// How far the cache's occupancy fell across the call: what left the
+    /// volume. The line an app shows ("Freed ...").
+    pub freed: u64,
+    /// How many torrents were running before the clear and are stopped
+    /// after it. A download's torrent goes on, and is not counted.
+    pub stopped: usize,
+    /// How many piece files and chunks left the disk.
+    pub deleted: usize,
+    /// What the cache holds after it, as [`CacheUsage::total_bytes`]
+    /// counts it: the kept downloads, and a link a player is still reading.
+    pub total: u64,
 }
 
 impl EvictionReport {

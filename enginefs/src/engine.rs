@@ -1554,6 +1554,15 @@ pub struct Engine<H: TorrentHandle> {
     /// leaves its readers parked for good unless something here wakes them.
     read_wakers: parking_lot::Mutex<HashMap<u64, std::task::Waker>>,
     next_reader_id: AtomicU64,
+    /// Every read open on this engine, by reader, as the slot its handle
+    /// shares ([`crate::files::FileHandle`] registers at its open and
+    /// forgets itself on drop): what [`Self::cut_reads`] empties. Weak, so
+    /// a handle's slot is the handle's to keep alive.
+    open_reads: parking_lot::Mutex<HashMap<u64, crate::files::WeakCutSlot<H>>>,
+    /// The pre-wants walking now ([`Self::prewant`]), so a clear can end
+    /// them with the reads: each holds a backend stream whose lookahead
+    /// librqbit protects as it does a reader's.
+    prewants: parking_lot::Mutex<Vec<tokio::task::AbortHandle>>,
     /// When the blocked-read probe last logged each `(file, offset piece)`,
     /// so mpv's several parallel ranges parked on one piece produce one
     /// line and not four; see [`Self::blocked_probe_may_log`].
@@ -1706,6 +1715,8 @@ impl<H: TorrentHandle> Engine<H> {
             volumes,
             reads_refused: AtomicBool::new(false),
             read_wakers: parking_lot::Mutex::new(HashMap::new()),
+            open_reads: parking_lot::Mutex::new(HashMap::new()),
+            prewants: parking_lot::Mutex::new(Vec::new()),
             next_reader_id: AtomicU64::new(1),
             blocked_probes: parking_lot::Mutex::new(HashMap::new()),
             streams,
@@ -1917,6 +1928,48 @@ impl<H: TorrentHandle> Engine<H> {
     pub fn refuse_reads_for_space(&self) {
         self.reads_refused.store(true, Ordering::SeqCst);
         self.wake_readers();
+    }
+
+    /// **Stop every read open on this torrent, now**: what a cache clear
+    /// does to whatever was streaming it (`BackendEngineFS::clear_cache`).
+    /// Each open read's backend stream and its head on the file's entity
+    /// are taken out of its handle, so its lookahead no longer keeps a
+    /// piece from being dropped and its window and promise no longer keep
+    /// one on the disk; a parked read is woken to find its stream gone,
+    /// and every read after that -- or a seek -- fails with
+    /// [`crate::files::cleared_error`] at once. The pre-wants
+    /// walking for this torrent end with them. A read opened after this
+    /// is untouched: whoever asks again is served. Answers how many reads
+    /// were stopped.
+    ///
+    /// What was taken is dropped after every slot's lock is let go: a
+    /// backend stream's drop takes the backend's own locks, and a head's
+    /// takes the entity's.
+    pub fn cut_reads(&self) -> usize {
+        let slots: Vec<_> = self
+            .open_reads
+            .lock()
+            .drain()
+            .filter_map(|(_, slot)| slot.upgrade())
+            .collect();
+        let taken: Vec<_> = slots.iter().filter_map(|slot| slot.lock().take()).collect();
+        let cut = taken.len();
+        drop(taken);
+        for walk in self.prewants.lock().drain(..) {
+            walk.abort();
+        }
+        self.wake_readers();
+        cut
+    }
+
+    /// Reader `id`'s slot, for [`Self::cut_reads`] to empty.
+    pub(crate) fn register_open_read(&self, id: u64, slot: &crate::files::CutSlot<H>) {
+        self.open_reads.lock().insert(id, Arc::downgrade(slot));
+    }
+
+    /// Reader `id` is gone; nothing to stop.
+    pub(crate) fn forget_open_read(&self, id: u64) {
+        self.open_reads.lock().remove(&id);
     }
 
     /// Wake every parked read so it polls again.
@@ -2909,8 +2962,9 @@ impl<H: TorrentHandle> Engine<H> {
         advertised.iter().any(|piece| !shares.contains(piece))
     }
 
-    /// **Shutdown's end of every play session**, on a torrent that has left
-    /// the swarm: the bytes of every file a stream opened in this process
+    /// **Shutdown's end of every play session**, and a cache clear's
+    /// (`BackendEngineFS::clear_cache`), on a torrent that has left the
+    /// swarm: the bytes of every file a stream opened in this process
     /// -- every entity -- go, except what a pin covers, and how many is
     /// answered. Refused on a torrent that is not `Paused`, and while the
     /// pin set is unknown, which keeps everything. What no play session
@@ -3346,6 +3400,11 @@ impl<H: TorrentHandle> Engine<H> {
             span,
             piece_length,
         }));
+        {
+            let mut walking = self.prewants.lock();
+            walking.retain(|walk| !walk.is_finished());
+            walking.push(walk.abort_handle());
+        }
         Some(PreWant { walk })
     }
 }

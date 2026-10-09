@@ -654,10 +654,11 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     /// reconciler's ladder, by every retention pass and by the task that
     /// drops the predecessor's slack. See [`crate::retention::live`].
     ///
-    /// This is a *decision*, not a record: one writer, no rollback, no
-    /// clearer -- because a stream the server saw opened really did leave
-    /// the previous one behind, whether or not the request that opened it
-    /// survived.
+    /// This is a *decision*, not a record: one writer, no rollback -- a
+    /// stream the server saw opened really did leave the previous one
+    /// behind, whether or not the request that opened it survived -- and
+    /// one clearer, the cache clear ([`Self::clear_cache`]), after which
+    /// nothing is being played.
     live: Arc<crate::retention::live::Live>,
     /// For multi-file torrents, only the latest requested file is allowed to be
     /// wanted at a time. Single-file torrents bypass this selector.
@@ -741,6 +742,20 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     /// the process believes is worse than either answer: see
     /// [`crate::piece_store::PinsUnknown`].
     pins_unknown: Arc<crate::piece_store::PinsUnknown>,
+    /// The torrents a cache clear stopped whose stream responses and reads
+    /// from before it still count for nothing in [`Self::held`]: the clear
+    /// stopped them, and a body it cut lets go of its registration only
+    /// when its consumer drops it, which a player with a failed read may
+    /// not do for as long as its screen is open. A hash leaves the set when
+    /// a stream starts on it again ([`Self::on_stream_start`] and its
+    /// siblings): a new ask, which counts. Holds need no such mark -- the
+    /// clear took them ([`crate::retention::holds::Holds::clear`]), so any
+    /// there are now were taken after it.
+    cleared: parking_lot::Mutex<std::collections::HashSet<String>>,
+    /// How many cache clears this instance has made ([`Self::clear_cache`]):
+    /// what a source opened before one compares against, to open nothing
+    /// after it ([`Self::clear_generation`]).
+    clears: AtomicU64,
 }
 
 /// What an [`Engine`] needs besides its backend handle: the epoch its
@@ -1191,6 +1206,19 @@ pub struct CacheHoldings {
     pub protected_files: usize,
 }
 
+/// What one [`BackendEngineFS::clear_cache`] did to the torrents.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CacheClear {
+    /// How many torrents were running before it and are stopped after it.
+    pub stopped: usize,
+    /// How many open reads it stopped ([`Engine::cut_reads`]).
+    pub reads_stopped: usize,
+    /// How many holds it overrode ([`crate::retention::holds::Holds::clear`]).
+    pub holds_overridden: usize,
+    /// How many piece files left the disk.
+    pub deleted: usize,
+}
+
 pub type EngineFS = BackendEngineFS<LibrqbitBackend>;
 
 /// Undoes what [`BackendEngineFS::on_stream_start`] (or
@@ -1449,6 +1477,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             budget,
             registry,
             pins_unknown,
+            cleared: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            clears: AtomicU64::new(0),
         };
 
         let sweep = tokio::spawn(
@@ -1679,7 +1709,9 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     ///   the setting going off or the app holding idle sharing back stops
     ///   the torrent at the next reconcile and the reverse runs it again,
     ///   the share standing throughout;
-    /// * **a body being delivered off it**: a stream response registered on
+    /// * **a body being delivered off it** -- unless a cache clear stopped
+    ///   the torrent since and no stream has started on it after
+    ///   ([`Self::clear_cache`]): a stream response registered on
     ///   it ([`Self::on_stream_start`] to [`Self::on_stream_end`], which every
     ///   route that opens a torrent reader brackets its response with), or
     ///   a read that has promised pieces or delivered a byte and not ended
@@ -1714,6 +1746,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
         if self.idle_sharing_allowed() && self.live.holds().idle_shares(info_hash) {
             return true;
+        }
+        // A cache clear stopped it: what was being delivered off it then
+        // was stopped with it, and a body it cut is nobody's ask any more.
+        if self.cleared.lock().contains(info_hash) {
+            return false;
         }
         if engine.retention.readers() > 0 {
             return true;
@@ -3186,6 +3223,101 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         reclaimed
     }
 
+    /// How many cache clears this instance has made: a source opened before
+    /// one ([`Self::clear_generation`] then differs) opens nothing after it.
+    pub fn clear_generation(&self) -> u64 {
+        self.clears.load(Ordering::SeqCst)
+    }
+
+    /// **Clear the torrent cache: stop everything that streams, and take
+    /// every piece no download keeps off the disk** -- what the user asks
+    /// for when they want the space back now, and what an app making room
+    /// for an update asks when the gentle clean ([`Self::drop_slack`]) did
+    /// not free enough.
+    ///
+    /// In order:
+    ///
+    /// 1. **Every hold is overridden** ([`crate::retention::holds::Holds::
+    ///    clear`]): a screen's, an idle share, a cast's. Every viewer's play
+    ///    session is put on nothing ([`crate::retention::sessions::
+    ///    PlaySessions::clear`]), so no draw is shared any more, and the
+    ///    liveness cell names nothing ([`crate::retention::live::Live::
+    ///    forget_all`]), so no window is kept -- the last thing played
+    ///    included. The bodies being delivered off each torrent are marked
+    ///    as counting for nothing in [`Self::held`] until a stream starts
+    ///    on it again.
+    /// 2. **Every read open on every torrent is stopped**
+    ///    ([`Engine::cut_reads`]): the player that was reading gets a read
+    ///    error, and a source opened before the clear opens nothing after
+    ///    it ([`Self::clear_generation`]).
+    /// 3. **Every torrent is reconciled as a delete is**
+    ///    ([`Self::reconcile_hash_ending_shares`]): nothing holds it now,
+    ///    so it stops -- unless a download is pinned on it, which keeps it
+    ///    running: a kept download is not cache. What it announced and
+    ///    nothing shares any more ends with it out of the swarm, a pinned
+    ///    one starting again at once.
+    /// 4. **Every piece no pin covers goes**, through the retention
+    ///    layer's own slack pass ([`Engine::drop_slack`]): every entity is
+    ///    slack now and no read keeps a window, the cell names nothing, and
+    ///    nothing announced is left to keep a piece -- a stopped torrent's
+    ///    every unpinned piece, and a running download's every piece of a
+    ///    file it does not keep.
+    ///
+    /// Each torrent under its pin lock, so a pin or an unpin of it waits.
+    /// Nothing here touches a pin, the settings or what was played where:
+    /// a download, finished or not, keeps every byte and goes on. While the
+    /// pin set is unknown every torrent counts as pinned, so nothing is
+    /// stopped for want of a hold and no piece is taken -- the clear does
+    /// the rest. Whoever asks after it is served as any first ask is: a
+    /// player's request holds again, a cast published holds, a stream
+    /// started counts.
+    pub async fn clear_cache(&self) -> CacheClear {
+        self.clears.fetch_add(1, Ordering::SeqCst);
+        let engines: Vec<_> = self.engines.read().await.values().cloned().collect();
+        self.cleared
+            .lock()
+            .extend(engines.iter().map(|engine| engine.info_hash.clone()));
+        let mut clear = CacheClear {
+            holds_overridden: self.live.holds().clear(),
+            ..CacheClear::default()
+        };
+        self.live.sessions().clear();
+        self.live.forget_all();
+        for engine in engines {
+            let lock = self.pin_lock(&engine.info_hash);
+            let _guard = lock.mutex().lock().await;
+            let was_live = engine.handle.run_state() == RunState::Live;
+            clear.reads_stopped += engine.cut_reads();
+            // Nothing plays any file of it now: every entity goes slack,
+            // without its draw, so the next open of a file draws afresh.
+            for file_idx in engine.retention.keys() {
+                engine.retention.end_play_session(&file_idx).await;
+            }
+            self.active_multifile_files
+                .write()
+                .await
+                .remove(&engine.info_hash);
+            self.reconcile_with_active_selection(engine.clone(), "clear_cache")
+                .await;
+            self.reconcile_hash_ending_shares(&engine.info_hash).await;
+            if let Some(pass) = engine.drop_slack(&self.registry).await {
+                clear.deleted += pass.reclaimed;
+            }
+            if was_live && engine.handle.run_state() != RunState::Live {
+                clear.stopped += 1;
+            }
+        }
+        self.apply_upload_switch().await;
+        tracing::info!(
+            stopped = clear.stopped,
+            reads_stopped = clear.reads_stopped,
+            holds_overridden = clear.holds_overridden,
+            deleted = clear.deleted,
+            "cache_cleared"
+        );
+        clear
+    }
+
     /// **Shutdown's: every torrent leaves the swarm, then every play
     /// session's bytes go.** Best effort -- the caller bounds it, and the
     /// process may be killed first -- and whatever is left is the next
@@ -3933,6 +4065,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             *count += 1;
         }
         rollback.counted_stream();
+        // A new ask: what a cache clear stopped counts again from here.
+        self.cleared.lock().remove(&info_hash);
         // Never taken back, not even by the rollback: a start that was
         // abandoned was still a player asking, and the light's window must
         // not claim the bytes it moved.
@@ -18517,6 +18651,73 @@ mod tests {
                 )
                 .await;
         }
+    }
+
+    /// **A cache clear ends what was played and shared, stops the torrent
+    /// under its reader, and takes its bytes**: the player's read fails,
+    /// the draw is gone with the session, the session is on nothing, the
+    /// cell names nothing, nothing is announced any more, and the torrent
+    /// is stopped and stays stopped although the read's response is still
+    /// registered -- all without breaking the sharing rule the fake holds
+    /// every test to. (What leaves the disk is `server/tests/
+    /// cache_clear.rs`'s: this fake keeps no pieces.)
+    #[tokio::test]
+    async fn a_clear_ends_what_was_played_and_shared_and_stops_the_torrent() {
+        use crate::backend::priorities::{BufferProfile, Fetching};
+        use tokio::io::AsyncReadExt;
+        let (enginefs, counters) =
+            test_enginefs_with_files(vec![("film.mkv".into(), 1000), ("film.srt".into(), 1000)]);
+        counters.pieces_per_file.store(40, Ordering::SeqCst);
+        let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+        enginefs.set_cache_budget(Some(1_000_000));
+        nothing_torrent_is_playing(&enginefs);
+
+        enginefs.note_player(PLAYER, played(TEST_HASH, 0));
+        enginefs.on_stream_start_unreconciled(TEST_HASH, 0).await;
+        enginefs.focus_torrent(TEST_HASH).await;
+        let mut film = engine
+            .try_get_file_with_intent(0, 0, 1, Fetching::Streaming, BufferProfile::Normal)
+            .await
+            .expect("the film");
+        assert!(engine.retention.draw_of(&0).is_some(), "the film drew");
+        assert!(!fake_advertises(&counters).is_empty(), "and announced it");
+        assert!(enginefs.live().is_torrent(TEST_HASH));
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Live);
+        assert_eq!(*counters.last_active_file.lock().unwrap(), Some(0));
+
+        let clear = enginefs.clear_cache().await;
+
+        assert_eq!(
+            *counters.last_active_file.lock().unwrap(),
+            None,
+            "the film is planned out of the want-set"
+        );
+        assert_eq!(clear.stopped, 1, "{clear:?}");
+        assert_eq!(clear.reads_stopped, 1, "{clear:?}");
+        assert_eq!(clear.holds_overridden, 1, "the screen's: {clear:?}");
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
+        assert!(
+            engine.retention.draw_of(&0).is_none(),
+            "the draw ended with the session"
+        );
+        assert_eq!(
+            enginefs.live().sessions().of(PLAYER),
+            Some(crate::retention::sessions::Played::Elsewhere)
+        );
+        assert!(
+            !enginefs.live().is_torrent(TEST_HASH),
+            "the cell names nothing"
+        );
+        assert_eq!(fake_advertises(&counters), Vec::<u32>::new());
+        let mut buf = [0u8; 16];
+        let error = film.read(&mut buf).await.expect_err("the read was stopped");
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+        // The response is still registered, and still holds nothing: the
+        // next tick leaves the torrent stopped.
+        enginefs.reconcile_tick().await;
+        assert_eq!(run_state_of(&enginefs, TEST_HASH).await, RunState::Paused);
+        drop(film);
+        enginefs.on_stream_end(TEST_HASH, 0).await;
     }
 
     /// **A subtitle read in the film's seek gap takes nothing from the
