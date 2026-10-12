@@ -220,7 +220,7 @@ impl ProxyDownloads {
             let Some(entry) = key.entry(state) else {
                 tracing::warn!(
                     ?key,
-                    "a proxy pin names nothing this server can key; it is dropped"
+                    "a proxy pin names nothing this server can key; dropping it"
                 );
                 continue;
             };

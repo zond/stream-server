@@ -661,8 +661,7 @@ impl DriveSource {
             None => {
                 tracing::info!(
                     origin = %ByteSource::describe(&inner),
-                    "Drive said nothing of this file's content that names it; it is kept by its \
-                     length"
+                    "Drive gave no identity for this file's content; keeping it under its length"
                 );
                 inner
             }

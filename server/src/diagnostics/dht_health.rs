@@ -148,11 +148,11 @@ pub fn start(engine: Arc<EngineFS>) -> tokio::task::JoinHandle<()> {
                 ),
                 Some(DhtReport::Unavailable) => tracing::warn!(
                     after_secs = since_start.as_secs(),
-                    "DHT did not bootstrap on this network; peer discovery is trackers-only. \
+                    "DHT did not bootstrap on this network, so peer discovery is trackers-only. \
                      Torrents with working trackers are unaffected. This is normally the \
                      network dropping the DHT's UDP (carrier-grade NAT, a firewalled mobile \
                      APN, a captive portal), not a server fault. Retries continue in the \
-                     background and are logged at debug; this warning is not repeated"
+                     background and are logged at debug. This warning is not repeated"
                 ),
                 Some(DhtReport::Recovered) => tracing::info!(
                     nodes = status.nodes,

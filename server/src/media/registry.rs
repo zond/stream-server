@@ -1278,7 +1278,7 @@ async fn resolve(state: &AppState, target: &Target) -> Result<Resolution, Refusa
                 info_hash,
                 file_idx,
                 ?format,
-                "a media id's torrent file is a container, by its head"
+                "a media id's torrent file is a container, judging by its head"
             );
             Ok(Resolution::Member {
                 format,
@@ -1534,7 +1534,7 @@ async fn sniffed_file(state: &AppState, sniffed: Sniffed) -> Result<Sniff, Refus
     tracing::info!(
         source = %source.describe(),
         ?format,
-        "a media id's file is a container, by its head"
+        "a media id's file is a container, judging by its head"
     );
     Ok(Sniff::Member(Resolution::Member {
         format,

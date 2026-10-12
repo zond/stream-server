@@ -925,7 +925,7 @@ impl Backing for ProxyBacking {
                 tracing::warn!(
                     dir = %domain.dir.path().display(),
                     error = %error,
-                    "the chunk directory could not be listed"
+                    "could not list the chunk directory"
                 );
                 None
             }
@@ -2152,7 +2152,7 @@ impl ProxyRetention {
                 tracing::debug!(
                     dir = %key.display(),
                     freed = conclusion.reclaimed,
-                    "the proxied stream nobody is playing was dropped"
+                    "dropped the proxied stream nobody is playing"
                 );
             }
         }

@@ -2764,8 +2764,8 @@ pub(crate) async fn cache_assisted_range(
                     from = %fetched_url.origin().ascii_serialization(),
                     to = %location.origin().ascii_serialization(),
                     headers = ?dropped,
-                    "a redirect leaves what this chain may spend the caller's h= \
-                     credentials on; not carrying them onto it"
+                    "a redirect goes where the caller's h= credentials may not be sent; \
+                     not carrying them onto it"
                 );
             }
         }

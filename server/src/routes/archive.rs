@@ -561,7 +561,7 @@ pub(crate) async fn create_session(
     {
         tracing::warn!(
             key = %key,
-            "a create under an existing session's key named a different archive; refused"
+            "refusing a create that names a different archive under an existing session's key"
         );
         return Err(SessionError::KeyInUse);
     }
@@ -965,7 +965,7 @@ pub(crate) async fn session_for(
         // A set with a hole in it is `Malformed`, naming the volume it
         // wanted. That is `422`, said at the index rather than as a short
         // read in the middle of a film.
-        tracing::warn!(%info_hash, archive = path, %refusal, "the set is not all there");
+        tracing::warn!(%info_hash, archive = path, %refusal, "the archive's volume set is incomplete");
         SessionError::Refused(refusal)
     })?;
     // This is held before the first volume opens. The opens below are what
