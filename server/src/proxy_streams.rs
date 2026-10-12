@@ -2,41 +2,41 @@
 //! ends one on purpose.
 //!
 //! Without this, a client that wants a player torn down has to wait for
-//! the read to time out -- and `network-timeout` is deliberately generous,
-//! because a slow swarm must not be mistaken for a dead connection, so
-//! that wait can be tens of seconds of a player that is already unwanted,
-//! holding its packet memory, its socket and the engine that socket pins.
+//! the read to time out. `network-timeout` is deliberately generous,
+//! because a slow swarm must not be mistaken for a dead connection. So
+//! that wait can be tens of seconds of an unwanted player holding its
+//! packet memory, its socket and the engine that socket pins.
 //!
-//! The hard part is not the closing, it is the correlation: this server
+//! The hard part is not the closing but the correlation. This server
 //! knows its streams by an id it minted, and the client has no way to say
 //! which one is *its* player's. So the client mints the name instead. It
 //! puts a token of its own in the proxy URL it hands the player (`p=` --
-//! see [`crate::routes::proxy`]), every stream opened through such a URL is
+//! see [`crate::routes::proxy`]). Every stream opened through such a URL is
 //! registered here under that token, and one call
 //! (`ServerHandle::close_proxy_streams`) closes every stream bearing it. A
 //! side effect: the count of live streams for a token is the count of
-//! players actually attached to it, which nothing outside this process
-//! can otherwise tell.
+//! players actually attached to it. Nothing outside this process can
+//! otherwise tell.
 //!
 //! **What this ends is the read *and the token*.** Closing makes the body
 //! yield an error, so hyper drops the connection and the player's demuxer
-//! sees its source fail at once instead of at timeout. On its own that is
-//! not the end of the stream: ffmpeg is started with `reconnect=1`, and a
-//! body that broke mid-file is re-fetched through the very same
-//! `/proxy/...&p=<token>` URL -- measured, three times over on one live
-//! reader, each close answering 1 and each answer followed by
-//! a fresh origin fetch at the offset the last one died at. So the token is
+//! sees its source fail at once instead of at timeout. That alone does
+//! not end the stream. ffmpeg is started with `reconnect=1`, and a body
+//! that broke mid-file is re-fetched through the very same
+//! `/proxy/...&p=<token>` URL. This was measured three times over on one
+//! live reader: each close answered 1, and each answer was followed by a
+//! fresh origin fetch at the offset the last one died at. So the token is
 //! struck off too: [`ProxyStreams::is_closed`] stays true for it, and
 //! `/proxy` refuses any later request bearing it. The pair is what ends a
-//! stream -- the read fails, and the retry has nowhere to go.
+//! stream. The read fails, and the retry has nowhere to go.
 //!
 //! **Ask the player to quit first, then close.** A cancelled demuxer never
-//! reaches the reconnect at all (ffmpeg checks its interrupt callback
+//! reaches the reconnect at all. ffmpeg checks its interrupt callback
 //! before the retry sleep, before every `url_read` and inside the socket
-//! poll), so the close then finds nothing left to close and answers 0 --
-//! which is the quiet, correct outcome. Closing *first*
-//! races the cancel, and losing that race is a reconnect provoked on the
-//! way out: one more origin connection for a player that is leaving.
+//! poll. The close then finds nothing left to close and answers 0, which
+//! is the quiet, correct outcome. Closing *first* races the cancel, and
+//! losing that race provokes a reconnect on the way out: one more origin
+//! connection for a player that is leaving.
 //!
 //! A demuxer wedged somewhere else -- on a texture handoff, on the audio
 //! device -- is not waiting on this read and is untouched by it. And a
@@ -55,24 +55,25 @@ use std::task::{Context, Poll};
 use tokio::sync::oneshot;
 
 /// How many closed tokens are remembered. A token names one player, and a
-/// client mints a new one for the next playback, so the only reader a
-/// forgotten token could let back in is a reconnect from a player that was
-/// closed several hundred playbacks ago -- and ffmpeg reconnects within
-/// seconds or not at all. The bound is here so a long-lived server's memory
-/// is a function of nothing.
+/// client mints a new one for the next playback. So the only reader a
+/// forgotten token could let back in is a reconnect from a player closed
+/// several hundred playbacks ago, and ffmpeg reconnects within seconds or
+/// not at all. The bound is here so a long-lived server's memory is a
+/// function of nothing.
 const CLOSED_TOKENS_REMEMBERED: usize = 512;
 
 /// Every proxied stream currently being read, keyed by an id of ours and
-/// tagged with the token the client minted for the player reading it --
-/// plus the tokens that have been closed, which are refused a new one.
+/// tagged with the token the client minted for the player reading it. It
+/// also holds the tokens that have been closed, which are refused a new
+/// stream.
 #[derive(Default)]
 pub struct ProxyStreams {
     next_id: AtomicU64,
     live: DashMap<u64, LiveStream>,
-    /// The most recently closed tokens, oldest first. A `VecDeque` rather
-    /// than a set because the bound needs an order to evict by, and it is
-    /// scanned rather than hashed because it is at most
-    /// [`CLOSED_TOKENS_REMEMBERED`] short strings and the scan happens once
+    /// The most recently closed tokens, oldest first. It is a `VecDeque`
+    /// rather than a set because the bound needs an order to evict by. It
+    /// is scanned rather than hashed because it holds at most
+    /// [`CLOSED_TOKENS_REMEMBERED`] short strings, and the scan happens once
     /// per proxied request, not once per byte.
     closed: Mutex<VecDeque<String>>,
 }
@@ -93,19 +94,19 @@ impl ProxyStreams {
 
     /// Wraps the origin's byte stream so it can be ended from outside, and
     /// registers it under `token`. Without a token there is nothing to
-    /// address the stream by, so it is only wrapped -- the caller gets one
+    /// address the stream by, so it is only wrapped. The caller gets one
     /// body type either way.
     ///
     /// `None` means the token was retired while this stream was being
     /// opened, and the caller must refuse the read rather than serve it.
-    /// `/proxy` asks [`ProxyStreams::is_closed`] before it opens the origin,
-    /// which is the cheap half -- a refusal that costs the origin nothing --
-    /// but that check is over long before the origin's first byte arrives.
-    /// The window is the whole time-to-first-byte: measured, a close during
-    /// one answered 0 and 3.9 MB was relayed afterwards, under
-    /// a token nothing could name any more. So the retirement and the
-    /// registration are decided under the same lock, and a stream either
-    /// belongs to a token that is still live or is never registered at all.
+    /// `/proxy` asks [`ProxyStreams::is_closed`] before it opens the origin.
+    /// That is the cheap half, a refusal that costs the origin nothing, but
+    /// the check is over long before the origin's first byte arrives. The
+    /// window is the whole time-to-first-byte. Measured: a close during one
+    /// answered 0, and 3.9 MB was relayed afterwards under a token nothing
+    /// could name any more. So the retirement and the registration are
+    /// decided under the same lock. A stream either belongs to a token that
+    /// is still live or is never registered at all.
     pub fn attach<S, E>(self: &Arc<Self>, token: Option<String>, inner: S) -> Option<ClosableStream>
     where
         S: Stream<Item = Result<Bytes, E>> + Send + 'static,
@@ -114,22 +115,23 @@ impl ProxyStreams {
         Some(self.register(token)?.wrap(inner))
     }
 
-    /// The decision half of [`ProxyStreams::attach`] on its own: register a
-    /// stream under `token` -- or refuse, `None`, exactly as `attach` would
-    /// -- and hand back the [`Handle`] that wraps the body later.
+    /// The decision half of [`ProxyStreams::attach`] on its own. It
+    /// registers a stream under `token`, or refuses with `None` exactly as
+    /// `attach` would, and hands back the [`Handle`] that wraps the body
+    /// later.
     ///
-    /// For a body that is not simply the origin's stream. `/proxy` builds a
-    /// stitched response as the cached head chained in front of the origin's
-    /// tail, with the cache writer over the tail, and two rules pull that
-    /// body in two directions. The writer may not be built until the
-    /// registration is decided, since a refusal serves no bytes and a writer
+    /// It is for a body that is not simply the origin's stream. `/proxy`
+    /// builds a stitched response: the cached head chained in front of the
+    /// origin's tail, with the cache writer over the tail. Two rules pull
+    /// that body in two directions. The writer may not be built until the
+    /// registration is decided. A refusal serves no bytes, and a writer
     /// started before it would commit chunks off a stream nobody reads. And
-    /// the registry's stream must go around the *whole* body: `Chain` never
-    /// polls its second stream until the first has ended, so a close during
-    /// the head of a body that registered only the tail was answered
-    /// 1 while every remaining chunk of the head kept coming off
-    /// disk -- the close was polled, but only by the half that was not being
-    /// read. Deciding first and wrapping last is how both hold.
+    /// the registry's stream must go around the *whole* body. `Chain` never
+    /// polls its second stream until the first has ended. So when a body
+    /// registered only the tail, a close during the head was answered 1
+    /// while every remaining chunk of the head kept coming off disk. The
+    /// close was polled, but only by the half that was not being read.
+    /// Deciding first and wrapping last is how both rules hold.
     pub fn register(self: &Arc<Self>, token: Option<String>) -> Option<Handle> {
         let Some(token) = token else {
             return Some(Handle {
@@ -141,9 +143,9 @@ impl ProxyStreams {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         {
             // The retired list is the lock both sides take, and each takes
-            // it before touching `live`: `close` writes the token down and
-            // then reads `live`, this reads the token and then writes
-            // `live`. There is no interleaving left in which a close sees no
+            // it before touching `live`. `close` writes the token down and
+            // then reads `live`. This code reads the token and then writes
+            // `live`. No interleaving is left in which a close sees no
             // stream and the stream sees no closure. A poisoned lock refuses
             // the read, which is the safe direction: it can only cost a
             // player a stream it can ask for again.
@@ -169,17 +171,17 @@ impl ProxyStreams {
     /// finished, or never have started, and closing is idempotent.
     ///
     /// The token is struck off first and for good (see
-    /// [`ProxyStreams::is_closed`]), because the count this returns is the
-    /// count of reads that were *live*, and the reader that matters most is
-    /// the one that is about to come back: a player that reconnects after
-    /// its body broke must not be handed a new stream on a name its client
-    /// has finished with. Striking off before closing leaves no window in
-    /// which the reconnect arrives while the token is still good.
+    /// [`ProxyStreams::is_closed`]). The count this returns covers only
+    /// reads that were *live*, and the reader that matters most is the one
+    /// that is about to come back. A player that reconnects after its body
+    /// broke must not be handed a new stream on a name its client has
+    /// finished with. Striking off before closing leaves no window in which
+    /// the reconnect arrives while the token is still good.
     ///
-    /// Striking off and reading `live` happen under one lock, for the
-    /// stream that is not back yet but is already on its way: a `/proxy`
-    /// request waiting on an origin's headers is registered by
-    /// [`ProxyStreams::attach`] under that same lock, so it is either
+    /// Striking off and reading `live` happen under one lock. That covers
+    /// the stream that is not back yet but is already on its way.
+    /// [`ProxyStreams::attach`] registers a `/proxy` request that waits on
+    /// an origin's headers under that same lock, so the stream is either
     /// counted here or refused there.
     pub fn close(&self, token: &str) -> usize {
         let ids: Vec<u64> = {
@@ -215,10 +217,10 @@ impl ProxyStreams {
     /// stream.
     ///
     /// This is what makes closing stick. ffmpeg's `reconnect=1` re-fetches
-    /// an aborted body through the URL it already has, token and all, so
-    /// without this the close is a stutter in the playback it was meant to
-    /// end. `/proxy` asks this before it opens anything, so a refused
-    /// request costs the origin nothing -- and asks again, by way of
+    /// an aborted body through the URL it already has, token and all.
+    /// Without this check the close is a stutter in the playback it was
+    /// meant to end. `/proxy` asks this before it opens anything, so a
+    /// refused request costs the origin nothing. It asks again, by way of
     /// [`ProxyStreams::attach`], once the origin has answered, because a
     /// token can be retired while a fetch is in flight.
     pub fn is_closed(&self, token: &str) -> bool {
@@ -228,9 +230,9 @@ impl ProxyStreams {
     }
 
     /// Writes `token` down as closed, evicting the oldest once there are
-    /// more than [`CLOSED_TOKENS_REMEMBERED`] of them. Takes the list rather
-    /// than the lock, because its caller holds that lock across more than
-    /// this.
+    /// more than [`CLOSED_TOKENS_REMEMBERED`] of them. It takes the list
+    /// rather than the lock, because its caller holds that lock across more
+    /// than this call.
     fn remember_closed(closed: &mut VecDeque<String>, token: &str) {
         if closed.iter().any(|closed| closed == token) {
             return;
@@ -243,8 +245,8 @@ impl ProxyStreams {
 }
 
 /// A stream's place in the registry, decided but not yet wrapped around a
-/// body (see [`ProxyStreams::register`]). Dropped unwrapped, it takes the
-/// stream out of the registry again, as an ended body would.
+/// body (see [`ProxyStreams::register`]). If it is dropped unwrapped, it
+/// takes the stream out of the registry again, as an ended body would.
 pub struct Handle {
     close: Option<oneshot::Receiver<()>>,
     registration: Option<Registration>,
@@ -252,9 +254,9 @@ pub struct Handle {
 
 impl Handle {
     /// The body this registration is for, endable from outside. Everything
-    /// the player will read goes inside -- the close is polled only by polls
-    /// of what is wrapped, so a part of the body left outside is a part a
-    /// close cannot reach.
+    /// the player will read goes inside. The close is polled only by polls
+    /// of what is wrapped, so a close cannot reach a part of the body left
+    /// outside.
     pub fn wrap<S, E>(self, inner: S) -> ClosableStream
     where
         S: Stream<Item = Result<Bytes, E>> + Send + 'static,
@@ -287,7 +289,7 @@ impl Drop for Registration {
 /// A close yields an **error**, not an end of stream: hyper then abandons
 /// the connection instead of writing a clean terminator, and the player
 /// reads a broken source rather than a file that ended early. For a
-/// content-length body a clean end would be a broken source anyway; for a
+/// content-length body a clean end would be a broken source anyway. For a
 /// chunked or close-delimited one it would look exactly like the film being
 /// over, which is the one thing this must not be mistaken for.
 pub struct ClosableStream {
@@ -306,7 +308,7 @@ impl Stream for ClosableStream {
             return Poll::Ready(None);
         }
         // The close is polled first and on every poll, so its waker is
-        // always the current one: a stream parked on a silent origin is
+        // always the current one. A stream parked on a silent origin is
         // woken by the close itself rather than by the next byte.
         if let Some(close) = this.close.as_mut()
             && Pin::new(close).poll(cx).is_ready()
@@ -346,10 +348,10 @@ mod tests {
     }
 
     /// A stream opened while its token was live but registered after the
-    /// close: the fetch was in flight the whole time, which is the window
+    /// close. The fetch was in flight the whole time, which is the window
     /// `/proxy`'s pre-fetch check cannot see. It is refused rather than
-    /// registered, so the close that already answered 0 is
-    /// still the end of that player's stream.
+    /// registered, so the close that already answered 0 is still the end of
+    /// that player's stream.
     #[test]
     fn a_token_retired_while_its_stream_was_opening_is_refused_the_stream() {
         let streams = Arc::new(ProxyStreams::new());

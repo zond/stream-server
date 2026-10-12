@@ -1,32 +1,32 @@
 //! **Offline downloads of what is not a torrent**: an addon URL, a Google
 //! Drive file -- anything that reads through the proxy cache.
 //!
-//! The principle is `docs/design/translated-sources.md`'s: only the thing that
-//! downloads a file may store it, and for everything that is not a torrent
-//! that is the proxy cache. A download of one of them is therefore not a new
-//! store but two things the torrent side has and the proxy side did not
-//! (`docs/design/generic-downloads.md`):
+//! The principle is `docs/design/translated-sources.md`'s: only the thing
+//! that downloads a file may store it. For everything that is not a
+//! torrent, that is the proxy cache. So a download of one of them is not a
+//! new store. It is two things the torrent side has and the proxy side did
+//! not (`docs/design/generic-downloads.md`):
 //!
 //! * **A pin** -- a claim on a key directory that outlives the process. The
-//!   embedder names the set at boot (the link and Drive keys of
-//!   [`crate::ServerConfig::pins`], under the piece store's rule that `None`
-//!   is "nobody told me" and not an empty set), the launch sweep keeps what it names, and the retention owner
-//!   answers `keeps_everything` from it
+//!   embedder names the set at boot: the link and Drive keys of
+//!   [`crate::ServerConfig::pins`]. The piece store's rule applies: `None`
+//!   is "nobody told me", not an empty set. The launch sweep keeps what the
+//!   set names, and the retention owner answers `keeps_everything` from it
 //!   ([`crate::proxy_retention::ProxyRetention::set_pins`]).
 //! * **A filler** -- something that fetches the bytes when no player is
 //!   asking for them ([`Filler`]). It is a quiet reader over the same
 //!   `ProxySource` a player would read through, walked from the first byte
-//!   to the last: a range the disk holds is served from the disk and a hole
-//!   is one narrowed, conditional fetch that lands in the cache, which is
-//!   exactly what `/proxy` does for a player and is why nothing here writes
-//!   a chunk itself. Quiet, because a reader that claimed the live entity
-//!   would move it off what the viewer is playing, and the switch would
-//!   take that file's bytes as slack.
+//!   to the last. A range the disk holds is served from the disk, and a
+//!   hole is one narrowed, conditional fetch that lands in the cache. That
+//!   is exactly what `/proxy` does for a player, and it is why nothing here
+//!   writes a chunk itself. It is quiet because a reader that claimed the
+//!   live entity would move it off what the viewer is playing, and the
+//!   switch would take that file's bytes as slack.
 //!
-//! What a pin names is the identity the cache already keys on: the final
-//! target URL with the `h=` request headers for an addon link, the vouched
-//! media URL for a Drive file. Credentials are not in it -- a Drive pin
-//! carries a file id, never a token -- so a Drive download resumes only once
+//! A pin names the identity the cache already keys on. For an addon link
+//! that is the final target URL with the `h=` request headers. For a Drive
+//! file it is the vouched media URL. Credentials are not in it: a Drive pin
+//! carries a file id, never a token. So a Drive download resumes only once
 //! the app has re-pinned it with a fresh pairing, which the app does for
 //! every unfinished download at boot. The bytes are kept meanwhile.
 
@@ -160,17 +160,17 @@ struct Pinned {
     key: ProxyPinKey,
     name: String,
     filler: Option<tokio::task::AbortHandle>,
-    /// Set by a filler that stopped for good ([`Filler::run`]); what the
-    /// row's `error` says. A new filler -- the next pin with a source --
+    /// Set by a filler that stopped for good ([`Filler::run`]). It is what
+    /// the row's `error` says. A new filler (the next pin with a source)
     /// starts with a fresh one.
     failure: Arc<std::sync::OnceLock<String>>,
 }
 
 /// How a filler opens its source again when a read finds the origin's file
 /// changed: what the pin opened it with, as a call. The open is the
-/// revalidation ([`ProxySource::open`] retires every other generation), and
-/// it answers the source quiet ([`ProxySource::for_filling`]) but not
-/// counting -- the filler counts.
+/// revalidation ([`ProxySource::open`] retires every other generation). It
+/// answers the source quiet ([`ProxySource::for_filling`]) but not
+/// counting, because the filler does the counting.
 pub(crate) type Reopen = Arc<
     dyn Fn() -> futures_util::future::BoxFuture<'static, Result<ProxySource, ProxyPinError>>
         + Send
@@ -188,10 +188,10 @@ pub struct ProxyDownloads {
 
 impl ProxyDownloads {
     /// Every byte the downloads' fillers have brought in from their
-    /// origins since the process started: what a download of what is not
-    /// a torrent adds to the activity light's down half
-    /// (`enginefs::traffic::Reading::fetched_over_http`). Only ever grows.
-    /// What a filler found already on disk is not in it.
+    /// origins since the process started. It is what a download of what is
+    /// not a torrent adds to the activity light's down half
+    /// (`enginefs::traffic::Reading::fetched_over_http`). It only ever
+    /// grows. What a filler found already on disk is not in it.
     pub(crate) fn fetched_over_http(&self) -> u64 {
         self.fetched.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -203,11 +203,11 @@ impl ProxyDownloads {
     }
 
     /// Registers the boot-time pin set: the keys the embedder named, resolved
-    /// to key directories. Pins the resolved set on the retention owner
-    /// (`None` stays `None`), and answers the directories for the sweep to
-    /// keep. No filler starts here: a URL pin's filler starts when the
-    /// embedder pins it again with its request, a Drive pin's when it comes
-    /// with a pairing.
+    /// to key directories. It pins the resolved set on the retention owner
+    /// (`None` stays `None`) and answers the directories for the sweep to
+    /// keep. No filler starts here. A URL pin's filler starts when the
+    /// embedder pins it again with its request, and a Drive pin's starts
+    /// when it comes with a pairing.
     pub(crate) fn install(
         &self,
         state: &crate::AppState,
@@ -237,14 +237,14 @@ impl ProxyDownloads {
         Some(dirs)
     }
 
-    /// Records the pin and, given a `source` (with the way to open it
-    /// again), starts (or keeps) the filler that fetches what the entry
-    /// does not hold yet; answers the key directory. Idempotent: a second pin of a running download changes
-    /// nothing but the name. `None` is a pin over
-    /// an entry that is already whole ([`held_complete`]): nothing to fetch,
-    /// so nothing is opened and the origin is not asked -- which is what
-    /// lets a re-pin after a restart, or a pin of a file that was streamed
-    /// to the end, succeed on a device that is offline.
+    /// Records the pin and answers the key directory. Given a `source`
+    /// (with the way to open it again), it starts or keeps the filler that
+    /// fetches what the entry does not hold yet. It is idempotent: a second
+    /// pin of a running download changes nothing but the name. `None` is a
+    /// pin over an entry that is already whole ([`held_complete`]). There is
+    /// nothing to fetch, so nothing is opened and the origin is not asked.
+    /// That is what lets a re-pin after a restart, or a pin of a file that
+    /// was streamed to the end, succeed on a device that is offline.
     fn pin(
         &self,
         state: &crate::AppState,
@@ -254,12 +254,12 @@ impl ProxyDownloads {
         source: Option<(ProxySource, Reopen)>,
     ) -> PathBuf {
         let dir = entry.dir().to_path_buf();
-        // The table first, and the retention owner told under it -- here
-        // and in [`Self::unpin`]: with the two done under different locks,
-        // an unpin landing between this pin's `retention.pin` and its
-        // record left a listed download with a filler running and no pin
-        // keeping what it fetched. The order is table, then retention;
-        // nothing takes them the other way round.
+        // The table comes first, and the retention owner is told under it,
+        // here and in [`Self::unpin`]. When the two were done under
+        // different locks, an unpin landing between this pin's
+        // `retention.pin` and its record left a listed download with a
+        // filler running and no pin keeping what it fetched. The order is
+        // table, then retention. Nothing takes them the other way round.
         let mut pinned = self.table();
         state.proxy_cache.retention().pin(dir.clone());
         let record = pinned.entry(dir.clone()).or_insert_with(|| Pinned {
@@ -299,8 +299,8 @@ impl ProxyDownloads {
         dir: &PathBuf,
         delete_files: bool,
     ) -> (bool, u64) {
-        // Under the table, as [`Self::pin`] is: a pin cannot land between
-        // the record going and the retention owner hearing it.
+        // This runs under the table, as [`Self::pin`] does, so a pin cannot
+        // land between the record going and the retention owner hearing it.
         let was_pinned = {
             let mut pinned = self.table();
             let record = pinned.remove(dir);
@@ -351,9 +351,10 @@ pub(crate) struct PinnedRow {
     pub(crate) failure: Option<String>,
 }
 
-/// Pins an addon URL as a download. Probes the origin the way a translated
-/// source does (`ProxySource::open`: one `bytes=0-0`, which is where an
-/// origin that will not range is refused), pins the key, starts the filler.
+/// Pins an addon URL as a download. It probes the origin the way a
+/// translated source does (`ProxySource::open`: one `bytes=0-0`, which is
+/// where an origin that will not range is refused), pins the key, and
+/// starts the filler.
 pub(crate) async fn pin_url(
     state: &crate::AppState,
     target: &str,
@@ -388,10 +389,10 @@ pub(crate) async fn pin_url(
         .pin(state, key, name, entry, Some((source, reopen))))
 }
 
-/// Whether the cache already holds every byte of `entry`'s entity: the
-/// question a pin asks before it opens anything, because a whole entry
-/// has nothing left to fetch and the origin -- or the token a Drive fetch
-/// would spend -- is not needed to keep it.
+/// Whether the cache already holds every byte of `entry`'s entity. A pin
+/// asks this before it opens anything. A whole entry has nothing left to
+/// fetch, so the origin (or the token a Drive fetch would spend) is not
+/// needed to keep it.
 async fn held_complete(state: &crate::AppState, entry: &Entry) -> bool {
     let Some(entry) = state
         .proxy_cache
@@ -411,7 +412,7 @@ async fn held_complete(state: &crate::AppState, entry: &Entry) -> bool {
 /// can open **without the origin**: the key, its media route
 /// (`/downloads/{key}/stream`, see `routes::downloads`), and the facts the
 /// disk holds about it. `None` when the file is not pinned or not whole
-/// yet -- then it is opened the ordinary way, through Drive.
+/// yet. Then it is opened the ordinary way, through Drive.
 ///
 /// This is what makes a finished Drive download play offline. Opening a
 /// Drive file otherwise probes the origin (`DriveSource::open`), and a
@@ -452,10 +453,10 @@ pub(crate) async fn complete_drive_download(
     })
 }
 
-/// The pinned download `key` names, as a source read off the disk, when it
-/// is whole there -- with the name it was pinned under. `None` for a key
-/// nothing pinned, or a download not complete yet: then the origin has to
-/// be asked. What a media id resolves to first (`crate::media`), so a
+/// The pinned download `key` names, as a source read off the disk, with
+/// the name it was pinned under, when it is whole there. `None` for a key
+/// nothing pinned, or a download not complete yet. Then the origin has to
+/// be asked. A media id resolves to this first (`crate::media`), so a
 /// finished download plays with the network gone, as
 /// [`complete_drive_download`] lets `open_drive_file` do.
 pub(crate) async fn held_download(
@@ -478,10 +479,10 @@ pub(crate) async fn held_download(
 }
 
 /// Pins a Google Drive file as a download, under the pairing the app
-/// holds: the token renews in Rust for the length of the fill, as it does
-/// for a stream. A file already whole on the disk needs no token -- nothing
-/// is fetched -- so `refresh_token` may be `None` for it; for anything else
-/// `None` is [`ProxyPinError::NoGrant`].
+/// holds. The token renews in Rust for the length of the fill, as it does
+/// for a stream. A file already whole on the disk needs no token, since
+/// nothing is fetched, so `refresh_token` may be `None` for it. For
+/// anything else, `None` is [`ProxyPinError::NoGrant`].
 pub(crate) async fn pin_drive(
     state: &crate::AppState,
     file_id: &str,
@@ -508,8 +509,9 @@ pub(crate) async fn pin_drive(
             .map_err(crate::routes::drive::DriveOpenError::Drive)?;
     let name = name.or_else(|| source.name().map(str::to_string));
     let source = source.filling_source();
-    // Opened again with the same grant, which the filler holds in memory
-    // for as long as it runs -- as the source it reads through already does.
+    // It is opened again with the same grant. The filler holds the grant in
+    // memory for as long as it runs, as the source it reads through already
+    // does.
     let reopen: Reopen = {
         let (cache, self_addr) = (state.proxy_cache.clone(), state.http_addr);
         let (endpoints, file_id) = (endpoints.clone(), file_id.to_string());
@@ -560,15 +562,15 @@ impl Filler {
             }
             let until = (pos + FILL_STRIDE).min(total);
             // A range the disk holds is served from the disk (no origin
-            // request); a hole is fetched and lands in the cache on its way
+            // request). A hole is fetched and lands in the cache on its way
             // through.
             match crate::proxy_retention::read_through(&self.source, pos, until, &mut sink).await {
                 Ok(()) => pos = until,
-                // The origin answered with something that is not the span:
-                // usually its file changed (the `If-Range` failed), and
+                // The origin answered with something that is not the span.
+                // Usually its file changed (the `If-Range` failed), and
                 // asking the same question again would get the same answer
-                // for as long as the pin stands. Open the source again --
-                // the revalidation -- and let that say what happened.
+                // for as long as the pin stands. Open the source again (the
+                // revalidation) and let that say what happened.
                 Err(error) if crate::sources::proxy::is_not_the_span(&error) => {
                     match self.reopen_after(&error).await {
                         Reopened::NewGeneration => {
@@ -609,14 +611,14 @@ impl Filler {
     /// Opens the source again after a read the origin answered with
     /// something other than the span, and says what it found.
     ///
-    /// **A file that changed at the origin is a new download**: a different
-    /// identity or length is a new generation, the open has already retired
-    /// what the cache held of the old one, and the walk starts again from
-    /// the first byte of the new one -- logged once, not hidden. An origin
-    /// that will not range any more cannot be a download at all, as at pin
-    /// time: the filler stops and the row's `error` says why. Anything else
-    /// -- the same entity, or no answer -- is asked again after
-    /// [`FILL_RETRY`], as any failed read is.
+    /// **A file that changed at the origin is a new download.** A
+    /// different identity or length is a new generation. The open has
+    /// already retired what the cache held of the old one, and the walk
+    /// starts again from the first byte of the new one. This is logged
+    /// once, not hidden. An origin that will not range any more cannot be a
+    /// download at all, as at pin time. The filler stops and the row's
+    /// `error` says why. Anything else (the same entity, or no answer) is
+    /// asked again after [`FILL_RETRY`], as any failed read is.
     async fn reopen_after(&mut self, error: &std::io::Error) -> Reopened {
         match (self.reopen)().await {
             Ok(fresh)
