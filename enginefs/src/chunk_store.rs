@@ -1,11 +1,11 @@
 //! One chunk store, for the torrent pieces and for `/proxy` alike.
 //!
 //! A chunk store is "store chunks; read them back as chunks (to serve a peer)
-//! or as a random-access byte range (to play)". That is what a torrent's
-//! pieces need and it is what a cache for HTTP range requests needs, so there
-//! is one of them and not two. What is here is the whole of it: the directory
-//! shape, the bucketing, the staging spellings, the typed read, the listing,
-//! the occupancy, and the LRU of open handles.
+//! or as a random-access byte range (to play)". A torrent's pieces need
+//! that, and so does a cache for HTTP range requests, so there is one store
+//! and not two. This module is the whole of it: the directory shape, the
+//! bucketing, the staging spellings, the typed read, the listing, the
+//! occupancy, and the LRU of open handles.
 //!
 //! # The two adapters
 //!
@@ -13,7 +13,7 @@
 //!   [`librqbit::storage::TorrentStorage`] over a [`ChunkDir`] and a
 //!   [`crate::piece_store::PieceLayout`], which is where a multi-file
 //!   torrent's global byte space and its BEP-47 padding live. That
-//!   arithmetic sits *above* a chunk store; none of it is here.
+//!   arithmetic sits *above* a chunk store. None of it is here.
 //! * `server::proxy_cache` -- a byte-range reader and writer over a
 //!   [`ChunkDir`] per cached entity, whose arithmetic is `offset / CHUNK`.
 //!
@@ -21,33 +21,33 @@
 //!
 //! * **Staging identity.** A chunk's bytes go to a name beside the final one
 //!   and are renamed into place, so presence at the final name means
-//!   *complete* -- for both adapters, and it already did for both. What
-//!   differs is whether the staged copy is *addressable*. librqbit writes a
-//!   piece 16 KiB at a time, reads it back through the same handle for the
-//!   hash check, and may be interrupted and resume it, so its staged copy has
-//!   one fixed name ([`ChunkDir::staging_path`]) and survives a restart. A
-//!   `/proxy` chunk is buffered whole in memory and written once, and two
-//!   readers of one stream may be filling the same chunk at the same time, so
-//!   its staged copy is anonymous ([`ChunkDir::write_whole`]) and a kill
-//!   leaves nothing that could be resumed. Collapsing to the named form alone
-//!   would let two fillers interleave into one file; collapsing to the
-//!   anonymous form alone would break the incremental write and the recovery
-//!   of a staged piece at launch.
-//! * **The commit criterion.** *When* a chunk is complete is the adapter's.
-//!   librqbit's is its own SHA-1 check, after which the torrent adapter
-//!   calls [`ChunkDir::commit`] -- the rename and nothing else, with no
-//!   length check, and there must be none: librqbit never writes BEP-47
-//!   padding, so a piece whose tail is padding is committed *short*, and
-//!   there is no length a legal padded piece would satisfy. A URL response
-//!   has no hash, so the proxy buffers a chunk whole and hands it to
-//!   [`ChunkDir::write_whole`] with the byte count its entity says it
-//!   should be (`expected_len`), which refuses a chunk that disagrees
-//!   before anything is written.
+//!   *complete*. That holds for both adapters, and it already did for both.
+//!   What differs is whether the staged copy is *addressable*. librqbit
+//!   writes a piece 16 KiB at a time, reads it back through the same handle
+//!   for the hash check, and may be interrupted and resume it. So its staged
+//!   copy has one fixed name ([`ChunkDir::staging_path`]) and survives a
+//!   restart. A `/proxy` chunk is buffered whole in memory and written once,
+//!   and two readers of one stream may be filling the same chunk at the same
+//!   time. So its staged copy is anonymous ([`ChunkDir::write_whole`]), and
+//!   a kill leaves nothing that could be resumed. The named form alone would
+//!   let two fillers interleave into one file. The anonymous form alone
+//!   would break the incremental write and the recovery of a staged piece at
+//!   launch.
+//! * **The commit criterion.** The adapter decides *when* a chunk is
+//!   complete. librqbit's criterion is its own SHA-1 check, after which the
+//!   torrent adapter calls [`ChunkDir::commit`]. That is the rename and
+//!   nothing else, with no length check, and there must be none. librqbit
+//!   never writes BEP-47 padding, so a piece whose tail is padding is
+//!   committed *short*. There is no length a legal padded piece would
+//!   satisfy. A URL response has no hash, so the proxy buffers a chunk whole
+//!   and hands it to [`ChunkDir::write_whole`] with the byte count its
+//!   entity says it should be (`expected_len`). That refuses a chunk that
+//!   disagrees before anything is written.
 //!
 //! # What is deliberately not parameterised
 //!
 //! The chunk size. A `/proxy` chunk is 256 KiB because of what a chunk
-//! boundary costs a fetch and what an uncompleted chunk costs in memory; a
+//! boundary costs a fetch and what an uncompleted chunk costs in memory. A
 //! torrent's piece length is the swarm's, and is the unit its SHA-1s are
 //! over. The store is *told* an index and never computes one, so it owns
 //! neither number.
@@ -55,14 +55,14 @@
 //! # Reads are typed, listings are lenient
 //!
 //! [`ChunkDir::open_complete`] tells [`ChunkError::Missing`] from
-//! [`ChunkError::Io`], because under this design the presence of a chunk file
-//! *is* the have-record, so "not there" is an ordinary state a reclaim
-//! creates deliberately and the layer above has to be able to tell it from a
-//! disk that is failing -- a read of an absent piece that returned zeroes
-//! would have a hash check call a hole a verified piece. The listings
+//! [`ChunkError::Io`]. Under this design the presence of a chunk file *is*
+//! the have-record, so "not there" is an ordinary state a reclaim creates
+//! deliberately. The layer above has to be able to tell it from a disk that
+//! is failing. A read of an absent piece that returned zeroes would have a
+//! hash check call a hole a verified piece. The listings
 //! ([`ChunkDir::held`], [`ChunkDir::held_in_bucket`], [`ChunkDir::stat`])
-//! swallow instead: a caller counting the disk must not be stopped by one
-//! directory it may not enter.
+//! swallow errors instead: a caller counting the disk must not be stopped by
+//! one directory it may not enter.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{File, Metadata, OpenOptions};
@@ -76,25 +76,25 @@ use parking_lot::Mutex;
 /// How many chunk files share one directory.
 ///
 /// Flat would work on ext4 and f2fs, which hash directory entries, but not
-/// everywhere the cache can land: a 27 GB torrent at 4 MB pieces is ~6,750
-/// files, and a 2 GB proxied film is eight thousand, and on a filesystem that
-/// scans a directory linearly (exFAT and FAT32 on a phone's SD card, which is
-/// exactly where a large offline download and a phone's proxy cache go) every
-/// open in a directory that size walks the entries. Bucketing by a thousand
-/// puts a ceiling on that -- seven directories of at most a thousand for that
-/// torrent -- for the cost of one extra path component. A thousand rather
-/// than a power of two because the names are decimal, and `4/4200` reading as
-/// "chunk 4200" is worth more when reading a directory listing by hand than
-/// the shift it saves.
+/// everywhere the cache can land. A 27 GB torrent at 4 MB pieces is ~6,750
+/// files, and a 2 GB proxied film is eight thousand. Some filesystems scan a
+/// directory linearly: exFAT and FAT32 on a phone's SD card, which is
+/// exactly where a large offline download and a phone's proxy cache go.
+/// There, every open in a directory that size walks the entries. Bucketing
+/// by a thousand puts a ceiling on that (seven directories of at most a
+/// thousand for that torrent) for the cost of one extra path component. It
+/// is a thousand rather than a power of two because the names are decimal.
+/// `4/4200` reading as "chunk 4200" is worth more when reading a directory
+/// listing by hand than the shift it saves.
 pub const CHUNKS_PER_DIRECTORY: u64 = 1000;
 
 /// What a chunk file is called while it is still being written.
 ///
 /// A torrent piece arrives 16 KiB at a time, so a file created by its first
-/// chunk is there for the whole of the download -- and the contract is that
+/// chunk is there for the whole of the download. The contract is that
 /// presence means **complete**, because a wrong "yes" is not a re-download
-/// but silent corruption: the have-set a restart starts from is the resume
-/// data intersected with what the storage says it still holds, the
+/// but silent corruption. The have-set a restart starts from is the resume
+/// data intersected with what the storage says it still holds. The
 /// intersection can only clear bits, and the fastresume hash check samples
 /// ~65 pieces of a torrent however large. So the bytes go to a name carrying
 /// this suffix and are renamed into place by [`ChunkDir::commit`]. A rename
@@ -103,11 +103,11 @@ pub const STAGING_SUFFIX: &str = ".part";
 
 /// How many chunk files an [`OpenChunks`] keeps open.
 ///
-/// librqbit has a handful of pieces in flight for a torrent and a stream
+/// librqbit has a handful of pieces in flight for a torrent, and a stream
 /// reads one piece at a time in order, so a few entries cover the working
-/// set; the point is the ratio (one open per chunk instead of one per 16 KiB
-/// write), not a hit rate, and eight of them is eight descriptors per torrent
-/// rather than the filesystem backend's one per file.
+/// set. The point is the ratio (one open per chunk instead of one per
+/// 16 KiB write), not a hit rate. Eight of them is eight descriptors per
+/// torrent rather than the filesystem backend's one per file.
 pub const OPEN_HANDLES: usize = 8;
 
 /// Names each anonymously staged chunk apart from every other one in the
@@ -121,9 +121,9 @@ const BUCKET_RETRIES: usize = 4;
 
 #[cfg(test)]
 thread_local! {
-    /// Run by [`ChunkDir::write_whole`] between making the bucket and
-    /// writing into it, on the writing thread: the one place a test can
-    /// stand a prune.
+    /// [`ChunkDir::write_whole`] runs it between making the bucket and
+    /// writing into it, on the writing thread. It is the one place a test
+    /// can stand a prune.
     static BUCKET_MADE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -149,16 +149,17 @@ pub enum ChunkError {
 /// One directory of bucketed chunk files: `<dir>/<index / 1000>/<index>`,
 /// with a staged spelling beside it.
 ///
-/// Cheap to clone -- it is a path and nothing else. Whatever state an adapter
-/// wants over it (which chunks it knows to be staged, an [`OpenChunks`]) is
-/// the adapter's, because the two adapters want different state.
+/// It is cheap to clone: it is a path and nothing else. Whatever state an
+/// adapter wants over it (which chunks it knows to be staged, an
+/// [`OpenChunks`]) is the adapter's, because the two adapters want
+/// different state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChunkDir {
     dir: PathBuf,
 }
 
 /// One chunk on disk: both copies of it, because `ChunkDir::remove` takes
-/// them together -- half of a chunk nobody wants is worth exactly as little
+/// them together. Half of a chunk nobody wants is worth exactly as little
 /// as the whole of it.
 #[derive(Debug)]
 pub struct StoredChunk {
@@ -172,8 +173,8 @@ pub struct StoredChunk {
 
 impl StoredChunk {
     /// Both copies' metadata, for a caller totting up what deleting this
-    /// chunk would free. Never empty: a stat reports no chunk it found no
-    /// file for.
+    /// chunk would free. It is never empty: a stat reports no chunk it found
+    /// no file for.
     pub fn files(&self) -> impl Iterator<Item = &Metadata> {
         self.complete.iter().chain(self.staged.iter())
     }
@@ -184,10 +185,11 @@ impl StoredChunk {
 pub struct StoredChunks {
     /// Every chunk with a file, in ascending index order.
     pub chunks: Vec<StoredChunk>,
-    /// Metadata of the files under the directory that are not chunk files --
+    /// Metadata of the files under the directory that are not chunk files:
     /// a name this store never wrote, or a chunk file in the wrong bucket.
-    /// Counted, because they are on the volume; never offered as chunks,
-    /// because a delete addressed to them would free nothing.
+    /// They are counted, because they are on the volume. They are never
+    /// offered as chunks, because a delete addressed to them would free
+    /// nothing.
     pub strays: Vec<Metadata>,
 }
 
@@ -251,7 +253,7 @@ impl ChunkDir {
     }
 
     /// The addressable staged copy, open for reading, or `None` when there
-    /// is none. An I/O failure is still an error: only "not there" is an
+    /// is none. An I/O failure is still an error. Only "not there" is an
     /// answer.
     pub fn open_staged(&self, index: u64) -> Result<Option<File>, ChunkError> {
         match File::open(self.staging_path(index)) {
@@ -261,15 +263,16 @@ impl ChunkDir {
         }
     }
 
-    /// The addressable staged copy, open for writing -- created along with
-    /// its bucket directory if this is the first byte to land in it.
+    /// The addressable staged copy, open for writing. It is created along
+    /// with its bucket directory if this is the first byte to land in it.
     ///
-    /// The retry is not belt-and-braces: [`Self::remove_if_empty`] prunes
+    /// The retry is not belt-and-braces. [`Self::remove_if_empty`] prunes
     /// bucket directories that have gone empty, so a bucket really can
     /// disappear between one write and the next.
     ///
-    /// Read as well as write: a caller caches the handle under the staged
-    /// copy and reads that copy back through the same entry.
+    /// It is opened for reading as well as writing. A caller caches the
+    /// handle under the staged copy and reads that copy back through the
+    /// same entry.
     pub fn open_staged_for_write(&self, index: u64) -> io::Result<File> {
         let path = self.staging_path(index);
         let mut opts = OpenOptions::new();
@@ -290,10 +293,10 @@ impl ChunkDir {
     /// about to [`Self::commit`] it and holding no handle of its own to
     /// flush through.
     ///
-    /// Opened for writing and never created: Windows refuses a flush
-    /// through a read-only handle, and a staged copy that is not there has
-    /// to stay not there -- what an absent one means is `commit`'s
-    /// decision, so this reports it as nothing to flush.
+    /// It is opened for writing and never created. Windows refuses a flush
+    /// through a read-only handle. A staged copy that is not there has to
+    /// stay not there: what an absent one means is `commit`'s decision, so
+    /// this reports it as nothing to flush.
     pub fn sync_staged(&self, index: u64) -> io::Result<()> {
         match OpenOptions::new()
             .write(true)
@@ -309,21 +312,21 @@ impl ChunkDir {
     /// within one directory, which is the single instant at which the
     /// have-record for a chunk comes into being.
     ///
-    /// No length is checked, and none may be: the one adapter that commits
+    /// No length is checked, and none may be. The one adapter that commits
     /// this way is the torrent's, whose criterion is librqbit's SHA-1 check
-    /// before the call, and librqbit never writes BEP-47 padding, so a piece
-    /// whose tail is padding is legally *short* -- there is no length a
-    /// legal padded piece would satisfy. The proxy's criterion, the byte
-    /// count of a URL response's chunk, is [`Self::write_whole`]'s
-    /// `expected_len`, checked where the bytes still are. See the module
-    /// docs.
+    /// before the call. librqbit never writes BEP-47 padding, so a piece
+    /// whose tail is padding is legally *short*. There is no length a legal
+    /// padded piece would satisfy. The proxy's criterion, the byte count of
+    /// a URL response's chunk, is [`Self::write_whole`]'s `expected_len`,
+    /// checked where the bytes still are. See the module docs.
     ///
-    /// Idempotent in the direction that matters: called for a chunk already
-    /// in place with nothing staged, it says so rather than failing, because
-    /// librqbit logs a failure here at debug and marks the piece have anyway.
+    /// It is idempotent in the direction that matters. Called for a chunk
+    /// already in place with nothing staged, it says so rather than failing.
+    /// librqbit logs a failure here at debug and marks the piece have
+    /// anyway.
     ///
-    /// The caller forgets its cached handles first: the staged handle names a
-    /// file about to become the complete one.
+    /// The caller forgets its cached handles first, because the staged
+    /// handle names a file about to become the complete one.
     pub fn commit(&self, index: u64) -> io::Result<()> {
         let staged = self.staging_path(index);
         let path = self.chunk_path(index);
@@ -339,21 +342,21 @@ impl ChunkDir {
     /// does.
     ///
     /// This is the concurrent-writer form. Two fillers of one chunk each
-    /// write their own temporary and each rename it over the final name;
-    /// neither can see or truncate the other's bytes, and the loser's rename
+    /// write their own temporary and each rename it over the final name.
+    /// Neither can see or truncate the other's bytes, and the loser's rename
     /// replaces a file with an identical one. Through the addressable staged
     /// name they would instead interleave into one file, and the second
     /// rename would name a path the first had already moved away.
     ///
     /// `expected_len` is checked against the buffer before anything is
-    /// written: the proxy's commit criterion, a URL response's chunk having
-    /// no hash to be checked against.
+    /// written. That is the proxy's commit criterion, since a URL response's
+    /// chunk has no hash to be checked against.
     ///
     /// The bucket is made here, and made again if it is gone by the time
-    /// the temporary is written: `server::proxy_cache` prunes the
-    /// directories a reclaim has emptied ([`Self::remove_if_empty`]), and a
+    /// the temporary is written. `server::proxy_cache` prunes the
+    /// directories a reclaim has emptied ([`Self::remove_if_empty`]). A
     /// bucket this write has just made is empty until the temporary lands
-    /// in it. Without the retry that `rmdir` loses the chunk -- the write
+    /// in it. Without the retry, that `rmdir` loses the chunk: the write
     /// fails `NotFound` over a directory nobody meant to take from it.
     /// Once the temporary is in, the bucket holds a file, and no `rmdir`
     /// can take it before the rename.
@@ -394,7 +397,7 @@ impl ChunkDir {
             match written {
                 Ok(()) => break,
                 // Bounded, so a directory that keeps vanishing is an error
-                // rather than a spin: each loss is a prune that landed in
+                // rather than a spin. Each loss is a prune that landed in
                 // the gap between two syscalls.
                 Err(e) if e.kind() == io::ErrorKind::NotFound && lost < BUCKET_RETRIES => {
                     lost += 1;
@@ -415,32 +418,31 @@ impl ChunkDir {
     /// Unlink both copies of `index`.
     ///
     /// **Crate-private, and that is the point.** There is one door into the
-    /// unlink per adapter and this is not a third one: the torrent
+    /// unlink per adapter, and this is not a third one. The torrent
     /// adapter's is `StoreRegistry::delete`, called from `retention` under
-    /// the `DroppedFilePieces` claim that keeps the delete atomic with
-    /// librqbit's have-set (or with no have-set left to interlock against);
-    /// and the `/proxy` adapter's is its own. A
-    /// generic *public* `remove` on the shared store would be exactly the
-    /// second door that interlock exists to refuse -- somewhere to unlink a
-    /// torrent's piece behind the backend's back and have it go on
-    /// advertising bytes it no longer has -- so the `server` crate, routes
-    /// and `/proxy` alike, cannot name this at all.
+    /// the `DroppedFilePieces` claim. That claim keeps the delete atomic with
+    /// librqbit's have-set (or with no have-set left to interlock against).
+    /// The `/proxy` adapter has its own. A generic *public* `remove` on the
+    /// shared store would be exactly the second door that interlock exists
+    /// to refuse: somewhere to unlink a torrent's piece behind the backend's
+    /// back and have it go on advertising bytes it no longer has. So the
+    /// `server` crate, routes and `/proxy` alike, cannot name this at all.
     ///
-    /// The bucket directory is left behind; it is pruned when the whole
+    /// The bucket directory is left behind. It is pruned when the whole
     /// directory goes ([`Self::remove_if_empty`]). Removing it here would be
     /// a rmdir per chunk against a directory a concurrent write may have just
     /// created and not yet opened its file in.
     ///
     /// A chunk with no file was not on the disk to leave it, and is not an
-    /// error -- the caller asked for bytes back and there were none. A
+    /// error: the caller asked for bytes back and there were none. A
     /// *directory* wearing either of a chunk's two names is not a chunk
-    /// either, and is the same non-event. It has to be: this is one chunk of
-    /// a whole run whose have-bits the caller has **already** cleared, and
+    /// either, and is the same non-event. It has to be. This is one chunk of
+    /// a whole run whose have-bits the caller has **already** cleared.
     /// `remove_file` answers `EISDIR` for a directory rather than
     /// `NotFound`, so treating it as a failure abandoned every chunk after
     /// it in the run. [`Self::held_in_bucket`] refuses to offer a directory
     /// wearing the *complete* name, and the two halves of that rule only
-    /// close together: a directory wearing the *staged* name spells no index
+    /// close together. A directory wearing the *staged* name spells no index
     /// at all, so no listing can filter it and only the delete ever meets
     /// it.
     pub(crate) fn remove(&self, index: u64) -> io::Result<bool> {
@@ -449,9 +451,9 @@ impl ChunkDir {
             match std::fs::remove_file(&path) {
                 Ok(()) => removed = true,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                // Asked of the path rather than of the errno: `EISDIR` is
+                // Asked of the path rather than of the errno. `EISDIR` is
                 // Linux's answer to unlinking a directory and not every
-                // platform's, and what this arm means is "there is no chunk
+                // platform's. What this arm means is "there is no chunk
                 // here", which is a question about the name.
                 Err(_) if path.is_dir() => {}
                 Err(e) => return Err(e),
@@ -481,21 +483,21 @@ impl ChunkDir {
 
     /// Which chunks of one bucket are **complete** on disk.
     ///
-    /// Names and nothing else: one `read_dir`, no `stat`. The name is matched
-    /// by re-spelling ([`canonical_index`]), and the index has to belong to
-    /// the bucket it was found in, because a chunk is only *reachable* when
-    /// both halves of its address are spelled the way a delete will spell
-    /// them. Anything else is reported held by nobody: a listing must never
-    /// promise bytes a delete could not take. A staged copy carries a suffix
-    /// and so spells no index, which is how a chunk still being written stays
-    /// invisible to a read.
+    /// It reads names and nothing else: one `read_dir`, no `stat`. The name
+    /// is matched by re-spelling ([`canonical_index`]). The index has to
+    /// belong to the bucket it was found in, because a chunk is only
+    /// *reachable* when both halves of its address are spelled the way a
+    /// delete will spell them. Anything else is reported held by nobody: a
+    /// listing must never promise bytes a delete could not take. A staged
+    /// copy carries a suffix and so spells no index. That is how a chunk
+    /// still being written stays invisible to a read.
     ///
     /// **A bucket that cannot be read is not an empty bucket.** A bucket
     /// that does not exist is one nothing has been written to, and it is
-    /// empty; a bucket the filesystem would not list -- `EIO`, an
-    /// `EMFILE` on a television that has run out of descriptors, a
-    /// permission it lost -- holds whatever it held, and the answer is that
-    /// there is no answer. Reporting it as empty would tell the retention
+    /// empty. A bucket the filesystem would not list holds whatever it held,
+    /// and the answer is that there is no answer. (That is `EIO`, an
+    /// `EMFILE` on a television that has run out of descriptors, or a
+    /// permission it lost.) Reporting it as empty would tell the retention
     /// policy that every committed piece of a file had left the disk, and
     /// the proxy's owner would unlink its record of them. One transient
     /// directory error would then break, for every piece of the file, the
@@ -517,9 +519,9 @@ impl ChunkDir {
             if index / CHUNKS_PER_DIRECTORY != bucket {
                 continue;
             }
-            // A *directory* named like a chunk is not a chunk: offered as
-            // one, the delete that follows fails with `EISDIR` -- not
-            // `NotFound` -- which abandons the whole run of chunks it was
+            // A *directory* named like a chunk is not a chunk. Offered as
+            // one, the delete that follows fails with `EISDIR` (not
+            // `NotFound`), which abandons the whole run of chunks it was
             // part of.
             if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
                 continue;
@@ -532,16 +534,16 @@ impl ChunkDir {
     /// Which chunks are **complete** on disk, across every bucket.
     ///
     /// [`Self::stat`] answers the same question and more, and the more is
-    /// what makes it the wrong call on a hot path: it costs a `metadata` per
-    /// file, and this is asked of a proxied entity by its retention pass's
-    /// seed and by the read-ahead -- a `statx` per chunk, for two numbers
-    /// neither wants. (The torrent side never lists: the piece store keeps
-    /// its held set in memory.)
+    /// what makes it the wrong call on a hot path. It costs a `metadata` per
+    /// file. This is asked of a proxied entity by its retention pass's seed
+    /// and by the read-ahead, and `stat` would be a `statx` per chunk, for
+    /// two numbers neither wants. (The torrent side never lists: the piece
+    /// store keeps its held set in memory.)
     ///
     /// `Err` is a directory that could not be listed, and it is the whole
-    /// answer: a listing with one bucket missing from it would be an
-    /// account of the disk that is wrong about that bucket's every chunk.
-    /// See [`Self::held_in_bucket`] for what treating it as empty cost.
+    /// answer. A listing with one bucket missing from it would be an account
+    /// of the disk that is wrong about that bucket's every chunk. See
+    /// [`Self::held_in_bucket`] for what treating it as empty cost.
     pub fn held(&self) -> io::Result<BTreeSet<u64>> {
         let mut held = BTreeSet::new();
         let buckets = match self.read_dir(&self.dir) {
@@ -569,12 +571,12 @@ impl ChunkDir {
     /// Every chunk under this directory with the metadata of both its
     /// copies, and everything else it holds as strays.
     ///
-    /// One `read_dir` per bucket and one `metadata` per file -- the same
-    /// filesystem work walking the tree would cost -- but the caller is
+    /// It costs one `read_dir` per bucket and one `metadata` per file, the
+    /// same filesystem work walking the tree would cost. But the caller is
     /// handed chunk indices rather than paths, so whatever it means to do
     /// next it has to ask this type to do.
     ///
-    /// An unreadable entry is skipped, not reported as an error: a stat is a
+    /// An unreadable entry is skipped, not reported as an error. A stat is a
     /// reading of what is there, and a caller counting the disk must not be
     /// stopped by one directory it may not enter. A directory that does not
     /// exist stats empty, which is the ordinary state before the first write.
@@ -584,9 +586,9 @@ impl ChunkDir {
             return stored;
         };
         // Both copies of a chunk are one entry, so they are counted, aged and
-        // deleted together -- keyed by index while the walk runs, because the
-        // staged file and the complete one are two directory entries that may
-        // arrive in either order.
+        // deleted together. They are keyed by index while the walk runs,
+        // because the staged file and the complete one are two directory
+        // entries that may arrive in either order.
         let mut chunks: BTreeMap<u64, StoredChunk> = BTreeMap::new();
         for bucket in buckets.flatten() {
             // Anything but a bucket directory at this level is debris an
@@ -608,14 +610,14 @@ impl ChunkDir {
                 };
                 if metadata.is_dir() {
                     // Nothing this store makes, so everything under it is
-                    // debris -- but it is occupying the volume, and a caller
+                    // debris. But it is occupying the volume, and a caller
                     // counting the disk must see all of it.
                     collect_strays(&entry.path(), &mut stored.strays);
                     continue;
                 }
                 let name = entry.file_name();
                 // A name this store never wrote, or a chunk file sitting in a
-                // bucket it does not belong to: a delete would look for it
+                // bucket it does not belong to. A delete would look for it
                 // somewhere else, so reporting it as that chunk would promise
                 // bytes back that no delete could take.
                 let stray = match name.to_str().and_then(chunk_of_name) {
@@ -647,31 +649,32 @@ impl ChunkDir {
     /// complete chunk by index, every staged file by name. One `read_dir`
     /// per bucket, names and types only, no `stat` of a chunk file.
     ///
-    /// The one place a staged file is *recognised*, so that what a staged
-    /// file is called stays one decision taken by [`Self::staging_path`] and
-    /// [`Self::write_whole`]. A second spelling of the suffix elsewhere would
-    /// let the constant change while a reconciliation pass silently stopped
-    /// finding anything -- and the stale shadow such a pass exists to delete
-    /// is exactly what gets a half-written chunk served as a complete one.
+    /// This is the one place a staged file is *recognised*, so that what a
+    /// staged file is called stays one decision taken by
+    /// [`Self::staging_path`] and [`Self::write_whole`]. A second spelling of
+    /// the suffix elsewhere would let the constant change while a
+    /// reconciliation pass silently stopped finding anything. The stale
+    /// shadow such a pass exists to delete is exactly what gets a
+    /// half-written chunk served as a complete one.
     ///
     /// A complete chunk is reported under the same rules as
-    /// [`Self::held_in_bucket`]: the name re-spells ([`canonical_index`]),
+    /// [`Self::held_in_bucket`]. The name re-spells ([`canonical_index`]),
     /// the index belongs to the bucket it was found in, and the entry is a
-    /// file -- a *directory* wearing a chunk's name is not a chunk, and
+    /// file. A *directory* wearing a chunk's name is not a chunk, and
     /// offered as one it would meet the delete as `EISDIR`. A staged name is
-    /// held to the same two: its index in the bucket it was found in, and a
-    /// file. Anything else is passed over: a walk must never name a chunk a
-    /// delete could not address.
+    /// held to the same two rules: its index in the bucket it was found in,
+    /// and a file. Anything else is passed over, because a walk must never
+    /// name a chunk a delete could not address.
     ///
     /// **Strict, in every bucket.** A directory that does not exist yet is
-    /// the ordinary state before the first write and walks empty; anything
-    /// that exists and will not list -- the directory itself, a bucket, an
-    /// entry whose kind cannot be read -- is an `Err`, and the whole walk is.
+    /// the ordinary state before the first write, and walks empty. Anything
+    /// that exists and will not list is an `Err`, and so is the whole walk:
+    /// the directory itself, a bucket, an entry whose kind cannot be read.
     /// The caller is seeding what it knows about the disk from this, and
-    /// there is no later event that adds a chunk already complete: a bucket
-    /// skipped here would be a set short of that bucket's every chunk for
-    /// the rest of the process -- tolerable only if this fed nothing but
-    /// the advisory staged set, which the held set below is not.
+    /// there is no later event that adds a chunk already complete. A bucket
+    /// skipped here would leave the set short of that bucket's every chunk
+    /// for the rest of the process. That would be tolerable only if this fed
+    /// nothing but the advisory staged set, and the held set below is not.
     pub fn walk(&self) -> io::Result<Vec<Entry>> {
         let mut found = Vec::new();
         let buckets = match self.read_dir(&self.dir) {
@@ -698,12 +701,12 @@ impl ChunkDir {
                     let index = canonical_index(stem);
                     // The complete chunk's two rules hold for a staged name
                     // too. Seeded as a piece's staged copy, it is what a
-                    // read of that piece prefers to the complete one: a
+                    // read of that piece prefers to the complete one. A
                     // directory wearing the name answers that read with
-                    // `EISDIR` where the piece is simply missing, and a
-                    // name in a bucket its index does not belong to is not
-                    // where a write of the chunk goes, so every read
-                    // probes a staged copy nothing will ever write.
+                    // `EISDIR` where the piece is simply missing. A name in
+                    // a bucket its index does not belong to is not where a
+                    // write of the chunk goes, so every read probes a
+                    // staged copy nothing will ever write.
                     if index.is_some_and(|index| bucket_index != Some(index / CHUNKS_PER_DIRECTORY))
                         || !entry.file_type()?.is_file()
                     {
@@ -737,10 +740,10 @@ impl ChunkDir {
 impl ChunkDir {
     /// **Every `read_dir` this type makes of its directory or a bucket goes
     /// through here**, so that `LISTINGS` counts all of them. The tests
-    /// that pin "the pass lists nothing" read that counter, and a listing
-    /// that reached the disk by any door this type has -- [`Self::held`],
-    /// [`Self::stat`], [`Self::walk`], a bucket on its own -- has to move
-    /// it: a counter on one door alone let a per-tick listing through
+    /// that pin "the pass lists nothing" read that counter. A listing that
+    /// reached the disk by any door this type has must move it:
+    /// [`Self::held`], [`Self::stat`], [`Self::walk`], or a bucket on its
+    /// own. A counter on one door alone let a per-tick listing through
     /// another pass for no listing at all. ([`collect_strays`] lists the
     /// debris trees `stat` finds below a bucket, which hold no chunk, and
     /// is not counted.)
@@ -759,12 +762,13 @@ impl ChunkDir {
 }
 
 /// How many times a [`ChunkDir`] has listed its directory or one of its
-/// buckets -- every `read_dir` it makes, by whichever of its methods: the
-/// probe for the tests that pin "the pass lists nothing". A test reads it
-/// once the seed has walked and expects the same number after every pass,
-/// rather than a count it knows, because the seed lists the directory and
-/// then each bucket. Keyed by directory so that tests running in parallel,
-/// each in a scratch root of its own, do not read one another's count.
+/// buckets: every `read_dir` it makes, by whichever of its methods. It is
+/// the probe for the tests that pin "the pass lists nothing". A test reads
+/// it once the seed has walked, and expects the same number after every
+/// pass rather than a count it knows, because the seed lists the directory
+/// and then each bucket. It is keyed by directory, so that tests running
+/// in parallel, each in a scratch root of its own, do not read one
+/// another's count.
 #[cfg(test)]
 pub static LISTINGS: Mutex<BTreeMap<PathBuf, usize>> = Mutex::new(BTreeMap::new());
 
@@ -772,9 +776,9 @@ pub static LISTINGS: Mutex<BTreeMap<PathBuf, usize>> = Mutex::new(BTreeMap::new(
 /// name that is not a staged one at all.
 ///
 /// Anonymous staged copies (`<index>.<pid>-<n>.part`) come back as their
-/// whole prefix, which [`canonical_index`] then refuses -- they name no
-/// addressable chunk, which is exactly right: nothing may promote one but the
-/// writer that holds it.
+/// whole prefix, which [`canonical_index`] then refuses. They name no
+/// addressable chunk, which is exactly right: nothing may promote one but
+/// the writer that holds it.
 pub fn staged_stem(name: &str) -> Option<&str> {
     name.strip_suffix(STAGING_SUFFIX)
 }
@@ -792,16 +796,16 @@ pub fn chunk_of_name(name: &str) -> Option<(u64, bool)> {
 /// The number a name spells, or `None` when it is not how this store spells
 /// that number.
 ///
-/// `str::parse` would accept a leading `+` and leading zeroes; the store
-/// writes neither, so `00`, `+0` and `0` all parse to the same chunk while
+/// `str::parse` would accept a leading `+` and leading zeroes. The store
+/// writes neither, so `00`, `+0` and `0` all parse to the same chunk, but
 /// only the last of them is a name [`ChunkDir::chunk_path`] would ever
-/// produce. Both halves of a chunk's address go through this -- the bucket
-/// directory and the file in it -- because a chunk is only *reachable* when
+/// produce. Both halves of a chunk's address go through this (the bucket
+/// directory and the file in it), because a chunk is only *reachable* when
 /// both are spelled the way a delete will spell them. Reporting debris as a
-/// chunk would promise bytes back that no delete could take: the delete would
-/// build `<index / CHUNKS_PER_DIRECTORY>/<index>`, find nothing there and
-/// free nothing, while the file sat on the volume being re-found by every
-/// later pass.
+/// chunk would promise bytes back that no delete could take. The delete
+/// would build `<index / CHUNKS_PER_DIRECTORY>/<index>`, find nothing there
+/// and free nothing, while the file sat on the volume being re-found by
+/// every later pass.
 pub fn canonical_index(name: &str) -> Option<u64> {
     if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -815,9 +819,9 @@ pub fn canonical_index(name: &str) -> Option<u64> {
 /// Every file under `dir`, however deep, as debris.
 ///
 /// The store makes no directory below a bucket, so a tree found there is
-/// somebody else's -- but its blocks are on the same volume, and a listing
-/// that stayed silent about them would be inventing exactly the invisible
-/// disk usage one file per chunk exists to abolish.
+/// somebody else's. But its blocks are on the same volume. A listing that
+/// stayed silent about them would be inventing exactly the invisible disk
+/// usage one file per chunk exists to abolish.
 pub fn collect_strays(dir: &Path, out: &mut Vec<Metadata>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -836,19 +840,19 @@ pub fn collect_strays(dir: &Path, out: &mut Vec<Metadata>) {
 
 /// What a file occupies, never its apparent length. **The one copy of this
 /// arithmetic**: the piece sweep and the proxy cache share it rather than
-/// each keeping their own, because two readings of "how much would deleting
-/// this give back" are two numbers that can disagree.
+/// each keeping their own. Two readings of "how much would deleting this
+/// give back" are two numbers that can disagree.
 ///
 /// On Unix `st_blocks` is the allocated block count in 512-byte units *by
-/// definition* -- the unit is POSIX, not the filesystem's block size -- so
+/// definition*. The unit is POSIX, not the filesystem's block size, so
 /// `blocks() * 512` is the occupancy including any tail slack. A chunk file
-/// written by one 16 KiB write out of many is a hole plus 16 KiB, and
-/// reporting its full length as freed would be a number the disk never gives
-/// back. Windows has no equivalent through `std` (it needs
+/// written by one 16 KiB write out of many is a hole plus 16 KiB. Reporting
+/// its full length as freed would be a number the disk never gives back.
+/// Windows has no equivalent through `std` (it needs
 /// `GetCompressedFileSize` or `FSCTL_QUERY_ALLOCATED_RANGES` through the
-/// Win32 API), so there the apparent length stands in: an over-estimate for a
-/// sparse file, which errs towards cleaning too eagerly rather than letting a
-/// disk fill.
+/// Win32 API), so there the apparent length stands in. That over-estimates
+/// a sparse file, which errs towards cleaning too eagerly rather than
+/// letting a disk fill.
 pub fn occupied_bytes(metadata: &Metadata) -> u64 {
     #[cfg(unix)]
     {
@@ -874,20 +878,20 @@ struct OpenHandle {
 /// The last few chunk files opened, most recently used last.
 ///
 /// Without it, every 16 KiB write and every 8 KiB read opens and closes the
-/// chunk file, and a read also probes the staging name first, so a complete
-/// chunk costs two opens per read. On ext4 that is microseconds; on the
+/// chunk file. A read also probes the staging name first, so a complete
+/// chunk costs two opens per read. On ext4 that is microseconds. On the
 /// FUSE-mediated external storage and exFAT cards a large offline download
-/// lands on, an open is 50-200 µs, putting a third of the read path in
+/// lands on, an open is 50-200 µs, which puts a third of the read path in
 /// opens alone. With this, a chunk written or streamed end to end is one
 /// open.
 ///
 /// The cache changes nothing about what is on disk, and it must not change
-/// what a read sees either: a handle is forgotten before the file it names is
-/// renamed into place or deleted, and a chunk's cached *complete* handle goes
+/// what a read sees either. A handle is forgotten before the file it names
+/// is renamed into place or deleted. A chunk's cached *complete* handle goes
 /// the moment a new staged copy is begun, since a read has to prefer the
-/// staged one. A handle still in a reader's hands survives that -- it is an
-/// `Arc` -- and keeps reading the bytes it had, which is the same thing a
-/// read that had already begun would do.
+/// staged one. A handle still in a reader's hands survives that (it is an
+/// `Arc`) and keeps reading the bytes it had. That is the same thing a read
+/// that had already begun would do.
 ///
 /// An adapter that reads and writes a chunk once (a `/proxy` fill is one
 /// `write_whole`, a `/proxy` read one `fs::read`) has nothing to gain from
@@ -941,8 +945,8 @@ impl OpenChunks {
         self.handles.lock().clear();
     }
 
-    /// Whether any handle is being held open. What a test asking "does a
-    /// paused torrent keep descriptors?" reads.
+    /// Whether any handle is being held open. A test asking "does a paused
+    /// torrent keep descriptors?" reads this.
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.handles.lock().is_empty()
@@ -971,11 +975,11 @@ mod tests {
     }
 
     /// The flush before a commit has to reach a staged copy whose handle
-    /// nobody holds any more, and it must not conjure one: an absent staged
+    /// nobody holds any more, and it must not conjure one. An absent staged
     /// copy is `commit`'s idempotent case and is reported as nothing to
-    /// flush, where a created empty file would be renamed over the complete
-    /// one. A staged name that cannot be opened for writing is an error, not
-    /// a silent "done" -- the bytes it stands for were not confirmed.
+    /// flush. A created empty file would be renamed over the complete one. A
+    /// staged name that cannot be opened for writing is an error, not a
+    /// silent "done": the bytes it stands for were not confirmed.
     #[test]
     fn a_staged_copy_is_flushed_by_name_and_never_created_by_it() {
         let (_tmp, chunks) = dir();
@@ -1015,9 +1019,8 @@ mod tests {
     }
 
     /// **A directory that is not there is empty; one that cannot be read is
-    /// unknown.** Conflating the two -- reading "cannot be read" as "empty"
-    /// -- costs every committed piece of a file its announcement; see
-    /// `held_in_bucket`.
+    /// unknown.** Reading "cannot be read" as "empty" costs every committed
+    /// piece of a file its announcement; see `held_in_bucket`.
     #[test]
     fn a_directory_that_cannot_be_listed_is_not_an_empty_one() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1034,8 +1037,8 @@ mod tests {
         std::fs::create_dir_all(chunks.path()).unwrap();
         std::fs::write(chunks.path().join("3"), b"not a bucket").unwrap();
         assert!(chunks.held_in_bucket(3).is_err());
-        // The tree listing skips a file where a bucket should be -- it is
-        // not a bucket -- so it still answers for the buckets that are.
+        // The tree listing skips a file where a bucket should be, since it
+        // is not a bucket. So it still answers for the buckets that are.
         chunks.write_whole(7, b"abcd", Some(4)).unwrap();
         assert_eq!(chunks.held().unwrap(), BTreeSet::from([7]));
 
@@ -1044,8 +1047,8 @@ mod tests {
         std::fs::write(file.path(), b"not a directory").unwrap();
         assert!(file.held().is_err());
 
-        // The walk that seeds the piece store answers the same way: a file
-        // where a bucket should be is no bucket and holds nothing, and a
+        // The walk that seeds the piece store answers the same way. A file
+        // where a bucket should be is no bucket and holds nothing. A
         // directory that will not list is no answer.
         let walked = chunks.walk().unwrap();
         assert!(
@@ -1057,10 +1060,10 @@ mod tests {
 
     /// **A staged name is held to a complete chunk's rules.** The walk
     /// seeds the piece store's staged set, and a read of a piece in that
-    /// set goes to the staged copy first: a directory called `5.part` was
-    /// seeded as piece 5's staged copy and read as `EISDIR` where the piece
-    /// is missing, and `7/3.part` -- piece 3 belongs to bucket 0 -- as a
-    /// staged copy at a name no write of piece 3 goes to.
+    /// set goes to the staged copy first. A directory called `5.part` was
+    /// seeded as piece 5's staged copy, and read as `EISDIR` where the piece
+    /// is missing. `7/3.part` was seeded as a staged copy at a name no write
+    /// of piece 3 goes to, since piece 3 belongs to bucket 0.
     #[test]
     fn the_walk_names_no_staged_copy_a_write_would_not_make() {
         let (_tmp, chunks) = dir();
@@ -1095,16 +1098,16 @@ mod tests {
     /// Two fillers of one chunk cannot corrupt it, and that is what the
     /// anonymous staged name buys.
     ///
-    /// `/proxy` does not coalesce: two players reading one stream both fetch
+    /// `/proxy` does not coalesce. Two players reading one stream both fetch
     /// a missing chunk and both write it, and that is the only concurrency
     /// either adapter has over one index. What makes it safe is that a fill
-    /// touches no name another writer could be holding -- so this drives one
+    /// touches no name another writer could be holding. So this drives one
     /// fill while another writer's staged copy of the same chunk is sitting
     /// on the disk, and asks what happened to both.
     ///
-    /// Through the *addressable* staged name the two would be one file: this
+    /// Through the *addressable* staged name the two would be one file. This
     /// fill would truncate the other writer's bytes and then rename them
-    /// away, so what got committed would be neither writer's chunk and the
+    /// away. What got committed would be neither writer's chunk, and the
     /// other writer's rename would name a path that had already moved.
     #[test]
     fn a_fill_touches_no_name_another_writer_could_hold() {
@@ -1135,8 +1138,8 @@ mod tests {
     /// The proxy cache prunes what its reclaims empty, from the retention
     /// pass's thread, while a fill writes from its own. A bucket the fill
     /// has just made is empty and prunable until its temporary is in it, so
-    /// the prune stands exactly there -- twice, since the directory a
-    /// retry makes again is as empty as the first one was.
+    /// the prune stands exactly there. It stands there twice, since the
+    /// directory a retry makes again is as empty as the first one was.
     #[test]
     fn a_bucket_pruned_under_a_write_is_made_again() {
         let (_tmp, chunks) = dir();

@@ -8,17 +8,17 @@ use tokio::io::{AsyncRead, AsyncSeek};
 
 /// A read that waited at least this long before returning data is logged.
 ///
-/// Reads here legitimately block for tens of seconds -- a read at an offset
-/// whose piece is not on disk parks until the whole piece verifies, which
-/// on a 16 MiB piece at a few hundred kB/s is a minute. Nothing logged that
-/// at all, so a player timing out on a slow read looked from the server
-/// side like nothing happening.
+/// Reads here legitimately block for tens of seconds. A read at an offset
+/// whose piece is not on disk parks until the whole piece verifies. On a
+/// 16 MiB piece at a few hundred kB/s, that is a minute. Nothing logged it,
+/// so from the server side a player timing out on a slow read looked like
+/// nothing happening.
 pub const BLOCKED_READ_LOG_THRESHOLD: Duration = Duration::from_secs(1);
 
 /// How long a read waits on a piece before its holders are logged
 /// ([`FileHandle::arm_blocked_probe`]), and how much longer before they are
-/// logged once more. Two seconds is past any wait a healthy swarm produces;
-/// the second line, ten seconds in, is for the reads that block for
+/// logged once more. Two seconds is past any wait a healthy swarm produces.
+/// The second line, ten seconds in, is for the reads that block for
 /// thirty, so the log shows whether the holders changed.
 pub(crate) const BLOCKED_READ_PROBE_AFTER: Duration = Duration::from_secs(2);
 const BLOCKED_READ_PROBE_AGAIN: Duration = Duration::from_secs(8);
@@ -40,27 +40,27 @@ struct ReadCursor {
     /// When the read in flight was first polled -- when the consumer asked
     /// for it, as against when it parked.
     ///
-    /// Latched on the first poll and kept across the rest, for the same
-    /// reason `pending_since` is: `poll_read` runs many times for one read,
-    /// once per wake-up, and a stamp overwritten on each of them says the
+    /// It is latched on the first poll and kept across the rest, for the
+    /// same reason as `pending_since`. `poll_read` runs many times for one
+    /// read, once per wake-up. A stamp overwritten on each of them says the
     /// read arrived at the moment it was about to return. A read blocked
-    /// four seconds would then report having taken no time at all, which is
-    /// the one number the consumer actually felt.
+    /// four seconds would then report having taken no time at all, and that
+    /// is the one number the consumer actually felt.
     arrived: Option<Instant>,
     /// The file's first byte within the torrent, or `None` for a file the
-    /// retention owner has no entity for, which is the only place the
-    /// handle can learn it. What turns an offset in the file into the
-    /// torrent piece a blocked read names; see [`ReadCursor::piece_of`].
+    /// retention owner has no entity for. The owner is the only place the
+    /// handle can learn it. It turns an offset in the file into the torrent
+    /// piece a blocked read names; see [`ReadCursor::piece_of`].
     file_start: Option<u64>,
 }
 
 /// What one served read turned out to be.
 ///
-/// Returned by [`ReadCursor::resume`] rather than read off the cursor
-/// afterwards, because `resume` is what advances the cursor: asked after
-/// it, `position` is the offset the *next* read starts at, and every
-/// caller wanting the offset this one ran from would have to subtract what
-/// it delivered. `log_blocked_read` did not, and named the wrong piece.
+/// It is returned by [`ReadCursor::resume`] rather than read off the cursor
+/// afterwards, because `resume` is what advances the cursor. After it,
+/// `position` is the offset the *next* read starts at. Every caller wanting
+/// the offset this one ran from would have to subtract what it delivered.
+/// `log_blocked_read` did not, and named the wrong piece.
 #[derive(Debug, Clone, Copy)]
 struct Served {
     /// The offset this read ran from -- the piece it parked on, when it
@@ -79,9 +79,9 @@ struct Served {
 impl Served {
     /// How long the consumer waited for this read, parked or not.
     ///
-    /// Not [`Served::waited`], which is time spent parked on a missing
-    /// piece and is `None` for a read served from the disk. This is the
-    /// whole of it, and it is what a player experiences.
+    /// This is not [`Served::waited`], which is time spent parked on a
+    /// missing piece and is `None` for a read served from the disk. This is
+    /// the whole wait, and it is what a player experiences.
     fn took(&self) -> Duration {
         self.returned.saturating_duration_since(self.arrived)
     }
@@ -144,9 +144,9 @@ impl ReadCursor {
     /// The absolute torrent piece `offset` of this file sits in; see
     /// [`torrent_piece`].
     ///
-    /// Takes the offset rather than reading the cursor, because the caller
-    /// that matters asks *after* [`ReadCursor::resume`] has moved it, about
-    /// the offset the read ran from.
+    /// It takes the offset rather than reading the cursor. The caller that
+    /// matters asks about the offset the read ran from, *after*
+    /// [`ReadCursor::resume`] has moved the cursor.
     fn piece_of(&self, offset: u64, piece_length: Option<u64>) -> Option<u64> {
         torrent_piece(offset, self.file_start, piece_length)
     }
@@ -156,10 +156,10 @@ impl ReadCursor {
 /// length (no metadata, or a backend without pieces) or without the file's
 /// offset within the torrent, `file_start`.
 ///
-/// `None` rather than guessing zero: guessing zero is right for a
-/// single-file torrent and for the first file of any other, but names a
-/// piece thousands away for the second episode of a season pack -- and
-/// would key the probe's one-line-per-piece throttle by it too.
+/// It is `None` rather than a guess of zero. Zero is right for a
+/// single-file torrent and for the first file of any other. For the second
+/// episode of a season pack it names a piece thousands away, and the
+/// probe's one-line-per-piece throttle would be keyed by it too.
 fn torrent_piece(offset: u64, file_start: Option<u64>, piece_length: Option<u64>) -> Option<u64> {
     let len = piece_length.filter(|len| *len > 0)?;
     Some(file_start?.saturating_add(offset) / len)
@@ -169,29 +169,29 @@ pub struct FileHandle<H: TorrentHandle> {
     pub size: u64,
     pub name: String,
     pub engine: Arc<crate::engine::Engine<H>>,
-    /// The backend stream and this read's head on the file's entity, which
-    /// a cache clear takes away from outside ([`Engine::cut_reads`]): the
-    /// slot is shared with the engine, and an empty one is a read that was
-    /// stopped. See [`OpenRead`].
+    /// The backend stream and this read's head on the file's entity. A
+    /// cache clear takes them away from outside ([`Engine::cut_reads`]).
+    /// The slot is shared with the engine, and an empty one is a read that
+    /// was stopped. See [`OpenRead`].
     ///
     /// [`Engine::cut_reads`]: crate::engine::Engine::cut_reads
     open: CutSlot<H>,
     /// Which file of the torrent, for the blocked-read log.
     file_idx: usize,
     cursor: ReadCursor,
-    /// This reader's key in the engine's waker registry, so a torrent that
-    /// is stopped for space can wake a read parked on a piece it will not
-    /// download -- see [`Engine::refuse_reads_for_space`].
+    /// This reader's key in the engine's waker registry. With it, a torrent
+    /// that is stopped for space can wake a read parked on a piece it will
+    /// not download. See [`Engine::refuse_reads_for_space`].
     ///
     /// [`Engine::refuse_reads_for_space`]: crate::engine::Engine::refuse_reads_for_space
     reader_id: u64,
     /// Which park of this read a probe is armed for, or zero for none; see
-    /// [`Self::arm_blocked_probe`]. Set to a fresh generation when the read
-    /// parks, cleared when it is served, and read by the probe task before
-    /// it logs: a task from an earlier park finds a different generation
-    /// and says nothing. A flag is not enough -- a read served within a
-    /// second and parked again on the next piece would have the first
-    /// park's task log the old offset against the new wait.
+    /// [`Self::arm_blocked_probe`]. It is set to a fresh generation when the
+    /// read parks and cleared when it is served. The probe task reads it
+    /// before it logs, and a task from an earlier park finds a different
+    /// generation and says nothing. A flag is not enough. Take a read served
+    /// within a second and parked again on the next piece: the first park's
+    /// task would log the old offset against the new wait.
     probe: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -200,29 +200,29 @@ pub struct FileHandle<H: TorrentHandle> {
 /// while it stands, and the read's head on the file's entity, which keeps
 /// a window and a promise. Both live in a slot the engine can empty
 /// ([`crate::engine::Engine::cut_reads`]) without the handle being
-/// polled: a player's reader sits idle between its reads for as long as it
-/// likes, and a clear that waited for the next read to notice would leave
-/// the pieces round it on the disk until then.
+/// polled. A player's reader sits idle between its reads for as long as it
+/// likes. A clear that waited for the next read to notice would leave the
+/// pieces round it on the disk until then.
 pub(crate) struct OpenRead<H: TorrentHandle> {
     stream: Box<dyn FileStreamTrait>,
     /// This read, as the retention owner sees it: its own playhead on the
-    /// file's entity, moved by every byte that really goes out and gone
-    /// when this handle is. Two handles on one file -- a seek is a second
-    /// response on the file still playing -- are two heads, each with a
-    /// window at the pass's door, where one head per torrent had the pass
-    /// take the piece the other response was inside. `None` for a file the
+    /// file's entity. Every byte that really goes out moves it, and it goes
+    /// when this handle does. Two handles on one file are two heads, each
+    /// with a window at the pass's door. (A seek is a second response on
+    /// the file still playing.) One head per torrent had the pass take the
+    /// piece the other response was inside. It is `None` for a file the
     /// owner has no entity for: nothing could bound it, and its bytes are
     /// not remembered.
     ///
-    /// Taken by [`Opening::reader_on`] and handed in, rather than opened
-    /// here: it has to be on the entity before the backend stream is asked
+    /// [`Opening::reader_on`] takes it and hands it in; it is not opened
+    /// here. It has to be on the entity before the backend stream is asked
     /// for, and this handle does not exist until after that await. See
     /// there for what runs in the gap.
     reader: Option<crate::retention::owner::Reader<crate::engine::TorrentBacking<H>>>,
 }
 
 /// The error a read fails with once a cache clear has stopped it
-/// ([`crate::engine::Engine::cut_reads`]) -- `ConnectionAborted`, so a
+/// ([`crate::engine::Engine::cut_reads`]). It is `ConnectionAborted`, so a
 /// caller that looks at the kind sees a stream that was ended for it, not a
 /// disk or a torrent that failed.
 pub fn cleared_error() -> std::io::Error {
@@ -244,14 +244,14 @@ pub(crate) type WeakCutSlot<H> = std::sync::Weak<parking_lot::Mutex<Option<OpenR
 /// how far ahead it will be fetched, and how much of the film its viewer
 /// asked to have buffered.
 ///
-/// A struct rather than four more parameters because the last two arrived
-/// together and mean nothing apart: the lookahead is what the backend is
-/// granted for this stream, which the owner keeps as the floor no later
-/// budget may size the window under, and the buffer profile is the seconds
-/// that number was computed from.
+/// It is a struct rather than four more parameters because the last two
+/// arrived together and mean nothing apart. The lookahead is what the
+/// backend is granted for this stream. The owner keeps it as the floor no
+/// later budget may size the window under. The buffer profile is the
+/// seconds that number was computed from.
 ///
-/// Built before the backend stream is asked for, because that is when the
-/// reader on the file's entity has to be taken -- see
+/// It is built before the backend stream is asked for, because that is
+/// when the reader on the file's entity has to be taken. See
 /// [`Self::reader_on`].
 #[derive(Debug, Clone, Copy)]
 pub struct Opening {
@@ -273,44 +273,44 @@ pub struct Opening {
 
 impl Opening {
     /// This read's [`Reader`] on the file's entity, or `None` when the owner
-    /// has no entity for the file -- one nothing could bound, with no
-    /// metadata to name its pieces by, so there is nothing a head would be
-    /// measured against and its bytes are not remembered.
+    /// has no entity for the file. Nothing could bound such a file, and it
+    /// has no metadata to name its pieces by. There is nothing a head would
+    /// be measured against, and its bytes are not remembered.
     ///
     /// **Called before the backend stream is asked for, and it has to be.**
-    /// `Engine::begin_retention` installs the policy and counts the open;
-    /// the reader is what puts a head on the entity that install made. In
+    /// `Engine::begin_retention` installs the policy and counts the open.
+    /// The reader is what puts a head on the entity that install made. In
     /// between sits one await, the backend's own open, and it is long
-    /// enough to lose the file for good. A retention pass whose mode
-    /// reading lands in there finds `opens` already counting this open --
-    /// so the slack pass's "did a stream open since the reading" comparison
-    /// finds it equal -- and no *observed* reader, because nothing has been
-    /// read yet. It throws the policy just installed away, reclaims, and,
-    /// for a file with nothing on the disk yet (the next episode, opened
-    /// while the last one's connection is still closing), finds the entity
-    /// empty and forgets it. A reader taken after that finds no entity at
-    /// all: `None` for the handle's whole life, every byte of the episode
-    /// unremembered, and nothing to reinstall a policy because an install
-    /// runs only at an open. Taken here, the reader's own `Arc` on the
-    /// entity outlives that pass and the read stays on the file.
+    /// enough to lose the file for good. A retention pass may read the mode
+    /// inside that gap. It finds `opens` already counting this open, so the
+    /// slack pass's "did a stream open since the reading" comparison finds
+    /// it equal. It finds no *observed* reader, because nothing has been
+    /// read yet. So it throws the policy just installed away and reclaims.
+    /// For a file with nothing on the disk yet, it finds the entity empty
+    /// and forgets it. (That is the next episode, opened while the last
+    /// one's connection is still closing.) A reader taken after that finds
+    /// no entity at all. It is `None` for the handle's whole life, and
+    /// every byte of the episode goes unremembered. Nothing reinstalls a
+    /// policy, because an install runs only at an open. Taken here, the
+    /// reader's own `Arc` on the entity outlives that pass and the read
+    /// stays on the file.
     ///
-    /// Taking the reader here closes the permanent half of the race, and
-    /// on its own only that half. A reader that has opened and not yet
-    /// delivered a byte is not an observed one ([`Retention::readers_of`]),
-    /// so a pass reading the mode between this call and the first
-    /// `poll_read` would still discard the policy, and nothing would
-    /// install another until the next open. Honouring the raw reader map
-    /// instead is the design question the owner argues against in
-    /// [`Retention::readers_and_opens_of`]: a handed-out-and-abandoned
-    /// stream would block slack for ever. What closes the other half is
-    /// the promise made below, the moment the reader exists: a promise is
-    /// what makes a reader observed, and this read is about to ask for
-    /// exactly the piece it promises.
+    /// Taking the reader here closes only the permanent half of the race.
+    /// A reader that has opened and not yet delivered a byte is not an
+    /// observed one ([`Retention::readers_of`]). A pass reading the mode
+    /// between this call and the first `poll_read` would still discard the
+    /// policy, and nothing would install another until the next open.
+    /// Honouring the raw reader map instead is the design the owner argues
+    /// against in [`Retention::readers_and_opens_of`]: a
+    /// handed-out-and-abandoned stream would block slack for ever. The
+    /// other half is closed by the promise made below, the moment the
+    /// reader exists. A promise is what makes a reader observed, and this
+    /// read is about to ask for exactly the piece it promises.
     ///
     /// `start_offset` reaches the owner too, so the read has a head from
-    /// the open rather than from its first delivered byte: a reader parked
+    /// the open rather than from its first delivered byte. A reader parked
     /// on the piece it is waiting for is the one the file is being buffered
-    /// for, and an entity with no head is one no pass draws a window for.
+    /// for. An entity with no head is one no pass draws a window for.
     ///
     /// [`Reader`]: crate::retention::owner::Reader
     /// [`Retention::readers_of`]: crate::retention::owner::Retention::readers_of
@@ -336,15 +336,15 @@ impl Opening {
         );
         // **And promised the piece it opened on, before the gap.** A reader
         // is not *observed* until it has promised or delivered
-        // (`ReaderState::observed`), so a pass landing between this and the
-        // read's first poll still reads the file as one nothing is using
-        // and takes the pieces under it. The promise is not a trick to look
-        // busy: this read is about to ask for exactly that piece, which is
+        // (`ReaderState::observed`). A pass landing between this and the
+        // read's first poll would read the file as one nothing is using,
+        // and take the pieces under it. The promise is not a trick to look
+        // busy. This read is about to ask for exactly that piece, which is
         // what a promise says, and it is one piece rather than a window.
         //
         // It is also why the window stays bounded by behaviour rather than
-        // by a clock: a handle that is opened and never read holds one
-        // piece until it is dropped, which is the same promise any parked
+        // by a clock. A handle that is opened and never read holds one
+        // piece until it is dropped. That is the same promise any parked
         // read makes.
         if let Some(reader) = reader.as_ref() {
             reader.promises_at((self.file_idx, self.start_offset));
@@ -358,13 +358,13 @@ impl<H: TorrentHandle> FileHandle<H> {
     /// `opening.start_offset`, with the reader that read already has on the
     /// file's entity.
     ///
-    /// `reader` is handed in rather than taken here because it has to exist
-    /// before `stream` does: the engine installs the policy, takes the
+    /// `reader` is handed in rather than taken here, because it has to
+    /// exist before `stream` does. The engine installs the policy, takes the
     /// reader ([`Opening::reader_on`], which is where the argument lives),
     /// and only then awaits the backend's open. A handle exists after that
-    /// await, which is too late -- a retention pass can have forgotten the
-    /// entity by then, leaving this read unable to note a byte for the rest
-    /// of its life.
+    /// await, which is too late. A retention pass can have forgotten the
+    /// entity by then, and this read could not note a byte for the rest of
+    /// its life.
     pub(crate) fn new(
         size: u64,
         name: String,
@@ -402,14 +402,14 @@ impl<H: TorrentHandle> FileHandle<H> {
     /// **Say who holds the piece this read is waiting on**, two seconds in
     /// and again ten seconds in, if it is still waiting by then.
     ///
-    /// The blocked-read log fires on completion and says how long; it
+    /// The blocked-read log fires on completion and says how long. It
     /// cannot say why, because by then the piece is done and its claims
-    /// are gone -- a measured 24- and 30-second block on the latency claim
-    /// rules could only be guessed at. This asks the backend
-    /// while the read is parked: each holder, its chunks, how many are
-    /// missing, how long since it last delivered and what its own last
-    /// chunk took -- the two halves of the takeover rule, so the line says
-    /// why nobody took the claim over. A task rather than a check in
+    /// are gone. A measured 24- and 30-second block on the latency claim
+    /// rules could only be guessed at. This asks the backend while the read
+    /// is parked: each holder, its chunks, how many are missing, how long
+    /// since it last delivered and what its own last chunk took. Those last
+    /// two are the two halves of the takeover rule, so the line says why
+    /// nobody took the claim over. It is a task rather than a check in
     /// `poll_read`, which is not polled while the read is parked.
     fn arm_blocked_probe(&self) {
         if self.probe.load(std::sync::atomic::Ordering::SeqCst) != 0 {
@@ -460,9 +460,9 @@ impl<H: TorrentHandle> FileHandle<H> {
         });
     }
 
-    /// The error a read on a torrent stopped for want of disk space fails
-    /// with -- `StorageFull`, so a caller that looks at the kind sees the
-    /// device's problem and not the torrent's.
+    /// The error a read fails with on a torrent stopped for want of disk
+    /// space. It is `StorageFull`, so a caller that looks at the kind sees
+    /// the device's problem and not the torrent's.
     pub fn stopped_for_space_error() -> std::io::Error {
         std::io::Error::new(
             std::io::ErrorKind::StorageFull,
@@ -472,11 +472,11 @@ impl<H: TorrentHandle> FileHandle<H> {
 
     /// Log a read that had to wait, once it finally returns.
     ///
-    /// Deliberately reported on completion rather than while pending:
-    /// `poll_read` is only called when the reader is woken, so a "it has
-    /// been blocked for a second" check would fire whenever the runtime
-    /// happened to poll again and never for the reads that block longest.
-    /// The completion line always fires and carries the real wait.
+    /// It is reported on completion rather than while pending, on purpose.
+    /// `poll_read` is only called when the reader is woken. An "it has been
+    /// blocked for a second" check would fire whenever the runtime happened
+    /// to poll again, and never for the reads that block longest. The
+    /// completion line always fires and carries the real wait.
     fn log_blocked_read(&self, served: Served, waited: Duration) {
         let piece_length = self.engine.handle.piece_length();
         tracing::info!(
@@ -505,10 +505,10 @@ impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
         // only when its piece arrives. So the engine says whether reads are
         // to fail instead, and a read that does park leaves its waker where
         // the engine can reach it.
-        // Stamped before anything can return, so every path out of this
-        // function has an arrival to clear and none inherits the last
-        // read's. Latched, not assigned: this runs again on every wake-up
-        // of a read that parked.
+        // The arrival is stamped before anything can return, so every path
+        // out of this function has an arrival to clear and none inherits
+        // the last read's. It is latched, not assigned, because this runs
+        // again on every wake-up of a read that parked.
         if !this.cursor.has_arrived() {
             this.cursor.arrive(Instant::now());
         }
@@ -517,9 +517,9 @@ impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
             return Poll::Ready(Err(Self::stopped_for_space_error()));
         }
         // The slot's lock is held across the backend's poll and the notes
-        // below, and never taken by anything that holds another lock of
-        // ours: a clear empties it under this lock alone and drops what it
-        // took after letting go ([`crate::engine::Engine::cut_reads`]).
+        // below. Nothing that holds another lock of ours takes it. A clear
+        // empties it under this lock alone and drops what it took after
+        // letting go ([`crate::engine::Engine::cut_reads`]).
         let slot = this.open.clone();
         let mut open = slot.lock();
         let Some(open) = open.as_mut() else {
@@ -541,9 +541,9 @@ impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
                 //
                 // A parked read is waiting for exactly one piece: the one
                 // under its cursor. Said here, it becomes a promise the pass
-                // may not unlink and -- more to the point -- the want-set
-                // the pass orders ahead of every window it holds. On the
-                // torrent side this is the only caller that names what a
+                // may not unlink. More to the point, it becomes the want-set
+                // the pass orders ahead of every window it holds. This is
+                // the only caller on the torrent side that names what a
                 // reader is *stuck on*, rather than merely near.
                 if let Some(reader) = &open.reader {
                     reader.promises_at((this.file_idx, this.cursor.position));
@@ -563,11 +563,11 @@ impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
                     this.log_blocked_read(served, waited);
                 }
                 // **What the reads of this file look like**, which is what
-                // a pass fetches, keeps and gives back by. Fed from here
-                // because this is the one place that sees every served read
-                // with both of its timestamps, and fed to the engine rather
-                // than to anything on this handle because a stream survives
-                // the response that was carrying it.
+                // a pass fetches, keeps and gives back by. It is fed from
+                // here because this is the one place that sees every served
+                // read with both of its timestamps. It is fed to the engine
+                // rather than to anything on this handle, because a stream
+                // survives the response that was carrying it.
                 if delivered > 0 {
                     this.engine.note_read(
                         this.file_idx,
@@ -582,8 +582,9 @@ impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
                 }
                 // Where a byte really reached a player from, which is what
                 // the retention policy calls the playhead: this read's own,
-                // on the file's entity. Written after the read rather than
-                // before it, so a read that failed or parked moves nothing.
+                // on the file's entity. It is written after the read rather
+                // than before it, so a read that failed or parked moves
+                // nothing.
                 if delivered > 0
                     && let Some(reader) = &open.reader
                 {
@@ -602,7 +603,7 @@ impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
 impl<H: TorrentHandle> Drop for FileHandle<H> {
     fn drop(&mut self) {
         // A read whose response closed while it was parked is not waiting
-        // on anything; its probe must not report the piece as still held
+        // on anything. Its probe must not report the piece as still held
         // up, or as held by nobody, ten seconds later.
         self.probe.store(0, std::sync::atomic::Ordering::SeqCst);
         self.engine.forget_read_waker(self.reader_id);
@@ -638,10 +639,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     /// The blocked-read line has to name the offset the read is parked on,
-    /// which means the cursor has to track what each read delivered -- and
-    /// the wait has to be measured from the moment the read first parked,
-    /// not from the last time the runtime happened to poll it. A read of a
-    /// missing 16 MiB piece waits a minute across many wake-ups.
+    /// so the cursor has to track what each read delivered. The wait has to
+    /// be measured from the moment the read first parked, not from the last
+    /// time the runtime happened to poll it. A read of a missing 16 MiB
+    /// piece waits a minute across many wake-ups.
     #[test]
     fn read_cursor_reports_the_whole_wait_at_the_offset_it_parked_on() {
         let piece = 16 * 1024 * 1024u64;
@@ -657,8 +658,8 @@ mod tests {
         assert_eq!(served.end, piece + 4096);
         assert_eq!(cursor.position, piece + 4096);
 
-        // A read that parks, is polled again while still parked, and only
-        // then completes reports the wait from the first park -- and the
+        // A read parks, is polled again while still parked, and only then
+        // completes. It reports the wait from the first park, and the
         // offset it ran from, which the cursor has moved past by the time
         // anyone asks.
         cursor.arrive(t0);
@@ -687,13 +688,13 @@ mod tests {
 
     /// **One read is stamped once, however many times it is polled.**
     ///
-    /// `poll_read` runs again on every wake-up of a read that parked, so a
+    /// `poll_read` runs again on every wake-up of a read that parked. A
     /// stamp assigned rather than latched says the read arrived at the
-    /// moment it was about to return: a read blocked four seconds reports
-    /// having taken none, which is the one number the consumer actually
-    /// felt. It is also what a rate measured from the gap between reads
-    /// needs, since an arrival that moves puts our own stall inside the
-    /// previous read's gap.
+    /// moment it was about to return. A read blocked four seconds then
+    /// reports having taken none, and that is the one number the consumer
+    /// actually felt. A rate measured from the gap between reads needs it
+    /// too: an arrival that moves puts our own stall inside the previous
+    /// read's gap.
     #[test]
     fn one_read_is_stamped_once_however_often_it_is_polled() {
         let t0 = Instant::now();
@@ -716,8 +717,8 @@ mod tests {
         );
     }
 
-    /// A seek abandons the arrival with the wait: what the consumer asked
-    /// for before it seeked is not what it is asking for now, and a stamp
+    /// A seek abandons the arrival with the wait. What the consumer asked
+    /// for before it seeked is not what it is asking for now. A stamp
     /// carried across would measure the next read from a read that never
     /// happened.
     #[test]
