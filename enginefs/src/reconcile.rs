@@ -1,28 +1,29 @@
 //! Whether a torrent should be running, recomputed from what is true now.
 //!
-//! There is one persisted pause bit in the backend and there are two
-//! reasons to pause: nothing holds it and nobody pinned it, and the
-//! volume the torrent writes to is under its floor ([`Volumes::floor`],
-//! which is [`crate::free_space_floor`] of the volume's own size, and
-//! [`CACHE_FREE_SPACE_FLOOR`] only on a volume large enough for it). A
-//! starting playback must lift the first and must not lift the second.
+//! There is one persisted pause bit in the backend, and there are two
+//! reasons to pause. One is that nothing holds the torrent and nobody
+//! pinned it. The other is that the volume the torrent writes to is under
+//! its floor ([`Volumes::floor`], which is [`crate::free_space_floor`] of
+//! the volume's own size, and [`CACHE_FREE_SPACE_FLOOR`] only on a volume
+//! large enough for it). A starting playback must lift the first and must
+//! not lift the second.
 //!
-//! Not an in-memory record of *why* a torrent was paused --
-//! `Engine::idle_paused`, `Engine::stopped_for_space`, the backend's own
-//! set of the hashes it idle-paused -- consulted before acting: such a
-//! record is a claim about the past, held in memory that starts empty
-//! while the pause it describes is persisted and survives the restart.
-//! After a restart "empty" reads as "nobody paused it", so the call sites
-//! that would consult it are dead code in exactly the situation they exist
-//! for, and a stored "stopped for space" would in any case be a claim
-//! about a disk that may have been emptied since.
+//! Nothing here consults an in-memory record of *why* a torrent was paused
+//! before acting (`Engine::idle_paused`, `Engine::stopped_for_space`, the
+//! backend's own set of the hashes it idle-paused). Such a record is a
+//! claim about the past. It is held in memory that starts empty, while the
+//! pause it describes is persisted and survives the restart. After a
+//! restart "empty" reads as "nobody paused it". So the call sites that
+//! would consult it are dead code in exactly the situation they exist for.
+//! A stored "stopped for space" would in any case be a claim about a disk
+//! that may have been emptied since.
 //!
 //! So nothing here remembers anything. [`desired`] is a pure function of
 //! conditions that are all readable now, and the set of facts that has to
 //! survive a restart is empty. That works because both policies really are
-//! functions of the present, and because there is no user-initiated pause
-//! anywhere in this server's routes: no caller can say "leave this one
-//! stopped, I meant it".
+//! functions of the present. It also works because there is no
+//! user-initiated pause anywhere in this server's routes: no caller can say
+//! "leave this one stopped, I meant it".
 
 use crate::backend::RunState;
 use crate::{
@@ -33,15 +34,15 @@ use std::time::Duration;
 
 /// How often the reconciler recomputes every torrent's decision.
 ///
-/// The same number as [`FREE_SPACE_WATCH_INTERVAL`], and deliberately the
-/// same one: the free-space arm of [`desired`] is the watch's policy, and a
-/// slower tick would let a torrent write further past the floor before
-/// anything noticed (at 20 MB/s that is 40 MB per second of tick). Written
-/// as an alias rather than a second `from_secs(2)` so the two cannot drift.
+/// It is the same number as [`FREE_SPACE_WATCH_INTERVAL`], on purpose. The
+/// free-space arm of [`desired`] is the watch's policy. A slower tick would
+/// let a torrent write further past the floor before anything noticed (at
+/// 20 MB/s that is 40 MB per second of tick). It is written as an alias
+/// rather than a second `from_secs(2)`, so the two cannot drift.
 pub const RECONCILE_INTERVAL: Duration = FREE_SPACE_WATCH_INTERVAL;
 
-/// What the reconciler wants of a torrent -- never why, and never what call
-/// to make: mapping this onto the backend is the caller's job, because the
+/// What the reconciler wants of a torrent: never why, and never what call
+/// to make. Mapping this onto the backend is the caller's job, because the
 /// call that gets there depends on what the torrent is doing now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
@@ -50,45 +51,44 @@ pub enum Decision {
     /// The torrent should not be running.
     Stop,
     /// The torrent is in the backend's error state, the error was the
-    /// volume filling up, and the volume has room again: take it out of
-    /// that state ([`crate::backend::TorrentHandle::restart_from_error`]),
-    /// which re-checks its storage and puts it back to work.
+    /// volume filling up, and the volume has room again. Take it out of
+    /// that state ([`crate::backend::TorrentHandle::restart_from_error`]).
+    /// That re-checks its storage and puts it back to work.
     ///
-    /// Its own decision and not a [`Self::Run`], because the call is a
-    /// different one: `start_torrent` on a torrent in the error state
+    /// It is its own decision and not a [`Self::Run`], because the call is
+    /// a different one: `start_torrent` on a torrent in the error state
     /// starts nothing. It is also the one decision that is allowed to fail
-    /// into the same state it started from -- a restart onto a volume that
-    /// fills again errors again -- which is why the actuator holds it to
-    /// the dwell.
+    /// into the same state it started from. A restart onto a volume that
+    /// fills again errors again, which is why the actuator holds it to the
+    /// dwell.
     RestartFromError,
     /// Not ours: whatever state it is in, this reconcile has no opinion and
     /// must issue no call.
     Leave,
     /// The torrent advertises pieces nobody shares any more
-    /// ([`Conditions::shares_to_end`]): stop it -- it leaves the swarm, its
-    /// peers are disconnected -- then make its advertised set again from
-    /// what is still shared (`Engine::end_shares`), and decide again, which
-    /// starts it once more if it is still wanted: the same torrent's next
-    /// episode, a download. The ended play session's bytes are taken after
-    /// that (`Engine::drop_slack`), no longer advertised.
+    /// ([`Conditions::shares_to_end`]). Stop it, so it leaves the swarm and
+    /// its peers are disconnected. Then make its advertised set again from
+    /// what is still shared (`Engine::end_shares`), and decide again. That
+    /// starts it once more if it is still wanted, for the same torrent's
+    /// next episode or a download. The ended play session's bytes are taken
+    /// after that (`Engine::drop_slack`), no longer advertised.
     ///
-    /// Its own decision because it is two calls and a rebuild between
+    /// It is its own decision because it is two calls and a rebuild between
     /// them, made under the hash's reconcile lock so that nothing starts
-    /// the torrent in between. There is no un-Have in BitTorrent: an
+    /// the torrent in between. There is no un-Have in BitTorrent. An
     /// announcement ends only with the torrent leaving the swarm, so this
     /// is the one way a play session's announced pieces are deleted.
     EndShares,
 }
 
-/// What made a decision be taken now. It changes two things -- which
-/// free-space line the volume is measured against (`line`) and whether
-/// the anti-flap dwell applies -- and both differences are the same
-/// difference: a decision taken because *somebody is waiting for it* is
-/// answering a person, while a decision taken by the timer is answering
-/// nobody.
+/// What made a decision be taken now. It changes two things: which
+/// free-space line the volume is measured against (`line`), and whether
+/// the anti-flap dwell applies. Both differences are the same difference.
+/// A decision taken because *somebody is waiting for it* is answering a
+/// person, while a decision taken by the timer is answering nobody.
 ///
-/// Nothing below the free-space arm reads the trigger -- what holds a
-/// torrent is declared before anything asks ([`Conditions::held`]) -- so
+/// Nothing below the free-space arm reads the trigger, because what holds
+/// a torrent is declared before anything asks ([`Conditions::held`]). So
 /// the ladder answers the same question to everyone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
@@ -96,15 +96,14 @@ pub enum Trigger {
     Timer,
     /// Somebody is waiting on this decision right now.
     ///
-    /// Named for its main case, which is a playback starting on this
-    /// torrent -- and it is also the pin of an offline download and the
-    /// focus of a stream. All three are somebody about to read from this
-    /// torrent, which is what the trigger is for: a torrent they are owed
-    /// is measured against the floor rather than the resume line, and is
-    /// not made to wait out a dwell that exists to protect an announce
-    /// budget.
+    /// It is named for its main case, which is a playback starting on this
+    /// torrent. It is also the pin of an offline download and the focus of
+    /// a stream. All three are somebody about to read from this torrent,
+    /// which is what the trigger is for. A torrent they are owed is
+    /// measured against the floor rather than the resume line. It is not
+    /// made to wait out a dwell that exists to protect an announce budget.
     ///
-    /// The test is *waiting*, not *asked*: a caller that is not about to
+    /// The test is *waiting*, not *asked*. A caller that is not about to
     /// open a reader asks as a [`Self::Timer`], so neither concession is
     /// spent on it.
     PlaybackStart,
@@ -114,40 +113,41 @@ pub enum Trigger {
 /// of it a record of something this process did earlier.
 #[derive(Debug, Clone, Copy)]
 pub struct Conditions {
-    /// What the backend's state machine says the torrent is doing --
-    /// [`crate::backend::TorrentHandle::run_state`], never its `paused`
-    /// flag, which across an initial check is wrong in both directions.
+    /// What the backend's state machine says the torrent is doing:
+    /// [`crate::backend::TorrentHandle::run_state`]. It is never the
+    /// `paused` flag, which across an initial check is wrong in both
+    /// directions.
     pub run_state: RunState,
     /// This process has re-applied its want-set to this torrent.
     ///
-    /// The one record in the whole design that is a claim about something
-    /// *this process did*, and it is here because starting false is the
-    /// correct answer rather than a hole. A backend that sets piece reclaim
-    /// ([`crate::backend::TorrentBackend::sets_piece_reclaim`]) restores
-    /// every torrent paused and wanting every hole in its storage, because
-    /// the piece-level want-set did not survive the record; until the
-    /// caller has put the want-set back, starting one would have a seeder
-    /// refill holes it is about to drop. A fresh process has re-applied
-    /// nothing, so `false` at start is exactly true -- which is what every
-    /// record this design deleted could not say.
+    /// This is the one record in the whole design that is a claim about
+    /// something *this process did*. It is here because starting false is
+    /// the correct answer rather than a hole. A backend that sets piece
+    /// reclaim ([`crate::backend::TorrentBackend::sets_piece_reclaim`])
+    /// restores every torrent paused and wanting every hole in its storage,
+    /// because the piece-level want-set did not survive the record. Until
+    /// the caller has put the want-set back, starting one would have a
+    /// seeder refill holes it is about to drop. A fresh process has
+    /// re-applied nothing, so `false` at start is exactly true. Every
+    /// record this design deleted could not say that.
     ///
-    /// Not to be confused with a *settled reading* of
+    /// It is not to be confused with a *settled reading* of
     /// [`Self::run_state`], which is about the backend's state machine and
     /// nothing to do with this process: see [`desired`]'s first two arms.
     pub settled: bool,
-    /// Something said it is using this torrent: an explicit hold (a player
-    /// screen open on it, a cast of it published --
+    /// Something said it is using this torrent. That is an explicit hold
+    /// (a player screen open on it, a cast of it published;
     /// [`crate::retention::holds`]), a viewer's idle share of it while idle
     /// sharing is allowed, or a body being delivered off it (a stream
     /// response registered on it, or a read not yet ended).
-    /// `EngineFS::held` reads it. Never the liveness cell
+    /// `EngineFS::held` reads it. It is never the liveness cell
     /// ([`crate::retention::live`]), which any open moves and nobody
     /// declared.
     ///
-    /// Declared, not inferred, and not a clock: a viewer who pauses for an
-    /// hour still has the screen open, a television still has the cast, and
-    /// what ends either is the holder saying so (leaving the player,
-    /// unpublishing), never a gap in the reads.
+    /// It is declared, not inferred, and not a clock. A viewer who pauses
+    /// for an hour still has the screen open, and a television still has
+    /// the cast. What ends either is the holder saying so (leaving the
+    /// player, unpublishing), never a gap in the reads.
     pub held: bool,
     /// Some file of it is pinned as an offline download.
     pub pinned: bool,
@@ -155,12 +155,12 @@ pub struct Conditions {
     /// ([`crate::backend::TorrentHandle::is_out_of_space`]), rather than
     /// for any of the other reasons it calls fatal.
     ///
-    /// Read by the `Error` arm alone, and meaningless above it: a torrent
-    /// that is not in the error state is not stopped for anything. It is
-    /// what tells the one error this process knows how to undo from every
-    /// error it does not -- a storage that failed its check, a write past
-    /// what the platform can address -- because restarting one of those
-    /// puts it straight back where it was.
+    /// Only the `Error` arm reads it, and it is meaningless above that arm:
+    /// a torrent that is not in the error state is not stopped for
+    /// anything. It tells the one error this process knows how to undo from
+    /// every error it does not (a storage that failed its check, a write
+    /// past what the platform can address). Restarting one of those puts it
+    /// straight back where it was.
     pub out_of_space: bool,
     /// The info dictionary is known. A magnet that is still resolving one
     /// has no files, no length and nothing to write.
@@ -168,20 +168,20 @@ pub struct Conditions {
     /// The torrent has everything it wants, so it writes nothing.
     pub finished: bool,
     /// The torrent advertises a piece no play session or download of it
-    /// shares any more -- the draw of a file the viewer left, a download
-    /// since unpinned (`Engine::shares_to_end`). Read from the backend's
-    /// advertised set and the retention owner's draws, now; nothing
+    /// shares any more: the draw of a file the viewer left, or a download
+    /// since unpinned (`Engine::shares_to_end`). It is read now, from the
+    /// backend's advertised set and the retention owner's draws. Nothing
     /// remembers that a session ended.
     pub shares_to_end: bool,
     /// Free bytes on the volume the torrent writes to, or `None` when the
     /// probe failed. `None` is "unknown", never "full".
     pub available: Option<u64>,
     /// The free space to keep on that volume, sized to it
-    /// ([`crate::free_space_floor`]) and read beside `available` -- the two
-    /// are one reading of one device ([`Volumes::record`]). Carried rather
-    /// than looked up so the ladder measures against the floor the reading
-    /// was taken under, not one recomputed from a volume it may since have
-    /// left.
+    /// ([`crate::free_space_floor`]) and read beside `available`. The two
+    /// are one reading of one device ([`Volumes::record`]). It is carried
+    /// rather than looked up, so the ladder measures against the floor the
+    /// reading was taken under, not one recomputed from a volume it may
+    /// since have left.
     pub floor: u64,
 }
 
@@ -190,95 +190,95 @@ pub struct Conditions {
 /// The ladder, in order, and why each arm is where it is:
 ///
 /// 1. **Not a settled reading -> [`Decision::Stop`].** An `Initializing` reading is
-///    not a state anything may conclude from: where the torrent ends up
+///    not a state anything may conclude from. Where the torrent ends up
 ///    when its check finishes is decided then, by the pause intent as it
-///    stands at that moment, so nothing read before it says where it will
+///    stands at that moment. So nothing read before it says where it will
 ///    land (see [`crate::backend::TorrentHandle::run_state`]). `Gone` is a
 ///    torrent the backend holds no state for at all. Neither is a reading
-///    that says "this should be running", and the honest answer to "should
-///    it be running?" is therefore no -- which is also the safe direction.
-///    What no caller may do is turn this into a pause call on an
-///    initializing torrent: pausing one wedges it (`FileOps::initial_check`
-///    bails on the pause, the check's continuation leaves the state
-///    `Initializing` with no check running, nothing but an unpause runs it
+///    that says "this should be running", so the honest answer to "should
+///    it be running?" is no. That is also the safe direction. What no
+///    caller may do is turn this into a pause call on an initializing
+///    torrent, because pausing one wedges it. `FileOps::initial_check`
+///    bails on the pause, and the check's continuation leaves the state
+///    `Initializing` with no check running. Nothing but an unpause runs it
 ///    again, and `ManagedTorrent::wait_until_initialized` refuses every
-///    waiter on that pair). An actuator acts on settled readings; this arm
+///    waiter on that pair. An actuator acts on settled readings. This arm
 ///    exists so the arms below cannot read `held` or `available` off an
 ///    unsettled one and conclude `Run`.
 /// 2. **Want-set not re-applied -> [`Decision::Stop`].**
 ///    [`Conditions::settled`]: a torrent this process has not put its
-///    want-set back on must not be started, because under piece reclaim it
-///    would come up wanting every hole in its storage. Above the `Error`
-///    arm, and it costs that arm nothing: the actuator's `Stop` calls
-///    nothing on a torrent that is not running, so for an errored torrent
-///    the two answers differ only in that this one also lets a read refusal
-///    lapse -- which is right, since a torrent nobody has settled is not a
-///    statement about a disk.
+///    want-set back on must not be started. Under piece reclaim it would
+///    come up wanting every hole in its storage. The arm sits above the
+///    `Error` arm, and it costs that arm nothing. The actuator's `Stop`
+///    calls nothing on a torrent that is not running. So for an errored
+///    torrent the two answers differ only in that this one also lets a
+///    read refusal lapse. That is right, since a torrent nobody has settled
+///    is not a statement about a disk.
 /// 3. **`Error` -> [`Decision::RestartFromError`] or
 ///    [`Decision::Leave`].** A torrent the backend stopped with an error
-///    is running nothing and writing nothing, so there is no call to make
-///    -- except the one that undoes it, and exactly one error is undoable
-///    from out here: the volume filled up. Three things have to hold
-///    together for that, on top of the settled reading this arm is already
-///    guarded by. The error has to be that one
-///    ([`Conditions::out_of_space`]); the volume has to be over the resume
-///    line, not merely over the floor, because a restart re-checks the
-///    storage and goes straight back to writing; and somebody has to want
-///    it -- playing or pinned -- since a torrent nobody wants is one whose
-///    bytes the retention owner is taking anyway (`EngineFS::retain_engine`
-///    removes an unwanted errored torrent with its files). Anything else
-///    is `Leave`: not ours, no call, and no read refusal lifted. The
-///    restart is a consequence of the device having room, never of an
-///    eviction having happened: a device that gained a gigabyte by any
-///    other means gets its torrent back, and a pass that freed a byte does
-///    not restart one onto a volume still under the floor.
+///    is running nothing and writing nothing, so there is no call to make,
+///    except the one that undoes it. Exactly one error is undoable from out
+///    here: the volume filled up. Three things have to hold together for
+///    that, on top of the settled reading this arm is already guarded by.
+///    The error has to be that one ([`Conditions::out_of_space`]). The
+///    volume has to be over the resume line, not merely over the floor,
+///    because a restart re-checks the storage and goes straight back to
+///    writing. And somebody has to want it (playing or pinned). A torrent
+///    nobody wants is one whose bytes the retention owner is taking anyway
+///    (`EngineFS::retain_engine` removes an unwanted errored torrent with
+///    its files). Anything else is `Leave`: not ours, no call, and no read
+///    refusal lifted. The restart is a consequence of the device having
+///    room, never of an eviction having happened. A device that gained a
+///    gigabyte by any other means gets its torrent back. A pass that freed
+///    a byte does not restart one onto a volume still under the floor.
 /// 4. **Shares to end -> [`Decision::EndShares`].** A play session is
-///    over -- playback moved to another file of this torrent, or to another
-///    torrent -- or a download was unpinned, and what it announced has to
-///    end. It ends only by the torrent leaving the swarm, so the torrent is
-///    stopped before anything of it is deleted, whatever else holds: above
-///    `held` and `pinned`, which decide only whether it starts again
-///    afterwards, and above the free-space arm, which would stop it anyway.
-///    Only a settled `Live` or `Paused` torrent reaches it.
+///    over, or a download was unpinned, and what it announced has to end.
+///    (A session is over when playback moved to another file of this
+///    torrent, or to another torrent.) It ends only by the torrent leaving
+///    the swarm, so the torrent is stopped before anything of it is
+///    deleted, whatever else holds. The arm sits above `held` and `pinned`,
+///    which decide only whether it starts again afterwards. It sits above
+///    the free-space arm, which would stop it anyway. Only a settled `Live`
+///    or `Paused` torrent reaches it.
 /// 5. **No metadata -> [`Decision::Run`].** A resolving magnet must stay
-///    connected to the swarm: the thing it is fetching is the info
-///    dictionary, it writes no file data while it does, and stopping it is
-///    how you make a magnet that never resolves. Above the free-space arm
-///    for that reason -- it cannot fill a disk.
+///    connected to the swarm. The thing it is fetching is the info
+///    dictionary, and it writes no file data while it does. Stopping it is
+///    how you make a magnet that never resolves. The arm sits above the
+///    free-space arm for that reason: it cannot fill a disk.
 /// 6. **Writing, and the volume is under the line -> [`Decision::Stop`].**
-///    Above `held`, which is the point: librqbit writes the file it
-///    wants straight to `ENOSPC` and calls that a fatal torrent error, so a
+///    It sits above `held`, which is the point. librqbit writes the file it
+///    wants straight to `ENOSPC` and calls that a fatal torrent error. So a
 ///    stream that is playing is exactly the torrent that will run the
 ///    volume to zero. A finished torrent writes nothing and so is never
-///    stopped by this arm. Which line, and what an unreadable probe means,
-///    is `line` and [`volume_is_short`].
+///    stopped by this arm. `line` and [`volume_is_short`] say which line,
+///    and what an unreadable probe means.
 /// 7. **An unreadable volume, and the torrent still has data to fetch ->
 ///    [`Decision::Leave`] for the timer, [`Decision::Run`] for a
 ///    playback.** An unreadable volume is not a full one. The timer has no
-///    opinion -- it asks again in two seconds, and a probe that has started
-///    failing is a broken environment, not evidence about a disk -- and the
-///    user who is waiting gets their stream, since refusing to start a
-///    torrent because `statvfs` failed would make an unreadable volume look
-///    like a server that plays nothing.
+///    opinion. It asks again in two seconds, and a probe that has started
+///    failing is a broken environment, not evidence about a disk. The user
+///    who is waiting gets their stream. Refusing to start a torrent because
+///    `statvfs` failed would make an unreadable volume look like a server
+///    that plays nothing.
 /// 8. **Playing or pinned -> [`Decision::Run`], otherwise
 ///    [`Decision::Stop`].** Someone is watching it, or someone asked for it
-///    offline; and if neither, a running torrent is fetching a film nobody
-///    is watching, into a cache whose next pass will delete every byte of
-///    it. So it is stopped, seeding on or off.
+///    offline. If neither, a running torrent is fetching a film nobody is
+///    watching, into a cache whose next pass will delete every byte of it.
+///    So it is stopped, seeding on or off.
 ///
-///    No clock decides this arm and no [`Trigger`] gates it:
-///    [`Conditions::held`] is what the users of the torrent declared -- a
-///    player screen's hold from its first request until it is left, a
-///    cast's from publish to unpublish, a body's for as long as it is
-///    delivered ([`crate::retention::holds`]) -- and nothing a request leaves
-///    behind. A viewer who pauses keeps their torrent running for as long
-///    as they like, and so does a television the film was handed to,
-///    whatever else a stream opens meanwhile; and what a viewer watched
-///    last goes on running after they leave it, as their idle share, while
-///    idle sharing is allowed and until they watch something else. Once
-///    nothing holds it, it stops.
+///    No clock decides this arm and no [`Trigger`] gates it.
+///    [`Conditions::held`] is what the users of the torrent declared, and
+///    nothing a request leaves behind. It is a player screen's hold from
+///    its first request until it is left, a cast's from publish to
+///    unpublish, and a body's for as long as it is delivered
+///    ([`crate::retention::holds`]). A viewer who pauses keeps their
+///    torrent running for as long as they like. So does a television the
+///    film was handed to, whatever else a stream opens meanwhile. What a
+///    viewer watched last goes on running after they leave it, as their
+///    idle share, while idle sharing is allowed and until they watch
+///    something else. Once nothing holds it, it stops.
 ///    Otherwise seeding is what a *pinned* torrent does, and pins are
-///    kept: with nothing held and nothing pinned there is nothing to
+///    kept. With nothing held and nothing pinned there is nothing to
 ///    seed from, because the bytes are going.
 pub fn desired(conditions: &Conditions, trigger: Trigger) -> Decision {
     verdict(conditions, trigger).decision
@@ -286,12 +286,12 @@ pub fn desired(conditions: &Conditions, trigger: Trigger) -> Decision {
 
 /// A [`desired`] decision together with the arm of the ladder that took it.
 ///
-/// The arm is computed, never remembered -- it comes out of the same walk
-/// of the same ladder as the decision, and is gone by the time the call
+/// The arm is computed, never remembered. It comes out of the same walk of
+/// the same ladder as the decision, and is gone by the time the call
 /// returns to anything that could store it. It is here because the two
-/// stops mean different things to different readers: only the free-space
-/// one is a statement about the device, which is what the statistics report
-/// to a client (`Engine::is_stopped_for_space`) and what the stream
+/// stops mean different things to different readers. Only the free-space
+/// one is a statement about the device. That is what the statistics report
+/// to a client (`Engine::is_stopped_for_space`), and what the stream
 /// route's disk gate refuses on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Verdict {
@@ -346,10 +346,10 @@ pub fn verdict(conditions: &Conditions, trigger: Trigger) -> Verdict {
         };
     }
     // An unreadable volume is not a full one. For the timer that means no
-    // opinion at all -- it will ask again in two seconds, and a probe that
+    // opinion at all. It will ask again in two seconds, and a probe that
     // has started failing is a broken environment, not evidence about a
     // disk. For a playback it means the user who is waiting gets their
-    // stream: refusing to start a torrent because `statvfs` failed would
+    // stream. Refusing to start a torrent because `statvfs` failed would
     // make an unreadable volume look like a server that plays nothing.
     if !conditions.finished && conditions.available.is_none() {
         return arm(match trigger {
@@ -358,12 +358,12 @@ pub fn verdict(conditions: &Conditions, trigger: Trigger) -> Verdict {
         });
     }
     // Nothing below reads the trigger. A `PlaybackStart` is a caller
-    // saying somebody is about to open a reader on this torrent: its
+    // saying somebody is about to open a reader on this torrent. Its
     // stream is registered by `on_stream_start` before it asks anything
-    // (and a player's hold taken before that), so `held` says so and the
-    // answer is the same whoever is asking, and
-    // `focus_torrent` -- which registers nothing at all -- is safe on its
-    // own account rather than by running two lines after something else.
+    // (and a player's hold taken before that). So `held` says so, and the
+    // answer is the same whoever is asking. `focus_torrent` registers
+    // nothing at all, and it is safe on its own account rather than by
+    // running two lines after something else.
     arm(if conditions.held || conditions.pinned {
         Decision::Run
     } else {
@@ -374,28 +374,28 @@ pub fn verdict(conditions: &Conditions, trigger: Trigger) -> Verdict {
 /// The free-space arm of [`desired`] on its own: whether the volume this
 /// torrent writes to is too short, against `line`, for it to be running.
 ///
-/// `wants_to_write` is the first half -- only a torrent that still has data
-/// to fetch can take a volume down, so a magnet that has not resolved its
+/// `wants_to_write` is the first half. Only a torrent that still has data
+/// to fetch can take a volume down. So a magnet that has not resolved its
 /// info dictionary (no files, no length) and a torrent that has everything
-/// it wants are both outside this arm however little room is left. The
+/// it wants are both outside this arm, however little room is left. The
 /// second half is the reading against `line`.
 ///
 /// It is a function of its own, and not a line inside the ladder, because
-/// the ladder is not the only caller: `Engine::is_stopped_for_space` asks
+/// the ladder is not the only caller. `Engine::is_stopped_for_space` asks
 /// the same question of a torrent that is already stopped, for the
 /// statistics a client polls and for the stream route's disk gate.
 /// A second copy of the test in either place is a policy in two halves that
-/// drift, which is how the free-space watch would come to skip the very
+/// drift. That is how the free-space watch would come to skip the very
 /// torrents the stream route answers `507` for.
 ///
 /// **The line is the caller's, and the two callers do not want the same
 /// one.** The ladder asks "should I start this torrent?" and takes its line
-/// from `line`, which is the hysteresis; everything that asks "is this
-/// device short?" -- the statistics a client reads, the stream route's
-/// gate -- asks at the volume's own floor ([`Volumes::floor`]), the same
+/// from `line`, which is the hysteresis. Everything that asks "is this
+/// device short?" asks at the volume's own floor ([`Volumes::floor`]): the
+/// statistics a client reads, and the stream route's gate. That is the same
 /// number `ensure_download_disk_ready` answers `507` under and the
-/// published cap keeps free. Handing the hysteresis to those callers reports a volume the
-/// rest of the server is happy with as out of disk.
+/// published cap keeps free. Handing the hysteresis to those callers
+/// reports a volume the rest of the server is happy with as out of disk.
 pub fn volume_is_short(
     line: u64,
     has_metadata: bool,
@@ -408,31 +408,31 @@ pub fn volume_is_short(
 /// The free-space line the *ladder's* decision is measured against, and the
 /// whole of the hysteresis.
 ///
-/// One line would flap: a torrent stopped at the floor is started again the
-/// moment the volume reads a byte over it, writes for two seconds, crosses
-/// back under and is stopped again -- and each stop drops its peers while
+/// One line would flap. A torrent stopped at the floor is started again the
+/// moment the volume reads a byte over it. It writes for two seconds,
+/// crosses back under and is stopped again. Each stop drops its peers, and
 /// each start re-announces. The classic fix is a stored "I stopped this
 /// one" bit, and that bit is exactly what this design refuses to keep.
 ///
 /// It does not need one: a Schmitt trigger's memory can be its own output,
 /// and the output here is observable. A torrent that is **already running**
 /// is measured against the floor, so it keeps running until the volume
-/// actually falls under it; a torrent that is **stopped** is measured
+/// actually falls under it. A torrent that is **stopped** is measured
 /// against the floor plus [`FREE_SPACE_RESUME_MARGIN`], so it is not
 /// started again until there is room to run into. Inside the band each
 /// keeps doing what it is doing, which is the definition of no flapping.
 ///
 /// A [`Trigger::PlaybackStart`] is measured against the floor whatever the
-/// torrent is doing: the margin is there to stop a *timer* restarting
-/// something into a nearly-full volume for no one, and a user pressing play
-/// on a volume that has room above the floor is owed their stream.
+/// torrent is doing. The margin is there to stop a *timer* restarting
+/// something into a nearly-full volume for no one. A user pressing play on
+/// a volume that has room above the floor is owed their stream.
 ///
 /// It is the ladder's alone. A reader that is not deciding whether to make
-/// a start/stop call wants the floor itself -- see [`volume_is_short`].
+/// a start/stop call wants the floor itself; see [`volume_is_short`].
 ///
-/// `floor` is the volume's own ([`Volumes::floor`]): the constant was one
+/// `floor` is the volume's own ([`Volumes::floor`]). The constant was one
 /// number for every device until a 4 GB television made it more than the
-/// device had free, and every reader of it has to move together or the
+/// device had free. Every reader of it has to move together, or the
 /// stream route admits what the ladder then stops (see
 /// [`crate::free_space_floor`]).
 pub(crate) fn line(trigger: Trigger, observed: RunState, floor: u64) -> u64 {
@@ -446,29 +446,29 @@ pub(crate) fn line(trigger: Trigger, observed: RunState, floor: u64) -> u64 {
 /// long it has been too short to run a torrent on.
 ///
 /// This is not a record of anything the process decided. It is the
-/// reconciler's most recent *observation* of a live input -- at most one
-/// [`RECONCILE_INTERVAL`] old -- kept because the question "is this torrent
-/// stopped because its volume is full?" is asked far more often than the
-/// volume can usefully be measured: every `stats.json` poll asks it, and
-/// so does the disk gate in front of every stream. A `statvfs` per asker
-/// would be a syscall per torrent per poll for a number that changes on the
-/// scale of seconds.
+/// reconciler's most recent *observation* of a live input, at most one
+/// [`RECONCILE_INTERVAL`] old. It is kept because the question "is this
+/// torrent stopped because its volume is full?" is asked far more often
+/// than the volume can usefully be measured. Every `stats.json` poll asks
+/// it, and so does the disk gate in front of every stream. A `statvfs` per
+/// asker would be a syscall per torrent per poll, for a number that changes
+/// on the scale of seconds.
 ///
 /// **One reading for the whole session, not one per torrent.** It is a
-/// property of a device: torrents writing to it share it, and the stall
-/// bound counted per torrent would start its clock again for each of them
-/// (see `Self::short_for`). A map keyed by each torrent's output folder
-/// instead would leave the folder to ask about every caller's to work out
-/// -- which is how three of them would come to ask about a card nothing
+/// property of a device, and the torrents writing to it share it. The
+/// stall bound counted per torrent would start its clock again for each of
+/// them (see `Self::short_for`). A map keyed by each torrent's output
+/// folder instead would leave every caller to work out which folder to ask
+/// about. That is how three of them would come to ask about a card nothing
 /// writes to.
 pub struct Volumes {
-    /// The folder every torrent's payload is written to -- the piece
-    /// store's root ([`crate::piece_store::StoreRoot`]), which is where the
-    /// session's default storage puts every byte of every torrent.
+    /// The folder every torrent's payload is written to: the piece store's
+    /// root ([`crate::piece_store::StoreRoot`]). That is where the session's
+    /// default storage puts every byte of every torrent.
     ///
-    /// One folder for all of them, and not the per-torrent output folder
-    /// the backend reports: that folder is a *name*, librqbit records one
-    /// and reports file paths under it, but no payload byte is written
+    /// It is one folder for all of them, and not the per-torrent output
+    /// folder the backend reports. That folder is a *name*. librqbit records
+    /// one and reports file paths under it, but no payload byte is written
     /// there (see `backend::librqbit::session_storage_factory`). Probing it
     /// would answer about the wrong device in both directions. There is one
     /// torrent-data root (`settings.cacheRoot`) and a pin is a retention
@@ -483,16 +483,17 @@ struct Reading {
     /// `None` is "unknown" everywhere, never "full".
     available: Option<u64>,
     /// The floor the volume is held to, from the same probe:
-    /// [`crate::free_space_floor`] of the volume's size. The constant until
-    /// the first probe, and for a volume that will not say its size.
+    /// [`crate::free_space_floor`] of the volume's size. It is the constant
+    /// until the first probe, and for a volume that will not say its size.
     floor: u64,
     /// The clock reading when this volume was first seen with less than
     /// its `floor` + [`FREE_SPACE_RESUME_MARGIN`] free.
     ///
-    /// That line, and not the floor, because this is the number the stall
-    /// bound is judged on: a stopped torrent is not started again until the
-    /// volume clears the margin, so between the floor and the margin its
-    /// readers are still waiting for something that is not coming.
+    /// It is that line, and not the floor, because this is the number the
+    /// stall bound is judged on. A stopped torrent is not started again
+    /// until the volume clears the margin. So between the floor and the
+    /// margin its readers are still waiting for something that is not
+    /// coming.
     short_since: Option<u64>,
 }
 
@@ -516,9 +517,9 @@ impl Volumes {
 
     /// The free space this volume is held to: [`crate::free_space_floor`]
     /// of its size at the last probe. Every reader that asks "is this
-    /// device short?" -- the ladder, the statistics, the stream route's
-    /// gate -- takes its floor from here, so they cannot disagree about
-    /// one device.
+    /// device short?" takes its floor from here, so they cannot disagree
+    /// about one device. Those readers are the ladder, the statistics and
+    /// the stream route's gate.
     pub fn floor(&self) -> u64 {
         self.reading.lock().floor
     }
@@ -533,15 +534,15 @@ impl Volumes {
     /// Record a probe of [`Self::data_folder`] taken at `now_secs`.
     ///
     /// A failed probe (`available` of `None`) leaves [`Reading::short_since`]
-    /// exactly as it was: it is evidence neither that the volume filled nor
-    /// that it cleared, and starting or clearing the stall clock on a
-    /// `statvfs` that stopped answering would fail a player's reads because
-    /// of a broken environment rather than because of a full disk.
+    /// exactly as it was. It is evidence neither that the volume filled nor
+    /// that it cleared. Starting or clearing the stall clock on a `statvfs`
+    /// that stopped answering would fail a player's reads because of a
+    /// broken environment rather than because of a full disk.
     ///
     /// `total` is the volume's size from the same probe, or `None` where it
-    /// would not say; it sizes the floor the reading is judged against. A
-    /// volume that will not say its size is held to the whole constant --
-    /// a failed reading is not a licence to cut the margin.
+    /// would not say. It sizes the floor the reading is judged against. A
+    /// volume that will not say its size is held to the whole constant,
+    /// because a failed reading is not a licence to cut the margin.
     pub(crate) fn record(&self, available: Option<u64>, total: Option<u64>, now_secs: u64) {
         let mut reading = self.reading.lock();
         reading.available = available;
@@ -565,13 +566,13 @@ impl Volumes {
     /// How long the volume has been under the line a stopped torrent has to
     /// see cleared before anything starts it again; `None` when it is not.
     ///
-    /// Per volume and not per torrent, which is the point of it. The bound
-    /// exists to fail reads that nothing is ever going to complete, and
-    /// what decides that is the state of the disk, not when this particular
-    /// torrent happened to be stopped: a second torrent stopped on the same
-    /// full volume a minute later has readers as doomed as the first one's,
-    /// and counting from its own stop would give them a fresh twenty
-    /// seconds of spinning for a disk that has been full the whole time.
+    /// It is per volume and not per torrent, which is the point of it. The
+    /// bound exists to fail reads that nothing is ever going to complete.
+    /// What decides that is the state of the disk, not when this particular
+    /// torrent happened to be stopped. A second torrent stopped on the same
+    /// full volume a minute later has readers as doomed as the first one's.
+    /// Counting from its own stop would give them a fresh twenty seconds of
+    /// spinning for a disk that has been full the whole time.
     pub(crate) fn short_for(&self, now_secs: u64) -> Option<Duration> {
         let since = self.reading.lock().short_since?;
         Some(Duration::from_secs(now_secs.saturating_sub(since)))
@@ -579,10 +580,10 @@ impl Volumes {
 }
 
 /// The line a volume has to clear before a stopped torrent is started
-/// again, which is `line`'s upper arm -- and the line the running-low
-/// bell is rung under ([`crate::retention::SlackBell`]), so that the slack
-/// is given back while the volume is still inside the band rather than
-/// once it is under the floor.
+/// again, which is `line`'s upper arm. It is also the line the running-low
+/// bell is rung under ([`crate::retention::SlackBell`]). So the slack is
+/// given back while the volume is still inside the band, rather than once
+/// it is under the floor.
 pub(crate) fn resume_line(floor: u64) -> u64 {
     floor.saturating_add(FREE_SPACE_RESUME_MARGIN)
 }
@@ -590,16 +591,16 @@ pub(crate) fn resume_line(floor: u64) -> u64 {
 /// One lock per info hash, so that reconciling one torrent never queues
 /// behind reconciling another.
 ///
-/// The obvious shape -- one `tokio::Mutex` around the whole policy -- is
-/// not merely inelegant: the pause call it would guard is `Session::pause`,
-/// which flushes the session's persistence file before it returns, so
-/// every torrent's decision would wait on every other torrent's disk
-/// write. A playback starting on one hash could sit behind a slow stop of
-/// an unrelated one.
+/// The obvious shape is one `tokio::Mutex` around the whole policy. That
+/// is not merely inelegant. The pause call it would guard is
+/// `Session::pause`, which flushes the session's persistence file before
+/// it returns. So every torrent's decision would wait on every other
+/// torrent's disk write. A playback starting on one hash could sit behind
+/// a slow stop of an unrelated one.
 ///
-/// Entries live only while a caller holds or waits for one, exactly as
-/// `BackendEngineFS::pin_locks` does, so an engine that reconciles a
-/// thousand torrents over a session keeps no thousand mutexes.
+/// Entries live only while a caller holds or waits for one, exactly as in
+/// `BackendEngineFS::pin_locks`. So an engine that reconciles a thousand
+/// torrents over a session keeps no thousand mutexes.
 #[derive(Default)]
 pub(crate) struct HashLocks {
     locks: parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -607,8 +608,8 @@ pub(crate) struct HashLocks {
 
 impl HashLocks {
     /// Take this hash's lock, waiting for whoever holds it. The guard
-    /// releases it -- and forgets the entry if nobody else wants it -- when
-    /// it is dropped.
+    /// releases it when it is dropped, and forgets the entry if nobody else
+    /// wants it.
     pub(crate) async fn lock(&self, info_hash: &str) -> HashLockGuard<'_> {
         let lock = self
             .locks
@@ -642,15 +643,15 @@ pub(crate) struct HashLockGuard<'a> {
 
 impl Drop for HashLockGuard<'_> {
     fn drop(&mut self) {
-        // The mutex first, the map second, and never the other way round: a
-        // caller that arrived after the entry was dropped but before the
-        // mutex was released would build itself a *second* mutex for the
-        // same hash and hold it at the same time as us. Dropping the entry
-        // is safe only for an entry nobody can still reach, and the
+        // The mutex first, the map second, and never the other way round.
+        // A caller could arrive after the entry was dropped but before the
+        // mutex was released. It would build itself a *second* mutex for
+        // the same hash and hold it at the same time as us. Dropping the
+        // entry is safe only for an entry nobody can still reach. The
         // `strong_count` below is read under the map lock, which is the
-        // same lock a new caller needs to clone the `Arc` -- so the count
-        // cannot change while it is being read. Two is ours plus the map's:
-        // a waiter, or a second guard, holds a third.
+        // same lock a new caller needs to clone the `Arc`. So the count
+        // cannot change while it is being read. Two is ours plus the map's.
+        // A waiter, or a second guard, holds a third.
         self.guard.take();
         let mut locks = self.locks.locks.lock();
         if Arc::strong_count(&self.lock) == 2 {
@@ -695,8 +696,8 @@ mod tests {
     }
 
     /// The property the whole shape exists for. One torrent's reconcile can
-    /// be arbitrarily slow -- the pause it makes flushes librqbit's session
-    /// file to disk -- and it must hold up no other torrent's. A single
+    /// be arbitrarily slow, because the pause it makes flushes librqbit's
+    /// session file to disk. It must hold up no other torrent's. A single
     /// global mutex would fail this.
     #[tokio::test(start_paused = true)]
     async fn a_slow_reconcile_holds_up_only_its_own_torrent() {
@@ -738,12 +739,12 @@ mod tests {
     /// stopped torrent's parked readers have anything coming.
     ///
     /// Three of its rules have nothing behind them but this test. It runs
-    /// from the moment the volume goes short and is not restarted by later
-    /// short readings, or a disk that stayed full would keep handing its
-    /// readers fresh patience. It is judged against the **resume line** and
-    /// not the floor, because between the two a stopped torrent is still
-    /// not started: its readers are still waiting for something that is not
-    /// coming. And a probe that failed clears nothing -- an unreadable
+    /// from the moment the volume goes short, and later short readings do
+    /// not restart it. Otherwise a disk that stayed full would keep handing
+    /// its readers fresh patience. It is judged against the **resume line**
+    /// and not the floor, because between the two a stopped torrent is
+    /// still not started. Its readers are still waiting for something that
+    /// is not coming. And a probe that failed clears nothing. An unreadable
     /// `statvfs` is evidence neither that the volume filled nor that it
     /// emptied, and failing a player's reads because the environment broke
     /// is not what the bound is for.
@@ -801,7 +802,7 @@ mod tests {
     /// condition it is about.
     ///
     /// `held` is part of "nothing wrong with it". A torrent nobody
-    /// is playing and nobody has pinned is one the ladder stops -- its
+    /// is playing and nobody has pinned is one the ladder stops. Its
     /// bytes are the retention owner's to delete, so there is nothing for
     /// it to fetch and nothing to seed from.
     fn healthy() -> Conditions {
@@ -887,7 +888,7 @@ mod tests {
 
     /// **The ladder measures against the volume's own floor, not the
     /// constant.** A 4 GB television with 422 MB free is under the 512 MB
-    /// the constant names and over the 128 MB its own size allows -- on the
+    /// the constant names, and over the 128 MB its own size allows. On the
     /// constant, the ladder would stop a torrent the stream route had just
     /// started for such a device.
     #[test]
@@ -922,10 +923,10 @@ mod tests {
     /// recently it was watched.
     ///
     /// There is no grace period and no clock. A viewer who pauses is still
-    /// playing this torrent -- the screen's hold says so until the screen
-    /// is left -- so there is no wait for "a player between two segment
-    /// reads" to cover: that reading came from the reads going quiet, and
-    /// a hold does not.
+    /// playing this torrent: the screen's hold says so until the screen is
+    /// left. So there is no wait for "a player between two segment reads"
+    /// to cover. That reading came from the reads going quiet, and a hold
+    /// does not.
     #[test]
     fn a_torrent_nobody_plays_and_nobody_pinned_is_stopped() {
         let left = Conditions {
@@ -957,10 +958,10 @@ mod tests {
         assert_eq!(desired(&healthy(), Trigger::PlaybackStart), Decision::Run);
     }
 
-    /// An initializing torrent is a torrent whose fate its check will
-    /// decide from a `start_paused` nobody out here can see, and a `Gone`
-    /// one has no state at all. Neither says "this should be running", and
-    /// no condition below the top of the ladder may argue otherwise.
+    /// An initializing torrent is one whose fate its check will decide,
+    /// from a `start_paused` nobody out here can see. A `Gone` one has no
+    /// state at all. Neither says "this should be running", and no
+    /// condition below the top of the ladder may argue otherwise.
     #[test]
     fn an_unsettled_reading_is_never_read_as_should_be_running() {
         for run_state in [
@@ -984,10 +985,10 @@ mod tests {
     }
 
     /// A torrent the backend stopped with an error on a volume that is
-    /// still full is left exactly where it is: there is nowhere to restart
+    /// still full is left exactly where it is. There is nowhere to restart
     /// it into, and pausing a torrent that is not running means nothing.
     /// The arm above this one is what puts it back to work, and only once
-    /// the volume has cleared -- this is the reading where it has not.
+    /// the volume has cleared. This is the reading where it has not.
     #[test]
     fn an_errored_torrent_with_no_room_to_restart_into_is_left_alone() {
         let dead = Conditions {
@@ -999,10 +1000,11 @@ mod tests {
         assert_eq!(desired(&dead, Trigger::Timer), Decision::Leave);
         assert_eq!(desired(&dead, Trigger::PlaybackStart), Decision::Leave);
 
-        // And only while its want-set is back. Without it nothing would
-        // restart the torrent whatever the volume said -- an unsettled
-        // reading is never read as "this should be running" -- and `Leave`
-        // would hold a read refusal that nothing was ever going to lift.
+        // And only while its want-set is back. Without it, nothing would
+        // restart the torrent whatever the volume said, because an
+        // unsettled reading is never read as "this should be running". And
+        // `Leave` would hold a read refusal that nothing was ever going to
+        // lift.
         let unsettled = Conditions {
             settled: false,
             ..dead
@@ -1015,13 +1017,13 @@ mod tests {
     /// that have to hold together before it says so.
     ///
     /// A restart re-checks the torrent's storage and puts it straight back
-    /// to writing, which is why none of the four is optional: an error that
+    /// to writing, which is why none of the four is optional. An error that
     /// was not the volume filling comes back the moment the torrent runs
     /// (a storage that failed its check, a write past what the platform can
-    /// address); a volume merely over the floor has no room to run into and
-    /// fills again within seconds; and a torrent nobody is playing and
-    /// nobody pinned has no reason to run at all -- its bytes are the
-    /// retention owner's to take.
+    /// address). A volume merely over the floor has no room to run into and
+    /// fills again within seconds. A torrent nobody is playing and nobody
+    /// pinned has no reason to run at all: its bytes are the retention
+    /// owner's to take.
     #[test]
     fn an_errored_torrent_is_restarted_only_when_a_full_volume_killed_it_and_has_cleared() {
         let killed = Conditions {
@@ -1099,8 +1101,8 @@ mod tests {
 
     /// A magnet that has not resolved its info dictionary is fetching that
     /// dictionary from the swarm and writing no file data. Stopping it is
-    /// how a magnet never resolves -- so not even a full volume and a day
-    /// of idleness stops one.
+    /// how a magnet never resolves. So not even a full volume and a day of
+    /// idleness stops one.
     #[test]
     fn a_resolving_magnet_runs_whatever_else_is_true() {
         let resolving = Conditions {
@@ -1112,8 +1114,8 @@ mod tests {
         assert_eq!(desired(&resolving, Trigger::Timer), Decision::Run);
     }
 
-    /// The arm the free-space watch exists for, and it is above `held`
-    /// on purpose: the torrent that fills the volume is the one being
+    /// The arm the free-space watch exists for. It is above `held` on
+    /// purpose, because the torrent that fills the volume is the one being
     /// watched.
     #[test]
     fn a_writing_torrent_under_the_floor_stops_even_while_watched() {
@@ -1140,7 +1142,7 @@ mod tests {
     }
 
     /// A probe that failed is not a reading of zero. The timer says nothing
-    /// and asks again in two seconds; a playback start gets its stream,
+    /// and asks again in two seconds. A playback start gets its stream,
     /// because a server that plays nothing whenever `statvfs` fails is
     /// worse than one that writes onto a volume it cannot measure.
     #[test]
@@ -1154,7 +1156,7 @@ mod tests {
     }
 
     /// The hysteresis, from both ends. A running torrent is measured
-    /// against the floor; a stopped one has to see the floor plus the
+    /// against the floor. A stopped one has to see the floor plus the
     /// margin before a timer starts it. The only thing that remembers which
     /// side it is on is the torrent itself.
     #[test]
@@ -1214,11 +1216,11 @@ mod tests {
     }
 
     /// The test the hysteresis exists for. Park the volume anywhere inside
-    /// the band and run the loop the reconciler will run -- decide, let the
-    /// torrent follow the decision, decide again on what it is doing now --
-    /// for thirty ticks. Both starting states must sit still: a running
-    /// torrent keeps running, a stopped one stays stopped, and neither
-    /// changes its mind once.
+    /// the band, and run the loop the reconciler will run for thirty ticks:
+    /// decide, let the torrent follow the decision, decide again on what it
+    /// is doing now. Both starting states must sit still. A running torrent
+    /// keeps running, a stopped one stays stopped, and neither changes its
+    /// mind once.
     #[test]
     fn nothing_flaps_inside_the_band() {
         for start in [RunState::Live, RunState::Paused] {
