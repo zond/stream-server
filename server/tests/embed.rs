@@ -1,9 +1,9 @@
 // Every test in this file starts a full embedded server. Both of its ports
-// are ephemeral: the HTTP port (`http_addr` port 0) and, through
-// `ServerConfig`'s default `TorrentListenPort::Ephemeral`, librqbit's
-// BitTorrent listener -- so any number of these servers coexist with each
-// other and with a desktop instance on its fixed 42000..42010 range, and
-// `cargo test`'s parallelism needs no limiting.
+// are ephemeral: the HTTP port (`http_addr` port 0) and librqbit's
+// BitTorrent listener, through `ServerConfig`'s default
+// `TorrentListenPort::Ephemeral`. So any number of these servers coexist
+// with each other and with a desktop instance on its fixed 42000..42010
+// range, and `cargo test`'s parallelism needs no limiting.
 
 use stream_server::{ServerAuth, ServerConfig, ServerHandle, TorrentListenPort};
 
@@ -29,11 +29,12 @@ use torrent_fixtures::{
 /// [`offline_config`] for a test that seeds a torrent's pieces itself and
 /// then reads them back.
 ///
-/// The one difference is the pin set: unknown rather than an empty record,
-/// so the retention pass never takes what the fixture wrote and the test is
-/// not racing a two-second timer. **A test about retention, idle pausing,
-/// the reconciler or the pin routes must not use this** -- it is about a
-/// cache that may not be touched. [`fixture_pins`] is the whole argument.
+/// The one difference is the pin set: unknown rather than an empty record.
+/// So the retention pass never takes what the fixture wrote, and the test
+/// is not racing a two-second timer. **A test about retention, idle
+/// pausing, the reconciler or the pin routes must not use this.** This
+/// config is about a cache that may not be touched. [`fixture_pins`] is the
+/// whole argument.
 fn seeded_fixture_config() -> ServerConfig {
     fixture_pins::keep_what_the_fixture_seeded(offline_config())
 }
@@ -59,16 +60,16 @@ fn torrent_pins(
 /// discovery included.
 ///
 /// The other two switches ([`offline_config`]) stop the DNS, the DoH and
-/// the tracker traffic, and with both off a run still shouted every info
-/// hash it held over BEP-14 multicast. A fixture built from deterministic
-/// bytes has a deterministic info hash, so two concurrent runs of the same
-/// test found each other and swapped pieces -- a seeded store came out
-/// holding more than the test's own seeder had ever uploaded.
+/// the tracker traffic. A run with both off still shouted every info hash
+/// it held over BEP-14 multicast. A fixture built from deterministic bytes
+/// has a deterministic info hash, so two concurrent runs of the same test
+/// found each other and swapped pieces. A seeded store came out holding
+/// more than the test's own seeder had ever uploaded.
 ///
-/// What is asserted is the *setting*, because the setting is what the
-/// session is built from and what the report describes: a config that says
-/// this process may not announce is the default `btEnableLsd` takes, not a
-/// veto applied somewhere the report cannot see.
+/// The test asserts the *setting*, because the session is built from the
+/// setting and the report describes it. A config that says this process may
+/// not announce is the default `btEnableLsd` takes. It is not a veto
+/// applied somewhere the report cannot see.
 #[test]
 fn a_test_does_not_announce_itself_on_the_local_network() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -84,9 +85,9 @@ fn a_test_does_not_announce_itself_on_the_local_network() -> anyhow::Result<()> 
         !handle.settings()?.bt_enable_lsd,
         "the offline config left local service discovery on"
     );
-    // Nor on the DHT: with the bootstrap names left to librqbit, it
-    // resolved them itself and joined, and strangers looked the test's info
-    // hash up and dialled in.
+    // Nor on the DHT. When the bootstrap names were left to librqbit, it
+    // resolved them itself and joined. Strangers then looked the test's
+    // info hash up and dialled in.
     assert!(
         !handle.settings()?.bt_enable_dht,
         "the offline config left the DHT on"
@@ -103,9 +104,9 @@ fn a_test_does_not_announce_itself_on_the_local_network() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Resolving bootstrap names is on in the stock configuration -- the Android
-/// embed is the case it exists for -- and so are the public trackers, which
-/// are how a real torrent finds peers at all.
+/// Resolving bootstrap names is on in the stock configuration (the Android
+/// embed is the case it exists for). So are the public trackers, which are
+/// how a real torrent finds peers at all.
 #[test]
 fn the_stock_config_resolves_dht_bootstrap_names() {
     assert!(ServerConfig::default().resolve_dht_bootstrap_names);
@@ -118,8 +119,8 @@ fn the_stock_config_resolves_dht_bootstrap_names() {
 }
 
 /// Every launch generates a per-launch token. There is no way to ask for an
-/// open control API: `ServerAuth::Disabled` was the deleted daemon's
-/// `--no-auth` and went with it, so `Generated` is both the default and the
+/// open control API. `ServerAuth::Disabled` was the deleted daemon's
+/// `--no-auth` and went with it. So `Generated` is both the default and the
 /// only value.
 #[test]
 fn the_stock_config_generates_a_token() {
@@ -128,7 +129,7 @@ fn the_stock_config_generates_a_token() {
 
 /// A server takes an OS-assigned BitTorrent listen port, so any number of
 /// them coexist. The fixed, forwardable range is still reachable, but only
-/// for an embedder that names it: the type's own `Default` is `Ephemeral`
+/// for an embedder that names it. The type's own `Default` is `Ephemeral`
 /// too, so `..Default::default()` on any config holding one cannot bind it.
 #[test]
 fn the_stock_config_uses_an_ephemeral_torrent_port() {
@@ -177,21 +178,22 @@ fn two_embedded_servers_start_concurrently() -> anyhow::Result<()> {
 }
 
 /// Start/stop round trip, plus the auth contract of the default
-/// (`ServerAuth::Generated`) server: the handle exposes the token, control
-/// routes 401 without it or with a wrong one (fixed body, no hint), accept
-/// it in `Authorization: Bearer`, and media routes stay open -- `/ftp/...`
-/// without a token gets its ordinary 400 for a missing `lz`, never a 401.
+/// (`ServerAuth::Generated`) server. The handle exposes the token. Control
+/// routes answer 401 without it or with a wrong one (fixed body, no hint),
+/// and accept it in `Authorization: Bearer`. Media routes stay open:
+/// `/ftp/...` without a token gets its ordinary 400 for a missing `lz`,
+/// never a 401.
 ///
-/// Also open: the `/local-addon` stub. stremio-core's default profile carries
-/// the protected `http://127.0.0.1:11470/local-addon/manifest.json` addon and
-/// requests `/local-addon/stream/{type}/{id}.json` on every details page, so
-/// the stub must answer the manifest and an empty stream list without a token
-/// (legacy clients call it too). A profile synced from an account carries a
-/// descriptor for the same addon that also declares an `other`/`local`
-/// catalog, so `catalog/{type}/{id}.json` and the extra-args
-/// `catalog/{type}/{id}/{extra}.json` shape must answer an empty but valid
-/// catalog; `meta` stays a 404, and so does every other resource under the
-/// prefix.
+/// The `/local-addon` stub is open too. stremio-core's default profile
+/// carries the protected `http://127.0.0.1:11470/local-addon/manifest.json`
+/// addon and requests `/local-addon/stream/{type}/{id}.json` on every
+/// details page. So the stub must answer the manifest and an empty stream
+/// list without a token (legacy clients call it too). A profile synced from
+/// an account carries a descriptor for the same addon that also declares an
+/// `other`/`local` catalog. So `catalog/{type}/{id}.json` and the
+/// extra-args `catalog/{type}/{id}/{extra}.json` shape must answer an empty
+/// but valid catalog. `meta` stays a 404, and so does every other resource
+/// under the prefix.
 
 #[test]
 fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
@@ -238,7 +240,7 @@ fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
     assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
 
     // A nested control router (`/casting`, the path stremio-core requests) is
-    // behind the same middleware; `/casting/` is no route at all, so it falls
+    // behind the same middleware. `/casting/` is no route at all, so it falls
     // through to the (open) 404 fallback like any unknown path.
     let response = anonymous.get(format!("{base}/casting")).send()?;
     assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
@@ -325,16 +327,15 @@ fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// **Loopback answers no CORS.** Loopback is not "only this
-/// app": any page a browser on the device has open reaches it, and the open
-/// routes fetch what the caller names -- `/proxy?d=http://192.168.1.1/admin`
-/// under `Access-Control-Allow-Origin: *` would be a page reading the LAN
-/// through this server. Nothing that reads loopback is a browser (mpv, the
-/// embedder's HTTP client, stremio-core), so no response there grants a
+/// **Loopback answers no CORS.** Loopback is not "only this app": any page
+/// a browser on the device has open reaches it. The open routes fetch what
+/// the caller names, so `/proxy?d=http://192.168.1.1/admin` under
+/// `Access-Control-Allow-Origin: *` would be a page reading the LAN through
+/// this server. Nothing that reads loopback is a browser (mpv, the
+/// embedder's HTTP client, stremio-core). So no response there grants a
 /// cross-origin read: not a preflight, not a media `GET`, not a control
 /// route. The Cast receiver's CORS lives on the LAN listener, and
-/// `lan_media_listener_serves_media_but_no_control_route` holds
-/// it there.
+/// `lan_media_listener_serves_media_but_no_control_route` holds it there.
 #[test]
 fn loopback_grants_no_cross_origin_read() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -397,13 +398,13 @@ fn header_value(response: &reqwest::blocking::Response, name: &str) -> String {
 ///
 /// stremio-core probes `/device-info` at startup expecting
 /// `{"availableHardwareAccelerations": [...]}`. This fork does no
-/// transcoding, so the honest answer is an empty list — but the route must
-/// exist (200, not 404) or every client boot logs an ERROR-level 404 in
+/// transcoding, so the honest answer is an empty list. The route must still
+/// exist (200, not 404), or every client boot logs an ERROR-level 404 in
 /// diagnostics::logging.
 ///
-/// And the DHT state a client needs to say "DHT unavailable, using
-/// trackers only" instead of pretending peer discovery is healthy is
-/// `ServerHandle::dht_status`, crossing FFI as JSON in these names.
+/// A client needs the DHT state to say "DHT unavailable, using trackers
+/// only" instead of pretending peer discovery is healthy. That state is
+/// `ServerHandle::dht_status`, which crosses FFI as JSON in these names.
 #[test]
 fn device_info_keeps_its_shape_and_the_dht_status_is_reported() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -443,7 +444,7 @@ fn device_info_keeps_its_shape_and_the_dht_status_is_reported() -> anyhow::Resul
 }
 
 /// The signal a client's "working in the background" indicator reads. An
-/// idle server is dark, and asking is not itself an event: it starts no
+/// idle server is dark. Asking is not itself an event: it starts no
 /// torrent, so a light can never be the reason there is something to report.
 #[test]
 fn background_traffic_is_dark_on_an_idle_server() -> anyhow::Result<()> {
@@ -487,8 +488,8 @@ fn background_traffic_is_dark_on_an_idle_server() -> anyhow::Result<()> {
 ///
 /// `GET /casting` answers an empty list. The SSDP discovery loop that filled
 /// it ran only in the deleted daemon and is gone, so empty is now the only
-/// answer -- and the honest one, since nothing could be cast to a discovered
-/// device anyway, which is the other half of this test.
+/// answer. It is also the honest one: nothing could be cast to a discovered
+/// device anyway, and that is the other half of this test.
 ///
 /// stremio-core's play_on_device (models/streaming_server.rs:716-744) POSTs
 /// to `casting/{device}/player` and treats any 2xx response as
@@ -553,7 +554,7 @@ fn casting_lists_no_devices_and_refuses_to_play_on_one() -> anyhow::Result<()> {
 }
 
 /// stremio-video's createTorrent.js checks `resp.ok` before reading the
-/// body (createTorrent.js:62); a 200 on failure leaves `guessedFileIdx`
+/// body (createTorrent.js:62). A 200 on failure leaves `guessedFileIdx`
 /// undefined downstream and produces a broken `/{infoHash}/undefined`
 /// stream URL. `POST /create` must fail with a non-2xx status for
 /// malformed requests instead.
@@ -596,12 +597,12 @@ fn create_engine_reports_failure_with_non_2xx_status() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A magnet in `POST /create`'s `from` -- a link or a bare info hash --
-/// goes through the shared, timed magnet registry like `/{infoHash}/create`
-/// and the stream route, never through `EngineFS::add_torrent`: a stats
+/// A magnet in `POST /create`'s `from` (a link or a bare info hash) goes
+/// through the shared, timed magnet registry like `/{infoHash}/create` and
+/// the stream route. It never goes through `EngineFS::add_torrent`. A stats
 /// poll arriving while the create still resolves sees that very add, with
 /// the link's own `tr=` trackers. (Through `add_torrent` the create would
-/// hang unbounded on librqbit's own resolve and the poll would start a
+/// hang unbounded on librqbit's own resolve, and the poll would start a
 /// second, tracker-less one.)
 #[test]
 fn create_from_a_magnet_joins_the_shared_registry_add() -> anyhow::Result<()> {
@@ -618,9 +619,9 @@ fn create_from_a_magnet_joins_the_shared_registry_add() -> anyhow::Result<()> {
         .timeout(std::time::Duration::from_secs(2))
         .build()?;
 
-    // Neither magnet resolves -- no peers, an unreachable tracker -- so each
+    // Neither magnet resolves (no peers, an unreachable tracker). So each
     // create blocks past the client's patience while its add lives on in
-    // the registry, where the stats poll finds it.
+    // the registry. The stats poll finds it there.
     let link_hash = "aabbccddeeff00112233445566778899aabbccdd";
     let link_tracker = "udp://from-link.invalid:6969/announce";
     let bare_hash = "bbccddeeff00112233445566778899aabbccddee";
@@ -760,13 +761,14 @@ fn create_engine_guesses_episode_from_season_pack() -> anyhow::Result<()> {
 }
 
 /// **`diagnosticsTrace` turns the retention trace on and off in the running
-/// process.** The trace target is `off` in the filter a start installs, a
+/// process.** The trace target is `off` in the filter a start installs. A
 /// `POST /settings` with the switch on reaches the installed filter at once,
-/// and off again likewise; the value is persisted like any other setting.
+/// and one with it off does too. The value is persisted like any other
+/// setting.
 ///
 /// This is the one test in the binary that starts a server with
-/// `init_logging`, because `tracing` takes one global subscriber per process
-/// and this test has to own it to read its filter; the log files land in the
+/// `init_logging`. `tracing` takes one global subscriber per process, and
+/// this test has to own it to read its filter. The log files land in the
 /// test's own config dir.
 #[test]
 fn the_diagnostics_trace_setting_changes_the_installed_log_filter() -> anyhow::Result<()> {
@@ -816,11 +818,12 @@ fn the_diagnostics_trace_setting_changes_the_installed_log_filter() -> anyhow::R
     assert!(!proxy_on(), "the proxy trace outlived the switch");
     assert!(rest_on());
 
-    // A start over settings that already say `true` applies it: the second
+    // A start over settings that already say `true` applies it. The second
     // server in this process finds the log files installed and does not
     // install them again, so what it changes is this process's one filter.
-    // The first server's whole file with the one value flipped: a partial
-    // file does not parse as settings and would fall through to defaults.
+    // It gets the first server's whole file with the one value flipped. A
+    // partial file does not parse as settings and would fall through to
+    // defaults.
     let mut persisted: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
         config_dir.path().join("config").join("settings.json"),
     )?)?;
@@ -842,10 +845,10 @@ fn the_diagnostics_trace_setting_changes_the_installed_log_filter() -> anyhow::R
     assert!(trace_on(), "a persisted `true` was not applied at start");
 
     // An update that does not move the switch leaves the filter alone. The
-    // first server's own setting is `false`, and the filter is the process's:
-    // restated on every settings write, this turned the second server's trace
-    // off -- which is what failed CI, from another test's server writing its
-    // settings at the wrong moment.
+    // first server's own setting is `false`, and the filter belongs to the
+    // process. When the switch was restated on every settings write, this
+    // turned the second server's trace off. That is what failed CI: another
+    // test's server wrote its settings at the wrong moment.
     handle.update_settings(serde_json::json!({ "btMaxConnections": 55 }))?;
     assert!(
         trace_on(),
@@ -856,15 +859,15 @@ fn the_diagnostics_trace_setting_changes_the_installed_log_filter() -> anyhow::R
     Ok(())
 }
 
-/// The library API on `ServerHandle` is the same code the control routes
-/// stremio-core calls run, so the app (FFI, no HTTP client) and the core
-/// (HTTP) see one server: `settings()` is `GET /settings`' `values`,
+/// The library API on `ServerHandle` runs the same code as the control
+/// routes stremio-core calls, so the app (FFI, no HTTP client) and the core
+/// (HTTP) see one server. `settings()` is `GET /settings`' `values`.
 /// `update_settings` is `POST /settings` (same merge/validation, visible to
-/// the next GET), `engine_stats` creates the engine with the given trackers
-/// on first sight -- normalised like the routes' `tr=` values: `tracker:`
-/// stripped, `dht:` dropped -- and answers `resolvingMetadata` at once, and
-/// `file_stats` is `/{infoHash}/{fileIdx}/stats.json`, with the route's 404
-/// as `FileNotFound`.
+/// the next GET). `engine_stats` creates the engine with the given trackers
+/// on first sight and answers `resolvingMetadata` at once. It normalises the
+/// trackers like the routes' `tr=` values: `tracker:` stripped, `dht:`
+/// dropped. `file_stats` is `/{infoHash}/{fileIdx}/stats.json`, with the
+/// route's 404 as `FileNotFound`.
 #[test]
 fn library_api_matches_the_http_control_routes() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -920,7 +923,7 @@ fn library_api_matches_the_http_control_routes() -> anyhow::Result<()> {
     assert_eq!(handle.settings()?.bt_max_connections, 55);
 
     // engine_stats() creates the engine with the trackers on first sight and
-    // answers resolvingMetadata at once, exactly like the stats route; a
+    // answers resolvingMetadata at once, exactly like the stats route. A
     // later per-file poll over HTTP sees that very engine.
     let unresolved = "8899aabbccddeeff00112233445566778899aabb";
     let tracker = "udp://library-first.invalid:6969/announce";
@@ -1059,8 +1062,8 @@ fn post_settings_reports_which_bt_settings_took_effect() -> anyhow::Result<()> {
         applied_live.contains(&"btDownloadSpeedHardLimit".to_string()),
         "{report}"
     );
-    // So is the peer limit: it is the same runtime lever the background
-    // footprint uses, not a session option, so a client must not show
+    // So is the peer limit. It is the same runtime lever the background
+    // footprint uses, not a session option. So a client must not show
     // "restart to apply" for this setting.
     assert!(
         applied_live.contains(&"btMaxConnections".to_string()),
@@ -1104,9 +1107,9 @@ fn post_settings_reports_which_bt_settings_took_effect() -> anyhow::Result<()> {
 ///
 /// Env vars are process-global, so the assertion runs in a re-exec of this
 /// test binary with a cleared environment (the parent only checks the exit
-/// status). On Linux `dirs` silently falls back to the passwd entry when
-/// `HOME` is unset, which would hide the bug, so the child gets a `HOME`
-/// under `/proc` instead: it resolves, but nothing can be created there,
+/// status). `dirs` on Linux silently falls back to the passwd entry when
+/// `HOME` is unset, which would hide the bug. So the child gets a `HOME`
+/// under `/proc` instead. It resolves, but nothing can be created there,
 /// which is exactly what a `directories`-derived default path hits on
 /// Android.
 #[test]
@@ -1170,12 +1173,12 @@ fn starts_without_home_env() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The stats contract for the startup-phase fields: they are additive
+/// The stats contract for the startup-phase fields. They are additive
 /// (every server.js-compatible key stremio-core's `Statistics` parses is
-/// still there), camelCase, and `engine_stats` describes the guessed stream
-/// file while `/{infoHash}/{fileIdx}/stats.json` describes the requested
+/// still there) and camelCase. `engine_stats` describes the guessed stream
+/// file, while `/{infoHash}/{fileIdx}/stats.json` describes the requested
 /// file instead.
-/// The torrent has a dummy piece hash and no peers, so after the (instant)
+/// The torrent has a dummy piece hash and no peers. So after the (instant)
 /// hash check it must sit in `buffering` with nothing of the window on disk.
 #[test]
 fn stats_json_exposes_startup_phase_fields_additively() -> anyhow::Result<()> {
@@ -1210,12 +1213,12 @@ fn stats_json_exposes_startup_phase_fields_additively() -> anyhow::Result<()> {
             Some("checking") if std::time::Instant::now() < deadline => {
                 // **Both or neither, and never a number that is really a
                 // fact about timing.** A check that has begun but not yet
-                // reported states no bytes -- both fields are absent --
-                // and a runner caught exactly that: `phase: "checking"`
-                // with `checkedBytes` and `checkTotalBytes` null, which
-                // asserting `is_u64()` read as a broken contract. What the
-                // contract says is that the pair travels together and
-                // describes this torrent when it is there at all.
+                // reported states no bytes, so both fields are absent. A
+                // runner caught exactly that: `phase: "checking"` with
+                // `checkedBytes` and `checkTotalBytes` null, which
+                // asserting `is_u64()` read as a broken contract. The
+                // contract says the pair travels together and describes
+                // this torrent when it is there at all.
                 match (&stats["checkedBytes"], &stats["checkTotalBytes"]) {
                     (serde_json::Value::Null, serde_json::Value::Null) => {}
                     (checked, total) => {
@@ -1276,11 +1279,11 @@ fn stats_json_exposes_startup_phase_fields_additively() -> anyhow::Result<()> {
         assert!(discovery[key].is_u64(), "peerDiscovery.{key}: {stats}");
     }
     // Nobody is seeding this fixture torrent and the embedded session has no
-    // peer to connect to, so the honest answer is 0 -- but the field is there.
+    // peer to connect to, so the honest answer is 0. The field is still there.
     assert_eq!(stats["connectedSeeders"], 0, "{stats}");
     // Swarm-wide scrape figures. This fixture torrent has no trackers, so
-    // there is nothing to scrape and all three are null -- present in the
-    // shape, never a stand-in 0.
+    // there is nothing to scrape and all three are null. They are present in
+    // the shape, never a stand-in 0.
     for key in ["swarmSeeders", "swarmLeechers", "swarmScrapeAgeSecs"] {
         assert!(obj.contains_key(key), "{key} missing: {stats}");
         assert_eq!(stats[key], serde_json::Value::Null, "{key}: {stats}");
@@ -1288,9 +1291,9 @@ fn stats_json_exposes_startup_phase_fields_additively() -> anyhow::Result<()> {
     assert_eq!(stats["files"][1]["initialWindowBytes"], 700);
     assert_eq!(stats["files"][1]["initialWindowReadyBytes"], 0);
     // Sub-piece progress. Nothing has opened a stream on this torrent, so
-    // there is no piece anybody is waiting on: `null` at the top level and
-    // the key omitted per file -- absence, never a zeroed piece a client
-    // would draw as an empty bar.
+    // there is no piece anybody is waiting on. It is `null` at the top level
+    // and the key is omitted per file. That is absence, never a zeroed piece
+    // a client would draw as an empty bar.
     assert!(obj.contains_key("inFlightPiece"), "{stats}");
     assert_eq!(stats["inFlightPiece"], serde_json::Value::Null, "{stats}");
     assert!(
@@ -1324,19 +1327,19 @@ fn stats_json_exposes_startup_phase_fields_additively() -> anyhow::Result<()> {
 }
 
 /// A progress overlay polls `stats.json` from the moment playback is
-/// requested -- typically before the first stream request, and while the
-/// magnet is still resolving its metadata. Both stats routes must then (a)
-/// start the engine the way the stream route does, with the addon's `tr=`
-/// trackers (librqbit cannot add trackers later, and the stream request will
-/// reuse this engine), and (b) answer immediately with 200 and the
-/// torrent-level `resolvingMetadata` phase rather than blocking on metadata
-/// or 404ing the per-file route. A 404 is reserved for an index that does
-/// not exist once metadata is known.
+/// requested. That is typically before the first stream request, and while
+/// the magnet is still resolving its metadata. Both stats routes must then
+/// do two things. (a) Start the engine the way the stream route does, with
+/// the addon's `tr=` trackers (librqbit cannot add trackers later, and the
+/// stream request will reuse this engine). (b) Answer immediately with 200
+/// and the torrent-level `resolvingMetadata` phase, rather than blocking on
+/// metadata or 404ing the per-file route. A 404 is reserved for an index
+/// that does not exist once metadata is known.
 ///
-/// The same holds with the roles reversed: stremio-core's
+/// The same holds with the roles reversed. stremio-core's
 /// `/{infoHash}/create` (POST, with the stream's `peerSearch.sources`) must
 /// join the shared magnet add rather than start a private one with
-/// `EngineFS::add_torrent`, so a stats poll arriving while the create is
+/// `EngineFS::add_torrent`. So a stats poll arriving while the create is
 /// still resolving sees that very add, with the create's trackers.
 #[test]
 fn stats_json_reports_resolving_metadata_with_the_requests_trackers() -> anyhow::Result<()> {
@@ -1439,7 +1442,7 @@ fn stats_json_reports_resolving_metadata_with_the_requests_trackers() -> anyhow:
 }
 
 /// **A big `.torrent` is not a `413`.** The file arrives hex-encoded in a
-/// JSON body, so it must not run into axum's default 2 MB body limit: a
+/// JSON body, so it must not run into axum's default 2 MB body limit. A
 /// 20,000-piece torrent is about a megabyte hex-encoded, and a `413` there
 /// reads to the client as "the server would not take this file".
 #[test]
@@ -1456,7 +1459,7 @@ fn a_large_torrent_file_is_not_refused_by_the_body_limit() -> anyhow::Result<()>
     let client = bearer_client(&handle)?;
 
     // Well past the old limit: 3 MB of hex, which is a 1.5 MB "torrent".
-    // Not a valid one -- what matters is where the refusal comes from.
+    // It is not a valid one. What matters is where the refusal comes from.
     let big = hex::encode(vec![0u8; 1_500_000]);
     let response = client
         .post(format!("{base}/create"))
@@ -1480,10 +1483,10 @@ fn a_large_torrent_file_is_not_refused_by_the_body_limit() -> anyhow::Result<()>
 
 /// **A torrent file with no bytes is a `200` with no body.** `HEAD` reports
 /// `Content-Length: 0`, and an unranged `GET` answers `200` with an empty
-/// body: the inclusive end of an empty range must not saturate to 0 and
-/// read as a one-byte range, which would answer `416` -- a file the client
-/// sees as unreadable rather than empty. The archive routes and the torrent
-/// routes share this rule.
+/// body. The inclusive end of an empty range must not saturate to 0 and
+/// read as a one-byte range. That would answer `416`, and the client would
+/// see the file as unreadable rather than empty. The archive routes and the
+/// torrent routes share this rule.
 #[test]
 fn a_zero_length_torrent_file_is_an_empty_body_not_a_416() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -1526,9 +1529,9 @@ fn a_zero_length_torrent_file_is_an_empty_body_not_a_416() -> anyhow::Result<()>
     assert!(get.bytes()?.is_empty());
 
     // A `Range` on an empty file is the one thing that is a 416: there is
-    // no byte for it to name. And it names the file's length, so the
-    // player can ask again for something that is there -- the same
-    // refusal an archive member answers, because it is the same framing
+    // no byte for it to name. The refusal names the file's length, so the
+    // player can ask again for something that is there. An archive member
+    // answers the same refusal, because it is the same framing
     // (`routes::util::MediaRange`).
     let ranged = anonymous
         .get(&url)
@@ -1549,7 +1552,7 @@ fn seed_piece_store(cache_root: &std::path::Path, torrent_bytes: &[u8], content:
 }
 
 /// Pre-seed the named files of a torrent, whole pieces only. See
-/// [`seed_piece_store_pieces`] for the rules; this is that function with no
+/// [`seed_piece_store_pieces`] for the rules. This is that function with no
 /// hole in it.
 fn seed_piece_store_files(
     cache_root: &std::path::Path,
@@ -1564,40 +1567,40 @@ fn seed_piece_store_files(
 /// `<cacheRoot>/media-cache/.pieces/<info hash>/<bucket>/<piece>`, which
 /// is where the session's default storage keeps it.
 ///
-/// A whole file under `media-cache/<torrent name>/` does not work: the
+/// A whole file under `media-cache/<torrent name>/` does not work. The
 /// session's default storage is `PieceStoreFactory`, so a whole `.mkv`
-/// there is bytes nothing reads, and the check finds every piece missing
-/// and reports the torrent empty.
+/// there is bytes nothing reads. The check finds every piece missing and
+/// reports the torrent empty.
 ///
-/// `content` is the directory `real_torrent` was pointed at, and each file is
-/// read back through the path the *metainfo* gives, in the order the metainfo
-/// gives -- never the fixture's own write order. `create_torrent` walks with
-/// `walkdir` and does not sort, so the torrent's file order is the
-/// filesystem's readdir order, and a concatenation built any other way
+/// `content` is the directory `real_torrent` was pointed at. Each file is
+/// read back through the path the *metainfo* gives, in the order the
+/// metainfo gives, never in the fixture's own write order. `create_torrent`
+/// walks with `walkdir` and does not sort, so the torrent's file order is
+/// the filesystem's readdir order. A concatenation built any other way
 /// produces pieces whose hashes are wrong on some machines and right on
 /// others.
 ///
 /// `only` names the files (by their last path component) to seed, for a
-/// fixture that means to leave part of a torrent missing; `None` seeds all of
-/// them. A piece is written only when *every* byte of it belongs to a named
-/// file, so a fixture whose named files share a boundary piece with an
-/// unnamed one leaves that piece out rather than writing a piece whose hash
-/// cannot check -- and the assertion below says how many pieces were seeded,
-/// so a fixture that meant to seed something and seeded nothing fails here.
+/// fixture that means to leave part of a torrent missing. `None` seeds all
+/// of them. A piece is written only when *every* byte of it belongs to a
+/// named file. So a fixture whose named files share a boundary piece with an
+/// unnamed one leaves that piece out, rather than writing a piece whose hash
+/// cannot check. The assertion below says how many pieces were seeded, so a
+/// fixture that meant to seed something and seeded nothing fails here.
 ///
-/// `hole` is the other way to leave something out: a byte range of that same
-/// flat layout, every piece overlapping which is skipped. `only` picks whole
-/// files; this picks bytes, which is what a fixture needs when the gap has to
-/// be *inside* one file -- an archive whose ends are present, so its
+/// `hole` is the other way to leave something out: a byte range of that
+/// same flat layout. Every piece that overlaps it is skipped. `only` picks
+/// whole files and this picks bytes. A fixture needs that when the gap has
+/// to be *inside* one file: an archive whose ends are present, so its
 /// directory can be read, and whose middle never arrives, so a read of a
-/// member parks there for ever. Nothing seeds these fixtures, so a piece left
-/// out either way is a piece that never comes.
+/// member parks there for ever. Nothing seeds these fixtures, so a piece
+/// left out either way is a piece that never comes.
 ///
 /// **Call this after the server has started**, never before. The launch-time
 /// sweep (`enginefs::piece_store::sweep_before_session`) deletes every piece
-/// directory the embedder's pin set does not name, and one seeded before the
-/// process comes up is exactly that: the server would start, delete it, and
-/// the torrent would then check as empty. Which is the sweep working.
+/// directory the embedder's pin set does not name. A directory seeded before
+/// the process comes up is exactly that. The server would start and delete
+/// it, and the torrent would then check as empty. That is the sweep working.
 fn seed_piece_store_pieces(
     cache_root: &std::path::Path,
     torrent_bytes: &[u8],
@@ -1628,9 +1631,9 @@ fn seed_piece_store_pieces(
         if wanted {
             let from = blob.len() as u64;
             let to = from + bytes.len() as u64;
-            // Merged as they are collected: two seeded files that follow one
-            // another share a boundary piece, and a piece that straddles two
-            // ranges is inside neither of them.
+            // Ranges are merged as they are collected. Two seeded files that
+            // follow one another share a boundary piece, and a piece that
+            // straddles two ranges is inside neither of them.
             match seeded.last_mut() {
                 Some(last) if last.1 == from => last.1 = to,
                 _ => seeded.push((from, to)),
@@ -1644,7 +1647,7 @@ fn seed_piece_store_pieces(
         "the fixture and the torrent disagree about the payload"
     );
 
-    // Where each piece goes is asked of the store, never spelled out here:
+    // The store says where each piece goes. It is never spelled out here:
     // the bucketed layout is `enginefs::piece_store`'s, and a fixture with a
     // second copy of it would go on seeding happily after it changed.
     let store = piece_store(cache_root);
@@ -1682,7 +1685,7 @@ fn seed_piece_store_pieces(
     assert!(written > 0, "the fixture seeded no piece at all");
 }
 
-/// The session's piece store, where all of a torrent's data is -- the
+/// The session's piece store, where all of a torrent's data is: the
 /// streaming cache and an offline download alike.
 fn piece_store(cache_root: &std::path::Path) -> enginefs::piece_store::StoreRoot {
     enginefs::piece_store::StoreRoot::in_download_dir(&cache_root.join(enginefs::CACHE_DIR_NAME))
@@ -1707,11 +1710,11 @@ fn write_payload(path: &std::path::Path, len: usize) {
 
 /// A `TempDir`-derived path in the spelling the server answers with.
 ///
-/// `prepare_torrent_data_root` stores and reports the *resolved* `cacheRoot`,
-/// so an expectation built from a `TempDir` path has to be resolved the same
-/// way or it compares two spellings of the same directory: on Windows
-/// `TempDir` hands back the 8.3 short name (`C:\Users\RUNNER~1\...`) while
-/// the server answers with the long one (`C:\Users\runneradmin\...`), and on
+/// `prepare_torrent_data_root` stores and reports the *resolved* `cacheRoot`.
+/// So an expectation built from a `TempDir` path has to be resolved the same
+/// way, or it compares two spellings of the same directory. `TempDir` on
+/// Windows hands back the 8.3 short name (`C:\Users\RUNNER~1\...`), while
+/// the server answers with the long one (`C:\Users\runneradmin\...`). On
 /// macOS `/var/...` is a symlink to `/private/var/...`. Both sides go through
 /// the server's own `resolved_path` rather than a copy of it.
 fn resolved(path: &std::path::Path) -> std::path::PathBuf {
@@ -1732,9 +1735,9 @@ fn file_index(stats: &serde_json::Value, name: &str) -> usize {
 /// The torrent pieces one file of `stats.files` occupies, read off the
 /// stats the server itself answers with.
 ///
-/// Only for a fixture whose files are whole numbers of pieces -- which the
-/// assertion below says -- because a file that shares a boundary piece with
-/// its neighbour has no range of pieces that are only its own.
+/// It is only for a fixture whose files are whole numbers of pieces, and the
+/// assertion below says so. A file that shares a boundary piece with its
+/// neighbour has no range of pieces that are only its own.
 fn file_pieces(stats: &serde_json::Value, idx: usize, piece_length: u64) -> std::ops::Range<u32> {
     let number = |key: &str| {
         stats["files"][idx][key]
@@ -1751,23 +1754,23 @@ fn file_pieces(stats: &serde_json::Value, idx: usize, piece_length: u64) -> std:
 }
 
 /// How long a hash check (or a metadata resolve that has the metadata
-/// already) may take before a test gives up on it. Not a timing
-/// assertion -- only there so a regression fails instead of hanging -- so
-/// it is far above anything a correct run needs: the whole suite runs its
-/// servers in parallel, and a loaded two-core runner is an order of
+/// already) may take before a test gives up on it. It is not a timing
+/// assertion. It is only there so a regression fails instead of hanging,
+/// so it is far above anything a correct run needs. The whole suite runs
+/// its servers in parallel, and a loaded two-core runner is an order of
 /// magnitude slower than an idle machine.
 const CHECK_WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The verdict the reconciler's ladder reaches when the *free-space* arm is
-/// what stopped a torrent -- what `ServerHandle::reconcile_as_timer` must
-/// answer for a torrent held back by the volume rather than by anything
-/// else.
+/// what stopped a torrent. `ServerHandle::reconcile_as_timer` must answer
+/// it for a torrent held back by the volume rather than by anything else.
 ///
-/// Spelled out as its own thing because `for_space` is the load-bearing
-/// half. A bare `Decision::Stop` is nearly free to satisfy: the ladder's
-/// last arm stops every torrent nobody is playing and nothing has pinned,
-/// which is most torrents in most tests, so an assertion on the decision
-/// alone passes whether the free-space policy works or has been deleted.
+/// It is spelled out as its own thing because `for_space` is the
+/// load-bearing half. A bare `Decision::Stop` is nearly free to satisfy.
+/// The ladder's last arm stops every torrent nobody is playing and nothing
+/// has pinned, which is most torrents in most tests. So an assertion on the
+/// decision alone passes whether the free-space policy works or has been
+/// deleted.
 fn free_space_stop() -> enginefs::reconcile::Verdict {
     enginefs::reconcile::Verdict {
         decision: enginefs::reconcile::Decision::Stop,
@@ -1820,8 +1823,8 @@ fn poll_stats(client: &reqwest::blocking::Client, url: &str) -> anyhow::Result<s
         match stats["phase"].as_str() {
             Some("checking") | Some("resolvingMetadata") => {
                 // Say so rather than handing back `checking` stats the
-                // caller will then assert on: every caller needs the check
-                // to be over, so an expired bound is the failure, and a
+                // caller will then assert on. Every caller needs the check
+                // to be over, so an expired bound is the failure. A
                 // mystery `complete: false` three lines later is not the
                 // way to report it.
                 anyhow::ensure!(
@@ -1837,25 +1840,25 @@ fn poll_stats(client: &reqwest::blocking::Client, url: &str) -> anyhow::Result<s
 }
 
 /// `ServerHandle::set_background` is app-lifecycle wiring, and this is
-/// where the wiring is pinned: the call reaches the torrent session, the
-/// peer cap on the torrent moves with it both ways, nothing is paused, and
-/// a stream request that arrives while lean is still served.
+/// where the wiring is pinned. The call reaches the torrent session, the
+/// peer cap on the torrent moves with it both ways, and nothing is paused.
+/// A stream request that arrives while lean is still served.
 ///
 /// No swarm, no network, no peer at all. The footprint is read back through
 /// the engine (`is_background` asks `EngineFS`, which asks the backend, so
-/// a `set_background` that only flipped a flag on the handle fails here),
-/// the cap is read off the very torrent the server holds
+/// a `set_background` that only flipped a flag on the handle fails here).
+/// The cap is read off the very torrent the server holds
 /// (`torrent_peer_limit`, the same librqbit `peer_limit` the enginefs tests
-/// read), and the bytes come from a torrent whose data is already on disk.
+/// read). The bytes come from a torrent whose data is already on disk.
 ///
-/// Deliberately not here: what the cap does to individual peers -- hanging
-/// up on the surplus but *parking* it rather than forgetting it, and
-/// re-dialling the parked ones on the way back. That needs a swarm and is
+/// Deliberately not here: what the cap does to individual peers. It hangs
+/// up on the surplus but *parks* it rather than forgetting it, and
+/// re-dials the parked ones on the way back. That needs a swarm. It is
 /// enginefs's `lean_parks_the_surplus_and_full_re_dials_it`, which dials
 /// out to seeders whose addresses it was handed instead of waiting to be
-/// dialled: a test that needs live peers dialling *in* -- which is the only
-/// way this server's API lets a swarm form -- is a bet on the runner's own
-/// network stack, so this test reads the cap off data already on disk
+/// dialled. This server's API lets a swarm form only with live peers
+/// dialling *in*, and a test that needs that is a bet on the runner's own
+/// network stack. So this test reads the cap off data already on disk
 /// instead. The cap's arithmetic (`LEAN_PEER_LIMIT` on every torrent the
 /// session holds and on the next one added, the *configured* limit back on
 /// `Full`) is enginefs's `footprint_caps_every_torrent_and_the_next_one_added`,
@@ -1865,8 +1868,9 @@ fn set_background_caps_the_torrent_and_still_streams() -> anyhow::Result<()> {
     const LEAN: usize = enginefs::backend::LEAN_PEER_LIMIT;
 
     // Before any torrent exists: safe, idempotent, and only the footprint
-    // moves. Its own server, because the fixture below hands one back with
-    // its torrent already created; it is stopped at the end, with that one.
+    // moves. This gets its own server, because the fixture below hands one
+    // back with its torrent already created. It is stopped at the end, with
+    // that one.
     let bare_config = tempfile::tempdir()?;
     let bare_cache = tempfile::tempdir()?;
     let bare = stream_server::start(stream_server::ServerConfig {
@@ -1898,7 +1902,7 @@ fn set_background_caps_the_torrent_and_still_streams() -> anyhow::Result<()> {
 
     // The cap the torrent carries in the foreground is the session's
     // configured one, which every real profile puts well above the lean
-    // limit -- otherwise going lean would not be a shrink and the rest of
+    // limit. Otherwise going lean would not be a shrink, and the rest of
     // this test would pass on a torrent nothing ever capped.
     let configured = handle
         .torrent_peer_limit(&info_hash)
@@ -1910,7 +1914,7 @@ fn set_background_caps_the_torrent_and_still_streams() -> anyhow::Result<()> {
 
     // Background: the footprint reaches the engine and the cap on the
     // torrent moves with it. Both are read straight after the call rather
-    // than waited for -- it is synchronous down to librqbit.
+    // than waited for, because it is synchronous down to librqbit.
     handle.set_background(true);
     assert!(handle.is_background());
     assert_eq!(handle.torrent_peer_limit(&info_hash), Some(LEAN));
@@ -1939,9 +1943,9 @@ fn set_background_caps_the_torrent_and_still_streams() -> anyhow::Result<()> {
         "nor lift the cap"
     );
 
-    // Foreground: the configured cap comes back -- the value the session
-    // opened with, so a `Full` that restored the backend's own default
-    // would be caught -- and the next range is served the same way.
+    // Foreground: the configured cap comes back, and the next range is
+    // served the same way. The cap is the value the session opened with, so
+    // a `Full` that restored the backend's own default would be caught.
     handle.set_background(false);
     assert!(!handle.is_background());
     assert_eq!(handle.torrent_peer_limit(&info_hash), Some(configured));
@@ -1965,12 +1969,12 @@ fn set_background_caps_the_torrent_and_still_streams() -> anyhow::Result<()> {
 /// **What an older build left under `<cacheRoot>/.archives` is deleted at
 /// launch.** That directory was the archive layer's extraction cache: an
 /// archive downloaded whole and a member extracted beside it, about twice
-/// the film, unlinked only when the session holding them dropped -- and a
-/// killed process drops nothing, which on Android is the ordinary end.
-/// Nothing writes the directory (`crate::translators`: a member is
-/// ranges of the container), so on an upgraded install it is bytes no
-/// retention owner speaks for, no cache figure counts, and nothing else
-/// will ever take: the piece store's own legacy sweep walks
+/// the film. They were unlinked only when the session holding them
+/// dropped. A killed process drops nothing, and on Android that is the
+/// ordinary end. Nothing writes the directory now (`crate::translators`: a
+/// member is ranges of the container). So on an upgraded install it is
+/// bytes no retention owner speaks for, no cache figure counts, and nothing
+/// else will ever take. The piece store's own legacy sweep walks
 /// `<cacheRoot>/media-cache`, one level below this. So this launch
 /// takes it, once, and leaves everything beside it alone.
 #[test]
@@ -2009,7 +2013,7 @@ fn a_previous_builds_archive_scratch_is_gone_at_the_next_start() -> anyhow::Resu
     Ok(())
 }
 
-/// Poll until `path` is gone, or fail naming it: the boot's delete of a
+/// Poll until `path` is gone, or fail naming it. The boot's delete of a
 /// retired cache directory runs on the blocking pool after the session
 /// opens, so `start` returning is not the end of it.
 fn until_gone(path: &std::path::Path) -> anyhow::Result<()> {
@@ -2026,9 +2030,9 @@ fn until_gone(path: &std::path::Path) -> anyhow::Result<()> {
 }
 
 /// **The previous build's cache directory is deleted at boot, with no
-/// migration**: `<cacheRoot>/rqbit-downloads` -- pieces, proxy chunks,
-/// session records -- is gone once the boot's delete has run, the session
-/// opened on `<cacheRoot>/media-cache` ([`enginefs::CACHE_DIR_NAME`]) and
+/// migration.** `<cacheRoot>/rqbit-downloads` (pieces, proxy chunks,
+/// session records) is gone once the boot's delete has run. The session
+/// opened on `<cacheRoot>/media-cache` ([`enginefs::CACHE_DIR_NAME`]), and
 /// nothing beside them is touched. The old name is the on-disk contract
 /// this deletes, so the test spells it.
 #[test]
@@ -2068,9 +2072,9 @@ fn a_previous_builds_cache_directory_is_deleted_at_boot() -> anyhow::Result<()> 
 }
 
 /// **A delete a killed process left half done is finished by the next
-/// boot**: a `.rqbit-downloads.deleting` at the cache root -- the name the
-/// old directory is renamed to before the session opens -- is deleted too,
-/// and so is an old directory found beside it.
+/// boot.** A `.rqbit-downloads.deleting` at the cache root is deleted too,
+/// and so is an old directory found beside it. That is the name the old
+/// directory is renamed to before the session opens.
 #[test]
 fn a_cache_directory_left_mid_delete_is_deleted_at_the_next_boot() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -2103,10 +2107,10 @@ fn a_cache_directory_left_mid_delete_is_deleted_at_the_next_boot() -> anyhow::Re
 
 /// **What a boot puts under `media-cache` is exactly what the launch sweep
 /// spares.** The sweep removes every entry under it that is neither on
-/// `piece_store::sweep`'s `NOT_OURS` list nor a session record, so a new
-/// directory that is not on that list is deleted by the next launch: this
-/// pins the entries a boot with a torrent added leaves there, and a second
-/// boot, which sweeps, keeping them. A new sibling fails here first.
+/// `piece_store::sweep`'s `NOT_OURS` list nor a session record. So a new
+/// directory that is not on that list is deleted by the next launch. This
+/// test pins the entries a boot with a torrent added leaves there, and a
+/// second boot, which sweeps, keeping them. A new sibling fails here first.
 #[test]
 fn the_cache_directory_holds_only_what_the_sweep_spares() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -2173,10 +2177,11 @@ fn the_cache_directory_holds_only_what_the_sweep_spares() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// **One pin set, both stores**: `ServerConfig::pins: None` is "nobody
+/// **One pin set, both stores.** `ServerConfig::pins: None` is "nobody
 /// said", and a boot under it sweeps neither the piece store nor the proxy
-/// cache; `Some(vec![])` is "nothing is pinned", and a boot under it sweeps
-/// both. What each half keeps of a non-empty set is the stores' own tests'.
+/// cache. `Some(vec![])` is "nothing is pinned", and a boot under it sweeps
+/// both. The stores' own tests cover what each half keeps of a non-empty
+/// set.
 #[test]
 fn one_pin_set_decides_both_launch_sweeps() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -2227,13 +2232,13 @@ fn one_pin_set_decides_both_launch_sweeps() -> anyhow::Result<()> {
 }
 
 /// **A dormant pin with nothing on the disk is held-nothing; one with a
-/// piece directory is dormant** (`docs/design/media-pipeline.md` §2.6). A
-/// pin the session did not bring back -- every pin, after the boot that
-/// deleted the previous build's cache -- whose `.pieces/<hash>` does not
-/// exist is a fact the server knows: nothing is held, `complete: false`
-/// and no error, the row a client reads as "not whole" and marks gone.
-/// With a directory there, what it holds is unknown until the torrent
-/// returns, and the row stays the dormant one: phase `error`, with the
+/// piece directory is dormant** (`docs/design/media-pipeline.md` §2.6).
+/// Take a pin the session did not bring back (every pin, after the boot
+/// that deleted the previous build's cache). If its `.pieces/<hash>` does
+/// not exist, the server knows the fact: nothing is held, `complete: false`
+/// and no error. A client reads that row as "not whole" and marks it gone.
+/// If a directory is there, what it holds is unknown until the torrent
+/// returns. The row then stays the dormant one: phase `error`, with the
 /// error that says so.
 #[test]
 fn a_dormant_pin_without_a_piece_directory_holds_nothing() -> anyhow::Result<()> {
@@ -2289,12 +2294,12 @@ fn a_dormant_pin_without_a_piece_directory_holds_nothing() -> anyhow::Result<()>
 }
 
 /// `cacheRoot` set through `POST /settings` is where the data lives *from the
-/// next start*: the running server keeps writing where it opened. At that
-/// next start the setting is prepared before anything opens on it, and one
-/// that cannot be used any more (its path is a file now) falls back to the
-/// configured cache directory -- in the settings file too, so an embedder
-/// reading the file sees what `settings()` says and the next boot does not
-/// warn about it again.
+/// next start*. The running server keeps writing where it opened. At the
+/// next start the setting is prepared before anything opens on it. A
+/// setting that cannot be used any more (its path is a file now) falls back
+/// to the configured cache directory. It does so in the settings file too,
+/// so an embedder reading the file sees what `settings()` says and the next
+/// boot does not warn about it again.
 #[test]
 fn the_cache_root_setting_decides_where_the_next_session_opens() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -2319,8 +2324,8 @@ fn the_cache_root_setting_decides_where_the_next_session_opens() -> anyhow::Resu
             &settings_file,
         )?)?)
     };
-    // Where a session keeps its own records for the torrents it holds, and
-    // so the mark that a session opened on a root and put a torrent there.
+    // Where a session keeps its own records for the torrents it holds. So
+    // it is the mark that a session opened on a root and put a torrent there.
     let opened_on =
         |root: &std::path::Path| root.join(enginefs::CACHE_DIR_NAME).join("session.json");
     // The torrent that makes it write them.
@@ -2378,9 +2383,9 @@ fn the_cache_root_setting_decides_where_the_next_session_opens() -> anyhow::Resu
 
     // And the cache figure goes on describing the root the session opened
     // on, not the one the setting now names: it takes the root from the
-    // engine. Read from the setting instead, this would answer about a
-    // directory nothing has ever written to and report a cache of nothing
-    // while the disk fills up.
+    // engine. If it read the setting instead, it would answer about a
+    // directory nothing has ever written to. It would report a cache of
+    // nothing while the disk fills up.
     let stray = default_root
         .join(enginefs::CACHE_DIR_NAME)
         .join(".pieces")
@@ -2425,19 +2430,19 @@ fn the_cache_root_setting_decides_where_the_next_session_opens() -> anyhow::Resu
 }
 
 /// **A pin moves nothing.** A torrent that was streamed first is pinned
-/// exactly where it is: `pin_download` reports the same path the backend
+/// exactly where it is. `pin_download` reports the same path the backend
 /// reported before, every piece of the pinned file is still held, and no
-/// second copy appears anywhere -- there is one root and a pin is not a
+/// second copy appears anywhere. There is one root, and a pin is not a
 /// location. A restart on the same dirs, with the embedder handing the pin
 /// back in, restores the torrent with its pin and the pinned file's pieces.
 ///
-/// What a pin keeps is the **file**: every piece of e2, the boundary piece
-/// it shares with e1 among them, kept because e2 needs it. e1 is not pinned
-/// and not playing, so the pieces that are only its own are the retention
-/// owner's to take at any tick -- which is why nothing here asserts on
-/// them. Which pieces are e2's is read off its offset in the stats: the
-/// torrent's file order is the order the directory walk met the files in,
-/// which the fixture does not control (see `file_index`).
+/// What a pin keeps is the **file**: every piece of e2. The boundary piece
+/// it shares with e1 is among them, kept because e2 needs it. e1 is not
+/// pinned and not playing, so the retention owner may take the pieces that
+/// are only its own at any tick. That is why nothing here asserts on them.
+/// Which pieces are e2's is read off its offset in the stats. The torrent's
+/// file order is the order the directory walk met the files in, which the
+/// fixture does not control (see `file_index`).
 #[test]
 fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -2464,8 +2469,8 @@ fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
             ..offline_config()
         };
     let handle = stream_server::start(config(Default::default()))?;
-    // "Streamed before": the data already sits in the piece store, which is
-    // where a torrent added without a placement puts it -- and where one
+    // "Streamed before": the data already sits in the piece store. That is
+    // where a torrent added without a placement puts it, and where one
     // *with* a placement puts it too.
     seed_piece_store(&cache_root, &torrent, &content);
     let seeded_pieces = pieces_held(&cache_root, &info_hash);
@@ -2484,10 +2489,10 @@ fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
     assert_eq!(stats["files"][1]["complete"], true, "{stats}");
     assert_eq!(stats["pinnedFiles"], serde_json::json!([]));
     let idx = file_index(&stats, "e2.bin");
-    // e1 is 40 KiB and e2 24 KiB, in 16 KiB pieces: e2 is pieces 2 and 3
-    // when it comes second and 0 and 1 when it comes first, and the order
-    // is `create_torrent`'s directory walk. Hardcoded as 2 and 3, this
-    // failed on the runners whose file system lists e2 first.
+    // e1 is 40 KiB and e2 24 KiB, in 16 KiB pieces. e2 is pieces 2 and 3
+    // when it comes second, and 0 and 1 when it comes first. The order is
+    // `create_torrent`'s directory walk. When this was hardcoded as 2 and 3,
+    // it failed on the runners whose file system lists e2 first.
     const PIECE: u64 = 16 * 1024;
     let e2_offset = stats["files"][idx]["offset"]
         .as_u64()
@@ -2540,8 +2545,8 @@ fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
     handle.shutdown()?;
     handle.join()?;
 
-    // Restart on the same dirs: librqbit restores the torrent where it
-    // always was (its persisted output folder / only_files) and the pin
+    // Restart on the same dirs. librqbit restores the torrent where it
+    // always was (its persisted output folder / only_files), and the pin
     // comes back because the embedder names it again.
     let handle = stream_server::start(config(std::collections::BTreeMap::from([(
         info_hash.clone(),
@@ -2576,13 +2581,13 @@ fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
 ///
 /// The launch sweep deletes every piece directory the set does not name, so
 /// a boot told nothing is one keystroke away from deleting every offline
-/// download the user has. It does not: nothing is swept, the disk keeps what
-/// it held, and `downloads()` lists every file of every restored
-/// torrent, because that is what is being kept -- reporting the empty
+/// download the user has. It does not. Nothing is swept, the disk keeps
+/// what it held, and `downloads()` lists every file of every restored
+/// torrent, because that is what is being kept. Reporting the empty
 /// in-memory pin set instead would tell the caller their downloads are gone
 /// while the bytes are still on the disk.
 ///
-/// There is no way out of it within the process: the embedder holds the
+/// There is no way out of it within the process. The embedder holds the
 /// record, and a boot it said nothing to learns nothing later.
 #[test]
 fn an_unnamed_pin_set_keeps_every_download_and_lists_it() -> anyhow::Result<()> {
@@ -2661,22 +2666,21 @@ fn bitv_files(session_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     files
 }
 
-/// With fastresume on, librqbit persists each torrent's verified-piece
+/// librqbit with fastresume on persists each torrent's verified-piece
 /// bitfield (`<infoHash>.bitv` beside the session state) instead of
-/// re-hashing every file on every launch: after two complete torrents,
-/// both bitfields exist, and a restart brings both back ready and complete
+/// re-hashing every file on every launch. After two complete torrents,
+/// both bitfields exist. A restart brings both back ready and complete,
 /// with the bitfields still in place (the `.bitv` + `overwrite: true`
-/// combination librqbit needs to resume on top of existing files). One
-/// root, because a pin is not a place: one torrent is pinned by the file
-/// the user asked for, the other whole, and neither moves a byte.
+/// combination librqbit needs to resume on top of existing files). There
+/// is one root, because a pin is not a place. One torrent is pinned by the
+/// file the user asked for, the other whole, and neither moves a byte.
 ///
-/// Both are pinned, and the second one is pinned *for the fixture*: this
-/// test is about fastresume and not about retention, and a torrent nobody
-/// is playing and nobody has pinned is one the owner empties within a tick
-/// -- an emptied torrent is not a complete one, and a bitfield read back
-/// against no data says nothing about fastresume. What is being kept
-/// apart here is the pin's shape, not the pin: pinned per file, and pinned
-/// whole.
+/// Both are pinned, and the second one is pinned *for the fixture*. This
+/// test is about fastresume and not about retention. The owner empties a
+/// torrent nobody is playing and nobody has pinned within a tick. An
+/// emptied torrent is not a complete one, and a bitfield read back against
+/// no data says nothing about fastresume. What is being kept apart here is
+/// the pin's shape, not the pin: pinned per file, and pinned whole.
 #[test]
 fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -2710,8 +2714,8 @@ fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Res
     let handle = stream_server::start(config(Default::default()))?;
     // Both torrents' data is in the one piece store, seeded after the launch
     // sweep: the streamed torrent whole, the pinned one only where the pin
-    // will be. There is no second store anywhere -- the store takes one
-    // root, and it is the cache root.
+    // will be. There is no second store anywhere. The store takes one root,
+    // and it is the cache root.
     seed_piece_store(&cache_root, &streamed_torrent, &streamed);
     seed_piece_store_files(&cache_root, &pinned_torrent, &pinned, Some(&["p2.bin"]));
     let base = format!("http://{}", handle.http_addr());
@@ -2731,7 +2735,7 @@ fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Res
     }
 
     // A pin by hash needs the metadata: /create supplies it. Nothing about
-    // the pin is a location -- the torrent stays where librqbit has it and
+    // the pin is a location. The torrent stays where librqbit has it, and
     // its data stays where the store has it.
     client
         .post(format!("{base}/create"))
@@ -2778,9 +2782,9 @@ fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Res
     assert_eq!(stats["phase"], "ready", "{stats}");
     assert_eq!(stats["files"][0]["complete"], true, "{stats}");
     assert_eq!(stats["files"][1]["complete"], true, "{stats}");
-    // The pinned file's own stats, not the torrent's: only the pinned file
+    // The pinned file's own stats, not the torrent's. Only the pinned file
     // was ever seeded, and torrent-wide `phase` describes whichever file
-    // the stream guess picks -- the other one, in half the file orders
+    // the stream guess picks. That is the other one in half the file orders
     // `create_torrent`'s directory walk can produce.
     let stats = file_stats_after_check(&client, &base, &pinned_hash, p2)?;
     assert_eq!(stats["phase"], "ready", "{stats}");
@@ -2791,7 +2795,7 @@ fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Res
         2,
         "bitfields survive the restart"
     );
-    // No whole file anywhere; both torrents' bytes are pieces in the one
+    // No whole file anywhere. Both torrents' bytes are pieces in the one
     // store, and the restart read the bitfields against those.
     assert!(!session_dir.join("Pinned").join("p2.bin").exists());
     assert!(!session_dir.join("Streamed").exists());
@@ -2803,11 +2807,11 @@ fn fastresume_persists_piece_bitfields_for_a_pinned_torrent_too() -> anyhow::Res
     Ok(())
 }
 
-/// The download API -- `pin_download`, `unpin_download`, `downloads`,
-/// `download_path` -- pins a file where its data already is and answers
-/// exactly what it did: a `DownloadInfo` for the pin, `unpinned` and
+/// The download API (`pin_download`, `unpin_download`, `downloads`,
+/// `download_path`) pins a file where its data already is. It answers
+/// exactly what it did: a `DownloadInfo` for the pin, and `unpinned` and
 /// `deleted_files` for the unpin as what happened rather than the request
-/// echoed, and `FileNotFound` for an index the torrent does not have -- on a
+/// echoed. An index the torrent does not have is `FileNotFound`, on a
 /// destructive unpin too, which is never read as "the whole torrent".
 #[test]
 fn downloads_pin_in_place_and_delete_only_what_they_say() -> anyhow::Result<()> {
@@ -2828,8 +2832,8 @@ fn downloads_pin_in_place_and_delete_only_what_they_say() -> anyhow::Result<()> 
         cache_dir: Some(cache_root.clone()),
         ..offline_config()
     })?;
-    // The data is already in the piece store, as after streaming it -- which
-    // is the only place a torrent's bytes are now, downloads included.
+    // The data is already in the piece store, as after streaming it. That is
+    // the only place a torrent's bytes are now, downloads included.
     seed_piece_store(&cache_root, &torrent, &content);
     let seeded_pieces = pieces_held(&cache_root, &info_hash);
     let base = format!("http://{}", handle.http_addr());
@@ -2869,8 +2873,8 @@ fn downloads_pin_in_place_and_delete_only_what_they_say() -> anyhow::Result<()> 
         named.join("e1.bin").to_str(),
         "{pinned:?}"
     );
-    // `path` is where the file *would* be, not where any byte actually is:
-    // a pinned download is piece files like everything else, and the folder
+    // `path` is where the file *would* be, not where any byte actually is.
+    // A pinned download is piece files like everything else, and the folder
     // in that name holds none of them.
     assert!(!named.join("e1.bin").exists(), "no whole file is produced");
     assert_eq!(
@@ -2901,7 +2905,7 @@ fn downloads_pin_in_place_and_delete_only_what_they_say() -> anyhow::Result<()> 
         )
     );
 
-    // The second file too; both are listed.
+    // The second file too. Both are listed.
     let api = handle.pin_download(&info_hash, second, &[])?;
     assert_eq!(api.name, "e2.bin");
     stats_after_check(&handle, &info_hash)?;
@@ -2979,7 +2983,7 @@ fn downloads_pin_in_place_and_delete_only_what_they_say() -> anyhow::Result<()> 
     // Nothing to unpin twice.
     assert!(!handle.unpin_download(&info_hash, first, false)?.unpinned);
 
-    // The last pin, with the files: the torrent goes with it, and the
+    // The last pin, with the files. The torrent goes with it, and the
     // answer says the data really went.
     assert_eq!(
         handle.unpin_download(&info_hash.to_uppercase(), second, true)?,
@@ -2997,7 +3001,7 @@ fn downloads_pin_in_place_and_delete_only_what_they_say() -> anyhow::Result<()> 
     assert!(handle.downloads()?.is_empty());
     assert_eq!(handle.download_path(&info_hash, second)?, None);
 
-    // `deleted_files` reports what happened, not what was asked for: an
+    // `deleted_files` reports what happened, not what was asked for. An
     // unmanaged hash nothing ever downloaded has no pieces in the store, so
     // the answer says nothing was deleted instead of echoing the flag back.
     // ("Nothing there" is not "freed", and under this storage it is the
@@ -3018,11 +3022,11 @@ fn downloads_pin_in_place_and_delete_only_what_they_say() -> anyhow::Result<()> 
 /// `ServerHandle::stream_numbers` for **a URL this server is not holding is
 /// `None`, not an error.**
 ///
-/// The client is not asking whether a resource exists here; it is asking
+/// The client is not asking whether a resource exists here. It is asking
 /// what we hold of the stream its player is on, and "nothing" is a complete
-/// answer to that -- the ordinary case for every stream this server neither
-/// torrents nor proxies. An error would have a panel showing one for a film
-/// that is playing perfectly.
+/// answer to that. It is the ordinary case for every stream this server
+/// neither torrents nor proxies. An error would have a panel showing one for
+/// a film that is playing perfectly.
 #[test]
 fn stream_numbers_for_a_stream_this_server_does_not_hold_are_none() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -3047,22 +3051,22 @@ fn stream_numbers_for_a_stream_this_server_does_not_hold_are_none() -> anyhow::R
 
 /// **A panel's numbers are about the file its URL really resolves to.**
 ///
-/// `/{infoHash}/-1` is the documented auto-select -- "pick the file
-/// yourself", narrowed by the `f=` filters -- and it is what a client hands
-/// its player whenever it does not name the file itself. The stream route
-/// serves it and `/{infoHash}/-1/stats.json` reports on it, so a panel
-/// holding that URL must be told about the file the player is being served
+/// `/{infoHash}/-1` is the documented auto-select ("pick the file
+/// yourself", narrowed by the `f=` filters). A client hands it to its
+/// player whenever it does not name the file itself. The stream route
+/// serves it and `/{infoHash}/-1/stats.json` reports on it. So a panel
+/// holding that URL must be told about the file the player is being served,
 /// rather than told this server holds nothing.
 ///
 /// **Which file that is only shows where the two files carry different
-/// numbers**, so the fixture is a season pack: two episodes, both already on
-/// the disk, both far larger than the budget, and only ever one of them
-/// bounded -- the one a reader is inside. The file being played carries a
-/// window and the other one does not, so a resolution that answers about the
-/// wrong file puts the window on the wrong URL. That is what a constant file
-/// index does, on `/{infoHash}/{fileIdx}` and on `-1` alike, and it is what
-/// an auto-select that drops its `f=` filters does to a client narrowing a
-/// pack to the episode it is playing.
+/// numbers**, so the fixture is a season pack. It has two episodes, both
+/// already on the disk and both far larger than the budget. Only ever one
+/// of them is bounded: the one a reader is inside. The file being played
+/// carries a window and the other one does not. So a resolution that
+/// answers about the wrong file puts the window on the wrong URL. A
+/// constant file index does that, on `/{infoHash}/{fileIdx}` and on `-1`
+/// alike. An auto-select that drops its `f=` filters does it too, to a
+/// client narrowing a pack to the episode it is playing.
 ///
 /// And the window is measured over the played episode's own pieces. The rest
 /// of the pack is on the same disk under the same info hash, so a window
@@ -3074,17 +3078,17 @@ fn a_panels_numbers_are_about_the_file_the_url_resolved_to() -> anyhow::Result<(
     const PIECE: u64 = 16 * 1024;
     /// The episode the auto-select lands on: the largest video in the pack.
     const PICKED_PIECES: u64 = 100;
-    /// The one only the `f=` filters reach. Smaller, so it is never the
-    /// auto-select, and still far above the budget, so a policy over it is a
-    /// bounded one.
+    /// The one only the `f=` filters reach. It is smaller, so it is never
+    /// the auto-select. It is still far above the budget, so a policy over
+    /// it is a bounded one.
     const FILTERED_PIECES: u64 = 60;
     /// Thirty-two pieces of budget: sixteen committed for sharing and
-    /// sixteen of window, of which the 10% behind the playhead is one. Well
-    /// under either episode, or the budget would cover the file being played
-    /// and nothing would be bounding it.
+    /// sixteen of window, of which the 10% behind the playhead is one. It is
+    /// well under either episode, or the budget would cover the file being
+    /// played and nothing would be bounding it.
     const BUDGET: u64 = 32 * PIECE;
-    /// The piece of the file the player is on. Far enough in that the window
-    /// has a piece behind it rather than sitting against the start.
+    /// The piece of the file the player is on. It is far enough in that the
+    /// window has a piece behind it rather than sitting against the start.
     const PLAYING: u64 = 4;
 
     let config_dir = tempfile::tempdir()?;
@@ -3092,10 +3096,10 @@ fn a_panels_numbers_are_about_the_file_the_url_resolved_to() -> anyhow::Result<(
     let src = tempfile::tempdir()?;
     let content = src.path().join("Show S01");
     std::fs::create_dir_all(&content)?;
-    // Two episodes, each a whole number of pieces, so neither shares a
-    // boundary piece with the other whatever order `create_torrent`'s
-    // directory walk produced -- and so each one's piece range is the range
-    // its own bytes are in.
+    // Two episodes, each a whole number of pieces. So neither shares a
+    // boundary piece with the other, whatever order `create_torrent`'s
+    // directory walk produced. And each one's piece range is the range its
+    // own bytes are in.
     write_payload(
         &content.join("Show.S01E01.mkv"),
         (PICKED_PIECES * PIECE) as usize,
@@ -3137,8 +3141,9 @@ fn a_panels_numbers_are_about_the_file_the_url_resolved_to() -> anyhow::Result<(
         "{base}/{info_hash}/-1?f={}",
         urlencoding::encode("/S01E02/i")
     );
-    // Play, and answer which file was served: the whole length in the
-    // Content-Range, because both episodes start with the same bytes.
+    // Play, and answer which file was served. The answer is the whole
+    // length in the Content-Range, because both episodes start with the
+    // same bytes.
     let play = |url: &str, from: u64| -> anyhow::Result<u64> {
         let response = anonymous
             .get(url)
@@ -3157,7 +3162,7 @@ fn a_panels_numbers_are_about_the_file_the_url_resolved_to() -> anyhow::Result<(
         Ok(total)
     };
     // What this torrent holds of one file, taken off the store's directory
-    // itself: the complete piece files, never a count anything keeps.
+    // itself. It is the complete piece files, never a count anything keeps.
     let held_in = |pieces: &std::ops::Range<u32>| -> u64 {
         piece_store(&cache_root)
             .stat(&info_hash)
@@ -3169,9 +3174,9 @@ fn a_panels_numbers_are_about_the_file_the_url_resolved_to() -> anyhow::Result<(
             * PIECE
     };
     // The window a panel is given for the file it is playing, checked
-    // against that file's own piece files -- either side of the question,
-    // because a retention pass may reclaim between the two readings and may
-    // only reclaim, nothing here downloading a piece back.
+    // against that file's own piece files on either side of the question.
+    // A retention pass may reclaim between the two readings. It may only
+    // reclaim, because nothing here downloads a piece back.
     let window_of = |url: &str, pieces: &std::ops::Range<u32>| -> anyhow::Result<()> {
         let before = held_in(pieces);
         let numbers = handle
@@ -3203,10 +3208,10 @@ fn a_panels_numbers_are_about_the_file_the_url_resolved_to() -> anyhow::Result<(
         );
         Ok(())
     };
-    // And the other file: this server holds the torrent, and nothing of
-    // this process is measuring that file -- no reader has been inside it,
-    // or the viewer left it and the switch's slack pass took it off the
-    // disk and forgot it -- which is a stream with no window rather than a
+    // And the other file. This server holds the torrent, and nothing of
+    // this process is measuring that file. Either no reader has been inside
+    // it, or the viewer left it and the switch's slack pass took it off the
+    // disk and forgot it. That is a stream with no window rather than a
     // stream with no rows.
     let no_window_for = |url: &str| -> anyhow::Result<()> {
         let numbers = handle
@@ -3222,8 +3227,8 @@ fn a_panels_numbers_are_about_the_file_the_url_resolved_to() -> anyhow::Result<(
 
     // A first read, so this torrent has an engine streaming it before the
     // budget arrives. Nothing bounds it yet, so it announces everything it
-    // holds and nothing takes any of it -- which is what leaves the cache
-    // the setting below is about to be measured against whole.
+    // holds and nothing takes any of it. That leaves whole the cache the
+    // setting below is about to be measured against.
     assert_eq!(
         play(&auto_url, 0)?,
         PICKED_PIECES * PIECE,
@@ -3244,9 +3249,9 @@ fn a_panels_numbers_are_about_the_file_the_url_resolved_to() -> anyhow::Result<(
     );
 
     // The player seeks on and reads. Opening the reader is what installs a
-    // policy under the budget the process has now published, and the byte
-    // reaching the player is what moves the playhead -- into the file the
-    // auto-select resolved to, and no other.
+    // policy under the budget the process has now published. The byte
+    // reaching the player is what moves the playhead, into the file the
+    // auto-select resolved to and no other.
     play(&auto_url, PLAYING * PIECE)?;
     window_of(&auto_url, &picked_pieces)?;
     window_of(&format!("{base}/{info_hash}/{picked_idx}"), &picked_pieces)?;
@@ -3254,8 +3259,8 @@ fn a_panels_numbers_are_about_the_file_the_url_resolved_to() -> anyhow::Result<(
 
     // Now the filters, on the URL a client narrowing the pack hands its
     // player. The read moves the policy and the playhead to that episode,
-    // and the numbers follow it: the filtered URL is the bounded one now and
-    // the bare auto-select, which resolves to the episode nobody is inside,
+    // and the numbers follow it. The filtered URL is the bounded one now.
+    // The bare auto-select resolves to the episode nobody is inside, and it
     // has no window.
     assert_eq!(
         play(&filtered_url, PLAYING * PIECE)?,
@@ -3267,10 +3272,10 @@ fn a_panels_numbers_are_about_the_file_the_url_resolved_to() -> anyhow::Result<(
         &format!("{base}/{info_hash}/{filtered_idx}"),
         &filtered_pieces,
     )?;
-    // The episode left behind is forgotten by the switch's slack drop,
-    // which runs on its own task after the read that moved the playhead:
-    // asked until it has, within a bound, so a slow runner reads the answer
-    // and not the moment before it. A window that never goes still fails.
+    // The switch's slack drop forgets the episode left behind. It runs on
+    // its own task after the read that moved the playhead. So this asks
+    // until it has, within a bound, and a slow runner reads the answer and
+    // not the moment before it. A window that never goes still fails.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let left = no_window_for(&auto_url)
@@ -3291,16 +3296,16 @@ fn a_panels_numbers_are_about_the_file_the_url_resolved_to() -> anyhow::Result<(
 /// The mirror of `proxy.rs`'s
 /// `a_panel_asking_about_a_proxied_stream_is_told_what_is_on_the_disk`, over
 /// the other store. A client holding the URL it handed its player asks one
-/// question -- through the library call and through the route a client
-/// really uses -- and gets the window round the playhead. It is a reading of
-/// the piece store it gets and not the policy's intentions: the two halves
-/// sum to the piece files really under the torrent's directory, which is
-/// what the bound below says, a retention pass being the only thing that can
-/// move that number and being able only to lower it.
+/// question, through the library call and through the route a client
+/// really uses. It gets the window round the playhead. What it gets is a
+/// reading of the piece store, not the policy's intentions. The two halves
+/// sum to the piece files really under the torrent's directory, and the
+/// bound below says so. A retention pass is the only thing that can move
+/// that number, and it can only lower it.
 ///
-/// Every other test of this window is a unit test over a fake backend, so
-/// none of them would notice the window failing to reach `stream_numbers` at
-/// all -- and a torrent stream's window is the row this whole feature was
+/// Every other test of this window is a unit test over a fake backend. So
+/// none of them would notice the window failing to reach `stream_numbers`
+/// at all, and a torrent stream's window is the row this whole feature was
 /// asked for.
 #[test]
 fn a_panel_asking_about_a_torrent_stream_is_told_what_is_on_the_disk() -> anyhow::Result<()> {
@@ -3310,12 +3315,12 @@ fn a_panel_asking_about_a_torrent_stream_is_told_what_is_on_the_disk() -> anyhow
     /// pieces on both sides.
     const PIECES: u64 = 100;
     /// Thirty-two pieces of budget: sixteen committed for sharing and
-    /// sixteen of window, of which the 10% behind the playhead is one. Well
-    /// under the file, or the budget would cover it and nothing would be
-    /// bounding this stream at all.
+    /// sixteen of window, of which the 10% behind the playhead is one. It is
+    /// well under the file, or the budget would cover it and nothing would
+    /// be bounding this stream at all.
     const BUDGET: u64 = 32 * PIECE;
-    /// The piece the player is on. Far enough in that the window has a
-    /// piece behind it rather than sitting against the start of the file.
+    /// The piece the player is on. It is far enough in that the window has
+    /// a piece behind it rather than sitting against the start of the file.
     const PLAYING: u64 = 4;
 
     let config_dir = tempfile::tempdir()?;
@@ -3324,8 +3329,8 @@ fn a_panel_asking_about_a_torrent_stream_is_told_what_is_on_the_disk() -> anyhow
     let content = src.path().join("Film");
     std::fs::create_dir_all(&content)?;
     // One file, so every piece the store holds for this torrent is a piece
-    // of the stream the panel is asking about and the sum below is one the
-    // test can take off the disk.
+    // of the stream the panel is asking about. The test can then take the
+    // sum below off the disk.
     write_payload(&content.join("film.bin"), (PIECES * PIECE) as usize);
     let (torrent, info_hash) = real_torrent(&content);
 
@@ -3369,13 +3374,13 @@ fn a_panel_asking_about_a_torrent_stream_is_told_what_is_on_the_disk() -> anyhow
 
     // A first read, so this torrent has an engine streaming it before the
     // budget arrives. Nothing bounds it yet, so it announces everything it
-    // holds and nothing takes any of it -- which is what leaves the cache
-    // the setting below is about to be measured against whole.
+    // holds and nothing takes any of it. That leaves whole the cache the
+    // setting below is about to be measured against.
     play(0)?;
     // **And the panel is told the run round the playhead all the same.**
     // Nothing bounds the stream, so the run is everything fetched round the
-    // playhead -- here the whole file, unbroken, the playhead a few bytes
-    // into its first piece.
+    // playhead. Here that is the whole file, unbroken, with the playhead a
+    // few bytes into its first piece.
     let unbounded = handle
         .stream_numbers(&player_url)?
         .expect("this server is holding that stream")
@@ -3405,13 +3410,13 @@ fn a_panel_asking_about_a_torrent_stream_is_told_what_is_on_the_disk() -> anyhow
     );
 
     // The player seeks on and reads. Opening the reader is what installs a
-    // policy under the budget the process has now published, and the byte
+    // policy under the budget the process has now published. The byte
     // reaching the player is what moves the playhead.
     play(PLAYING * PIECE)?;
 
     // Either side of the question, because a retention pass may reclaim
-    // between the two -- and may only reclaim, nothing here downloading a
-    // piece back. So the sum the panel was given lies between them.
+    // between the two. It may only reclaim, because nothing here downloads
+    // a piece back. So the sum the panel was given lies between them.
     let before = pieces_held(&cache_root, &info_hash) as u64 * PIECE;
     let numbers = handle
         .stream_numbers(&player_url)?
@@ -3459,30 +3464,30 @@ fn content_range_total(response: &reqwest::blocking::Response) -> u64 {
 ///
 /// The disk arm of the cap is `occupied + available - floor`, and
 /// `occupied` is what the owners count, never an eviction pass's last walk
-/// of the root. A stale count is not close: a four-gigabyte television
+/// of the root. A stale count is not close. A four-gigabyte television
 /// already holding four gigabytes with six hundred megabytes free measured
-/// a cap of eighty-eight megabytes under a stale count, with every stream
-/// opened during a sixteen-thousand-file walk running under a window that
-/// size. The publisher reads the owners directly, and this is the moment
-/// that proves it: bytes that were on the volume
-/// before the process started -- so the free-space arm has already lost
-/// them -- become *counted* when the session registers the store over them,
-/// and the very next publication states a cap that much larger.
+/// a cap of eighty-eight megabytes under a stale count. Every stream opened
+/// during a sixteen-thousand-file walk ran under a window that size. The
+/// publisher reads the owners directly, and this is the moment that proves
+/// it. Some bytes were on the volume before the process started, so the
+/// free-space arm has already lost them. They become *counted* when the
+/// session registers the store over them, and the very next publication
+/// states a cap that much larger.
 ///
 /// The cap is read where the retention policies read it
-/// (`ServerHandle::published_cache_budget`), not from `GET /cache.json`,
-/// which runs the arithmetic again for the client: a publisher that stopped
-/// reading the owners would still be answering that route correctly while
-/// sizing every window on free space alone.
+/// (`ServerHandle::published_cache_budget`). It is not read from
+/// `GET /cache.json`, which runs the arithmetic again for the client. A
+/// publisher that stopped reading the owners would still answer that route
+/// correctly while sizing every window on free space alone.
 ///
 /// **What is asserted is the cap net of the volume's own movement.** The
-/// disk arm is `occupied + available - floor`, and `available` is a reading
-/// of a real volume that the rest of this test binary is writing to while
-/// this runs: a plain `after > before` is a bet that the suite freed more
-/// than it wrote in between, a bet this suite can lose. So the volume is
-/// read beside each cap -- the same `statvfs` the publisher takes -- and
-/// the growth is measured in `cap - available`, which is the occupancy the
-/// publisher put in and nothing else.
+/// disk arm is `occupied + available - floor`. `available` is a reading of
+/// a real volume that the rest of this test binary is writing to while
+/// this runs. A plain `after > before` is a bet that the suite freed more
+/// than it wrote in between, and this suite can lose that bet. So the
+/// volume is read beside each cap, with the same `statvfs` the publisher
+/// takes. The growth is measured in `cap - available`, which is the
+/// occupancy the publisher put in and nothing else.
 #[test]
 fn the_minute_publishers_cap_follows_the_owners_occupancy() -> anyhow::Result<()> {
     /// Enough that the difference is nothing like the noise of a session
@@ -3508,17 +3513,17 @@ fn the_minute_publishers_cap_follows_the_owners_occupancy() -> anyhow::Result<()
         ..offline_config()
     })?;
     // Already "streamed": the data sits in the piece store, as it would
-    // after playback, and no store speaks for it until the session picks it
-    // up below. The bytes are on the volume before the reading below, which
-    // is the whole point -- whatever `statvfs` answers has already lost
-    // them, so nothing but the count can put them back into the cap. (The
-    // seed goes after the launch sweep, which removes every store directory
-    // the session does not claim.)
+    // after playback. No store speaks for it until the session picks it up
+    // below. The bytes are on the volume before the reading below, and that
+    // is the whole point. Whatever `statvfs` answers has already lost them,
+    // so nothing but the count can put them back into the cap. (The seed
+    // goes after the launch sweep, which removes every store directory the
+    // session does not claim.)
     seed_piece_store(&cache_root, &torrent, &content);
     // The publisher's own view of the volume, read here as it reads it. It
-    // moves under both of us -- every other test in this binary writes to
-    // this volume -- which is why each cap below is paired with a reading
-    // of it.
+    // moves under both of us, because every other test in this binary
+    // writes to this volume. That is why each cap below is paired with a
+    // reading of it.
     let available = || fs4::available_space(&cache_root).expect("the volume answers");
     handle.update_settings(serde_json::json!({ "cacheSize": UNCAPPED }))?;
     let before = handle
@@ -3526,9 +3531,9 @@ fn the_minute_publishers_cap_follows_the_owners_occupancy() -> anyhow::Result<()
         .expect("a cap from the volume");
     let free_before = available();
 
-    // The session picks the seeded pieces up: `init` seeds the store's held
-    // set from what is on the disk and registers it, and from that instant
-    // the process knows it holds those bytes.
+    // The session picks the seeded pieces up. `init` seeds the store's held
+    // set from what is on the disk and registers it. From that instant the
+    // process knows it holds those bytes.
     let base = format!("http://{}", handle.http_addr());
     let client = bearer_client(&handle)?;
     let created: serde_json::Value = client
@@ -3539,7 +3544,7 @@ fn the_minute_publishers_cap_follows_the_owners_occupancy() -> anyhow::Result<()
         .json()?;
     assert_eq!(created["infoHash"], info_hash);
     let stats = stats_after_check(&handle, &info_hash)?;
-    // Pinned, so nothing is playing it and nothing takes it either: the
+    // Pinned, so nothing is playing it and nothing takes it either. The
     // count under test stays still while the two publications straddle it.
     handle.pin_download(&info_hash, file_index(&stats, "film.mkv"), &[])?;
 
@@ -3555,11 +3560,11 @@ fn the_minute_publishers_cap_follows_the_owners_occupancy() -> anyhow::Result<()
         "the store counts what it registered: {usage:?}"
     );
     // `cap - available` is the occupancy the publisher put into it, and
-    // that is what the registration moved: the seeded bytes were on the
+    // that is what the registration moved. The seeded bytes were on the
     // volume before either reading, so no `statvfs` can account for them.
-    // Half the film as the bound, for the session's own records and for
-    // the moment between the publisher's reading of the volume and ours --
-    // the claim is the whole film, and what is allowed for is noise.
+    // The bound is half the film. It allows for the session's own records
+    // and for the moment between the publisher's reading of the volume and
+    // ours. The claim is the whole film, and what is allowed for is noise.
     let occupancy_in = |cap: u64, free: u64| cap as i128 - free as i128;
     let gained = occupancy_in(after, free_after) - occupancy_in(before, free_before);
     assert!(
@@ -3568,8 +3573,8 @@ fn the_minute_publishers_cap_follows_the_owners_occupancy() -> anyhow::Result<()
          -> {after} (volume {free_after}), occupancy in the cap grew by {gained}"
     );
     // And the two readings of the same cache agree. `GET /cache.json` runs
-    // the same arithmetic over the same owners a moment later, so the only
-    // difference between them is whatever the volume did in between -- a
+    // the same arithmetic over the same owners a moment later. So the only
+    // difference between them is whatever the volume did in between. A
     // publisher reading no occupancy at all would be short by the whole of
     // the seeded film. "Whatever the volume did" is measured rather than
     // assumed small, because on a busy volume it is not.
@@ -3589,37 +3594,38 @@ fn the_minute_publishers_cap_follows_the_owners_occupancy() -> anyhow::Result<()
 /// **A clean restates the cap before it reports one.**
 ///
 /// The number a clean answers with is the number the owners are now sized
-/// against, and that is only true if the clean says it: the cap is
-/// published by the minute timer and by `POST /settings`, and a clean that
+/// against, and that is only true if the clean says it. The cap is
+/// published by the minute timer and by `POST /settings`. A clean that
 /// moved the occupancy without restating it would answer a client a figure
-/// nothing in the process was enforcing -- for up to a minute, which is
-/// several windows.
+/// nothing in the process was enforcing. That would last up to a minute,
+/// which is several windows.
 ///
-/// Read where the policies read it (`ServerHandle::published_cache_budget`)
-/// and not off `GET /cache.json`, which runs the arithmetic again for the
-/// client: a clean that stopped restating would still answer that route
-/// correctly while every window stayed sized to the cap of a minute ago.
+/// The cap is read where the policies read it
+/// (`ServerHandle::published_cache_budget`), not off `GET /cache.json`,
+/// which runs the arithmetic again for the client. A clean that stopped
+/// restating would still answer that route correctly while every window
+/// stayed sized to the cap of a minute ago.
 ///
-/// The occupancy is moved here by the session registering a store over
-/// bytes that were already on the volume -- the same motion
-/// `the_minute_publishers_cap_follows_the_owners_occupancy` uses, and for
-/// the same reason: it is a change no `statvfs` can see, so only a
+/// The session moves the occupancy here by registering a store over bytes
+/// that were already on the volume.
+/// `the_minute_publishers_cap_follows_the_owners_occupancy` uses the same
+/// motion, for the same reason: no `statvfs` can see the change, so only a
 /// publication that reads the owners can carry it.
 ///
-/// The claim is the *agreement* of the two numbers and not the direction
-/// either moved: the disk arm is `occupied + available - floor`, and
+/// The claim is the *agreement* of the two numbers, not the direction
+/// either moved. The disk arm is `occupied + available - floor`, and
 /// `available` is a real volume that the rest of this test binary is
 /// writing to meanwhile. Both readings here are taken inside the one call,
-/// microseconds apart, so nothing the volume does can separate them --
-/// while a cap last stated before the store registered is short by the
-/// whole of the seeded film.
+/// microseconds apart, so nothing the volume does can separate them. A cap
+/// last stated before the store registered is short by the whole of the
+/// seeded film.
 #[test]
 fn a_clean_restates_the_cap_before_it_reports_it() -> anyhow::Result<()> {
     /// Enough that the difference is nothing like the noise of a session
     /// writing its own records while this runs.
     const SEEDED: usize = 16 * 1024 * 1024;
     /// `cacheSize` above anything a volume could offer, so the cap under
-    /// test is the disk arm -- the one occupancy is a term of.
+    /// test is the disk arm (the one occupancy is a term of).
     const UNCAPPED: f64 = 1024.0 * 1024.0 * 1024.0 * 1024.0;
 
     let config_dir = tempfile::tempdir()?;
@@ -3645,8 +3651,8 @@ fn a_clean_restates_the_cap_before_it_reports_it() -> anyhow::Result<()> {
     );
 
     // The session picks the seeded pieces up, which is the whole of what
-    // moves the occupancy. Pinned, so the clean below has nothing to take
-    // and the only thing it can change is the published number.
+    // moves the occupancy. It is pinned, so the clean below has nothing to
+    // take, and the only thing it can change is the published number.
     let base = format!("http://{}", handle.http_addr());
     let client = bearer_client(&handle)?;
     client
@@ -3677,12 +3683,12 @@ fn a_clean_restates_the_cap_before_it_reports_it() -> anyhow::Result<()> {
 
 /// **Two settings updates at once are applied in the order they are saved.**
 ///
-/// The settings lock is dropped before an update reaches the engine, so
-/// with nothing else ordering them two updates could merge in one order
-/// and apply in the other: `seedingEnabled` saved as `false` and the
-/// session left uploading, which is the one setting a viewer turns off to
-/// stop something. Opposite updates are raced round after round; after
-/// each round the session, the live settings and the file agree.
+/// The settings lock is dropped before an update reaches the engine. With
+/// nothing else ordering them, two updates could merge in one order and
+/// apply in the other. Then `seedingEnabled` is saved as `false` and the
+/// session is left uploading, and that is the one setting a viewer turns
+/// off to stop something. Opposite updates are raced round after round.
+/// After each round the session, the live settings and the file agree.
 #[test]
 fn opposite_settings_updates_at_once_leave_the_session_as_saved() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -3731,10 +3737,10 @@ fn opposite_settings_updates_at_once_leave_the_session_as_saved() -> anyhow::Res
 /// **`cacheSize: 0` is "no caching", a cap of zero -- never "no limit".**
 ///
 /// stremio-core offers 0 as its own selection beside the "∞" that sends
-/// `null`, and the app reads it the same way; a publisher that filtered the
+/// `null`, and the app reads it the same way. A publisher that filtered the
 /// zero out as "unset" handed a user who asked to cache nothing a cache
-/// bounded only by the volume. Posted the way the core posts it, and read
-/// where the retention policies read the cap.
+/// bounded only by the volume. The test posts it the way the core posts
+/// it, and reads it where the retention policies read the cap.
 #[test]
 fn a_cache_size_of_zero_publishes_a_cap_of_zero() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -3768,12 +3774,12 @@ fn a_cache_size_of_zero_publishes_a_cap_of_zero() -> anyhow::Result<()> {
 /// What a clean does is give back both owners' slack, so on this fixture it
 /// gives back **nothing**, and that is the claim. Both of the torrent's
 /// files are pinned, so no piece of it is slack. A pinned download is kept
-/// until it is unpinned, however far over the cap the cache is; and the
+/// until it is unpinned, however far over the cap the cache is. The
 /// **whole-file copies an earlier version of this server left behind**
-/// belong to no owner at all -- nothing here booked those bytes, nothing
-/// counts them and nothing takes them. There is no migration by decision: a
-/// plain-file download is neither converted nor read, and the torrent that
-/// owns it re-downloads as pieces. Nothing old matters.
+/// belong to no owner at all. Nothing here booked those bytes, nothing
+/// counts them and nothing takes them. There is no migration, by decision.
+/// A plain-file download is neither converted nor read, and the torrent
+/// that owns it re-downloads as pieces. Nothing old matters.
 ///
 /// So the honest answer to "clean now" here is `overLimit`, and a client
 /// that wants those bytes back unpins something.
@@ -3787,9 +3793,9 @@ fn a_clean_takes_no_pinned_and_no_ownerless_byte() -> anyhow::Result<()> {
     std::fs::create_dir_all(&content)?;
     // Two files, each a whole number of 16 KiB pieces (as `lan_media_server`
     // does), so no piece is shared between them. A pin keeps a file, not the
-    // torrent it is in: with only `movie.mkv` pinned, the subtitle's piece
-    // would be slack for this clean -- or for any tick before it -- to take.
-    // Both are pinned, so there is nothing disposable here at all.
+    // torrent it is in. With only `movie.mkv` pinned, the subtitle's piece
+    // would be slack for this clean (or any tick before it) to take. Both
+    // are pinned, so there is nothing disposable here at all.
     write_payload(&content.join("movie.mkv"), 64 * 1024);
     write_payload(&content.join("subtitle.srt"), 16 * 1024);
     let (torrent, info_hash) = real_torrent(&content);
@@ -3803,14 +3809,14 @@ fn a_clean_takes_no_pinned_and_no_ownerless_byte() -> anyhow::Result<()> {
         ..offline_config()
     })?;
     // Written *after* the server opened, and that is the whole of why it is
-    // here rather than above: a previous release's whole-file data is the
-    // one category with no owner, and the launch sweep
-    // (`piece_store::sweep::sweep_legacy_downloads`) is what takes it -- at launch,
-    // and nowhere else. Put here, these stand for the life of the process
-    // exactly as they would in one that had already booted, which is what
-    // makes them a witness that no *route* takes them.
+    // here rather than above. A previous release's whole-file data is the
+    // one category with no owner. The launch sweep
+    // (`piece_store::sweep::sweep_legacy_downloads`) takes it at launch, and
+    // nowhere else. Put here, these stand for the life of the process
+    // exactly as they would in one that had already booted. That makes them
+    // a witness that no *route* takes them.
     //
-    // An idle leftover with no engine managing it at all -- ordinary cache
+    // An idle leftover with no engine managing it at all: ordinary cache
     // from a torrent nothing is tracking any more.
     let idle = cache_root
         .join(enginefs::CACHE_DIR_NAME)
@@ -3828,7 +3834,7 @@ fn a_clean_takes_no_pinned_and_no_ownerless_byte() -> anyhow::Result<()> {
         root_folder.join("subtitle.srt"),
     )?;
     // Already "streamed": the data sits in the piece store, as it would
-    // after playback, and `POST /create` below picks it up from there.
+    // after playback. `POST /create` below picks it up from there.
     seed_piece_store(&cache_root, &torrent, &content);
     let seeded_pieces = pieces_held(&cache_root, &info_hash);
     let base = format!("http://{}", handle.http_addr());
@@ -3849,10 +3855,10 @@ fn a_clean_takes_no_pinned_and_no_ownerless_byte() -> anyhow::Result<()> {
 
     // Read usage() before touching the limit, to learn how many bytes the
     // pinned files occupy. The limit below sits one byte under that, so the
-    // cache is really over its cap while the clean runs -- otherwise
-    // "nothing was taken" would be the uninteresting answer of a cache with
-    // room to spare rather than the answer of one that has nothing
-    // disposable in it.
+    // cache is really over its cap while the clean runs. Otherwise "nothing
+    // was taken" would be the uninteresting answer of a cache with room to
+    // spare, rather than the answer of one that has nothing disposable in
+    // it.
     let baseline = handle.cache_usage()?;
     assert_eq!(
         baseline.protected_files, 2,
@@ -3883,9 +3889,9 @@ fn a_clean_takes_no_pinned_and_no_ownerless_byte() -> anyhow::Result<()> {
     );
 
     // The clean: both owners give back their slack, and there is none to
-    // give. The pin is kept, and the whole-file copies an earlier version
-    // left behind are nobody's -- in no count and in no pass -- so every
-    // byte this test put on the disk is still there afterwards.
+    // give. The pin is kept. The whole-file copies an earlier version left
+    // behind are nobody's (in no count and in no pass). So every byte this
+    // test put on the disk is still there afterwards.
     let report = serde_json::to_value(handle.clean_cache_now()?)?;
     assert!(
         idle.is_file(),
@@ -3902,9 +3908,9 @@ fn a_clean_takes_no_pinned_and_no_ownerless_byte() -> anyhow::Result<()> {
     );
     assert_eq!(report["deleted"], 0, "{report}");
     assert_eq!(report["freed"], 0, "{report}");
-    // The figures are the owners' own, which is what makes them the same
-    // figures `cache_usage` answers: the pinned files, counted as files,
-    // and the cap the process has just restated.
+    // The figures are the owners' own, which makes them the same figures
+    // `cache_usage` answers: the pinned files, counted as files, and the
+    // cap the process has just restated.
     assert_eq!(report["protectedFiles"], 2, "{report}");
     assert_eq!(report["protected"], baseline.protected_bytes, "{report}");
     assert_eq!(report["limit"], limit, "{report}");
@@ -3930,8 +3936,8 @@ fn a_clean_takes_no_pinned_and_no_ownerless_byte() -> anyhow::Result<()> {
 }
 
 /// A server whose torrent is pre-seeded in the cache root, so media
-/// requests answer real bytes with no peer anywhere -- and a LAN media
-/// listener on `lan_media_addr` when one is given.
+/// requests answer real bytes with no peer anywhere. It also has a LAN
+/// media listener on `lan_media_addr` when one is given.
 ///
 /// Returns the handle, the loopback base URL, the info hash, the file index
 /// and the payload the file holds.
@@ -3940,8 +3946,8 @@ fn a_clean_takes_no_pinned_and_no_ownerless_byte() -> anyhow::Result<()> {
 /// test. One reads bytes and wants [`seeded_fixture_config`], so that no
 /// pass takes what was seeded while it reads. The other is about the free
 /// space gate, the slack a switch gives back or the reconciler stopping an
-/// idle torrent, and must keep the empty pin record: under an unknown pin
-/// set nothing is slack, nothing is reclaimed and nothing is stopped, so
+/// idle torrent, and must keep the empty pin record. Under an unknown pin
+/// set nothing is slack, nothing is reclaimed and nothing is stopped. So
 /// there would be nothing left for it to be about. See [`fixture_pins`].
 fn lan_media_server(
     config_dir: &std::path::Path,
@@ -3952,8 +3958,8 @@ fn lan_media_server(
 ) -> anyhow::Result<(ServerHandle, String, String, usize, Vec<u8>)> {
     let content = src.join("Movie");
     std::fs::create_dir_all(&content)?;
-    // Two files, each a whole number of 16 KiB pieces, so neither shares a
-    // boundary piece with the other whatever order `create_torrent`'s
+    // Two files, each a whole number of 16 KiB pieces. So neither shares a
+    // boundary piece with the other, whatever order `create_torrent`'s
     // directory walk produced.
     write_payload(&content.join("movie.bin"), 64 * 1024);
     write_payload(&content.join("extra.bin"), 16 * 1024);
@@ -3968,8 +3974,8 @@ fn lan_media_server(
         cache_dir: Some(cache_root.clone()),
         ..config
     })?;
-    // After the start, and before the add: the launch sweep has run and has
-    // nothing to say about a torrent that does not exist yet.
+    // After the start, and before the add. The launch sweep has run, and it
+    // has nothing to say about a torrent that does not exist yet.
     seed_piece_store(&cache_root, &torrent, &content);
     let base = format!("http://{}", handle.http_addr());
     let client = bearer_client(&handle)?;
@@ -3987,26 +3993,25 @@ fn lan_media_server(
 
 /// Wait until the pre-seeded file really is complete, and answer its stats.
 ///
-/// The hash check of the pre-seeded copy is what makes the bytes servable,
-/// and `phase` can already read `buffering` while that check is still queued
-/// -- so this waits on the observable state a media request needs (bounded,
+/// The hash check of the pre-seeded copy is what makes the bytes servable.
+/// `phase` can already read `buffering` while that check is still queued.
+/// So this waits on the observable state a media request needs (bounded,
 /// not a timing assertion), never on a sleep of its own choosing.
 ///
 /// `cache_root` is the one the fixture seeded through, and it is here for the
 /// failure message alone. If this wait expires, the stats alone cannot say
-/// which of two things happened -- a torrent reports the same numbers
-/// either way, `downloaded` zero and every piece of a one-file torrent
-/// missing:
+/// which of two things happened. A torrent reports the same numbers either
+/// way: `downloaded` zero and every piece of a one-file torrent missing.
 ///
 /// * the piece files were **not on the disk** when the check ran, so
 ///   `PieceStore::has_piece` said no to every piece and the check read
 ///   nothing; or
 /// * they **were** on the disk and the check would not claim them. One read
-///   error is enough for that: `FileOps::initial_check` marks the whole
+///   error is enough for that. `FileOps::initial_check` marks the whole
 ///   *file* broken on the first failed read and skips every later piece of
-///   it without reading, so a single transient failure on piece 0 of a
-///   one-file torrent writes off all hundred -- and nothing re-checks a
-///   torrent afterwards, which is why the wait then has nothing to wait for.
+///   it without reading. So a single transient failure on piece 0 of a
+///   one-file torrent writes off all hundred. Nothing re-checks a torrent
+///   afterwards, which is why the wait then has nothing to wait for.
 ///
 /// So the count off the disk goes in the message. It is read *after* the
 /// bound has expired, against a torrent that is no longer downloading
@@ -4041,7 +4046,7 @@ fn complete_file_stats(
 
 /// Permit and start the LAN media listener the way a cast session does: the
 /// setting first, because the veto is the default, then the start. Nothing
-/// binds the listener at startup, however it is configured, so every test
+/// binds the listener at startup, however it is configured. So every test
 /// that wants one up asks for it here.
 fn start_lan_media(handle: &ServerHandle) -> anyhow::Result<std::net::SocketAddr> {
     handle.update_settings(serde_json::json!({ "lanMediaEnabled": true }))?;
@@ -4050,9 +4055,9 @@ fn start_lan_media(handle: &ServerHandle) -> anyhow::Result<std::net::SocketAddr
         .ok_or_else(|| anyhow::anyhow!("set_lan_media(true) answered with no address"))
 }
 
-/// Publish the fixture's film for a cast the way the app does -- registered
-/// by the streaming URL stremio-core builds, published with no play -- and
-/// answer the path the receiver is handed, `/cast/<token>`.
+/// Publish the fixture's film for a cast the way the app does (registered
+/// by the streaming URL stremio-core builds, published with no play). Answer
+/// the path the receiver is handed, `/cast/<token>`.
 fn cast_path(
     handle: &ServerHandle,
     base: &str,
@@ -4066,22 +4071,22 @@ fn cast_path(
     Ok(format!("/cast/{}", token.as_str()))
 }
 
-/// The whole free-space loop, inside a real server: the reconciler `run()`
+/// The whole free-space loop, inside a real server. The reconciler `run()`
 /// starts stops a torrent that is writing when its volume falls under the
-/// floor, the statistics say so, and it runs again when the space comes
-/// back.
+/// floor. The statistics say so, and the torrent runs again when the space
+/// comes back.
 ///
-/// Every unit test of the arm drives `reconcile_tick` by hand, so none of
+/// Every unit test of the arm drives `reconcile_tick` by hand. So none of
 /// them would notice the two lines in `run()` that start the loop going
-/// away -- which is the whole of what makes the floor hold on a real
-/// device. A volume cannot be filled on demand, so the engine's own probe
-/// is declared through `pretend_volume_space`, keyed by this test's cache
-/// root so no other server in the run sees it.
+/// away, and those lines are the whole of what makes the floor hold on a
+/// real device. A volume cannot be filled on demand, so the engine's own
+/// probe is declared through `pretend_volume_space`. It is keyed by this
+/// test's cache root so no other server in the run sees it.
 ///
-/// The last part is the window the hysteresis opens. Between the floor and
-/// the resume margin a timer leaves a stopped torrent alone -- but the
+/// The last part is the window the hysteresis opens. A timer leaves a
+/// stopped torrent alone between the floor and the resume margin. But the
 /// stream route has no refusal of its own keyed on "this torrent is
-/// stopped", so a request landing there must be what starts it, or the
+/// stopped". So a request landing there must be what starts it, or the
 /// reader would park on a torrent nothing is fetching for.
 #[test]
 fn the_servers_own_reconciler_stops_a_torrent_under_the_floor_and_starts_it_again()
@@ -4126,8 +4131,8 @@ fn the_servers_own_reconciler_stops_a_torrent_under_the_floor_and_starts_it_agai
     };
     assert_eq!(error_of(&handle)?, None, "nothing is wrong with it yet");
 
-    // The volume fills. Bounded poll on what the client can see, never a
-    // sleep: the loop runs on its own two-second interval.
+    // The volume fills. This is a bounded poll on what the client can see,
+    // never a sleep. The loop runs on its own two-second interval.
     stream_server::pretend_volume_space(&cache_root, 0);
     let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
     loop {
@@ -4141,7 +4146,7 @@ fn the_servers_own_reconciler_stops_a_torrent_under_the_floor_and_starts_it_agai
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    // Room above the floor, but inside the resume margin: the timer leaves
+    // Room above the floor, but inside the resume margin. The timer leaves
     // it stopped, and a stream request is what starts it. The route's own
     // probe reads the same number, so its floor check passes.
     stream_server::pretend_volume_space(&cache_root, FLOOR + MARGIN - 1);
@@ -4159,7 +4164,7 @@ fn the_servers_own_reconciler_stops_a_torrent_under_the_floor_and_starts_it_agai
             "with room above the floor the request is not refused"
         ),
         // No peer will ever bring these bytes, so the request waits until
-        // this client gives up -- which is the proof it was not refused.
+        // this client gives up. That is the proof it was not refused.
         Err(error) => assert!(error.is_timeout(), "{error}"),
     }
     let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
@@ -4180,27 +4185,27 @@ fn the_servers_own_reconciler_stops_a_torrent_under_the_floor_and_starts_it_agai
 }
 
 /// A restart, over the real persisted librqbit session the server keeps,
-/// with a torrent the previous process had stopped -- and the stream
-/// request that starts it again.
+/// with a torrent the previous process had stopped. Then the stream request
+/// that starts it again.
 ///
 /// This is the whole of the design, from outside. The pause is in
-/// `session.json` and survived the process; nothing in the new one knows
-/// it exists, let alone why. On master three of the four sites that could
+/// `session.json` and survived the process. Nothing in the new one knows it
+/// exists, let alone why. On master, three of the four sites that could
 /// have lifted it read `if idle_paused.swap(false) && resume()`, which is
-/// `false && ...` in a fresh process, and the fourth -- the stream route's
-/// own metadata-resolution guard, which this test drives -- was gated on
-/// the same flag.
+/// `false && ...` in a fresh process. The fourth was gated on the same
+/// flag: the stream route's own metadata-resolution guard, which this test
+/// drives.
 ///
-/// Observed through `swarmPaused`, which the backend answers from its state
-/// machine: it is the one field of the stats shape that says whether the
-/// torrent is running.
+/// It is observed through `swarmPaused`, which the backend answers from its
+/// state machine. It is the one field of the stats shape that says whether
+/// the torrent is running.
 ///
-/// The volume is held **inside the hysteresis band** -- room above the
-/// free-space floor, but under the resume margin -- for the middle of the
-/// test, because that is the window in which nothing *but* a request will
-/// start the torrent: the reconciler's timer deliberately leaves a stopped
-/// torrent alone until the volume has cleared the margin. Without that the
-/// timer would start it a couple of seconds later and the test would pass
+/// The volume is held **inside the hysteresis band** (room above the
+/// free-space floor, but under the resume margin) for the middle of the
+/// test. That is the window in which nothing *but* a request will start the
+/// torrent. The reconciler's timer deliberately leaves a stopped torrent
+/// alone until the volume has cleared the margin. Without that, the timer
+/// would start it a couple of seconds later and the test would pass
 /// whatever the route did. The route's own floor check reads a separate
 /// declaration (`pretend_available_space`), so the request is not refused.
 #[test]
@@ -4248,8 +4253,8 @@ fn a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it() -> anyhow
             let stats: serde_json::Value =
                 serde_json::to_value(handle.engine_stats(&info_hash, &[])?)?;
             // Both, in one reading, rather than breaking on the message and
-            // asserting the flag after it: they are two fields of one
-            // snapshot and nothing makes them move together, so on a slow
+            // asserting the flag after it. They are two fields of one
+            // snapshot and nothing makes them move together. On a slow
             // runner the message lands first and the flag a moment later.
             if stats["error"].as_str() == Some(stopped_message)
                 && stats["swarmPaused"] == serde_json::json!(true)
@@ -4266,8 +4271,8 @@ fn a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it() -> anyhow
     handle.shutdown()?;
     handle.join()?;
 
-    // This one. Room above the floor, inside the resume margin: nothing on
-    // a timer will start the torrent here.
+    // This one. Room above the floor, inside the resume margin, so nothing
+    // on a timer will start the torrent here.
     stream_server::pretend_volume_space(&cache_root, FLOOR + MARGIN - 1);
     stream_server::pretend_available_space(&cache_root, FLOOR + MARGIN - 1);
     let handle = start()?;
@@ -4277,10 +4282,10 @@ fn a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it() -> anyhow
         Ok(stats["swarmPaused"] == serde_json::json!(true))
     };
     // The initial check has to finish before the state machine can say
-    // anything settled about the torrent at all -- and `phase` leaving
-    // `checking` is not that moment, so this is a bounded poll on the
-    // reading the rest of the test depends on rather than one assertion
-    // taken the instant `phase` moves.
+    // anything settled about the torrent at all. `phase` leaving `checking`
+    // is not that moment. So this is a bounded poll on the reading the rest
+    // of the test depends on, rather than one assertion taken the instant
+    // `phase` moves.
     stats_after_check(&handle, &info_hash)?;
     let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
     while !swarm_paused(&handle)? {
@@ -4290,18 +4295,18 @@ fn a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it() -> anyhow
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    // And it stays that way while nobody asks. Asked rather than waited
-    // for: the timer's own question, put to the ladder synchronously, so
-    // what is read is the decision itself and not a torrent that happens
-    // not to have moved yet. A sleep proves nothing here -- a `Run` the
+    // And it stays that way while nobody asks. The test asks rather than
+    // waits: it puts the timer's own question to the ladder synchronously.
+    // So what is read is the decision itself, not a torrent that happens
+    // not to have moved yet. A sleep proves nothing here. A `Run` the
     // actuator declined to act on looks exactly like a `Stop` from
     // outside, and `for_space` is not on the wire at all.
     //
     // `for_space` is the whole of the claim. Nothing is playing this
     // torrent either, so the ladder's idle arm would answer `Stop` for a
-    // torrent on a volume with all the room in the world; only the
-    // free-space arm firing says the *margin* is what is holding it, which
-    // is the policy this test exists for.
+    // torrent on a volume with all the room in the world. Only the
+    // free-space arm firing says the *margin* is what is holding it, and
+    // that is the policy this test exists for.
     assert_eq!(
         handle.reconcile_as_timer(&info_hash)?,
         Some(free_space_stop()),
@@ -4314,11 +4319,11 @@ fn a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it() -> anyhow
 
     // A player's first request for a file it has not seen before, which is
     // a HEAD: it asks how long the file is and whether ranges work. That
-    // path resolves the torrent's file list and nothing else -- no stream
-    // is started, so the metadata-resolution guard is the only thing on it
+    // path resolves the torrent's file list and nothing else. No stream is
+    // started, so the metadata-resolution guard is the only thing on it
     // that asks the reconciler anything. It is also the request that must
-    // work on a torrent whose metadata is not resolved at all, which is a
-    // torrent that has to be running to resolve it.
+    // work on a torrent whose metadata is not resolved at all, and such a
+    // torrent has to be running to resolve it.
     let anonymous = reqwest::blocking::Client::new();
     let head = anonymous
         .head(format!("{base}/{info_hash}/0"))
@@ -4367,24 +4372,24 @@ fn a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it() -> anyhow
 ///
 /// The `torrent:` form opens a file reader on a torrent exactly the way
 /// the stream route does, and registered nothing at all: no
-/// `on_stream_start`, no reconcile. Two failures follow, and
-/// this test drives the one that can be observed from outside without
-/// racing a timer -- an archive request landing on a torrent the last
-/// reconciler pass already stopped, which is left parked on pieces nobody
-/// is fetching, with no end and no error, because nothing asked the
-/// reconciler to start it. (The other is the mirror image: with seeding
-/// off and the grace elapsed, the timer pauses the torrent an archive
-/// response body is streaming from, mid-body.)
+/// `on_stream_start`, no reconcile. Two failures follow. This test drives
+/// the one that can be observed from outside without racing a timer. An
+/// archive request lands on a torrent the last reconciler pass already
+/// stopped. It is left parked on pieces nobody is fetching, with no end and
+/// no error, because nothing asked the reconciler to start it. (The other
+/// is the mirror image. With seeding off and the grace elapsed, the timer
+/// pauses the torrent an archive response body is streaming from,
+/// mid-body.)
 ///
 /// The volume is held **inside the hysteresis band** for the archive
 /// request, exactly as `a_restart_leaves_a_torrent_stopped_and_a_stream_request_starts_it`
-/// holds it: room above the floor, but under the resume margin, is the one
+/// holds it. Room above the floor, but under the resume margin, is the one
 /// window in which nothing *but* a request will start the torrent.
 /// Without it the timer would start it a couple of seconds later and the
 /// test would pass whatever the route did.
 ///
 /// Nothing seeds this fixture, so the member is never read and the request
-/// parks -- which is the point. What the request has to cause, while it is
+/// parks. That is the point. What the request has to cause, while it is
 /// parked, is a torrent that is running.
 #[test]
 fn an_archive_member_request_starts_the_torrent_it_reads_from() -> anyhow::Result<()> {
@@ -4396,9 +4401,9 @@ fn an_archive_member_request_starts_the_torrent_it_reads_from() -> anyhow::Resul
     let cache_root = resolved(&cache_dir.path().join("cache"));
     stream_server::pretend_volume_space(&cache_root, u64::MAX);
 
-    // A torrent whose one file is an archive. Its bytes are never read --
-    // no peer will bring them -- so what is in it does not matter, but the
-    // suffix does: the `torrent:` form takes the format from the URL
+    // A torrent whose one file is an archive. Its bytes are never read (no
+    // peer will bring them), so what is in it does not matter. The suffix
+    // does matter. The `torrent:` form takes the format from the URL
     // prefix, and the file it names has to be the container that prefix
     // reads for the request to get as far as the torrent at all.
     let content = src.path().join("Wanted");
@@ -4440,13 +4445,13 @@ fn an_archive_member_request_starts_the_torrent_it_reads_from() -> anyhow::Resul
     // Room above the floor, inside the resume margin: the timer, asked,
     // leaves it stopped.
     //
-    // Asked and not slept past, and here that is the difference between a
-    // test and a decoration. The stop above was made by this process
-    // moments ago, so `RECONCILE_MIN_DWELL` -- fifteen seconds -- is still
-    // running, and it suppresses a timer's start whatever the ladder
+    // The timer is asked, not slept past, and here that is the difference
+    // between a test and a decoration. The stop above was made by this
+    // process moments ago, so `RECONCILE_MIN_DWELL` (fifteen seconds) is
+    // still running. It suppresses a timer's start whatever the ladder
     // wants. Any sleep short enough to belong in a suite expires inside
-    // that window, so the torrent is still paused for a reason that has
-    // nothing to do with the resume margin this line is about.
+    // that window. The torrent would then still be paused for a reason that
+    // has nothing to do with the resume margin this line is about.
     stream_server::pretend_volume_space(&cache_root, FLOOR + MARGIN - 1);
     stream_server::pretend_available_space(&cache_root, FLOOR + MARGIN - 1);
     assert_eq!(
@@ -4460,10 +4465,10 @@ fn an_archive_member_request_starts_the_torrent_it_reads_from() -> anyhow::Resul
     );
 
     // `torrent:<info hash>/<path in the torrent>` is one path segment, so
-    // the separator inside it is encoded; the member after it is the
+    // the separator inside it is encoded. The member after it is the
     // wildcard. The zip reader goes looking for the central directory and
-    // parks there for ever, so the request is sent on a socket of its own
-    // and the torrent watched while it is parked -- the start is what the
+    // parks there for ever. So the request is sent on a socket of its own,
+    // and the torrent is watched while it is parked. The start is what the
     // request has to cause, and waiting out a client timeout would only
     // spend the suite's time. The bound is generous because what is waited
     // for is the *server* reaching its registration, on a loaded machine
@@ -4515,11 +4520,11 @@ fn member_payload(len: usize) -> Vec<u8> {
 /// A zip holding one member, written `compression`'s way.
 ///
 /// The fixtures that leave a hole in the middle of the archive use `Stored`,
-/// because such a fixture needs to know where the member's bytes are:
-/// uncompressed, they run from a local header at the front to the central
-/// directory at the back, so a hole anywhere in the middle of the file is a
+/// because such a fixture needs to know where the member's bytes are.
+/// Uncompressed, they run from a local header at the front to the central
+/// directory at the back. So a hole anywhere in the middle of the file is a
 /// hole in the member's data and nowhere else. `Stored` is also the only
-/// member that is served at all -- a compressed one is refused -- so a test
+/// member that is served at all (a compressed one is refused), so a test
 /// about the refusal asks for `Deflate`.
 fn member_zip(member: &str, len: usize, compression: async_zip::Compression) -> Vec<u8> {
     let data = member_payload(len);
@@ -4538,15 +4543,15 @@ fn member_zip(member: &str, len: usize, compression: async_zip::Compression) -> 
 }
 
 /// A server holding one torrent whose only file is `fixture.zip`, a zip with
-/// one stored member -- the shape `/zip/stream/torrent:<hash>/<archive>/<member>`
-/// reads.
+/// one stored member. That is the shape
+/// `/zip/stream/torrent:<hash>/<archive>/<member>` reads.
 ///
 /// `hole` is a byte range of that file the piece store is *not* seeded with.
 /// Nothing seeds these fixtures and no peer will ever bring the missing
-/// pieces, so a read that reaches the hole parks there for as long as the
+/// pieces. So a read that reaches the hole parks there for as long as the
 /// test wants, which is how a response body is held open.
 ///
-/// The volume is declared roomy: every arm of the reconciler's ladder above
+/// The volume is declared roomy. Every arm of the reconciler's ladder above
 /// the idle one is about the disk, and a test about the idle one wants none
 /// of them.
 ///
@@ -4555,8 +4560,8 @@ fn member_zip(member: &str, len: usize, compression: async_zip::Compression) -> 
 /// to and wants [`seeded_fixture_config`], so that no pass takes what was
 /// seeded while it reads. The other is about the reconciler stopping a
 /// torrent nobody reads, and that cannot be asked under an unknown pin set
-/// at all: it reads as pinned, so the torrent is exempt from idle removal
-/// and is never stopped. See [`fixture_pins`].
+/// at all. An unknown set reads as pinned, so the torrent is exempt from
+/// idle removal and is never stopped. See [`fixture_pins`].
 fn archive_member_server(
     config_dir: &std::path::Path,
     cache_dir: &std::path::Path,
@@ -4620,8 +4625,8 @@ fn archive_member_server_with(
 }
 
 /// `torrent:<info hash>/<path in the torrent>` is one path segment of the
-/// archive URL, so the separator inside it is encoded; the member after it is
-/// the wildcard.
+/// archive URL, so the separator inside it is encoded. The member after it
+/// is the wildcard.
 fn archive_member_url(base: &str, info_hash: &str, member: &str) -> String {
     format!("{base}/zip/stream/torrent:{info_hash}%2Ffixture.zip/{member}")
 }
@@ -4629,16 +4634,17 @@ fn archive_member_url(base: &str, info_hash: &str, member: &str) -> String {
 /// **A film played out of an archive in a torrent shares nothing.**
 ///
 /// The archive's file is read through a translated source
-/// (`sources::torrent`), which opens its readers on the torrent the way a
-/// stream does -- registered, bounded -- and is not the viewer's playback
-/// stream. Drawn as one, the file would share itself whole under a budget
-/// that covers it (the default); a RAR set read across its volumes would
-/// leave a play session nobody shares at every boundary, whose end stops
-/// the torrent under the film. So the file's sharing row promises nothing,
-/// and the torrent is still in the swarm once the member has been played.
+/// (`sources::torrent`). It opens its readers on the torrent the way a
+/// stream does (registered, bounded), and it is not the viewer's playback
+/// stream. If it were drawn as one, the file would share itself whole
+/// under a budget that covers it (the default). A RAR set read across its
+/// volumes would leave a play session nobody shares at every boundary, and
+/// that session's end stops the torrent under the film. So the file's
+/// sharing row promises nothing, and the torrent is still in the swarm
+/// once the member has been played.
 ///
 /// The pin set is known, as for any test of what playing does to a
-/// torrent; the read follows the add at once.
+/// torrent. The read follows the add at once.
 #[test]
 fn a_film_played_out_of_an_archive_in_a_torrent_shares_nothing() -> anyhow::Result<()> {
     const MEMBER_LEN: usize = 64 * 1024;
@@ -4688,16 +4694,16 @@ fn a_film_played_out_of_an_archive_in_a_torrent_shares_nothing() -> anyhow::Resu
 /// **An archive read beside the film, in the same torrent, takes nothing
 /// from the film.**
 ///
-/// The film has been played through and its reads have closed -- a seek
-/// closes them all for a moment, and so does the end of a body -- when a
-/// member of an archive in the same torrent is read. The archive's source
+/// The film has been played through and its reads have closed when a
+/// member of an archive in the same torrent is read. (A seek closes them
+/// all for a moment, and so does the end of a body.) The archive's source
 /// registers an unshared stream, which never takes the liveness cell from
-/// the file the viewer's player opened: registered as a player's stream,
-/// it took the cell, the film's play session ended with its draw still
-/// announced, and the torrent was stopped and the film's bytes deleted --
-/// under a film the viewer had only paused or seeked in. Here the player
-/// states no length and the default budget covers the film, so the film's
-/// draw is the whole film from its first open.
+/// the file the viewer's player opened. When it was registered as a
+/// player's stream, it took the cell. The film's play session ended with
+/// its draw still announced, and the torrent was stopped and the film's
+/// bytes deleted, under a film the viewer had only paused or seeked in.
+/// Here the player states no length and the default budget covers the
+/// film, so the film's draw is the whole film from its first open.
 #[test]
 fn an_archive_read_beside_the_film_takes_nothing_from_it() -> anyhow::Result<()> {
     const MEMBER_LEN: usize = 64 * 1024;
@@ -4776,16 +4782,17 @@ fn an_archive_read_beside_the_film_takes_nothing_from_it() -> anyhow::Result<()>
     Ok(())
 }
 
-/// **Only the player's own request shares anything.** The same film,
-/// fetched twice: by a client that sends no player token -- another app on
-/// the HTTP routes, a subtitle fetch, a probe -- and then by the app's
-/// player, whose request carries `p=`. Under the default budget, which
-/// covers the film, a player's open shares all of it at once; the other
-/// request shares none of it, however much of it was read.
+/// **Only the player's own request shares anything.** The same film is
+/// fetched twice. First a client that sends no player token fetches it
+/// (another app on the HTTP routes, a subtitle fetch, a probe). Then the
+/// app's player fetches it, and its request carries `p=`. Under the
+/// default budget, which covers the film, a player's open shares all of it
+/// at once. The other request shares none of it, however much of it was
+/// read.
 ///
-/// The film is asked for the moment it is added, as the other tests of
-/// what playing does are: under the pin record a torrent nobody plays is
-/// emptied by the next tick.
+/// The film is asked for the moment it is added, as in the other tests of
+/// what playing does. Under the pin record, the next tick empties a torrent
+/// nobody plays.
 #[test]
 fn only_the_players_request_shares_anything() -> anyhow::Result<()> {
     const FILM_LEN: usize = 128 * 1024;
@@ -4849,7 +4856,7 @@ fn only_the_players_request_shares_anything() -> anyhow::Result<()> {
         })
     );
 
-    // The player goes on to a proxied stream: its session leaves the film,
+    // The player goes on to a proxied stream. Its session leaves the film,
     // whether or not the origin answers.
     let origin = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?;
     let _ = anonymous
@@ -4864,7 +4871,7 @@ fn only_the_players_request_shares_anything() -> anyhow::Result<()> {
     );
 
     // The first screen's player, still reconnecting, asks for the film
-    // again: an older screen of the same viewer, which moves nothing.
+    // again. It is an older screen of the same viewer, so it moves nothing.
     anonymous
         .get(format!("{film_url}?p=tv.1"))
         .send()?
@@ -4882,11 +4889,11 @@ fn only_the_players_request_shares_anything() -> anyhow::Result<()> {
 }
 
 /// **An older screen's request is served and moves nothing.** The viewer
-/// watches episode one on screen `tv.1`, then episode two on `tv.2`; the
+/// watches episode one on screen `tv.1`, then episode two on `tv.2`. The
 /// first screen's player, still tearing down, asks for episode one again.
-/// It gets its bytes, and the liveness cell stays on episode two -- moved
-/// there, episode two would be slack under a viewer who is watching it,
-/// and its read-ahead the next tick's to give back.
+/// It gets its bytes, and the liveness cell stays on episode two. If the
+/// cell moved, episode two would be slack under a viewer who is watching
+/// it, and the next tick would give its read-ahead back.
 #[test]
 fn an_older_screens_request_is_served_and_leaves_the_cell_where_it_is() -> anyhow::Result<()> {
     const EPISODE_LEN: usize = 64 * 1024;
@@ -4913,8 +4920,8 @@ fn an_older_screens_request_is_served_and_leaves_the_cell_where_it_is() -> anyho
         .json(&serde_json::json!({ "torrent": hex::encode(&torrent) }))
         .send()?
         .error_for_status()?;
-    // Episode one is kept as a download: left by the viewer, it would
-    // otherwise be taken off the disk before the older screen asks, and
+    // Episode one is kept as a download. Otherwise, once the viewer left
+    // it, it would be taken off the disk before the older screen asks, and
     // there is nothing offline to fetch it back from.
     handle.pin_download(&info_hash, 0, &[])?;
     let (engine, _runtime) = handle.engine_for_tests();
@@ -4963,7 +4970,8 @@ fn an_older_screens_request_is_served_and_leaves_the_cell_where_it_is() -> anyho
 /// player is handed the archive's own file first (`p=` and all), fails to
 /// recognise it, and the app has its member served out of it by the
 /// archive route. That request is the player's, and it moves the player's
-/// play session -- but it draws nothing: the archive is never what plays.
+/// play session. But it draws nothing, because the archive is never what
+/// plays.
 #[test]
 fn an_archive_the_player_opens_shares_nothing() -> anyhow::Result<()> {
     const MEMBER_LEN: usize = 64 * 1024;
@@ -5016,9 +5024,9 @@ fn an_archive_the_player_opens_shares_nothing() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Whether the reconciler has this torrent stopped, as the server reports it:
-/// `swarmPaused` is `run_state() == Paused` read off librqbit, not anything
-/// the route under test writes.
+/// Whether the reconciler has this torrent stopped, as the server reports
+/// it. `swarmPaused` is `run_state() == Paused` read off librqbit, not
+/// anything the route under test writes.
 fn swarm_paused(handle: &stream_server::ServerHandle, info_hash: &str) -> anyhow::Result<bool> {
     let stats: serde_json::Value = serde_json::to_value(handle.engine_stats(info_hash, &[])?)?;
     Ok(stats["swarmPaused"] == serde_json::json!(true))
@@ -5042,7 +5050,7 @@ fn archive_extractions(cache_root: &std::path::Path) -> Vec<std::path::PathBuf> 
 /// **A compressed member inside a torrent is refused**, with the sentence
 /// the player shows and nothing written anywhere.
 ///
-/// A deflated member has no random access: reaching any offset means
+/// A deflated member has no random access. Reaching any offset means
 /// inflating everything before it, so a range read is refused by decision
 /// (`docs/design/translated-sources.md` §2.2) rather than serving a
 /// decompressed copy. A member is `Direct` extents or a `Refusal`, never a
@@ -5095,9 +5103,9 @@ fn a_compressed_member_in_a_torrent_is_refused_rather_than_extracted() -> anyhow
 }
 
 /// **A stored member inside a torrent is served from the torrent**, with no
-/// extraction at all: it is a byte range of the archive, so a range request
-/// on it is a range read of the torrent and nothing is written under the
-/// cache root. That is the ordinary case -- a film does not compress, so a
+/// extraction at all. It is a byte range of the archive. So a range request
+/// on it is a range read of the torrent, and nothing is written under the
+/// cache root. That is the ordinary case: a film does not compress, so a
 /// film put in a ZIP is stored.
 #[test]
 fn a_stored_member_in_a_torrent_is_served_without_an_extraction() -> anyhow::Result<()> {
@@ -5140,7 +5148,7 @@ fn a_stored_member_in_a_torrent_is_served_without_an_extraction() -> anyhow::Res
     );
 
     // And back to the head of the member, which is the seek a player makes
-    // after reading a film's index: the torrent's own handle moves, and
+    // after reading a film's index. The torrent's own handle moves, and
     // nothing reads through the bytes in between.
     let back = anonymous
         .get(archive_member_url(&base, &info_hash, MEMBER))
@@ -5149,7 +5157,7 @@ fn a_stored_member_in_a_torrent_is_served_without_an_extraction() -> anyhow::Res
     assert_eq!(back.status(), reqwest::StatusCode::PARTIAL_CONTENT);
     assert_eq!(back.bytes()?.as_ref(), &payload[1024..5120]);
 
-    // The hash in either case names the same archive: the key is filed
+    // The hash in either case names the same archive. The key is filed
     // under its lowercase hash (`routes::archive::canonical_key`), so this
     // is served by the session the reads above made.
     let upper = anonymous
@@ -5193,7 +5201,7 @@ fn a_stored_member_in_a_torrent_is_served_without_an_extraction() -> anyhow::Res
 /// name a test asserts against.
 ///
 /// `RAR_SET_VOLUME_BYTES` of member data per volume and a film of four
-/// times that: `rar5_volumes` splits it into three, so the film is three
+/// times that. `rar5_volumes` splits it into three, so the film is three
 /// extents of three different files of the torrent.
 #[cfg(feature = "rar")]
 const RAR_SET_MEMBER: &str = "videos/film.bin";
@@ -5203,8 +5211,8 @@ const RAR_SET_FILM_LEN: usize = 256 * 1024;
 const RAR_SET_VOLUME_BYTES: usize = 100_000;
 
 /// A server whose torrent holds `volumes` of a RAR set, named
-/// `film.part1.rar`, `film.part2.rar`, ... -- but only the ones `keep`
-/// says, so a test can leave a hole in the middle of the set.
+/// `film.part1.rar`, `film.part2.rar`, and so on. It holds only the ones
+/// `keep` says, so a test can leave a hole in the middle of the set.
 #[cfg(feature = "rar")]
 fn rar_set_server(
     config_dir: &std::path::Path,
@@ -5212,10 +5220,9 @@ fn rar_set_server(
     src: &std::path::Path,
     keep: &[usize],
 ) -> anyhow::Result<(ServerHandle, String, String)> {
-    // What this test is about is which bytes a member maps to, not
-    // retention, and it asks for three volumes' worth of ranges: it needs
-    // the pin set unknown, or it is racing a two-second timer
-    // (`fixture_pins`).
+    // This test is about which bytes a member maps to, not retention, and
+    // it asks for three volumes' worth of ranges. It needs the pin set
+    // unknown, or it is racing a two-second timer (`fixture_pins`).
     rar_set_server_under(config_dir, cache_dir, src, keep, seeded_fixture_config())
 }
 
@@ -5269,17 +5276,17 @@ fn rar_set_server_under(
 /// This is what a scene release is: `film.part1.rar`, `film.part2.rar`,
 /// `film.part3.rar` beside each other in a torrent, with the film stored
 /// (not compressed) and split across all three. The URL names **one**
-/// volume -- `torrent:<hash>/film.part1.rar` -- and the rest of the set is
-/// found beside it by the naming rules
+/// volume (`torrent:<hash>/film.part1.rar`). The naming rules find the rest
+/// of the set beside it
 /// (`translators::rar::volume_set`, wired through `Translator::volumes`).
 ///
-/// The member is then three extents, one per volume, and what proves the
-/// mapping is a range that spans a volume boundary: its bytes have to be
-/// the film's on both sides of it. The film's every kibibyte states its
-/// own offset, so a part read out of the wrong volume is a wrong sentence.
-/// Nothing is extracted and nothing is written: the reader takes a
-/// `ByteSource`, not a `std::fs::File`, so a RAR set stored in a torrent is
-/// served by range like any other member.
+/// The member is then three extents, one per volume. A range that spans a
+/// volume boundary proves the mapping: its bytes have to be the film's on
+/// both sides of it. The film's every kibibyte states its own offset, so a
+/// part read out of the wrong volume is a wrong sentence. Nothing is
+/// extracted and nothing is written. The reader takes a `ByteSource`, not a
+/// `std::fs::File`, so a RAR set stored in a torrent is served by range
+/// like any other member.
 #[cfg(feature = "rar")]
 #[test]
 fn a_stored_film_across_three_rar_volumes_in_a_torrent_is_served_by_range() -> anyhow::Result<()> {
@@ -5306,7 +5313,7 @@ fn a_stored_film_across_three_rar_volumes_in_a_torrent_is_served_by_range() -> a
     assert_eq!(whole.bytes()?.as_ref(), film.as_slice());
 
     // A range across each boundary between two volumes: 4 KiB centred on
-    // it, which no single-volume mapping can answer correctly.
+    // it. No single-volume mapping can answer it correctly.
     for boundary in [RAR_SET_VOLUME_BYTES, 2 * RAR_SET_VOLUME_BYTES] {
         let (from, to) = (boundary - 2048, boundary + 2047);
         let across = anonymous
@@ -5369,25 +5376,25 @@ fn a_stored_film_across_three_rar_volumes_in_a_torrent_is_served_by_range() -> a
 /// **Reading a RAR set across its volumes keeps the volumes it has read.**
 ///
 /// The same three-volume set as above, under a **known** pin set that names
-/// nothing -- what xtremio publishes -- instead of the unknown one every
-/// other RAR test runs under, which keeps every byte whatever retention
-/// decides (`fixture_pins`). Seeded and offline, so a piece the server lets
+/// nothing (what xtremio publishes). Every other RAR test runs under the
+/// unknown one, which keeps every byte whatever retention decides
+/// (`fixture_pins`). It is seeded and offline, so a piece the server lets
 /// go of never comes back and a read of it parks.
 ///
 /// Each volume of the set is a `TorrentSource` that registers a stream
 /// on its own file. Before the session held its volumes as one set
 /// (`Live::hold_set`), each of those opens moved the liveness cell to
-/// itself and the switch's slack drop passed over every other volume as
-/// slack: measured 2026-09-29 against 3ac90f6, 17 pieces seeded and 1 left
+/// itself. The switch's slack drop then passed over every other volume as
+/// slack. Measured 2026-09-29 against 3ac90f6: 17 pieces seeded and 1 left
 /// (the piece the first and second volumes share) before the body delivered
-/// a byte, and the range itself then parked. What a correct server does is
-/// keep what the archive's reads have touched while the archive is the
-/// thing being read: the index read across all three volumes, and the
-/// member bytes on both sides of a boundary.
+/// a byte, and the range itself then parked. A correct server keeps what
+/// the archive's reads have touched while the archive is the thing being
+/// read: the index read across all three volumes, and the member bytes on
+/// both sides of a boundary.
 ///
 /// The one window this spends, `SETTLE`, is the one the "nothing is taken"
-/// claim is measured over: two reconcile intervals, so a tick's pass and the
-/// switch's both fall inside it.
+/// claim is measured over. It is two reconcile intervals, so a tick's pass
+/// and the switch's both fall inside it.
 #[cfg(feature = "rar")]
 #[test]
 fn a_rar_set_read_across_its_volumes_keeps_the_volumes_it_read() -> anyhow::Result<()> {
@@ -5427,8 +5434,8 @@ fn a_rar_set_read_across_its_volumes_keeps_the_volumes_it_read() -> anyhow::Resu
     eprintln!("volumes: {volume_pieces:?}");
     eprintln!("seeded: {} pieces {seeded:?}", seeded.len());
 
-    // A range across the boundary between the first volume and the second:
-    // the index is read across all three to open it, then the member's
+    // A range across the boundary between the first volume and the second.
+    // The index is read across all three to open it, then the member's
     // bytes on both sides of the boundary.
     let boundary = RAR_SET_VOLUME_BYTES;
     let (from, to) = (boundary - 2048, boundary + 2047);
@@ -5473,8 +5480,8 @@ fn a_rar_set_read_across_its_volumes_keeps_the_volumes_it_read() -> anyhow::Resu
         })
         .collect();
 
-    // And the head of the member again, which is in the first volume: with
-    // no peer, a piece that went is a read that parks.
+    // And the head of the member again, which is in the first volume. There
+    // is no peer, so a piece that went is a read that parks.
     let head = client
         .get(&member)
         .header(reqwest::header::RANGE, "bytes=1024-5119")
@@ -5503,10 +5510,10 @@ fn a_rar_set_read_across_its_volumes_keeps_the_volumes_it_read() -> anyhow::Resu
 
 /// **A set with a hole in it is refused, `422`, naming the volume it
 /// wanted.** The torrent holds `film.part1.rar` and `film.part3.rar`, so
-/// the naming rules find a gap in the run before a single header is read
-/// -- and say which file is missing, which is the one thing a viewer can
-/// act on. Serving it as a film with a silent gap where the second
-/// volume's bytes should be is the alternative, and it is not one.
+/// the naming rules find a gap in the run before a single header is read.
+/// They say which file is missing, which is the one thing a viewer can act
+/// on. The alternative is serving it as a film with a silent gap where the
+/// second volume's bytes should be, and that is not one.
 #[cfg(feature = "rar")]
 #[test]
 fn a_rar_set_in_a_torrent_missing_its_middle_volume_is_refused_by_name() -> anyhow::Result<()> {
@@ -5547,21 +5554,21 @@ fn a_rar_set_in_a_torrent_missing_its_middle_volume_is_refused_by_name() -> anyh
 /// player is still reading out of it.
 ///
 /// `routes::archive::stream_file` puts the registration guard inside the
-/// body's closure for exactly this reason, and what the guard's `start` does
-/// first is tell the server a stream opened on this torrent -- which is what
-/// makes it the entity being played (`enginefs::retention::live`). Every
-/// other torrent is then one nobody is playing, and the ladder's bottom arm
-/// stops those at once.
+/// body's closure for exactly this reason. The guard's `start` first tells
+/// the server a stream opened on this torrent, and that makes it the entity
+/// being played (`enginefs::retention::live`). Every other torrent is then
+/// one nobody is playing, and the ladder's bottom arm stops those at once.
 ///
-/// Two torrents, because "it is still running" only means something if the
-/// arm was firing at all in that window: the second one is read by nobody,
-/// and the test waits for the reconciler to stop *it* before asking about the
-/// first. That is the observable proof the policy was armed and running --
-/// no counter the route writes is read anywhere here.
+/// There are two torrents, because "it is still running" only means
+/// something if the arm was firing at all in that window. The second one
+/// is read by nobody, and the test waits for the reconciler to stop *it*
+/// before asking about the first. That is the observable proof the policy
+/// was armed and running. No counter the route writes is read anywhere
+/// here.
 ///
 /// The body is held open by the fixture rather than by the client's reading
-/// pace: the middle of the archive is missing from the piece store and no
-/// peer will bring it, so the member's read parks there and the response
+/// pace. The middle of the archive is missing from the piece store and no
+/// peer will bring it. So the member's read parks there, and the response
 /// stays open however slowly or quickly the client reads.
 #[test]
 fn an_archive_body_keeps_its_torrent_running_while_it_is_open() -> anyhow::Result<()> {
@@ -5571,7 +5578,7 @@ fn an_archive_body_keeps_its_torrent_running_while_it_is_open() -> anyhow::Resul
     let cache_dir = tempfile::tempdir()?;
     let src = tempfile::tempdir()?;
 
-    // The hole sits well inside the member's own bytes: the local header at
+    // The hole sits well inside the member's own bytes. The local header at
     // the front and the central directory at the back are both seeded, so the
     // zip opens and the member's read gets going before it stalls.
     let (handle, base, info_hash) = archive_member_server(
@@ -5582,7 +5589,7 @@ fn an_archive_body_keeps_its_torrent_running_while_it_is_open() -> anyhow::Resul
         MEMBER_LEN,
         Some(128 * 1024..192 * 1024),
         // The empty pin record, because this test is about the reconciler
-        // stopping a torrent nobody reads: an unknown pin set reads as pinned
+        // stopping a torrent nobody reads. An unknown pin set reads as pinned,
         // and nothing would ever be stopped (`fixture_pins`).
         offline_config(),
     )?;
@@ -5600,9 +5607,9 @@ fn an_archive_body_keeps_its_torrent_running_while_it_is_open() -> anyhow::Resul
         .error_for_status()?;
     stats_after_check(&handle, &idle_hash)?;
 
-    // The read. The response arrives -- there are bytes to send before the
-    // hole -- and the body is then left open, unread, for the rest of the
-    // test.
+    // The read. The response arrives, because there are bytes to send
+    // before the hole. The body is then left open, unread, for the rest of
+    // the test.
     let anonymous = reqwest::blocking::Client::new();
     let response = anonymous
         .get(archive_member_url(&base, &info_hash, MEMBER))
@@ -5611,8 +5618,8 @@ fn an_archive_body_keeps_its_torrent_running_while_it_is_open() -> anyhow::Resul
     let opened = std::time::Instant::now();
 
     // Seeding off is neither here nor there for this arm: a torrent nobody
-    // is playing is stopped either way. Left in as the setting a viewer of
-    // this feature would have.
+    // is playing is stopped either way. It is left in as the setting a
+    // viewer of this feature would have.
     handle.update_settings(serde_json::json!({ "seedingEnabled": false }))?;
 
     // Wait until both are true: the control torrent has been stopped, and
@@ -5645,21 +5652,21 @@ fn an_archive_body_keeps_its_torrent_running_while_it_is_open() -> anyhow::Resul
 /// the read is done.
 ///
 /// The read has no player token, so nothing holds the torrent but the
-/// read itself: `routes::archive::stream_file` registers a stream, which
-/// is a body being delivered (`EngineFS::held`), and the ladder keeps the
-/// torrent running for exactly as long as that lasts. What ends it is the
-/// registration ending -- an aside `TorrentSource`'s drop, a spawned
-/// `on_stream_end`, since a `Drop` cannot await the async locks itself --
-/// and without it every archive member ever read would keep its torrent
+/// read itself. `routes::archive::stream_file` registers a stream, which
+/// is a body being delivered (`EngineFS::held`). The ladder keeps the
+/// torrent running for exactly as long as that lasts. The registration
+/// ending is what ends it: an aside `TorrentSource`'s drop, a spawned
+/// `on_stream_end`, since a `Drop` cannot await the async locks itself.
+/// Without it, every archive member ever read would keep its torrent
 /// running for the life of the process. The liveness cell still names the
 /// torrent afterwards, and keeps nothing running.
 ///
 /// The oracle for the registration is the register itself, on the wire
-/// the embedder reads it off: `background_traffic().playing` is
+/// the embedder reads it off. `background_traffic().playing` is
 /// `enginefs::EngineFS::playback_is_live`, which is the open file readers
 /// **or** the stream registrations. The reader goes with the body either
-/// way, so a light that goes out when the body ends is one where the
-/// registration was ended too; and then the timer's verdict is `Stop`.
+/// way. So a light that goes out when the body ends is one where the
+/// registration was ended too, and then the timer's verdict is `Stop`.
 #[test]
 fn an_archive_member_read_lets_the_torrent_be_stopped_again_when_it_is_done() -> anyhow::Result<()>
 {
@@ -5692,13 +5699,13 @@ fn an_archive_member_read_lets_the_torrent_be_stopped_again_when_it_is_done() ->
         member_payload(MEMBER_LEN).as_slice(),
         "the member served out of the torrent"
     );
-    // The body is over, so the registration it made is over: the drop
+    // The body is over, so the registration it made is over. The drop
     // spawns the `on_stream_end` that ends it, and nothing else ever will.
-    // Bounded rather than immediate because that end is spawned.
+    // The wait is bounded rather than immediate because that end is spawned.
     //
     // This waits *before* the assertion below, and that order is the whole
-    // point of it: with a registration still open the reconciler answers
-    // `Run`, rightly, for the body being delivered.
+    // point of it. While a registration is still open, the reconciler
+    // answers `Run`, rightly, for the body being delivered.
     let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
     while handle.background_traffic()?.playing {
         anyhow::ensure!(
@@ -5736,26 +5743,26 @@ fn an_archive_member_read_lets_the_torrent_be_stopped_again_when_it_is_done() ->
 ///
 /// The stream route's metadata-resolution guard must not ask the
 /// reconciler about every torrent it is handed before the stream open has
-/// written the liveness cell: for a torrent with its metadata, that asks
+/// written the liveness cell. For a torrent with its metadata, that asks
 /// about one nobody has claimed. The viewer watched X, moved to Y, and
-/// comes back to X before the timer has stopped it -- X is running,
-/// neither playing nor pinned, so the ladder's last arm answers `Stop`, and
-/// a guard that reconciled would drop its peers moments before the GET's
-/// own reconcile started it again. A HEAD never opens a stream, so that
-/// stop would never be undone.
+/// comes back to X before the timer has stopped it. X is running, neither
+/// playing nor pinned, so the ladder's last arm answers `Stop`. A guard
+/// that reconciled would drop its peers moments before the GET's own
+/// reconcile started it again. A HEAD never opens a stream, so that stop
+/// would never be undone.
 ///
-/// **The window is one tick.** A stop is not held back by the dwell, so
+/// **The window is one tick.** A stop is not held back by the dwell. So
 /// the server's own reconciler stops X within `RECONCILE_INTERVAL` of Y
-/// opening whatever the route does, and a pause seen after the HEAD is
-/// the guard's only if no tick can have landed in between. So each
-/// attempt starts on a tick -- it watches the timer stop a torrent just
-/// added, which nobody plays -- and a pause counts only if the HEAD was
-/// answered inside half an interval of the last reading that saw that
-/// torrent running. X still running after the HEAD is an answer whatever
-/// the timing: nothing but a stream open starts X.
+/// opening, whatever the route does. A pause seen after the HEAD is the
+/// guard's only if no tick can have landed in between. So each attempt
+/// starts on a tick: it watches the timer stop a torrent just added, which
+/// nobody plays. A pause counts only if the HEAD was answered inside half
+/// an interval of the last reading that saw that torrent running. X still
+/// running after the HEAD is an answer whatever the timing, because
+/// nothing but a stream open starts X.
 ///
-/// A fresh server per attempt, because a torrent just added is the one
-/// thing the test can watch the timer stop without having started it
+/// Each attempt gets a fresh server, because a torrent just added is the
+/// one thing the test can watch the timer stop without having started it
 /// itself.
 #[test]
 fn a_head_on_a_torrent_the_viewer_left_does_not_stop_it() -> anyhow::Result<()> {
@@ -5775,13 +5782,13 @@ fn a_head_on_a_torrent_the_viewer_left_does_not_stop_it() -> anyhow::Result<()> 
 }
 
 /// One attempt of [`a_head_on_a_torrent_the_viewer_left_does_not_stop_it`],
-/// on a server of its own: whether the torrent left behind was stopped
-/// after the HEAD, or `None` when a stop could have been the timer's.
+/// on a server of its own. It answers whether the torrent left behind was
+/// stopped after the HEAD, or `None` when a stop could have been the timer's.
 fn head_on_the_torrent_left(budget: std::time::Duration) -> anyhow::Result<Option<bool>> {
     let config_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
     let src = tempfile::tempdir()?;
-    // Roomy, for the ladder and for the route's gate: Y's GET wants bytes,
+    // Roomy, for the ladder and for the route's gate. Y's GET wants bytes,
     // and no arm above the last one may have an opinion.
     let cache_root = resolved(&cache_dir.path().join("cache"));
     stream_server::pretend_volume_space(&cache_root, u64::MAX);
@@ -5795,12 +5802,12 @@ fn head_on_the_torrent_left(budget: std::time::Duration) -> anyhow::Result<Optio
     )?;
     let client = bearer_client(&handle)?;
     // A cache too small to hold a stream's read-ahead and a shared set
-    // beside it, so X's play session shares nothing: leaving X then ends no
-    // announcement, and nothing stops it but the timer -- the one state in
-    // which the HEAD's guard could be what stops it. A session that shared
-    // something is stopped by the switch itself, before its bytes go -- and
-    // under the default budget, which covers X, its session shares X whole
-    // from its first open, so the switch to Y is what would stop it, as the
+    // beside it, so X's play session shares nothing. Leaving X then ends no
+    // announcement, and nothing stops it but the timer. That is the one
+    // state in which the HEAD's guard could be what stops it. The switch
+    // itself stops a session that shared something, before its bytes go.
+    // Under the default budget, which covers X, its session shares X whole
+    // from its first open. So the switch to Y is what would stop it, as the
     // sharing rule says it must.
     handle.update_settings(serde_json::json!({ "cacheSize": 32 * 1024 }))?;
 
@@ -5834,11 +5841,11 @@ fn head_on_the_torrent_left(budget: std::time::Duration) -> anyhow::Result<Optio
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 
-    // X opened, which starts it, and its read closed again: a read open on
+    // X opened, which starts it, and its read closed again. A read open on
     // X is `playing`, and the ladder would answer `Run` whatever the guard
-    // did. Nothing of X is left to read by now -- the retention owner has
-    // reclaimed what nobody was playing, and no peer will bring it back --
-    // so its body parks, and the player hanging up is what ends it.
+    // did. Nothing of X is left to read by now. The retention owner has
+    // reclaimed what nobody was playing, and no peer will bring it back.
+    // So its body parks, and the player hanging up is what ends it.
     let anonymous = reqwest::blocking::Client::new();
     let watched = anonymous
         .get(format!("{base}/{left_hash}/{left_idx}"))
@@ -5854,14 +5861,14 @@ fn head_on_the_torrent_left(budget: std::time::Duration) -> anyhow::Result<Optio
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
 
-    // Then Y: X is running and nobody's. Y's body parks like X's did, and
-    // is held open for the rest of the attempt.
+    // Then Y, while X is running and nobody's. Y's body parks like X's did,
+    // and is held open for the rest of the attempt.
     let watching = anonymous
         .get(format!("{base}/{other_hash}/{other_idx}"))
         .send()?
         .error_for_status()?;
 
-    // And back to X -- a HEAD first, as a player asks before it reads.
+    // And back to X, with a HEAD first, as a player asks before it reads.
     anonymous
         .head(format!("{base}/{left_hash}/{left_idx}"))
         .send()?
@@ -5876,27 +5883,27 @@ fn head_on_the_torrent_left(budget: std::time::Duration) -> anyhow::Result<Optio
 }
 
 /// A stream request below the free-space floor is refused with a `507`
-/// once a retention pass has had its chance -- not "degraded to memory-only",
-/// which re-selected the same disk-backed engine and streamed to the disk
-/// the check had just refused.
+/// once a retention pass has had its chance. It is not "degraded to
+/// memory-only", which re-selected the same disk-backed engine and streamed
+/// to the disk the check had just refused.
 ///
 /// The refusal is keyed on what the engine's reconciler keys its free-space
 /// arm on, and on nothing else: **a torrent that still wants bytes**, on a
 /// volume under the floor. So the two halves are tested apart. A torrent
 /// that has everything it wants writes nothing, and is served from the disk
-/// it has already filled -- refusing it would take a finished film off a
+/// it has already filled. Refusing it would take a finished film off a
 /// device at exactly the moment its owner wanted to watch something without
-/// downloading anything, and the engine would not have stopped that torrent
+/// downloading anything. The engine would not have stopped that torrent
 /// either. A torrent that still has data to fetch is the one the floor is
 /// about, and it is refused.
 ///
 /// A volume cannot be filled on demand, so the reading is declared through
-/// `pretend_available_space`, keyed by this test's own cache root so no
-/// other server in the run sees it.
+/// `pretend_available_space`. It is keyed by this test's own cache root so
+/// no other server in the run sees it.
 /// **A television with room above its own floor gets its stream.** The
-/// floor is a share of the volume (`enginefs::free_space_floor`), and every
-/// reader of it -- the route's gate and the reconciler the same request then
-/// runs -- takes the same one, or the gate admits what the ladder stops.
+/// floor is a share of the volume (`enginefs::free_space_floor`). Every
+/// reader of it (the route's gate, and the reconciler the same request then
+/// runs) takes the same one, or the gate admits what the ladder stops.
 #[test]
 fn a_television_above_its_own_floor_streams() -> anyhow::Result<()> {
     const MIB: u64 = 1024 * 1024;
@@ -5944,7 +5951,8 @@ fn a_television_above_its_own_floor_streams() -> anyhow::Result<()> {
              stream was refused for space"
         ),
         // No peer brings these bytes, so a request that got past the floor
-        // waits until this client gives up -- the proof it was not refused.
+        // waits until this client gives up. That is the proof it was not
+        // refused.
         Err(error) => assert!(error.is_timeout(), "{error}"),
     }
 
@@ -5970,14 +5978,14 @@ fn a_stream_below_the_free_space_floor_is_refused_not_degraded() -> anyhow::Resu
     let anonymous = reqwest::blocking::Client::new();
     let url = format!("{base}/{info_hash}/{idx}");
     // The finished torrent is pinned, at once, because this test is about
-    // the floor and not about retention: a torrent nobody is playing and
-    // nobody has pinned is one the retention owner empties within a tick,
-    // and an emptied torrent is not a finished one any more.
+    // the floor and not about retention. The retention owner empties a
+    // torrent nobody is playing and nobody has pinned within a tick, and an
+    // emptied torrent is not a finished one any more.
     let pinned = handle.pin_download(&info_hash, idx, &[])?;
     assert!(pinned.complete, "the fixture's finished file is kept whole");
 
     // A second torrent, whose data is deliberately *not* seeded into the
-    // cache: it still wants every byte it has, which is what the floor is
+    // cache. It still wants every byte it has, which is what the floor is
     // about.
     let wanting = src.path().join("Wanted");
     std::fs::create_dir_all(&wanting)?;
@@ -5992,7 +6000,7 @@ fn a_stream_below_the_free_space_floor_is_refused_not_degraded() -> anyhow::Resu
     let wanting_idx = file_index(&wanting_stats, "wanted.bin");
     let wanting_url = format!("{base}/{wanting_hash}/{wanting_idx}");
 
-    // Nothing free: refused, whatever the range, with a fixed body -- the
+    // Nothing free: refused, whatever the range, with a fixed body. The
     // check's own message names the cache root, and no response may.
     stream_server::pretend_available_space(&cache_root, 0);
     for range in [None, Some("bytes=0-1023")] {
@@ -6014,23 +6022,23 @@ fn a_stream_below_the_free_space_floor_is_refused_not_degraded() -> anyhow::Resu
     }
 
     // The torrent that has everything it wants is served from the same full
-    // volume: it writes nothing, so there is nothing for the floor to
+    // volume. It writes nothing, so there is nothing for the floor to
     // protect against.
     //
     let response = anonymous.get(&url).send()?.error_for_status()?;
     assert_eq!(response.bytes()?.as_ref(), payload.as_slice());
 
-    // A HEAD probe writes nothing and is not refused either: the player
-    // learns the length and the range support, and the GET that follows is
-    // what the floor is judged on.
+    // A HEAD probe writes nothing and is not refused either. The player
+    // learns the length and the range support, and the floor is judged on
+    // the GET that follows.
     let response = anonymous.head(&wanting_url).send()?.error_for_status()?;
     assert_eq!(
         header_value(&response, "content-length"),
         (64 * 1024).to_string()
     );
 
-    // Room again: the same request is no longer refused, and it is the
-    // same engine it always was -- there was never another.
+    // Room again: the same request is no longer refused. It is the same
+    // engine it always was, because there was never another.
     stream_server::pretend_available_space(&cache_root, u64::MAX);
     let refused_again = anonymous
         .get(&wanting_url)
@@ -6044,7 +6052,7 @@ fn a_stream_below_the_free_space_floor_is_refused_not_degraded() -> anyhow::Resu
             "with room on the volume the floor refuses nothing"
         ),
         // No peer will ever bring these bytes, so a request that got past
-        // the floor waits for them until this client gives up -- which is
+        // the floor waits for them until this client gives up. That is
         // itself the proof that it was not refused.
         Err(error) => assert!(error.is_timeout(), "{error}"),
     }
@@ -6057,22 +6065,22 @@ fn a_stream_below_the_free_space_floor_is_refused_not_degraded() -> anyhow::Resu
 /// **A stream refused for space takes back what the viewer just left, and
 /// asks the volume again.**
 ///
-/// This request is the switch: registering the stream is what makes the
+/// This request is the switch. Registering the stream is what makes the
 /// film the viewer was watching disposable, and those bytes are ours. So a
 /// gate that answered `507` from the reading it took first would refuse a
-/// stream for room it was about to have -- which on a full phone is every
+/// stream for room it was about to have. On a full phone that is every
 /// switch, for ever. It drops both cache owners' slack instead, re-reads
 /// the volume, and refuses only what is still short.
 ///
 /// And when it is still short, it refuses. Nothing below the slack is ever
 /// taken: no pin, no window somebody is inside. When what is left does not
-/// fit, `507` is the answer and a viewer who wants that stream unpins
-/// something -- and the answer comes back rather than hanging on the disk
+/// fit, `507` is the answer, and a viewer who wants that stream unpins
+/// something. The answer comes back rather than hanging on the disk
 /// (`SLACK_DROP_BOUND`).
 ///
-/// The volume is declared as a *sequence* (`pretend_available_space_readings`),
-/// which is the only honest way to say "it read short, and by the time it
-/// was read again the bytes had come back": flipping one declared number
+/// The volume is declared as a *sequence* (`pretend_available_space_readings`).
+/// That is the only honest way to say "it read short, and by the time it
+/// was read again the bytes had come back". Flipping one declared number
 /// from another thread would pin the race rather than the rule.
 #[test]
 fn a_stream_refused_for_space_frees_the_slack_and_asks_again() -> anyhow::Result<()> {
@@ -6100,7 +6108,7 @@ fn a_stream_refused_for_space_frees_the_slack_and_asks_again() -> anyhow::Result
     let watched = pieces_held(&cache_root, &info_hash);
     assert!(watched > 0, "the film is on the disk to be given back");
 
-    // A second torrent, whose data is deliberately not in the cache: it
+    // A second torrent, whose data is deliberately not in the cache. It
     // still wants every byte of itself, which is what the floor is about.
     let wanting = src.path().join("Wanted");
     std::fs::create_dir_all(&wanting)?;
@@ -6115,8 +6123,8 @@ fn a_stream_refused_for_space_frees_the_slack_and_asks_again() -> anyhow::Result
     let wanting_idx = file_index(&wanting_stats, "wanted.bin");
     let wanting_url = format!("{base}/{wanting_hash}/{wanting_idx}");
 
-    // Nothing free when the gate first asks; room by the time it asks
-    // again, which is what dropping the slack did.
+    // Nothing free when the gate first asks. There is room by the time it
+    // asks again, which is what dropping the slack did.
     stream_server::pretend_available_space_readings(&cache_root, vec![0, u64::MAX]);
     match anonymous
         .get(&wanting_url)
@@ -6129,7 +6137,7 @@ fn a_stream_refused_for_space_frees_the_slack_and_asks_again() -> anyhow::Result
             "the gate refused a stream for room it had just taken back"
         ),
         // No peer will ever bring these bytes, so a request that got past
-        // the gate waits for them until this client gives up -- which is
+        // the gate waits for them until this client gives up. That is
         // itself the proof that it was not refused.
         Err(error) => assert!(error.is_timeout(), "{error}"),
     }
@@ -6140,7 +6148,7 @@ fn a_stream_refused_for_space_frees_the_slack_and_asks_again() -> anyhow::Result
     );
 
     // Still short however often it is asked, and there is nothing
-    // disposable left: the answer is `507`, with the fixed body, and it
+    // disposable left. The answer is `507`, with the fixed body, and it
     // comes back rather than sitting on the disk.
     stream_server::pretend_available_space(&cache_root, 0);
     let started = std::time::Instant::now();
@@ -6166,27 +6174,27 @@ fn a_stream_refused_for_space_frees_the_slack_and_asks_again() -> anyhow::Result
 
 /// `stats.json` reports the piece the open reader is waiting on, in bytes.
 ///
-/// Whole verified pieces are all the have-bitfield can show, and a piece on
-/// a real torrent is 8-16 MiB -- bigger than the startup window -- so a
-/// player waiting on its first piece could only ever be shown 0% or 100%.
+/// Whole verified pieces are all the have-bitfield can show. A piece on a
+/// real torrent is 8-16 MiB, bigger than the startup window. So a player
+/// waiting on its first piece could only ever be shown 0% or 100%.
 /// `inFlightPiece` is the sub-piece view: `downloadedBytes` of
 /// `totalBytes`, plus `verified`, which is the only field that means the
 /// piece can actually be served.
 ///
 /// The piece named is the one at the offset the reader was opened at, which
 /// is what a player starting up waits on (see `StreamPositions` in the
-/// librqbit backend), and it is named only while that reader is open.
+/// librqbit backend). It is named only while that reader is open.
 ///
-/// So the fixture leaves piece 1 out, and no peer will ever bring it: a read
-/// from the head is sent piece 0 and then waits at piece 1 for as long as
-/// the test holds the response, which keeps the reader open while the stats
-/// are asked. A fully seeded file would not do -- its body fits in the
-/// socket buffers, the server finishes writing it whatever the client reads,
-/// and the reader has closed (and taken its piece with it) before the stats
-/// are asked.
+/// So the fixture leaves piece 1 out, and no peer will ever bring it. A
+/// read from the head is sent piece 0 and then waits at piece 1 for as long
+/// as the test holds the response. That keeps the reader open while the
+/// stats are asked. A fully seeded file would not do. Its body fits in the
+/// socket buffers, and the server finishes writing it whatever the client
+/// reads. The reader has then closed (and taken its piece with it) before
+/// the stats are asked.
 ///
-/// Absence is a state of its own: before anything opens the file there is
-/// no reader and so no piece anybody waits on, and that must read as `null`
+/// Absence is a state of its own. Before anything opens the file there is
+/// no reader, and so no piece anybody waits on. That must read as `null`
 /// rather than as a piece with nothing downloaded. The library API sees
 /// exactly what the route serves.
 #[test]
@@ -6237,7 +6245,7 @@ fn stats_json_reports_the_piece_the_open_reader_waits_for() -> anyhow::Result<()
         "the library API reports the same absence"
     );
 
-    // A read from the head: piece 0 is there and is sent, and the reader
+    // A read from the head. Piece 0 is there and is sent, and the reader
     // then parks at piece 1. The response is held for the rest of the test.
     let anonymous = reqwest::blocking::Client::new();
     let mut response = anonymous
@@ -6264,8 +6272,8 @@ fn stats_json_reports_the_piece_the_open_reader_waits_for() -> anyhow::Result<()
     let piece = &stats["inFlightPiece"];
     assert_eq!(piece["index"], 0, "the piece it was opened in: {stats}");
     assert_eq!(piece["totalBytes"], piece_length, "{stats}");
-    // The fixture seeded it, so it is on disk and hash-checked: the one
-    // state in which a client may treat it as ready.
+    // The fixture seeded it, so it is on disk and hash-checked. That is the
+    // one state in which a client may treat it as ready.
     assert_eq!(piece["downloadedBytes"], piece_length, "{stats}");
     assert_eq!(piece["verified"], true, "{stats}");
     // Per file as well as at the top level, for the same file.
@@ -6286,19 +6294,19 @@ fn stats_json_reports_the_piece_the_open_reader_waits_for() -> anyhow::Result<()
 /// The LAN media listener serves published cast tokens and nothing else.
 ///
 /// It exists so a Chromecast can fetch a stream from a server that otherwise
-/// binds loopback only. What it must NOT expose is the control API: the
+/// binds loopback only. What it must NOT expose is the control API. The
 /// control router is not mounted on it at all, so a control path is an
-/// unknown path there -- `404`, never the `401` that would tell the LAN the
-/// route exists and only a token is missing. The loopback listener keeps
-/// serving both, and range and HEAD requests -- what a receiver actually
-/// issues -- work on a published token.
+/// unknown path there. It answers `404`, never the `401` that would tell
+/// the LAN the route exists and only a token is missing. The loopback
+/// listener keeps serving both. Range and HEAD requests (what a receiver
+/// actually issues) work on a published token.
 ///
-/// Nor any other media route: the torrent routes (whose first request
-/// starts a torrent with the caller's trackers on loopback), the archive
-/// routes, `/proxy`, `/ftp`, `/drive/stream`, `/downloads/.../stream` and
-/// the `/local-addon` stub are all `404` on the LAN, every method -- the
-/// paths that used to be on it included. What a receiver reads is
-/// `/cast/{token}`, for an id the app published.
+/// Nor does it expose any other media route. The torrent routes (whose
+/// first request starts a torrent with the caller's trackers on loopback),
+/// the archive routes, `/proxy`, `/ftp`, `/drive/stream`,
+/// `/downloads/.../stream` and the `/local-addon` stub are all `404` on the
+/// LAN, for every method. That includes the paths that used to be on it.
+/// What a receiver reads is `/cast/{token}`, for an id the app published.
 #[test]
 fn lan_media_listener_serves_published_tokens_and_nothing_else() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -6348,7 +6356,7 @@ fn lan_media_listener_serves_published_tokens_and_nothing_else() -> anyhow::Resu
             );
         }
         // The same path on the loopback listener is a control route that
-        // exists: it answers the request rather than the 404 fallback.
+        // exists. It answers the request rather than the 404 fallback.
         // (`/get-https` answers `501`; what matters is that it is not a
         // 404.)
         let response = with_token.get(format!("{base}{path}")).send()?;
@@ -6361,10 +6369,10 @@ fn lan_media_listener_serves_published_tokens_and_nothing_else() -> anyhow::Resu
     }
 
     // Every other route, and every path the LAN used to serve, is a `404`
-    // there whatever the method: nothing collides with a pattern any more,
+    // there whatever the method. Nothing collides with a pattern any more,
     // since the one pattern is `/cast/{token}`. The torrent paths would
-    // start a torrent with the caller's trackers on loopback; `/proxy` and
-    // `/ftp` fetch a caller-named URL; the archive creates download one.
+    // start a torrent with the caller's trackers on loopback. `/proxy` and
+    // `/ftp` fetch a caller-named URL. The archive creates download one.
     let unknown = "00112233445566778899aabbccddeeff00112233";
     let attacker_tracker = urlencoding::encode("udp://attacker.invalid:6969/announce");
     let mut old_paths = vec![
@@ -6405,7 +6413,7 @@ fn lan_media_listener_serves_published_tokens_and_nothing_else() -> anyhow::Resu
             );
         }
     }
-    // The loopback listener still has them: the torrent route serves, and
+    // The loopback listener still has them. The torrent route serves, and
     // `/proxy` and an archive create are real routes refusing a bad payload.
     assert_eq!(
         anonymous
@@ -6421,9 +6429,9 @@ fn lan_media_listener_serves_published_tokens_and_nothing_else() -> anyhow::Resu
             "{path} is a real route on the loopback listener"
         );
     }
-    // And the LAN's torrent paths started nothing: the stats poll starts
-    // its own registry add for the hash -- that is what a stats poll does
-    // -- so what it proves is that no LAN request left an add of its own
+    // And the LAN's torrent paths started nothing. The stats poll starts
+    // its own registry add for the hash, because that is what a stats poll
+    // does. So what it proves is that no LAN request left an add of its own
     // behind carrying the attacker's tracker.
     let stats: serde_json::Value = serde_json::to_value(handle.engine_stats(unknown, &[])?)?;
     let sources = stats["sources"].to_string();
@@ -6467,7 +6475,7 @@ fn lan_media_listener_serves_published_tokens_and_nothing_else() -> anyhow::Resu
     assert_eq!(header_value(&response, "accept-ranges"), "bytes");
     assert!(response.bytes()?.is_empty());
 
-    // CORS reaches the LAN listener as well -- a receiver preflights the
+    // CORS reaches the LAN listener as well. A receiver preflights the
     // media request before it fetches a byte.
     let response = anonymous
         .request(reqwest::Method::OPTIONS, format!("{lan}{cast}"))
@@ -6481,7 +6489,7 @@ fn lan_media_listener_serves_published_tokens_and_nothing_else() -> anyhow::Resu
     for header in ["accept-encoding", "content-type", "range"] {
         assert!(allowed.contains(header), "{header:?} in {allowed:?}");
     }
-    // No bearer header travels here: the LAN has no control route to send
+    // No bearer header travels here. The LAN has no control route to send
     // one to.
     assert!(!allowed.contains("authorization"), "{allowed:?}");
     let response = anonymous
@@ -6521,12 +6529,11 @@ fn set_lan_media_toggles_the_listener_and_the_setting_can_forbid_it() -> anyhow:
     )?;
 
     // Loopback media, hammered from another thread for as long as the
-    // toggling below takes. Not a timing assertion -- it just has to be
-    // in flight while the LAN listener starts and stops. So the toggling
-    // waits for the thread's first answer before it starts: a thread that
-    // has not been scheduled yet is not in flight, and on a loaded runner
-    // the whole sequence below ran and stopped it before it had sent a
-    // request.
+    // toggling below takes. This is not a timing assertion. It just has to
+    // be in flight while the LAN listener starts and stops. So the toggling
+    // waits for the thread's first answer before it starts. A thread that
+    // has not been scheduled yet is not in flight. On a loaded runner the
+    // whole sequence below ran and stopped it before it had sent a request.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (first_served, in_flight) = std::sync::mpsc::channel::<()>();
     let probe = {
@@ -6559,7 +6566,7 @@ fn set_lan_media_toggles_the_listener_and_the_setting_can_forbid_it() -> anyhow:
         .recv_timeout(CHECK_WAIT_BOUND)
         .map_err(|_| anyhow::anyhow!("the loopback probe never served its first request"))?;
 
-    // Nothing is bound at startup, however the address is configured: the
+    // Nothing is bound at startup, however the address is configured. The
     // listener is a cast session's, and there is none yet.
     let peer = std::net::IpAddr::from([127, 0, 0, 1]);
     assert!(!handle.lan_media_running());
@@ -6577,7 +6584,7 @@ fn set_lan_media_toggles_the_listener_and_the_setting_can_forbid_it() -> anyhow:
     );
     assert!(!handle.lan_media_running());
 
-    // Permitted, it starts and advertises the address it bound.
+    // When permitted, it starts and advertises the address it bound.
     handle.update_settings(serde_json::json!({ "lanMediaEnabled": true }))?;
     let started = handle.set_lan_media(true)?.expect("bound");
     assert!(handle.lan_media_running());
@@ -6594,7 +6601,7 @@ fn set_lan_media_toggles_the_listener_and_the_setting_can_forbid_it() -> anyhow:
     );
     let cast = cast_path(&handle, &base, &info_hash, idx)?;
 
-    // Stop: the socket is gone when the call returns, and so is the URL.
+    // Stop. The socket is gone when the call returns, and so is the URL.
     assert_eq!(handle.set_lan_media(false)?, None);
     assert!(!handle.lan_media_running());
     assert_eq!(handle.lan_media_addr(), None);
@@ -6609,9 +6616,9 @@ fn set_lan_media_toggles_the_listener_and_the_setting_can_forbid_it() -> anyhow:
         "the stopped LAN listener still answered: {refused:?}"
     );
 
-    // Still permitted, it comes back -- on a fresh OS-assigned port -- and
-    // serves media again, under a new publication: the stop unpublished
-    // the old one.
+    // While still permitted, it comes back on a fresh OS-assigned port. It
+    // serves media again, under a new publication, because the stop
+    // unpublished the old one.
     let restarted = handle.set_lan_media(true)?.expect("bound");
     assert!(handle.lan_media_running());
     assert_eq!(handle.lan_media_addr(), Some(restarted));
@@ -6630,8 +6637,8 @@ fn set_lan_media_toggles_the_listener_and_the_setting_can_forbid_it() -> anyhow:
         .error_for_status()?;
     assert_eq!(response.bytes()?.as_ref(), payload.as_slice());
 
-    // Revoking the setting stops a listener that is already running --
-    // otherwise "forbid it" would only mean "forbid the next one".
+    // Revoking the setting stops a listener that is already running.
+    // Otherwise "forbid it" would only mean "forbid the next one".
     handle.update_settings(serde_json::json!({ "lanMediaEnabled": false }))?;
     assert!(!handle.lan_media_running());
     assert_eq!(handle.lan_media_base_url(peer), None);
@@ -6665,14 +6672,14 @@ fn set_lan_media_toggles_the_listener_and_the_setting_can_forbid_it() -> anyhow:
 ///
 /// stremio-core has `GetHTTPSEndpoint` in its `StreamingServer` vocabulary
 /// and dispatches it for "access from other devices", so the path has to
-/// exist: a `404` would make this a server core does not recognise, and
-/// leaving the route in is also what keeps our fork of core from needing a
-/// patch. There is nothing behind it -- an embedded server binds loopback
-/// inside a host process and has no HTTPS endpoint to name -- so the answer
-/// is the refusal, whatever the query says and whether or not it carries
-/// the parameters the old certificate fetch read.
+/// exist. A `404` would make this a server core does not recognise. Leaving
+/// the route in also keeps our fork of core from needing a patch. There is
+/// nothing behind it: an embedded server binds loopback inside a host
+/// process and has no HTTPS endpoint to name. So the answer is the refusal,
+/// whatever the query says and whether or not it carries the parameters
+/// the old certificate fetch read.
 ///
-/// No network call and nothing written: a `501` that took a round trip to
+/// No network call and nothing written. A `501` that took a round trip to
 /// Stremio's API, or left a private key in the config dir, would be a
 /// different thing wearing the same status code.
 #[test]
@@ -6719,15 +6726,15 @@ fn get_https_is_a_501_and_writes_nothing() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A configured LAN media address is a place, not a running listener: the
-/// server comes up with nothing bound there, so the persisted veto is never
-/// bypassed by the boot, and a port already in use is the cast caller's
-/// error rather than the server's.
+/// A configured LAN media address is a place, not a running listener. The
+/// server comes up with nothing bound there, so the boot never bypasses the
+/// persisted veto. A port already in use is the cast caller's error rather
+/// than the server's.
 ///
-/// The address is pre-bound by this test, which is what the fixed port an
-/// embedder might configure runs into when a previous instance -- or any
-/// other program -- still holds it. Once the port is free the same handle
-/// starts the listener without a restart.
+/// This test pre-binds the address. A fixed port an embedder might
+/// configure runs into that when a previous instance (or any other program)
+/// still holds it. Once the port is free the same handle starts the
+/// listener without a restart.
 #[test]
 fn a_configured_lan_media_address_binds_nothing_until_a_cast_asks() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -6798,20 +6805,21 @@ fn a_configured_lan_media_address_binds_nothing_until_a_cast_asks() -> anyhow::R
 /// The LAN listener counts what has reached it, per cast session.
 ///
 /// This is the only way to tell a receiver that never fetched the stream
-/// from one that fetched it and could not play it, and the two need
-/// different words: the first says this device could not be reached at the
-/// address it handed out, the second says nothing about the network at all.
-/// A receiver told an unroutable address raises no error -- the connect
-/// hangs -- so nothing else distinguishes them.
+/// from one that fetched it and could not play it. The two need different
+/// words. The first says this device could not be reached at the address
+/// it handed out. The second says nothing about the network at all. A
+/// receiver told an unroutable address raises no error (the connect hangs),
+/// so nothing else distinguishes them.
 ///
-/// The count is therefore per session and not cumulative: every start
-/// resets it -- including one that finds the listener already up, which is
-/// what casting to a second receiver mid-session does -- and so does a stop,
-/// or the previous cast would answer for this one. Only the LAN listener
-/// counts; loopback traffic is this host's own client, not a receiver.
+/// The count is therefore per session and not cumulative. Every start
+/// resets it, and so does a stop, or the previous cast would answer for
+/// this one. That includes a start that finds the listener already up,
+/// which is what casting to a second receiver mid-session does. Only the
+/// LAN listener counts. Loopback traffic is this host's own client, not a
+/// receiver.
 ///
 /// Beside it, the bodies count: a `/cast` `GET` that began sending bytes,
-/// never a `HEAD` or a `404`. Requests with no body is the third reading --
+/// never a `HEAD` or a `404`. Requests with no body is the third reading:
 /// the receiver reached this device and was served nothing.
 #[test]
 fn the_lan_listener_counts_the_requests_that_reach_it() -> anyhow::Result<()> {
@@ -6850,8 +6858,8 @@ fn the_lan_listener_counts_the_requests_that_reach_it() -> anyhow::Result<()> {
 
     // What a receiver actually does: probe with HEAD, then read a range.
     // The count is bumped when the request arrives, so it is already up to
-    // date by the time the response is in hand -- nothing to wait for. A
-    // `HEAD` is no body; the `GET` is.
+    // date by the time the response is in hand. There is nothing to wait
+    // for. A `HEAD` is no body, and the `GET` is.
     anonymous
         .head(format!("{lan}{cast}"))
         .send()?
@@ -6867,8 +6875,8 @@ fn the_lan_listener_counts_the_requests_that_reach_it() -> anyhow::Result<()> {
     assert_eq!(handle.lan_media_requests_served(), 2);
     assert_eq!(handle.lan_media_bodies_served(), 1);
 
-    // A request the fallback answers still reached us, which is the whole
-    // question the count exists to answer -- and served nothing.
+    // A request the fallback answers still reached us, and that is the
+    // whole question the count exists to answer. It served nothing.
     assert_eq!(
         anonymous
             .get(format!("{lan}/no-such-route"))
@@ -6880,7 +6888,7 @@ fn the_lan_listener_counts_the_requests_that_reach_it() -> anyhow::Result<()> {
     assert_eq!(handle.lan_media_bodies_served(), 1);
 
     // Tapping a second receiver starts a cast on a listener that is already
-    // bound, and the question that cast asks is about itself: the first
+    // bound. The question that cast asks is about itself, so the first
     // receiver's requests must not answer for it.
     assert_eq!(
         handle.set_lan_media(true)?,
@@ -6902,7 +6910,7 @@ fn the_lan_listener_counts_the_requests_that_reach_it() -> anyhow::Result<()> {
     assert_eq!(handle.lan_media_bodies_served(), 1);
 
     // Nothing is listening once a stop returns, so nothing can have reached
-    // us: a count left standing would report a receiver fetching from a
+    // us. A count left standing would report a receiver fetching from a
     // socket that is closed.
     handle.set_lan_media(false)?;
     assert!(!handle.lan_media_running());
@@ -6938,7 +6946,7 @@ fn the_lan_listener_counts_the_requests_that_reach_it() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// With no `lan_media_addr` configured -- the default -- there is no LAN
+/// With no `lan_media_addr` configured (the default), there is no LAN
 /// listener and nothing to start, whatever the setting says.
 #[test]
 fn without_a_configured_address_there_is_no_lan_media_listener() -> anyhow::Result<()> {
@@ -6974,9 +6982,10 @@ fn without_a_configured_address_there_is_no_lan_media_listener() -> anyhow::Resu
 ///
 /// The setting is `bufferProfile` (`normal` by default), and the stream route
 /// takes `?buffer=` alongside its existing parameters. Both are additive, and
-/// neither can fail a playback request: a value this build does not know
-/// falls back -- the query parameter to the setting, the setting to what it
-/// already was -- rather than answering an error to a player that guessed.
+/// neither can fail a playback request. A value this build does not know
+/// falls back rather than answering an error to a player that guessed. The
+/// query parameter falls back to the setting, and the setting to what it
+/// already was.
 #[test]
 fn buffer_profile_is_a_setting_and_a_stream_query_override() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -6987,10 +6996,11 @@ fn buffer_profile_is_a_setting_and_a_stream_query_override() -> anyhow::Result<(
         cache_dir.path(),
         src.path(),
         None,
-        // Reads the seeded bytes and is about no retention: under the empty pin
-        // record a reconciler tick landing before the first request -- the
-        // torrent is then one nobody plays -- takes every seeded piece, and
-        // the requests park on pieces no peer will bring (`fixture_pins`).
+        // Reads the seeded bytes and is about no retention. Under the empty
+        // pin record, a reconciler tick landing before the first request
+        // takes every seeded piece, because the torrent is then one nobody
+        // plays. The requests then park on pieces no peer will bring
+        // (`fixture_pins`).
         seeded_fixture_config(),
     )?;
     let client = bearer_client(&handle)?;
@@ -7025,8 +7035,8 @@ fn buffer_profile_is_a_setting_and_a_stream_query_override() -> anyhow::Result<(
     assert_eq!(persisted["bufferProfile"], "large");
 
     // An unknown or wrong-typed value leaves the setting as it was, exactly
-    // like every other unrecognised value in the payload -- and takes the
-    // rest of the payload with it, so the update still applies.
+    // like every other unrecognised value in the payload. It takes the rest
+    // of the payload with it, so the update still applies.
     let updated = handle.update_settings(serde_json::json!({
         "bufferProfile": "gigantic",
         "btMaxConnections": 61,
@@ -7037,7 +7047,7 @@ fn buffer_profile_is_a_setting_and_a_stream_query_override() -> anyhow::Result<(
     assert_eq!(serde_json::to_value(&updated)?["bufferProfile"], "large");
 
     // The stream route takes the override next to the parameters it already
-    // had, and serves the same bytes whichever profile is asked for -- the
+    // had, and serves the same bytes whichever profile is asked for. The
     // profile changes how far ahead the engine reads, never the response.
     // An unknown value is not a client error: it falls back to the setting.
     let media = format!("{base}/{info_hash}/{idx}");
@@ -7074,12 +7084,12 @@ fn buffer_profile_is_a_setting_and_a_stream_query_override() -> anyhow::Result<(
 /// is held, and a read of it seeks in the piece store** rather than reading
 /// its way to the byte it wants.
 ///
-/// The two claims step 1 of `docs/design/translated-sources.md` makes about the
-/// torrent half of the seam, and both are observable from outside the
-/// source:
+/// These are the two claims step 1 of `docs/design/translated-sources.md`
+/// makes about the torrent half of the seam. Both are observable from
+/// outside the source:
 ///
 /// * the registration is AGENTS.md's rule for every route that opens a
-///   reader on a torrent -- register a stream first, or the reconciler
+///   reader on a torrent: register a stream first, or the reconciler
 ///   pauses the torrent under the read, mid-body, dropping its peers. The
 ///   source holds it for its whole life rather than for the length of one
 ///   response, because a translator reads an index, waits, and reads a body
@@ -7090,8 +7100,8 @@ fn buffer_profile_is_a_setting_and_a_stream_query_override() -> anyhow::Result<(
 /// * the seek is what the whole design rests on: a byte in the middle of a
 ///   file costs the bytes asked for and not the bytes before it. The
 ///   fixture's piece store has a hole at 128..192 KiB that no peer will ever
-///   fill, so a read that walked to 400 KiB would park there forever and one
-///   that seeks past it answers at once.
+///   fill. So a read that walked to 400 KiB would park there forever, and
+///   one that seeks past it answers at once.
 #[test]
 fn a_torrent_source_registers_its_stream_and_seeks_past_what_it_does_not_need() -> anyhow::Result<()>
 {
@@ -7131,23 +7141,23 @@ fn a_torrent_source_registers_its_stream_and_seeks_past_what_it_does_not_need() 
     stats_after_check(&handle, &idle_hash)?;
 
     // The source, opened on the torrent's one file and held for the rest of
-    // the test -- which is what a translated session does with it.
+    // the test. That is what a translated session does with it.
     let (engine, runtime) = handle.engine_for_tests();
     let source = runtime.block_on(TorrentSource::open(engine, &info_hash, "fixture.zip"))?;
     let opened = std::time::Instant::now();
 
     // **Before any read**, which is what makes this about the
-    // registration and nothing else: the source opens its reader lazily,
-    // so no file handle is open yet and the only thing that can make this
-    // server say a player is reading is `on_stream_start`
+    // registration and nothing else. The source opens its reader lazily, so
+    // no file handle is open yet. The only thing that can make this server
+    // say a player is reading is then `on_stream_start`
     // (`EngineFS::playback_is_live` is the two of them, in that order).
     assert!(
         handle.background_traffic()?.playing,
         "the source opened without registering a stream on its torrent"
     );
 
-    // The archive as the fixture wrote it: what the read is checked
-    // against, so "it answered" is not mistaken for "it answered rightly".
+    // The archive as the fixture wrote it. The read is checked against it,
+    // so "it answered" is not mistaken for "it answered rightly".
     let archive = std::fs::read(src.path().join("Wanted").join("fixture.zip"))?;
     assert_eq!(source.len(), archive.len() as u64);
 
@@ -7168,10 +7178,10 @@ fn a_torrent_source_registers_its_stream_and_seeks_past_what_it_does_not_need() 
         "the read answered from somewhere other than the offset it was given"
     );
 
-    // And a second read *backwards*, which is what an index is made of:
-    // the source keeps one reader and seeks it, so this has to land where
+    // And a second read *backwards*, which is what an index is made of.
+    // The source keeps one reader and seeks it, so this has to land where
     // it was told rather than carry on from where the last one stopped.
-    // Still past the hole, since nothing will ever fill that.
+    // It is still past the hole, since nothing will ever fill that.
     const READ_BACK_AT: u64 = 300 * 1024;
     let mut back = [0u8; 64];
     let filled = runtime.block_on(async {
@@ -7188,7 +7198,7 @@ fn a_torrent_source_registers_its_stream_and_seeks_past_what_it_does_not_need() 
         "the second read carried on from the first instead of seeking"
     );
 
-    // Seeding off, as the viewer of this feature would have it: a torrent
+    // Seeding off, as the viewer of this feature would have it. A torrent
     // nobody is playing is stopped either way.
     handle.update_settings(serde_json::json!({ "seedingEnabled": false }))?;
 
@@ -7212,10 +7222,10 @@ fn a_torrent_source_registers_its_stream_and_seeks_past_what_it_does_not_need() 
         "the torrent a source is open on was stopped under it"
     );
 
-    // On the runtime, because ending the registration is an async call a
-    // `Drop` cannot make itself and so spawns (`TorrentSource`'s drop).
-    // And it does end: without that spawn every member ever read would
-    // leave a stream registered for the life of the process.
+    // On the runtime, because ending the registration is an async call. A
+    // `Drop` cannot make it itself, and so spawns it (`TorrentSource`'s
+    // drop). And it does end. Without that spawn, every member ever read
+    // would leave a stream registered for the life of the process.
     runtime.block_on(async move { drop(source) });
     let deadline = std::time::Instant::now() + CHECK_WAIT_BOUND;
     while handle.background_traffic()?.playing {
@@ -7232,9 +7242,9 @@ fn a_torrent_source_registers_its_stream_and_seeks_past_what_it_does_not_need() 
 }
 
 /// A server with one seeded torrent of two whole-piece films, `a.bin` and
-/// `b.bin`, for the [`stream_server::sources::TorrentSource`] tests: the
-/// server, its base URL, the hash, and each film's index (looked up, never
-/// assumed). The tempdirs are the caller's to hold.
+/// `b.bin`, for the [`stream_server::sources::TorrentSource`] tests. It
+/// answers the server, its base URL, the hash, and each film's index
+/// (looked up, never assumed). The tempdirs are the caller's to hold.
 fn two_film_server(
     config_dir: &std::path::Path,
     cache_dir: &std::path::Path,
@@ -7268,9 +7278,9 @@ fn two_film_server(
 }
 
 /// A [`stream_server::sources::TorrentSource`] that is dropped inside its
-/// runtime's context however the test ends: its drop spawns (the stream's
-/// end), and a failed assertion unwinding past a bare source would turn
-/// the failure into an abort that hides it.
+/// runtime's context however the test ends. Its drop spawns (the stream's
+/// end). A failed assertion unwinding past a bare source would turn the
+/// failure into an abort that hides it.
 struct HeldSource {
     source: Option<stream_server::sources::TorrentSource>,
     runtime: tokio::runtime::Handle,
@@ -7291,7 +7301,7 @@ impl Drop for HeldSource {
 }
 
 /// What `source` reads from `offset` to its end, through a reader opened
-/// there -- a body read, as `MemberView` makes one.
+/// there. It is a body read, as `MemberView` makes one.
 fn read_source_from(
     runtime: &tokio::runtime::Handle,
     source: &stream_server::sources::TorrentSource,
@@ -7312,14 +7322,14 @@ fn read_source_from(
         .map_err(Into::into)
 }
 
-/// **A `TorrentSource` with a play is the viewer's playback**: its first
-/// read is the stream route's own open, so it moves the viewer's play
-/// session to its file and opens the reader shared -- under the default
+/// **A `TorrentSource` with a play is the viewer's playback.** Its first
+/// read is the stream route's own open. So it moves the viewer's play
+/// session to its file and opens the reader shared. Under the default
 /// budget, which covers the film, the draw is the whole film at once, as
 /// [`only_the_players_request_shares_anything`] has it for a `p=` request.
 ///
-/// Nothing before the first read: the open is the route's, and the route's
-/// open is at an offset.
+/// Nothing happens before the first read. The open is the route's, and the
+/// route's open is at an offset.
 #[test]
 fn a_torrent_source_with_a_play_moves_the_session_and_shares() -> anyhow::Result<()> {
     const FILM_LEN: usize = 128 * 1024;
@@ -7379,7 +7389,7 @@ fn a_torrent_source_with_a_play_moves_the_session_and_shares() -> anyhow::Result
 
 /// **A `TorrentSource` without a play is an aside**: it reads unshared and
 /// touches no session. The viewer's player is on film `a` (a `p=`
-/// request, which draws the whole film under the default budget); an
+/// request, which draws the whole film under the default budget). An
 /// aside then reads all of film `b` of the same torrent. The session stays
 /// on `a`, `a`'s draw is what it was, and `b` shares nothing.
 #[test]
@@ -7441,16 +7451,16 @@ fn a_torrent_source_without_a_play_shares_nothing_and_moves_no_session() -> anyh
 }
 
 /// **A seek in a played `TorrentSource` is a new handle at the offset, and
-/// nothing else**: the stream registration and the play session are the
-/// source's, made by its first read and held until it is dropped, so a
-/// second reader -- what a seek is -- neither moves the session again nor
+/// nothing else.** The stream registration and the play session are the
+/// source's, made by its first read and held until it is dropped. So a
+/// second reader (what a seek is) neither moves the session again nor
 /// registers anew.
 ///
 /// The viewer's player goes on from film `a` to film `b` *on the same
-/// screen* (a current request, which moves the session), and then the
-/// source over `a` is read again at an offset. The session stays on `b`:
-/// a reopen that ran the whole open again would put it back on `a`. And
-/// the read answers from the offset, the engine having been told it.
+/// screen* (a current request, which moves the session). Then the source
+/// over `a` is read again at an offset. The session stays on `b`. A reopen
+/// that ran the whole open again would put it back on `a`. And the read
+/// answers from the offset, because the engine was told it.
 #[test]
 fn a_seek_in_a_played_torrent_source_reopens_at_the_offset_and_moves_nothing() -> anyhow::Result<()>
 {
@@ -7462,8 +7472,8 @@ fn a_seek_in_a_played_torrent_source_reopens_at_the_offset_and_moves_nothing() -
     let (handle, base, info_hash, a, b) =
         two_film_server(config_dir.path(), cache_dir.path(), src.path(), FILM_LEN)?;
     let film_a = std::fs::read(src.path().join("Films").join("a.bin"))?;
-    // Film `a` is kept as a download: left by the viewer, it would
-    // otherwise be taken off the disk before the seek reads it, and there
+    // Film `a` is kept as a download. Otherwise, once the viewer left it,
+    // it would be taken off the disk before the seek reads it, and there
     // is nothing offline to fetch it back from.
     handle.pin_download(&info_hash, a, &[])?;
 
@@ -7519,24 +7529,24 @@ fn a_seek_in_a_played_torrent_source_reopens_at_the_offset_and_moves_nothing() -
 /// no torrent nobody is playing.** Not a cap, not the volume: everything.
 ///
 /// `ServerConfig::pins: Some(Default::default())` is what a client with a
-/// downloads registry and no downloads in it publishes -- xtremio's
-/// `downloads::pins_in` over an empty registry answers exactly this -- so it
+/// downloads registry and no downloads in it publishes. xtremio's
+/// `downloads::pins_in` over an empty registry answers exactly this. So it
 /// is the ordinary state of the ordinary install, not a corner. Under it the
 /// reconciler's retention pass reaches `Engine::reclaim_rest` for every
-/// torrent nothing is reading, and that call takes every held piece outside
+/// torrent nothing is reading. That call takes every held piece outside
 /// every holding extent. A torrent that was just added has no reader, so no
-/// extent, so the first tick after its initial check takes all of it: one
+/// extent. So the first tick after its initial check takes all of it: one
 /// `reconcile::RECONCILE_INTERVAL`, about two seconds.
 ///
 /// The volume is declared enormous here on purpose. `reclaim_rest` asks no
-/// volume and no cap -- what it acts on is "nobody wants this", not "the
-/// disk is short" -- so a machine with infinite room reclaims just the same,
-/// and a test that seeds a fixture cannot buy its way out with space.
+/// volume and no cap. It acts on "nobody wants this", not on "the disk is
+/// short". So a machine with infinite room reclaims just the same, and a
+/// test that seeds a fixture cannot buy its way out with space.
 ///
 /// On a real torrent the bytes come back from the swarm, which is why this
 /// is the design and not a leak. Nothing seeds these fixtures, which is why
 /// every test here that reads seeded bytes runs under [`fixture_pins`]
-/// instead; its sibling
+/// instead. Its sibling
 /// `a_seeded_fixture_is_still_read_after_the_pass_that_would_have_taken_it`
 /// is that half.
 #[test]
@@ -7561,13 +7571,13 @@ fn an_embedder_that_has_pinned_nothing_keeps_no_torrent_nobody_plays() -> anyhow
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.path().join("config")),
         cache_dir: Some(cache_root.clone()),
-        // The empty record, deliberately: this test is what it does.
+        // The empty record, deliberately. This test is about what it does.
         ..offline_config()
     })?;
     // After the start, never before (see `seed_piece_store_pieces`), and
-    // before the `/create`: until the torrent is added there is no engine
-    // and so no pass, which is what makes this reading of the fixture
-    // safe rather than a race of its own.
+    // before the `/create`. Until the torrent is added there is no engine
+    // and so no pass. That makes this reading of the fixture safe rather
+    // than a race of its own.
     seed_piece_store(&cache_root, &torrent, &content);
     assert_eq!(
         pieces_held(&cache_root, &info_hash) as u64,
@@ -7606,10 +7616,10 @@ fn an_embedder_that_has_pinned_nothing_keeps_no_torrent_nobody_plays() -> anyhow
 /// **Shutdown takes what the play session fetched, with the torrent out of
 /// the swarm first, and the next start takes what is left.**
 ///
-/// The film is being played when the server is shut down -- the liveness
-/// cell is on it, so no pass has taken a byte of it -- and the shutdown
-/// stops every torrent before it deletes the files a stream opened: there
-/// is no un-Have, and a peer still connected could ask for a piece that is
+/// The film is being played when the server is shut down. The liveness
+/// cell is on it, so no pass has taken a byte of it. The shutdown stops
+/// every torrent before it deletes the files a stream opened. There is no
+/// un-Have, and a peer still connected could ask for a piece that is
 /// going. What a shutdown cannot finish is the next start's: the launch
 /// sweep takes the directory of every torrent nobody pinned.
 #[test]
@@ -7647,7 +7657,7 @@ fn shutdown_takes_what_the_play_session_fetched_and_the_next_start_the_rest() ->
         .error_for_status()?;
     let stats = stats_after_check(&handle, &info_hash)?;
     let idx = file_index(&stats, "film.bin");
-    // The viewer plays the film through; the cell stays on it.
+    // The viewer plays the film through, and the cell stays on it.
     let played = reqwest::blocking::Client::new()
         .get(format!("{base}/{info_hash}/{idx}"))
         .send()?
@@ -7680,15 +7690,15 @@ fn shutdown_takes_what_the_play_session_fetched_and_the_next_start_the_rest() ->
 }
 
 /// **A seeded fixture is still there, and still served, after the pass that
-/// would have taken it.** The other half of
+/// would have taken it.** This is the other half of
 /// `an_embedder_that_has_pinned_nothing_keeps_no_torrent_nobody_plays`, and
 /// the proof that [`seeded_fixture_config`] is what the tests here need.
 ///
-/// It waits three ticks with nothing reading the torrent -- the state in
-/// which the empty pin record loses everything -- and then reads a range.
-/// Under the empty record this fails twice over: the pieces are gone by the
+/// It waits three ticks with nothing reading the torrent (the state in
+/// which the empty pin record loses everything), and then reads a range.
+/// Under the empty record this fails twice over. The pieces are gone by the
 /// first assertion, and the read parks for ever, because no peer will bring
-/// them back. Under the unknown pin set nothing is taken and the bytes are
+/// them back. Under the unknown pin set nothing is taken, and the bytes are
 /// the fixture's.
 ///
 /// The read is given a timeout rather than left to hang, so a regression
