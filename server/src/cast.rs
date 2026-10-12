@@ -3,13 +3,13 @@
 //!
 //! The app publishes a [`MediaId`] for a cast
 //! ([`crate::ServerHandle::publish`]) and hands the receiver
-//! `<lan base>/cast/<token>`; `GET` and `HEAD` there serve what the id
+//! `<lan base>/cast/<token>`. `GET` and `HEAD` there serve what the id
 //! resolved to, with the range framing every media route shares
 //! (`routes::util::MediaRange`). Nothing else is on the LAN: no torrent
 //! route, no archive route, no `/proxy`, no control route. **The listener
-//! serves published tokens and nothing else**, so what a stranger on the
-//! network can reach is exactly what the app chose to cast, for exactly as
-//! long as it chose to -- and nothing it asks for can make this device
+//! serves published tokens and nothing else.** So a stranger on the
+//! network can reach exactly what the app chose to cast, for exactly as
+//! long as it chose to. Nothing the stranger asks for can make this device
 //! fetch, add or open anything the app did not.
 //!
 //! The rules a token keeps:
@@ -23,31 +23,32 @@
 //! * **A publication holds a lease on its id**, as an open reader does, so
 //!   the id is not evicted while it is cast.
 //! * **Unpublishing cuts the bytes.** Every body served under a token is
-//!   wrapped (`CastBody`) and polls the token's cut before each chunk,
-//!   so an unpublish -- or the listener's stop, which is every token's --
-//!   ends a response in flight at once, with an error, not a clean end the
+//!   wrapped (`CastBody`) and polls the token's cut before each chunk. So
+//!   an unpublish (or the listener's stop, which is every token's) ends a
+//!   response in flight at once, with an error. It is not a clean end the
 //!   receiver would read as the film being over.
 //! * **Never logged.** `routes::util::log_path` elides `/cast/<token>` to
-//!   `/cast`, and nothing here writes one down: a token in a log file is a
+//!   `/cast`, and nothing here writes one down. A token in a log file is a
 //!   URL into this device for as long as it is published.
 //!
 //! **What a body is.** A `GET` opens the id's source the way
-//! [`crate::ServerHandle::open_reader`] does -- the same resolve, the same
-//! play rules -- and reads it on the runtime with no reader task: with the
-//! publication's [`PlayToken`] the receiver's reads are the viewer's
-//! playback (the session moves, the file shares as the app's own player's
-//! would), without one they are an aside. A torrent source registers its
-//! stream at the body's open and ends it when the body is dropped, as the
-//! HTTP torrent route's body does.
+//! [`crate::ServerHandle::open_reader`] does, with the same resolve and the
+//! same play rules. It reads it on the runtime with no reader task. With
+//! the publication's [`PlayToken`], the receiver's reads are the viewer's
+//! playback: the session moves, and the file shares as the app's own
+//! player's would. Without one they are an aside. A torrent source
+//! registers its stream at the body's open and ends it when the body is
+//! dropped, as the HTTP torrent route's body does.
 //!
 //! **Renditions** (`docs/design/renditions.md`, `crate::rendition`) are
 //! publications too ([`crate::ServerHandle::publish_rendition`]), with the
-//! same token rules and the same cut, and one progressive fragmented MP4
-//! at `/cast/{token}/stream.mp4`: a file with a length and ranges whose
-//! every byte is fixed before it is made (header, then one padded slot per
-//! segment), so a receiver seeks in it by bytes. A plain publication has
-//! no `stream.mp4` (`404`); a rendition's token serves it and, like a
-//! plain one, the source as it is at `/cast/{token}`.
+//! same token rules and the same cut. A rendition adds one progressive
+//! fragmented MP4 at `/cast/{token}/stream.mp4`. That is a file with a
+//! length and ranges whose every byte is fixed before it is made (header,
+//! then one padded slot per segment), so a receiver seeks in it by bytes.
+//! A plain publication has no `stream.mp4` (`404`). A rendition's token
+//! serves it, and also, like a plain one, the source as it is at
+//! `/cast/{token}`.
 
 use crate::media::reader::SourceTally;
 use crate::media::registry::Entry;
@@ -116,19 +117,20 @@ impl From<String> for CastToken {
     }
 }
 
-/// **What a publication has served so far, and how**: what the app's cast
-/// panel is told ([`crate::ServerHandle::cast_numbers`]). Counts that only
-/// grow and positions as they are now -- no rate and no clock: the app takes
-/// two and divides by the time between them. Every absence is `null`.
+/// **What a publication has served so far, and how.** The app's cast
+/// panel is told this ([`crate::ServerHandle::cast_numbers`]). It holds
+/// counts that only grow and positions as they are now. There is no rate
+/// and no clock: the app takes two and divides by the time between them.
+/// Every absence is `null`.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CastNumbers {
-    /// `plain` -- the source as it is, at `/cast/{token}` -- or
-    /// `rendition`, the file made from it at `/cast/{token}/stream.mp4`.
+    /// `plain` (the source as it is, at `/cast/{token}`), or `rendition`
+    /// (the file made from it at `/cast/{token}/stream.mp4`).
     pub kind: CastKind,
-    /// The type the receiver is answered with: a plain publication's
-    /// source's, once a request has resolved it; `video/mp4` for a
-    /// rendition.
+    /// The type the receiver is answered with. For a plain publication it
+    /// is the source's, once a request has resolved it. For a rendition it
+    /// is `video/mp4`.
     pub content_type: Option<String>,
     pub delivery: DeliveryNumbers,
     pub source: SourceNumbers,
@@ -151,8 +153,8 @@ pub struct DeliveryNumbers {
     /// Requests under the token, `GET` and `HEAD`, answered with bytes or
     /// not.
     pub requests: u64,
-    /// Responses that began a body, ended ones, and the difference: the
-    /// bodies being read now.
+    /// Responses that began a body, ended ones, and the difference, which
+    /// is the bodies being read now.
     pub bodies_begun: u64,
     pub bodies_ended: u64,
     pub bodies_open: u64,
@@ -169,23 +171,23 @@ pub struct DeliveryNumbers {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceNumbers {
-    /// `torrent`, `member` (a file inside an archive) or `http` -- every
-    /// other source, read through the shared reader: a link, a Drive file,
-    /// a finished download, a file on this device. `None` before the first
-    /// open.
+    /// `torrent`, `member` (a file inside an archive) or `http`. `http` is
+    /// every other source, read through the shared reader: a link, a Drive
+    /// file, a finished download, a file on this device. `None` before the
+    /// first open.
     pub kind: Option<String>,
     pub bytes_read: u64,
-    /// Opens: one a body for a plain publication, one a run for a
-    /// rendition.
+    /// Opens. A plain publication opens once a body, and a rendition once
+    /// a run.
     pub opens: u64,
-    /// Reopens at another offset inside one open: a rendition's producer
-    /// seeking in the file.
+    /// Reopens at another offset inside one open. These are a rendition's
+    /// producer seeking in the file.
     pub seeks: u64,
 }
 
 /// What every body under one token adds to: the delivery half of
-/// [`CastNumbers`]. Atomics, so a body's poll takes no lock; a position is
-/// stored one past itself, so a zero is "none yet".
+/// [`CastNumbers`]. The fields are atomics, so a body's poll takes no
+/// lock. A position is stored one past itself, so a zero is "none yet".
 #[derive(Default)]
 struct Tally {
     requests: AtomicU64,
@@ -262,23 +264,24 @@ struct Publication {
     cut: CancellationToken,
     /// What its bodies have sent, and what its source has read.
     tally: Arc<Tally>,
-    /// The stream behind the token, for a rendition. Its runs' stops
-    /// are children of `cut`, so the cut ends them; its ring goes with the
-    /// last holder -- the map, a request in flight, a run task -- each of
-    /// which lets go at the cut.
+    /// The stream behind the token, for a rendition. Its runs' stops are
+    /// children of `cut`, so the cut ends them. Its ring goes with the last
+    /// holder (the map, a request in flight, a run task), and each of those
+    /// lets go at the cut.
     rendition: Option<Arc<Rendition>>,
     /// **The cast's hold on its torrent** (`enginefs::retention::holds`),
-    /// for an id a torrent is behind: from publish to unpublish the torrent
+    /// for an id a torrent is behind. From publish to unpublish the torrent
     /// runs and keeps its bytes, whatever the receiver is reading and
-    /// whatever else a stream opens. Taken while the player's own hold is
-    /// still there, so the hand-over has no gap; let go by the unpublish.
+    /// whatever else a stream opens. It is taken while the player's own
+    /// hold is still there, so the hand-over has no gap. The unpublish lets
+    /// it go.
     hold: std::sync::Mutex<Option<enginefs::retention::holds::TorrentHold>>,
     _lease: Lease<Entry>,
 }
 
 impl Publication {
-    /// Let go of the torrent: unpublished, now -- not when the last request
-    /// still holding the publication finishes.
+    /// Let go of the torrent, because it was unpublished. This happens now,
+    /// not when the last request still holding the publication finishes.
     fn release(&self) {
         self.hold
             .lock()
@@ -307,8 +310,8 @@ impl Publication {
         }
     }
 
-    /// The line a publication ends with: its totals, and nothing that names
-    /// what it was or where.
+    /// The line a publication ends with. It holds its totals, and nothing
+    /// that names what it was or where.
     fn log_end(&self) {
         let delivery = self.tally.delivery();
         let (read, opens, seeks) = self.tally.source.counts();
@@ -331,23 +334,23 @@ impl Publication {
 }
 
 /// Every token published and not unpublished, and what a rendition needs
-/// to be published at all. Held by [`crate::lan_media::LanMedia`], whose
-/// stop unpublishes all of them.
+/// to be published at all. [`crate::lan_media::LanMedia`] holds it, and
+/// its stop unpublishes all of them.
 #[derive(Default)]
 pub(crate) struct Casts {
     published: std::sync::Mutex<HashMap<String, Arc<Publication>>>,
-    /// The embedder's producer (`ServerHandle::install_producer`): without
+    /// The embedder's producer (`ServerHandle::install_producer`). Without
     /// one, a rendition is refused.
     producer: std::sync::Mutex<Option<Arc<dyn Producer>>>,
     /// The release period and the speed window renditions published from
     /// now on run by.
     tuning: std::sync::Mutex<RenditionTuning>,
-    /// Preparations waiting now (`ServerHandle::prepare_rendition`): what a
-    /// test reads to see an unpublish end one.
+    /// Preparations waiting now (`ServerHandle::prepare_rendition`). A test
+    /// reads this to see an unpublish end one.
     preparing: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-/// Why a rendition was not published: the sentence of the error
+/// Why a rendition was not published. It is the sentence of the error
 /// `publish_rendition` answers when no producer is installed.
 pub(crate) const NO_PRODUCER: &str =
     "no rendition producer is installed (noProducer); install one with install_producer first";
@@ -360,9 +363,9 @@ impl Casts {
     }
 
     /// Publish `id` under a fresh token, if `running` says the listener is
-    /// up -- asked under this map's lock, which is what makes a publish
-    /// racing a stop either land before the stop's unpublish (and be
-    /// unpublished by it) or see the listener down.
+    /// up. `running` is asked under this map's lock. So a publish racing a
+    /// stop either lands before the stop's unpublish (and is unpublished by
+    /// it), or sees the listener down.
     pub(crate) fn publish(
         &self,
         running: impl FnOnce() -> bool,
@@ -408,9 +411,9 @@ impl Casts {
         let player = play.as_ref().map(|play| play.token.as_str());
         let hold = match lease.torrent_now() {
             Some((info_hash, files)) => Some(holds.hold(&info_hash, files, player)),
-            // Not a torrent: a cast of the viewer's all the same, so the
-            // viewer is watching something else now and their idle share
-            // goes. Nothing is held for it.
+            // Not a torrent. It is a cast of the viewer's all the same, so
+            // the viewer is watching something else now and their idle
+            // share goes. Nothing is held for it.
             None => {
                 if let Some(player) = player {
                     holds.watching_elsewhere(player);
@@ -442,8 +445,8 @@ impl Casts {
         Ok(token)
     }
 
-    /// Unpublish `token`: nothing new is served under it, and every body
-    /// being served under it ends now. Whether it was published.
+    /// Unpublish `token`. Nothing new is served under it, and every body
+    /// being served under it ends now. Answers whether it was published.
     pub(crate) fn unpublish(&self, token: &CastToken) -> bool {
         let Some(publication) = self.published().remove(token.as_str()) else {
             return false;
@@ -455,7 +458,7 @@ impl Casts {
         true
     }
 
-    /// Unpublish every token, cutting every body: the listener stopping.
+    /// Unpublish every token, cutting every body, as the listener stops.
     pub(crate) fn unpublish_all(&self) -> usize {
         let all: Vec<_> = self.published().drain().map(|(_, cast)| cast).collect();
         for publication in &all {
@@ -505,7 +508,8 @@ impl Casts {
             .map_or(RenditionReadiness::Ended, |rendition| rendition.readiness())
     }
 
-    /// How many preparations are waiting now: each holds this while it does.
+    /// How many preparations are waiting now. Each holds this while it
+    /// waits.
     pub(crate) fn preparing(&self) -> Arc<std::sync::atomic::AtomicUsize> {
         self.preparing.clone()
     }
@@ -560,10 +564,10 @@ async fn stream_head(
     serve_stream(&state, &token, &headers, false).await
 }
 
-/// What a rendition answers when it has no bytes for the request: `404`
-/// past the end, `503` with `{refused, message}` once it has failed or
-/// while it is being cut -- never a clean empty body a receiver would read
-/// as the film being over.
+/// What a rendition answers when it has no bytes for the request. It is
+/// `404` past the end, and `503` with `{refused, message}` once it has
+/// failed or while it is being cut. It is never a clean empty body a
+/// receiver would read as the film being over.
 fn not_served(reason: NotServed) -> Response {
     match reason {
         NotServed::NotFound => StatusCode::NOT_FOUND.into_response(),
@@ -587,8 +591,8 @@ fn not_served(reason: NotServed) -> Response {
 static ZEROS: [u8; 64 * 1024] = [0; 64 * 1024];
 
 /// A rendition file's bytes from `next` to `end` (inclusive), piece by
-/// piece: the header, then each slot's fragment and padding, the
-/// fragments asked of the rendition as the body gets to them.
+/// piece: the header, then each slot's fragment and padding. The fragments
+/// are asked of the rendition as the body gets to them.
 struct FileReader {
     state: AppState,
     rendition: Arc<Rendition>,
@@ -598,8 +602,8 @@ struct FileReader {
     end: u64,
     /// The first slot's fragment, when the answer waited for it.
     first: Option<(u64, Bytes)>,
-    /// What the next fragment is asked as: the range's first slot is the
-    /// receiver's request wherever the range began, the rest are read on
+    /// What the next fragment is asked as. The range's first slot is the
+    /// receiver's request wherever the range began. The rest are read on
     /// into.
     ask: Ask,
 }
@@ -653,7 +657,7 @@ impl FileReader {
     }
 }
 
-/// Bytes `from..=to` of a slot `size` long holding `fragment`: the
+/// Bytes `from..=to` of a slot `size` long holding `fragment`. That is the
 /// fragment, then its padding ([`crate::rendition::layout::padding`]).
 fn slot_bytes(fragment: &Bytes, size: u64, from: u64, to: u64) -> Bytes {
     let len = fragment.len() as u64;
@@ -669,28 +673,31 @@ fn slot_bytes(fragment: &Bytes, size: u64, from: u64, to: u64) -> Bytes {
 }
 
 /// **A rendition's file**: one progressive fragmented MP4 with a length
-/// and ranges (`docs/design/renditions.md`, "Seeking by bytes") -- the
+/// and ranges (`docs/design/renditions.md`, "Seeking by bytes"). It is the
 /// header (`ftyp` + `moov` + `sidx`), then one slot per segment, each its
-/// fragment padded with `free` boxes of 1 KiB (`layout::padding`), every byte the same however often
-/// and in whatever order it is asked for. A receiver plays it as a file
-/// (`<video src>`), not through Media Source, and seeks in it by bytes:
-/// it finds the time in the `sidx` and asks for a `Range` there.
+/// fragment padded with `free` boxes of 1 KiB (`layout::padding`). Every
+/// byte is the same however often and in whatever order it is asked for.
+/// A receiver plays it as a file (`<video src>`), not through Media
+/// Source, and seeks in it by bytes. It finds the time in the `sidx` and
+/// asks for a `Range` there.
 ///
 /// The length is known once the first run has reported the source's
-/// formats and index, so the answer -- a `HEAD` too -- waits for that
-/// (starting the run, from the film's start, if none is live). Then the
+/// formats and index. So the answer (a `HEAD` too) waits for that,
+/// starting the run from the film's start if none is live. Then comes the
 /// range framing every media route shares: `200` or `206` with
 /// `Content-Range`, `416` for a range past the end. A range that begins in
-/// a slot waits for that slot's fragment before it answers, so a rendition
+/// a slot waits for that slot's fragment before it answers. So a rendition
 /// that cannot make it is a status (`503`, as [`not_served`] says) rather
-/// than a body that breaks; one that begins in the header answers at once.
+/// than a body that breaks. A range that begins in the header answers at
+/// once.
 ///
-/// Each later slot is asked for as the receiver takes the bytes before it,
-/// so a receiver that pauses stops asking and the run's lookahead holds
-/// the producer. The first slot a range asks for may move the run there --
-/// a read from the header on into slot 0 included: Chrome's demuxer probes
-/// it before it seeks, and a read that waits for nobody waits forever; the slots a range reads on
-/// into never move a live run ([`Ask`]: the latest asker wins). The last bytes of a slot are always zeros and are
+/// Each later slot is asked for as the receiver takes the bytes before it.
+/// So a receiver that pauses stops asking, and the run's lookahead holds
+/// the producer. The first slot a range asks for may move the run there,
+/// a read from the header on into slot 0 included. Chrome's demuxer probes
+/// slot 0 before it seeks, and a read that waits for nobody waits forever.
+/// The slots a range reads on into never move a live run ([`Ask`]: the
+/// latest asker wins). The last bytes of a slot are always zeros and are
 /// answered without asking for anything. No timer ends a body: a slot that
 /// is slow to come is waited for. The cut (unpublish, the listener's stop)
 /// and a rendition that fails partway break the body with an error.
@@ -727,8 +734,8 @@ async fn serve_stream(state: &AppState, token: &str, headers: &HeaderMap, body: 
     if !body {
         return (framing.status(), res_headers, Body::empty()).into_response();
     }
-    // A range that begins in a slot -- and not in its zero tail -- waits for
-    // that slot's fragment: the receiver's seek.
+    // A range that begins in a slot, and not in its zero tail, waits for
+    // that slot's fragment. That is the receiver's seek.
     let first = match layout.slot_at(framing.start) {
         Some(slot)
             if !layout.slots[slot as usize]
@@ -745,7 +752,7 @@ async fn serve_stream(state: &AppState, token: &str, headers: &HeaderMap, body: 
     state.lan_media.record_body();
     publication.tally.body(framing.start);
     // The first slot a range reaches is one it asked for, wherever the
-    // range began: a read from the header on into slot 0 (Chrome's demuxer
+    // range began. A read from the header on into slot 0 (Chrome's demuxer
     // probing the first fragment) is as much the receiver's request as a
     // jump to its start.
     let ask = Ask::Seek;
@@ -842,8 +849,8 @@ async fn serve(state: &AppState, token: &str, headers: &HeaderMap, body: bool) -
         .tally
         .content_type
         .set(resolved.content_type.clone());
-    // An origin that will not range can be read forward by a player
-    // through `/proxy` on loopback, never by a receiver: nothing here can
+    // A player can read an origin that will not range forward through
+    // `/proxy` on loopback. A receiver never can, since nothing here can
     // seek it.
     if !resolved.in_process {
         return refused(Refusal::NoRanges);
@@ -865,8 +872,8 @@ async fn serve(state: &AppState, token: &str, headers: &HeaderMap, body: bool) -
         return (framing.status(), res_headers, Body::empty()).into_response();
     }
 
-    // The same open a reader over the id makes, with the publication's play:
-    // the session moves and the stream registers here, before a byte.
+    // The same open a reader over the id makes, with the publication's
+    // play. The session moves and the stream registers here, before a byte.
     let (entry, source) = match state
         .media
         .open_source(state, &publication.id, publication.play.clone())
@@ -913,14 +920,14 @@ async fn serve(state: &AppState, token: &str, headers: &HeaderMap, body: bool) -
 
 type Chunks = Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>;
 
-/// A cast response's body, endable by its token's unpublish: the cut is
-/// polled first on every poll, so a body parked on a piece nobody has is
-/// woken by the cut itself, and yields an **error** -- hyper then drops the
+/// A cast response's body, endable by its token's unpublish. The cut is
+/// polled first on every poll, so the cut itself wakes a body parked on a
+/// piece nobody has. The body then yields an **error**. hyper drops the
 /// connection, and the receiver reads a broken source rather than a file
 /// that ended early (`proxy_streams::ClosableStream`'s rule, for the same
 /// reason). It holds the source and the id's lease for as long as it is
-/// read (nothing, for a rendition's file, which is bytes in memory);
-/// dropped, the source's stream ends.
+/// read (nothing, for a rendition's file, which is bytes in memory). When
+/// it is dropped, the source's stream ends.
 struct CastBody {
     chunks: Chunks,
     cut: Pin<Box<WaitForCancellationFutureOwned>>,
@@ -931,11 +938,11 @@ struct CastBody {
     start: u64,
     length: u64,
     kind: &'static str,
-    /// The publication's counts, which every chunk adds to and the drop
-    /// ends a body in.
+    /// The publication's counts. Every chunk adds to them, and the drop
+    /// ends a body in them.
     tally: Arc<Tally>,
-    /// The source's, for a body read straight from it: a plain
-    /// publication's, whose every byte sent is a byte read.
+    /// The source's counts, for a body read straight from it. That is a
+    /// plain publication's, whose every byte sent is a byte read.
     source: Option<Arc<SourceTally>>,
     _held: Box<dyn Send>,
 }

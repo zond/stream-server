@@ -3,23 +3,24 @@
 //!
 //! A Chromecast (or any other receiver on the LAN) cannot fetch anything from
 //! a loopback-only server, which is what `ServerConfig`'s default binds. It
-//! also must not be handed the control API: a cast session needs media bytes
+//! also must not be handed the control API. A cast session needs media bytes
 //! and nothing else, while the control surface reaches settings, offline
 //! downloads, engine stats and the torrent session.
 //!
 //! So this is a whole second listener rather than a wider bind on the first
-//! one, and it serves **published cast tokens and nothing else**
+//! one. It serves **published cast tokens and nothing else**
 //! (`crate::cast`): `/cast/{token}` for each id the app published (and a
-//! rendition's `/cast/{token}/stream.mp4`), every other path a `404`. No route that fetches a caller-named URL, none that
+//! rendition's `/cast/{token}/stream.mp4`), and every other path is a
+//! `404`. There is no route that fetches a caller-named URL, none that
 //! starts a torrent, none that names a file, and no control route at any
-//! level, not even behind the bearer middleware, so there is no bearer
+//! level, not even behind the bearer middleware. So there is no bearer
 //! token to guess, leak or brute-force. Both listeners share one
 //! [`AppState`], so a cast body uses the same engines, piece cache and
 //! settings as the app's own player.
 //!
-//! It is off unless an embedder configures [`ServerConfig::lan_media_addr`],
-//! and [`ServerHandle::set_lan_media`] starts and stops it at runtime so it
-//! exists only for as long as a cast session does -- nothing binds it at
+//! It is off unless an embedder configures [`ServerConfig::lan_media_addr`].
+//! [`ServerHandle::set_lan_media`] starts and stops it at runtime, so it
+//! exists only for as long as a cast session does. Nothing binds it at
 //! startup, so a configured address is a place, not a running listener. The
 //! `lanMediaEnabled` setting is the operator's veto, and since every start
 //! goes through `set_lan_media`, every start is subject to it.
@@ -47,21 +48,21 @@ pub struct LanMedia {
     /// stop, so two concurrent toggles cannot both bind.
     running: tokio::sync::Mutex<Option<Running>>,
     /// Requests that have reached the listener since the cast session it is
-    /// serving began -- see [`LanMedia::requests_served`]. Not behind the
-    /// mutex, though both [`LanMedia::start`] and [`LanMedia::stop`] reset
-    /// it while holding it: it is written
-    /// from the serving task on every request and read from whatever thread
-    /// asks, and neither cares to be ordered against anything else.
+    /// serving began (see [`LanMedia::requests_served`]). It is not behind
+    /// the mutex, though both [`LanMedia::start`] and [`LanMedia::stop`]
+    /// reset it while holding it. It is written from the serving task on
+    /// every request and read from whatever thread asks, and neither cares
+    /// to be ordered against anything else.
     requests: AtomicU64,
-    /// The address in `running`, mirrored where a reader needs no await:
-    /// written under that lock, read without it. See
+    /// The address in `running`, mirrored where a reader needs no await. It
+    /// is written under that lock and read without it. See
     /// [`LanMedia::bound_addr`].
     bound: std::sync::Mutex<Option<SocketAddr>>,
-    /// Cast bodies begun since the cast session began -- see
-    /// [`LanMedia::bodies_served`]. Reset where [`Self::requests`] is.
+    /// Cast bodies begun since the cast session began (see
+    /// [`LanMedia::bodies_served`]). It is reset where [`Self::requests`] is.
     bodies: AtomicU64,
-    /// The published cast tokens (`crate::cast`): what the listener
-    /// serves, and all of it. A stop unpublishes every one.
+    /// The published cast tokens (`crate::cast`). They are what the
+    /// listener serves, and all of it. A stop unpublishes every one.
     casts: crate::cast::Casts,
 }
 
@@ -87,9 +88,10 @@ impl LanMedia {
     /// which is why the answer comes from the listener and not from the
     /// configuration.
     ///
-    /// Synchronous, and never behind the listener's lock, which a start
-    /// holds for the whole of its bind: `ServerHandle::lan_media_running` is
-    /// asked from a UI thread with no await of its own to give up.
+    /// It is synchronous, and never behind the listener's lock, which a
+    /// start holds for the whole of its bind.
+    /// `ServerHandle::lan_media_running` is asked from a UI thread with no
+    /// await of its own to give up.
     pub fn bound_addr(&self) -> Option<SocketAddr> {
         *self.bound.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -98,18 +100,18 @@ impl LanMedia {
         *self.bound.lock().unwrap_or_else(|e| e.into_inner()) = bound;
     }
 
-    /// Bind the listener and start serving cast tokens on it. Idempotent:
-    /// an already-running listener is left alone and its address returned.
-    /// The request count is reset either way -- see below.
+    /// Bind the listener and start serving cast tokens on it. It is
+    /// idempotent: an already-running listener is left alone and its address
+    /// returned. The request count is reset either way (see below).
     ///
     /// Fails when the `lanMediaEnabled` setting forbids the listener, when
     /// no address is configured, or when the bind fails.
     pub async fn start(&self, state: &AppState) -> anyhow::Result<SocketAddr> {
         let mut running = self.running.lock().await;
-        // The operator's veto, read under the lock that `stop` takes: read
+        // The operator's veto, read under the lock that `stop` takes. Read
         // anywhere else, a settings update that revokes it while this waits
-        // for the lock could find nothing running to stop, and this would
-        // then bind the listener the setting just forbade. Read here, a
+        // for the lock could find nothing running to stop. This would then
+        // bind the listener the setting just forbade. Read here, a
         // revocation either lands first and is seen, or its `stop` queues
         // behind this start and takes what it bound.
         anyhow::ensure!(
@@ -118,11 +120,11 @@ impl LanMedia {
              set it through POST /settings (or update_settings) first"
         );
         // The count belongs to this session, not to the process or to the
-        // listener: a caller asking "has the receiver fetched anything yet?"
-        // is asking about the cast it just started, and a count left over
-        // from the previous one would answer yes for a receiver that never
+        // listener. A caller asking "has the receiver fetched anything yet?"
+        // is asking about the cast it just started. A count left over from
+        // the previous one would answer yes for a receiver that never
         // connected. That is why this is above the already-running return
-        // rather than beside the bind -- casting to a second receiver
+        // rather than beside the bind. Casting to a second receiver
         // mid-session starts a cast on a listener that is already up, and
         // that cast is the one being asked about.
         self.requests.store(0, Ordering::Relaxed);
@@ -165,31 +167,31 @@ impl LanMedia {
     ///
     /// **The door closes and the bytes stop.** The serving task owns the
     /// `TcpListener` and the accept loop, so aborting and awaiting it closes
-    /// the socket: by the time this returns the port is free -- it rebinds
-    /// immediately -- nothing new is accepted, and a connection sitting idle
+    /// the socket. By the time this returns the port is free (it rebinds
+    /// immediately), nothing new is accepted, and a connection sitting idle
     /// on keep-alive is closed without serving another request.
     ///
     /// A response already streaming is cut by the unpublish, not by the
-    /// abort. axum spawns every accepted connection into a task of its own,
-    /// and dropping the serve future only asks those to shut down
-    /// gracefully, which would let the response in flight run to its end
-    /// (measured on axum 0.8). Every body this listener serves is a cast
-    /// body, and every cast body polls its token's cut before each chunk
-    /// (`crate::cast`), so unpublishing every token ends every body: it
-    /// yields an error at its next poll and hyper drops the connection.
+    /// abort. axum spawns every accepted connection into a task of its own.
+    /// Dropping the serve future only asks those to shut down gracefully,
+    /// which would let the response in flight run to its end (measured on
+    /// axum 0.8). Every body this listener serves is a cast body, and every
+    /// cast body polls its token's cut before each chunk (`crate::cast`).
+    /// So unpublishing every token ends every body. It yields an error at
+    /// its next poll and hyper drops the connection.
     ///
-    /// The call is still not a drain: it returns as soon as the accept loop
-    /// is gone instead of waiting for a receiver, so ending a cast session
-    /// -- or the operator revoking `lanMediaEnabled` -- never blocks.
+    /// The call is still not a drain. It returns as soon as the accept loop
+    /// is gone instead of waiting for a receiver. So ending a cast session,
+    /// or the operator revoking `lanMediaEnabled`, never blocks.
     ///
-    /// Nothing here touches the loopback listener: it owns a different socket
-    /// and a different `axum::serve` future, and requests in flight on it --
-    /// including ones sharing the very torrent the LAN was streaming -- run on
-    /// untouched. Only the shared [`AppState`] is common, and it is not
+    /// Nothing here touches the loopback listener. It owns a different
+    /// socket and a different `axum::serve` future. Requests in flight on it
+    /// run on untouched, including ones sharing the very torrent the LAN was
+    /// streaming. Only the shared [`AppState`] is common, and it is not
     /// modified.
     pub async fn stop(&self) {
         let mut running = self.running.lock().await;
-        // Every token first, and after the bound address is gone: a publish
+        // Every token first, and after the bound address is gone. A publish
         // asks for that address under the casts' lock, so one racing this
         // stop either sees the listener down or is unpublished here. The
         // unpublish cuts every body being served, so the bytes stop too.
@@ -197,72 +199,72 @@ impl LanMedia {
         self.casts.unpublish_all();
         if let Some(running) = running.take() {
             running.task.abort();
-            // Awaiting the aborted task is what makes the stop observable:
-            // the task owns the `TcpListener`, so the port is only released
+            // Awaiting the aborted task is what makes the stop observable.
+            // The task owns the `TcpListener`, so the port is only released
             // once it has been dropped.
             let _ = running.task.await;
             tracing::info!(bound = %running.bound, "LAN media listener stopped");
         }
         // The reset goes below that await, not above the abort. Aborting is
-        // not instantaneous: the accept loop can already have taken a
-        // connection whose request is dispatched -- and counted, from the
-        // serving task -- while this one sits at the await. Reset first and
-        // that arrival lands on the fresh zero, handing the next session a
+        // not instantaneous. The accept loop can already have taken a
+        // connection whose request is dispatched (and counted, from the
+        // serving task) while this one sits at the await. Reset first, and
+        // that arrival lands on the fresh zero. That hands the next session a
         // request its receiver never made, which is exactly the reading
         // [`LanMedia::requests_served`] exists to be trusted for. Reset last
-        // and it cannot: by then the accept loop is gone and the shutdown has
-        // reached the connection tasks, which take no further request.
-        // Unconditional, running listener or not, so the count reads zero
-        // whenever nothing is listening.
+        // and it cannot. By then the accept loop is gone, and the shutdown
+        // has reached the connection tasks, which take no further request.
+        // It is unconditional, running listener or not, so the count reads
+        // zero whenever nothing is listening.
         self.requests.store(0, Ordering::Relaxed);
         self.bodies.store(0, Ordering::Relaxed);
     }
 
     /// The published cast tokens. A publish asks [`Self::bound_addr`]
-    /// under their lock (`Casts::publish`): refused while the listener is
-    /// not running, since a token with nothing to serve it would hold its
+    /// under their lock (`Casts::publish`). It is refused while the listener
+    /// is not running, since a token with nothing to serve it would hold its
     /// id until the next stop.
     pub(crate) fn casts(&self) -> &crate::cast::Casts {
         &self.casts
     }
 
-    /// Count one cast response beginning a body. Called by the `/cast`
-    /// route when it hands a `GET` its bytes -- not for a `HEAD`, a `404`
+    /// Count one cast response beginning a body. The `/cast` route calls
+    /// this when it hands a `GET` its bytes, and not for a `HEAD`, a `404`
     /// or a refusal.
     pub(crate) fn record_body(&self) {
         self.bodies.fetch_add(1, Ordering::Relaxed);
     }
 
     /// How many cast responses have begun a body since the current cast
-    /// session began; reset as [`Self::requests_served`] is. Beside that
-    /// count it tells a receiver that reached this device but was served
-    /// nothing (a token it was not given, a refusal) from one that is
-    /// reading.
+    /// session began. It is reset as [`Self::requests_served`] is. Beside
+    /// that count, it tells a receiver that reached this device but was
+    /// served nothing (a token it was not given, a refusal) from one that
+    /// is reading.
     pub fn bodies_served(&self) -> u64 {
         self.bodies.load(Ordering::Relaxed)
     }
 
-    /// Count one request arriving on the listener. Called by the tracing
-    /// layer [`crate::build_lan_media_router`] installs, which is the one
-    /// place every request to this listener passes through -- including the
-    /// ones the fallbacks answer with a `404`, since a receiver that asks
-    /// for the wrong path has still demonstrably reached us.
+    /// Count one request arriving on the listener. The tracing layer
+    /// [`crate::build_lan_media_router`] installs calls this. It is the one
+    /// place every request to this listener passes through, including the
+    /// ones the fallbacks answer with a `404`. A receiver that asks for the
+    /// wrong path has still demonstrably reached us.
     pub fn record_request(&self) {
         self.requests.fetch_add(1, Ordering::Relaxed);
     }
 
     /// How many requests have reached the listener since the current cast
     /// session began. Every [`LanMedia::start`] resets it, running listener
-    /// or not, so a second receiver never inherits the first one's count;
+    /// or not, so a second receiver never inherits the first one's count.
     /// [`LanMedia::stop`] resets it too, so it reads zero whenever nothing
     /// is listening.
     ///
     /// Zero is the diagnosis a caller cannot make any other way. A receiver
     /// that never fetched the stream and one that fetched it and failed to
-    /// play it look identical from the sofa -- both are a still picture --
-    /// and only the first is this device's fault: it means the address we
-    /// handed out was one the receiver could not reach. A non-zero count
-    /// says the network is fine and the problem is the media.
+    /// play it look identical from the sofa: both are a still picture. Only
+    /// the first is this device's fault. It means the address we handed out
+    /// was one the receiver could not reach. A non-zero count says the
+    /// network is fine and the problem is the media.
     pub fn requests_served(&self) -> u64 {
         self.requests.load(Ordering::Relaxed)
     }
@@ -272,13 +274,13 @@ impl LanMedia {
     ///
     /// The host is the local interface that can actually reach `peer` (see
     /// [`pick_host`]), because a receiver is told a URL it has to connect
-    /// back to: on a host with a LAN and a VPN or container bridge, the
+    /// back to. On a host with a LAN and a VPN or container bridge, the
     /// first interface in the list is regularly the wrong one.
     ///
     /// Every answer is logged at INFO, each way of returning `None`
-    /// distinctly. Naming the wrong address leaves no other trace anywhere:
-    /// a receiver told an address it cannot route to hangs on the TCP
-    /// connect rather than failing, so the cast simply never starts and
+    /// distinctly. Naming the wrong address leaves no other trace anywhere.
+    /// A receiver told an address it cannot route to hangs on the TCP
+    /// connect rather than failing. So the cast simply never starts, and
     /// nothing on either side says why. The address is a private one on the
     /// user's own LAN, not a secret.
     pub async fn base_url_for(&self, peer: IpAddr) -> Option<Url> {
@@ -311,7 +313,7 @@ impl LanMedia {
 
 /// The host a URL for `peer` should name, given what the listener bound.
 fn host_for_peer(bound: SocketAddr, peer: IpAddr) -> Option<IpAddr> {
-    // Bound to one specific address: that is the only address the listener
+    // Bound to one specific address. That is the only address the listener
     // answers on, so there is nothing to pick.
     if !bound.ip().is_unspecified() {
         return Some(bound.ip());
@@ -327,25 +329,26 @@ fn host_for_peer(bound: SocketAddr, peer: IpAddr) -> Option<IpAddr> {
 
 /// The local IPv4 address to advertise to a receiver at `peer`.
 ///
-/// The interface whose subnet contains `peer` wins outright: that is the
+/// The interface whose subnet contains `peer` wins outright. That is the
 /// address `peer` can demonstrably route back to, and everything else here
 /// is guesswork beside it. Loopback is a subnet like any other for that
-/// match, and an interface whose netmask the kernel never reported is on
+/// match. An interface whose netmask the kernel never reported is on
 /// nobody's subnet (see [`same_subnet`]) and takes its chances in the
 /// ranking.
 ///
-/// Failing that -- `peer` is behind a router we cannot see, or there is no
-/// real peer at all, which is what every platform that does not report a
-/// receiver's address gives us -- the answer is a guess. Taking whichever
-/// non-loopback address `getifaddrs` lists first is not enough: on a phone
-/// that is as likely to be the cellular interface as the Wi-Fi one, and a
-/// cellular address handed to a Chromecast is a cast that hangs on a TCP
-/// connect nobody ever times out. So the candidates are ranked instead (see
-/// [`Reachability`]) and the best one wins, ties keeping enumeration order.
+/// Failing that, the answer is a guess. That happens when `peer` is behind
+/// a router we cannot see, or there is no real peer at all, which is what
+/// every platform that does not report a receiver's address gives us.
+/// Taking whichever non-loopback address `getifaddrs` lists first is not
+/// enough. On a phone that is as likely to be the cellular interface as the
+/// Wi-Fi one. A cellular address handed to a Chromecast is a cast that
+/// hangs on a TCP connect nobody ever times out. So the candidates are
+/// ranked instead (see [`Reachability`]) and the best one wins, ties
+/// keeping enumeration order.
 ///
-/// `None` only when the host has nothing but loopback and `peer` is not on
-/// it either: a loopback address is never a guess worth making, since a
-/// receiver reaching this process over loopback is not a receiver.
+/// It is `None` only when the host has nothing but loopback and `peer` is
+/// not on it either. A loopback address is never a guess worth making,
+/// since a receiver reaching this process over loopback is not a receiver.
 fn pick_host(interfaces: &[LocalIpv4Interface], peer: Ipv4Addr) -> Option<Ipv4Addr> {
     if let Some(iface) = interfaces.iter().find(|iface| same_subnet(iface, peer)) {
         return Some(iface.addr.ip);
@@ -358,18 +361,18 @@ fn pick_host(interfaces: &[LocalIpv4Interface], peer: Ipv4Addr) -> Option<Ipv4Ad
 }
 
 /// How plausibly a receiver on the same home network could reach one of our
-/// addresses, best first -- the `Ord` derive *is* the ranking, and
+/// addresses, best first. The `Ord` derive *is* the ranking, and
 /// [`pick_host`] takes the minimum.
 ///
 /// The order encodes two judgements, the first outranking the second. An
-/// interface the receiver cannot be behind -- a tunnel, a carrier link, a
-/// container or VM bridge (see [`OFF_LAN_INTERFACE_PREFIXES`]) -- is no way
-/// back to it whatever address it carries, so both of its ranks sit below
+/// interface the receiver cannot be behind (a tunnel, a carrier link, a
+/// container or VM bridge: see [`OFF_LAN_INTERFACE_PREFIXES`]) is no way
+/// back to it whatever address it carries. So both of its ranks sit below
 /// every ordinary interface. Within a kind, an RFC1918 address is what a
-/// device on a home network has and anything else is a worse guess.
+/// device on a home network has, and anything else is a worse guess.
 ///
-/// Both are heuristics, and deliberately only tie-breaks: an interface on
-/// the receiver's own subnet never reaches this, and a host whose only
+/// Both are heuristics, and deliberately only tie-breaks. An interface on
+/// the receiver's own subnet never reaches this. A host whose only
 /// routable address is a cellular one still offers it rather than nothing.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 enum Reachability {
@@ -377,16 +380,16 @@ enum Reachability {
     /// address of a machine sharing a home network with the receiver, and
     /// the rank this is expected to answer with nearly always.
     PrivateOnOrdinary,
-    /// Any other address on an ordinary interface -- a public address, or a
-    /// carrier-grade NAT or link-local one. A poor guess, but the link
-    /// itself is one the receiver may genuinely share.
+    /// Any other address on an ordinary interface: a public address, or a
+    /// carrier-grade NAT or link-local one. It is a poor guess, but the
+    /// link itself is one the receiver may genuinely share.
     OtherOnOrdinary,
     /// A private address on an interface the receiver is not behind: a
-    /// VPN's `10.x` or `docker0`'s `172.17.x`, each of which looks exactly
-    /// like a LAN address and is reachable only from inside its own tunnel
-    /// or bridge. This is the tie the ranking mostly exists to break --
-    /// without it, the address shape alone says these are as good as the
-    /// Wi-Fi address and enumeration order decides.
+    /// VPN's `10.x` or `docker0`'s `172.17.x`. Each looks exactly like a
+    /// LAN address and is reachable only from inside its own tunnel or
+    /// bridge. This is the tie the ranking mostly exists to break. Without
+    /// it, the address shape alone says these are as good as the Wi-Fi
+    /// address, and enumeration order decides.
     PrivateOffLan,
     /// Everything else, the case that started this: a cellular address,
     /// which no receiver has ever been able to reach.
@@ -407,22 +410,22 @@ fn reachability(iface: &LocalIpv4Interface) -> Reachability {
 ///
 /// Cellular: `rmnet` is Android's, `ccmni` MediaTek's, `pdp_ip` iOS's.
 /// Tunnels: `tun`, `tap` and `wg`, plus macOS and iOS's `utun`, which the
-/// `tun` prefix does not match -- a VPN is typically up for a whole
-/// session. Container and VM bridges: `docker`, Docker's user-defined
-/// `br-<id>`, the `veth` half of a container's pair, libvirt's `virbr` and
-/// VirtualBox's `vboxnet`, every one of which carries an RFC1918 address on
+/// `tun` prefix does not match. A VPN is typically up for a whole session.
+/// Container and VM bridges: `docker`, Docker's user-defined `br-<id>`,
+/// the `veth` half of a container's pair, libvirt's `virbr` and
+/// VirtualBox's `vboxnet`. Every one of these carries an RFC1918 address on
 /// a machine that also has a real LAN address. Interfaces this device hands
 /// *out* rather than reaches a LAN through: Android's `ap0` hotspot, `p2p`
 /// (Wi-Fi Direct) and `rndis` (USB tethering). And `dummy`, the kernel's
-/// blackhole device. Loopback needs no prefix here -- it is excluded before
-/// the ranking runs.
+/// blackhole device. Loopback needs no prefix here, because it is excluded
+/// before the ranking runs.
 ///
-/// `br-` keeps its hyphen deliberately: a bare `br0` is as often a real
-/// bridged LAN interface as a virtual one, and demoting the address a
-/// bridged host actually answers on would be the mistake this list exists
-/// to avoid.
+/// `br-` keeps its hyphen deliberately. A bare `br0` is as often a real
+/// bridged LAN interface as a virtual one. Demoting the address a bridged
+/// host actually answers on would be the mistake this list exists to
+/// avoid.
 ///
-/// Matching a name is coarse, which is why it only ever demotes: the cost
+/// Matching a name is coarse, which is why it only ever demotes. The cost
 /// of being wrong is offering a second-choice address that also works, not
 /// refusing one that does.
 const OFF_LAN_INTERFACE_PREFIXES: [&str; 16] = [
@@ -440,24 +443,23 @@ fn is_off_lan(name: &str) -> bool {
 fn same_subnet(iface: &LocalIpv4Interface, peer: Ipv4Addr) -> bool {
     let mask = u32::from(iface.addr.netmask);
     // `if-addrs` substitutes `0.0.0.0` when the kernel reports no netmask
-    // for an interface, and a zero mask matches *every* peer -- the
-    // `0.0.0.0` a caller passes when it has no receiver address included.
-    // Such an interface would win the outright match against anything at
-    // all, taking the ranking and the loopback exclusion with it. An
-    // interface with no netmask cannot be subnet-matched; let the ranking
-    // have it.
+    // for an interface. A zero mask matches *every* peer, the `0.0.0.0` a
+    // caller passes when it has no receiver address included. Such an
+    // interface would win the outright match against anything at all,
+    // taking the ranking and the loopback exclusion with it. An interface
+    // with no netmask cannot be subnet-matched, so let the ranking have it.
     //
-    // The cost was weighed, not overlooked: this also refuses an interface
+    // The cost was weighed, not overlooked. This also refuses an interface
     // that genuinely *is* on the peer's subnet and merely lost its netmask,
     // dropping a real match down into the ranking with the guesses. That is
     // the cheaper of the two mistakes by a distance. A demoted real match
-    // still usually wins, because an interface that shares a receiver's
-    // subnet is an ordinary private one and that is the ranking's top rank;
-    // and when it loses, the answer is another address on this host, which
-    // the receiver may well reach anyway. A zero mask honoured is the
-    // opposite: it beats the interface that really shares the subnet, every
-    // call, for every receiver, and hands out an address chosen by nothing
-    // at all. Guessing is recoverable; a false match is not.
+    // still usually wins. An interface that shares a receiver's subnet is
+    // an ordinary private one, and that is the ranking's top rank. When it
+    // loses, the answer is another address on this host, which the receiver
+    // may well reach anyway. A zero mask honoured is the opposite. It beats
+    // the interface that really shares the subnet, every call, for every
+    // receiver, and hands out an address chosen by nothing at all. Guessing
+    // is recoverable, and a false match is not.
     if mask == 0 {
         return false;
     }
@@ -499,7 +501,7 @@ mod tests {
         iface("rmnet_data0", [10, 82, 3, 4], 24)
     }
 
-    /// The peer a caller passes when it has no receiver address at all --
+    /// The peer a caller passes when it has no receiver address at all,
     /// which is every platform that does not report one. It matches no
     /// interface's subnet, so it is the ranking's real workload rather than
     /// an edge case.
@@ -507,11 +509,11 @@ mod tests {
 
     /// The whole of the host pick, on the shapes of host it runs on.
     ///
-    /// Everything here is a pure function over a list, so the awkward cases
-    /// -- a phone on Wi-Fi and cellular at once, a machine with a VPN up or
-    /// containers running, an interface the kernel gave no netmask, a host
-    /// with nothing but loopback -- are built rather than found, and no case
-    /// touches the network.
+    /// Everything here is a pure function over a list. So the awkward cases
+    /// are built rather than found, and no case touches the network. They
+    /// are a phone on Wi-Fi and cellular at once, a machine with a VPN up
+    /// or containers running, an interface the kernel gave no netmask, and
+    /// a host with nothing but loopback.
     #[test]
     fn pick_host_ranks_what_a_receiver_could_reach() {
         let cases: [(&str, Vec<LocalIpv4Interface>, Ipv4Addr, Option<Ipv4Addr>); 18] = [
@@ -632,8 +634,8 @@ mod tests {
         }
     }
 
-    /// A listener bound to one address answers only there, so that address is
-    /// the URL host whatever the peer is -- no interface pick at all.
+    /// A listener bound to one address answers only there. So that address
+    /// is the URL host whatever the peer is, with no interface pick at all.
     #[test]
     fn host_for_peer_uses_a_specific_bind_address_verbatim() {
         let bound = SocketAddr::from(([192, 168, 1, 20], 11471));
@@ -645,7 +647,7 @@ mod tests {
 
     /// A wildcard bind goes through the real interface enumeration. Loopback
     /// is the one interface every machine that runs this test has, so it is
-    /// the only peer an assertion can be built on -- and a v4-mapped v6 peer,
+    /// the only peer an assertion can be built on. A v4-mapped v6 peer,
     /// which is what a dual-stack socket reports for an IPv4 receiver, has to
     /// resolve to the same interface as the plain v4 one.
     #[test]
