@@ -41,7 +41,7 @@ use url::Url;
 const UDP_PROTOCOL_ID: u64 = 0x0417_2710_1980;
 const ACTION_CONNECT: u32 = 0;
 /// BEP-15 scrape. The constant is commented out in librqbit's
-/// `tracker_comms_udp.rs`; this module implements the request itself rather
+/// `tracker_comms_udp.rs`. This module implements the request itself rather
 /// than depending on the fork gaining it.
 const ACTION_SCRAPE: u32 = 2;
 const ACTION_ERROR: u32 = 3;
@@ -66,8 +66,8 @@ pub struct SwarmCounts {
 
 /// What one scrape of one tracker produced.
 ///
-/// The three cases must stay distinguishable all the way to the JSON:
-/// "nobody is seeding" and "the tracker has never heard of this hash" and
+/// The three cases must stay distinguishable all the way to the JSON.
+/// "Nobody is seeding", "the tracker has never heard of this hash" and
 /// "we could not ask" are three different things, and only the first is a
 /// number a client may show.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,7 +76,7 @@ pub enum ScrapeOutcome {
     Counts(SwarmCounts),
     /// The tracker answered, but does not track this hash: an empty `files`
     /// dictionary (or one without our key) over HTTP, an all-zero entry over
-    /// UDP -- BEP-15 has no way to say "unknown", so a tracker that does not
+    /// UDP. BEP-15 has no way to say "unknown", so a tracker that does not
     /// know the hash answers with zeroes.
     UnknownHash,
     /// No usable answer: timeout, DNS/connect error, tracker error (action 3
@@ -86,10 +86,10 @@ pub enum ScrapeOutcome {
 
 /// Derive a tracker's scrape URL from its announce URL, per BEP-48.
 ///
-/// The **last path segment** must begin with `announce`; that prefix is
-/// replaced with `scrape` and everything else -- the leading path, any suffix
-/// on the segment, and the whole query string (passkeys live there) -- is kept
-/// verbatim. A tracker whose last segment does not start with `announce`
+/// The **last path segment** must begin with `announce`. That prefix is
+/// replaced with `scrape`, and everything else is kept verbatim: the leading
+/// path, any suffix on the segment, and the whole query string (passkeys live
+/// there). A tracker whose last segment does not start with `announce`
 /// declares no scrape support, so this returns `None` rather than guessing.
 ///
 /// ```text
@@ -124,10 +124,10 @@ pub async fn scrape(announce: &str, info_hash: &[u8; 20]) -> ScrapeOutcome {
 
 /// BEP-15 UDP scrape: connect handshake, then action 2 for a single hash.
 ///
-/// Takes the tracker's **announce** URL: the UDP protocol selects scrape with
-/// an action code, so the path is not part of the request and a tracker
+/// Takes the tracker's **announce** URL. The UDP protocol selects scrape with
+/// an action code, so the path is not part of the request. A tracker
 /// published as a bare `udp://host:port` is scrapable all the same. The socket
-/// is ours alone -- librqbit's announce socket is never touched -- and the
+/// is ours alone (librqbit's announce socket is never touched). The
 /// connection id is fetched fresh, because trackers expire them in ~60 s.
 pub async fn scrape_udp(announce: &Url, info_hash: &[u8; 20]) -> ScrapeOutcome {
     match tokio::time::timeout(UDP_SCRAPE_TIMEOUT, scrape_udp_inner(announce, info_hash)).await {
@@ -218,8 +218,8 @@ fn parse_udp_connect_response(buf: &[u8], transaction_id: u32) -> Result<u64> {
 
 /// Parse a BEP-15 scrape response for a single-hash request.
 ///
-/// Layout: `action` (2), `transaction_id`, then one 12-byte entry per hash --
-/// `complete`, `downloaded`, `incomplete`. An all-zero entry is how a tracker
+/// Layout: `action` (2), `transaction_id`, then one 12-byte entry per hash
+/// (`complete`, `downloaded`, `incomplete`). An all-zero entry is how a tracker
 /// says it does not know the hash, which is [`ScrapeOutcome::UnknownHash`] and
 /// not a swarm of size zero.
 fn parse_udp_scrape_response(buf: &[u8], transaction_id: u32) -> Result<ScrapeOutcome> {
@@ -256,7 +256,7 @@ fn error_message(buf: &[u8]) -> String {
 }
 
 /// Transaction ids only have to be unpredictable enough that a stray datagram
-/// from a previous request is not mistaken for this one's answer; a counter
+/// from a previous request is not mistaken for this one's answer. A counter
 /// seeded from the clock does that without pulling in an RNG crate.
 fn next_transaction_id() -> u32 {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -288,7 +288,7 @@ fn http_client() -> Option<&'static reqwest::Client> {
 
 /// BEP-48 HTTP(S) scrape of a single info hash.
 ///
-/// Takes the **announce** URL and derives the scrape URL from it; a tracker
+/// Takes the **announce** URL and derives the scrape URL from it. A tracker
 /// whose announce path does not support the derivation is
 /// [`ScrapeOutcome::Failed`] without a request being made.
 pub async fn scrape_http(announce: &Url, info_hash: &[u8; 20]) -> ScrapeOutcome {
@@ -337,7 +337,7 @@ async fn scrape_http_inner(url: &Url, info_hash: &[u8; 20]) -> Result<ScrapeOutc
 
 /// Parse a bencoded BEP-48 scrape body for one info hash.
 ///
-/// `{"files": {}}` -- or a `files` dictionary without our key -- is
+/// `{"files": {}}`, or a `files` dictionary without our key, is
 /// [`ScrapeOutcome::UnknownHash`]: the tracker answered and does not track the
 /// hash. A `failure reason` is an error, not a count.
 fn parse_http_scrape_response(body: &[u8], info_hash: &[u8; 20]) -> Result<ScrapeOutcome> {
@@ -372,16 +372,16 @@ fn parse_http_scrape_response(body: &[u8], info_hash: &[u8; 20]) -> Result<Scrap
 // ---------------------------------------------------------------------------
 
 /// Minimum wait between two scrapes of the same (tracker, info hash) once the
-/// tracker has answered. Scrape is cheap for a tracker but it is still an
-/// unsolicited request; a quarter of an hour is far more often than swarm
+/// tracker has answered. Scrape is cheap for a tracker, but it is still an
+/// unsolicited request. A quarter of an hour is far more often than swarm
 /// numbers meaningfully move.
 pub const MIN_SCRAPE_INTERVAL: Duration = Duration::from_secs(15 * 60);
-/// First retry delay after a failed scrape; doubles per consecutive failure.
+/// First retry delay after a failed scrape. It doubles per consecutive failure.
 const BACKOFF_BASE: Duration = Duration::from_secs(60);
 /// Ceiling on the failure backoff.
 const BACKOFF_CAP: Duration = Duration::from_secs(30 * 60);
 /// How long a successful scrape stays presentable. After this the numbers are
-/// dropped rather than shown as if current: a client would rather see "we do
+/// dropped rather than shown as if current. A client would rather see "we do
 /// not know" than an hour-old count labelled as now.
 pub const SCRAPE_STALE_AFTER: Duration = Duration::from_secs(60 * 60);
 /// Tracker scrapes in flight at once, across every torrent.
@@ -448,10 +448,9 @@ struct TorrentScrape {
 
 /// Swarm-wide seeder/leecher counts from tracker scrapes, cached per info hash.
 ///
-/// [`SwarmScraper::snapshot`] is what the stats path calls, and it **never
-/// awaits the network**: players poll `stats.json` about once a second, so it
-/// reads the cached snapshot and at most schedules a refresh in the
-/// background.
+/// The stats path calls [`SwarmScraper::snapshot`], and it **never awaits the
+/// network**. Players poll `stats.json` about once a second, so it reads the
+/// cached snapshot and at most schedules a refresh in the background.
 pub struct SwarmScraper {
     /// `None` disables scraping entirely (hermetic test sessions).
     transport: Option<Arc<dyn ScrapeTransport>>,
@@ -493,10 +492,10 @@ impl SwarmScraper {
     }
 
     /// The cached swarm figures for `info_hash`, scheduling a refresh of any
-    /// tracker that is due. Returns immediately -- no network, no lock held
-    /// across an await.
+    /// tracker that is due. Returns immediately, with no network and no lock
+    /// held across an await.
     ///
-    /// `private` torrents are skipped outright: an unsolicited scrape is
+    /// `private` torrents are skipped outright. An unsolicited scrape is
     /// exactly the kind of request private trackers ban accounts over, and
     /// their announce URLs carry the passkey that would identify us.
     pub fn snapshot(
@@ -521,8 +520,8 @@ impl SwarmScraper {
             let torrent = cache.entry(info_hash_hex.to_string()).or_default();
             torrent.last_seen = Some(now);
             // Trackers can only be set when the engine is created, but a
-            // restart or a different creating request can change the list;
-            // never keep counters for a tracker this torrent no longer uses.
+            // restart or a different creating request can change the list.
+            // Never keep counters for a tracker this torrent no longer uses.
             torrent.trackers.retain(|url, _| trackers.contains(url));
             for tracker in trackers {
                 let entry = torrent.trackers.entry(tracker.clone()).or_default();
@@ -545,7 +544,7 @@ impl SwarmScraper {
     }
 
     fn spawn_round(self: &Arc<Self>, info_hash_hex: String, info_hash: [u8; 20], due: Vec<String>) {
-        // `snapshot` is reachable from a library caller with no reactor; a
+        // `snapshot` is reachable from a library caller with no reactor. A
         // scrape needs one, so without a runtime we simply do not refresh.
         if tokio::runtime::Handle::try_current().is_err() {
             self.finish_round(&info_hash_hex);
@@ -593,10 +592,10 @@ impl SwarmScraper {
         let entry = torrent.trackers.entry(tracker.to_string()).or_default();
         match outcome {
             ScrapeOutcome::Counts(counts) => {
-                // Said here, once per answer, and not where the aggregate
-                // leaves it out: the aggregate is recomputed on every stats
-                // poll, about once a second, for the hour the answer stays
-                // fresh.
+                // This is said here, once per answer, and not where the
+                // aggregate leaves it out. The aggregate is recomputed on
+                // every stats poll, about once a second, for the hour the
+                // answer stays fresh.
                 for (what, value) in [("seeders", counts.seeders), ("leechers", counts.leechers)] {
                     if !plausible(value) {
                         warn!(%tracker, %what, value, "ignoring implausible tracker scrape count");
@@ -608,8 +607,8 @@ impl SwarmScraper {
             }
             ScrapeOutcome::UnknownHash => {
                 // The tracker answered and does not track this hash. Drop any
-                // counts it gave earlier -- it has dropped the torrent -- but
-                // treat the answer as a success for rate-limiting purposes.
+                // counts it gave earlier, since it has dropped the torrent.
+                // But treat the answer as a success for rate-limiting.
                 entry.counts = None;
                 entry.failures = 0;
                 entry.next_attempt = Some(now + MIN_SCRAPE_INTERVAL);
@@ -632,18 +631,17 @@ fn backoff(failures: u32) -> Duration {
 /// Fold the per-tracker counters into one figure per counter.
 ///
 /// **`max`, never `sum`.** Each tracker only ever sees the peers that
-/// registered with *it*, so no tracker's number is a share of a total; and
-/// several trackers in the shipped list share a backend and answer with
+/// registered with *it*, so no tracker's number is a share of a total.
+/// Several trackers in the shipped list share a backend and answer with
 /// byte-identical counts, so summing over-counts the same swarm several times
 /// over. The largest number any single tracker can vouch for is the honest
-/// floor, and seeders and leechers are maxed independently because a tracker
+/// floor. Seeders and leechers are maxed independently, because a tracker
 /// can be authoritative about one and stale about the other.
 ///
 /// Only [`ScrapeOutcome::Counts`] entries that are fresher than
-/// [`SCRAPE_STALE_AFTER`] take part: an unknown hash or a failed scrape
-/// contributes nothing at all, rather than folding in as a zero that would
-/// drag nothing down but would make "no tracker answered" look like an empty
-/// swarm.
+/// [`SCRAPE_STALE_AFTER`] take part. An unknown hash or a failed scrape
+/// contributes nothing at all. Folded in as a zero, it would drag nothing
+/// down, but it would make "no tracker answered" look like an empty swarm.
 fn aggregate(trackers: &HashMap<String, TrackerScrape>, now: Instant) -> SwarmSnapshot {
     let mut snapshot = SwarmSnapshot::default();
     let mut freshest: Option<Duration> = None;
@@ -970,9 +968,9 @@ mod tests {
         }
     }
 
-    /// Build a tracker map whose entries are `(url, age, counts)`; an entry
+    /// Build a tracker map whose entries are `(url, age, counts)`. An entry
     /// with no counts stands for a tracker that failed or answered
-    /// `UnknownHash`, which are recorded the same way here -- no numbers.
+    /// `UnknownHash`. Both are recorded the same way here, with no numbers.
     fn tracker_map(
         now: Instant,
         entries: &[(&str, Duration, Option<SwarmCounts>)],
@@ -993,7 +991,7 @@ mod tests {
     }
 
     /// Trackers disagree, and the aggregate takes the biggest number any one
-    /// of them vouches for -- per counter, and never the sum.
+    /// of them vouches for, per counter, and never the sum.
     #[tokio::test(start_paused = true)]
     async fn aggregate_takes_the_max_per_counter() {
         let now = Instant::now();
@@ -1021,7 +1019,7 @@ mod tests {
     }
 
     /// Several trackers in the shipped list share a backend and answer with
-    /// identical numbers; summing would report the same swarm three times.
+    /// identical numbers. Summing would report the same swarm three times.
     #[tokio::test(start_paused = true)]
     async fn aggregate_does_not_sum_shared_backend_duplicates() {
         let now = Instant::now();
@@ -1038,8 +1036,8 @@ mod tests {
         assert_eq!(snapshot.leechers, Some(7));
     }
 
-    /// Trackers with nothing to say are left out, not folded in as zero; when
-    /// every tracker is like that the answer is "unknown", never an empty
+    /// Trackers with nothing to say are left out, not folded in as zero. When
+    /// every tracker is like that, the answer is "unknown", never an empty
     /// swarm.
     #[tokio::test(start_paused = true)]
     async fn aggregate_excludes_unknown_and_failed_trackers() {
@@ -1069,7 +1067,7 @@ mod tests {
         assert_eq!(snapshot.leechers, None);
         assert_eq!(snapshot.age_secs, None);
 
-        // A real zero-seeder swarm still reports 0 -- that is a fact, not an
+        // A real zero-seeder swarm still reports 0. That is a fact, not an
         // absence.
         let seedless = tracker_map(
             now,
@@ -1078,7 +1076,7 @@ mod tests {
         assert_eq!(aggregate(&seedless, now).seeders, Some(0));
     }
 
-    /// An absurd count is a tracker bug; it is logged and left out instead of
+    /// An absurd count is a tracker bug. It is logged and left out instead of
     /// being shown.
     #[tokio::test(start_paused = true)]
     async fn aggregate_drops_implausible_counts() {
@@ -1176,8 +1174,8 @@ mod tests {
 
     /// **An implausible count is warned about once per answer, not once per
     /// stats poll.** The aggregate that leaves it out is recomputed on every
-    /// poll -- about once a second, for the hour the answer stays fresh --
-    /// and warned each time, into logs that are kept.
+    /// poll (about once a second, for the hour the answer stays fresh) and
+    /// warned each time, into logs that are kept.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn an_implausible_count_is_warned_about_once() {
         let warns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1198,8 +1196,8 @@ mod tests {
         assert_eq!(warns.load(Ordering::SeqCst), 1);
     }
 
-    /// A poll every second must not become a scrape every second: one round,
-    /// then nothing until the interval has passed.
+    /// A poll every second must not become a scrape every second. There is
+    /// one round, then nothing until the interval has passed.
     #[tokio::test(start_paused = true)]
     async fn scrapes_are_rate_limited_to_the_minimum_interval() {
         let transport = FakeTracker::answering(ScrapeOutcome::Counts(counts(10, 2)));
@@ -1308,8 +1306,8 @@ mod tests {
         assert_eq!(snapshot.age_secs, None);
     }
 
-    /// `UnknownHash` is an answer, not a failure: it clears any counts the
-    /// tracker gave before and is rate limited like a success.
+    /// `UnknownHash` is an answer, not a failure. It clears any counts the
+    /// tracker gave before, and it is rate limited like a success.
     #[tokio::test(start_paused = true)]
     async fn an_unknown_hash_clears_the_counts_it_replaces() {
         let transport = FakeTracker::answering(ScrapeOutcome::Counts(counts(10, 2)));
@@ -1329,7 +1327,7 @@ mod tests {
         assert_eq!(transport.calls(), 2);
     }
 
-    /// Private torrents are never scraped: an unsolicited request can breach
+    /// Private torrents are never scraped. An unsolicited request can breach
     /// a private tracker's rules, and its announce URL carries our passkey.
     #[tokio::test(start_paused = true)]
     async fn private_torrents_are_never_scraped() {
@@ -1376,9 +1374,10 @@ mod tests {
         assert_eq!(transport.calls(), 1);
     }
 
-    /// Live scrape of the Debian netinst ISO -- a legitimate, well-seeded
-    /// torrent. Ignored by default: it talks to the real internet, so it must
-    /// never run in CI. `cargo test -p enginefs -- --ignored live_scrape`.
+    /// Live scrape of the Debian netinst ISO, a legitimate, well-seeded
+    /// torrent. It is ignored by default because it talks to the real
+    /// internet, so it must never run in CI.
+    /// `cargo test -p enginefs -- --ignored live_scrape`.
     #[tokio::test]
     #[ignore = "hits real trackers"]
     async fn live_scrape_of_the_debian_iso_reports_a_plausible_swarm() {
@@ -1399,7 +1398,7 @@ mod tests {
     }
 
     /// A scrape body over the cap is refused as it arrives, not after it
-    /// has been buffered whole: one that never ends would otherwise be read
+    /// has been buffered whole. Otherwise one that never ends would be read
     /// until the request's timeout.
     #[tokio::test]
     async fn a_scrape_body_over_the_cap_is_refused_as_it_arrives() {

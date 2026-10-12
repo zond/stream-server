@@ -9,7 +9,7 @@ pub struct TrackerProber;
 
 impl TrackerProber {
     /// The trackers that answered their probe, fastest first. One that did
-    /// not answer is left out rather than ranked last: the caller keeps the
+    /// not answer is left out rather than ranked last. The caller keeps the
     /// top of this list, and failures at its end filled that top whenever
     /// fewer trackers answered than it keeps.
     pub async fn rank_trackers(trackers: Vec<String>) -> Vec<String> {
@@ -138,10 +138,10 @@ mod tests {
             while let Ok((mut socket, _)) = listener.accept().await {
                 tokio::spawn(async move {
                     // The request is read before the answer goes out, and
-                    // the write side is closed rather than dropped: a
-                    // socket dropped with bytes still unread is a reset on
-                    // Windows, and the probe then reads its own answer as
-                    // a tracker that did not answer.
+                    // the write side is closed rather than dropped. On
+                    // Windows, a socket dropped with bytes still unread is a
+                    // reset, and the probe then reads its own answer as a
+                    // tracker that did not answer.
                     let mut head = [0u8; 1024];
                     let _ = socket.read(&mut head).await;
                     let _ = socket

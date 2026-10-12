@@ -18,9 +18,9 @@ const TRACKER_LIST_MAX_BODY: usize = 1024 * 1024;
 /// Trait for tracker persistence (implemented by AppState or similar)
 /// This allows enginefs to persist trackers without depending on server crate
 ///
-/// Synchronous, and an implementation may block: the server's bridge answers
-/// from a `block_on` of its settings lock. [`TrackerManager`] asks it on the
-/// blocking pool for that reason -- see `ask_storage`.
+/// It is synchronous, and an implementation may block: the server's bridge
+/// answers from a `block_on` of its settings lock. [`TrackerManager`] asks it
+/// on the blocking pool for that reason (see `ask_storage`).
 pub trait TrackerStorage: Send + Sync {
     /// Get cached trackers from settings
     fn get_cached_trackers(&self) -> Vec<String>;
@@ -36,10 +36,10 @@ pub trait TrackerStorage: Send + Sync {
 pub struct TrackerManager {
     trackers: Arc<RwLock<Vec<String>>>,
     storage: Option<Arc<dyn TrackerStorage>>,
-    /// The periodic refresh task, held until its owner takes it -- see
-    /// [`TrackerManager::take_refresh_task`]. Shared with every clone (the
-    /// task holds one itself) so the manager the engine keeps can hand out
-    /// the task a constructor spawned.
+    /// The periodic refresh task, held until its owner takes it (see
+    /// [`TrackerManager::take_refresh_task`]). It is shared with every clone
+    /// (the task holds one itself), so the manager the engine keeps can hand
+    /// out the task a constructor spawned.
     refresh_task: Arc<parking_lot::Mutex<Option<JoinHandle<()>>>>,
 }
 
@@ -53,11 +53,11 @@ impl TrackerManager {
     /// Create a new TrackerManager without persistence (legacy behavior)
     /// A manager that fetches nothing and knows no trackers.
     ///
-    /// For a process that must make no outbound request of its own -- the
-    /// other half of `DhtBootstrapDns::Off`. [`TrackerManager::new`] spawns
-    /// a task whose first act is an HTTP GET of the default tracker list,
-    /// before anybody has added a torrent, so "offline" cannot be arranged
-    /// after the fact by clearing the list.
+    /// It is for a process that must make no outbound request of its own,
+    /// and is the other half of `DhtBootstrapDns::Off`.
+    /// [`TrackerManager::new`] spawns a task whose first act is an HTTP GET
+    /// of the default tracker list, before anybody has added a torrent. So
+    /// "offline" cannot be arranged after the fact by clearing the list.
     pub fn offline() -> Self {
         Self {
             trackers: Arc::new(RwLock::new(Vec::new())),
@@ -136,30 +136,30 @@ impl TrackerManager {
     }
 
     /// Take the periodic refresh task, so whoever shuts this process down can
-    /// abort it -- the way `server::run` cancels every other forever-loop it
-    /// starts. Returns the task once: the second caller gets `None`.
+    /// abort it, the way `server::run` cancels every other forever-loop it
+    /// starts. It returns the task once: the second caller gets `None`.
     ///
-    /// What aborting it avoids: the `tokio::time::interval` above is built
-    /// once, before the loop, so between refreshes the task is *parked* on
-    /// `interval.tick()` with a timer registered on the runtime's time
+    /// Here is what aborting it avoids. The `tokio::time::interval` above is
+    /// built once, before the loop, so between refreshes the task is *parked*
+    /// on `interval.tick()` with a timer registered on the runtime's time
     /// driver. Shutting that driver down marks it shut down and then fires
     /// every pending timer to the end of time
-    /// (`runtime::time::Handle::shutdown` -> `process_at_time(u64::MAX)`),
-    /// which wakes every task parked on one; a worker that polls such a task
+    /// (`runtime::time::Handle::shutdown` -> `process_at_time(u64::MAX)`).
+    /// That wakes every task parked on one. A worker that polls such a task
     /// before the scheduler drops it trips `TimerEntry::poll_elapsed`'s
     /// `assert!(!self.driver().is_shutdown())` and panics with "A Tokio 1.x
     /// context was found, but it is being shutdown". Tokio catches it and the
-    /// process survives, so it is only noise -- but it is the kind of noise a
-    /// real panic hides in, and which of the wake and the drop wins is why it
-    /// appears on some shutdowns and not others. A task that has been aborted
-    /// is not there to be woken.
+    /// process survives, so it is only noise. But it is the kind of noise a
+    /// real panic hides in. It appears on some shutdowns and not others
+    /// depending on whether the wake or the drop wins. A task that has been
+    /// aborted is not there to be woken.
     ///
     /// **An abort lands at an await that is pending, and at nothing else.**
-    /// A task inside a poll -- blocked in a storage call, say -- is only
-    /// flagged, and runs on to its next pending await; if the runtime was
-    /// shut down meanwhile, the first thing it reaches is that same timer,
-    /// armed on a dead driver. So nothing in this task blocks inside a
-    /// poll: the storage is asked on the blocking pool (`ask_storage`).
+    /// A task inside a poll (blocked in a storage call, say) is only flagged,
+    /// and runs on to its next pending await. If the runtime was shut down
+    /// meanwhile, the first thing it reaches is that same timer, armed on a
+    /// dead driver. So nothing in this task blocks inside a poll: the storage
+    /// is asked on the blocking pool (`ask_storage`).
     pub fn take_refresh_task(&self) -> Option<JoinHandle<()>> {
         self.refresh_task.lock().take()
     }
@@ -188,8 +188,8 @@ impl TrackerManager {
 
         let last_updated = ask_storage(storage, |storage| storage.get_last_updated()).await?;
         // A clock before 1970 (dead RTC on Android/embedded) makes
-        // duration_since fail; treat it as the epoch instead of panicking —
-        // cached trackers are then reused, or fetched when none exist.
+        // duration_since fail. Treat it as the epoch instead of panicking.
+        // Cached trackers are then reused, or fetched when none exist.
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -234,14 +234,16 @@ impl TrackerManager {
             "Fetched raw trackers, ranking by RTT"
         );
 
-        // The reachable ones, fastest first; a tracker whose probe failed
-        // is not in the answer at all. Only then the top 20: ranked with
-        // the failures at the end, a refresh on a network where most probes
-        // failed filled the persisted list with trackers nobody could reach.
+        // The reachable ones, fastest first. A tracker whose probe failed
+        // is not in the answer at all. Only then take the top 20. When the
+        // failures were ranked at the end instead, a refresh on a network
+        // where most probes failed filled the persisted list with trackers
+        // nobody could reach.
         let ranked = TrackerProber::rank_trackers(raw_trackers).await;
         if ranked.is_empty() {
-            // Nothing answered -- this network, not the list. The trackers
-            // cached from a refresh that could reach some stay.
+            // Nothing answered, which says this network is at fault, not the
+            // list. The trackers cached from a refresh that could reach some
+            // stay.
             warn!("No fetched tracker answered its probe; keeping the cached list");
             return Ok(());
         }
@@ -273,13 +275,14 @@ impl TrackerManager {
 
     /// Fetch trackers from URL.
     ///
-    /// Through [`crate::http_client_builder`], like every other HTTPS client
-    /// here: the list is fetched from GitHub over TLS on every refresh.
+    /// It goes through [`crate::http_client_builder`], like every other HTTPS
+    /// client here: the list is fetched from GitHub over TLS on every
+    /// refresh.
     ///
-    /// Bounded twice, because the refresh task awaits it and nothing else
-    /// would end it: by [`TRACKER_LIST_FETCH_TIMEOUT`] for the whole request,
-    /// so a GET that stalls does not park the refresh for the life of the
-    /// process, and by [`TRACKER_LIST_MAX_BODY`] for what is buffered.
+    /// It is bounded twice, because the refresh task awaits it and nothing
+    /// else would end it. [`TRACKER_LIST_FETCH_TIMEOUT`] bounds the whole
+    /// request, so a GET that stalls does not park the refresh for the life
+    /// of the process. [`TRACKER_LIST_MAX_BODY`] bounds what is buffered.
     async fn fetch_trackers(&self, url: &str) -> anyhow::Result<Vec<String>> {
         let response = crate::http_client_builder()
             .timeout(TRACKER_LIST_FETCH_TIMEOUT)
@@ -313,12 +316,13 @@ impl TrackerManager {
 /// The trait is synchronous and the server's implementation blocks (a
 /// `block_on` of its settings lock under `block_in_place`). Asking it
 /// inside the refresh task's poll would hold the poll open, and an abort
-/// cannot land inside a poll: on a server stopped as it starts, the task
-/// would still be in it when the runtime shuts down, then go on to its
-/// interval and panic on the dead driver ("A Tokio 1.x context was found,
-/// but it is being shutdown"). Awaited here instead, the task is parked on
-/// a join handle while the storage answers, and an abort ends it there.
-/// `Err` when the question panicked or the runtime is going away.
+/// cannot land inside a poll. On a server stopped as it starts, the task
+/// would still be in the poll when the runtime shuts down. It would then go
+/// on to its interval and panic on the dead driver ("A Tokio 1.x context
+/// was found, but it is being shutdown"). When the question is awaited
+/// here, the task is parked on a join handle while the storage answers, and
+/// an abort ends it there. Returns `Err` when the question panicked or the
+/// runtime is going away.
 async fn ask_storage<T: Send + 'static>(
     storage: &Arc<dyn TrackerStorage>,
     question: impl FnOnce(&dyn TrackerStorage) -> T + Send + 'static,
@@ -366,13 +370,13 @@ mod tests {
     }
 
     /// Storage that blocks its thread on one answer until the test lets it
-    /// go: the shape of the server's bridge, which answers from a
+    /// go. That is the shape of the server's bridge, which answers from a
     /// `block_on` of its settings lock.
     ///
-    /// The cached list reads empty the first time and full the second, and
-    /// the list is fresh unless the source URL is the question -- so each
-    /// question is reached, and none of them leads to a fetch except the
-    /// URL's, whose answer is not a URL at all.
+    /// The cached list reads empty the first time and full the second. The
+    /// list is fresh unless the source URL is the question. So each question
+    /// is reached, and none of them leads to a fetch except the URL's, whose
+    /// answer is not a URL at all.
     struct BlockingStorage {
         blocks: Question,
         cached_reads: std::sync::atomic::AtomicUsize,
@@ -424,14 +428,14 @@ mod tests {
     /// An abort ends the refresh loop while the storage is still answering,
     /// whichever answer it is.
     ///
-    /// Guards `ask_storage`: asked inside the task's poll instead, a
-    /// storage that blocks holds the poll open, and an abort only flags a
-    /// task that is inside one, so the loop would run on until the storage
-    /// lets go. On a server stopped as it starts, the runtime would shut
-    /// down in that gap and the loop's next step would arm its interval on
-    /// the dead driver -- the "A Tokio 1.x context was found, but it is
-    /// being shutdown" panic. A question asked without `ask_storage` times
-    /// out here.
+    /// Guards `ask_storage`. A storage that blocks, asked inside the task's
+    /// poll instead, holds the poll open. An abort only flags a task that is
+    /// inside a poll, so the loop would run on until the storage lets go. On
+    /// a server stopped as it starts, the runtime would shut down in that
+    /// gap. The loop's next step would then arm its interval on the dead
+    /// driver, which is the "A Tokio 1.x context was found, but it is being
+    /// shutdown" panic. A question asked without `ask_storage` times out
+    /// here.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_abort_lands_while_the_storage_is_still_answering() {
         for blocks in [
@@ -457,8 +461,9 @@ mod tests {
                 .expect("the wait for the storage call did not panic")
                 .unwrap_or_else(|_| panic!("the refresh loop never asked {blocks:?}"));
             task.abort();
-            // A bound on a failure, not a wait on a success: a task parked
-            // on an await is cancelled by the first worker to pick it up.
+            // This bounds a failure. It is not a wait on a success. A task
+            // parked on an await is cancelled by the first worker to pick it
+            // up.
             let ended = tokio::time::timeout(Duration::from_secs(10), task).await;
             let _ = release_tx.send(());
 
@@ -474,8 +479,9 @@ mod tests {
         }
     }
 
-    /// The refresh loop must belong to someone who can stop it: detached, it
-    /// arms its next interval while the runtime is shutting down and panics.
+    /// The refresh loop must belong to someone who can stop it. A detached
+    /// loop arms its next interval while the runtime is shutting down, and
+    /// panics.
     /// Aborting the task it hands over must end it by cancellation.
     #[tokio::test]
     async fn the_refresh_loop_is_handed_over_and_stops_when_aborted() {
@@ -516,8 +522,8 @@ mod tests {
         format!("http://{addr}/trackers.txt")
     }
 
-    /// A tracker-list GET that never answers ends at the fetch's timeout:
-    /// the refresh task awaits it, and nothing else would.
+    /// A tracker-list GET that never answers ends at the fetch's timeout.
+    /// The refresh task awaits it, and nothing else would end it.
     #[tokio::test(start_paused = true)]
     async fn a_tracker_list_fetch_that_stalls_ends() {
         let url = origin(|socket| async move {
@@ -581,8 +587,8 @@ mod tests {
         );
     }
 
-    /// Storage whose list is a day stale and whose source is `url`; records
-    /// every save.
+    /// Storage whose list is a day stale and whose source is `url`. It
+    /// records every save.
     struct StaleCache {
         url: String,
         saved: parking_lot::Mutex<Vec<Vec<String>>>,
@@ -606,7 +612,7 @@ mod tests {
     /// **A refresh on which no tracker answers keeps the cached list.**
     /// Ranking failed probes last rather than leaving them out would fill
     /// the persisted top 20 with trackers nobody can reach whenever fewer
-    /// than 20 answer -- and with nothing but those when none do.
+    /// than 20 answer. When none answer, it would hold nothing but those.
     #[tokio::test]
     async fn a_refresh_where_no_tracker_answers_keeps_the_cached_list() {
         use tokio::io::AsyncWriteExt;

@@ -4,11 +4,11 @@
 //! [`http_client_builder`] -- the tracker-list fetch, the tracker prober, the
 //! BEP-48 scrape, the DoH bootstrap resolver, `/proxy`, the archive fetches,
 //! and the `/get-https` call to Stremio's certificate API. (`/ftp` is the one
-//! fetch that is not reqwest's -- it speaks FTP, through `suppaftp` -- and it
+//! fetch that does not use reqwest. It speaks FTP through `suppaftp`, and it
 //! verifies FTPS against the same compiled-in roots; see
 //! `server::routes::ftp::tls_config`.)
 //! It lives in `enginefs` rather than `server` because `server` depends on
-//! `enginefs` and not the reverse; librqbit has its own copy of this policy
+//! `enginefs` and not the reverse. librqbit has its own copy of this policy
 //! (`librqbit::http_client_builder`) for the same reason. The two differ:
 //! librqbit's is written to be upstreamable and trusts the compiled-in roots
 //! alone, while this one also reads the platform's store.
@@ -21,8 +21,8 @@
 ///
 /// The compiled-in roots come from `webpki-root-certs`, which
 /// `rustls-platform-verifier` already pulls into the graph, so they compile
-/// nothing new; the platform's own anchors are read by `platform_roots`,
-/// once, at the first HTTPS request rather than at every handshake.
+/// nothing new. `platform_roots` reads the platform's own anchors once, at
+/// the first HTTPS request rather than at every handshake.
 ///
 /// # Why not the platform verifier
 ///
@@ -31,18 +31,19 @@
 /// `src/async_impl/client.rs`, the `!config.tls_certs_only` arm of the
 /// verifier `match`). `tls_certs_only` is the one builder state that takes
 /// the plain `with_root_certificates` arm instead and never names that
-/// verifier: rustls checks the chain itself. `add_root_certificate` is not an
-/// escape -- extra roots take `Verifier::new_with_extra_roots`, still the
-/// platform verifier.
+/// verifier: rustls checks the chain itself. `add_root_certificate` is no way
+/// out either. Extra roots take `Verifier::new_with_extra_roots`, which is
+/// still the platform verifier.
 ///
 /// On Android that verifier hands every handshake to Java's
-/// `CertPathValidator` with revocation checking on and SOFT_FAIL, so for a
-/// leaf certificate with no OCSP URL Android downloads the issuer's CRL and
-/// parses it in Java. Measured in an app embedding librqbit, on a Chromecast
-/// with Google TV: one tracker announce whose issuer's CRL held 116,196
-/// entries cost about 400 MB of Java heap -- every announce, no result cache
-/// -- which was 91% of the whole app's Java allocation and the GC storm
-/// behind an ANR. This server is the same process on that device, and its own
+/// `CertPathValidator`, with revocation checking on and SOFT_FAIL. Android
+/// then downloads the issuer's CRL and parses it in Java whenever the leaf
+/// certificate has no OCSP URL. This was measured in an app embedding
+/// librqbit, on a Chromecast with Google TV. One tracker announce whose
+/// issuer's CRL held 116,196 entries cost about 400 MB of Java heap, on every
+/// announce, with no result cache. That was 91% of the whole app's Java
+/// allocation, and the GC storm behind an ANR. This server is the same
+/// process on that device, and its own
 /// HTTPS is on the same paths: the tracker list is refetched, trackers are
 /// probed and scraped, and `/proxy` fetches whatever a stream URL points at.
 /// On Linux the same verifier re-reads the system store from disk for every
@@ -57,9 +58,9 @@
 /// # The trade
 ///
 /// Revocation is not checked. rustls verifies a chain against these anchors
-/// and consults no CRL and no OCSP responder, where Android's verifier at
-/// least asked (and SOFT_FAILed when it could not reach one). Against a CA
-/// that has had to revoke, this is weaker.
+/// and consults no CRL and no OCSP responder. Android's verifier at least
+/// asked, and SOFT_FAILed when it could not reach one. This is weaker against
+/// a CA that has had to revoke.
 ///
 /// The union is also, by construction, more permissive than either set alone:
 /// a root that one program has distrusted and the other has not is trusted
@@ -68,21 +69,21 @@
 /// threat from the one this path faces.
 ///
 /// What it buys is that nothing silently stops verifying. Everything this
-/// server speaks HTTPS to is on the open internet -- public trackers, a
+/// server speaks HTTPS to is on the open internet: public trackers, a
 /// tracker list on GitHub, DoH resolvers, Google Drive, and the remote media
-/// URLs `/proxy` and the archive `/create`s are handed -- and that traffic is
-/// worth protecting: an announce URL carries this peer's identity and the
+/// URLs `/proxy` and the archive `/create`s are handed. That traffic is
+/// worth protecting. An announce URL carries this peer's identity and the
 /// torrents it holds, a Drive request carries the user's grant, and a
 /// proxied stream URL often carries a credential of its own. A device or
-/// organisation that has installed its own CA keeps working, which is what
+/// organisation that has installed its own CA keeps working. That is what
 /// stops a failure here from being routed around.
 ///
-/// Every async client in the workspace starts here: `clippy.toml` refuses
-/// the other constructors, so an embedder may leave the platform verifier
-/// uninitialised (xtremio does).
+/// Every async client in the workspace starts here, because `clippy.toml`
+/// refuses the other constructors. So an embedder may leave the platform
+/// verifier uninitialised (xtremio does).
 ///
-/// The other half of the policy -- that the platform verifier is never
-/// constructed -- is `tests/tls_roots.rs`, which needs a test binary of its
+/// `tests/tls_roots.rs` holds the other half of the policy: that the
+/// platform verifier is never constructed. It needs a test binary of its
 /// own.
 #[allow(clippy::disallowed_methods)] // the one door clippy.toml points everyone to
 pub fn http_client_builder() -> reqwest::ClientBuilder {
@@ -96,10 +97,10 @@ pub fn http_client_builder() -> reqwest::ClientBuilder {
 /// A response body read whole, but never more than `max` bytes of it.
 ///
 /// `Response::bytes` and `text` buffer whatever the far end sends before
-/// anybody can look at the length, so a cap checked afterwards bounds
-/// nothing: the whole body is already in memory, and a body that never ends
-/// is read until the client's timeout. Refused at once on a declared
-/// `Content-Length` over the cap, and otherwise at the first chunk that
+/// anybody can look at the length. A cap checked afterwards bounds nothing.
+/// The whole body is already in memory, and a body that never ends is read
+/// until the client's timeout. This refuses the body at once when a declared
+/// `Content-Length` is over the cap, and otherwise at the first chunk that
 /// crosses it.
 pub async fn read_capped(mut response: reqwest::Response, max: usize) -> anyhow::Result<Vec<u8>> {
     if let Some(declared) = response.content_length()
@@ -119,18 +120,18 @@ pub async fn read_capped(mut response: reqwest::Response, max: usize) -> anyhow:
 
 /// Extra trust anchors for tests that need an HTTPS origin that *verifies*.
 ///
-/// `server`'s proxy tests stand up a real TLS listener, and several of them
-/// are about what a chain carries once it is established -- the credential
-/// rules for a redirect that steps down to cleartext, and for the lines of a
-/// playlist. A chain that will not verify never reaches the behaviour under
-/// test, and there is deliberately no other way in: what this module trusts
-/// is otherwise decided entirely by what the platform and Mozilla ship.
+/// `server`'s proxy tests stand up a real TLS listener. Several of them test
+/// what a chain carries once it is established: the credential rules for a
+/// redirect that steps down to cleartext, and for the lines of a playlist. A
+/// chain that will not verify never reaches the behaviour under test. There
+/// is deliberately no other way in. Otherwise, what this module trusts is
+/// decided entirely by what the platform and Mozilla ship.
 ///
-/// Behind a feature the server enables only as a dev-dependency, so it does
-/// not exist in a release build. Set once, before the first client is built:
-/// every proxy test builds its fixture before it makes a request, and the
-/// fixture is where this is called, so the ordering holds without a lock. A
-/// second call is ignored rather than racing the first.
+/// It sits behind a feature the server enables only as a dev-dependency, so
+/// it does not exist in a release build. It is set once, before the first
+/// client is built. Every proxy test builds its fixture before it makes a
+/// request, and the fixture is where this is called, so the ordering holds
+/// without a lock. A second call is ignored rather than racing the first.
 #[cfg(feature = "test-roots")]
 #[doc(hidden)]
 pub fn trust_roots_for_tests(pems: Vec<Vec<u8>>) {
@@ -168,9 +169,9 @@ fn mozilla_roots() -> impl Iterator<Item = reqwest::Certificate> {
 ///
 /// Empty is a valid answer and never an error: it means this build trusts
 /// the compiled-in roots alone. A store that cannot be read is logged and
-/// skipped rather than propagated, because the alternative -- refusing to
-/// build a client -- would take the whole server down over a directory the
-/// compiled-in roots make optional.
+/// skipped rather than propagated. Refusing to build a client instead would
+/// take the whole server down over a directory the compiled-in roots make
+/// optional.
 fn platform_roots() -> &'static [reqwest::Certificate] {
     static ROOTS: std::sync::LazyLock<Vec<reqwest::Certificate>> =
         std::sync::LazyLock::new(load_platform_roots);
@@ -178,16 +179,17 @@ fn platform_roots() -> &'static [reqwest::Certificate] {
 }
 
 /// Android keeps its system CAs as one PEM file per hashed subject, world
-/// readable, in two places: Conscrypt's APEX module, which is authoritative
-/// from Android 14 and is what the platform verifier itself consults, and the
-/// older `/system` copy, which is what earlier releases have. Both are read
-/// and the result deduplicated, because a device may have either or both and
-/// the union is the set the platform would have accepted.
+/// readable, in two places. One is Conscrypt's APEX module, which is
+/// authoritative from Android 14 and is what the platform verifier itself
+/// consults. The other is the older `/system` copy, which is what earlier
+/// releases have. Both are read and the result deduplicated, because a device
+/// may have either or both, and the union is the set the platform would have
+/// accepted.
 ///
 /// **User-installed CAs are deliberately not read.** They live in
-/// `/data/misc/user/0/cacerts-added`, which an app cannot read, and an app
-/// does not trust them anyway unless its manifest opts in with a
-/// `networkSecurityConfig` -- Android's default has excluded them since API
+/// `/data/misc/user/0/cacerts-added`, which an app cannot read. An app does
+/// not trust them anyway unless its manifest opts in with a
+/// `networkSecurityConfig`. Android's default has excluded them since API
 /// 24. Reading them here would make this server trust more than the platform
 /// it runs on, which is not what "what the platform trusts" should mean.
 #[cfg(target_os = "android")]
@@ -216,9 +218,10 @@ fn load_platform_roots() -> Vec<reqwest::Certificate> {
             // dump `keytool` writes, so a bundle parse would stop at the same
             // one certificate a single parse takes.
             match reqwest::Certificate::from_pem(&pem) {
-                // Deduplicated on the file's bytes rather than the parsed
-                // certificate, which is opaque: the two directories hold the
-                // same file under the same hashed name where they overlap.
+                // This deduplicates on the file's bytes rather than the
+                // parsed certificate, which is opaque. Where the two
+                // directories overlap, they hold the same file under the same
+                // hashed name.
                 Ok(cert) if seen.insert(pem) => roots.push(cert),
                 Ok(_) => {}
                 Err(e) => tracing::debug!("skipping {}: {e}", path.display()),
@@ -250,8 +253,8 @@ fn load_platform_roots() -> Vec<reqwest::Certificate> {
 mod tests {
     /// That the compiled-in set is a real root program and not an empty or
     /// stubbed one. With `tls_certs_only` an empty set trusts nothing at all,
-    /// so every HTTPS request in the process would fail -- a way for this to
-    /// go wrong that no compiler check catches. Mozilla's program has held
+    /// so every HTTPS request in the process would fail. No compiler check
+    /// catches that. Mozilla's program has held
     /// between 130 and 160 roots for years.
     #[test]
     fn the_compiled_in_roots_are_a_full_root_program() {
@@ -260,9 +263,9 @@ mod tests {
     }
 
     /// That reading the platform store is never fatal and never a panic. It
-    /// is allowed to find nothing -- a container with no `/etc/ssl`, an
-    /// Android image with neither cacerts directory -- and the compiled-in
-    /// roots carry the process in that case.
+    /// is allowed to find nothing (a container with no `/etc/ssl`, an
+    /// Android image with neither cacerts directory). The compiled-in roots
+    /// carry the process in that case.
     #[test]
     fn the_platform_store_is_optional() {
         let _ = super::platform_roots();
