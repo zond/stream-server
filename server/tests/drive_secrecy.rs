@@ -1,13 +1,13 @@
 // What the log files may not contain about a Google Drive pairing.
 //
-// The refresh token is the longest-lived secret this device holds: it does
-// not expire on its own and it reaches every file the account has picked
+// The refresh token is the longest-lived secret this device holds. It does
+// not expire on its own, and it reaches every file the account has picked
 // through this OAuth client. The process keeps the last ten launches'
-// logs, so a token written to one at a level that is always on is that
-// credential filed on the device -- and the file id is written *on
-// purpose*, because it names content and is the cache key already.
+// logs. So a token written to one at a level that is always on is that
+// credential filed on the device. The file id is written *on purpose*,
+// because it names content and is the cache key already.
 //
-// A binary of its own for the same reason `log_redaction.rs` is one:
+// It is a binary of its own for the same reason `log_redaction.rs` is one.
 // `init_logging` installs the process's subscriber once, and a second
 // logging test in the same binary would write into whichever tempdir won
 // the race.
@@ -32,9 +32,9 @@ fn log_text(config_dir: &std::path::Path) -> anyhow::Result<String> {
     Ok(all)
 }
 
-/// A pairing service that refuses every grant -- and echoes it, which is
-/// what a naive one would do and what makes this test worth having: if any
-/// of that body reached a log line or an error, the search below finds it.
+/// A pairing service that refuses every grant, and echoes it. That is what
+/// a naive one would do, and what makes this test worth having. If any of
+/// that body reached a log line or an error, the search below finds it.
 fn refusing_service() -> anyhow::Result<SocketAddr> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?;
@@ -75,8 +75,8 @@ fn answer(mut stream: TcpStream) {
     let _ = stream.flush();
 }
 
-/// The grant reaches no log line -- not from the open, not
-/// from the refresh that failed, and not from the service's own body.
+/// The grant reaches no log line: not from the open, not from the refresh
+/// that failed, and not from the service's own body.
 #[test]
 fn a_drive_grant_never_reaches_the_log() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -99,8 +99,8 @@ fn a_drive_grant_never_reaches_the_log() -> anyhow::Result<()> {
     let base = format!("http://{}", handle.http_addr());
     let client = reqwest::blocking::Client::new();
 
-    // The open, which fails at the refresh -- the loudest path there is,
-    // because it logs and it answers.
+    // The open, which fails at the refresh. It is the loudest path there
+    // is, because it logs and it answers.
     let error = handle
         .open_drive_file(FILE_ID, REFRESH_TOKEN, Some("A Film.mkv".to_string()))?
         .expect_err("the service refuses the grant");
@@ -109,8 +109,8 @@ fn a_drive_grant_never_reaches_the_log() -> anyhow::Result<()> {
     assert!(!answered.contains(REFRESH_TOKEN), "{answered}");
 
     // And a request for a route nothing serves, whose whole path and query
-    // are logged at ERROR: a build that ever put the grant in a URL would
-    // be caught here even if the route above never logged a thing.
+    // are logged at ERROR. A build that ever put the grant in a URL would
+    // be caught here, even if the route above never logged a thing.
     let response = client
         .get(format!("{base}/no-such-route?refreshToken={REFRESH_TOKEN}"))
         .send()?;
@@ -122,7 +122,7 @@ fn a_drive_grant_never_reaches_the_log() -> anyhow::Result<()> {
     let text = log_text(&config_dir)?;
     assert!(!text.is_empty(), "the test wrote no log at all");
     // The one line this asserts the *presence* of would be the file id,
-    // which is deliberately logged -- so the search is for the grant, and
+    // which is deliberately logged. So the search is for the grant, and
     // the unhandled-request line above is the proof the search had
     // something to find.
     assert!(

@@ -1,10 +1,10 @@
 //! **The container sniff in `resolve`** (`docs/design/media-pipeline.md`
-//! §2.9): a torrent file, a `/proxy` link or a file on this device whose
+//! §2.9). A torrent file, a `/proxy` link or a file on this device whose
 //! first bytes are a container's resolves to the member an archive URL
-//! would have named -- with no `/create` and no `torrent:` form -- and a
-//! film resolves as itself, saying whether its head was looked at.
+//! would have named, with no `/create` and no `torrent:` form. A film
+//! resolves as itself, saying whether its head was looked at.
 //!
-//! Every server here is offline and on ephemeral ports; the one origin is
+//! Every server here is offline and on ephemeral ports. The one origin is
 //! a loopback fake of this file's own. A [`MediaReader`] blocks its caller
 //! and refuses to be called from inside a runtime, so the tests read from
 //! threads of their own.
@@ -36,7 +36,7 @@ const BOUND: Duration = Duration::from_secs(120);
 /// The fixtures' piece length (`real_torrent`'s).
 const PIECE: usize = 16 * 1024;
 
-/// A film: an EBML head, as a Matroska file starts, then a pattern that
+/// A film: an EBML head, as a Matroska file starts, and then a pattern that
 /// says where each byte came from.
 fn film(len: usize) -> Vec<u8> {
     let mut bytes: Vec<u8> = (0..len)
@@ -46,7 +46,7 @@ fn film(len: usize) -> Vec<u8> {
     bytes
 }
 
-/// The member every archive here holds, and what to pick it by: the
+/// The member every archive here holds, and what to pick it by. It is the
 /// largest file, as `/create` with no `fileIdx` picks.
 const MEMBER: &str = "film.mkv";
 
@@ -106,8 +106,8 @@ fn plain_tar(members: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 /// A self-extracting ZIP: a Windows executable's stub, then one stored
-/// member, every offset counted from the start of the file (as `zip -A`
-/// leaves one), written field by field.
+/// member, with every offset counted from the start of the file (as
+/// `zip -A` leaves one). It is written field by field.
 fn self_extracting_zip(name: &str, data: &[u8]) -> Vec<u8> {
     let mut out = b"MZ".to_vec();
     out.resize(4096, 0x90);
@@ -154,8 +154,9 @@ fn self_extracting_zip(name: &str, data: &[u8]) -> Vec<u8> {
 // --- A server with a torrent ------------------------------------------------
 
 /// Seed the pieces of `torrent` whose index `keep` accepts, from the files
-/// under `content` in the order the metainfo lists them. After the server
-/// has started: the launch sweep deletes a piece directory seeded before.
+/// under `content` in the order the metainfo lists them. Call it after the
+/// server has started. The launch sweep deletes a piece directory seeded
+/// before.
 fn seed(cache_root: &Path, torrent: &[u8], content: &Path, keep: impl Fn(usize) -> bool) {
     let meta = librqbit::torrent_from_bytes(torrent).expect("parse the torrent back");
     let info_hash = meta.info_hash.as_string();
@@ -189,8 +190,8 @@ fn seed(cache_root: &Path, torrent: &[u8], content: &Path, keep: impl Fn(usize) 
     }
 }
 
-/// A server with one torrent of `files` added and checked, the pieces
-/// `keep` accepts seeded -- and kept (`fixture_pins`): the claims here are
+/// A server with one torrent of `files` added and checked, and the pieces
+/// `keep` accepts seeded and kept (`fixture_pins`). The claims here are
 /// about bytes, not about retention.
 struct TorrentFixture {
     handle: stream_server::ServerHandle,
@@ -209,8 +210,8 @@ impl TorrentFixture {
         )
     }
 
-    /// [`Self::start`] under `config`'s pin set: a pin test's, which must
-    /// keep the empty record (`fixture_pins`).
+    /// [`Self::start`] under `config`'s pin set. That is a pin test's,
+    /// which must keep the empty record (`fixture_pins`).
     fn start_in(
         config: ServerConfig,
         files: &[(&str, Vec<u8>)],
@@ -274,8 +275,8 @@ impl TorrentFixture {
             .unwrap_or_else(|| panic!("no file {name} in {:?}", self.files))
     }
 
-    /// The file's plain streaming URL, as stremio-core builds it: no
-    /// archive prefix, no `torrent:` form.
+    /// The file's plain streaming URL, as stremio-core builds it, with no
+    /// archive prefix and no `torrent:` form.
     fn register(&self, name: &str) -> anyhow::Result<MediaId> {
         self.handle
             .register(MediaSpec::StreamingUrl(url::Url::parse(&format!(
@@ -368,14 +369,14 @@ const REFRESH_TOKEN: &str = "refresh-tok-sniff-41d2";
 const FILE_ID: &str = "1SniffFixtureFile";
 
 /// One loopback listener standing in for a CDN, Google Drive and the
-/// pairing service: fixed bodies by path, by range, with a validator;
-/// `/refresh` mints a Drive token, and `/drive/v3/files/{FILE_ID}` is the
-/// body filed under `"drive"`.
+/// pairing service. It serves fixed bodies by path, by range, with a
+/// validator. `/refresh` mints a Drive token, and
+/// `/drive/v3/files/{FILE_ID}` is the body filed under `"drive"`.
 struct Origin {
     addr: SocketAddr,
-    /// Set by [`Origin::kill`]: every connection after it is dropped.
+    /// Set by [`Origin::kill`]. Every connection after it is dropped.
     dead: Arc<std::sync::atomic::AtomicBool>,
-    /// Set by [`Origin::revoke`]: `/refresh` answers `pairAgain` from then
+    /// Set by [`Origin::revoke`]. `/refresh` answers `pairAgain` from then
     /// on.
     revoked: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -405,7 +406,7 @@ impl Origin {
         })
     }
 
-    /// The Drive grant is gone: every refresh answers `pairAgain`.
+    /// The Drive grant is gone. Every refresh answers `pairAgain`.
     fn revoke(&self) {
         self.revoked
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -447,7 +448,7 @@ fn serve(
     let path = request_line.split_whitespace().nth(1).unwrap_or("");
     if path.starts_with("/refresh") {
         // Sixty seconds is the credential's renew margin, so this token is
-        // renewed at every request: a revocation is met at the next read.
+        // renewed at every request. A revocation is met at the next read.
         let (status, body): (&str, &[u8]) = match revoked.load(std::sync::atomic::Ordering::SeqCst)
         {
             true => ("401 Unauthorized", b"{\"pairAgain\":true}"),
@@ -549,10 +550,10 @@ fn local_id(
 // --- The tests --------------------------------------------------------------
 
 /// **A torrent's ZIP, 7z, TAR and disc image each resolve to their member
-/// by their first bytes**, registered by the plain streaming URL: the
-/// member's name and length, read by id, and the same bytes the archive
-/// route's `torrent:` form serves. Each is named `.bin`, so nothing but
-/// the content can have said what it is.
+/// by their first bytes**, registered by the plain streaming URL. Each
+/// answers the member's name and length, read by id, and the same bytes
+/// the archive route's `torrent:` form serves. Each is named `.bin`, so
+/// nothing but the content can have said what it is.
 #[test]
 fn a_torrent_file_resolves_to_its_member_by_its_head() -> anyhow::Result<()> {
     let member = member_bytes();
@@ -614,9 +615,8 @@ fn a_torrent_rar_resolves_to_its_member_by_its_head() -> anyhow::Result<()> {
 }
 
 /// **A multi-volume RAR in a torrent resolves by the head of its first
-/// volume, with every volume**: the siblings found by the naming rules, as
-/// the `torrent:` form finds them, and a read by id crossing every
-/// boundary.
+/// volume, with every volume.** The naming rules find the siblings, as the
+/// `torrent:` form finds them, and a read by id crosses every boundary.
 #[cfg(feature = "rar")]
 #[test]
 fn a_rar_set_in_a_torrent_resolves_by_its_first_volume_with_all_of_them() -> anyhow::Result<()> {
@@ -653,9 +653,10 @@ fn a_film_resolves_as_itself_sniffed() -> anyhow::Result<()> {
 }
 
 /// **A torrent whose first piece is not here resolves as the plain file,
-/// unsniffed, within the bound** -- offline, nothing will ever bring it,
-/// and the sniff must not turn a playable file into a wait. A ZIP's bytes
-/// in fact, so a sniff that did read it would answer the member instead.
+/// unsniffed, within the bound.** Offline, nothing will ever bring it, and
+/// the sniff must not turn a playable file into a wait. The file is in
+/// fact a ZIP's bytes, so a sniff that did read it would answer the member
+/// instead.
 #[test]
 fn a_torrent_whose_head_is_missing_resolves_unsniffed_within_the_bound() -> anyhow::Result<()> {
     const SNIFF_BOUND: Duration = Duration::from_millis(300);
@@ -707,7 +708,7 @@ fn a_proxy_link_to_a_rar_resolves_to_its_member() -> anyhow::Result<()> {
 }
 
 /// **A file on this device that is a ZIP resolves to its member**, and so
-/// does a self-extracting one, whose head is an executable's: the ZIP
+/// does a self-extracting one, whose head is an executable's. The ZIP
 /// reader finds its end record at the tail.
 #[test]
 fn a_local_zip_resolves_to_its_member() -> anyhow::Result<()> {
@@ -743,7 +744,7 @@ fn a_local_zip_resolves_to_its_member() -> anyhow::Result<()> {
 }
 
 /// **A container's signature that no translator indexes is the
-/// translator's refusal**, never a film: a ZIP's local header with no end
+/// translator's refusal**, never a film. A ZIP's local header with no end
 /// record behind it is `malformed`, with the ZIP reader's sentence.
 #[test]
 fn a_signature_nothing_indexes_is_refused_as_malformed() -> anyhow::Result<()> {
@@ -763,10 +764,9 @@ fn a_signature_nothing_indexes_is_refused_as_malformed() -> anyhow::Result<()> {
 }
 
 /// **A Google Drive file that is a ZIP resolves to its member**, read
-/// under the grant through the proxy cache, as a link's does; and once
-/// the grant is found dead, the next resolve asks for it again, as the
-/// plain file's would, rather than answering the member it can no longer
-/// read.
+/// under the grant through the proxy cache, as a link's does. Once the
+/// grant is found dead, the next resolve asks for it again, as the plain
+/// file's would. It does not answer the member it can no longer read.
 #[test]
 fn a_drive_zip_resolves_to_its_member() -> anyhow::Result<()> {
     let member = member_bytes();
@@ -797,7 +797,7 @@ fn a_drive_zip_resolves_to_its_member() -> anyhow::Result<()> {
 }
 
 /// **A finished download of a link to a ZIP resolves to its member with
-/// the origin gone**: the sniff reads the download off the disk, as the
+/// the origin gone.** The sniff reads the download off the disk, as the
 /// file itself is read.
 #[test]
 fn a_downloaded_zip_resolves_to_its_member_with_the_origin_gone() -> anyhow::Result<()> {
@@ -830,7 +830,7 @@ fn a_downloaded_zip_resolves_to_its_member_with_the_origin_gone() -> anyhow::Res
     assert_member(&resolved, MEMBER, member.len());
     assert_eq!(read_by_id(&handle, &id)?, member);
 
-    // Unpinned, its bytes are no longer kept: the next resolve goes to
+    // Unpinned, its bytes are no longer kept. The next resolve goes to
     // the origin, which is gone, rather than answering the member.
     assert!(handle.unpin(&id, false)?.unpinned);
     assert!(
@@ -843,8 +843,8 @@ fn a_downloaded_zip_resolves_to_its_member_with_the_origin_gone() -> anyhow::Res
 }
 
 /// **A torrent file found to be a set's first volume pins every volume,
-/// and unpins every volume** -- by the plain URL with an index, which an
-/// unpin otherwise answers without a resolve: once the id has resolved to
+/// and unpins every volume**, by the plain URL with an index. An unpin
+/// otherwise answers that without a resolve. Once the id has resolved to
 /// the member, its pin was the set's.
 #[cfg(feature = "rar")]
 #[test]
@@ -890,9 +890,9 @@ fn a_sniffed_rar_set_pins_and_unpins_every_volume() -> anyhow::Result<()> {
 }
 
 /// **A sniffed container's session let go is made again** from the file
-/// it was found in: there is no create to run and no `torrent:` key, so
-/// the id keeps the file. Here the archive map's cap lets it go -- as many
-/// newer containers resolved, none of them read.
+/// it was found in. There is no create to run and no `torrent:` key, so
+/// the id keeps the file. Here the archive map's cap lets it go, with as
+/// many newer containers resolved, none of them read.
 #[test]
 fn a_sniffed_session_let_go_is_made_again() -> anyhow::Result<()> {
     let member = member_bytes();
@@ -912,8 +912,8 @@ fn a_sniffed_session_let_go_is_made_again() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// **The same for a finished download of a Drive file**, with Drive gone:
-/// the sniff reads the download off the disk, and asks for no grant.
+/// **The same for a finished download of a Drive file**, with Drive gone.
+/// The sniff reads the download off the disk, and asks for no grant.
 #[test]
 fn a_downloaded_drive_zip_resolves_to_its_member_with_drive_gone() -> anyhow::Result<()> {
     let member = member_bytes();

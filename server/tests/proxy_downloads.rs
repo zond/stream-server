@@ -1,8 +1,9 @@
-//! **A download of what is not a torrent**, end to end: an addon URL pinned
-//! through `ServerHandle::pin_proxy_download`, filled from a loopback origin into the proxy
-//! cache, played back from the disk with the origin asked for nothing, kept
-//! across a restart that names it and swept by one that does not, and
-//! deleted on request. What `docs/design/generic-downloads.md` describes, measured.
+//! **A download of what is not a torrent**, end to end. An addon URL is
+//! pinned through `ServerHandle::pin_proxy_download` and filled from a
+//! loopback origin into the proxy cache. It is played back from the disk
+//! with the origin asked for nothing. It is kept across a restart that
+//! names it, swept by one that does not, and deleted on request. This is
+//! what `docs/design/generic-downloads.md` describes, measured.
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -41,8 +42,8 @@ const LONG_FILE: Generation = Generation {
     byte: byte_at,
 };
 
-/// What [`LONG_FILE`] is replaced by at the origin: another identity,
-/// another length, other bytes.
+/// What [`LONG_FILE`] is replaced by at the origin. It has another
+/// identity, another length and other bytes.
 const REPLACED_FILE: Generation = Generation {
     etag: "\"the-replacement\"",
     length: 2 * 256 * 1024 + 777,
@@ -67,8 +68,8 @@ impl Request {
 }
 
 /// A loopback origin that serves `ORIGIN_LENGTH` deterministic bytes by
-/// range (or whole, when `ranges` is off -- an origin that will not range)
-/// and records every request it was asked.
+/// range (or whole, when `ranges` is off: an origin that will not range).
+/// It records every request it was asked.
 struct Origin {
     addr: SocketAddr,
     requests: std::sync::mpsc::Receiver<Request>,
@@ -79,16 +80,16 @@ impl Origin {
         Self::start_answering(ranges, false)
     }
 
-    /// An origin that answers its first request whole and every later one
-    /// with a `206` that carries no bytes -- a range that ends before it
-    /// begins, as a broken CDN answers.
+    /// An origin that answers its first request whole, and every later one
+    /// with a `206` that carries no bytes. That is a range that ends before
+    /// it begins, as a broken CDN answers.
     fn start_stingy() -> anyhow::Result<Self> {
         Self::start_answering(true, true)
     }
 
     /// An origin that serves [`LONG_FILE`] for its first `after` requests
-    /// and [`REPLACED_FILE`] from then on -- by range, or not at all when
-    /// `ranges_after` is off.
+    /// and [`REPLACED_FILE`] from then on. It serves that by range, or not
+    /// at all when `ranges_after` is off.
     fn start_changing(after: usize, ranges_after: bool) -> anyhow::Result<Self> {
         Self::start_with(true, false, Some((after, ranges_after)))
     }
@@ -183,9 +184,10 @@ fn answer(request: &Request, socket: &mut TcpStream, ranges: bool) {
     answer_as(request, socket, &THE_FILE, ranges)
 }
 
-/// `file`, by range when `ranges` is on: a `206` of the span asked for, a
-/// `416` for a span past its end, and the whole of it (`200`) for a request
-/// with no range or an `If-Range` that names another version.
+/// `file`, by range when `ranges` is on. It answers a `206` of the span
+/// asked for, and a `416` for a span past its end. It answers the whole of
+/// it (`200`) for a request with no range or an `If-Range` that names
+/// another version.
 fn answer_as(request: &Request, socket: &mut TcpStream, file: &Generation, ranges: bool) {
     let Generation { etag, length, byte } = *file;
     let current = request
@@ -298,8 +300,8 @@ impl Fixture {
             .join(".proxy")
     }
 
-    /// A pin of `url`, as the app asks for one; the row as JSON, which is
-    /// how it crosses FFI.
+    /// A pin of `url`, as the app asks for one. It answers the row as JSON,
+    /// which is how it crosses FFI.
     fn pin_url(&self, url: &str) -> anyhow::Result<serde_json::Value> {
         let row = self
             .handle
@@ -348,9 +350,10 @@ fn key_dir_exists(fixture: &Fixture, key: &str) -> bool {
     fixture.proxy_root().join(key).is_dir()
 }
 
-/// The whole life of a URL download: pinned, filled from the origin by
-/// range, listed as complete with the bytes counted, played back off the
-/// disk with the origin asked for nothing, and deleted on request.
+/// The whole life of a URL download. It is pinned, filled from the origin
+/// by range, and listed as complete with the bytes counted. It is played
+/// back off the disk with the origin asked for nothing, and deleted on
+/// request.
 #[test]
 fn a_url_download_is_filled_played_from_disk_and_deleted() -> anyhow::Result<()> {
     let origin = Origin::start(true)?;
@@ -390,7 +393,7 @@ fn a_url_download_is_filled_played_from_disk_and_deleted() -> anyhow::Result<()>
     assert!(!asked.is_empty(), "the origin was asked at least once");
 
     // Playback: the /proxy URL of the same stream, a player's ranged read,
-    // served from the disk -- the origin hears nothing.
+    // served from the disk. The origin hears nothing.
     let play = done["playUrl"].as_str().expect("a play URL").to_string();
     let response = reqwest::blocking::Client::new()
         .get(&play)
@@ -409,7 +412,7 @@ fn a_url_download_is_filled_played_from_disk_and_deleted() -> anyhow::Result<()>
     );
     assert!(key_dir_exists(&fixture, &key));
 
-    // Deleted on request: the pin goes and so do the bytes.
+    // Deleted on request. The pin goes, and so do the bytes.
     let outcome = fixture.handle.unpin_proxy_download(&key, true)?;
     assert!(outcome.unpinned);
     assert!(outcome.deleted_files);
@@ -426,7 +429,7 @@ fn a_url_download_is_filled_played_from_disk_and_deleted() -> anyhow::Result<()>
 }
 
 /// A restart keeps what the embedder's record names and sweeps what it
-/// does not; the kept download lists as complete and plays without the
+/// does not. The kept download lists as complete and plays without the
 /// origin ever being asked again.
 #[test]
 fn a_pinned_download_survives_a_restart_and_an_unpinned_one_is_swept() -> anyhow::Result<()> {
@@ -492,8 +495,8 @@ fn a_pinned_download_survives_a_restart_and_an_unpinned_one_is_swept() -> anyhow
     );
 
     // What the app does at every launch for what it kept: pin it again.
-    // A whole entry has nothing to fetch, so the origin is not even probed
-    // -- which is what makes the launch work with no network.
+    // A whole entry has nothing to fetch, so the origin is not even probed.
+    // That is what makes the launch work with no network.
     let again = fixture.pin_url(&origin.url("/kept.mp4"))?;
     assert_eq!(again["infoHash"], kept);
     assert_eq!(again["complete"], true, "{again}");
@@ -505,7 +508,7 @@ fn a_pinned_download_survives_a_restart_and_an_unpinned_one_is_swept() -> anyhow
     Ok(())
 }
 
-/// The piece store's silence rule, on this side: a boot that names no proxy
+/// The piece store's silence rule, on this side. A boot that names no proxy
 /// pin record at all sweeps nothing.
 #[test]
 fn a_boot_that_names_no_record_sweeps_nothing() -> anyhow::Result<()> {
@@ -534,8 +537,8 @@ fn a_boot_that_names_no_record_sweeps_nothing() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// An origin that answers a ranged request whole cannot be resumed and so
-/// cannot be a download: refused at pin time, and nothing is fetched.
+/// An origin that answers a ranged request whole cannot be resumed, and so
+/// cannot be a download. It is refused at pin time, and nothing is fetched.
 #[test]
 fn an_origin_that_will_not_range_is_refused() -> anyhow::Result<()> {
     let origin = Origin::start(false)?;
@@ -564,14 +567,14 @@ fn an_origin_that_will_not_range_is_refused() -> anyhow::Result<()> {
 }
 
 /// **A file that changed at the origin mid-download is downloaded again,
-/// from the start**, as the new file: the filler holds the first stride of
-/// the old one when the origin starts answering for another, the read that
-/// finds it fails, and the filler opens the source again -- which retires
-/// the old generation -- and fills the new one. It does not ask the old
-/// question every fifteen seconds for as long as the pin stands.
+/// from the start**, as the new file. The filler holds the first stride of
+/// the old one when the origin starts answering for another. The read that
+/// finds it fails. The filler opens the source again, which retires the
+/// old generation, and fills the new one. It does not ask the old question
+/// every fifteen seconds for as long as the pin stands.
 #[test]
 fn a_file_changed_at_the_origin_is_downloaded_again_from_the_start() -> anyhow::Result<()> {
-    // The probe and the first stride see the long file; the second stride
+    // The probe and the first stride see the long file. The second stride
     // finds the replacement.
     let origin = Origin::start_changing(2, true)?;
     let fixture = Fixture::start(Some(Vec::new()))?;
@@ -603,7 +606,7 @@ fn a_file_changed_at_the_origin_is_downloaded_again_from_the_start() -> anyhow::
 }
 
 /// A file that changed into one the origin will not range is refused as
-/// it would have been at pin time: the filler stops, and the row says why
+/// it would have been at pin time. The filler stops, and the row says why
 /// rather than sitting at `buffering`.
 #[test]
 fn a_file_changed_into_one_that_will_not_range_stops_the_download_with_a_reason()
@@ -705,9 +708,9 @@ fn a_request_that_names_no_source_is_refused() -> anyhow::Result<()> {
 
 /// An unpin names a key, and only a key: 64 lowercase hex digits, the
 /// spelling the cache writes. A key is validated before any delete, because
-/// `..` joins to a path whose parent is the proxy root; every other
-/// spelling is refused as well, and nothing outside the key directory --
-/// nor the pinned download beside it -- is touched.
+/// `..` joins to a path whose parent is the proxy root. Every other
+/// spelling is refused as well. Nothing outside the key directory is
+/// touched, and neither is the pinned download beside it.
 #[test]
 fn an_unpin_that_names_no_key_touches_nothing() -> anyhow::Result<()> {
     let origin = Origin::start(true)?;
@@ -762,9 +765,9 @@ fn an_unpin_that_names_no_key_touches_nothing() -> anyhow::Result<()> {
 }
 
 /// An origin that answers a fill with no bytes is asked again after the
-/// filler's retry wait, not at once: a stride that reads nothing is a
-/// failure, and `pos += 0` in a loop with no sleep is a busy loop against
-/// the origin for as long as the pin stands.
+/// filler's retry wait, not at once. A stride that reads nothing is a
+/// failure. `pos += 0` in a loop with no sleep is a busy loop against the
+/// origin for as long as the pin stands.
 #[test]
 fn an_origin_that_answers_nothing_is_not_asked_in_a_loop() -> anyhow::Result<()> {
     let origin = Origin::start_stingy()?;
@@ -805,10 +808,10 @@ fn wait_for_light(
 
 /// **A download of what is not a torrent lights the down half of the
 /// activity light, and a player's own reads through the proxy do not.**
-/// An addon link has no peers and no torrent counters; what its filler
+/// An addon link has no peers and no torrent counters. What its filler
 /// brings in from the origin is what the light counts. What a player
 /// fetches through `/proxy` is the viewer's own, and a poster or a
-/// subtitle is not a download either, so none of that is in the count.
+/// subtitle is not a download either. So none of that is in the count.
 #[test]
 fn a_url_download_lights_the_way_down_and_a_players_read_does_not() -> anyhow::Result<()> {
     let origin = Origin::start(true)?;
@@ -844,7 +847,7 @@ fn a_url_download_lights_the_way_down_and_a_players_read_does_not() -> anyhow::R
         "the count is what the filler fetched, about the file once: {whole}"
     );
 
-    // Finished, it fetches nothing more, and the light goes out.
+    // Once finished, it fetches nothing more, and the light goes out.
     wait_for_light(&fixture.handle, "the download finishing", |reading| {
         !reading.active
     })?;
@@ -872,8 +875,8 @@ fn files_under(fixture: &Fixture, key: &str) -> usize {
 
 /// **A clear takes every proxied entry no download pins, and keeps the
 /// download.** A link a player streamed to its end is the entity played
-/// last, so the gentle clean keeps its chunks -- it is somebody's window --
-/// and a clear takes them; a kept download of another link keeps every
+/// last. So the gentle clean keeps its chunks (it is somebody's window),
+/// and a clear takes them. A kept download of another link keeps every
 /// chunk and stays complete. The report counts what left the disk.
 #[test]
 fn a_clear_takes_every_proxied_entry_but_a_kept_download() -> anyhow::Result<()> {

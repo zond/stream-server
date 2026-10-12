@@ -1,39 +1,39 @@
 //! RAR archives built by hand, for tests that have no `rar` binary.
 //!
-//! `unrar-rs` deliberately exposes no writer and the RARLAB `rar` tool is
-//! not on a build machine, so every RAR this suite reads is assembled here
+//! `unrar-rs` deliberately exposes no writer, and the RARLAB `rar` tool is
+//! not on a build machine. So every RAR this suite reads is assembled here
 //! from the format's own technote: signature, main header, one file header
 //! plus data area per member (per *part* of a member, in a split set), end
-//! header. Both generations are built -- RAR5, which is what `rar` has
-//! written since 2013, and RAR4, which is what most of the scene archives
-//! still in circulation are -- and both single volumes and sets.
+//! header. Both generations are built, and both single volumes and sets.
+//! RAR5 is what `rar` has written since 2013. RAR4 is what most of the
+//! scene archives still in circulation are.
 //!
-//! Shared by `#[path]` between the translator's unit tests and the
-//! integration tests, which is why nothing here is `#[cfg(test)]` and why
-//! the unused-function lint is off: each includer uses the part of it that
-//! its tests are about.
+//! This file is shared by `#[path]` between the translator's unit tests and
+//! the integration tests. That is why nothing here is `#[cfg(test)]`, and
+//! why the unused-function lint is off: each includer uses the part of it
+//! that its tests are about.
 //!
-//! Where `unrar` is installed the translator's tests hand these archives to
-//! it (`unrar t`), so what is asserted about them is asserted about archives
-//! a real reader accepts, checksums and all.
+//! Where `unrar` is installed, the translator's tests hand these archives
+//! to it (`unrar t`). So what is asserted about them is asserted about
+//! archives a real reader accepts, checksums and all.
 
 #![allow(dead_code)]
 
-/// Deterministic, mildly incompressible bytes: a member a test can find in
-/// the archive by value, and one whose every 251-byte window differs from
-/// every other, so a range served from the wrong offset is caught.
+/// Deterministic, mildly incompressible bytes. A test can find the member
+/// in the archive by value. Its every 251-byte window differs from every
+/// other, so a range served from the wrong offset is caught.
 pub fn payload(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i.wrapping_mul(31) % 251) as u8).collect()
 }
 
 /// [`payload`] with the offset stamped into every kibibyte of it.
 ///
-/// For the multi-volume tests: a member spread over three volumes is three
-/// extents of three different files, and a byte served out of the wrong
-/// one is then a wrong *sentence* -- `[offset 000099328]` where
-/// `[offset 000199680]` was asked for -- rather than a subtle byte
-/// somebody has to decode a diff to see. Between the stamps the payload's
-/// own every-251-bytes-differs property catches an offset that is wrong by
+/// For the multi-volume tests. A member spread over three volumes is three
+/// extents of three different files. A byte served out of the wrong one is
+/// then a wrong *sentence* (`[offset 000099328]` where
+/// `[offset 000199680]` was asked for), rather than a subtle byte somebody
+/// has to decode a diff to see. Between the stamps, the payload's own
+/// every-251-bytes-differs property catches an offset that is wrong by
 /// less than a kibibyte.
 pub fn signposted(len: usize) -> Vec<u8> {
     let mut bytes = payload(len);
@@ -47,7 +47,8 @@ pub fn signposted(len: usize) -> Vec<u8> {
 }
 
 /// Standard reflected CRC-32 (ISO-HDLC / zlib), as both RAR generations
-/// store for headers and data. Table-less so the fixture pulls in nothing.
+/// store for headers and data. It is table-less so the fixture pulls in
+/// nothing.
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &b in data {
@@ -60,7 +61,7 @@ pub fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-/// How a member's bytes were packed. Only `Store` is served; `Normal` is
+/// How a member's bytes were packed. Only `Store` is served. `Normal` is
 /// what `rar` uses by default and what a test about refusal asks for.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Method {
@@ -84,15 +85,15 @@ pub struct Rar5Options {
     pub method: Method,
     pub hash: Hash,
     /// The archive-level solid flag in the main header, plus the per-member
-    /// solid bit on every member after the first -- both, as `rar -s` sets
-    /// them.
+    /// solid bit on every member after the first. Both are set, as `rar -s`
+    /// sets them.
     pub solid: bool,
     /// The per-member solid bit alone, on every member after the first,
-    /// with the archive-level flag clear: not a shape `rar` writes, but a
-    /// shape the format allows.
+    /// with the archive-level flag clear. `rar` does not write this shape,
+    /// but the format allows it.
     pub solid_members: bool,
-    /// Every member carries a file-encryption record and its data area is
-    /// the AES-padded length (`rar -p`): the headers are readable, the
+    /// Every member carries a file-encryption record, and its data area is
+    /// the AES-padded length (`rar -p`). The headers are readable, and the
     /// bytes are ciphertext.
     pub encrypted_members: bool,
 }
@@ -203,9 +204,9 @@ fn rar5_extra_record(record_type: u64, data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The main header of volume `volume` -- `None` for an archive that is not
+/// The main header of volume `volume`, `None` for an archive that is not
 /// a set. A set's first volume carries the volume flag and no number, as
-/// `rar` writes it; every later one states its number.
+/// `rar` writes it. Every later one states its number.
 fn rar5_main_header(volume: Option<u64>, solid: bool) -> Vec<u8> {
     let mut flags = 0;
     let mut body = Vec::new();
@@ -225,18 +226,19 @@ fn rar5_main_header(volume: Option<u64>, solid: bool) -> Vec<u8> {
     rar5_header(RAR5_MAIN, 0, None, &type_body, &[])
 }
 
-/// The end header of a volume, saying whether another follows. Public so
-/// a test can rewrite a volume's end: the header is the last thing in it.
+/// The end header of a volume, saying whether another follows. It is
+/// public so a test can rewrite a volume's end, since the header is the
+/// last thing in it.
 pub fn rar5_end_header(more_volumes: bool) -> Vec<u8> {
     let flags = if more_volumes { RAR5_MORE_VOLUMES } else { 0 };
     rar5_header(RAR5_END, 0, None, &encode_vint(flags), &[])
 }
 
-/// One part of a member, as its file header: `part_len` bytes of data
+/// One part of a member, as its file header. `part_len` bytes of data
 /// follow it, out of a member `total_len` long. `crc` is what a real
-/// writer puts there: the CRC of this part's packed bytes while the member
-/// continues into the next volume, and of the whole member in its last
-/// part.
+/// writer puts there. It is the CRC of this part's packed bytes while the
+/// member continues into the next volume, and of the whole member in its
+/// last part.
 #[allow(clippy::too_many_arguments)]
 fn rar5_file_header(
     name: &str,
@@ -248,7 +250,7 @@ fn rar5_file_header(
     solid_member: bool,
     opts: &Rar5Options,
 ) -> Vec<u8> {
-    // A name ending in `/` is a directory entry: the flag says so, the
+    // A name ending in `/` is a directory entry. The flag says so, the
     // name loses the slash, and there is no data area.
     let directory = name.ends_with('/');
     let name = name.trim_end_matches('/');
@@ -280,7 +282,8 @@ fn rar5_file_header(
     let mut extra = Vec::new();
     if opts.encrypted_members {
         // Version 0 (AES-256), no password check, KDF count 2^15, a salt
-        // and an IV: the record `rar -p` writes, minus the check value.
+        // and an IV. That is the record `rar -p` writes, minus the check
+        // value.
         let mut record = encode_vint(0);
         record.extend_from_slice(&encode_vint(0));
         record.push(15);
@@ -289,8 +292,8 @@ fn rar5_file_header(
         extra.extend_from_slice(&rar5_extra_record(RAR5_EXTRA_FILE_ENCRYPTION, &record));
     }
     if opts.hash == Hash::Blake2 {
-        // Hash type 0 is BLAKE2sp; the digest is not checked by anything
-        // this suite drives, so it is a stand-in.
+        // Hash type 0 is BLAKE2sp. Nothing this suite drives checks the
+        // digest, so it is a stand-in.
         let mut record = encode_vint(0);
         record.extend_from_slice(&[0x42; 32]);
         extra.extend_from_slice(&rar5_extra_record(RAR5_EXTRA_FILE_HASH, &record));
@@ -341,8 +344,8 @@ pub fn rar5_stored(members: &[(&str, &[u8])]) -> Vec<u8> {
 
 /// A RAR5 set: `members`, stored, split into volumes of at most
 /// `data_per_volume` bytes of member data each, the way `rar -v` splits a
-/// film -- a member that does not fit continues in the next volume under
-/// a header of its own, and the volumes say so at both ends of the split.
+/// film. A member that does not fit continues in the next volume under a
+/// header of its own, and the volumes say so at both ends of the split.
 pub fn rar5_volumes(members: &[(&str, &[u8])], data_per_volume: usize) -> Vec<Vec<u8>> {
     assert!(data_per_volume > 0);
     let opts = Rar5Options::default();
@@ -394,7 +397,7 @@ pub fn rar5_volumes(members: &[(&str, &[u8])], data_per_volume: usize) -> Vec<Ve
     volumes
 }
 
-/// A RAR5 archive whose headers are encrypted (`rar -hp`): the encryption
+/// A RAR5 archive whose headers are encrypted (`rar -hp`). The encryption
 /// header is in the clear and everything after it is ciphertext, so no
 /// member can be named without the password.
 pub fn rar5_header_encrypted() -> Vec<u8> {
@@ -454,8 +457,8 @@ fn rar4_main_header(flags: u16) -> Vec<u8> {
     rar4_block(RAR4_MAIN, flags, &[0u8; 6])
 }
 
-/// One part of a member under a RAR4 file header; `crc` as for RAR5.
-/// `unpack_version` is 29 for everything `rar` 3.x and later wrote; an
+/// One part of a member under a RAR4 file header, with `crc` as for RAR5.
+/// `unpack_version` is 29 for everything `rar` 3.x and later wrote. An
 /// older one selects an older cipher for an encrypted member.
 #[allow(clippy::too_many_arguments)]
 fn rar4_file_header(
@@ -533,8 +536,8 @@ pub fn rar4_archive(members: &[(&str, &[u8])], method: Method, main_flags: u16) 
 }
 
 /// A RAR4 archive whose members are encrypted with the RAR 2.0 cipher
-/// (unpack version 20): encryption the format has that is not AES, and
-/// so not one whose bytes can be mapped by block.
+/// (unpack version 20). That is encryption the format has that is not AES,
+/// and so not one whose bytes can be mapped by block.
 pub fn rar4_legacy_encrypted(members: &[(&str, &[u8])]) -> Vec<u8> {
     let mut archive = RAR4_SIGNATURE.to_vec();
     archive.extend_from_slice(&rar4_main_header(0));
@@ -566,7 +569,7 @@ pub fn rar4_solid(members: &[(&str, &[u8])]) -> Vec<u8> {
     rar4_archive(members, Method::Normal, RAR4_SOLID)
 }
 
-/// A RAR4 archive whose headers are encrypted (`rar -hp`): the main header
+/// A RAR4 archive whose headers are encrypted (`rar -hp`). The main header
 /// says so and is the last thing readable.
 pub fn rar4_header_encrypted() -> Vec<u8> {
     let mut archive = RAR4_SIGNATURE.to_vec();
@@ -575,10 +578,10 @@ pub fn rar4_header_encrypted() -> Vec<u8> {
     archive
 }
 
-/// A RAR4 set, split as [`rar5_volumes`] splits, under either numbering:
-/// `new_numbering` for `.partN.rar` names (the main header says so), off
-/// for `.rar`, `.r00`, `.r01`. Every volume's end header states its number,
-/// as `rar` 3.x wrote them.
+/// A RAR4 set, split as [`rar5_volumes`] splits, under either numbering.
+/// `new_numbering` is on for `.partN.rar` names (the main header says so),
+/// and off for `.rar`, `.r00`, `.r01`. Every volume's end header states its
+/// number, as `rar` 3.x wrote them.
 pub fn rar4_volumes(
     members: &[(&str, &[u8])],
     data_per_volume: usize,
@@ -587,8 +590,8 @@ pub fn rar4_volumes(
     rar4_volumes_with(members, data_per_volume, new_numbering, true)
 }
 
-/// [`rar4_volumes`] without a volume number anywhere, which is what an
-/// old `.rar`/`.r00` set states: nothing but the split flags.
+/// [`rar4_volumes`] without a volume number anywhere. That is what an old
+/// `.rar`/`.r00` set states: nothing but the split flags.
 pub fn rar4_volumes_unnumbered(members: &[(&str, &[u8])], data_per_volume: usize) -> Vec<Vec<u8>> {
     rar4_volumes_with(members, data_per_volume, false, false)
 }
@@ -659,9 +662,9 @@ fn rar4_volumes_with(
     volumes
 }
 
-/// The file names a set of `count` volumes has under each naming rule, so
-/// a test writes the volumes where `unrar` -- and this server's own volume
-/// discovery -- will look for them.
+/// The file names a set of `count` volumes has under each naming rule. So
+/// a test writes the volumes where `unrar` (and this server's own volume
+/// discovery) will look for them.
 pub fn part_names(stem: &str, count: usize) -> Vec<String> {
     (1..=count).map(|n| format!("{stem}.part{n}.rar")).collect()
 }

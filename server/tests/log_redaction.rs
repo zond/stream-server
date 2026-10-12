@@ -1,13 +1,13 @@
 //! What the log files may not contain.
 //!
-//! `/proxy` takes the URL it fetches -- and the request headers it attaches
-//! -- from the caller, in the *path* as well as the query, and an addon's
-//! stream URL is where a debrid token or a signed CDN link lives. The
-//! process keeps the last ten launches' logs, so a URL written to one at a
-//! level that is always on is that credential filed on the device.
+//! `/proxy` takes the URL it fetches, and the request headers it attaches,
+//! from the caller, in the *path* as well as the query. An addon's stream
+//! URL is where a debrid token or a signed CDN link lives. The process
+//! keeps the last ten launches' logs. So a URL written to one at a level
+//! that is always on is that credential filed on the device.
 //!
-//! A binary of its own because `init_logging` installs the process's
-//! subscriber once: a second logging test in the same binary would write
+//! It is a binary of its own because `init_logging` installs the process's
+//! subscriber once. A second logging test in the same binary would write
 //! into whichever tempdir won the race.
 
 use std::io::Read;
@@ -34,8 +34,8 @@ fn log_text(config_dir: &std::path::Path) -> anyhow::Result<String> {
 }
 
 /// An origin that answers every request with a `302` back to itself,
-/// carrying the caller's token in the `Location` -- a redirect loop, which
-/// is what makes `/proxy` give up and say so.
+/// carrying the caller's token in the `Location`. That is a redirect loop,
+/// which is what makes `/proxy` give up and say so.
 fn looping_origin() -> std::net::SocketAddr {
     use std::io::{Read as _, Write as _};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -58,7 +58,7 @@ fn looping_origin() -> std::net::SocketAddr {
 }
 
 /// The proxied URL, the credentials beside it and the archive link never
-/// reach the log; what is written is the origin and the route.
+/// reach the log. What is written is the origin and the route.
 #[test]
 fn a_caller_supplied_url_is_logged_as_its_origin_only() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -97,8 +97,8 @@ fn a_caller_supplied_url_is_logged_as_its_origin_only() -> anyhow::Result<()> {
     let response = client.get(format!("{base}/proxy/?d={encoded}")).send()?;
     assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
 
-    // A redirect loop, which `/proxy` gives up on at WARN -- with the URL
-    // it gave up on, which is the caller's.
+    // A redirect loop, which `/proxy` gives up on at WARN, with the URL it
+    // gave up on. That URL is the caller's.
     let looping = looping_origin();
     let response = client
         .get(format!(
@@ -109,7 +109,7 @@ fn a_caller_supplied_url_is_logged_as_its_origin_only() -> anyhow::Result<()> {
     assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
 
     // A request nothing serves, which is logged at ERROR with everything
-    // about it: the query's key names, never its values.
+    // about it. That means the query's key names, never its values.
     let response = client
         .get(format!(
             "{base}/no-such-route?d={encoded}&h={}",
@@ -117,10 +117,10 @@ fn a_caller_supplied_url_is_logged_as_its_origin_only() -> anyhow::Result<()> {
         ))
         .send()?;
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
-    // And one whose *path* carries the target: `/proxy` is not mounted on
+    // And one whose *path* carries the target. `/proxy` is not mounted on
     // the LAN media listener (it serves `/cast/{token}` alone), so a request
-    // for it there is unhandled -- and that path is the Core spelling,
-    // target and `h=` headers included.
+    // for it there is unhandled. That path is the Core spelling, target and
+    // `h=` headers included.
     handle.update_settings(serde_json::json!({ "lanMediaEnabled": true }))?;
     let lan = handle
         .set_lan_media(true)?
@@ -134,9 +134,10 @@ fn a_caller_supplied_url_is_logged_as_its_origin_only() -> anyhow::Result<()> {
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
 
     // A cast token is a URL into this device for as long as it is
-    // published: requested on the LAN listener -- answered (the id's origin
-    // is dead, so a refusal), with a method the route does not take,
-    // unpublished -- it must reach no line, and neither may an unknown one.
+    // published. It is requested on the LAN listener: answered (the id's
+    // origin is dead, so a refusal), with a method the route does not take,
+    // and unpublished. It must reach no line, and neither may an unknown
+    // one.
     let id = handle.register(stream_server::MediaSpec::StreamingUrl(
         stream_server::Url::parse(&format!("{base}/proxy/?d={encoded}"))?,
     ))?;
@@ -207,8 +208,8 @@ fn a_caller_supplied_url_is_logged_as_its_origin_only() -> anyhow::Result<()> {
         reqwest::StatusCode::NOT_FOUND
     );
 
-    // An archive create, whose download is logged at INFO and whose failure
-    // at ERROR.
+    // An archive create. Its download is logged at INFO and its failure at
+    // ERROR.
     let response = client
         .post(format!("{base}/zip/create"))
         .json(&serde_json::json!({ "urls": [target] }))
@@ -241,8 +242,9 @@ fn a_caller_supplied_url_is_logged_as_its_origin_only() -> anyhow::Result<()> {
         "the rendition's run was logged at all: {logs}"
     );
     // Each publication ends with its totals: the rendition's two bodies
-    // and a HEAD, the plain one's two refused requests (the POST reached
-    // no handler). Read in the JSON file; the text one says the same.
+    // and a HEAD, and the plain one's two refused requests (the POST reached
+    // no handler). They are read in the JSON file. The text one says the
+    // same.
     let ends: Vec<&str> = logs
         .lines()
         .filter(|line| line.starts_with('{') && line.contains("cast_publication_end"))

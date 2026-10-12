@@ -2,19 +2,19 @@
 //! verifier out of this workspace's HTTPS.
 //!
 //! reqwest exposes nothing about a built client's certificate verifier, so
-//! this proves it by difference: in an environment where the platform
+//! this proves it by difference. In an environment where the platform
 //! verifier cannot be constructed, a plain builder fails and ours does not.
 //!
-//! Its own test binary on purpose. It has to move `SSL_CERT_FILE` and
-//! `SSL_CERT_DIR` out from under the process for a moment, and the enginefs
-//! unit tests build torrent sessions -- and with them reqwest clients -- in
+//! It is its own test binary on purpose. It has to move `SSL_CERT_FILE` and
+//! `SSL_CERT_DIR` out from under the process for a moment. The enginefs
+//! unit tests build torrent sessions, and with them reqwest clients, in
 //! parallel.
 #![cfg(target_os = "linux")]
 
-/// On Linux `rustls-platform-verifier` loads the system store through
+/// `rustls-platform-verifier` on Linux loads the system store through
 /// `rustls-native-certs`, which takes the store from `SSL_CERT_FILE` and
 /// `SSL_CERT_DIR` when either is set. Pointed at an empty file and an empty
-/// directory it loads nothing, and `Verifier::new` refuses an empty store
+/// directory, it loads nothing. `Verifier::new` refuses an empty store
 /// ("No CA certificates were loaded from the system"), so a builder that
 /// constructs it cannot `build()`. Ours builds anyway, which is only
 /// possible if it never asked the platform for roots.
@@ -24,8 +24,8 @@ fn our_client_builds_where_the_platform_verifier_cannot() {
     let empty_dir = tempfile::tempdir().expect("temp dir");
     let saved = ["SSL_CERT_FILE", "SSL_CERT_DIR"].map(|name| (name, std::env::var_os(name)));
 
-    // Safe here: this test binary is single-threaded at this point (one
-    // test, no spawned runtime) and nothing else in it reads the
+    // Safe here. This test binary is single-threaded at this point (one
+    // test, no spawned runtime), and nothing else in it reads the
     // environment.
     unsafe {
         std::env::set_var("SSL_CERT_FILE", empty_file.path());

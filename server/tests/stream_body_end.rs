@@ -3,21 +3,21 @@
 //! `stage="http_stream_end"` is the only record that a playback session
 //! ended and the only one that says how much of what was asked for actually
 //! left the server. It is read off real devices, so what its `reason` says
-//! is not a detail: a range delivered whole and a player that hung up
+//! is not a detail. A range delivered whole and a player that hung up
 //! part-way have to be told apart in a log nobody can reproduce. Hyper
 //! stops polling a body of declared length the moment that length is met,
-//! so the body itself never signals an end, and the two cases need their
-//! own signal to stay apart (the same fact `/proxy` works around; see
+//! so the body itself never signals an end. The two cases need their own
+//! signal to stay apart (the same fact `/proxy` works around; see
 //! `proxy_body_end.rs`).
 //!
 //! So this asserts over the log file the field report is read from, with a
-//! real torrent fixture behind the route: a client that reads a whole file
+//! real torrent fixture behind the route. A client that reads a whole file
 //! must produce `complete`, and one that hangs up must still produce
 //! `client-disconnect`. A test of only the first would pass a line that
 //! said `complete` about everything.
 //!
-//! A binary of its own because `init_logging` installs the process's
-//! subscriber once: a second logging test in the same binary would write
+//! It is a binary of its own because `init_logging` installs the process's
+//! subscriber once. A second logging test in the same binary would write
 //! into whichever tempdir won the race (`log_redaction.rs` and
 //! `proxy_body_end.rs` are binaries for the same reason).
 
@@ -51,8 +51,9 @@ const CHECK_WAIT_BOUND: Duration = Duration::from_secs(30);
 /// client that stops reading a client the server finds out about.
 const PAYLOAD: usize = 8 * 1024 * 1024;
 
-/// One byte of the payload at `offset`: a cheap pattern, so a body can be
-/// checked to be the fixture's own bytes and not merely the right length.
+/// One byte of the payload at `offset`. It is a cheap pattern, so a body
+/// can be checked to be the fixture's own bytes and not merely the right
+/// length.
 fn byte_at(offset: usize) -> u8 {
     (offset % 251) as u8
 }
@@ -109,8 +110,8 @@ fn seeded_stream_url(
 }
 
 /// A range delivered whole says so, and a player that hangs up says that
-/// instead: the distinction the line exists for, read back out of the log
-/// file a field report is made of.
+/// instead. That is the distinction the line exists for, read back out of
+/// the log file a field report is made of.
 #[test]
 fn a_torrent_body_says_whether_it_was_delivered_or_hung_up_on() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -125,8 +126,8 @@ fn a_torrent_body_says_whether_it_was_delivered_or_hung_up_on() -> anyhow::Resul
         config_dir: Some(config_root.clone()),
         cache_dir: Some(cache_root.clone()),
         init_logging: true,
-        // Nothing seeds this fixture, so nothing may take its pieces back:
-        // see [`fixture_pins`].
+        // Nothing seeds this fixture, so nothing may take its pieces back.
+        // See [`fixture_pins`].
         ..fixture_pins::keep_what_the_fixture_seeded(torrent_fixtures::offline_config())
     })?;
     let base = format!("http://{}", handle.http_addr());
@@ -168,8 +169,8 @@ fn a_torrent_body_says_whether_it_was_delivered_or_hung_up_on() -> anyhow::Resul
         "how long the body was open: {fields}"
     );
 
-    // And a player that hangs up part-way, which must still read as one:
-    // a line that said `complete` about every body would be no better than
+    // And a player that hangs up part-way, which must still read as one. A
+    // line that said `complete` about every body would be no better than
     // one that said `client-disconnect` about every body.
     let mut socket = std::net::TcpStream::connect(handle.http_addr())?;
     socket.set_read_timeout(Some(Duration::from_secs(10)))?;

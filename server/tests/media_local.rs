@@ -1,8 +1,8 @@
 //! A file on this device played by id (`MediaSpec::Local`,
-//! `docs/design/media-pipeline.md` §2.3, step B): a path or an fd is
+//! `docs/design/media-pipeline.md` §2.3, step B). A path or an fd is
 //! registered with no I/O, resolved by opening it, and read through the
-//! same reader task as every other source. A pipe is refused at resolve;
-//! and no HTTP route can name a local file, because none takes a spec.
+//! same reader task as every other source. A pipe is refused at resolve.
+//! No HTTP route can name a local file, because none takes a spec.
 //!
 //! Every server here is offline and on an ephemeral port. A
 //! [`MediaReader`] refuses to be called from inside a runtime, so the reads
@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 // `Refusal` is named only by the pipe test, which is Unix-only (a pipe fd
-// is a Unix thing); Windows would see an unused import under `-D warnings`.
+// is a Unix thing). Windows would see an unused import under `-D warnings`.
 #[cfg(unix)]
 use stream_server::Refusal;
 use stream_server::{LocalFile, MediaReader, MediaSpec, PlayToken, ServerConfig};
@@ -62,7 +62,7 @@ fn read_to_end(reader: &mut MediaReader) -> std::io::Result<Vec<u8>> {
 }
 
 /// Read `reader` whole, seek to `seek_to` and read the rest, then read
-/// once more at the end: the three things a player does.
+/// once more at the end. Those are the three things a player does.
 fn read_seek_end(mut reader: MediaReader, bytes: &[u8], seek_to: u64) -> anyhow::Result<()> {
     assert_eq!(read_to_end(&mut reader)?, bytes, "read from the top");
     assert_eq!(reader.seek(seek_to)?, seek_to);
@@ -78,9 +78,9 @@ fn read_seek_end(mut reader: MediaReader, bytes: &[u8], seek_to: u64) -> anyhow:
 const LEN: usize = 700 * 1024 + 13;
 const SEEK_TO: u64 = 333_333;
 
-/// **A path registers, resolves and reads**: exact bytes from the top and
-/// from after a seek, then the end. Its name is the file name and its type
-/// follows the extension.
+/// **A path registers, resolves and reads.** It reads exact bytes from the
+/// top and from after a seek, then the end. Its name is the file name and
+/// its type follows the extension.
 #[test]
 fn a_local_path_resolves_and_reads_seeks_and_ends() -> anyhow::Result<()> {
     let (handle, _dirs) = server()?;
@@ -129,7 +129,7 @@ fn the_content_type_follows_the_extension() -> anyhow::Result<()> {
 }
 
 /// **A path that is not there is a refusal at resolve**, and registering
-/// it was not: `register` does no I/O.
+/// it was not, because `register` does no I/O.
 #[test]
 fn a_missing_path_is_refused_at_resolve() -> anyhow::Result<()> {
     let (handle, _dirs) = server()?;
@@ -152,8 +152,8 @@ fn a_missing_path_is_refused_at_resolve() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// **An fd reads as its path does**: an open file handed over as an
-/// `OwnedFd`, named by the app.
+/// **An fd reads as its path does.** The fd is an open file handed over as
+/// an `OwnedFd`, named by the app.
 #[cfg(unix)]
 #[test]
 fn a_local_fd_resolves_and_reads_seeks_and_ends() -> anyhow::Result<()> {
@@ -182,9 +182,9 @@ fn a_local_fd_resolves_and_reads_seeks_and_ends() -> anyhow::Result<()> {
 }
 
 /// **A pipe is refused at resolve, with the sentence**, never streamed
-/// forward: what a cloud provider behind Android's storage framework may
-/// hand out for a document. The sentence is pinned: it is what a viewer
-/// is shown.
+/// forward. A pipe is what a cloud provider behind Android's storage
+/// framework may hand out for a document. The sentence is pinned, because
+/// it is what a viewer is shown.
 #[cfg(unix)]
 #[test]
 fn a_pipe_fd_is_refused_at_resolve() -> anyhow::Result<()> {
@@ -209,7 +209,7 @@ fn a_pipe_fd_is_refused_at_resolve() -> anyhow::Result<()> {
 }
 
 /// **A local id read with a play puts the viewer's session on
-/// `Elsewhere`**, as a `p=` request through `/proxy` does: the viewer is
+/// `Elsewhere`**, as a `p=` request through `/proxy` does. The viewer is
 /// on no torrent file now, so one played before is left to go slack. An
 /// aside moves nothing.
 #[test]
@@ -248,8 +248,8 @@ fn a_played_local_reader_puts_the_session_elsewhere() -> anyhow::Result<()> {
 
 /// Whether `T` can be read out of a request body. The two impls make a
 /// call with the parameter left to inference ambiguous exactly when both
-/// apply, i.e. when `T` is `DeserializeOwned` -- a compile error, which is
-/// the failure.
+/// apply, i.e. when `T` is `DeserializeOwned`. That is a compile error,
+/// which is the failure.
 trait NotFromABody<A> {
     fn check() {}
 }
@@ -258,8 +258,8 @@ impl<T: ?Sized> NotFromABody<()> for T {}
 struct FromABody;
 impl<T: serde::de::DeserializeOwned> NotFromABody<FromABody> for T {}
 
-/// The text of `fn name` at the top level of `source`: its signature to
-/// its closing brace, the first line that is exactly `}`.
+/// The text of `fn name` at the top level of `source`, from its signature
+/// to its closing brace. The brace is the first line that is exactly `}`.
 fn function<'a>(source: &'a str, name: &str) -> &'a str {
     let start = source
         .find(&format!("fn {name}("))
@@ -270,8 +270,8 @@ fn function<'a>(source: &'a str, name: &str) -> &'a str {
     &source[start..start + len]
 }
 
-/// A source file's text with `\n` line endings whatever the checkout's:
-/// a Windows runner checks out CRLF, and the scans below look for `\n}\n`.
+/// A source file's text with `\n` line endings whatever the checkout's.
+/// A Windows runner checks out CRLF, and the scans below look for `\n}\n`.
 fn source_of(path: &Path) -> String {
     std::fs::read_to_string(path)
         .expect("a source file")
@@ -290,13 +290,13 @@ fn rust_files(dir: &Path, into: &mut Vec<PathBuf>) {
     }
 }
 
-/// **No HTTP route takes a `MediaSpec`, or reaches the id registry**: a
+/// **No HTTP route takes a `MediaSpec`, or reaches the id registry.** A
 /// `local:` spec is constructible only through `ServerHandle::register`,
 /// over FFI, so no URL or request body can name a file on this device
 /// (design §2.3). Two halves, each able to fail:
 ///
 /// * `MediaSpec` cannot be deserialized, so no `Json<_>` or `Query<_>`
-///   extractor can take one -- a compile-time check;
+///   extractor can take one (a compile-time check);
 /// * no handler under `routes/`, nothing in the LAN listener, and none of
 ///   the router builders in `lib.rs` names `MediaSpec`, `LocalFile`, a
 ///   `MediaId` or the registry (`.media.`), comments aside;

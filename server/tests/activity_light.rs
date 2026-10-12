@@ -1,11 +1,11 @@
-//! **The activity light against real peers**: a torrent download from a
+//! **The activity light against real peers.** A torrent download from a
 //! seeder lights the way down, and seeding it to a leecher lights the way
 //! up, with bytes on the wire rather than counters set by hand.
 //!
-//! The judge's arithmetic is `enginefs::traffic`'s own unit tests; what
-//! only a swarm can show is that the counters the server feeds it are the
-//! peers' -- summed over the torrents that exist, read without starting
-//! anything -- and that nothing playing is what the reading says.
+//! `enginefs::traffic`'s own unit tests cover the judge's arithmetic. Only
+//! a swarm can show that the counters the server feeds it are the peers'
+//! (summed over the torrents that exist, read without starting anything).
+//! It can also show that nothing playing is what the reading says.
 
 use stream_server::ServerConfig;
 
@@ -16,16 +16,16 @@ use torrent_fixtures::offline_config;
 /// The fixture's piece length.
 const PIECE: u32 = 256 * 1024;
 
-/// The torrent: at [`PEER_BPS`] it takes four seconds each way, so a
-/// transfer is still moving when the first poll takes its baseline and has
+/// The torrent. At [`PEER_BPS`] it takes four seconds each way. So a
+/// transfer is still moving when the first poll takes its baseline, and has
 /// moved by the time the window after it closes.
 const PAYLOAD: usize = 16 * 1024 * 1024;
 
 /// What the seeder may upload and the leecher may download.
 const PEER_BPS: u32 = 4 * 1024 * 1024;
 
-/// The longest any wait below may take before it is a failure. A bound on
-/// a poll, never a sleep.
+/// The longest any wait below may take before it is a failure. It is a
+/// bound on a poll, never a sleep.
 const WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(90);
 
 const POLL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -51,9 +51,9 @@ fn until(
     }
 }
 
-/// **Downloading lights the way down, seeding lights the way up.** A
-/// torrent pinned as a download, fed by a seeder, with nothing playing:
-/// the reading's down half comes on and its up half stays off. Once it is
+/// **Downloading lights the way down, seeding lights the way up.** Take a
+/// torrent pinned as a download, fed by a seeder, with nothing playing.
+/// The reading's down half comes on and its up half stays off. Once it is
 /// whole and the seeder has gone, a leecher that dials the server takes it
 /// back out, and now the up half comes on.
 #[test]
@@ -146,8 +146,8 @@ enum Rate {
 }
 
 /// A second librqbit session holding (or wanting) the torrent, dialling
-/// one address -- the server -- and rate-limited one way to [`PEER_BPS`].
-/// It owns its runtime: dropping it stops the peer.
+/// one address (the server), and rate-limited one way to [`PEER_BPS`].
+/// It owns its runtime, so dropping it stops the peer.
 struct Peer {
     _runtime: tokio::runtime::Runtime,
     _session: std::sync::Arc<librqbit::Session>,
@@ -177,7 +177,7 @@ impl Peer {
             let session = librqbit::Session::new_with_opts(
                 content_dir.to_path_buf(),
                 librqbit::SessionOptions {
-                    // No DHT, no persistence, no local discovery: the one
+                    // No DHT, no persistence, no local discovery. The one
                     // address below is the only peer this session has.
                     dht: None,
                     persistence: None,
@@ -224,7 +224,7 @@ impl Peer {
     }
 }
 
-/// A single-file torrent over `path`, with [`PIECE`] pieces. Returns the
+/// A single-file torrent over `path`, with [`PIECE`] pieces. It returns the
 /// metainfo bytes and the info hash.
 fn torrent_of(path: &std::path::Path) -> anyhow::Result<(Vec<u8>, String)> {
     let runtime = tokio::runtime::Runtime::new()?;

@@ -1,28 +1,28 @@
 //! **Who keeps a torrent running is said, not guessed**
-//! (`enginefs::retention::holds`): a player screen holds the torrent its
-//! own requests named from its first request until the app says the screen
-//! is gone (`ServerHandle::release_player`), paused, stalled or with nothing
-//! open; a cast holds it from publish to unpublish, direct or rendition
-//! alike, and takes the hold while the screen's is still there; a newer
-//! screen of the viewer lets the older one's go; what the viewer left --
-//! the screen released, the cast unpublished -- is their idle share,
-//! which keeps it running while idle sharing is allowed, until they watch
-//! something else; and once nothing holds a torrent the reconciler stops
-//! it, whatever the liveness cell names.
+//! (`enginefs::retention::holds`). A player screen holds the torrent its
+//! own requests named, from its first request until the app says the
+//! screen is gone (`ServerHandle::release_player`). It holds it paused,
+//! stalled or with nothing open. A cast holds it from publish to
+//! unpublish, direct or rendition alike, and takes the hold while the
+//! screen's is still there. A newer screen of the viewer lets the older
+//! one's go. What the viewer left (the screen released, the cast
+//! unpublished) is their idle share. That keeps it running while idle
+//! sharing is allowed, until they watch something else. Once nothing holds
+//! a torrent, the reconciler stops it, whatever the liveness cell names.
 //!
 //! What this replaced, and what each test would have caught: the
-//! reconciler read "playing" off the liveness cell -- the last entity a
-//! stream opened, which any other open moves -- and the reads open at the
-//! tick. A phone that handed its film to a television had no read open
-//! between the receiver's requests, and an open of anything else stopped
-//! the torrent the television was waiting on (measured on a phone:
-//! `torrent_stopped_by_reconciler playing=false` right after a cast began),
-//! and deleted its bytes with it.
+//! reconciler read "playing" off the liveness cell and the reads open at
+//! the tick. The cell is the last entity a stream opened, and any other
+//! open moves it. A phone that handed its film to a television had no read
+//! open between the receiver's requests. An open of anything else then
+//! stopped the torrent the television was waiting on, and deleted its
+//! bytes with it (measured on a phone:
+//! `torrent_stopped_by_reconciler playing=false` right after a cast began).
 //!
 //! The reconciler's decision is read with `ServerHandle::reconcile_as_timer`
-//! -- the verdict, before the actuator -- so nothing here sleeps past a
-//! tick. Every server is offline, on ephemeral ports, with the pin set an
-//! embedder that pinned nothing hands in (`offline_config`): a torrent
+//! (the verdict, before the actuator), so nothing here sleeps past a tick.
+//! Every server is offline, on ephemeral ports, with the pin set an
+//! embedder that pinned nothing hands in (`offline_config`). A torrent
 //! nobody holds is slack, which is the point.
 
 use std::net::SocketAddr;
@@ -65,7 +65,7 @@ struct Torrent {
 }
 
 /// A server with two one-file torrents added, checked and seeded, and the
-/// LAN listener up. `a` is the film being watched; `b` is what moves the
+/// LAN listener up. `a` is the film being watched. `b` is what moves the
 /// liveness cell away from it.
 struct Fixture {
     handle: stream_server::ServerHandle,
@@ -77,9 +77,9 @@ struct Fixture {
 
 impl Fixture {
     /// **Both torrents start pinned**, because a seeded fixture has no
-    /// swarm: a torrent nothing holds loses its pieces at the first tick
+    /// swarm. A torrent nothing holds loses its pieces at the first tick
     /// after its check (`support/fixture_pins.rs`), before a test could open
-    /// it. `b` stays pinned -- it is only what moves the cell -- and `a` is
+    /// it. `b` stays pinned, since it is only what moves the cell. `a` is
     /// unpinned (bytes kept) once the screen holds it ([`Self::watch_a`]).
     fn start() -> anyhow::Result<Self> {
         let config_dir = tempfile::tempdir()?;
@@ -159,7 +159,7 @@ impl Fixture {
     }
 
     /// The screen `token` playing `a`, and `a`'s pin let go (its bytes
-    /// kept): from here only what holds it keeps it.
+    /// kept). From here only what holds it keeps it.
     fn watch_a(&self, token: &str) -> anyhow::Result<stream_server::MediaReader> {
         let reader = self.play(&self.a, token)?;
         self.handle.unpin(&self.a.id, false)?;
@@ -176,8 +176,8 @@ impl Fixture {
         Ok(reader)
     }
 
-    /// Something else opened -- here `b`, read as an aside and closed --
-    /// which moves the liveness cell off `a`: what used to decide that `a`
+    /// Something else opened (here `b`, read as an aside and closed), which
+    /// moves the liveness cell off `a`. That is what used to decide that `a`
     /// was nobody's.
     fn open_something_else(&self) -> anyhow::Result<()> {
         let mut reader = self.handle.open_reader(&self.b.id, None)?;
@@ -196,9 +196,9 @@ impl Fixture {
             .decision)
     }
 
-    /// The reconciler asked about `a` until it answers `Stop` -- the cut
-    /// body or run lets go of its stream on a task of its own -- then the
-    /// server stopped. Bounded.
+    /// The reconciler asked about `a` until it answers `Stop`, then the
+    /// server stopped. (The cut body or run lets go of its stream on a task
+    /// of its own.) Bounded.
     fn until_a_stops(self) -> anyhow::Result<()> {
         let deadline = Instant::now() + BOUND;
         while self.verdict_on_a()? != Decision::Stop {
@@ -239,11 +239,11 @@ fn read_exact(reader: &mut stream_server::MediaReader, buf: &mut [u8]) -> anyhow
     Ok(())
 }
 
-/// **A player screen holds its torrent until it is left**: paused with no
+/// **A player screen holds its torrent until it is left.** Paused with no
 /// read open, and with something else opened since, the torrent is still
-/// the screen's and runs; the screen's goodbye leaves it as the viewer's
-/// idle share, which runs it while idle sharing is allowed (the default)
-/// and not while the app holds idle sharing back; and the viewer starting
+/// the screen's and runs. The screen's goodbye leaves it as the viewer's
+/// idle share. That runs it while idle sharing is allowed (the default),
+/// and not while the app holds idle sharing back. The viewer starting
 /// something else lets it go, and the reconciler stops it.
 #[test]
 fn a_player_screen_holds_its_torrent_until_it_is_left() -> anyhow::Result<()> {
@@ -281,7 +281,7 @@ fn a_player_screen_holds_its_torrent_until_it_is_left() -> anyhow::Result<()> {
     fixture.until_a_stops()
 }
 
-/// **A newer screen of the viewer lets the older one's torrent go**: the
+/// **A newer screen of the viewer lets the older one's torrent go.** The
 /// screen that never said goodbye holds nothing once the viewer plays
 /// something else.
 #[test]
@@ -301,9 +301,9 @@ fn a_newer_screen_of_the_viewer_lets_the_older_ones_torrent_go() -> anyhow::Resu
 }
 
 /// **A cast holds its torrent from publish to unpublish**, and the hand-over
-/// from the phone has no gap: the cast is published while the screen still
-/// holds the torrent, the screen goes, something else opens, and the
-/// torrent runs and serves the receiver; the unpublish lets it go.
+/// from the phone has no gap. The cast is published while the screen still
+/// holds the torrent. The screen goes and something else opens, and the
+/// torrent runs and serves the receiver. The unpublish lets it go.
 #[test]
 fn a_cast_holds_its_torrent_from_publish_to_unpublish() -> anyhow::Result<()> {
     let fixture = Fixture::start()?;
@@ -331,7 +331,8 @@ fn a_cast_holds_its_torrent_from_publish_to_unpublish() -> anyhow::Result<()> {
     assert_eq!(served.as_ref(), &fixture.a.bytes[8 * PIECE..]);
 
     assert!(fixture.handle.unpublish(&token));
-    // The cast was what the viewer watched last: their idle share now.
+    // The cast was what the viewer watched last. It is their idle share
+    // now.
     assert_eq!(
         fixture.holders_of_a(),
         vec![Holder::IdleShare("viewer".into())]
@@ -345,8 +346,8 @@ fn a_cast_holds_its_torrent_from_publish_to_unpublish() -> anyhow::Result<()> {
 }
 
 /// **A rendition holds its torrent from publish to unpublish**, before the
-/// receiver has asked for anything and between its requests -- and keeps
-/// its bytes: with something else opened and the phone's player gone, the
+/// receiver has asked for anything and between its requests. It keeps its
+/// bytes too. With something else opened and the phone's player gone, the
 /// rendition still makes its slots out of the torrent.
 #[test]
 fn a_rendition_holds_its_torrent_and_its_bytes_from_publish_to_unpublish() -> anyhow::Result<()> {
@@ -381,14 +382,15 @@ fn a_rendition_holds_its_torrent_and_its_bytes_from_publish_to_unpublish() -> an
         Decision::Run,
         "a rendition nobody has asked for yet lost its torrent"
     );
-    // A pass of the retention owner, as the tick runs one: nothing of a
+    // A pass of the retention owner, as the tick runs one. Nothing of a
     // held torrent is slack.
     fixture.handle.reconcile_as_timer(&fixture.b.info_hash)?;
     let slot = made(&fixture.handle, &token, 3)?;
     assert!(!slot.is_empty());
 
     assert!(fixture.handle.unpublish(&token));
-    // The cast was what the viewer watched last: their idle share now.
+    // The cast was what the viewer watched last. It is their idle share
+    // now.
     assert_eq!(
         fixture.holders_of_a(),
         vec![Holder::IdleShare("viewer".into())]
@@ -401,7 +403,7 @@ fn a_rendition_holds_its_torrent_and_its_bytes_from_publish_to_unpublish() -> an
     fixture.until_a_stops()
 }
 
-/// Slot `slot` of the rendition, or an error once [`BOUND`] has passed: a
+/// Slot `slot` of the rendition, or an error once [`BOUND`] has passed. A
 /// read parked on a piece the server let go of never ends by itself, so
 /// the bound unpublishes, which cuts it.
 fn made(
@@ -428,7 +430,7 @@ fn made(
 }
 
 /// **A cast of something that is not a torrent, published with the
-/// viewer's token, is the viewer watching something else**: their idle
+/// viewer's token, is the viewer watching something else.** Their idle
 /// share goes, and the torrent it kept stops.
 #[test]
 fn a_cast_of_a_link_ends_the_viewers_idle_share() -> anyhow::Result<()> {

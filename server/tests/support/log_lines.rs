@@ -1,15 +1,15 @@
 //! The log files a field report is read from, as a test reads them back.
 //!
-//! Some failures leave nothing behind but one INFO line -- what a playback
-//! delivered, and what ended it -- so the tests that pin those lines assert
+//! Some failures leave nothing behind but one INFO line: what a playback
+//! delivered, and what ended it. So the tests that pin those lines assert
 //! over the files the process actually writes (`server_<launch>.jsonl`)
 //! rather than over a function that writes them. This is the reading half
-//! of that, shared by `#[path]` between the binaries which do it: one per
-//! subscriber, because `init_logging` installs the process's once and a
-//! second such test in the same binary would write into whichever tempdir
-//! won the race.
+//! of that, shared by `#[path]` between the binaries which do it. There is
+//! one binary per subscriber, because `init_logging` installs the
+//! process's once. A second such test in the same binary would write into
+//! whichever tempdir won the race.
 //!
-//! Which is also why nothing here is `#[cfg(test)]` and why the
+//! That is also why nothing here is `#[cfg(test)]`, and why the
 //! unused-function lint is off: each includer uses the part of it its own
 //! subject needs.
 
@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 
 /// How long a line is given to reach the file. The log writer is not
 /// blocking, so a line is written some short while after the event it
-/// describes -- and this is a bound on a mistake, not a wait anything
-/// normally spends.
+/// describes. This is a bound on a mistake, not a wait anything normally
+/// spends.
 const LINE_WAIT_BOUND: Duration = Duration::from_secs(20);
 
 /// Every line the process has written at `stage`, as the JSON log carries
@@ -50,7 +50,7 @@ pub fn lines_at_stage(config_dir: &std::path::Path, stage: &str) -> Vec<serde_js
     lines
 }
 
-/// The line at `stage` that `wanted` describes, waited for; `described` is
+/// The line at `stage` that `wanted` describes, waited for. `described` is
 /// what the failure calls it when none arrives.
 ///
 /// `wanted` is handed the line's fields, which is where everything a line

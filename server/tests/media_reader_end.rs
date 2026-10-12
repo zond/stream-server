@@ -3,13 +3,13 @@
 //! A reader over a played torrent id makes the stream route's own open
 //! (`open_torrent_stream`), so it registers a stream and its end is logged
 //! by the same guard. The route's end line (`http_stream_end`) reports what
-//! a response body delivered against the range it promised; a reader has
-//! neither, and written through that line it said `requested_len=0` and a
+//! a response body delivered against the range it promised. A reader has
+//! neither. Written through that line, it said `requested_len=0` and a
 //! disconnect for every playback. So a reader's stream ends with a line of
-//! its own (`reader_stream_end`) carrying no HTTP numbers, and the reader
+//! its own (`reader_stream_end`) carrying no HTTP numbers. The reader
 //! task's close line (`media_reader_closed`) says what it delivered.
 //!
-//! A binary of its own because `init_logging` installs the process's
+//! It is a binary of its own because `init_logging` installs the process's
 //! subscriber once (see `stream_body_end.rs`).
 
 use std::path::Path;

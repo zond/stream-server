@@ -1,12 +1,12 @@
 //! What a *debug* line may say about a caller's credentials: nothing.
-//! `log_redaction.rs` holds the lines the default filter writes; this is the
-//! rest of them, because a field report is taken with `RUST_LOG` turned up
-//! and the log files this process keeps for the last ten launches are the
-//! one place a signed URL's token, an FTP login, an `h=` header value or the
+//! `log_redaction.rs` holds the lines the default filter writes, and this
+//! is the rest of them. A field report is taken with `RUST_LOG` turned up.
+//! The log files this process keeps for the last ten launches are the one
+//! place a signed URL's token, an FTP login, an `h=` header value or the
 //! proxy password in a settings patch must not turn up.
 //!
-//! A binary of its own because it installs the process's global
-//! subscriber, at `trace` for this server's crates -- and `log_redaction.rs`
+//! It is a binary of its own because it installs the process's global
+//! subscriber, at `trace` for this server's crates, and `log_redaction.rs`
 //! installs the server's own.
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener};
@@ -131,7 +131,7 @@ fn no_debug_line_carries_a_callers_credentials() -> anyhow::Result<()> {
     // A settings patch with the proxy password in it.
     let _ = handle.update_settings(serde_json::json!({ "btProxyPassword": "SECRET-PATCH" }));
 
-    // An FTP login, to a port nothing listens on: the transfer fails.
+    // An FTP login, to a port nothing listens on. The transfer fails.
     let ftp = serde_json::json!({ "ftpUrl": "ftp://viewer:SECRET-FTP@127.0.0.1:1/film.mkv" });
     let lz = lz_str::compress_to_encoded_uri_component(ftp.to_string().as_str());
     let response = client.get(format!("{base}/ftp/film.mkv?lz={lz}")).send()?;
@@ -170,7 +170,8 @@ fn no_debug_line_carries_a_callers_credentials() -> anyhow::Result<()> {
     }
 
     // A cast token, which is a URL into this device for as long as it is
-    // published: a body served under it, and a request after it is gone.
+    // published. A body is served under it, and a request made after it is
+    // gone.
     handle.update_settings(serde_json::json!({ "lanMediaEnabled": true }))?;
     let lan = handle
         .set_lan_media(true)?

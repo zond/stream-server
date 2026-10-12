@@ -2,12 +2,11 @@
 
 use stream_server::ServerConfig;
 
-/// A second start in one process -- an embedder's stop, then start --
-/// leaves the first start's log files alone. The first start's subscriber
-/// is the process's for good and goes on writing `server_current.log`;
-/// when the second start rotated that file, its lines went on into the
-/// archive the rename made, and the fresh `server_current.log` stayed
-/// empty.
+/// A second start in one process (an embedder's stop, then start) leaves
+/// the first start's log files alone. The first start's subscriber is the
+/// process's for good, and goes on writing `server_current.log`. When the
+/// second start rotated that file, its lines went on into the archive the
+/// rename made, and the fresh `server_current.log` stayed empty.
 #[test]
 fn a_second_start_in_one_process_rotates_nothing() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -15,7 +14,7 @@ fn a_second_start_in_one_process_rotates_nothing() -> anyhow::Result<()> {
         config_dir: Some(dir.path().join("config")),
         cache_dir: Some(dir.path().join("cache")),
         init_logging: true,
-        // Ephemeral, and offline like every other server a test starts: the
+        // Ephemeral, and offline like every other server a test starts. The
         // default HTTP port is a fixed one another process may hold.
         http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         resolve_dht_bootstrap_names: false,

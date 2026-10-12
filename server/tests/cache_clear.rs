@@ -1,14 +1,14 @@
 //! **A full clear of the cache** (`ServerHandle::clear_cache`): what the
 //! user asks for when they want the space back now, whatever is playing.
-//! Unlike `clean_cache_now`, which gives back only what nobody plays, it
-//! stops every torrent that streams -- the one a player screen is reading,
-//! the one a viewer's idle share keeps running -- and takes every piece no
-//! download keeps, the window of the film being played included; a kept
-//! download keeps every byte and goes on running. The player that was
-//! reading gets a read error, and a later ask is served as a first one is.
+//! `clean_cache_now` gives back only what nobody plays. A clear stops every
+//! torrent that streams: the one a player screen is reading, and the one a
+//! viewer's idle share keeps running. It takes every piece no download
+//! keeps, the window of the film being played included. A kept download
+//! keeps every byte and goes on running. The player that was reading gets
+//! a read error, and a later ask is served as a first one is.
 //!
 //! Every server is offline, on ephemeral ports, with the pin set an
-//! embedder that pinned nothing hands in: a torrent nobody holds is slack,
+//! embedder that pinned nothing hands in. A torrent nobody holds is slack,
 //! which is the point. The reconciler's decision is read with
 //! `ServerHandle::reconcile_as_timer`, so nothing here sleeps past a tick.
 
@@ -46,10 +46,10 @@ struct Torrent {
     bytes: Vec<u8>,
 }
 
-/// A server with four one-file torrents added, checked and seeded: `a` is
-/// the film a player screen is reading, `b` what another viewer watched
-/// last and left as their idle share, `c` a kept download, and `d` read by
-/// a client with no player behind it, which shares nothing.
+/// A server with four one-file torrents added, checked and seeded. `a` is
+/// the film a player screen is reading. `b` is what another viewer watched
+/// last and left as their idle share. `c` is a kept download. `d` is read
+/// by a client with no player behind it, which shares nothing.
 struct Fixture {
     handle: stream_server::ServerHandle,
     cache_root: PathBuf,
@@ -62,10 +62,10 @@ struct Fixture {
 
 impl Fixture {
     /// **Every torrent starts pinned**, because a seeded fixture has no
-    /// swarm: a torrent nothing holds loses its pieces at the first tick
-    /// after its check (`support/fixture_pins.rs`). `c` stays pinned -- it
-    /// is the kept download -- and the others are unpinned, bytes kept,
-    /// once something reads each.
+    /// swarm. A torrent nothing holds loses its pieces at the first tick
+    /// after its check (`support/fixture_pins.rs`). `c` stays pinned, since
+    /// it is the kept download. The others are unpinned, bytes kept, once
+    /// something reads each.
     fn start() -> anyhow::Result<Self> {
         let config_dir = tempfile::tempdir()?;
         let cache_dir = tempfile::tempdir()?;
@@ -143,8 +143,8 @@ impl Fixture {
     }
 
     /// The viewer's player screen `token` opening `torrent` and reading its
-    /// first bytes, as the app's player does through the id; then the
-    /// torrent's pin let go, bytes kept, so only what holds it keeps it.
+    /// first bytes, as the app's player does through the id. Then the
+    /// torrent's pin is let go, bytes kept, so only what holds it keeps it.
     fn watch(&self, torrent: &Torrent, token: &str) -> anyhow::Result<stream_server::MediaReader> {
         self.read(torrent, Some(play(token)))
     }
@@ -205,13 +205,13 @@ fn read_exact(reader: &mut stream_server::MediaReader, buf: &mut [u8]) -> anyhow
 }
 
 /// **A clear stops what streams, takes every piece no download keeps, and
-/// leaves the download alone.** A player screen reading `a` with its window
-/// on the disk, another viewer's idle share running `b`, a kept download
-/// `c`, another client reading `d`: after the clear nothing holds `a`, `b`
-/// or `d`, the reconciler stops all three although the readers of `a` and
-/// `d` are still open, every piece of them is gone, and `c` runs with
-/// every byte. The player's next read fails, and so does a
-/// seek; the report says what left the disk and how many torrents stopped.
+/// leaves the download alone.** Take a player screen reading `a` with its
+/// window on the disk, another viewer's idle share running `b`, a kept
+/// download `c`, and another client reading `d`. After the clear nothing
+/// holds `a`, `b` or `d`. The reconciler stops all three, although the
+/// readers of `a` and `d` are still open, and every piece of them is gone.
+/// `c` runs with every byte. The player's next read fails, and so does a
+/// seek. The report says what left the disk and how many torrents stopped.
 #[test]
 fn a_clear_stops_what_streams_and_takes_every_piece_no_download_keeps() -> anyhow::Result<()> {
     let fixture = Fixture::start()?;
@@ -244,7 +244,7 @@ fn a_clear_stops_what_streams_and_takes_every_piece_no_download_keeps() -> anyho
         "and what the idle share keeps"
     );
     assert_eq!(fixture.pieces(&fixture.c), FILM_LEN / PIECE);
-    // The gentle clean takes none of it: all three are somebody's.
+    // The gentle clean takes none of it, because all three are somebody's.
     fixture.handle.clean_cache_now()?;
     assert!(fixture.pieces(&fixture.a) > 0 && fixture.pieces(&fixture.b) > 0);
 
@@ -292,10 +292,10 @@ fn a_clear_stops_what_streams_and_takes_every_piece_no_download_keeps() -> anyho
     drop(reader);
     drop(aside);
 
-    // A new ask is served as a first ask is: the viewer's next screen's
-    // request holds the torrent again and the reconciler runs it. Asked on
-    // the stream route, whose response is answered before its body parks
-    // on a piece the clear took (there is no swarm to bring it back).
+    // A new ask is served as a first ask is. The viewer's next screen's
+    // request holds the torrent again, and the reconciler runs it. It is
+    // asked on the stream route, whose response is answered before its body
+    // parks on a piece the clear took (there is no swarm to bring it back).
     let response = reqwest::blocking::Client::builder()
         .timeout(BOUND)
         .build()?
@@ -313,9 +313,9 @@ fn a_clear_stops_what_streams_and_takes_every_piece_no_download_keeps() -> anyho
     );
     assert_eq!(fixture.verdict(&fixture.a)?, Decision::Run);
     drop(response);
-    // And a stream with no player behind it -- another client -- counts as
-    // any body being delivered does: what the clear set aside was the
-    // bodies from before it.
+    // And a stream with no player behind it (another client) counts as any
+    // body being delivered does. What the clear set aside was the bodies
+    // from before it.
     let response = reqwest::blocking::Client::builder()
         .timeout(BOUND)
         .build()?

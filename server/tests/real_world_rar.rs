@@ -4,11 +4,11 @@
 //! which writes the headers this workspace believes in. That proves the
 //! reader against its own author. A set packed years ago by WinRAR, split
 //! across four volumes, served by somebody else's HTTP server, proves it
-//! against the world -- which is the only thing that can find a header
-//! this repository has never written.
+//! against the world. Only that can find a header this repository has
+//! never written.
 //!
 //! **Ignored, and it stays ignored.** It fetches over the internet, so it
-//! is not a gate; `cargo test` must make no request of its own. Run it by
+//! is not a gate. `cargo test` must make no request of its own. Run it by
 //! hand when the RAR reader or the translated-sources seam changes:
 //!
 //! ```text
@@ -17,20 +17,20 @@
 //!
 //! Two tests, because the world has two kinds of RAR in it.
 //!
-//! The first is a four-volume set on archive.org -- freely distributed,
+//! The first is a four-volume set on archive.org: freely distributed,
 //! served with byte ranges, somebody's real WinRAR output. It is packed
-//! the way WinRAR packs by default, which is to say **compressed**, so
+//! the way WinRAR packs by default, which is to say **compressed**. So
 //! what it proves is the half that runs before the refusal: four volumes
 //! of headers parsed, the member found, its method read, and the right
 //! refusal given in the viewer's words. That is the half our own fixtures
 //! could be wrong about together with the reader.
 //!
 //! The second needs a **stored** set, which is what a scene release is and
-//! what our fixtures imitate. No freely-distributable one has turned up,
-//! so it takes its volumes from `XTREMIO_RAR_VOLUMES` (comma-separated
+//! what our fixtures imitate. No freely-distributable one has turned up.
+//! So it takes its volumes from `XTREMIO_RAR_VOLUMES` (comma-separated
 //! URLs, in volume order) and skips when that is unset. Point it at any
-//! stored set and it reads the member's head and then a span across the
-//! seam between two volumes -- the one thing a single-volume archive
+//! stored set, and it reads the member's head and then a span across the
+//! seam between two volumes. That is the one thing a single-volume archive
 //! cannot test at all.
 #![cfg(feature = "rar")]
 
@@ -42,7 +42,7 @@ use std::net::SocketAddr;
 mod torrent_fixtures;
 use torrent_fixtures::offline_config;
 
-/// The volumes, in order. **Order is the whole of what a set is**: an
+/// The volumes, in order. **Order is the whole of what a set is.** An
 /// extent names the volume it lives in by position in this list.
 const VOLUMES: [&str; 4] = [
     "https://archive.org/download/Quran.Giants/Quran.Giants.CD.part1.rar",
@@ -71,11 +71,11 @@ fn a_compressed_set_packed_by_somebody_else_is_refused_for_being_compressed() ->
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
 
-    // Resolved here rather than by the server: archive.org answers
+    // Resolved here rather than by the server. archive.org answers
     // `/download/...` with a 302 to whichever storage node holds the item,
     // and what is under test is the reading of a RAR set, not our handling
-    // of somebody's redirect. Worth doing regardless: the storage node can
-    // answer a ranged read with a 500, which the server reports as
+    // of somebody's redirect. It is worth doing regardless. The storage node
+    // can answer a ranged read with a 500, which the server reports as
     // `malformed` and which says nothing about the reader.
     let following = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -92,8 +92,9 @@ fn a_compressed_set_packed_by_somebody_else_is_refused_for_being_compressed() ->
     }
     println!("resolved to {}", volumes[0]);
 
-    // Indexing reads headers, not archives: four volumes of 200 MB each,
-    // and what leaves the origin is the few kilobytes the headers sit in.
+    // Indexing reads headers, not archives. There are four volumes of 200 MB
+    // each, and what leaves the origin is the few kilobytes the headers sit
+    // in.
     let created = client
         .post(format!("{base}/rar/create"))
         .json(&serde_json::json!({ "urls": volumes }))
@@ -101,8 +102,8 @@ fn a_compressed_set_packed_by_somebody_else_is_refused_for_being_compressed() ->
 
     // The origin's own bad day is not a verdict on the reader. archive.org
     // answers a burst of ranged reads with a 500 often enough that calling
-    // that `malformed` would be crying wolf: indexing four volumes is four
-    // bursts. Said out loud and skipped, never passed quietly.
+    // that `malformed` would be crying wolf, and indexing four volumes is
+    // four bursts. It is said out loud and skipped, never passed quietly.
     let status = created.status();
     let body: serde_json::Value = created.json()?;
     if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
@@ -116,11 +117,11 @@ fn a_compressed_set_packed_by_somebody_else_is_refused_for_being_compressed() ->
         return Ok(());
     }
 
-    // 415 and `compressed`, not 422 and `malformed`: the difference is the
-    // whole point. `malformed` would mean the headers beat us; this means
-    // they were read, the member was found, and its method was understood
-    // -- and then policy, not the reader, said no. Nothing is unpacked to
-    // play a film, ever.
+    // 415 and `compressed`, not 422 and `malformed`. The difference is the
+    // whole point. `malformed` would mean the headers beat us. This means
+    // they were read, the member was found, and its method was understood.
+    // Then policy, not the reader, said no. Nothing is unpacked to play a
+    // film, ever.
     anyhow::ensure!(
         status == reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE,
         "a compressed set answered {status} instead of 415: {body}"
@@ -184,7 +185,7 @@ fn a_stored_set_is_read_across_its_volumes() -> anyhow::Result<()> {
         .expect("a key")
         .to_string();
 
-    // The redirect is where a member's name is told: nothing else in the
+    // The redirect is where a member's name is told. Nothing else in the
     // API hands one out, which is why the player asks for it here.
     let redirect = client.get(format!("{base}/rar/stream/{key}")).send()?;
     anyhow::ensure!(
@@ -207,7 +208,7 @@ fn a_stored_set_is_read_across_its_volumes() -> anyhow::Result<()> {
     println!("member: {member}");
 
     // A stored member is bytes of the volumes, so its first sixteen are
-    // the file's own -- a signature, a header, something that is not a
+    // the file's own: a signature, a header, something that is not a
     // hole. A reader that mis-stated an extent's offset answers zeros
     // here and a length there, both plausibly.
     let head = client
@@ -228,7 +229,7 @@ fn a_stored_set_is_read_across_its_volumes() -> anyhow::Result<()> {
     );
 
     // And across the seam, if the caller said where it is. The member
-    // begins a little way into volume one (its headers come first), so a
+    // begins a little way into volume one (its headers come first). So a
     // read that starts just before the volume's end and runs past it is
     // served out of two volumes.
     if let Ok(seam) = std::env::var("XTREMIO_RAR_SEAM") {

@@ -3,15 +3,15 @@
 //! A player that fails part-way through a proxied stream leaves the server
 //! nothing to be read back from except this: how many bytes actually left
 //! it, of how many the response promised, how long that took and what ended
-//! the body. So the test is over the log file rather than over a function --
-//! what a field report contains is the whole subject -- and it covers every
-//! way a body is served: relayed from an origin, rewritten as a playlist,
-//! served whole off the proxy's cache, and cut short by a player that hung
-//! up, or by an origin that hung up first. A `HEAD` is here too, for the
-//! body it does not have.
+//! the body. So the test is over the log file rather than over a function,
+//! because what a field report contains is the whole subject. It covers
+//! every way a body is served: relayed from an origin, rewritten as a
+//! playlist, served whole off the proxy's cache, and cut short by a player
+//! that hung up, or by an origin that hung up first. A `HEAD` is here too,
+//! for the body it does not have.
 //!
-//! A binary of its own because `init_logging` installs the process's
-//! subscriber once: a second logging test in the same binary would write
+//! It is a binary of its own because `init_logging` installs the process's
+//! subscriber once. A second logging test in the same binary would write
 //! into whichever tempdir won the race (see `log_redaction.rs`, which is a
 //! binary for the same reason).
 
@@ -28,11 +28,11 @@ mod log_lines;
 /// The stage this file is about.
 const STAGE: &str = "http_proxy_body_end";
 
-/// The proxy cache's chunk size: a range shorter than one stores nothing,
+/// The proxy cache's chunk size. A range shorter than one stores nothing,
 /// so the range the cache-hit case asks for is spelled in these.
 const CHUNK: u64 = stream_server::PROXY_CACHE_CHUNK_BYTES;
 
-/// The entity the cache case reads twice, and the one it may keep: an
+/// The entity the cache case reads twice, and the one it may keep. An
 /// origin that identifies neither by `ETag` nor by `Last-Modified` is not
 /// one the cache stores.
 const CACHED_ETAG: &str = "\"the-movie\"";
@@ -45,7 +45,7 @@ const SHORT_LEN: usize = 64 * 1024;
 /// assertion it is.
 const SLOW_LEN: usize = 64 * 1024 * 1024;
 
-/// A string that appears nowhere but in the URLs this test sends: the
+/// A string that appears nowhere but in the URLs this test sends. The
 /// end-of-body line names origins, and a caller's query is the one place a
 /// debrid or CDN credential lives.
 const SECRET: &str = "s3cr3t-token-do-not-log";
@@ -59,8 +59,8 @@ fn byte_at(offset: usize) -> u8 {
 /// The origin these tests proxy: three resources, one per way a body ends.
 ///
 /// `/short.mp4` is delivered whole and identifies no entity, so the cache
-/// keeps nothing of it; `/cached.mp4` answers ranges and names its entity,
-/// which is what lets the second read of it be a hit; `/slow.mp4` promises
+/// keeps nothing of it. `/cached.mp4` answers ranges and names its entity,
+/// which is what lets the second read of it be a hit. `/slow.mp4` promises
 /// [`SLOW_LEN`] bytes and trickles them until the write fails, which is a
 /// player hanging up seen from the other end.
 struct Origin {
@@ -164,7 +164,7 @@ impl Origin {
     }
 
     /// An origin that promises [`SHORT_LEN`] bytes and hangs up after a
-    /// few: the failure a relayed body reports as its own.
+    /// few. That is the failure a relayed body reports as its own.
     fn truncated(socket: &mut TcpStream) {
         let _ = socket.write_all(
             format!(
@@ -177,7 +177,7 @@ impl Origin {
         let _ = socket.flush();
     }
 
-    /// A playlist, which `/proxy` does not relay but rewrites: the body the
+    /// A playlist, which `/proxy` does not relay but rewrites. The body the
     /// player gets is ours, and is framed as it is written rather than
     /// promised a length.
     fn playlist(socket: &mut TcpStream) {
@@ -256,8 +256,8 @@ fn cached_chunks(cache_root: &std::path::Path) -> usize {
 }
 
 /// A body delivered whole, one the origin cut short, one rewritten as a
-/// playlist, one served off the cache and one the player hung up on: each
-/// is one line, each saying what left the server and what ended it. And a
+/// playlist, one served off the cache and one the player hung up on. Each
+/// is one line, saying what left the server and what ended it. And a
 /// `HEAD`, which is none of them, because it is no body.
 #[test]
 fn every_proxied_body_says_what_left_the_server() -> anyhow::Result<()> {
@@ -281,7 +281,7 @@ fn every_proxied_body_says_what_left_the_server() -> anyhow::Result<()> {
     let origin_base = format!("http://{}", origin.addr);
     let client = reqwest::blocking::Client::new();
 
-    // A `HEAD` first, whose response carries no body at all: whatever the
+    // A `HEAD` first, whose response carries no body at all. Whatever the
     // rest of this test finds in the log, none of it may be about this.
     let short = format!(
         "{base}/proxy/?d={}",
@@ -351,8 +351,8 @@ fn every_proxied_body_says_what_left_the_server() -> anyhow::Result<()> {
         "and the line says what broke it: {fields}"
     );
 
-    // The `HEAD` answered before that `GET` was sent, so by now a line about
-    // it would be in the file. A body that is never sent is not a body.
+    // The `HEAD` was answered before that `GET` was sent, so by now a line
+    // about it would be in the file. A body that is never sent is not a body.
     assert!(
         log_lines::lines_at_stage(&config_dir, STAGE)
             .iter()
@@ -361,8 +361,8 @@ fn every_proxied_body_says_what_left_the_server() -> anyhow::Result<()> {
         log_lines::lines_at_stage(&config_dir, STAGE)
     );
 
-    // A playlist, which is not relayed but rewritten: our body, framed as it
-    // is written, so it promises no length at all.
+    // A playlist, which is not relayed but rewritten. It is our body, framed
+    // as it is written, so it promises no length at all.
     let playlist = client
         .get(format!(
             "{base}/proxy/?d={}",
@@ -428,7 +428,8 @@ fn every_proxied_body_says_what_left_the_server() -> anyhow::Result<()> {
     assert_eq!(fields["range"], two_chunks);
 
     // And a player that hangs up part-way, which is the distinction the
-    // whole line exists for: a body that stopped short of what it promised.
+    // whole line exists for. It is a body that stopped short of what it
+    // promised.
     let mut socket = TcpStream::connect(handle.http_addr())?;
     socket.set_read_timeout(Some(Duration::from_secs(10)))?;
     write!(

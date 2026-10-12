@@ -1,15 +1,15 @@
 // The `/iso` routes end to end: a disc image inside a torrent read through
 // the `torrent:` key form, and one behind a URL read through
-// `/iso/create` -- an ISO 9660 image, a UDF image, an image the parser
-// refuses, and, where a real tool is installed, an image a real tool wrote.
-// Every server here binds ephemeral ports (see embed.rs); nothing here goes
-// near the network.
+// `/iso/create`. The images are an ISO 9660 image, a UDF image, an image
+// the parser refuses, and, where a real tool is installed, an image a real
+// tool wrote. Every server here binds ephemeral ports (see embed.rs), and
+// nothing here goes near the network.
 //
 // The fixtures are the images module's own
 // (`stream_server::images::fixtures`), which is why that module is not
-// `#[cfg(test)]`: what is proved here is that the same bytes the parser's
-// unit tests index are served back by the routes, byte for byte, with
-// nothing written under the cache root.
+// `#[cfg(test)]`. What is proved here is that the routes serve back the
+// same bytes the parser's unit tests index, byte for byte, with nothing
+// written under the cache root.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -33,12 +33,12 @@ use torrent_fixtures::{bearer_client, real_torrent, seed_single_file};
 /// Offline, and with the pin set unknown.
 ///
 /// Every server here reads a disc image this file seeded into the piece
-/// store itself, and nothing ever seeds it again: under the empty pin
-/// record an embedder publishes when it has pinned nothing, the retention
-/// pass takes a torrent nobody is playing about two seconds after it is
-/// added, and every read after that parks for ever ([`fixture_pins`]).
-/// Nothing in this file is about retention, so nothing here wants that
-/// timer.
+/// store itself, and nothing ever seeds it again. Take the empty pin
+/// record an embedder publishes when it has pinned nothing. Under it, the
+/// retention pass takes a torrent nobody is playing about two seconds
+/// after it is added, and every read after that parks for ever
+/// ([`fixture_pins`]). Nothing in this file is about retention, so nothing
+/// here wants that timer.
 fn offline_config() -> ServerConfig {
     fixture_pins::keep_what_the_fixture_seeded(torrent_fixtures::offline_config())
 }
@@ -46,7 +46,7 @@ fn offline_config() -> ServerConfig {
 /// How long a torrent's initial check is given (`embed.rs` waits the same).
 const CHECK_WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The tiny origin the URL tests read from: ranges answered as ranges,
+/// The tiny origin the URL tests read from. It answers ranges as ranges,
 /// with a validator, which is what `ProxySource` needs of an origin.
 struct Origin {
     addr: SocketAddr,
@@ -171,14 +171,14 @@ fn server() -> anyhow::Result<Server> {
 
 impl Server {
     /// A torrent whose one file is `fixture.iso` holding `image`, added and
-    /// checked, its pieces already in the piece store -- the shape
+    /// checked, its pieces already in the piece store. That is the shape
     /// `/iso/stream/torrent:<hash>%2Ffixture.iso/<member>` reads.
     fn add_image_torrent(&self, src: &Path, image: &[u8]) -> anyhow::Result<String> {
         let content = src.join("Disc");
         std::fs::create_dir_all(&content)?;
         std::fs::write(content.join("fixture.iso"), image)?;
         let (torrent, info_hash) = real_torrent(&content);
-        // After the start, never before: the launch-time sweep deletes a
+        // After the start, never before. The launch-time sweep deletes a
         // piece directory the pin set does not name (see
         // `embed.rs::seed_piece_store_pieces`).
         seed_single_file(&self.cache_root, &torrent, image);
@@ -223,8 +223,8 @@ impl Server {
             .send()?)
     }
 
-    /// `POST /iso/create` for `url`, which must succeed; the member URL
-    /// under the key it answered.
+    /// `POST /iso/create` for `url`, which must succeed. It answers the
+    /// member URL under the key the create answered.
     fn create_member_url(&self, url: &str, member: &str) -> anyhow::Result<String> {
         let response = self.create(url)?;
         anyhow::ensure!(
@@ -241,9 +241,9 @@ impl Server {
     /// **Nothing under the cache root but the fetchers' own stores**: the
     /// torrent's pieces (`.pieces/`), the proxy cache's chunks (`.proxy/`)
     /// and librqbit's record of the session beside them. The whole root is
-    /// walked, not one known directory: an extraction anywhere is a file
-    /// outside those, and one inside them is a file that is a served
-    /// member whole -- `members` are those.
+    /// walked, not one known directory. An extraction anywhere is a file
+    /// outside those. One inside them is a file that is a served member
+    /// whole, and `members` are those.
     fn assert_nothing_extracted(&self, members: &[&[u8]]) {
         fn walk(dir: &Path, into: &mut Vec<(PathBuf, u64)>) {
             let Ok(entries) = std::fs::read_dir(dir) else {
@@ -295,8 +295,8 @@ impl Server {
 
 /// What a member of an image answers, whichever way the image came:
 /// served whole, by a range in its middle, by a range back at its head,
-/// and a `HEAD` that promises the same length -- exactly what a plain file
-/// answers, since the framing is the stream route's own.
+/// and a `HEAD` that promises the same length. That is exactly what a
+/// plain file answers, since the framing is the stream route's own.
 fn assert_member_served(url: &str, expected: &[u8]) -> anyhow::Result<()> {
     let anonymous = reqwest::blocking::Client::new();
 
@@ -304,7 +304,7 @@ fn assert_member_served(url: &str, expected: &[u8]) -> anyhow::Result<()> {
     assert_eq!(whole.status(), reqwest::StatusCode::OK, "{url}");
     assert_eq!(whole.bytes()?.as_ref(), expected);
 
-    // Clamped into the file: a range past its end is answered clamped, as
+    // Clamped into the file. A range past its end is answered clamped, as
     // for a plain file, and this is a test of the bytes, not of that.
     let last = expected.len() - 1;
     let (from, to) = (expected.len() / 2, (expected.len() / 2 + 99).min(last));
@@ -341,15 +341,15 @@ fn assert_member_served(url: &str, expected: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The file's bytes as the fixture wrote them: the range the fixture
-/// states, out of the image.
+/// The file's bytes as the fixture wrote them. That is the range the
+/// fixture states, out of the image.
 fn file_bytes(image: &[u8], range: (u64, u64)) -> Vec<u8> {
     image[range.0 as usize..(range.0 + range.1) as usize].to_vec()
 }
 
 /// **An ISO 9660 image inside a torrent is served from the torrent** by the
-/// `torrent:` key form, with no `/create`: a file of the image is a byte
-/// range of the image, so a range request on it is a range read of the
+/// `torrent:` key form, with no `/create`. A file of the image is a byte
+/// range of the image. So a range request on it is a range read of the
 /// piece store, and nothing is written under the cache root.
 #[test]
 fn a_9660_image_inside_a_torrent_is_served_by_range() -> anyhow::Result<()> {
@@ -368,9 +368,9 @@ fn a_9660_image_inside_a_torrent_is_served_by_range() -> anyhow::Result<()> {
 
 /// **A container inside a torrent names its own member.** The `torrent:`
 /// form has no `/create` to be made at, and only the index knows what the
-/// members are called -- so a client that has just sniffed an `.iso` in a
+/// members are called. So a client that has just sniffed an `.iso` in a
 /// torrent has no member path to ask for. `GET /iso/stream/{key}` is where
-/// it is told: it indexes the container (the same `session_for` the member
+/// it is told. It indexes the container (the same `session_for` the member
 /// routes use) and redirects to the member the `/create` rule picks.
 /// Without this redirect the torrent form has no member path a client can
 /// construct, so it is unreachable by any request.
@@ -428,8 +428,8 @@ fn a_9660_image_behind_a_link_is_served_by_range() -> anyhow::Result<()> {
     server.finish()
 }
 
-/// **A UDF image with no ISO 9660 tree** -- the Blu-ray shape -- goes the
-/// same two ways: the 9660 parser finds no `CD001` and the UDF parser
+/// **A UDF image with no ISO 9660 tree** (the Blu-ray shape) goes the
+/// same two ways. The 9660 parser finds no `CD001` and the UDF parser
 /// takes over, and the file is served by range from the torrent.
 #[test]
 fn a_udf_image_inside_a_torrent_is_served_by_range() -> anyhow::Result<()> {
@@ -446,8 +446,8 @@ fn a_udf_image_inside_a_torrent_is_served_by_range() -> anyhow::Result<()> {
     server.finish()
 }
 
-/// A UDF image behind a link, and a file in a directory named by its path
-/// -- `BDMV/STREAM/00000.m2ts`, written in two extents, read back as one
+/// A UDF image behind a link, and a file in a directory named by its path:
+/// `BDMV/STREAM/00000.m2ts`, written in two extents, read back as one
 /// file.
 #[test]
 fn a_udf_image_behind_a_link_is_served_by_range() -> anyhow::Result<()> {
@@ -455,8 +455,8 @@ fn a_udf_image_behind_a_link_is_served_by_range() -> anyhow::Result<()> {
     let origin = Origin::start(HashMap::from([("/bd.iso".to_string(), image.clone())]))?;
     let server = server()?;
 
-    // What the file's bytes are is asked of the parser here, through the
-    // library rather than the route: the route is what is under test, and
+    // The parser is asked here what the file's bytes are, through the
+    // library rather than the route. The route is what is under test, and
     // the parser has its own tests against this fixture.
     let expected = {
         let rt = tokio::runtime::Runtime::new()?;
@@ -481,10 +481,10 @@ fn a_udf_image_behind_a_link_is_served_by_range() -> anyhow::Result<()> {
 }
 
 /// **An image the parser refuses is a status and a sentence**, in the
-/// route's own mapping: a UDF metadata partition map -- what a real Blu-ray
-/// image hits first -- is `415 unsupported` with the map named, and bytes
-/// that are no image at all are `422 malformed`. Both ways in answer the
-/// same, and neither writes anything.
+/// route's own mapping. A UDF metadata partition map (what a real Blu-ray
+/// image hits first) is `415 unsupported` with the map named. Bytes that
+/// are no image at all are `422 malformed`. Both ways in answer the same,
+/// and neither writes anything.
 #[test]
 fn an_image_the_parser_refuses_answers_the_status_and_the_sentence() -> anyhow::Result<()> {
     let src = tempfile::tempdir()?;
@@ -523,7 +523,7 @@ fn an_image_the_parser_refuses_answers_the_status_and_the_sentence() -> anyhow::
         "{body}"
     );
 
-    // The `torrent:` form has no create: the refusal is the answer to the
+    // The `torrent:` form has no create. The refusal is the answer to the
     // first member request.
     let info_hash = server.add_image_torrent(src.path(), &udf::udf_with_metadata_partition())?;
     let refused = anonymous
@@ -572,14 +572,14 @@ fn image_writer() -> Option<(String, Vec<String>)> {
     None
 }
 
-/// **An image a real tool wrote**, inside a torrent, served by range: a
+/// **An image a real tool wrote**, inside a torrent, served by range. A
 /// fixture built in the test proves the route matches this reading of the
-/// standard, and only a tool's image proves it matches what tools write.
-/// Rock Ridge, Joliet and UDF all on, which is what a DVD-shaped image
-/// carries, and a nested file large enough to span pieces.
+/// standard. Only a tool's image proves it matches what tools write. Rock
+/// Ridge, Joliet and UDF are all on, which is what a DVD-shaped image
+/// carries, with a nested file large enough to span pieces.
 ///
-/// Skipped, loudly, when no tool is installed: it is on the machine this
-/// was written on and not on CI.
+/// It is skipped, loudly, when no tool is installed. A tool is on the
+/// machine this was written on and not on CI.
 #[test]
 fn a_real_image_inside_a_torrent_is_served_by_range() -> anyhow::Result<()> {
     let Some((tool, args)) = image_writer() else {

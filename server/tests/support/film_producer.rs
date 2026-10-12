@@ -1,15 +1,16 @@
 //! **A producer over a real film** (`docs/design/renditions.md`, §2.8 and
-//! the interleaving in `mux.rs`): an MP4 that the system `ffmpeg` encodes
-//! for the test, its packets listed by `ffprobe`, handed to the sink the
-//! way the embedder's libavformat producer hands them -- in the file's
+//! the interleaving in `mux.rs`). The system `ffmpeg` encodes an MP4 for
+//! the test, and `ffprobe` lists its packets. They are handed to the sink
+//! the way the embedder's libavformat producer hands them: in the file's
 //! order, from the sync sample at or before the job's `from`, video in
-//! Annex-B, the index of the video's sync samples when the job wants it.
+//! Annex-B, and the index of the video's sync samples when the job wants
+//! it.
 //!
-//! What the synthetic producer (`test_producer.rs`) cannot be: real H.264
-//! and HEVC with B-frames (HEVC's open GOPs too), real AAC at 48 and
-//! 44.1 kHz, and a film big enough per second that where the sound lies
-//! beside the picture matters to a reader -- which is what the system
-//! `ffmpeg` and `ffprobe` then read back, as a receiver's FFmpeg does.
+//! This is what the synthetic producer (`test_producer.rs`) cannot be:
+//! real H.264 and HEVC with B-frames (HEVC's open GOPs too), real AAC at
+//! 48 and 44.1 kHz, and a film big enough per second that where the sound
+//! lies beside the picture matters to a reader. The system `ffmpeg` and
+//! `ffprobe` then read that back, as a receiver's FFmpeg does.
 //!
 //! Every test using it skips, loudly, when `ffmpeg` or the encoder it
 //! needs is not installed.
@@ -35,18 +36,18 @@ pub enum Picture {
 /// What the picture shows, and how it is encoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Look {
-    /// Moving noise at 640x360, 24 frames a second, at [`Recipe::kbps`]:
-    /// a film big enough per second that where the sound lies matters.
+    /// Moving noise at 640x360, 24 frames a second, at [`Recipe::kbps`]. It
+    /// is a film big enough per second that where the sound lies matters.
     Noise,
     /// The app's own test film (xtremio `rust/tests/support/film.rs`,
     /// `make_with` for a long film): `testsrc` at 320x240, 25 frames a
-    /// second, `ultrafast`; H.264 with two B-frames, or HEVC Main 10 tagged
-    /// HDR10 with three B-frames and x265's open GOPs. No bitrate.
+    /// second, `ultrafast`. It is H.264 with two B-frames, or HEVC Main 10
+    /// tagged HDR10 with three B-frames and x265's open GOPs. No bitrate.
     App,
     /// The foreman's open-GOP clip: `testsrc2` at 1280x720, 25 frames a
-    /// second, x265 at its default preset with open GOPs -- whose number
-    /// of leading pictures varies from GOP to GOP (0, 3, 1, 0, 0, 1, 1, 4,
-    /// ... measured). HEVC only; no bitrate.
+    /// second, x265 at its default preset with open GOPs. Their number of
+    /// leading pictures varies from GOP to GOP (0, 3, 1, 0, 0, 1, 1, 4,
+    /// ... measured). HEVC only, and no bitrate.
     OpenGop,
 }
 
@@ -105,8 +106,8 @@ fn has_encoder(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether `ffmpeg` and `ffprobe` are here with what `picture` needs; says
-/// so on stderr when not, for `test`, and the test returns.
+/// Whether `ffmpeg` and `ffprobe` are here with what `picture` needs. It
+/// says so on stderr when not, for `test`, and the test returns.
 pub fn tools_for(picture: Picture, test: &str) -> bool {
     let encoder = match picture {
         Picture::H264 => "libx264",
@@ -141,7 +142,7 @@ fn boxes(data: &[u8]) -> Vec<([u8; 4], &[u8])> {
     out
 }
 
-/// The body of the first `kind` box inside `moov`, found by its name: the
+/// The body of the first `kind` box inside `moov`, found by its name. The
 /// `moov` holds nothing but boxes, so the name is never sample data.
 fn in_moov<'a>(file: &'a [u8], kind: &[u8; 4]) -> &'a [u8] {
     let moov = boxes(file)
@@ -437,8 +438,8 @@ impl Film {
         })
     }
 
-    /// How many leading pictures each GOP has: the samples after its sync
-    /// sample in decode order shown before it.
+    /// How many leading pictures each GOP has. Those are the samples after
+    /// its sync sample in decode order that are shown before it.
     pub fn leading_pictures(&self) -> Vec<usize> {
         let mut out = Vec::new();
         let mut key = None;
@@ -482,7 +483,7 @@ impl Film {
     }
 
     /// A packet's bytes as the producer hands them: the video's NAL units
-    /// behind start codes (Annex-B), the sound's as they are.
+    /// behind start codes (Annex-B), and the sound's as they are.
     fn data(&self, packet: &Packet) -> Bytes {
         let raw = self
             .bytes
@@ -505,9 +506,9 @@ impl Film {
 /// The producer: one thread per run, the film's packets in its order.
 pub struct FilmProducer {
     film: Arc<Film>,
-    /// Whether it reports the film's index when a job wants it: a source
-    /// with none -- a transport stream, a Matroska file without cues -- is
-    /// laid out by estimate.
+    /// Whether it reports the film's index when a job wants it. A source
+    /// with none (a transport stream, a Matroska file without cues) is laid
+    /// out by estimate.
     indexed: bool,
 }
 
@@ -557,8 +558,8 @@ fn produce(film: &Film, job: Job, indexed: bool) {
         return;
     }
     // As a demuxer seeks: to the sync sample at or before `from`, and on
-    // in the file's order from there; from the film's start, from the
-    // first byte.
+    // in the file's order from there. From the film's start, it starts
+    // from the first byte.
     let from_us = from.as_micros() as i64;
     let start = if from_us == 0 {
         0

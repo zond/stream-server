@@ -1,23 +1,23 @@
 //! What a torrent wants between `POST /create` and the first stream request.
 //!
-//! Both create routes work out which file the caller means --
-//! `fileMustInclude` names it, `guessFileIdx` asks for the season/episode
-//! guess -- and that answer becomes the add's want-set
-//! (`enginefs::backend::TorrentPlacement::choose`), not just a JSON field:
-//! otherwise a season pack wants every file, forty gigabytes fetched, and a
-//! `stats.json` poller watches the pack's progress rather than the
-//! episode's for however long the client sits on the details page before it
-//! plays anything.
+//! Both create routes work out which file the caller means.
+//! `fileMustInclude` names it, and `guessFileIdx` asks for the
+//! season/episode guess. That answer becomes the add's want-set
+//! (`enginefs::backend::TorrentPlacement::choose`), not just a JSON field.
+//! Otherwise a season pack wants every file, forty gigabytes fetched. A
+//! `stats.json` poller would then watch the pack's progress rather than the
+//! episode's, for however long the client sits on the details page before
+//! it plays anything.
 //!
-//! What that makes is observable from outside: `stats.json`'s `isFinished`
-//! is "nothing left to fetch of what this torrent wants", so with one
+//! What that makes is observable from outside. `stats.json`'s `isFinished`
+//! is "nothing left to fetch of what this torrent wants". So with one
 //! episode of a two-episode pack on the disk, a create that names that
-//! episode is finished and a create that names nothing is not. The control
+//! episode is finished, and a create that names nothing is not. The control
 //! half of the test is what makes that a statement about the want-set and
 //! not about the fixture.
 //!
-//! A binary of its own because the file this would otherwise belong in is
-//! being edited elsewhere; the shared scaffolding is
+//! It is a binary of its own because the file this would otherwise belong
+//! in is being edited elsewhere. The shared scaffolding is
 //! `support/torrent_fixtures.rs`, and the multi-file seeding here is its own.
 
 use std::path::Path;
@@ -36,7 +36,7 @@ mod torrent_fixtures;
 use torrent_fixtures::bearer_client;
 
 /// 16 KiB pieces, and both files a whole number of them, so no piece
-/// straddles the two: a fixture that seeds one file seeds whole pieces.
+/// straddles the two. A fixture that seeds one file seeds whole pieces.
 const PIECE: u64 = 16 * 1024;
 const EPISODE_ONE: &str = "Show.S01E01.mkv";
 const EPISODE_TWO: &str = "Show.S01E02.mkv";
@@ -78,8 +78,8 @@ fn season_pack(dir: &Path) -> (Vec<u8>, String) {
     })
 }
 
-/// The index of `name` in the torrent's own file order -- which is
-/// `create_torrent`'s directory walk, i.e. the filesystem's readdir order
+/// The index of `name` in the torrent's own file order. That order is
+/// `create_torrent`'s directory walk, i.e. the filesystem's readdir order,
 /// and never the order the fixture wrote the files in.
 fn file_index(torrent_bytes: &[u8], name: &str) -> usize {
     let meta = librqbit::torrent_from_bytes(torrent_bytes).expect("parse the torrent back");
@@ -96,10 +96,11 @@ fn file_index(torrent_bytes: &[u8], name: &str) -> usize {
 }
 
 /// Pre-seed just `only`'s pieces where the server reads them: the piece
-/// store. The two-file case of `embed.rs`'s `seed_piece_store_pieces`, read
-/// back through the metainfo's own file order.
+/// store. This is the two-file case of `embed.rs`'s
+/// `seed_piece_store_pieces`, read back through the metainfo's own file
+/// order.
 ///
-/// **Call this after the server has started**, never before: the launch-time
+/// **Call this after the server has started**, never before. The launch-time
 /// sweep deletes every piece directory the embedder's pin set does not name.
 fn seed_one_file(cache_root: &Path, torrent_bytes: &[u8], content: &Path, only: &str) {
     let meta = librqbit::torrent_from_bytes(torrent_bytes).expect("parse the torrent back");
@@ -167,7 +168,7 @@ fn config(cache: &Path, config_dir: &Path) -> stream_server::ServerConfig {
 /// The torrent's stats, polled until it is past the states it is only ever
 /// passing through (no metadata yet, hash check running). Every fixture here
 /// is a blob add with its data already on the disk, so both settle in
-/// milliseconds; the budget is for a loaded runner.
+/// milliseconds. The budget is for a loaded runner.
 fn settled_stats(handle: &stream_server::ServerHandle, info_hash: &str) -> serde_json::Value {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -202,26 +203,26 @@ fn wait_until_finished(handle: &stream_server::ServerHandle, info_hash: &str) {
 }
 
 /// A `POST /create` that names its file leaves the torrent wanting that file
-/// and nothing else -- before any reader exists, which is the whole window
-/// this is about.
+/// and nothing else. It does so before any reader exists, which is the
+/// whole window this is about.
 ///
-/// Read through `stats.json`'s `isFinished`, which is "nothing left to
-/// fetch of what this torrent wants": with only the named episode on the
-/// disk, a torrent that wants only that episode is finished, and one that
-/// wants the pack is not and never will be, since there is no swarm
-/// anywhere in this suite. The control half is the same fixture, the same
-/// seed and the same route with nothing naming a file, so the difference is
-/// the want-set and not the data.
+/// It is read through `stats.json`'s `isFinished`, which is "nothing left
+/// to fetch of what this torrent wants". With only the named episode on the
+/// disk, a torrent that wants only that episode is finished. One that wants
+/// the pack is not and never will be, since there is no swarm anywhere in
+/// this suite. The control half is the same fixture, the same seed and the
+/// same route with nothing naming a file. So the difference is the
+/// want-set and not the data.
 ///
 /// `isFinished` here is the wanted answer and not the hazard the empty
-/// want-set is: the file the client asked for really is on the disk, so a
+/// want-set is. The file the client asked for really is on the disk, so a
 /// torrent that stops asking peers for the rest of the pack is doing the
 /// right thing. Nothing in this change can produce an *empty* want-set,
 /// which would say the same with nothing on the disk at all (see
 /// `add_torrent_placed_wants_the_file_the_choice_names`).
 ///
-/// `phase` is deliberately not the assertion: `Engine::get_statistics`
-/// focuses it on its own hint-less guess (the largest media file), so it
+/// `phase` is deliberately not the assertion. `Engine::get_statistics`
+/// focuses it on its own hint-less guess (the largest media file). So it
 /// answers about the pack's biggest episode whatever the torrent wants,
 /// independent of the want-set.
 #[test]
@@ -266,9 +267,9 @@ fn a_create_that_names_its_episode_wants_that_episode_and_not_the_pack() -> anyh
         "the other one is not on the disk and is not wanted: {stats}"
     );
 
-    // The control: the same torrent, the same seeded episode, a create that
-    // names no file at all. It wants both episodes, and the second one is
-    // not there and cannot arrive.
+    // The control: the same torrent, the same seeded episode, and a create
+    // that names no file at all. It wants both episodes, and the second one
+    // is not there and cannot arrive.
     let control_cache = tempfile::tempdir()?;
     let control_config = tempfile::tempdir()?;
     let control_handle = stream_server::start(config(control_cache.path(), control_config.path()))?;

@@ -2,15 +2,15 @@
 //! `docs/design/media-pipeline.md` §2.7): `ServerHandle::publish` and
 //! `unpublish`, and the LAN listener's one route, `/cast/{token}`.
 //!
-//! Every kind of id casts -- a torrent file, a link through `/proxy`'s
-//! cache, a Google Drive file, a finished download of a link, a member of a
-//! single-file RAR -- with the range framing every media route shares; an
-//! unknown token is a `404` the reachability count still counts; a cast
-//! with a play token is the viewer's playback; an unpublish, or the
-//! listener's stop, ends a body in flight; and a publication holds its id
+//! Every kind of id casts, with the range framing every media route
+//! shares: a torrent file, a link through `/proxy`'s cache, a Google Drive
+//! file, a finished download of a link, a member of a single-file RAR. An
+//! unknown token is a `404` the reachability count still counts. A cast
+//! with a play token is the viewer's playback. An unpublish, or the
+//! listener's stop, ends a body in flight. A publication holds its id
 //! against eviction. What the LAN listener does *not* serve is
-//! `embed.rs`'s `lan_media_listener_serves_published_tokens_and_nothing_else`;
-//! that no token reaches a log line is `log_redaction.rs`'s.
+//! `embed.rs`'s `lan_media_listener_serves_published_tokens_and_nothing_else`.
+//! That no token reaches a log line is `log_redaction.rs`'s.
 //!
 //! Every server here is offline and on ephemeral ports, and every origin is
 //! a loopback fake of this file's own ([`Origin`]).
@@ -43,8 +43,8 @@ use torrent_fixtures::{bearer_client, offline_config, piece_store, real_torrent}
 const BOUND: Duration = Duration::from_secs(120);
 
 /// How long a body that should have been cut is given to end. A cut body
-/// ends at once; one that is not cut never ends (its next piece is one
-/// nobody has, and [`parked_cast`]'s client has no timeout), so this is the
+/// ends at once. One that is not cut never ends (its next piece is one
+/// nobody has, and [`parked_cast`]'s client has no timeout). So this is the
 /// whole of what a broken cut costs a run.
 const CUT_BOUND: Duration = Duration::from_secs(20);
 
@@ -61,7 +61,7 @@ fn payload(len: usize) -> Vec<u8> {
 }
 
 /// Permit and start the LAN listener the way a cast session does: the
-/// setting, then the start. Answers the LAN base, `http://addr`.
+/// setting, then the start. It answers the LAN base, `http://addr`.
 fn start_lan(handle: &stream_server::ServerHandle) -> anyhow::Result<String> {
     handle.update_settings(serde_json::json!({ "lanMediaEnabled": true }))?;
     let addr = handle
@@ -102,8 +102,9 @@ fn header(response: &reqwest::blocking::Response, name: &str) -> String {
 }
 
 /// **The cast of `token` answers `expected` (a file of that many bytes)
-/// with ranges and `HEAD`**: a `206` with the range's bytes and framing, a
-/// `200` with the whole file, and a `HEAD` with the length and no body.
+/// with ranges and `HEAD`.** That is a `206` with the range's bytes and
+/// framing, a `200` with the whole file, and a `HEAD` with the length and
+/// no body.
 fn assert_casts(lan: &str, token: &CastToken, expected: &[u8]) -> anyhow::Result<()> {
     let len = expected.len();
     let (first, last) = (len / 3 + 7, len / 3 + 7 + 20_000.min(len / 2));
@@ -148,8 +149,8 @@ fn until(what: &str, mut ready: impl FnMut() -> anyhow::Result<bool>) -> anyhow:
 
 /// Seed the pieces of `torrent` whose index `keep` accepts, in the piece
 /// store where the server reads them, from the files under `content` in
-/// the order the metainfo lists them. **After the server has started**:
-/// the launch sweep deletes a piece directory seeded before it.
+/// the order the metainfo lists them. **Call it after the server has
+/// started.** The launch sweep deletes a piece directory seeded before it.
 fn seed(cache_root: &Path, torrent: &[u8], content: &Path, keep: impl Fn(usize) -> bool) {
     let meta = librqbit::torrent_from_bytes(torrent).expect("parse the torrent back");
     let info_hash = meta.info_hash.as_string();
@@ -295,13 +296,12 @@ const FILE_ID: &str = "1CastFixtureFile";
 const ORIGIN_LEN: usize = 300 * 1024;
 
 /// One loopback listener standing in for a CDN, Google Drive and the
-/// pairing service at once: `/film.bin` serves ranges, `/whole.bin`
-/// answers every request with the whole file, `/refresh` mints
-/// Drive tokens and `/drive/v3/files/...` serves ranges to whoever holds
-/// one.
+/// pairing service at once. `/film.bin` serves ranges. `/whole.bin`
+/// answers every request with the whole file. `/refresh` mints Drive
+/// tokens, and `/drive/v3/files/...` serves ranges to whoever holds one.
 struct Origin {
     addr: SocketAddr,
-    /// Set by [`Origin::kill`]: every connection after it is dropped
+    /// Set by [`Origin::kill`]. Every connection after it is dropped
     /// unanswered, and counted in [`Origin::after_death`].
     dead: Arc<AtomicBool>,
     after_death: Arc<AtomicUsize>,
@@ -440,8 +440,8 @@ fn respond(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]
 }
 
 /// A server with nothing of its own on the network, pointed at `origin`
-/// for Drive, with the LAN listener started: the handle, the LAN base and
-/// the directories it lives in.
+/// for Drive, with the LAN listener started. It answers the handle, the
+/// LAN base and the directories it lives in.
 fn origin_server(
     origin: &Origin,
 ) -> anyhow::Result<(stream_server::ServerHandle, String, [tempfile::TempDir; 2])> {
@@ -481,9 +481,9 @@ fn stop(handle: stream_server::ServerHandle) -> anyhow::Result<()> {
 
 // --- Every kind of id casts --------------------------------------------------
 
-/// **A torrent id casts**: registered by the URL stremio-core builds,
-/// published, and read from the LAN listener by range, whole and by
-/// `HEAD`.
+/// **A torrent id casts.** It is registered by the URL stremio-core
+/// builds, published, and read from the LAN listener by range, whole and
+/// by `HEAD`.
 #[test]
 fn a_torrent_id_casts() -> anyhow::Result<()> {
     let film = payload(5 * PIECE + 321);
@@ -501,8 +501,8 @@ fn a_torrent_id_casts() -> anyhow::Result<()> {
 }
 
 /// **A `/proxy` id casts**, through the proxy cache as the app's player
-/// reads it -- what the LAN could never fetch before: `/proxy` is an open
-/// relay and was never on the LAN listener.
+/// reads it. The LAN could never fetch this before, because `/proxy` is an
+/// open relay and was never on the LAN listener.
 #[test]
 fn a_proxy_id_casts() -> anyhow::Result<()> {
     let origin = Origin::start()?;
@@ -516,7 +516,7 @@ fn a_proxy_id_casts() -> anyhow::Result<()> {
     stop(handle)
 }
 
-/// **A Drive id casts**, under the grant its supplier gives: the receiver
+/// **A Drive id casts**, under the grant its supplier gives. The receiver
 /// sees one file under a random token, never a Drive route.
 #[test]
 fn a_drive_id_casts() -> anyhow::Result<()> {
@@ -532,7 +532,7 @@ fn a_drive_id_casts() -> anyhow::Result<()> {
     stop(handle)
 }
 
-/// **A finished download of a link casts with the origin gone**: the id
+/// **A finished download of a link casts with the origin gone.** The id
 /// resolves to the held entry, off the disk, and the receiver reads it with
 /// no origin asked.
 #[test]
@@ -562,8 +562,9 @@ fn a_finished_url_download_casts_with_the_origin_gone() -> anyhow::Result<()> {
     stop(handle)
 }
 
-/// **A member of a single-file RAR casts**: the `torrent:` form's id, read
-/// from the LAN as the member's own bytes, its own length and its own type.
+/// **A member of a single-file RAR casts.** The `torrent:` form's id is
+/// read from the LAN as the member's own bytes, its own length and its own
+/// type.
 #[cfg(feature = "rar")]
 #[test]
 fn a_member_of_a_single_file_rar_casts() -> anyhow::Result<()> {
@@ -588,10 +589,10 @@ fn a_member_of_a_single_file_rar_casts() -> anyhow::Result<()> {
     fixture.stop()
 }
 
-/// **A link whose origin will not range is refused, not served**: a
+/// **A link whose origin will not range is refused, not served.** A
 /// player on this device can read it forward through `/proxy`, but nothing
-/// here can seek it for a receiver, so `HEAD` and `GET` both answer `501`
-/// with the refusal -- never a `200` of no length.
+/// here can seek it for a receiver. So `HEAD` and `GET` both answer `501`
+/// with the refusal, never a `200` of no length.
 #[test]
 fn a_link_that_will_not_range_is_refused_on_the_cast_route() -> anyhow::Result<()> {
     let origin = Origin::start()?;
@@ -623,7 +624,7 @@ fn a_link_that_will_not_range_is_refused_on_the_cast_route() -> anyhow::Result<(
 // --- Tokens, counts, plays ----------------------------------------------------
 
 /// **A token's `Debug` says nothing of it**, so nothing that derives
-/// `Debug` around one can put it in a log line; its string is the URL's.
+/// `Debug` around one can put it in a log line. Its string is the URL's.
 #[test]
 fn a_tokens_debug_hides_it() -> anyhow::Result<()> {
     let origin = Origin::start()?;
@@ -642,9 +643,9 @@ fn a_tokens_debug_hides_it() -> anyhow::Result<()> {
 }
 
 /// **An unknown token is a `404`**, and the two counts read it as what it
-/// is: the receiver reached this device (the requests count, which a `404`
+/// is. The receiver reached this device (the requests count, which a `404`
 /// has always counted) and was served nothing (the bodies count). A
-/// published token's `GET` is a body; its `HEAD` is not.
+/// published token's `GET` is a body, and its `HEAD` is not.
 #[test]
 fn an_unknown_token_is_a_404_counted_as_a_request_and_not_a_body() -> anyhow::Result<()> {
     let origin = Origin::start()?;
@@ -697,9 +698,9 @@ fn an_unknown_token_is_a_404_counted_as_a_request_and_not_a_body() -> anyhow::Re
     stop(handle)
 }
 
-/// **A cast published with a play token is the viewer's playback**: the
+/// **A cast published with a play token is the viewer's playback.** The
 /// receiver's read moves the viewer's play session to the file, as the
-/// app's own player's would; a cast without one is an aside and moves
+/// app's own player's would. A cast without one is an aside and moves
 /// nothing.
 #[test]
 fn a_cast_with_a_play_token_moves_the_session_and_one_without_does_not() -> anyhow::Result<()> {
@@ -743,7 +744,7 @@ fn a_cast_with_a_play_token_moves_the_session_and_one_without_does_not() -> anyh
 }
 
 /// A torrent of one film whose pieces after the second nobody has, cast
-/// whole: the body delivers the first two pieces and parks. Answers the
+/// whole. The body delivers the first two pieces and parks. It answers the
 /// fixture, the token and the response with those two pieces read off it.
 fn parked_cast() -> anyhow::Result<(TorrentFixture, CastToken, reqwest::blocking::Response)> {
     let film = payload(8 * PIECE);
@@ -755,7 +756,7 @@ fn parked_cast() -> anyhow::Result<(TorrentFixture, CastToken, reqwest::blocking
     let token = fixture
         .handle
         .publish(&fixture.register("film.mkv")?, None)?;
-    // No timeout: reqwest's default of thirty seconds would end a body the
+    // No timeout. reqwest's default of thirty seconds would end a body the
     // cut never reached, and the test would pass on it.
     let mut response = reqwest::blocking::Client::builder()
         .timeout(None)
@@ -770,7 +771,7 @@ fn parked_cast() -> anyhow::Result<(TorrentFixture, CastToken, reqwest::blocking
 }
 
 /// Read what is left of `response` on a thread of its own, and answer
-/// whether it ended -- with an error or short of its length -- within
+/// whether it ended (with an error or short of its length) within
 /// [`CUT_BOUND`] of `cut` being called.
 fn ends_when(mut response: reqwest::blocking::Response, cut: impl FnOnce()) -> anyhow::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -778,7 +779,7 @@ fn ends_when(mut response: reqwest::blocking::Response, cut: impl FnOnce()) -> a
         let mut rest = Vec::new();
         let _ = tx.send((response.read_to_end(&mut rest), rest.len()));
     });
-    // The body is parked on the missing piece, and stays parked: nothing
+    // The body is parked on the missing piece, and stays parked. Nothing
     // but the cut can end it.
     assert!(
         rx.recv_timeout(Duration::from_millis(500)).is_err(),
@@ -795,7 +796,7 @@ fn ends_when(mut response: reqwest::blocking::Response, cut: impl FnOnce()) -> a
     Ok(())
 }
 
-/// **`unpublish` ends a body mid-stream**: a receiver parked on a piece
+/// **`unpublish` ends a body mid-stream.** A receiver parked on a piece
 /// nobody has sees its body end at once, and the token answers `404` from
 /// then on.
 #[test]
@@ -811,8 +812,8 @@ fn unpublish_ends_a_body_mid_stream() -> anyhow::Result<()> {
     fixture.stop()
 }
 
-/// **Stopping the listener unpublishes every token and ends every body**:
-/// the receiver mid-file is cut, and a listener started again serves none
+/// **Stopping the listener unpublishes every token and ends every body.**
+/// The receiver mid-file is cut, and a listener started again serves none
 /// of the old tokens.
 #[test]
 fn stopping_the_lan_listener_unpublishes_all_and_ends_bodies() -> anyhow::Result<()> {
@@ -843,8 +844,8 @@ fn stopping_the_lan_listener_unpublishes_all_and_ends_bodies() -> anyhow::Result
 }
 
 /// **A publication keeps its id from eviction until it is unpublished**,
-/// as an open reader does; and a publish is refused for an id this server
-/// does not hold and while the listener is not running.
+/// as an open reader does. A publish is refused for an id this server does
+/// not hold, and while the listener is not running.
 #[test]
 fn a_publication_holds_its_id_until_unpublished() -> anyhow::Result<()> {
     let origin = Origin::start()?;
@@ -884,9 +885,9 @@ fn a_publication_holds_its_id_until_unpublished() -> anyhow::Result<()> {
 // --- What the cast panel is told -------------------------------------------------
 
 /// **What a plain publication tells the app's panel**
-/// (`ServerHandle::cast_numbers`): a `HEAD` is a request and no body; a
+/// (`ServerHandle::cast_numbers`). A `HEAD` is a request and no body. A
 /// range that begins mid-file is a body from there, its bytes sent and
-/// read from the source; a receiver that lets go partway ends its body
+/// read from the source. A receiver that lets go partway ends its body
 /// with what it took, not the range's length.
 #[test]
 fn the_cast_numbers_count_a_range_mid_file_and_a_body_the_receiver_cut() -> anyhow::Result<()> {

@@ -1,8 +1,8 @@
 //! The scaffolding every embedded-server test binary builds on: the offline
 //! config, the control client, a real torrent of a directory, and the piece
-//! store seeded and read back. Shared by `#[path]`, one copy per including
-//! binary, so the unused-function lint is off: each includer uses the part
-//! its own subject needs.
+//! store seeded and read back. It is shared by `#[path]`, one copy per
+//! including binary, so the unused-function lint is off. Each includer uses
+//! the part its own subject needs.
 
 #![allow(dead_code)]
 
@@ -13,34 +13,34 @@ use stream_server::{ServerConfig, ServerHandle};
 
 /// The base config every test spreads from: `ServerConfig::default()`
 /// with DHT bootstrap name resolution turned off, so starting a server makes
-/// no DNS query and no DNS-over-HTTPS request, and with the public tracker
-/// lists off, so adding a torrent announces to nothing. The stock configs
-/// leave both on (`embed.rs` asserts it); tests must stay offline, and on a
-/// runner with no DNS at all the resolution ladder would otherwise spend its
-/// whole budget failing, once per server.
+/// no DNS query and no DNS-over-HTTPS request. The public tracker lists are
+/// off too, so adding a torrent announces to nothing. The stock configs
+/// leave both on (`embed.rs` asserts it). Tests must stay offline. On a
+/// runner with no DNS at all, the resolution ladder would otherwise spend
+/// its whole budget failing, once per server.
 ///
 /// The tracker half matters even though [`real_torrent`] passes
-/// `trackers: Vec::new()`: `EngineFS::merged_trackers` prepends the built-in
-/// list and whatever the tracker manager has fetched below the caller's, so
-/// an empty caller list alone does not stop announcing -- only
+/// `trackers: Vec::new()`. `EngineFS::merged_trackers` prepends the built-in
+/// list and whatever the tracker manager has fetched below the caller's. So
+/// an empty caller list alone does not stop announcing. Only
 /// `use_public_trackers: false` above does (measured: a torrent's `sources`
 /// otherwise carry twenty-seven public trackers).
 pub fn offline_config() -> ServerConfig {
     ServerConfig {
         resolve_dht_bootstrap_names: false,
         use_public_trackers: false,
-        // And no multicast either: local service discovery would announce
-        // every test's info hash to the runner's network, letting two
-        // concurrent runs of a fixture built from the same bytes (the same
-        // info hash) find each other and feed each other pieces.
+        // And no multicast either. Local service discovery would announce
+        // every test's info hash to the runner's network. Two concurrent
+        // runs of a fixture built from the same bytes (the same info hash)
+        // would then find each other and feed each other pieces.
         enable_local_service_discovery: false,
         enable_dht: false,
         // Nor reachable: the torrent listener on loopback alone.
         torrent_listen_port: enginefs::backend::TorrentListenPort::Loopback,
         // An embedder that keeps a pin record and has nothing in it yet.
-        // `None` is not the same thing -- it is "nobody said", which keeps
-        // every torrent's data and reports it all as pinned -- and it has a
-        // test of its own; spreading it here would turn every retention and
+        // `None` is not the same thing. It is "nobody said", which keeps
+        // every torrent's data and reports it all as pinned, and it has a
+        // test of its own. Spreading it here would turn every retention and
         // idle-pause test into one about a cache that may not be touched. A
         // test whose fixture nothing re-seeds opts out through
         // `fixture_pins::keep_what_the_fixture_seeded`.
@@ -49,8 +49,8 @@ pub fn offline_config() -> ServerConfig {
     }
 }
 
-/// Client builder that sends the server's bearer token on every request --
-/// every control route requires it, and every server has one.
+/// Client builder that sends the server's bearer token on every request.
+/// Every control route requires it, and every server has one.
 pub fn bearer_client_builder(handle: &ServerHandle) -> reqwest::blocking::ClientBuilder {
     let mut headers = reqwest::header::HeaderMap::new();
     let token = handle.auth_token().expect("every launch generates a token");
@@ -66,7 +66,7 @@ pub fn bearer_client(handle: &ServerHandle) -> anyhow::Result<reqwest::blocking:
 }
 
 /// A real `.torrent` (correct piece hashes, 16 KiB pieces) built from the
-/// files under `dir`, whose name becomes the torrent name. Returns the
+/// files under `dir`, whose name becomes the torrent name. It returns the
 /// metainfo bytes and the info hash.
 pub fn real_torrent(dir: &Path) -> (Vec<u8>, String) {
     real_torrent_with_pieces(dir, 16 * 1024)
@@ -100,10 +100,10 @@ pub fn piece_store(cache_root: &Path) -> enginefs::piece_store::StoreRoot {
 }
 
 /// Pre-seed a one-file torrent's every piece where the server reads them:
-/// the piece store. The single-file case of `embed.rs`'s
+/// the piece store. This is the single-file case of `embed.rs`'s
 /// `seed_piece_store_pieces`, with the layout asked of the store.
 ///
-/// **Call this after the server has started**, never before: the
+/// **Call this after the server has started**, never before. The
 /// launch-time sweep deletes every piece directory the embedder's pin set
 /// does not name, and one seeded before the process comes up is exactly
 /// that.
@@ -137,7 +137,7 @@ pub fn seed_single_file(cache_root: &Path, torrent_bytes: &[u8], content: &[u8])
     }
 }
 
-/// How many pieces the store holds for a torrent -- asked of the store, so
+/// How many pieces the store holds for a torrent. The store is asked, so
 /// nothing here has to know how they are laid out.
 pub fn pieces_held(cache_root: &Path, info_hash: &str) -> usize {
     piece_store(cache_root).stat(info_hash).pieces.len()

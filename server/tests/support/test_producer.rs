@@ -1,13 +1,15 @@
-//! A rendition producer for the tests (`docs/design/renditions.md` §5 F1):
-//! Rust, on a plain thread per run, emitting synthetic samples through the
-//! same `Producer` trait the embedder's Kotlin producer implements.
+//! A rendition producer for the tests (`docs/design/renditions.md` §5 F1).
+//! It is Rust, on a plain thread per run, emitting synthetic samples
+//! through the same `Producer` trait the embedder's Kotlin producer
+//! implements.
 //!
-//! What it emits is H.264-shaped video -- a fixed GOP, a sync sample every
+//! It emits H.264-shaped video: a fixed GOP, a sync sample every
 //! [`Knobs::gop`] frames at [`Knobs::fps`], x264's real SPS and PPS as
-//! `csd-0`/`csd-1`, and NAL units in Annex-B whose payload names the frame
-//! -- and AAC frames every 1024 samples at 48 kHz (21.33 ms) with a stereo
-//! AAC-LC AudioSpecificConfig. A run from `from` starts as a demuxer does:
-//! video at the sync sample at or before it, audio one frame before it.
+//! `csd-0`/`csd-1`, and NAL units in Annex-B whose payload names the
+//! frame. It emits AAC frames every 1024 samples at 48 kHz (21.33 ms) with
+//! a stereo AAC-LC AudioSpecificConfig. A run from `from` starts as a
+//! demuxer does: video at the sync sample at or before it, audio one frame
+//! before it.
 //!
 //! The knobs: a speed factor (a producer slower than real time paces
 //! itself, which is the work being simulated, not a wait for anything); a
@@ -53,7 +55,7 @@ pub enum IndexKnob {
     /// film's.
     Proportional,
     /// The same, but the first sync sample at or after `at_us` is put one
-    /// byte before the next (or the source's end, for the last): the
+    /// byte before the next (or the source's end, for the last). The
     /// segment it starts gets almost no bytes of the source, and overflows
     /// its slot.
     Squeezed { at_us: i64 },
@@ -66,32 +68,32 @@ pub struct Knobs {
     pub gop: u32,
     /// How long the film is: the producer ends there.
     pub length: Duration,
-    /// Media time per wall time; `None` is as fast as it can.
+    /// Media time per wall time. `None` is as fast as it can.
     pub speed: Option<f64>,
     /// The run (counted from 0) that reports [`OTHER_SPS`].
     pub other_format_on_run: Option<usize>,
     /// The run that fails after a few samples, with this sentence.
     pub fail_on_run: Option<(usize, String)>,
     /// Read one byte of the job's reader at `stride` x the GOP's index at
-    /// every sync sample: a seek and a read the source answers.
+    /// every sync sample. That is a seek and a read the source answers.
     pub read_stride: Option<u64>,
     /// Filler bytes in each video frame after its NAL header and number.
     pub frame_bytes: usize,
-    /// The index reported; `None` reports none.
+    /// The index reported. `None` reports none.
     pub index: Option<IndexKnob>,
-    /// A gate the first run waits at before it reports its index -- a
-    /// source whose index is behind a stalled swarm -- until the test opens
+    /// A gate the first run waits at before it reports its index (a source
+    /// whose index is behind a stalled swarm). It waits until the test opens
     /// it, or the run is stopped.
     pub index_gate: Option<Arc<Gate>>,
-    /// A gate every run waits at after its first sample -- the layout is
-    /// fixed by then, the slots not made -- until the test opens it.
+    /// A gate every run waits at after its first sample, until the test
+    /// opens it. The layout is fixed by then, and the slots are not made.
     pub start_gate: Option<Arc<Gate>>,
     /// A gate run `n` (counted from 0) alone waits at after its first
     /// sample, until the test opens it.
     pub run_gate: Option<(usize, Arc<Gate>)>,
     /// A gate every run waits at before it hands over the first sample at
-    /// or after this time, until the test opens it: a source that stalls
-    /// there.
+    /// or after this time, until the test opens it. It is a source that
+    /// stalls there.
     pub time_gate: Option<(i64, Arc<Gate>)>,
 }
 
@@ -121,8 +123,8 @@ impl Gate {
     }
 
     /// Wait until the gate opens (`true`) or `stopped` says the run is gone
-    /// (`false`). The stop is looked at between short waits: the sink has
-    /// no way to wake this.
+    /// (`false`). The stop is looked at between short waits, because the
+    /// sink has no way to wake this.
     fn pass(&self, stopped: impl Fn() -> bool) -> bool {
         let mut open = self.open.lock().unwrap();
         self.parked.store(true, Ordering::SeqCst);
@@ -305,7 +307,7 @@ impl Producer for TestProducer {
 }
 
 /// A frame number as four bytes with the top bit set in each, so a NAL
-/// payload never holds a start code: 28 bits, seven to a byte.
+/// payload never holds a start code. That gives 28 bits, seven to a byte.
 pub fn frame_bytes(frame: i64) -> [u8; 4] {
     let frame = frame as u32;
     [
