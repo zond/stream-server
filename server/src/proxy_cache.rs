@@ -1,37 +1,37 @@
 //! What `/proxy` fetched, kept on disk so the next read of the same bytes
 //! does not go back to the origin.
 //!
-//! A player seeks; it does not download. So the unit here is a byte range and
-//! never a response: the cache answers the part of a range it holds, the
-//! origin is asked only for the rest, and a miss streams to the player *as it
-//! fills* rather than being fetched and then served. A design that only cached
-//! whole responses would be no use to a demuxer.
+//! A player seeks. It does not download. So the unit here is a byte range
+//! and never a response. The cache answers the part of a range it holds,
+//! and the origin is asked only for the rest. A miss streams to the player
+//! *as it fills* rather than being fetched and then served. A design that
+//! only cached whole responses would be no use to a demuxer.
 //!
 //! # One chunk store, two adapters
 //!
-//! The bytes themselves are [`enginefs::chunk_store::ChunkDir`]'s -- the
+//! The bytes themselves are [`enginefs::chunk_store::ChunkDir`]'s: the
 //! same store the torrent pieces are in, and none of its code is written
 //! twice. It owns the directory shape, the bucketing, the two staging
 //! spellings, the rename that makes presence mean complete, the typed read,
 //! the listings and the occupancy. What is here is the *adapter*: the key,
-//! the entity, the refusals, and the arithmetic, which for a URL response is
-//! `offset / CHUNK` where a torrent's is a file table with BEP-47 padding in
-//! it.
+//! the entity, the refusals, and the arithmetic. For a URL response the
+//! arithmetic is `offset / CHUNK`, where a torrent's is a file table with
+//! BEP-47 padding in it.
 //!
 //! Only two things about the store differ between the two adapters, and they
 //! are parameters of it rather than a reason for a second one:
 //!
 //! * **Staging identity.** A `/proxy` chunk is buffered whole and written
 //!   once, and two readers of one stream may fill the same chunk at the same
-//!   time, so it is staged *anonymously*
-//!   ([`enginefs::chunk_store::ChunkDir::write_whole`]) and a kill leaves
+//!   time. So it is staged *anonymously*
+//!   ([`enginefs::chunk_store::ChunkDir::write_whole`]), and a kill leaves
 //!   nothing resumable. librqbit writes a piece 16 KiB at a time and resumes
 //!   it, so its staged copy is addressable.
 //! * **The commit trigger.** Completeness for a URL response has to be
-//!   established internally: there is no hash to check the bytes against. So
-//!   a chunk is buffered until it is `chunk_len` bytes and that count is
-//!   passed to the store as the commit criterion, where a torrent piece
-//!   passes `None` -- librqbit never writes padding, so a piece whose tail is
+//!   established internally, because there is no hash to check the bytes
+//!   against. So a chunk is buffered until it is `chunk_len` bytes, and that
+//!   count is passed to the store as the commit criterion. A torrent piece
+//!   passes `None`: librqbit never writes padding, so a piece whose tail is
 //!   padding is legally short. A chunk file whose length disagrees with its
 //!   entity is refused at the read and deleted, never served (see
 //!   [`Cached::body`]).
@@ -49,38 +49,38 @@
 //!   origin identified it by, the last two percent-encoded. All three are in
 //!   the directory name rather than in a metadata file beside the chunks, and
 //!   that is deliberate. What reclaims here reclaims *files*, and a
-//!   metadata file is a file no playhead is ever inside: it would be the
-//!   first thing in an entry to go, and losing it would leave a directory
-//!   of chunks nothing could state the length, type or identity of. A
+//!   metadata file is a file no playhead is ever inside. It would be the
+//!   first thing in an entry to go. Losing it would leave a directory of
+//!   chunks nothing could state the length, type or identity of. A
 //!   directory name cannot be reclaimed out from under the files it
-//!   describes. An entity that differs
-//!   from the one before it in any of the three gets a new directory, and the
-//!   fill that discovers it removes the old one.
+//!   describes. An entity that differs from the one before it in any of the
+//!   three gets a new directory, and the fill that discovers it removes the
+//!   old one.
 //! * **The validator is the only one of the three that can tell two
-//!   generations of one resource apart**, and it is what keeps chunks of two
-//!   of them out of one directory and out of one body. Length and type say
-//!   nothing about a URL whose content was replaced by content of the same
-//!   size. It is the strongest identity there is for the entity
-//!   (`routes::proxy::entity_identity`): what the source that opened it
-//!   knows (a Drive file's checksum), else the origin's `ETag` or
-//!   `Last-Modified`, else **the length alone** -- every entity is kept, and
+//!   generations of one resource apart.** It keeps chunks of two of them
+//!   out of one directory and out of one body. Length and type say nothing
+//!   about a URL whose content was replaced by content of the same size. It
+//!   is the strongest identity there is for the entity
+//!   (`routes::proxy::entity_identity`). That is what the source that
+//!   opened it knows (a Drive file's checksum), else the origin's `ETag` or
+//!   `Last-Modified`, else **the length alone**. Every entity is kept, and
 //!   one whose origin names nothing is told from its next generation only
-//!   when the length changes. What the evidence says is the whole of what is
-//!   claimed here: an origin that serves new bytes under an old validator,
-//!   or a same-length file under no validator, is served as it was, and
-//!   nothing in this module can catch that.
+//!   when the length changes. What the evidence says is the whole of what
+//!   is claimed here. An origin that serves new bytes under an old
+//!   validator, or a same-length file under no validator, is served as it
+//!   was, and nothing in this module can catch that.
 //! * `<bucket>` is `<chunk> / 1000`, the chunk store's own bucketing
-//!   ([`enginefs::chunk_store::CHUNKS_PER_DIRECTORY`]): exFAT and FAT32 scan
+//!   ([`enginefs::chunk_store::CHUNKS_PER_DIRECTORY`]). exFAT and FAT32 scan
 //!   a directory linearly, and that is exactly where a phone's cache lives.
 //!
 //! The root is `.proxy` inside the engine's `download_dir`, beside
-//! `.pieces` -- inside the cache root on purpose, so every byte of it is
+//! `.pieces`. It is inside the cache root on purpose, so every byte of it is
 //! counted in the one usage figure and capped by the one published budget.
 //! It is on the launch sweep's list of directories that reconcile
-//! themselves (`enginefs::piece_store::sweep`'s `NOT_OURS`): anything else
+//! themselves (`enginefs::piece_store::sweep`'s `NOT_OURS`). Anything else
 //! under the download root is deleted at launch as a previous release's
-//! data, `.cache` and `.metadata` -- a pre-fork server's -- included. A
-//! proxied stream nobody is reading is the first thing that should go; the
+//! data, including `.cache` and `.metadata` (a pre-fork server's). A
+//! proxied stream nobody is reading is the first thing that should go. The
 //! one exception is a key directory the embedder pinned as a download
 //! (`crate::proxy_downloads`).
 //!
@@ -88,27 +88,26 @@
 //!
 //! Nothing outside this owner bounds it, and a proxied stream at 20 MB/s
 //! writes a gigabyte a minute. So the same retention policy the piece store
-//! is under bounds this too --
-//! `enginefs::piece_store::policy`, one budget, with a window per consumer
-//! the read-pattern detector finds (`enginefs::retention::streams`) --
-//! driven by
-//! [`crate::proxy_retention`]. The only input it was missing is the
-//! playhead: a proxied stream serves ranges, so the reads were always here,
-//! but nothing recorded where playback had got to. It is recorded now, in
-//! the two places a byte of a proxied response reaches a player --
-//! [`Cached::body`] for what came off the disk and [`Filler::take`] for what
-//! came off the origin -- and nowhere else. A `Range` header is what a
-//! player *asks* for and is not one of them.
+//! is under bounds this too: `enginefs::piece_store::policy`, one budget,
+//! with a window per consumer the read-pattern detector finds
+//! (`enginefs::retention::streams`). [`crate::proxy_retention`] drives it.
+//! The only input it was missing is the playhead. A proxied stream serves
+//! ranges, so the reads were always here, but nothing recorded where
+//! playback had got to. It is recorded now in the two places a byte of a
+//! proxied response reaches a player, and nowhere else: [`Cached::body`]
+//! for what came off the disk and [`Filler::take`] for what came off the
+//! origin. A `Range` header is what a player *asks* for and is not one of
+//! them.
 //!
 //! Two things follow for what may be unlinked, and they are the same fact
 //! from two sides. A chunk inside a live stream's window is not the pass's
-//! to take, and a chunk an open body has been framed to deliver and has not
-//! delivered yet is not either -- a response says its length
-//! before its first byte goes out, and a window 90% ahead of the playhead
-//! does not cover a body longer than that, so without it the pass a read's
-//! own playhead drives would delete that read's tail. `Cached` opens a
+//! to take. Nor is a chunk an open body has been framed to deliver and has
+//! not delivered yet. A response says its length before its first byte goes
+//! out, and a window 90% ahead of the playhead does not cover a body longer
+//! than that. Without this rule, the pass a read's own playhead drives
+//! would delete that read's tail. `Cached` opens a
 //! [`crate::proxy_retention::Reader`] and tells it what the response is
-//! framed around; the promise shrinks as the bytes go out and is released
+//! framed around. The promise shrinks as the bytes go out and is released
 //! when the body ends. Everything else here, including every byte of every
 //! stream nobody is reading, is ordinary cache exactly as before.
 //!
@@ -116,35 +115,36 @@
 //!
 //! * **Nothing here is revalidated.** No `If-None-Match`, no
 //!   `If-Modified-Since`, no freshness lifetime, no `Age`. An entry is served
-//!   until its owner reclaims it. The origin's validator *is* kept -- it is a
-//!   third of the entity's directory name -- but it is only ever compared
+//!   until its owner reclaims it. The origin's validator *is* kept, as a
+//!   third of the entity's directory name. But it is only ever compared
 //!   when the origin is being asked for something anyway, and a read this
 //!   store answers in full asks the origin nothing. So a resource that
-//!   changed under the URL is served as it was until this key next misses,
-//!   and the fill that misses is what discovers the change and drops what was
+//!   changed under the URL is served as it was until this key next misses.
+//!   The fill that misses is what discovers the change and drops what was
 //!   held of the old entity. That is the single largest thing this does not
 //!   do.
 //!
 //!   The one conditional the cache itself adds to a request is the
-//!   `If-Range` that goes with a narrowed range, and that is not revalidation
-//!   either: it asks the origin to answer the tail *only* while the head
-//!   being narrowed against is still part of the entity, and it rides on a
-//!   fetch the player had asked for regardless.
-//! * **No `Vary`.** The key is fixed (below); the header is not read.
-//! * **No credentialed responses at all.** Not "keyed carefully" -- refused,
-//!   in [`ProxyCache::entry`]. The one exception is not a relaxation of that
-//!   rule but a different question asked somewhere else: a source whose
-//!   *constructor* vouches that its URL identifies the bytes is keyed on the
-//!   URL alone, with no credential anywhere in it
+//!   `If-Range` that goes with a narrowed range, and that is not
+//!   revalidation either. It asks the origin to answer the tail *only* while
+//!   the head being narrowed against is still part of the entity. It rides
+//!   on a fetch the player had asked for regardless.
+//! * **No `Vary`.** The key is fixed (below), and the header is not read.
+//! * **No credentialed responses at all.** Not "keyed carefully" but
+//!   refused, in [`ProxyCache::entry`]. The one exception is not a
+//!   relaxation of that rule but a different question asked somewhere else.
+//!   A source whose *constructor* vouches that its URL identifies the bytes
+//!   is keyed on the URL alone, with no credential anywhere in it
 //!   ([`ProxyCache::entry_for_vouched_url`], where what that costs is
 //!   written out). `/proxy` has nobody to vouch for it and is still refused.
 //! * **No coalescing.** Two players filling the same missing chunk both fetch
 //!   it.
 //! * **Nothing is kept of the chunk a fetch starts inside.** Only whole
-//!   chunks are written and there is no completing a chunk whose front the
-//!   response does not carry, so the bytes before a body's first chunk
-//!   boundary are dropped rather than provoking a wider fetch than the player
-//!   asked for. Every whole chunk after that boundary is written as usual.
+//!   chunks are written, and there is no completing a chunk whose front the
+//!   response does not carry. So the bytes before a body's first chunk
+//!   boundary are dropped rather than provoking a wider fetch than the
+//!   player asked for. Every whole chunk after that boundary is written as
+//!   usual.
 
 use crate::proxy_retention::{OnDisk, ProxyRetention};
 use bytes::Bytes;
@@ -161,30 +161,30 @@ use std::task::{Context, Poll};
 use url::Url;
 
 /// The store's directory inside a torrent cache root, beside the piece
-/// store's `.pieces`. Dot-prefixed so a target host called `proxy` could
-/// never land on top of it, and on the launch sweep's list of directories
-/// that are not a previous release's -- see the module docs.
+/// store's `.pieces`. It is dot-prefixed so a target host called `proxy`
+/// could never land on top of it. It is on the launch sweep's list of
+/// directories that are not a previous release's (see the module docs).
 pub const PROXY_CACHE_DIR: &str = ".proxy";
 
 /// How many bytes one chunk file holds, except the last of an entity.
 ///
-/// 256 KiB. Small enough that a chunk is never an appreciable fraction of
-/// the cap (`cacheSize` is megabytes at the very least), that a reclaim is
-/// fine-grained, and that the two places a chunk boundary costs something
-/// bound it to this much: a fetch that starts mid-chunk drops what it carries
-/// of that chunk, and a chunk buffered but never completed is this much
-/// memory per stream. Large enough that a 2 GB film is eight thousand files
-/// rather than a hundred thousand.
+/// 256 KiB. It is small enough that a chunk is never an appreciable
+/// fraction of the cap (`cacheSize` is megabytes at the very least), and
+/// that a reclaim is fine-grained. It also bounds the two places a chunk
+/// boundary costs something to this much. A fetch that starts mid-chunk
+/// drops what it carries of that chunk, and a chunk buffered but never
+/// completed is this much memory per stream. It is large enough that a
+/// 2 GB film is eight thousand files rather than a hundred thousand.
 pub const CHUNK_BYTES: u64 = 256 * 1024;
 
 /// The forwarded request headers that say *which bytes* of one answer are
 /// wanted rather than what the answer is.
 ///
 /// The keyed set is `routes::proxy::FORWARDED_REQUEST_HEADERS` minus these,
-/// computed rather than written out, so there is one list of what a player
-/// sends on and not two that have to agree about it. A header added to the
-/// forwarded list is keyed on from the moment it is added, which is the safe
-/// direction: the unsafe one is a header that changes the origin's answer
+/// computed rather than written out. So there is one list of what a player
+/// sends on, not two that have to agree about it. A header added to the
+/// forwarded list is keyed on from the moment it is added. That is the safe
+/// direction. The unsafe one is a header that changes the origin's answer
 /// and is not in the key.
 const RANGE_REQUEST_HEADERS: [&str; 2] = ["range", "if-range"];
 
@@ -193,7 +193,7 @@ const RANGE_REQUEST_HEADERS: [&str; 2] = ["range", "if-range"];
 /// [`RANGE_REQUEST_HEADERS`]), in the forwarded list's order, with the value
 /// the player sent. The key is hashed from this and a read-ahead source is
 /// built with it, so the two cannot disagree about which entity a player
-/// reads -- a source that carried a different set would fill a sibling key.
+/// reads. A source that carried a different set would fill a sibling key.
 pub(crate) fn negotiation_headers(
     player_headers: &axum::http::HeaderMap,
 ) -> impl Iterator<Item = (&'static str, &axum::http::HeaderValue)> {
@@ -207,30 +207,29 @@ pub(crate) fn negotiation_headers(
 /// writes on their way to the disk, and the retention passes on their way
 /// round it.
 ///
-/// Neither is joined by anything, and that is what keeps the reactor off
-/// the disk -- a body must not wait for its own chunk to be written, and a
-/// playhead must not wait for a directory listing. A chunk write is one
-/// `spawn_blocking` call; a pass is a task that makes two of its own, for
+/// Nothing joins either, and that is what keeps the reactor off the disk.
+/// A body must not wait for its own chunk to be written, and a playhead
+/// must not wait for a directory listing. A chunk write is one
+/// `spawn_blocking` call. A pass is a task that makes two of its own, for
 /// the listing and for the unlinks, and it is counted for the whole of
-/// itself rather than for those -- see
-/// `proxy_retention::ProxyRetention::spawn_pass`. What it
-/// costs is that **nothing else in the process can tell when the disk has
-/// stopped moving**: the last chunk of a body is written after the player
-/// has read the last byte of it and out of order with its neighbours, and
-/// the pass that reclaims round the final playhead runs after that again.
-/// Anything reading the cache root -- a test counting what the policy left,
-/// above all -- is therefore looking at a directory that is still being
-/// written to and deleted from, and two listings a moment apart are of two
-/// different caches.
+/// itself rather than for those (see
+/// `proxy_retention::ProxyRetention::spawn_pass`). What it costs is that
+/// **nothing else in the process can tell when the disk has stopped
+/// moving**. The last chunk of a body is written after the player has read
+/// the last byte of it, and out of order with its neighbours. The pass that
+/// reclaims round the final playhead runs after that again. So anything
+/// reading the cache root (a test counting what the policy left, above
+/// all) is looking at a directory that is still being written to and
+/// deleted from. Two listings a moment apart are of two different caches.
 ///
 /// So the work is counted, and [`Self::settled`] is the wait for there being
-/// none of it. Once a body has been read to its end that wait is a real
-/// quiescence and not a guess: no byte is delivered after it, so no chunk
+/// none of it. Once a body has been read to its end, that wait is a real
+/// quiescence and not a guess. No byte is delivered after it, so no chunk
 /// write and no pass can begin that this count has not already seen.
-/// Nothing in the server's own paths waits on it -- a stream that waited for
+/// Nothing in the server's own paths waits on it. A stream that waited for
 /// its own cache would be the very thing the blocking pool is here to
-/// prevent -- and it is here so that what looks at the cache from outside
-/// can look at it while it is still.
+/// prevent. It is here so that what looks at the cache from outside can
+/// look at it while it is still.
 #[derive(Debug)]
 pub struct DiskWork {
     /// The count, and the thing a waiter is woken by. A `watch` channel
@@ -297,30 +296,29 @@ type VolumeProbe = Box<dyn Fn(&Path) -> Option<u64> + Send + Sync>;
 /// The free-space floor, for the chunk writes of a fill.
 ///
 /// **A cap is not a floor.** The published cap is `occupied + available -
-/// floor`, and a proxy write moves `occupied` up and `available` down by
-/// the same bytes, so it never tightens under the fill that is using the
+/// floor`. A proxy write moves `occupied` up and `available` down by the
+/// same bytes, so the cap never tightens under the fill that is using the
 /// volume up. The retention owner keeps a live entity whole when the cap
-/// can hold it, and the slack passes leave the live entity alone, so
+/// can hold it, and the slack passes leave the live entity alone. So
 /// nothing else stops a proxy fill at the free-space floor the way the
-/// torrent side's reconciler does: without this, a film proxied onto a
+/// torrent side's reconciler does. Without this, a film proxied onto a
 /// volume that pins had taken to the margin fills it to zero, one chunk at
 /// a time, each `ENOSPC` logged at debug and the next chunk tried.
 ///
 /// This is that stop. A chunk the volume cannot take without going under
-/// [`enginefs::CACHE_FREE_SPACE_FLOOR`] is not written, and
-/// nothing else changes: the body goes on reaching the player from the
-/// origin, so what the floor costs is a later seek back that has to fetch
-/// again.
+/// [`enginefs::CACHE_FREE_SPACE_FLOOR`] is not written, and nothing else
+/// changes. The body goes on reaching the player from the origin, so what
+/// the floor costs is a later seek back that has to fetch again.
 ///
 /// The volume is read at most every [`VOLUME_READING_TTL`], on the write's
-/// blocking thread, and what this process writes in between is taken off
-/// the reading, so a burst of chunks cannot all pass one reading that only
+/// blocking thread. What this process writes in between is taken off the
+/// reading, so a burst of chunks cannot all pass one reading that only
 /// had room for the first. (The engine keeps a reading of the same volume
 /// on the same clock, for its reconciler, but the server cannot reach it.)
 /// An unreadable volume is not a full one, as everywhere else.
 pub(crate) struct VolumeFloor {
-    /// The torrent-data root, which exists for as long as the engine does;
-    /// the proxy's own directory may not have been made yet.
+    /// The torrent-data root, which exists for as long as the engine does.
+    /// The proxy's own directory may not have been made yet.
     root: PathBuf,
     probe: VolumeProbe,
     reading: std::sync::Mutex<Option<FloorReading>>,
@@ -350,10 +348,10 @@ impl VolumeFloor {
     /// **In unit tests, a volume with room to spare** rather than the one
     /// the test runs on. A test about keys, entities or retention wrote
     /// chunks under the real floor, so every one of them failed on a host
-    /// whose disk was nearly full -- a failure about the machine, reported
-    /// as one about the cache. A test *about* the floor says what the volume
-    /// holds ([`ProxyCache::with_volume_probe`]); the integration tests, a
-    /// separate build, still read the real disk.
+    /// whose disk was nearly full. That was a failure about the machine,
+    /// reported as one about the cache. A test *about* the floor says what
+    /// the volume holds ([`ProxyCache::with_volume_probe`]). The integration
+    /// tests, a separate build, still read the real disk.
     #[cfg(test)]
     fn host_probe() -> VolumeProbe {
         Box::new(|_: &Path| Some(1 << 40))
@@ -368,7 +366,7 @@ impl VolumeFloor {
     }
 
     /// Whether `len` more bytes may be written without the volume going
-    /// under the floor, booking them if so. Blocking: it may `statvfs`.
+    /// under the floor, booking them if so. It blocks: it may `statvfs`.
     fn allows(&self, len: u64) -> bool {
         let mut reading = self.reading.lock().unwrap_or_else(|e| e.into_inner());
         if reading
@@ -404,9 +402,9 @@ pub struct ProxyCache {
     /// Where playback has got to in each entity being read, and the window
     /// that follows it (see [`crate::proxy_retention`]). It lives here
     /// rather than beside the cache because the two things that can observe
-    /// a proxied playhead are both this module's -- the body served from
-    /// disk and the body filled on its way past -- and a playhead nothing
-    /// observes is the gap this whole policy exists to close.
+    /// a proxied playhead are both this module's: the body served from disk
+    /// and the body filled on its way past. A playhead nothing observes is
+    /// the gap this whole policy exists to close.
     retention: Arc<ProxyRetention>,
     /// What this cache has on the blocking pool right now: see [`DiskWork`].
     work: Arc<DiskWork>,
@@ -416,17 +414,16 @@ pub struct ProxyCache {
 }
 
 impl ProxyCache {
-    /// The cache under an engine's `download_dir` -- the one torrent-data
-    /// root -- bounded by the published cap, which is the *same* cell the
-    /// torrent half reads (`EngineFS::cache_budget`) and not a second copy
-    /// of the number.
+    /// The cache under an engine's `download_dir` (the one torrent-data
+    /// root). It is bounded by the published cap, which is the *same* cell
+    /// the torrent half reads (`EngineFS::cache_budget`) and not a second
+    /// copy of the number.
     ///
     /// `live` is shared the same way and for the same reason
     /// (`EngineFS::live`): what is being played is one fact about the
     /// server, not one per owner. A torrent stream opening is what makes
-    /// the proxied body slack, and a proxied body opening is what makes the
-    /// torrent's file slack, and neither could say so through a cell of its
-    /// own.
+    /// the proxied body slack. A proxied body opening is what makes the
+    /// torrent's file slack. Neither could say so through a cell of its own.
     pub fn new(
         download_dir: &Path,
         budget: Arc<enginefs::retention::RetentionBudget>,
@@ -456,9 +453,9 @@ impl ProxyCache {
     /// The key directory a caller names by its key (a download row's
     /// `infoHash`), or `None` for anything that is not a key this cache
     /// writes: 64 lowercase hex digits, the SHA-256 every entry is named by.
-    /// Checked by spelling, never by where the joined path lands -- `..`
-    /// joins to a path whose parent is the root, and a delete there would
-    /// take the root's parent.
+    /// It is checked by spelling, never by where the joined path lands.
+    /// `..` joins to a path whose parent is the root, and a delete there
+    /// would take the root's parent.
     pub(crate) fn key_dir(&self, key: &str) -> Option<PathBuf> {
         is_key_name(key).then(|| self.root.join(key))
     }
@@ -498,26 +495,26 @@ impl ProxyCache {
     /// # What is deliberately *not* in it
     ///
     /// * **`r=`.** It never travels to the origin. It overrides headers on
-    ///   the way back and it can flip the playlist verdict -- so it varies
+    ///   the way back and it can flip the playlist verdict. So it varies
     ///   *the response the player is handed*, and not one byte of what the
     ///   origin sends. What is stored here is origin bytes, and both things
-    ///   `r=` does to them are done to a hit exactly as to a fetch: the
+    ///   `r=` does to them are done to a hit exactly as to a fetch. The
     ///   playlist verdict is `routes::proxy::is_a_playlist`, asked of
-    ///   **every** hit -- whole or partial -- before it answers and before a
-    ///   fetch is narrowed against it, and the overrides are
+    ///   **every** hit (whole or partial) before it answers and before a
+    ///   fetch is narrowed against it. The overrides are
     ///   `apply_custom_response_headers`, applied by both. That is what the
-    ///   omission rests on, and it is load-bearing at both ends: while a
-    ///   full hit answered before the classification, an `r=` that turned the
-    ///   verdict over got the rewrite on a miss and the origin's own body on
-    ///   a hit; while a partial hit narrowed before it, the same `r=` got a
-    ///   raw unrewritten tail of a range the player never asked for. Both are
-    ///   this key promising something it did not do. (The note is here
+    ///   omission rests on, and it is load-bearing at both ends. While a
+    ///   full hit answered before the classification, an `r=` that turned
+    ///   the verdict over got the rewrite on a miss and the origin's own body
+    ///   on a hit. While a partial hit narrowed before it, the same `r=` got
+    ///   a raw unrewritten tail of a range the player never asked for. Both
+    ///   are this key promising something it did not do. (The note is here
     ///   because the design this was built from asserted the opposite. A
     ///   cache of assembled *responses* would have to key on it.)
     /// * **`p=`.** The client's name for its player, never sent to the
-    ///   origin. Keyed on, two players reading the same stream would share
-    ///   nothing, since each mints its own token -- which is the case this
-    ///   cache exists for.
+    ///   origin. If it were keyed on, two players reading the same stream
+    ///   would share nothing, since each mints its own token. That is the
+    ///   case this cache exists for.
     ///
     /// # What it refuses outright
     ///
@@ -526,7 +523,7 @@ impl ProxyCache {
     ///   conditional from a store that never revalidates would be inventing
     ///   the condition's answer;
     /// * an `h=` naming any of [`crate::routes::proxy::CREDENTIAL_REQUEST_HEADERS`].
-    ///   `/proxy` is an open route with no bearer token of its own, so a key
+    ///   `/proxy` is an open route with no bearer token of its own. So a key
     ///   that merely *distinguished* credentials would still be one caller's
     ///   authenticated response sitting in a store another caller can reach
     ///   by naming the same URL and the same secret. Refusing is structural
@@ -536,7 +533,7 @@ impl ProxyCache {
     ///   `/stream` is the engine's bytes going through a second store, both
     ///   of them under one volume's cap, which is the shape of every disk bug
     ///   this project has had. `self_addr` is what makes that a statement
-    ///   about *this* server rather than about loopback in general -- a test
+    ///   about *this* server rather than about loopback in general. A test
     ///   origin, and an addon a viewer runs on the same machine, are on
     ///   loopback too and are nothing of ours.
     pub fn entry(
@@ -564,8 +561,8 @@ impl ProxyCache {
         }
 
         let mut hash = Sha256::new();
-        // Length-prefixed rather than delimited: a header value cannot hold a
-        // newline, but a URL can hold anything a delimiter could be, and a
+        // Length-prefixed rather than delimited. A header value cannot hold
+        // a newline, but a URL can hold anything a delimiter could be. A
         // key that two different requests can collide on is one caller's
         // bytes served to another.
         let mut field = |bytes: &[u8]| {
@@ -599,7 +596,7 @@ impl ProxyCache {
     ///
     /// It does not relax [`Self::entry`], and nothing should. `/proxy`
     /// still refuses a credentialed target outright, for the reason
-    /// written there: the route is handed a URL and a header by a caller
+    /// written there. The route is handed a URL and a header by a caller
     /// it cannot interpret, and keying on a credential it cannot read is a
     /// guess. Refusing is structural where keying is careful. A bare
     /// `/proxy` request has nobody to vouch for it and stays refused.
@@ -607,24 +604,24 @@ impl ProxyCache {
     /// # What it is
     ///
     /// The same question, moved somewhere that can answer it. `/proxy`
-    /// can only ask *"does this request carry a credential?"*, which is
-    /// the wrong question -- it is about the request, when what a key
-    /// needs to know is about the bytes. The constructor of a source can
-    /// ask the right one: *"does this URL identify the content I am about
-    /// to get back?"* For `crate::sources::DriveSource` the answer is yes
-    /// and it is checkable: `files/{id}?alt=media` is the same file for
-    /// everyone entitled to it, so the id names the content, and the
-    /// credential authorises the *fetch* without determining the *result*.
+    /// can only ask *"does this request carry a credential?"*. That is the
+    /// wrong question: it is about the request, when what a key needs to
+    /// know is about the bytes. The constructor of a source can ask the
+    /// right one: *"does this URL identify the content I am about to get
+    /// back?"* For `crate::sources::DriveSource` the answer is yes, and it
+    /// is checkable. `files/{id}?alt=media` is the same file for everyone
+    /// entitled to it, so the id names the content, and the credential
+    /// authorises the *fetch* without determining the *result*.
     ///
     /// **No token is in this key**, which is the whole reason the
-    /// exception is worth having: an access token rotates hourly, so a key
-    /// with one in it is never hit twice -- not a cache, an empty
+    /// exception is worth having. An access token rotates hourly, so a key
+    /// with one in it is never hit twice. That is not a cache but an empty
     /// directory tree with a sweep over it. Nor is a fingerprint of the
-    /// grant, which would be a per-account key and is not what was
-    /// decided; see below.
+    /// grant in the key. That would be a per-account key, which is not what
+    /// was decided (see below).
     ///
     /// The vouch is an assertion the *caller* makes (`sources::proxy::Vouch`),
-    /// deliberately, so no source acquires caching by accident: a source
+    /// deliberately, so no source acquires caching by accident. A source
     /// that mints its own header and says nothing is read and never kept.
     ///
     /// # What the owner has accepted, knowingly
@@ -632,32 +629,32 @@ impl ProxyCache {
     /// The key has no credential in it, so **anything that can reach this
     /// server and name the same URL reads these bytes out of the store
     /// without being authorised for them.** That is a real consequence and
-    /// not an oversight. What bounds it is where this server listens: the
-    /// HTTP listener is loopback (`Ipv4Addr::LOCALHOST` at boot) and the
+    /// not an oversight. What bounds it is where this server listens. The
+    /// HTTP listener is loopback (`Ipv4Addr::LOCALHOST` at boot), and the
     /// LAN listener is the cast receiver's narrow allow-list with no
-    /// `/create` on it, so "anything that can reach it" means another app
-    /// on this same device -- not the network, and not another household.
+    /// `/create` on it. So "anything that can reach it" means another app
+    /// on this same device, not the network and not another household.
     /// The owner has weighed that against a television re-fetching every
     /// backward seek over domestic wifi and chosen this. A change that
-    /// widens what the loopback router serves is a change that has to
-    /// revisit this paragraph.
+    /// widens what the loopback router serves has to revisit this
+    /// paragraph.
     ///
     /// # What is still guarded
     ///
-    /// The file changing underneath is not this key's job and is not left
-    /// open: the entity directory *under* the key is named for the
-    /// origin's own validator, a fill that finds a different one drops
-    /// what was held of the old generation ([`remove_other_entities`]),
-    /// and the source that vouched checks the generation again at every
-    /// open (`ProxySource::retire_stale`). A vouch is about identity, and
-    /// the validator is about generation; the two are separate and both
-    /// are needed.
+    /// The file changing underneath is not this key's job, and it is not
+    /// left open. The entity directory *under* the key is named for the
+    /// origin's own validator. A fill that finds a different one drops
+    /// what was held of the old generation ([`remove_other_entities`]). The
+    /// source that vouched checks the generation again at every open
+    /// (`ProxySource::retire_stale`). A vouch is about identity, and the
+    /// validator is about generation. The two are separate and both are
+    /// needed.
     ///
     /// `None` for this server's own listener, for the same budget reason
     /// [`Self::entry`] refuses one: no key this cache mints may name bytes
     /// the engine is already storing under the same cap. Nothing builds
-    /// such a URL today -- the API host is a constant -- which is exactly
-    /// why the check is cheap to keep.
+    /// such a URL today, because the API host is a constant. That is
+    /// exactly why the check is cheap to keep.
     pub(crate) fn entry_for_vouched_url(
         &self,
         url: &Url,
@@ -673,7 +670,7 @@ impl ProxyCache {
         };
         // A domain tag, first and always. No `h=` key begins with this
         // field, so a vouched key can never collide with a relayed one
-        // however either is spelled -- which matters in the one direction
+        // however either is spelled. That matters in the one direction
         // that would hurt: a `/proxy` caller must not be able to name a
         // URL that lands on a directory filled under somebody's grant.
         field(b"vouched-url");
@@ -691,8 +688,8 @@ impl ProxyCache {
     /// The entry for a key directory a pin names, whoever made it: what
     /// [`crate::proxy_downloads`] lists a pinned download from once the
     /// process that made the key is gone. `dir` is a child of this cache's
-    /// root; a path elsewhere is refused. Quiet, since only a download's
-    /// bookkeeping ever asks for one.
+    /// root, and a path elsewhere is refused. It is quiet, since only a
+    /// download's bookkeeping ever asks for one.
     pub(crate) fn entry_for_key_dir(&self, dir: PathBuf, target: Arc<str>) -> Option<Entry> {
         let named_a_key = dir
             .file_name()
@@ -723,17 +720,18 @@ fn is_key_name(name: &str) -> bool {
 
 /// Whether a target names this server's own HTTP listener, in any of the
 /// spellings that reach it: `127.0.0.1`, `::1`, `localhost`, or the address
-/// it actually bound. Here, a budget check: bytes the engine is already
-/// serving out of the cache root must not be stored a second time against
-/// the same volume's cap. The redirect loop in
+/// it actually bound. Here it is a budget check. Bytes the engine is
+/// already serving out of the cache root must not be stored a second time
+/// against the same volume's cap. The redirect loop in
 /// [`crate::routes::proxy::cache_assisted_range`] asks it too, about every
-/// hop an origin names: a `302` back into this server's own `/proxy` is a
+/// hop an origin names. A `302` back into this server's own `/proxy` is a
 /// loop the hop count cannot see, since every turn of it is a new request
 /// with a count of its own.
 ///
-/// The port has to match too. Loopback alone is not this server: an addon or
-/// a debrid helper a viewer runs on the same machine is a perfectly ordinary
-/// origin, and refusing to cache it would refuse the case the cache is for.
+/// The port has to match too. Loopback alone is not this server. An addon
+/// or a debrid helper a viewer runs on the same machine is a perfectly
+/// ordinary origin, and refusing to cache it would refuse the case the
+/// cache is for.
 ///
 /// Three spellings reach this listener without being the address it named:
 /// `0.0.0.0` (and `::`), which a client resolves to this host; the
@@ -777,8 +775,8 @@ pub(crate) fn names_this_server(url: &Url, self_addr: std::net::SocketAddr) -> b
 pub struct Entry {
     dir: PathBuf,
     retention: Arc<ProxyRetention>,
-    /// What this entry puts on the blocking pool -- the chunk writes of the
-    /// fills it opens, and the sweep of a stale entity -- while it is on its
+    /// What this entry puts on the blocking pool (the chunk writes of the
+    /// fills it opens, and the sweep of a stale entity) while it is on its
     /// way to the disk. See [`DiskWork`].
     work: Arc<DiskWork>,
     /// What the fills this entry opens ask before each chunk write: see
@@ -799,14 +797,14 @@ impl Entry {
     /// shape.
     ///
     /// **The key, not the bytes.** What is under it is one directory per
-    /// generation of the resource, and which of those a reader is in is
-    /// the retention cell's business (`crate::proxy_retention`), not this
-    /// accessor's. Two callers: `crate::sources::ProxySource`, which asks
-    /// whether the body being played is one of *its* URL's -- a question
-    /// about the resource, which is all a holder of a URL knows -- and a
-    /// test asserting that a source and `/proxy` agree about the key for
-    /// one URL, which is a claim about two callers of
-    /// [`ProxyCache::entry`].
+    /// generation of the resource. Which of those a reader is in is the
+    /// retention cell's business (`crate::proxy_retention`), not this
+    /// accessor's. There are two callers. One is
+    /// `crate::sources::ProxySource`, which asks whether the body being
+    /// played is one of *its* URL's. That is a question about the
+    /// resource, which is all a holder of a URL knows. The other is a test
+    /// asserting that a source and `/proxy` agree about the key for one
+    /// URL, which is a claim about two callers of [`ProxyCache::entry`].
     pub(crate) fn dir(&self) -> &Path {
         &self.dir
     }
@@ -814,25 +812,26 @@ impl Entry {
     /// What is on disk for the range this request asked for, or `None` when
     /// there is nothing here the request can be answered from.
     ///
-    /// Blocking: it reads one directory per thousand chunks of the range,
+    /// It blocks: it reads one directory per thousand chunks of the range,
     /// from the chunk the range starts in to the first one missing. Call it
-    /// on the blocking pool -- it is a handful of `getdents` for a cached
+    /// on the blocking pool. It is a handful of `getdents` for a cached
     /// film, but a handful on a phone's flash is still not nothing.
     ///
     /// A `stat` of every chunk file instead, from the range's first chunk
     /// to its last, would cost eight thousand `statx` calls on `Range:
-    /// bytes=0-` over a fully cached 2 GB film, on every rewatch, all of it
-    /// before the first byte. The names in a bucket directory say which
-    /// chunks are there; a file's length is checked instead at the one
-    /// place the file is opened anyway ([`Cached::body`]). **What this
-    /// reads as held is therefore a chunk at its final name**, which is the
-    /// claim the store is built to make good: a chunk gets that name by
-    /// being renamed into it whole. A file of some other length under that
-    /// name is an accident's, and `body` is where that is refused.
+    /// bytes=0-` over a fully cached 2 GB film. That would happen on every
+    /// rewatch, all of it before the first byte. The names in a bucket
+    /// directory say which chunks are there. A file's length is checked
+    /// instead at the one place the file is opened anyway
+    /// ([`Cached::body`]). **So what this reads as held is a chunk at its
+    /// final name.** That is the claim the store is built to make good: a
+    /// chunk gets that name by being renamed into it whole. A file of some
+    /// other length under that name is an accident's, and `body` is where
+    /// that is refused.
     ///
     /// `range` is the request's `Range` header as it arrived. **A request
-    /// with no `Range` is answered only from a complete entry**: it asks for
-    /// the whole entity, and a partial answer to it would have to be re-framed
+    /// with no `Range` is answered only from a complete entry.** It asks for
+    /// the whole entity. A partial answer to it would have to be re-framed
     /// as a `200` carrying a body stitched out of a cached head and the
     /// origin's `206` tail. The shape a player actually sends is
     /// `Range: bytes=0-`, which is the ranged path.
@@ -844,14 +843,14 @@ impl Entry {
             None => (0, total.checked_sub(1)?),
         };
 
-        // **Promised before the disk is read**, over every chunk the range
-        // could be framed around. A pass unlinks what nothing has promised,
-        // and it honours a promise from the instant it is made: a chunk
-        // this walk finds and the pass then takes would be framed into a
-        // body and fail at the read, a transfer ending short of its
-        // `Content-Length`. Narrowed to what was found once the walk is
-        // done; a lookup that finds nothing drops the reader, and the
-        // promise with it.
+        // **The promise is made before the disk is read**, over every chunk
+        // the range could be framed around. A pass unlinks what nothing has
+        // promised, and it honours a promise from the instant it is made. A
+        // chunk this walk finds and the pass then takes would be framed into
+        // a body and fail at the read: a transfer ending short of its
+        // `Content-Length`. The promise is narrowed to what was found once
+        // the walk is done. A lookup that finds nothing drops the reader,
+        // and the promise with it.
         let reader = self
             .retention
             .reader_with(&dir, total, self.target.clone(), self.quiet);
@@ -859,7 +858,7 @@ impl Entry {
         let mut held_to: Option<u64> = None;
         let mut index = first / CHUNK_BYTES;
         // The bucket directory being read from, listed once and consulted
-        // for every chunk in it; the walk moves to the next listing when the
+        // for every chunk in it. The walk moves to the next listing when the
         // run of held chunks crosses into the next bucket.
         let mut bucket: Option<(u64, std::collections::HashSet<u64>)> = None;
         loop {
@@ -868,11 +867,11 @@ impl Entry {
                 .as_ref()
                 .is_none_or(|(listed, _)| *listed != in_bucket)
             {
-                // A bucket that would not list holds, for this walk,
-                // nothing: the run ends here and the reader fetches on from
-                // the origin. The safe side of that mistake -- a byte
-                // fetched again -- is the one this walk can afford; the
-                // retention pass, which cannot, refuses to run on it.
+                // A bucket that would not list holds nothing, for this
+                // walk. The run ends here and the reader fetches on from the
+                // origin. The safe side of that mistake (a byte fetched
+                // again) is the one this walk can afford. The retention
+                // pass, which cannot afford it, refuses to run on it.
                 bucket = Some((in_bucket, dir.held_in_bucket(in_bucket).unwrap_or_default()));
             }
             if !bucket
@@ -915,17 +914,17 @@ impl Entry {
         let dir = self
             .dir
             .join(entity_dir_name(total, content_type, validator));
-        // The removal of any *other* entity under this key happens once, off
-        // the reactor, and does not have to finish before the first chunk is
-        // written: what is being removed is by definition not the directory
-        // being written into.
+        // The removal of any *other* entity under this key happens once,
+        // off the reactor. It does not have to finish before the first
+        // chunk is written, because what is being removed is by definition
+        // not the directory being written into.
         //
         // The entity's own directory is not made here. The first chunk
-        // write makes it with its bucket, and a fill that never completes a
-        // chunk -- a range that starts inside one and ends before the next
-        // boundary, a player gone before 256 KiB arrived -- made one that
-        // held nothing and that nothing would ever remove. The exception is
-        // a sibling left standing because a body is reading it: then this
+        // write makes it with its bucket. A fill that never completes a
+        // chunk (a range that starts inside one and ends before the next
+        // boundary, a player gone before 256 KiB arrived) made one that held
+        // nothing and that nothing would ever remove. The exception is a
+        // sibling left standing because a body is reading it. Then this
         // directory is what makes the key hold two entities, which sends
         // every request to the origin until a fill can take the old one.
         // Without it the key would hold the old entity alone, and a lookup
@@ -955,11 +954,11 @@ impl Entry {
     }
 
     /// Removes every entity under this key but the one named `current`
-    /// (an [`entity_dir_name`]): what an open does once the origin -- or
-    /// what the source knows of it -- has said which generation of the
-    /// resource is the one there now (`ProxySource::retire_stale`). The
-    /// same removal a fill makes when it finds a new entity, made before
-    /// anything reads rather than after the first byte arrives, so a whole
+    /// (an [`entity_dir_name`]). An open does this once the origin, or what
+    /// the source knows of it, has said which generation of the resource
+    /// is the one there now (`ProxySource::retire_stale`). It is the same
+    /// removal a fill makes when it finds a new entity, made before
+    /// anything reads rather than after the first byte arrives. So a whole
     /// stale entity is never served as a hit. Blocking.
     pub(crate) fn retire_others(&self, current: &str) {
         self.retire_others_than(&self.dir.join(current));
@@ -1013,9 +1012,9 @@ impl Entry {
     }
 
     /// What is held of the one entity under this key: its total length,
-    /// content type, and the bytes of it on the disk -- `None` when there
-    /// is no entity yet (nothing fetched) or more than one (a generation
-    /// change in progress). Blocking: lists the entity's bucket
+    /// content type, and the bytes of it on the disk. `None` when there is
+    /// no entity yet (nothing fetched) or more than one (a generation
+    /// change in progress). It blocks: it lists the entity's bucket
     /// directories.
     pub(crate) fn held_facts(&self) -> Option<HeldFacts> {
         let (dir, total, content_type, _validator) = self.sole_entity()?;
@@ -1040,9 +1039,9 @@ impl Entry {
         })
     }
 
-    /// Removes everything under this key -- every generation, every chunk
-    /// -- and takes the bytes out of the occupancy figure. For a download
-    /// the user deleted. Blocking.
+    /// Removes everything under this key (every generation, every chunk)
+    /// and takes the bytes out of the occupancy figure. It is for a
+    /// download the user deleted. Blocking.
     pub(crate) fn remove_all(&self) -> u64 {
         let held = tree_occupancy(&self.dir);
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
@@ -1066,9 +1065,9 @@ impl Entry {
     /// The entity under this key, when there is exactly one.
     ///
     /// Two is what a kill between writing a new entity and removing the old
-    /// one leaves, and there is nothing here that can say which of them the
-    /// origin would send now -- so the request goes to the origin, and the
-    /// fill it comes back with removes the loser.
+    /// one leaves. Nothing here can say which of them the origin would send
+    /// now. So the request goes to the origin, and the fill it comes back
+    /// with removes the loser.
     fn sole_entity(&self) -> Option<(PathBuf, u64, String, String)> {
         let mut only: Option<(PathBuf, u64, String, String)> = None;
         for entry in std::fs::read_dir(&self.dir).ok()?.flatten() {
@@ -1089,12 +1088,12 @@ impl Entry {
 
 /// `<length>_<content type>_<validator>`, the last two percent-encoded.
 ///
-/// `_` is escaped too, which a percent-encoding on its own would not do: it
-/// is in the unreserved set `urlencoding::encode` leaves alone, and a content
-/// type may hold one (`application/x-foo_bar`), so leaving it would make the
-/// separator ambiguous the first time an origin used one. Escaped, the name
-/// splits into exactly three fields however an origin spells a type or a
-/// tag.
+/// `_` is escaped too, which a percent-encoding on its own would not do.
+/// It is in the unreserved set `urlencoding::encode` leaves alone, and a
+/// content type may hold one (`application/x-foo_bar`). Leaving it would
+/// make the separator ambiguous the first time an origin used one.
+/// Escaped, the name splits into exactly three fields however an origin
+/// spells a type or a tag.
 pub(crate) fn entity_dir_name(total: u64, content_type: &str, validator: &str) -> String {
     format!(
         "{total}_{}_{}",
@@ -1108,8 +1107,8 @@ fn encode_field(value: &str) -> String {
 }
 
 /// The three fields back, and `None` for a name that is not three fields or
-/// whose validator is empty. Every entity is filed under an identity -- its
-/// length, when nothing better (`routes::proxy::entity_identity`) -- so
+/// whose validator is empty. Every entity is filed under an identity (its
+/// length, when nothing better: `routes::proxy::entity_identity`). So
 /// nothing writes an empty one, and a directory claiming to be one is not
 /// read as an entity at all.
 fn parse_entity_dir_name(name: &str) -> Option<(u64, String, String)> {
@@ -1124,14 +1123,14 @@ fn parse_entity_dir_name(name: &str) -> Option<(u64, String, String)> {
 }
 
 /// How long an entity's directory name may be: 255 bytes, which is what one
-/// name may hold on every filesystem this runs on, and the name is ASCII once
-/// its two text fields are percent-encoded so bytes and characters are the
+/// name may hold on every filesystem this runs on. The name is ASCII once
+/// its two text fields are percent-encoded, so bytes and characters are the
 /// same count.
 ///
 /// An origin is free to send a content type or an `ETag` longer than the
-/// remainder; what it is not free to do is make every chunk write of that
-/// response fail its `mkdir` and say so in the log. Beyond this the response
-/// is simply not one the cache keeps, like every other thing it declines.
+/// remainder. It is not free to make every chunk write of that response
+/// fail its `mkdir` and say so in the log. Beyond this the response is
+/// simply not one the cache keeps, like every other thing it declines.
 const MAX_ENTITY_DIR_NAME: usize = 255;
 
 /// See [`Entry::held_facts`].
@@ -1156,11 +1155,11 @@ pub fn can_be_filed(total: u64, content_type: &str, validator: &str) -> bool {
 ///
 /// Except one a body is still reading, which `is_read` says. A player
 /// inside the old entity was promised its chunks by a lookup, and the
-/// reclaim honours that promise at every unlink through its door; an
+/// reclaim honours that promise at every unlink through its door. A
 /// `remove_dir_all` from here would take the same chunks behind the same
 /// player's back, and the read would fail mid-body for a reason the player
 /// cannot see. The stale entity is left for the next fill under this key,
-/// which asks again -- until then the key holds two entities and
+/// which asks again. Until then the key holds two entities and
 /// [`Entry::sole_entity`] sends every request to the origin, which is what
 /// two entities have always meant.
 ///
@@ -1169,13 +1168,13 @@ pub fn can_be_filed(total: u64, content_type: &str, validator: &str) -> bool {
 ///
 /// **`removed` is how the held set hears about this.** It is the one
 /// deletion of proxy chunks that does not go chunk by chunk through the
-/// retention owner, so it is the one place the owner's mirror could be left
-/// naming a directory's worth of chunks that are not there -- the direction
-/// that breaks reads (`proxy_retention::Held`). It is called for every
-/// entity this *attempted* to remove, whether or not the removal succeeded,
-/// because `remove_dir_all` walks and a failure partway through leaves some
-/// of the chunks gone; never for an entity left standing for a body that is
-/// reading it, which is untouched.
+/// retention owner. So it is the one place the owner's mirror could be
+/// left naming a directory's worth of chunks that are not there, which is
+/// the direction that breaks reads (`proxy_retention::Held`). It is called
+/// for every entity this *attempted* to remove, whether or not the removal
+/// succeeded, because `remove_dir_all` walks and a failure partway through
+/// leaves some of the chunks gone. It is never called for an entity left
+/// standing for a body that is reading it, which is untouched.
 fn remove_other_entities(
     key_dir: &Path,
     keep: &Path,
@@ -1200,18 +1199,18 @@ fn remove_other_entities(
             left += 1;
             continue;
         }
-        // Measured before the directory goes, because this is the one place
-        // besides a reclaim where chunks this process counted leave the
-        // disk, and a running total that did not hear about them would
-        // state a cap over bytes that are not there
+        // Measured before the directory goes. This is the one place besides
+        // a reclaim where chunks this process counted leave the disk, and a
+        // running total that did not hear about them would state a cap over
+        // bytes that are not there
         // (`crate::proxy_retention::ProxyRetention::occupancy`). The walk is
         // over a directory that is about to be removed anyway.
         let held = tree_occupancy(&path);
         let dropped = std::fs::remove_dir_all(&path);
         // Told whether it worked or not, and that is the point of putting
-        // it here rather than in the `Ok` arm: `remove_dir_all` walks, so a
+        // it here rather than in the `Ok` arm. `remove_dir_all` walks, so a
         // failure partway through is a directory some of whose chunks have
-        // gone -- which is exactly the state a held set must not be left
+        // gone. That is exactly the state a held set must not be left
         // believing it holds. What it is told is "forget this entity", so
         // the worst a failure costs is the one listing that seeds it again
         // from whatever really survived.
@@ -1237,14 +1236,14 @@ fn remove_other_entities(
 /// buckets, the entity once it has none, and its key directory once that
 /// holds no entity.
 ///
-/// A reclaim unlinks chunk files and nothing else, so without this every
-/// URL anyone played left `<key>/<entity>/<bucket>/` behind once its bytes
-/// had gone. One HLS playback is a URL per segment, so that is three empty
-/// directories per segment, thousands of them in a root that the exFAT of
-/// a phone scans linearly, and nothing but the next launch's sweep removed
-/// them.
+/// A reclaim unlinks chunk files and nothing else. Without this, every URL
+/// anyone played left `<key>/<entity>/<bucket>/` behind once its bytes had
+/// gone. One HLS playback is a URL per segment, so that is three empty
+/// directories per segment. That made thousands of them in a root that the
+/// exFAT of a phone scans linearly, and nothing but the next launch's sweep
+/// removed them.
 ///
-/// Only empty directories go, and `rmdir` is what decides that: it refuses
+/// Only empty directories go, and `rmdir` is what decides that. It refuses
 /// a directory holding anything, a chunk or a temporary on its way to
 /// becoming one. What a writer can lose to it is a bucket it has made and
 /// not yet written into, and `ChunkDir::write_whole` makes that again.
@@ -1275,15 +1274,15 @@ pub(crate) fn chunk_len(index: u64, total: u64) -> u64 {
 /// What one entity holds for one request's range.
 pub struct Cached {
     dir: ChunkDir,
-    /// This read, for as long as it lasts: the chunks between
+    /// This read, for as long as it lasts. The chunks between
     /// [`Cached::first`] and [`Cached::held_to`] are promised to whatever
-    /// response is framed around them, and nothing may unlink one until it
-    /// has gone out or this read has ended (see [`crate::proxy_retention`]).
+    /// response is framed around them. Nothing may unlink one until it has
+    /// gone out or this read has ended (see [`crate::proxy_retention`]).
     /// It is also where the bytes that do go out are noted as a playhead.
     ///
     /// An `Arc` because [`Cached::body`] hands the promise to a stream that
-    /// outlives this struct -- the route drops the `Cached` once the
-    /// response is built, and the body it built is what is still reading.
+    /// outlives this struct. The route drops the `Cached` once the response
+    /// is built, and the body it built is what is still reading.
     reader: Arc<crate::proxy_retention::Reader>,
     /// The entity's length, which is what a `Content-Range` has to state.
     pub total: u64,
@@ -1294,17 +1293,17 @@ pub struct Cached {
     /// as the origin named it, `source:..` as its opener supplied it, or
     /// `length:..`. Never empty.
     ///
-    /// It is what says that this and a fresh `206` are parts of one entity,
-    /// and -- the origin's two only -- the `If-Range` the narrowed fetch
-    /// asks under.
+    /// It is what says that this and a fresh `206` are parts of one entity.
+    /// For the origin's two only (`etag:..` and `last-modified:..`), it is
+    /// also the `If-Range` the narrowed fetch asks under.
     pub validator: String,
     /// The first byte the request asked for, clamped into the entity.
     pub first: u64,
     /// The last byte it asked for, likewise.
     pub last: u64,
-    /// The last byte held contiguously from [`Cached::first`] -- never past
-    /// [`Cached::last`], and never before [`Cached::first`], since a lookup
-    /// with nothing at `first` is not a [`Cached`] at all.
+    /// The last byte held contiguously from [`Cached::first`]. It is never
+    /// past [`Cached::last`], and never before [`Cached::first`], since a
+    /// lookup with nothing at `first` is not a [`Cached`] at all.
     pub held_to: u64,
 }
 
@@ -1333,25 +1332,25 @@ impl Cached {
 
     /// The cached bytes themselves, `first..=held_to`, a chunk at a time.
     ///
-    /// A read that fails -- a chunk gone from under a promise made before
-    /// the lookup read the disk, which the door is there to make impossible
-    /// -- ends the stream with an error rather than a short body, so the
-    /// player sees a broken source instead of a file that ended early.
+    /// A read that fails ends the stream with an error rather than a short
+    /// body, so the player sees a broken source instead of a file that
+    /// ended early. Such a failure is a chunk gone from under a promise made
+    /// before the lookup read the disk, which the door is there to make
+    /// impossible.
     ///
     /// **This is where a chunk's length is checked, and the only place.** A
-    /// chunk file is never written at any length but its entity's, so one
-    /// found at another length is an accident's -- a power loss that
-    /// committed the rename and not the data is the realistic one -- and it
+    /// chunk file is never written at any length but its entity's. So one
+    /// found at another length is an accident's (a power loss that
+    /// committed the rename and not the data is the realistic one), and it
     /// is not served: the read ends in an error, as above. It is also
-    /// *deleted*, which is what makes checking here rather than in the
-    /// lookup the better arrangement and not merely the cheaper one:
-    /// checked in the lookup instead, a wrong-length chunk would read as
-    /// absent there, and the fill skips a chunk whose name is already
-    /// taken, so such a file would be skipped by every lookup and every
-    /// fill for as long as it sat there, with the origin asked for those
-    /// bytes at every play. Checked here, it costs the player one broken
-    /// read, the next lookup finds the gap, and the next fill writes the
-    /// chunk again.
+    /// *deleted*. That is what makes checking here rather than in the
+    /// lookup the better arrangement, and not merely the cheaper one.
+    /// Checked in the lookup instead, a wrong-length chunk would read as
+    /// absent there. The fill skips a chunk whose name is already taken, so
+    /// such a file would be skipped by every lookup and every fill for as
+    /// long as it sat there, with the origin asked for those bytes at every
+    /// play. Checked here, it costs the player one broken read. The next
+    /// lookup finds the gap, and the next fill writes the chunk again.
     pub fn body(&self) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
         let dir = self.dir.clone();
         let reader = self.reader.clone();
@@ -1364,7 +1363,7 @@ impl Cached {
                 if offset > last {
                     return None;
                 }
-                // When the consumer asked, taken before the disk read: the
+                // When the consumer asked, taken before the disk read. The
                 // gap that measures a consumer runs from the last read's
                 // return to this one's arrival, so anything of ours that
                 // happens after this point must not be inside it.
@@ -1379,12 +1378,12 @@ impl Cached {
                         // Off the count *and* out of the held set as well
                         // as off the disk, like every other deletion of a
                         // chunk, and all three under one booking
-                        // (`ProxyRetention::discarded`): bytes the count
+                        // (`ProxyRetention::discarded`). Bytes the count
                         // still held would read as a larger cap for the
-                        // life of the process, and a chunk the held set
-                        // still named would have the next lookup frame a
-                        // body round bytes this has just unlinked. On the
-                        // blocking pool because the booking takes a
+                        // life of the process. A chunk the held set still
+                        // named would have the next lookup frame a body
+                        // round bytes this has just unlinked. It runs on
+                        // the blocking pool because the booking takes a
                         // `std::sync::Mutex` and does a `stat` and an
                         // `unlink` under it.
                         let retention = reader.retention();
@@ -1402,20 +1401,20 @@ impl Cached {
                 };
                 let to = last.min(start + want - 1);
                 // The read's own allocation is the body's: `slice` shares
-                // it, where copying the wanted span out was a second 256 KiB
+                // it. Copying the wanted span out was a second 256 KiB
                 // allocation and memcpy per chunk served, and twice the
                 // chunk in flight at once.
                 let served =
                     Bytes::from(bytes).slice((offset - start) as usize..=(to - start) as usize);
                 // A byte that really went out, which is the only thing this
-                // server will call a playhead. Here and in [`Filler::take`]
-                // are the two places one exists for a proxied stream, and
-                // between them they cover a hit, a miss and the two halves
-                // of a partial hit.
+                // server will call a playhead. This and [`Filler::take`] are
+                // the two places one exists for a proxied stream. Between
+                // them they cover a hit, a miss and the two halves of a
+                // partial hit.
                 reader.note(to);
                 // **What the reads of this entity look like**, which is
-                // what a pass keeps and gives back by. The cached half of
-                // it -- the miss goes through `Filler::take`.
+                // what a pass keeps and gives back by. This is the cached
+                // half of it. The miss goes through `Filler::take`.
                 reader.note_read(offset, to + 1, arrived, std::time::Instant::now());
                 Some((Ok(served), to + 1))
             }
@@ -1427,9 +1426,9 @@ impl Cached {
 ///
 /// A chunk is held in memory until it is complete and only then written, in
 /// one blocking task, to a temporary name that is renamed into place. Two
-/// properties come out of that and both are load-bearing: a client that
-/// vanishes mid-chunk leaves *nothing* on disk to be mistaken for a complete
-/// chunk later, and the reactor never blocks on the write.
+/// properties come out of that, and both are load-bearing. A client that
+/// vanishes mid-chunk leaves *nothing* on disk to be mistaken for a
+/// complete chunk later. And the reactor never blocks on the write.
 pub struct Filler {
     dir: ChunkDir,
     /// Where the chunks this writes are counted: see
@@ -1437,9 +1436,9 @@ pub struct Filler {
     /// a blocking task that cannot borrow this struct, so it carries a
     /// clone of the owner rather than reaching back through the reader.
     retention: Arc<crate::proxy_retention::ProxyRetention>,
-    /// This fill, as a read of the entity: the origin's body is on its way
+    /// This fill, as a read of the entity. The origin's body is on its way
     /// to the player as it goes past here, so every byte of it is a
-    /// playhead. It promises nothing -- what a fill delivers comes off the
+    /// playhead. It promises nothing: what a fill delivers comes off the
     /// origin and not off the disk, so there is no chunk of ours it is
     /// waiting to read.
     reader: crate::proxy_retention::Reader,
@@ -1461,9 +1460,9 @@ impl Filler {
     fn take(&mut self, mut bytes: &[u8]) {
         // Where this body was before the origin's bytes went past, and when
         // they did: the miss half of what the detector sees. There is no
-        // "asked" moment distinct from the arrival here -- the origin's
-        // body is pushed at us -- so a read of a miss measures the origin's
-        // delivery, which is what it is.
+        // "asked" moment distinct from the arrival here, because the
+        // origin's body is pushed at us. So a read of a miss measures the
+        // origin's delivery, which is what it is.
         let from = self.offset;
         let at = std::time::Instant::now();
         while !bytes.is_empty() && self.offset < self.total {
@@ -1474,13 +1473,12 @@ impl Filler {
             if self.collecting != Some(index) && within == 0 {
                 self.collecting = Some(index);
                 self.buffer.clear();
-                // The whole chunk's room, once. The finished buffer is handed
-                // to the write task below rather than copied, which leaves
-                // this one with no capacity at all, and a body arrives in
-                // pieces of 8 or 16 KiB -- so without this the buffer grew
-                // from the first piece's size by doubling, several
-                // reallocations and about one extra copy of the chunk per
-                // chunk written.
+                // The whole chunk's room, once. The finished buffer is
+                // handed to the write task below rather than copied, which
+                // leaves this one with no capacity at all. A body arrives in
+                // pieces of 8 or 16 KiB. Without this the buffer grew from
+                // the first piece's size by doubling: several reallocations
+                // and about one extra copy of the chunk per chunk written.
                 self.buffer.reserve_exact(want as usize);
             }
             if self.collecting == Some(index) {
@@ -1494,12 +1492,12 @@ impl Filler {
                     let floor = self.floor.clone();
                     tokio::task::spawn_blocking(move || {
                         let _ticket = ticket;
-                        // A chunk already on disk is not written again: the
+                        // A chunk already on disk is not written again. The
                         // fill is only ever asked for what the lookup did
                         // not hold, but a second reader of the same stream
-                        // can overlap it. Asked here and not as the bytes
-                        // arrive: that was a `statx` per chunk on a reactor
-                        // worker, in the body's poll.
+                        // can overlap it. This is asked here and not as the
+                        // bytes arrive, where it was a `statx` per chunk on
+                        // a reactor worker, in the body's poll.
                         if dir.has_chunk(index) {
                             return;
                         }
@@ -1522,8 +1520,8 @@ impl Filler {
             bytes = &bytes[take..];
         }
         // The origin's body is on its way to the player as it goes past
-        // here, so this is a playhead exactly as a cached read is -- and it
-        // is the one that matters most, since a miss is when the cache is
+        // here, so this is a playhead exactly as a cached read is. It is
+        // the one that matters most, since a miss is when the cache is
         // growing and the window is what bounds that growth.
         if self.offset > 0 {
             self.reader.note(self.offset - 1);
@@ -1536,32 +1534,32 @@ impl Filler {
 /// Write one complete chunk through the store's anonymous staging: a
 /// temporary no other filler can be using, then the rename into place.
 ///
-/// `want` is the commit criterion -- what this entity says the chunk's length
+/// `want` is the commit criterion: what this entity says the chunk's length
 /// is. There is no hash to check a URL's bytes against, so this count is the
 /// whole of what establishes completeness, and it is checked by the store
 /// before anything is renamed.
 ///
-/// Nothing fails loudly -- a cache that cannot write is a slower stream and
+/// Nothing fails loudly. A cache that cannot write is a slower stream and
 /// never a broken one.
 ///
 /// Answers what the cache gained by it, which is what the running count of
 /// its occupancy is moved by
-/// (`crate::proxy_retention::ProxyRetention::occupancy`). A difference and
-/// not the chunk's length: two bodies of one entity can race to the same
-/// chunk past [`Filler::take`]'s check, and the second one's rename
-/// replaces the first one's file rather than adding a second, so a count
-/// that booked the length twice would say the cache held a chunk it does
-/// not. **The difference is only a difference if nothing else writes that
-/// name between the two readings**, which is why the caller takes it
-/// through `ProxyRetention::counted` and not around it -- the two racing
+/// (`crate::proxy_retention::ProxyRetention::occupancy`). It is a
+/// difference and not the chunk's length. Two bodies of one entity can race
+/// to the same chunk past [`Filler::take`]'s check, and the second one's
+/// rename replaces the first one's file rather than adding a second. A
+/// count that booked the length twice would say the cache held a chunk it
+/// does not. **The difference is only a difference if nothing else writes
+/// that name between the two readings.** That is why the caller takes it
+/// through `ProxyRetention::counted` and not around it. The two racing
 /// writers would otherwise both read "no file" first and both book the
 /// whole chunk.
 ///
-/// It answers what stands at the chunk's name as well, because the held set
-/// is booked from the same closure and a difference of bytes cannot say
-/// that: a second writer of a chunk already there gains nothing and the
-/// chunk is very much held, while a write the filesystem refused gains
-/// nothing and leaves whatever was there before -- which may be a complete
+/// It answers what stands at the chunk's name as well, because the held
+/// set is booked from the same closure and a difference of bytes cannot
+/// say that. A second writer of a chunk already there gains nothing, and
+/// the chunk is very much held. A write the filesystem refused gains
+/// nothing and leaves whatever was there before. That may be a complete
 /// chunk somebody else wrote, so it is [`OnDisk::Unmoved`] and not
 /// `OnDisk::Gone`.
 fn write_chunk(dir: &ChunkDir, index: u64, chunk: &[u8], want: u64) -> (u64, OnDisk) {
@@ -1610,9 +1608,9 @@ where
                     filler.take(bytes);
                 }
             }
-            // A body that ended, broke or was closed carries no more chunks;
-            // the half-collected one in memory is dropped with the filler and
-            // was never on disk to begin with.
+            // A body that ended, broke or was closed carries no more chunks.
+            // The half-collected one in memory is dropped with the filler
+            // and was never on disk to begin with.
             Poll::Ready(_) => this.filler = None,
             Poll::Pending => {}
         }
@@ -1622,8 +1620,8 @@ where
 
 /// What every file under `path` occupies, by the volume's own accounting
 /// (`enginefs::chunk_store::occupied_bytes`): what a removal of the tree is
-/// about to free. A walk, so only for a tree that is about to go -- the
-/// running figure is the owner's count, never this.
+/// about to free. It is a walk, so it is only for a tree that is about to
+/// go. The running figure is the owner's count, never this.
 fn tree_occupancy(path: &Path) -> u64 {
     walkdir::WalkDir::new(path)
         .into_iter()
@@ -1647,9 +1645,9 @@ pub struct SweepReport {
     /// **Counted as it is written and as it goes, and nothing walks the
     /// tree to learn it.** A walk of the root to size the budget's disk arm
     /// would cost minutes on a television with sixteen thousand cache
-    /// files -- the whole of a film. Instead, the two places this cache's
-    /// bytes move are a chunk landing and a chunk being reclaimed, so both
-    /// of them book what they did and the figure is current without a
+    /// files: the whole of a film. Instead, the two places this cache's
+    /// bytes move are a chunk landing and a chunk being reclaimed. Both of
+    /// them book what they did, and the figure is current without a
     /// syscall.
     pub freed_bytes: u64,
     /// Entries that could not be read or removed. Logged, never fatal.
@@ -1660,41 +1658,41 @@ pub struct SweepReport {
 /// record does not name.
 ///
 /// **`keep` is `None` when the embedder named no pin record at all, and
-/// that means unknown, not empty**: nothing is swept and nothing is
+/// that means unknown, not empty.** Nothing is swept and nothing is
 /// booked, the same rule the piece store keeps for the same silence
-/// (`ServerConfig::pins`). A restart with no pin record therefore keeps
-/// every stray the run before it left, uncounted, rather than guess which
-/// of them was wanted.
+/// (`ServerConfig::pins`). So a restart with no pin record keeps every
+/// stray the run before it left, uncounted, rather than guess which of
+/// them was wanted.
 ///
 /// Once a pin record is named, **nothing unpinned survives a restart.**
-/// A proxied entity is kept for
-/// exactly as long as something is playing it: a window round the playhead
-/// while it is live, and nothing at all once a stream opens on anything
-/// else. A process that has served nothing is playing nothing, so every
-/// unpinned chunk under this root belongs to a playback that ended when the
-/// last process did -- no claim outlives the run but a pin, and no owner in
-/// this process would ever count these bytes or reclaim them. Left alone
-/// they would be exactly the invisible disk usage the design exists to
-/// remove: on the disk, out of every occupancy figure this process
-/// publishes (`crate::proxy_retention::ProxyRetention::occupancy` counts
-/// what *it* wrote), and reclaimed by nothing.
+/// A proxied entity is kept for exactly as long as something is playing
+/// it: a window round the playhead while it is live, and nothing at all
+/// once a stream opens on anything else. A process that has served
+/// nothing is playing nothing. So every unpinned chunk under this root
+/// belongs to a playback that ended when the last process did. No claim
+/// outlives the run but a pin, and no owner in this process would ever
+/// count these bytes or reclaim them. Left alone they would be exactly
+/// the invisible disk usage the design exists to remove. They would be on
+/// the disk, out of every occupancy figure this process publishes
+/// (`crate::proxy_retention::ProxyRetention::occupancy` counts what *it*
+/// wrote), and reclaimed by nothing.
 ///
-/// The key directories in `keep` -- the pinned downloads -- stay whole, and
+/// The key directories in `keep` (the pinned downloads) stay whole, and
 /// their bytes are reported so the owner books them
 /// (`crate::proxy_retention::ProxyRetention::restored`). That is what makes
 /// the occupancy count true from the first byte: what this process writes,
 /// plus what the sweep kept, is what is on the disk.
 ///
-/// Removed whole rather than chunk by chunk -- the key directory and every
-/// entity under it -- because an empty tree of directories is debris too.
-/// The chunk a kill was writing to its temporary name goes with the rest;
-/// it needed naming when committed chunks stayed.
+/// Removed whole rather than chunk by chunk (the key directory and every
+/// entity under it), because an empty tree of directories is debris too.
+/// The chunk a kill was writing to its temporary name goes with the rest.
+/// It needed naming when committed chunks stayed.
 pub fn sweep(root: &Path, keep: Option<&std::collections::HashSet<PathBuf>>) -> SweepReport {
     let mut report = SweepReport::default();
-    // Nobody has named the pins: nothing is swept, the piece store's rule
-    // for the same silence -- nothing is deleted for want of a claim. The
-    // price is the count: nothing is kept by name either, so nothing is
-    // booked, and what an earlier process left is on the disk and in
+    // Nobody has named the pins, so nothing is swept. That is the piece
+    // store's rule for the same silence: nothing is deleted for want of a
+    // claim. The price is the count. Nothing is kept by name either, so
+    // nothing is booked. What an earlier process left is on the disk and in
     // nobody's occupancy figure until something that takes it prices it
     // (`proxy_retention`'s `Occupancy::take`).
     let Some(keep) = keep else {
@@ -1721,7 +1719,7 @@ pub fn sweep(root: &Path, keep: Option<&std::collections::HashSet<PathBuf>>) -> 
             }
         };
         let path = entry.path();
-        // Measured before it goes, and by the volume's own accounting: a
+        // Measured before it goes, and by the volume's own accounting. A
         // partly-written chunk frees what its blocks free, not what its
         // length claims.
         let held = tree_occupancy(&path);
@@ -1766,7 +1764,7 @@ mod tests {
     use std::collections::{BTreeSet, HashSet};
 
     /// **Every spelling that reaches this listener is this server**, so
-    /// `/proxy` refuses to fetch it: caching any of these as an ordinary
+    /// `/proxy` refuses to fetch it. Caching any of these as an ordinary
     /// origin would write the engine's own bytes a second time against the
     /// volume's cap.
     #[test]
@@ -1826,9 +1824,9 @@ mod tests {
 
     fn cache() -> (tempfile::TempDir, ProxyCache) {
         let dir = tempfile::tempdir().expect("a scratch root");
-        // No budget: nothing has published one, which is what these tests
-        // are about anyway -- they are about the key, the entity and the
-        // arithmetic, and no chunk here is ever reclaimed by the window.
+        // No budget: nothing has published one. These tests are about the
+        // key, the entity and the arithmetic, and no chunk here is ever
+        // reclaimed by the window.
         let cache = ProxyCache::new(dir.path(), Arc::default(), Arc::default());
         (dir, cache)
     }
@@ -1880,13 +1878,13 @@ mod tests {
     }
 
     /// The key is a SHA-256 of the length-prefixed fields, and not some
-    /// cheaper hash: two requests whose keys collide share an entity, which
+    /// cheaper hash. Two requests whose keys collide share an entity, which
     /// is one caller's bytes served to another. The literal is SHA-256 over
     /// the URL's length as a little-endian u64 and its bytes, computed
     /// outside this code. Nothing needs the key to stay the same from one
-    /// build to the next -- the launch sweep empties the cache before
-    /// anything is served (`sweep`) -- so a change to what goes into it
-    /// only has to update this literal.
+    /// build to the next, because the launch sweep empties the cache before
+    /// anything is served (`sweep`). So a change to what goes into it only
+    /// has to update this literal.
     #[test]
     fn the_key_of_a_plain_get_is_the_sha_256_of_its_url() {
         let (_root, cache) = cache();
@@ -1994,8 +1992,8 @@ mod tests {
     ///
     /// The refusal above stays: `/proxy` cannot cache a credentialed
     /// request. What the vouched door adds is a store filled under
-    /// somebody's grant, and the one thing that must not be possible is a
-    /// caller reaching it by naming the URL through the route -- so the two
+    /// somebody's grant. The one thing that must not be possible is a
+    /// caller reaching it by naming the URL through the route. So the two
     /// namespaces are separated by a field no `h=` key begins with, rather
     /// than by whatever the hash happens to do.
     #[test]
@@ -2007,7 +2005,7 @@ mod tests {
             .expect("a target that is not this server");
 
         // The plainest `/proxy` request for the same URL, and the same with
-        // every forwarded header a player can send: none of them lands on
+        // every forwarded header a player can send. None of them lands on
         // the vouched directory.
         let mut relayed = vec![
             cache
@@ -2139,12 +2137,12 @@ mod tests {
     }
 
     /// A chunk written whole and renamed into place is readable. A file at a
-    /// chunk's name whose length disagrees with the entity is never served
-    /// -- that would serve a hole as content -- but the place it is caught is
-    /// the read, not the lookup (see [`Cached::body`] for why): the lookup
-    /// goes by names, the read refuses the file and removes it, and from
-    /// then on the lookup sees the gap it leaves and a fill can write the
-    /// chunk again.
+    /// chunk's name whose length disagrees with the entity is never served,
+    /// since that would serve a hole as content. But the place it is caught
+    /// is the read, not the lookup (see [`Cached::body`] for why). The
+    /// lookup goes by names, and the read refuses the file and removes it.
+    /// From then on the lookup sees the gap it leaves, and a fill can write
+    /// the chunk again.
     #[tokio::test]
     async fn a_chunk_of_the_wrong_length_is_refused_at_the_read_and_removed() {
         use futures_util::StreamExt as _;
@@ -2216,17 +2214,17 @@ mod tests {
     /// **Reading bytes off the disk is a playhead too.**
     ///
     /// The two places a proxied byte reaches a player are this body and the
-    /// origin's on its way past, and only one of them is on the path that
-    /// matters here: a rewatch off a warm cache asks the origin nothing at
-    /// all, so if a cached read moved no playhead there would be no window
+    /// origin's on its way past. Only one of them is on the path that
+    /// matters here. A rewatch off a warm cache asks the origin nothing at
+    /// all. So if a cached read moved no playhead, there would be no window
     /// over the very stream a player is inside, and the retention pass
     /// would be free to take the chunk under its head.
     ///
     /// Sixteen chunks on disk, a budget of four, and a read of the first
-    /// three: what is left afterwards is a window round where the read got
-    /// to, and the tail of the entity -- written last, so the *newest* thing
-    /// in the directory and the last thing any age or size rule would take
-    /// -- is gone. Nothing but the window can produce that shape.
+    /// three. What is left afterwards is a window round where the read got
+    /// to. The tail of the entity is gone, though it was written last, so it
+    /// is the *newest* thing in the directory and the last thing any age or
+    /// size rule would take. Nothing but the window can produce that shape.
     #[tokio::test]
     async fn a_read_off_the_disk_moves_the_playhead_and_the_window_follows_it() {
         use futures_util::StreamExt as _;
@@ -2288,16 +2286,16 @@ mod tests {
     /// the window its own reading moves passes over them.**
     ///
     /// The `Content-Length` and `Content-Range` of a hit are a promise about
-    /// chunks that are still on the disk when the player gets to them, and
-    /// the thing most likely to take one is the retention pass this very
-    /// body's playhead is driving. A window is 90%
-    /// ahead of the playhead, so a body longer than that has its own tail
-    /// outside the window from its first chunk onwards.
+    /// chunks that are still on the disk when the player gets to them. The
+    /// thing most likely to take one is the retention pass this very body's
+    /// playhead is driving. A window is 90% ahead of the playhead, so a body
+    /// longer than that has its own tail outside the window from its first
+    /// chunk onwards.
     ///
     /// Twenty chunks on disk, four chunks of budget, a read of the first
-    /// sixteen. The pass really runs -- the four chunks nothing promised go
-    /// while the body is open, which is what says this is not a test of a
-    /// pass that never happened -- and the read is served whole regardless.
+    /// sixteen. The pass really runs: the four chunks nothing promised go
+    /// while the body is open, which says this is not a test of a pass that
+    /// never happened. The read is served whole regardless.
     #[tokio::test]
     async fn a_read_is_served_every_byte_it_was_promised() {
         use futures_util::StreamExt as _;
@@ -2464,9 +2462,9 @@ mod tests {
     /// **A body served off the disk is a read the detector sees**, and
     /// what the detector sees is what the pass then keeps and reclaims by.
     ///
-    /// The cached half. It has an "asked" moment of its own -- the poll
-    /// that wants the next chunk -- so what it measures is the consumer's
-    /// own pace, which is the measurement the whole design is built on.
+    /// The cached half. It has an "asked" moment of its own (the poll that
+    /// wants the next chunk), so what it measures is the consumer's own
+    /// pace. That is the measurement the whole design is built on.
     #[tokio::test]
     async fn what_a_cached_body_served_is_a_read_the_detector_sees() {
         use enginefs::retention::live::Live;
@@ -2506,11 +2504,11 @@ mod tests {
     /// **What a fill pushed to the player is a read the detector sees**,
     /// and so a consumer of the entity the pass decides about.
     ///
-    /// The miss is the half that matters most here -- it is when the cache
-    /// is growing -- and it is the half with no "asked" moment of its own:
-    /// the origin's body is pushed at us, so what a read of a miss measures
-    /// is the origin's delivery. What this pins is that the body path
-    /// reports it at all, and reports the span it actually pushed.
+    /// The miss is the half that matters most here, because it is when the
+    /// cache is growing. It is also the half with no "asked" moment of its
+    /// own. The origin's body is pushed at us, so what a read of a miss
+    /// measures is the origin's delivery. What this pins is that the body
+    /// path reports it at all, and reports the span it actually pushed.
     #[tokio::test]
     async fn what_a_fill_pushed_is_a_read_the_detector_sees() {
         use enginefs::retention::live::Live;
@@ -2544,14 +2542,14 @@ mod tests {
     /// runs ahead of what is on the disk.
     ///
     /// A fill reports every slice the origin pushes as it goes past, and a
-    /// chunk is written only once it is whole -- so slice after slice
-    /// begins in a chunk no listing holds. Under the run rule alone each of
-    /// them was `Rejected::Outside` and started a consumer of its own: one
-    /// 16 MiB play-through of one URL was counted as thirty-two of them,
-    /// each granted the two-piece floor that no unlink may touch, and the
-    /// cache settled over its cap for the life of the stream. Here the
-    /// slices are a quarter of a chunk, which is the shape of a real body,
-    /// and the pass is let run after each one.
+    /// chunk is written only once it is whole. So slice after slice begins
+    /// in a chunk no listing holds. Under the run rule alone each of them
+    /// was `Rejected::Outside` and started a consumer of its own. One 16 MiB
+    /// play-through of one URL was counted as thirty-two of them, each
+    /// granted the two-piece floor that no unlink may touch. The cache
+    /// settled over its cap for the life of the stream. Here the slices are
+    /// a quarter of a chunk, which is the shape of a real body, and the
+    /// pass is let run after each one.
     #[tokio::test]
     async fn a_body_pushed_in_slices_the_disk_does_not_hold_yet_is_one_consumer() {
         use enginefs::retention::live::Live;
@@ -2582,9 +2580,9 @@ mod tests {
              not caught up with: {heads:?}"
         );
         // How many of the slices a pass has answered by now is the pass's
-        // own timing -- a read waits for one, and the last few are still
-        // pending -- so what is asserted is that they joined *this*
-        // consumer and carried it along.
+        // own timing: a read waits for one, and the last few are still
+        // pending. So what is asserted is that they joined *this* consumer
+        // and carried it along.
         let (at, reads) = heads[0];
         assert!(
             reads > 1 && at > CHUNK_BYTES,
@@ -2592,17 +2590,17 @@ mod tests {
         );
     }
 
-    /// The count is asserted against the directory itself at each step
-    /// rather than against an arithmetic of chunk lengths: what it has to
-    /// be right about is the disk, and a count that agreed with a
-    /// calculation and not with the volume would be exactly the 17 GB
-    /// reading `occupied_bytes` exists to prevent.
+    /// The count is asserted against the directory itself at each step,
+    /// rather than against an arithmetic of chunk lengths. What it has to
+    /// be right about is the disk. A count that agreed with a calculation
+    /// and not with the volume would be exactly the 17 GB reading
+    /// `occupied_bytes` exists to prevent.
     #[tokio::test]
     async fn the_cache_counts_its_chunks_as_they_land_and_as_they_go() {
         use enginefs::retention::live::{Live, LiveEntity};
 
         let dir = tempfile::tempdir().expect("a scratch root");
-        // The launch sweep, before anything is relayed: what it leaves is
+        // The launch sweep, before anything is relayed. What it leaves is
         // what this process has counted, which is nothing.
         assert_eq!(super::sweep(dir.path(), Some(&HashSet::new())).removed, 0);
         let live = Arc::new(Live::default());
@@ -2625,8 +2623,8 @@ mod tests {
             "and what the fill booked is what the volume gave up for them"
         );
 
-        // Nobody is playing it any more -- the body ended, and a stream
-        // opened somewhere else -- so a slack pass takes the lot.
+        // Nobody is playing it any more (the body ended, and a stream
+        // opened somewhere else), so a slack pass takes the lot.
         drop(filler);
         live.open(
             LiveEntity::Torrent {
@@ -2648,12 +2646,12 @@ mod tests {
     /// **An entity the origin replaced takes its bytes off the count with
     /// it.**
     ///
-    /// The other place chunks this process wrote leave the disk: not a
-    /// reclaim, but a whole directory removed because the origin's resource
-    /// changed under its key. A running total that did not hear about it
-    /// would go on stating a cap over bytes that are not there, and it
-    /// would never come back down -- nothing else in the process would ever
-    /// subtract them.
+    /// The other place chunks this process wrote leave the disk is not a
+    /// reclaim. It is a whole directory removed because the origin's
+    /// resource changed under its key. A running total that did not hear
+    /// about it would go on stating a cap over bytes that are not there. It
+    /// would never come back down, because nothing else in the process
+    /// would ever subtract them.
     #[tokio::test]
     async fn a_replaced_entity_takes_its_bytes_off_the_count() {
         let dir = tempfile::tempdir().expect("a scratch root");
@@ -2668,7 +2666,7 @@ mod tests {
         assert!(cache.retention().occupancy() >= was, "two chunks landed");
 
         // The origin now answers a different length, which is a different
-        // entity: the fill that finds out drops what was cached of the old
+        // entity. The fill that finds out drops what was cached of the old
         // one.
         let mut fresh = entry.fill(3 * CHUNK_BYTES, "video/mp4", VALIDATOR, 0);
         fresh.take(&vec![2u8; CHUNK_BYTES as usize]);
@@ -2682,15 +2680,15 @@ mod tests {
 
     /// **A fill stops writing at the free-space floor, and the body goes
     /// on.** A chunk the volume cannot take without going under the floor
-    /// is not written; one it can is, and what the fill has written since
-    /// the last reading counts against it.
+    /// is not written. One it can take is written, and what the fill has
+    /// written since the last reading counts against it.
     #[tokio::test]
     async fn a_fill_writes_nothing_under_the_free_space_floor() {
         const FLOOR: u64 = crate::cache_budget::CACHE_FREE_SPACE_FLOOR;
         let dir = tempfile::tempdir().expect("a scratch root");
         // Room above the floor for two chunks and a half at the first
-        // reading, and none at any later one -- which a slow runner can
-        // take, since a reading only lasts `VOLUME_READING_TTL`.
+        // reading, and none at any later one. A slow runner can take a later
+        // one, since a reading only lasts `VOLUME_READING_TTL`.
         let readings = std::sync::atomic::AtomicUsize::new(0);
         let probe = move |_: &Path| {
             let first = readings.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
@@ -2718,7 +2716,7 @@ mod tests {
     }
 
     /// **A fill leaves a chunk that is already on disk alone**, rather than
-    /// writing its own copy over it: the fill of a second reader overlaps
+    /// writing its own copy over it. The fill of a second reader overlaps
     /// what the first one wrote.
     #[tokio::test]
     async fn a_fill_does_not_write_over_a_chunk_already_held() {
@@ -2747,7 +2745,7 @@ mod tests {
     }
 
     /// **A chunk the read refuses for its length comes off the count with
-    /// the file.** Every other deleter of a chunk is booked; one the count
+    /// the file.** Every other deleter of a chunk is booked. One the count
     /// did not hear would stay in it, and in the cap, for the life of the
     /// process.
     #[tokio::test]
@@ -2789,15 +2787,15 @@ mod tests {
     ///
     /// The fill is the proxy's one writer of a chunk, so it is the whole of
     /// what the held set has to hear on the way in
-    /// (`proxy_retention::Held`). Shown by listing the entity exactly once,
-    /// before it exists: the one seed this entity will ever get finds an
-    /// empty directory, so every chunk the set names afterwards is one the
-    /// fill booked as it renamed the file into place.
+    /// (`proxy_retention::Held`). This is shown by listing the entity
+    /// exactly once, before it exists. The one seed this entity will ever
+    /// get finds an empty directory, so every chunk the set names afterwards
+    /// is one the fill booked as it renamed the file into place.
     ///
-    /// A writer the set did not hear is the survivable direction -- nobody
-    /// reads a chunk we have forgotten, they re-fetch it -- but it is also
-    /// a leak: no pass would ever be asked to reclaim those bytes, because
-    /// no pass would know they were there.
+    /// A writer the set did not hear is the survivable direction: nobody
+    /// reads a chunk we have forgotten, they re-fetch it. But it is also a
+    /// leak. No pass would ever be asked to reclaim those bytes, because no
+    /// pass would know they were there.
     #[tokio::test]
     async fn what_a_fill_writes_goes_into_the_held_set_without_a_listing() {
         let (_root, cache) = cache();
@@ -2833,8 +2831,8 @@ mod tests {
     /// would have felt.**
     ///
     /// The count being wrong costs a cap that is a little the wrong size.
-    /// The held set being wrong the other way costs a read: this deleter
-    /// runs from inside a body, and a set that went on naming the chunk it
+    /// The held set being wrong the other way costs a read. This deleter
+    /// runs from inside a body. A set that went on naming the chunk it
     /// unlinked would have the next lookup follow the run through it and
     /// frame a `Content-Length` round bytes that are not on the disk. So
     /// the `stat`, the `unlink`, the count and the set are one booking
@@ -2855,9 +2853,9 @@ mod tests {
         drop(filler);
 
         // Chunk 1 is not the length it was written at any more. A listing
-        // reads names and not lengths, so the seed below holds both chunks
-        // -- as it should: the file is there, and it is the *read* that
-        // finds out it is not a chunk.
+        // reads names and not lengths, so the seed below holds both chunks,
+        // as it should. The file is there, and it is the *read* that finds
+        // out it is not a chunk.
         std::fs::write(chunk_path(&dir, 1), vec![7u8; CHUNK_BYTES as usize / 2]).unwrap();
         let listed = ChunkDir::new(dir.clone());
         assert_eq!(
@@ -2884,9 +2882,9 @@ mod tests {
     /// Two bodies of one entity can race past [`Filler::take`]'s check on
     /// the same chunk, and the second one's rename replaces the first one's
     /// file rather than adding a second. A count that booked the chunk's
-    /// length each time would say the cache held a chunk it does not, and
-    /// nothing would ever take that back off: the reclaim of the one file
-    /// subtracts one file's worth.
+    /// length each time would say the cache held a chunk it does not.
+    /// Nothing would ever take that back off, because the reclaim of the
+    /// one file subtracts one file's worth.
     #[test]
     fn writing_a_chunk_that_is_already_there_gains_the_cache_nothing() {
         let dir = tempfile::tempdir().expect("a scratch root");
@@ -2909,16 +2907,15 @@ mod tests {
     /// **And a write the store refused leaves whatever was at that name.**
     ///
     /// The answer that goes into the held set has to distinguish "the write
-    /// did not happen" from "there is nothing there", because the fill only
-    /// skips a chunk it saw at the moment it looked and a second body of
-    /// the same entity can put one under it after that. A failed write
-    /// reported as `Gone` would withdraw a complete chunk that is on the
-    /// disk and staying there.
+    /// did not happen" from "there is nothing there". The fill only skips a
+    /// chunk it saw at the moment it looked, and a second body of the same
+    /// entity can put one under it after that. A failed write reported as
+    /// `Gone` would withdraw a complete chunk that is on the disk and
+    /// staying there.
     ///
-    /// The refusal here is the store's own commit criterion -- a buffer
-    /// that is not the length the entity says the chunk is -- which fails
-    /// before anything is written, which is exactly the case being
-    /// described.
+    /// The refusal here is the store's own commit criterion: a buffer that
+    /// is not the length the entity says the chunk is. It fails before
+    /// anything is written, which is exactly the case being described.
     #[test]
     fn a_write_the_store_refused_leaves_the_chunk_that_was_there() {
         let dir = tempfile::tempdir().expect("a scratch root");
@@ -2947,15 +2944,15 @@ mod tests {
     /// them.**
     ///
     /// The sibling above is sequential, so the second write sees the first
-    /// one's file; this is the case that actually happens. Two bodies of
-    /// one entity race past [`Filler::take`]'s check and each writes from
-    /// its own blocking task, so both read "nothing at this name" before
-    /// either rename, and a count that priced each write from its own pair
-    /// of readings would book half a megabyte for one 256 KiB file. The
-    /// surplus is permanent -- the reclaim of the one file subtracts one
-    /// file's worth -- and it moves the published cap *up*
-    /// (`crate::cache_budget`), which grows the cache rather than bounding
-    /// it. So the readings and the write between them are one booking.
+    /// one's file. This is the case that actually happens. Two bodies of one
+    /// entity race past [`Filler::take`]'s check, and each writes from its
+    /// own blocking task. So both read "nothing at this name" before either
+    /// rename. A count that priced each write from its own pair of readings
+    /// would book half a megabyte for one 256 KiB file. The surplus is
+    /// permanent, because the reclaim of the one file subtracts one file's
+    /// worth. It also moves the published cap *up* (`crate::cache_budget`),
+    /// which grows the cache rather than bounding it. So the readings and
+    /// the write between them are one booking.
     #[test]
     fn two_bodies_writing_one_chunk_at_once_book_it_once() {
         let dir = tempfile::tempdir().expect("a scratch root");
@@ -3010,7 +3007,7 @@ mod tests {
         assert!(entry.look_up(Some("bytes=0-0")).is_some());
 
         let filler = entry.fill(CHUNK_BYTES * 3, "video/mp4", VALIDATOR, 0);
-        // The sibling removal is a blocking task; wait for it the way a test
+        // The sibling removal is a blocking task. Wait for it the way a test
         // waits for anything it did not await.
         for _ in 0..200 {
             if !old.exists() {
@@ -3033,10 +3030,10 @@ mod tests {
 
     /// The old entity is not removed from under a body that is reading it.
     /// A lookup promised that body its chunks, and the reclaim keeps the
-    /// promise at every unlink; a fill's sibling removal is the one other
-    /// deleter of a proxied chunk, and it has to keep it too -- or the
-    /// player's read fails mid-body for a reason it cannot see. The fill
-    /// after the read has ended is what takes it.
+    /// promise at every unlink. A fill's sibling removal is the one other
+    /// deleter of a proxied chunk, and it has to keep the promise too, or
+    /// the player's read fails mid-body for a reason it cannot see. The
+    /// fill after the read has ended is what takes it.
     #[tokio::test]
     async fn an_entity_a_body_is_inside_outlives_the_fill_that_replaced_it() {
         let (_root, cache) = cache();
@@ -3080,11 +3077,12 @@ mod tests {
     /// The sibling removal is the one deletion of proxy chunks that does
     /// not go through the retention owner chunk by chunk: one
     /// `remove_dir_all` takes a whole entity. The owner keeps an in-memory
-    /// set of what each entity holds (`proxy_retention::Held`) and it may be
-    /// short but may never be long -- a chunk it names that is not there is
-    /// a lookup framing a body round bytes the disk does not hold. So this
-    /// removal has to be heard, and what it says is "forget this entity",
-    /// after which the next ask seeds from what is really at that path.
+    /// set of what each entity holds (`proxy_retention::Held`). It may be
+    /// short but may never be long, because a chunk it names that is not
+    /// there is a lookup framing a body round bytes the disk does not hold.
+    /// So this removal has to be heard. What it says is "forget this
+    /// entity", and after that the next ask seeds from what is really at
+    /// that path.
     #[tokio::test]
     async fn a_replaced_entity_is_forgotten_by_the_owners_held_set() {
         let (_root, cache) = cache();
@@ -3128,11 +3126,11 @@ mod tests {
     /// A fill that completes no chunk leaves no directory behind.
     ///
     /// A range that starts inside a chunk and ends before the next boundary
-    /// carries nothing the cache can keep -- a player probing the tail of
-    /// an MP4 for its index is the everyday one -- so the fill makes no
-    /// entity directory before a chunk has arrived: nothing reclaims an
-    /// entity with no chunks, so a directory made early, and the key above
-    /// it, would stand until the next launch.
+    /// carries nothing the cache can keep. A player probing the tail of an
+    /// MP4 for its index is the everyday case. So the fill makes no entity
+    /// directory before a chunk has arrived. Nothing reclaims an entity with
+    /// no chunks, so a directory made early, and the key above it, would
+    /// stand until the next launch.
     #[tokio::test]
     async fn a_fill_that_keeps_nothing_makes_no_directory() {
         let (_root, cache) = cache();
@@ -3151,9 +3149,9 @@ mod tests {
     /// bucket, not the entity, not the key.
     ///
     /// One HLS playback is a URL per segment, and each segment opening
-    /// makes the one before it slack, so a reclaim that unlinked the chunks
-    /// and left their directories left three of them per segment in the
-    /// cache root, until the next launch.
+    /// makes the one before it slack. A reclaim that unlinked the chunks and
+    /// left their directories left three of them per segment in the cache
+    /// root, until the next launch.
     #[tokio::test]
     async fn a_stream_a_slack_pass_took_leaves_no_directory_behind() {
         let (_root, cache) = cache();
@@ -3236,8 +3234,8 @@ mod tests {
     }
 
     /// A body that does not start on a chunk boundary contributes nothing to
-    /// the chunk it starts inside -- there is no way to complete a chunk
-    /// whose front the response does not carry.
+    /// the chunk it starts inside. There is no way to complete a chunk whose
+    /// front the response does not carry.
     #[tokio::test]
     async fn a_fill_that_starts_mid_chunk_skips_to_the_next_boundary() {
         let (_root, cache) = cache();
@@ -3262,10 +3260,10 @@ mod tests {
     }
 
     /// A chunk is collected into one allocation of its own size, however
-    /// small the pieces it arrives in: the buffer is handed to the write
-    /// task whole, so the next chunk starts from nothing, and left to grow by
-    /// doubling from an 8 KiB piece it reallocated -- and copied -- its way
-    /// to 256 KiB on every chunk of every stream.
+    /// small the pieces it arrives in. The buffer is handed to the write
+    /// task whole, so the next chunk starts from nothing. Left to grow by
+    /// doubling from an 8 KiB piece, it reallocated (and copied) its way to
+    /// 256 KiB on every chunk of every stream.
     #[tokio::test]
     async fn a_chunk_is_collected_into_one_allocation_of_its_own_size() {
         const PIECE: usize = 8 * 1024;
@@ -3297,8 +3295,8 @@ mod tests {
                     "chunk {chunk}: and so no move of what was collected"
                 );
             }
-            // The last piece completes the chunk, which goes to the writer;
-            // the next chunk starts with an empty buffer and reserves again.
+            // The last piece completes the chunk, which goes to the writer.
+            // The next chunk starts with an empty buffer and reserves again.
             filler.take(&piece);
             assert_eq!(filler.collecting, None);
             assert_eq!(
@@ -3312,11 +3310,11 @@ mod tests {
     /// The sweep's whole job: leave the proxy cache empty.
     ///
     /// Nothing here outlives the process that wrote it. A proxied entity is
-    /// kept while something is playing it and disposable the moment anything
-    /// else opens, and a process that has served nothing is playing nothing
-    /// -- so a committed chunk from the last run is a byte no owner in this
-    /// run will ever count or reclaim. The temporary a kill left goes with
-    /// it, and needs no rule of its own any more.
+    /// kept while something is playing it and disposable the moment
+    /// anything else opens. A process that has served nothing is playing
+    /// nothing. So a committed chunk from the last run is a byte no owner in
+    /// this run will ever count or reclaim. The temporary a kill left goes
+    /// with it, and needs no rule of its own any more.
     #[test]
     fn the_sweep_empties_the_cache() {
         let (_root, cache) = cache();
@@ -3349,12 +3347,12 @@ mod tests {
     /// stray file, and a root that will not list at all.
     ///
     /// The sweep's job is that nothing a previous run wrote is here when
-    /// this one starts serving, so a plain file directly under the root --
-    /// a temporary an older layout left, a `.DS_Store`, anything -- is as
-    /// much a leftover as a key directory and goes by the same rule. And a
-    /// root that cannot be read is counted and survived: the proxy cache
-    /// filling up again is a far smaller problem than a launch that fails
-    /// because of it.
+    /// this one starts serving. So a plain file directly under the root (a
+    /// temporary an older layout left, a `.DS_Store`, anything) is as much
+    /// a leftover as a key directory and goes by the same rule. And a root
+    /// that cannot be read is counted and survived. The proxy cache filling
+    /// up again is a far smaller problem than a launch that fails because
+    /// of it.
     #[test]
     fn a_stray_file_goes_too_and_an_unreadable_root_is_counted() {
         let (_root, cache) = cache();
@@ -3407,18 +3405,18 @@ mod tests {
         }
     }
 
-    /// The three fields go into one directory name, and a name past what a
+    /// The three fields go into one directory name. A name past what a
     /// filesystem holds is the one refusal that is about none of the things
-    /// the origin said -- only about how long they are.
+    /// the origin said, only about how long they are.
     ///
     /// This is where it is pinned rather than in the route's tests, because
-    /// from outside the two answers are the same: a name past what a
-    /// filesystem takes fails its `mkdir` for every chunk of the response, so
-    /// nothing is cached either way. What the rule buys is that the refusal
-    /// is a decision made once instead of a line in the log per chunk -- and
-    /// the boundary is asserted against the filesystem itself, since a
-    /// constant that were one byte out would refuse names that fit or accept
-    /// names that do not.
+    /// from outside the two answers are the same. A name past what a
+    /// filesystem takes fails its `mkdir` for every chunk of the response,
+    /// so nothing is cached either way. What the rule buys is that the
+    /// refusal is a decision made once instead of a line in the log per
+    /// chunk. The boundary is asserted against the filesystem itself, since
+    /// a constant that were one byte out would refuse names that fit or
+    /// accept names that do not.
     #[test]
     fn an_entity_is_kept_only_under_a_name_a_directory_can_hold() {
         let (root, cache) = cache();
@@ -3441,8 +3439,8 @@ mod tests {
     }
 
     /// The name splits into exactly the three fields it was written from,
-    /// whatever an origin spells them with -- `_` included, which is in the
-    /// set a percent-encoding would otherwise leave alone.
+    /// whatever an origin spells them with. That includes `_`, which is in
+    /// the set a percent-encoding would otherwise leave alone.
     #[test]
     fn an_entity_name_round_trips_through_the_characters_that_could_break_it() {
         for (content_type, validator) in [
@@ -3461,9 +3459,9 @@ mod tests {
                 "{name}"
             );
         }
-        // Nothing writes an entity with an empty identity -- one with no
-        // validator is filed under its length -- so a directory claiming
-        // to be one is not read as an entity at all.
+        // Nothing writes an entity with an empty identity: one with no
+        // validator is filed under its length. So a directory claiming to
+        // be one is not read as an entity at all.
         assert_eq!(
             parse_entity_dir_name(&entity_dir_name(4096, "video/mp4", "")),
             None
