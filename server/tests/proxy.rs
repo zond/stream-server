@@ -4,19 +4,19 @@
 //! **keeps the whole chunks of them it is allowed to keep**, so the next read
 //! of the same bytes is answered from disk (`server/src/proxy_cache.rs`). A
 //! client sending every remote stream through this server therefore gets the
-//! header rewriting, the single egress point *and* a cache -- but a narrow
-//! one, and the tests below pin both halves: what it serves without asking
-//! the origin, what it asks the origin for when it holds only part of a
-//! range, and every reason it refuses to keep a response at all.
+//! header rewriting, the single egress point *and* a cache. The cache is a
+//! narrow one, and the tests below pin both halves: what it serves without
+//! asking the origin, what it asks the origin for when it holds only part
+//! of a range, and every reason it refuses to keep a response at all.
 //!
 //! Both URL shapes are exercised. The Core path format
 //! (`/proxy/d=<origin>&h=.../<path>`) is the one stremio-core builds and
-//! the one this server writes itself: every line of a rewritten HLS
+//! the one this server writes itself. Every line of a rewritten HLS
 //! playlist comes back in it, because only a path format leaves a nested
 //! playlist a directory of its own to resolve *its* lines against. The
-//! query format (`/proxy/?d=<url>`) is read and not written -- callers
-//! still send it, and most tests below use it because a whole target in
-//! one parameter is the shorter thing to write.
+//! query format (`/proxy/?d=<url>`) is read and not written. Callers still
+//! send it, and most tests below use it because a whole target in one
+//! parameter is the shorter thing to write.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -27,17 +27,17 @@ use std::path::PathBuf;
 mod torrent_fixtures;
 
 /// The config every test here spreads from: offline and with an empty pin
-/// record (`support/torrent_fixtures.rs`), which is the proxy cache's too
-/// -- one pin set for both stores: an embedder that keeps a record and has
-/// pinned nothing, under which a restart sweeps the cache clean. `None`
-/// would keep everything (`proxy_downloads.rs` has that case).
+/// record (`support/torrent_fixtures.rs`). That record is the proxy cache's
+/// too, since one pin set serves both stores. It is an embedder that keeps a
+/// record and has pinned nothing, and under it a restart sweeps the cache
+/// clean. `None` would keep everything (`proxy_downloads.rs` has that case).
 fn offline_config() -> stream_server::ServerConfig {
     torrent_fixtures::offline_config()
 }
 
-/// One byte of the body at `offset`: a cheap pattern, so a range response
-/// can be checked to have come from the offset it claims rather than merely
-/// to have the right length.
+/// One byte of the body at `offset`. It is a cheap pattern, so a range
+/// response can be checked to have come from the offset it claims rather
+/// than merely to have the right length.
 fn byte_at(offset: usize) -> u8 {
     (offset % 251) as u8
 }
@@ -64,8 +64,8 @@ impl Request {
         self.header("range")
     }
 
-    /// The request target exactly as it came off the wire -- still
-    /// percent-encoded, which is the only form in which a `%2F` can be told
+    /// The request target exactly as it came off the wire, still
+    /// percent-encoded. That is the only form in which a `%2F` can be told
     /// from the separator it stands for.
     fn target(&self) -> &str {
         self.line
@@ -88,14 +88,14 @@ const ORIGIN_LENGTH: usize = 1024 * 1024;
 
 /// How the default origin identifies its entity, the way most real ones do.
 /// One that names neither `ETag` nor `Last-Modified` is kept too, under its
-/// length alone (`routes::proxy::entity_identity`); these tests exercise
+/// length alone (`routes::proxy::entity_identity`). These tests exercise
 /// the stronger identity, which is the one a stitch and an `If-Range` can
 /// use.
 const ORIGIN_ETAG: &str = "\"the-movie\"";
 
 impl Origin {
     /// The default origin: [`ORIGIN_LENGTH`] bytes of [`byte_at`] with
-    /// `Range` support, which is how a test tells "the proxy relayed the
+    /// `Range` support. That is how a test tells "the proxy relayed the
     /// range" from "the proxy fetched the whole file and sliced it".
     fn start() -> anyhow::Result<Self> {
         Self::start_sized(ORIGIN_LENGTH)
@@ -202,12 +202,12 @@ impl Origin {
     }
 
     /// Whether the origin has been asked for anything it has not been asked
-    /// about yet -- how a cache hit is told from a fetch.
+    /// about yet. This is how a cache hit is told from a fetch.
     ///
-    /// Not a timing assertion: the responder records a request *before* it
-    /// writes a byte of the answer, so by the time a proxied response has
-    /// been read to its end, an origin fetch that happened has already
-    /// arrived here. Nothing has, and nothing will.
+    /// It is not a timing assertion. The responder records a request
+    /// *before* it writes a byte of the answer. So by the time a proxied
+    /// response has been read to its end, an origin fetch that happened has
+    /// already arrived here. Nothing has, and nothing will.
     fn was_asked_for_nothing_more(&self) -> bool {
         self.requests.try_recv().is_err()
     }
@@ -221,7 +221,7 @@ impl Origin {
 }
 
 /// Percent-encodes everything but the unreserved set, which is what a `d=`
-/// value needs: the target URL's own `:`, `/`, `?` and `&` must survive the
+/// value needs. The target URL's own `:`, `/`, `?` and `&` must survive the
 /// query segment they are carried in.
 fn encode(value: &str) -> String {
     let mut encoded = String::new();
@@ -251,7 +251,7 @@ fn fixture() -> anyhow::Result<Fixture> {
 fn fixture_with(origin: Origin) -> anyhow::Result<Fixture> {
     // Before the first request, which is when the proxy's client is built and
     // the trust set is read. Every proxy request in this binary follows a
-    // fixture, so this is the ordering point; the call after the first is a
+    // fixture, so this is the ordering point. The call after the first is a
     // no-op.
     enginefs::http_client::trust_roots_for_tests(vec![TEST_CA.pem.clone()]);
     let config_dir = tempfile::tempdir()?;
@@ -298,7 +298,7 @@ fn the_core_path_format_relays_the_target() -> anyhow::Result<()> {
     assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
 
     // The path after the `d=` segment, and the proxy URL's own query, both
-    // reach the origin: a signed URL loses neither.
+    // reach the origin. A signed URL loses neither.
     assert_eq!(
         fixture.origin.next_request().line,
         "GET /dir/movie.mp4?token=abc HTTP/1.1"
@@ -308,9 +308,9 @@ fn the_core_path_format_relays_the_target() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `/proxy` relays reads and nothing else: a `POST`, `PUT` or `DELETE` is
-/// `405` and the origin is asked for nothing. The route is open, under a
-/// wildcard CORS, so a relay that took any method would let any page or
+/// `/proxy` relays reads and nothing else. A `POST`, `PUT` or `DELETE` is
+/// `405`, and the origin is asked for nothing. The route is open, under a
+/// wildcard CORS. So a relay that took any method would let any page or
 /// app on the device write to wherever the device can reach.
 #[test]
 fn only_reads_are_relayed() -> anyhow::Result<()> {
@@ -350,11 +350,10 @@ fn only_reads_are_relayed() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The query format. Not what the playlist rewrite writes -- the rewrite
-/// writes the path format, since a rewritten line needs a directory of its
-/// own -- but callers still send it, so the route still reads it, and the
-/// whole target in one parameter has to say everything a target named by
-/// path can.
+/// The query format. The playlist rewrite does not write it: it writes the
+/// path format, since a rewritten line needs a directory of its own. But
+/// callers still send it, so the route still reads it. The whole target in
+/// one parameter has to say everything a target named by path can.
 #[test]
 fn the_query_format_relays_the_target() -> anyhow::Result<()> {
     let fixture = fixture()?;
@@ -420,7 +419,7 @@ fn a_byte_range_is_forwarded_to_the_origin_and_its_206_relayed_back() -> anyhow:
         "and the bytes are the ones at that offset"
     );
 
-    // The origin was asked for the range, not for the file: the proxy is not
+    // The origin was asked for the range, not for the file. The proxy is not
     // fetching from the start and discarding the front of it.
     assert_eq!(
         fixture.origin.next_request().range(),
@@ -434,11 +433,11 @@ fn a_byte_range_is_forwarded_to_the_origin_and_its_206_relayed_back() -> anyhow:
 /// A range shorter than a chunk leaves nothing behind, and is fetched again
 /// every time it is asked for.
 ///
-/// Only *whole* chunks are stored -- there is no hash to tell a complete
-/// chunk from a truncated one, so completeness is a rename and a rename only
-/// happens when the chunk is full -- and a hundred bytes never fill one. It
-/// is the ordinary shape of a probe rather than of playback, and the cache
-/// deliberately does nothing for it.
+/// Only *whole* chunks are stored, and a hundred bytes never fill one.
+/// There is no hash to tell a complete chunk from a truncated one. So
+/// completeness is a rename, and a rename only happens when the chunk is
+/// full. A short range is the ordinary shape of a probe rather than of
+/// playback, and the cache deliberately does nothing for it.
 #[test]
 fn a_read_too_short_to_fill_a_chunk_is_not_cached() -> anyhow::Result<()> {
     let fixture = fixture()?;
@@ -539,7 +538,7 @@ fn a_range_the_cache_holds_is_served_without_asking_the_origin() -> anyhow::Resu
     Ok(())
 }
 
-/// Ranges are the whole job: holding the front of one must narrow what the
+/// Ranges are the whole job. Holding the front of one must narrow what the
 /// origin is asked for, not merely save the write.
 #[test]
 fn a_range_partly_held_fetches_only_the_missing_part() -> anyhow::Result<()> {
@@ -585,15 +584,15 @@ fn a_range_partly_held_fetches_only_the_missing_part() -> anyhow::Result<()> {
     Ok(())
 }
 /// An origin whose entity can change under the caller's feet **without
-/// changing its length or its content type** -- the one shape a store filed
-/// by length and type alone cannot tell apart, and the reason a validator is
-/// filed with them.
+/// changing its length or its content type**. A store filed by length and
+/// type alone cannot tell that shape apart, and that is the reason a
+/// validator is filed with them.
 ///
 /// Flipping the returned flag serves a second generation of the same
 /// resource: same length, same `Content-Type`, every byte different, and a
 /// new `ETag`. `honours_if_range` is the difference between an origin that
-/// implements the conditional and one that ignores it -- both must leave the
-/// player holding bytes from one generation and never a body spliced from
+/// implements the conditional and one that ignores it. Both must leave the
+/// player holding bytes from one generation, never a body spliced from
 /// two.
 fn generational_origin(
     honours_if_range: bool,
@@ -669,7 +668,7 @@ fn generation_byte(second: bool, offset: usize) -> u8 {
 }
 
 /// Every byte of `body` belongs to one generation, and the assertion names
-/// which -- a splice fails it at the seam rather than at the length.
+/// which. A splice fails it at the seam rather than at the length.
 fn assert_generation(body: &[u8], second: bool, from: usize, what: &str) {
     for (index, byte) in body.iter().enumerate() {
         assert_eq!(
@@ -696,9 +695,9 @@ fn warm_the_head(fixture: &Fixture) -> anyhow::Result<String> {
     Ok(url)
 }
 
-/// A playlist long enough to fill `chunks` whole cache chunks: ordinary
-/// `#EXTINF`/segment pairs, cut to the byte so every chunk of it is a whole
-/// one and the store keeps them all.
+/// A playlist long enough to fill `chunks` whole cache chunks. It is
+/// ordinary `#EXTINF`/segment pairs, cut to the byte so every chunk of it
+/// is a whole one and the store keeps them all.
 fn playlist_of(chunks: u64) -> Vec<u8> {
     let mut playlist = "#EXTM3U\n#EXT-X-VERSION:3\n".to_string();
     while (playlist.len() as u64) < CHUNK * chunks {
@@ -713,10 +712,10 @@ fn playlist_of(chunks: u64) -> Vec<u8> {
 /// two are parts of one entity, and the joined response is labelled with the
 /// validator that said so.
 ///
-/// Length and content type cannot say it: a resource that changes without
+/// Length and content type cannot say it. A resource that changes without
 /// changing either is exactly the case the store has no other way to see.
-/// So the entity is filed under the origin's own validator as well, the
-/// narrowed fetch carries it as `If-Range`, and the `206` that comes back
+/// So the entity is filed under the origin's own validator as well, and
+/// the narrowed fetch carries it as `If-Range`. The `206` that comes back
 /// has to name it again before a byte of the cached head goes in front.
 #[test]
 fn a_stitch_is_licensed_by_the_validator_the_head_was_filed_under() -> anyhow::Result<()> {
@@ -761,9 +760,9 @@ fn a_stitch_is_licensed_by_the_validator_the_head_was_filed_under() -> anyhow::R
 }
 
 /// The same narrowing against an entity that changed between the two reads.
-/// Same length, same type, different bytes -- so nothing but the validator
-/// can tell, and the `If-Range` the narrowed fetch carries makes the origin
-/// answer with the whole of the new entity instead of a tail that would be
+/// Same length, same type, different bytes, so nothing but the validator
+/// can tell. The `If-Range` the narrowed fetch carries makes the origin
+/// answer with the whole of the new entity, instead of a tail that would be
 /// spliced onto the old one's head.
 #[test]
 fn an_entity_that_changed_is_not_spliced_onto_the_cached_head() -> anyhow::Result<()> {
@@ -801,16 +800,16 @@ fn an_entity_that_changed_is_not_spliced_onto_the_cached_head() -> anyhow::Resul
     Ok(())
 }
 
-/// And an origin that ignores `If-Range` altogether -- which is allowed, and
-/// is why the condition is not the guard. It answers the narrowed range as a
-/// `206` of the *new* entity; the `ETag` on it is not the one the cached head
-/// is filed under, so the head is dropped and the origin's own answer is
-/// relayed as it stands.
+/// And an origin that ignores `If-Range` altogether. That is allowed, and
+/// it is why the condition is not the guard. It answers the narrowed range
+/// as a `206` of the *new* entity. The `ETag` on it is not the one the
+/// cached head is filed under, so the head is dropped and the origin's own
+/// answer is relayed as it stands.
 ///
-/// That answer is a range the player did not ask for, and it says so: the
+/// That answer is a range the player did not ask for, and it says so. The
 /// `Content-Range` is the origin's, the body is one generation's, and the
 /// player re-reads. A broken read is the price of narrowing against a store
-/// that never revalidates; a body spliced out of two generations is not,
+/// that never revalidates. A body spliced out of two generations is not,
 /// because nothing downstream could ever find out.
 #[test]
 fn an_origin_that_ignores_if_range_is_still_not_spliced() -> anyhow::Result<()> {
@@ -846,19 +845,20 @@ fn an_origin_that_ignores_if_range_is_still_not_spliced() -> anyhow::Result<()> 
 /// The one way a cached head can still meet a playlist tail, and the guard
 /// that keeps them apart.
 ///
-/// The hit's classification asks about the type the *store* filed; the
-/// fetch's asks about the URL the body came from, and a redirect to a
-/// `.m3u8` is exactly the shape that turns the verdict over between the two
-/// -- an extension-less URL at an indifferent origin (`application/octet-
-/// stream`), an edge that hands the tail off to a playlist path. Nothing is
-/// stale here: same entity, same validator, the `Content-Range` continues
-/// the head to the byte. Only the verdict changed.
+/// The hit's classification asks about the type the *store* filed. The
+/// fetch's asks about the URL the body came from. A redirect to a `.m3u8`
+/// is exactly the shape that turns the verdict over between the two: an
+/// extension-less URL at an indifferent origin (`application/octet-
+/// stream`), and an edge that hands the tail off to a playlist path.
+/// Nothing is stale here: same entity, same validator, and the
+/// `Content-Range` continues the head to the byte. Only the verdict
+/// changed.
 ///
-/// So the head is dropped and the origin's own `206` relayed -- a broken
-/// read the player re-reads, which is the documented price -- rather than a
-/// playlist spliced onto bytes that were never classified as one. It is also
-/// the reason the refusal below has to name *which* condition failed: this
-/// one fails none of the others.
+/// So the head is dropped and the origin's own `206` relayed, rather than a
+/// playlist spliced onto bytes that were never classified as one. That is a
+/// broken read the player re-reads, which is the documented price. It is
+/// also the reason the refusal below has to name *which* condition failed:
+/// this one fails none of the others.
 #[test]
 fn a_tail_that_turned_out_to_be_a_playlist_is_not_joined_to_the_head() -> anyhow::Result<()> {
     let body = playlist_of(4);
@@ -957,19 +957,19 @@ fn a_tail_that_turned_out_to_be_a_playlist_is_not_joined_to_the_head() -> anyhow
 
 /// A cache hit and a cache miss classify the same request the same way.
 ///
-/// `r=` is deliberately not in the cache key: it never reaches the origin,
+/// `r=` is deliberately not in the cache key. It never reaches the origin,
 /// so it cannot vary the bytes stored. What it *can* vary is the verdict on
-/// what those bytes are -- `r=Content-Type:application/x-mpegURL` is what
+/// what those bytes are. `r=Content-Type:application/x-mpegURL` is what
 /// stremio-core sends for an HLS stream, and it forces the playlist rewrite
 /// over an origin that mislabels. A hit that answers before that
 /// classification is reached would serve the very body the rewrite exists
-/// to replace, so the same URL would play through the proxy on a miss and
-/// bypass it on a hit -- which is what keeping `r=` out of the key promises
-/// does not happen.
+/// to replace. The same URL would then play through the proxy on a miss
+/// and bypass it on a hit. Keeping `r=` out of the key promises that does
+/// not happen.
 #[test]
 fn a_cache_hit_is_classified_the_way_a_miss_is() -> anyhow::Result<()> {
-    // A playlist the origin labels `video/mp4`, four whole chunks of it, so
-    // the store keeps it and a request with no `Range` can be answered from
+    // A playlist the origin labels `video/mp4`, four whole chunks of it. So
+    // the store keeps it, and a request with no `Range` can be answered from
     // the store entire.
     let body = playlist_of(4);
     let origin = Origin::start_with(move |request: &Request, socket: &mut TcpStream| {
@@ -1002,7 +1002,8 @@ fn a_cache_hit_is_classified_the_way_a_miss_is() -> anyhow::Result<()> {
         }
     };
 
-    // The miss: never fetched before, so it is classified as it is fetched.
+    // The miss. It was never fetched before, so it is classified as it is
+    // fetched.
     let missed = client.get(proxied("/cold.mp4", true)).send()?;
     fixture.origin.next_request();
     let missed_status = missed.status();
@@ -1046,22 +1047,21 @@ fn a_cache_hit_is_classified_the_way_a_miss_is() -> anyhow::Result<()> {
 /// The same request, answered from an empty cache, from a half-filled one
 /// and from a full one, must come back the same three times.
 ///
-/// This is the previous test's question asked of the *partial* hit: a hit
-/// that holds only the head of the range must still be classified rather
-/// than narrow the player's `Range` down to what it does not hold and relay
+/// This is the previous test's question asked of the *partial* hit. A hit
+/// that holds only the head of the range must still be classified. It must
+/// not narrow the player's `Range` down to what it does not hold and relay
 /// the fetched tail raw because that tail turns out to be a playlist. A
 /// reader that skips the classification on a partial hit answers `200` and
-/// a rewritten playlist cold, but `206` and unrewritten origin bytes -- with
-/// a `Content-Range` naming a range the player never asked for and every
-/// segment line pointing straight at the origin, no `h=`, no `p=` -- half
-/// cached: one request, three answers, chosen by how much happened to be on
-/// disk.
+/// a rewritten playlist cold. Half cached, it answers `206` and unrewritten
+/// origin bytes, with a `Content-Range` naming a range the player never
+/// asked for and every segment line pointing straight at the origin (no
+/// `h=`, no `p=`). That is one request with three answers, chosen by how
+/// much happened to be on disk.
 #[test]
 fn a_partly_held_range_is_classified_the_way_a_hit_and_a_miss_are() -> anyhow::Result<()> {
     // A playlist the origin labels `video/mp4` at a URL that names no
-    // extension: nothing but `r=` says this is a playlist, which is the
-    // whole point -- and four whole chunks of it, so the cache can hold
-    // half.
+    // extension. Nothing but `r=` says this is a playlist, which is the
+    // whole point. It is four whole chunks, so the cache can hold half.
     let body = playlist_of(4);
     let total = body.len();
     let origin = Origin::start_with(move |request: &Request, socket: &mut TcpStream| {
@@ -1115,7 +1115,7 @@ fn a_partly_held_range_is_classified_the_way_a_hit_and_a_miss_are() -> anyhow::R
         }
     };
     // What a player opens a stream with, and the one shape that reaches the
-    // cache holding part of the range: an unranged request is answered only
+    // cache holding part of the range. An unranged request is answered only
     // from a complete entry.
     let whole = "bytes=0-";
     let answer = |force: bool| -> anyhow::Result<(String, Option<String>, String)> {
@@ -1147,8 +1147,8 @@ fn a_partly_held_range_is_classified_the_way_a_hit_and_a_miss_are() -> anyhow::R
         "and a playlist is not a body the cache keeps"
     );
 
-    // Half of it on disk, filled by a request that did not force the type --
-    // which is the second player of a stream, or the same one before the
+    // Half of it on disk, filled by a request that did not force the type.
+    // That is the second player of a stream, or the same one before the
     // addon's `r=` was in play.
     let warm = client
         .get(proxied(false))
@@ -1199,14 +1199,14 @@ fn a_partly_held_range_is_classified_the_way_a_hit_and_a_miss_are() -> anyhow::R
 }
 
 /// Two players reading the same stream at different offsets. Neither is in
-/// the other's key -- `p=` is the client's name for its own player and is
-/// never part of what the cache is filed under -- so what one of them fetched
+/// the other's key. `p=` is the client's name for its own player and is
+/// never part of what the cache is filed under. So what one of them fetched
 /// answers the other.
 ///
 /// A player's token is also what turns read-ahead on for its stream
-/// (`proxy_retention::Prefetcher`), and this film fits the budget whole, so
-/// after the first player's first chunk the rest of the film is on its way
-/// to the disk on the players' behalf. That is more sharing, not less: the
+/// (`proxy_retention::Prefetcher`), and this film fits the budget whole. So
+/// after the first player's first chunk, the rest of the film is on its way
+/// to the disk on the players' behalf. That is more sharing, not less. The
 /// second player's range may already be there when it asks, and the third
 /// player's certainly is.
 #[test]
@@ -1236,7 +1236,7 @@ fn two_players_reading_one_stream_share_what_either_fetched() -> anyhow::Result<
         .header(reqwest::header::RANGE, &middle)
         .send()?;
     assert_eq!(two.bytes()?.len() as u64, CHUNK);
-    // Fetched by the second player, or read ahead of the first: either way
+    // Fetched by the second player, or read ahead of the first. Either way
     // the origin was asked for it once, by this server, on a player's
     // behalf.
     let second = fixture.origin.next_request();
@@ -1268,11 +1268,11 @@ fn two_players_reading_one_stream_share_what_either_fetched() -> anyhow::Result<
 /// A body that stops part way through a chunk leaves nothing on disk that a
 /// later read could take for a complete chunk.
 ///
-/// The origin here promises a megabyte and writes a thousand bytes, which is
+/// The origin here promises a megabyte and writes a thousand bytes. That is
 /// what a client that vanished mid-fill looks like from the writer's side:
 /// the stream ends at a byte that is not a chunk boundary. A chunk is held in
 /// memory until it is whole, so there is nothing to half-write and nothing to
-/// sweep -- and the next read of those bytes goes back to the origin.
+/// sweep. The next read of those bytes goes back to the origin.
 #[test]
 fn a_body_that_stops_mid_chunk_leaves_no_chunk_to_serve() -> anyhow::Result<()> {
     let fixture = fixture_with(Origin::start_with(
@@ -1295,7 +1295,7 @@ fn a_body_that_stops_mid_chunk_leaves_no_chunk_to_serve() -> anyhow::Result<()> 
     let url = format!("{}/proxy/d={}/movie.mp4", fixture.base, encode(&origin));
     let client = reqwest::blocking::Client::new();
 
-    // The body breaks where the origin stopped writing; that is the point.
+    // The body breaks where the origin stopped writing. That is the point.
     let response = client
         .get(&url)
         .header(reqwest::header::RANGE, "bytes=0-")
@@ -1332,16 +1332,16 @@ fn a_body_that_stops_mid_chunk_leaves_no_chunk_to_serve() -> anyhow::Result<()> 
 /// it: a `Cache-Control` directive, a content coding, a missing
 /// `Accept-Ranges`, and so on. So every case here is paired with the same
 /// response minus its defect, on a URL of its own, and the pair is the whole
-/// assertion -- the defective one stores nothing, the control stores its four
-/// chunks. A case that failed for some *other* reason would take its control
-/// down with it.
+/// assertion. The defective one stores nothing, and the control stores its
+/// four chunks. A case that failed for some *other* reason would take its
+/// control down with it.
 ///
-/// That pairing is the point: an origin whose `Accept-Ranges: bytes` is
-/// missing from even one arm would refuse every path for a rule none of
-/// them was written to exercise, and the test would pass with every one of
-/// those rules deleted.
+/// That pairing is the point. Take an origin whose `Accept-Ranges: bytes`
+/// is missing from even one arm. It would refuse every path for a rule none
+/// of them was written to exercise, and the test would pass with every one
+/// of those rules deleted.
 ///
-/// The accounting is per entity, not a running total over the cache: each
+/// The accounting is per entity, not a running total over the cache. Each
 /// of these requests opens a stream on a URL of its own, and opening one is
 /// what makes the one before it disposable (`server::proxy_retention`). So
 /// what a pair claims is that the defective response added no entity of its
@@ -1349,11 +1349,11 @@ fn a_body_that_stops_mid_chunk_leaves_no_chunk_to_serve() -> anyhow::Result<()> 
 ///
 /// The refusals are deliberately more than the letter of HTTP asks for. A
 /// store that never revalidates cannot honour `no-cache` or a `max-age` of
-/// zero any other way; an origin that has not said it answers ranges must not
-/// have one answered out of the cache later; a body under a content coding is
-/// not the body the framing headers a hit writes would describe.
+/// zero any other way. An origin that has not said it answers ranges must
+/// not have one answered out of the cache later. A body under a content
+/// coding is not the body the framing headers a hit writes would describe.
 ///
-/// **An entity the origin names no validator for is not on the list**: it
+/// **An entity the origin names no validator for is not on the list.** It
 /// is kept under its length (`routes::proxy::entity_identity`), and the
 /// test says so with the same pair the refusals use.
 #[test]
@@ -1399,9 +1399,9 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
                 other => panic!("the test asked for a defect the origin does not serve: {other}"),
             }
             // A `206` a byte short of the whole entity. It is what the
-            // playlist rule needs to be *reachable*: a playlist that is the
+            // playlist rule needs to be *reachable*. A playlist that is the
             // whole body is replaced by the rewrite, which never reaches the
-            // cache at all, so the only response the rule itself decides is
+            // cache at all. So the only response the rule itself decides is
             // the fragment the rewrite declines to touch.
             if shape == "fragment" {
                 body.truncate(ORIGIN_LENGTH - 1);
@@ -1447,9 +1447,9 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
     let proxied = |path: &str| format!("{}/proxy/d={}{path}", fixture.base, encode(&origin));
 
     // Each defect against the same response without it, in the same shape.
-    // The entities the cache holds before the pair are what both halves are
-    // read against: a directory that was not among them and holds chunks is
-    // a response that was cached.
+    // Both halves are read against the entities the cache holds before the
+    // pair. A directory that was not among them and holds chunks is a
+    // response that was cached.
     for (shape, defect) in [
         ("whole", "no-store"),
         ("whole", "no-cache"),
@@ -1475,7 +1475,7 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
         assert_nothing_new_is_cached(&fixture, &before, &format!("{defect} must not be cached"));
 
         // The same response, the same shape, the same length, the same
-        // everything but the defect -- and it is kept. So the assertion
+        // everything but the defect, and it is kept. So the assertion
         // above is about the rule and not about the origin, the body or the
         // fixture.
         let control = client
@@ -1491,7 +1491,7 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
         );
     }
 
-    // No validator is not a defect: the response is kept, under its
+    // No validator is not a defect. The response is kept, under its
     // length, and a hit on it states no validator the origin never wrote.
     settled(&fixture);
     let before = cached_entities(&fixture);
@@ -1515,16 +1515,16 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
 
     // The `long-type` rule has no case here and cannot have one. A content
     // type past what one directory name holds is refused
-    // (`proxy_cache::can_be_filed`), and if it were not, every chunk write of
-    // that response would fail its own `mkdir` -- so nothing is cached either
-    // way and no origin can tell the two apart. What the rule buys is that
-    // the failure is a decision rather than a line in the log per chunk, and
-    // it is pinned where that is visible: beside the function, in
+    // (`proxy_cache::can_be_filed`). If it were not, every chunk write of
+    // that response would fail its own `mkdir`. So nothing is cached either
+    // way, and no origin can tell the two apart. What the rule buys is that
+    // the failure is a decision rather than a line in the log per chunk. It
+    // is pinned where that is visible: beside the function, in
     // `proxy_cache`'s own tests.
     //
     // And the refusals that are about the *request* rather than the
-    // response. What each of them refuses is an **entry**, not a response, so
-    // "nothing new was cached" does not isolate any of them -- a `HEAD` has
+    // response. What each of them refuses is an **entry**, not a response.
+    // So "nothing new was cached" does not isolate any of them: a `HEAD` has
     // no body to store whatever the rule says. What does isolate them is the
     // other half of an entry: the read. Each entity below is filled by an
     // ordinary `GET` first, and the refused request is then made against a
@@ -1534,19 +1534,19 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
     // Each case is finished before the next one is filled, because filling
     // the next is what makes this one's chunks disposable.
     //
-    // A `HEAD` describes a body it does not carry; an `If-Range` is a
+    // A `HEAD` describes a body it does not carry. An `If-Range` is a
     // conditional, and answering one out of a store that never revalidates
-    // would be inventing the condition's answer; an `h=` naming a credential
-    // is refused outright rather than keyed, since `/proxy` takes no bearer
-    // token of its own and an entry one caller's secret filled is one any
-    // other caller could name.
+    // would be inventing the condition's answer. An `h=` naming a credential
+    // is refused outright rather than keyed. `/proxy` takes no bearer token
+    // of its own, and any other caller could name an entry one caller's
+    // secret filled.
     //
     // Two claims per case: the filled entity is intact *and* nothing outside
     // it holds a chunk. A refused request answered from disk would fail the
-    // first; one
-    // that quietly filed an entry of its own -- under the framing of a body
-    // it never carried, which is a directory of its own -- would fail the
-    // second and nothing else here would notice it.
+    // first. A request that quietly filed an entry of its own would fail the
+    // second, and nothing else here would notice it. (It would be filed
+    // under the framing of a body it never carried, which is a directory of
+    // its own.)
     //
     // `fill` says which entity it filled and which entities may hold a chunk
     // after it: what was there before, plus the one it made.
@@ -1582,8 +1582,8 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
     );
 
     // A request with no `Range` is answered from the cache only when the
-    // whole entity is there -- which for this one it now is, and it is still
-    // the stream being played, so nothing has taken it.
+    // whole entity is there. For this one it now is. It is still the stream
+    // being played, so nothing has taken it.
     let response = client.get(proxied("/whole/none/head.mp4")).send()?;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(
@@ -1652,19 +1652,19 @@ fn nothing_the_rules_refuse_is_cached() -> anyhow::Result<()> {
 
 /// **What `clean_cache_now` takes is the slack, and only the slack.**
 ///
-/// Cached proxy bytes are ordinary cache and a proxied stream the viewer
-/// has left is the first thing that should go -- a clean is one of the four
+/// Cached proxy bytes are ordinary cache, and a proxied stream the viewer
+/// has left is the first thing that should go. A clean is one of the four
 /// things that takes it, beside the tick, the switch and the running-low
 /// bell. What it may not take is the entity being played. There is no age
-/// rule and no size rule left to weigh the two against each other: the one
+/// rule and no size rule left to weigh the two against each other. The one
 /// stream somebody is inside keeps its window however far over the cap the
 /// cache is, and what the report says about that is `over_limit`.
 ///
 /// Which of the two deleters got there first is deliberately not asserted.
 /// Opening the second stream is itself what makes the first disposable, so
-/// the switch task may have taken those chunks before the clean was asked
-/// -- it is the same pass over the same entity under the same turn, and a
-/// test that pinned the winner would be pinning a race rather than a rule.
+/// the switch task may have taken those chunks before the clean was asked.
+/// It is the same pass over the same entity under the same turn. A test
+/// that pinned the winner would be pinning a race rather than a rule.
 /// What is asserted is the state a client sees when the clean answers.
 #[test]
 fn cleaning_now_takes_the_proxied_stream_the_viewer_left_and_not_the_one_playing()
@@ -1682,9 +1682,9 @@ fn cleaning_now_takes_the_proxied_stream_the_viewer_left_and_not_the_one_playing
     fixture.origin.next_request();
     let left = wait_for_new_entity(&fixture, &Default::default(), 4);
     // And nobody is reading it any more. The client has every byte, but the
-    // read that delivered them lives until hyper drops the response, and
-    // while it does those bytes are promised to a body in flight -- which
-    // is true, and is the subject of another test.
+    // read that delivered them lives until hyper drops the response. While
+    // it does, those bytes are promised to a body in flight. That is true,
+    // and it is the subject of another test.
     nothing_is_reading(&fixture);
 
     // The viewer opens something else, which is the whole of what makes the
@@ -1703,8 +1703,8 @@ fn cleaning_now_takes_the_proxied_stream_the_viewer_left_and_not_the_one_playing
     nothing_is_reading(&fixture);
 
     // A cap under what is cached, so there is something for a clean to be
-    // unable to get under. Well above one chunk, so nothing here is about a
-    // single file being bigger than the whole cap.
+    // unable to get under. It is well above one chunk, so nothing here is
+    // about a single file being bigger than the whole cap.
     fixture
         .handle
         .update_settings(serde_json::json!({ "cacheSize": (CHUNK as f64) * 1.5 }))?;
@@ -1736,7 +1736,7 @@ fn cleaning_now_takes_the_proxied_stream_the_viewer_left_and_not_the_one_playing
 /// walked the tree.**
 ///
 /// A walk of the whole cache root would make the figure only as current as
-/// the last pass and absent before the first -- a client's "Storage" screen
+/// the last pass, and absent before the first. A client's "Storage" screen
 /// would read 0 for the minutes a device with sixteen thousand files takes
 /// to finish one. The two things that put bytes in this cache count them as
 /// they land instead, so the answer is current and costs no `statx`.
@@ -1768,9 +1768,9 @@ fn the_cache_figure_follows_the_chunks_the_proxy_wrote() -> anyhow::Result<()> {
         cached * CHUNK,
         "every chunk the fill wrote, and no walk of the root to find them: {usage:?}"
     );
-    // Nothing is bounding this entity -- the volume this test runs on is
-    // roomier than a megabyte -- and it is the stream being played, so no
-    // pass may take any of it and the whole of it is protected.
+    // Nothing is bounding this entity, because the volume this test runs on
+    // is roomier than a megabyte. It is the stream being played, so no pass
+    // may take any of it, and the whole of it is protected.
     assert_eq!(
         (usage.protected_bytes, usage.protected_files),
         (usage.total_bytes, 1),
@@ -1779,10 +1779,10 @@ fn the_cache_figure_follows_the_chunks_the_proxy_wrote() -> anyhow::Result<()> {
 
     // **And the figure is the count, not a reading of the tree.** A chunk
     // put into the entity's own directory by hand is a chunk no fill
-    // booked: a walk would find it, the count cannot, and which of the two
+    // booked. A walk would find it and the count cannot. Which of the two
     // answers this route gives is the whole of this slice. (A count can
     // stand for the tree only because the launch sweep empties the cache
-    // before anything is served -- see `proxy_cache::sweep`.)
+    // before anything is served. See `proxy_cache::sweep`.)
     let bucket = cached_chunks(&fixture)
         .first()
         .and_then(|chunk| chunk.parent().map(std::path::Path::to_path_buf))
@@ -1803,17 +1803,17 @@ fn the_cache_figure_follows_the_chunks_the_proxy_wrote() -> anyhow::Result<()> {
 /// byte no owner ever booked is neither counted nor taken.**
 ///
 /// A count that never heard the deletions would keep those bytes booked for
-/// the life of the process -- and the cap this process publishes is
-/// `occupied + available - floor`, so an over-counted occupancy states a
-/// *larger* cap, the windows are sized to it, the cache refills past the
-/// floor and the next pass has more to take. There is no term in that loop
-/// that brings the count back down.
+/// the life of the process. The cap this process publishes is
+/// `occupied + available - floor`. So an over-counted occupancy states a
+/// *larger* cap, and the windows are sized to it. The cache then refills
+/// past the floor, and the next pass has more to take. There is no term in
+/// that loop that brings the count back down.
 ///
 /// A whole-file download under the same root that nothing here wrote is the
-/// other half. It belongs to no owner: nothing here booked it, so it is in
-/// no count, and a clean that is the owners' own passes has no way to reach
-/// it and takes nothing off any count for it. What bounds this cache is
-/// what this process wrote, not what predates it.
+/// other half. It belongs to no owner. Nothing here booked it, so it is in
+/// no count. A clean that is the owners' own passes has no way to reach it,
+/// and takes nothing off any count for it. What bounds this cache is what
+/// this process wrote, not what predates it.
 #[test]
 fn the_count_hears_the_clean_and_ignores_what_no_owner_booked() -> anyhow::Result<()> {
     let fixture = fixture()?;
@@ -1837,10 +1837,10 @@ fn the_count_hears_the_clean_and_ignores_what_no_owner_booked() -> anyhow::Resul
         .send()?;
     assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
     fixture.origin.next_request();
-    // Both readings taken once the cache has stopped moving, and in that
-    // order: the usage figure is what the fills booked, and counting the
+    // Both readings are taken once the cache has stopped moving, and in
+    // that order. The usage figure is what the fills booked. Counting the
     // files first compares a disk that is still being written to against a
-    // count that has heard every write. Read out of order the two figures
+    // count that has heard every write. Read out of order, the two figures
     // can differ by as much as a megabyte.
     nothing_is_reading(&fixture);
     settled(&fixture);
@@ -1852,8 +1852,8 @@ fn the_count_hears_the_clean_and_ignores_what_no_owner_booked() -> anyhow::Resul
          not the legacy file, which no owner booked"
     );
 
-    // The viewer opens something else, so the first entity is disposable,
-    // and a clean takes it.
+    // The viewer opens something else, so the first entity is disposable.
+    // A clean takes it.
     let response = client
         .get(proxied("/playing.mp4"))
         .header(reqwest::header::RANGE, "bytes=0-")
@@ -1886,16 +1886,17 @@ fn the_count_hears_the_clean_and_ignores_what_no_owner_booked() -> anyhow::Resul
 
 /// **What empties a proxied stream's cache is another one being opened.**
 ///
-/// Not a clock: a clock that forgets an entity ninety seconds after its
-/// last delivered byte, leaving its chunks for a cache cleaner's walk to
-/// find whenever it gets round to them, would treat a viewer who pauses for
-/// an hour as though they had stopped playing, and a viewer who opens
-/// something else as though they were still playing until the clock ran
-/// out. So the cache keeps the one stream being played and drops what was
-/// left, at the moment it is left -- with no clock in the decision.
+/// It is not a clock. Picture a clock that forgets an entity ninety seconds
+/// after its last delivered byte, and leaves its chunks for a cache
+/// cleaner's walk to find whenever it gets round to them. It would treat a
+/// viewer who pauses for an hour as though they had stopped playing. It
+/// would treat a viewer who opens something else as though they were still
+/// playing until the clock ran out. So the cache keeps the one stream being
+/// played and drops what was left, at the moment it is left, with no clock
+/// in the decision.
 ///
-/// This runs through the whole server, which is the point of it being here:
-/// the cell the proxy writes when a body opens is the engine's own
+/// This runs through the whole server, which is the point of it being here.
+/// The cell the proxy writes when a body opens is the engine's own
 /// (`AppState::new_with_shared_settings_and_log_dir`), and what wakes on it
 /// is the switch task in `server::serve`. Either of those wired to a cell of
 /// its own would leave the first stream's chunks on the disk for ever.
@@ -1910,12 +1911,12 @@ fn opening_another_proxied_stream_takes_the_one_it_left_off_the_disk() -> anyhow
     assert_eq!(first.bytes()?.len(), ORIGIN_LENGTH);
     fixture.origin.next_request();
     let left = wait_for_new_entity(&fixture, &Default::default(), 4);
-    // The body has to be over before the switch, because a body still being
-    // delivered keeps the bytes it was framed round however long ago the
-    // viewer left: what the switch drops is slack, and an open read is not.
+    // The body has to be over before the switch. A body still being
+    // delivered keeps the bytes it was framed round, however long ago the
+    // viewer left. What the switch drops is slack, and an open read is not.
     nothing_is_reading(&fixture);
 
-    // A second later or an hour later -- there is no clock in this -- the
+    // A second later or an hour later (there is no clock in this), the
     // viewer opens something else.
     let second = client.get(proxied("/second.mp4")).send()?;
     assert_eq!(second.bytes()?.len(), ORIGIN_LENGTH);
@@ -1950,8 +1951,8 @@ fn opening_another_proxied_stream_takes_the_one_it_left_off_the_disk() -> anyhow
 }
 
 /// A cache big enough that the tests below are about the window and not
-/// about the file: 128 chunks of origin against 32 chunks of budget, so the
-/// budget covers a quarter of it and the policy really splits.
+/// about the file. It is 128 chunks of origin against 32 chunks of budget,
+/// so the budget covers a quarter of it and the policy really splits.
 const RETENTION_ORIGIN: usize = 32 * 1024 * 1024;
 /// 32 chunks. A proxied stream shares nothing, so the whole of it is window.
 const RETENTION_BUDGET: u64 = 8 * 1024 * 1024;
@@ -1960,25 +1961,25 @@ const RETENTION_BUDGET: u64 = 8 * 1024 * 1024;
 /// the streams below.
 ///
 /// **Nothing here runs a pass.** Stating the budget is a publication and
-/// not a deletion -- `update_settings` publishes it, because `cacheSize` is
-/// half of what the cap is made of and a client that changes it has changed
-/// the cap (`server::cache_budget`). Sweeping the volume here first would
-/// make these tests pass just as well with the publication back where it
-/// was, and a stream started before the first pass -- or between the change
-/// and the next pass, which is a minute after the last write at best --
-/// would be bounded by nothing at all.
+/// not a deletion. `update_settings` publishes it, because `cacheSize` is
+/// half of what the cap is made of, and a client that changes it has
+/// changed the cap (`server::cache_budget`). Sweeping the volume here first
+/// would make these tests pass just as well with the publication back where
+/// it was. A stream started before the first pass would then be bounded by
+/// nothing at all. So would one started between the change and the next
+/// pass, which is a minute after the last write at best.
 ///
 /// The reading is `cache_usage`'s, which is the same arithmetic
-/// (`CacheLimit::effective`) and evicts nothing: it says the volume this
-/// test runs on is roomy enough that `cacheSize` is the smaller of the two,
-/// so a volume too full to give the configured cap fails the test loudly
+/// (`CacheLimit::effective`) and evicts nothing. It says the volume this
+/// test runs on is roomy enough that `cacheSize` is the smaller of the two.
+/// So a volume too full to give the configured cap fails the test loudly
 /// instead of quietly making it prove nothing.
 ///
 /// **And then the owner is asked what it is actually enforcing.** The
-/// reading above is that arithmetic run again over a fresh `statvfs`, so on
-/// a roomy volume it answers the configured number whether or not any
-/// publication ever reached the retention cell a pass measures against --
-/// which makes it a statement about this machine's disk and not about this
+/// reading above is that arithmetic run again over a fresh `statvfs`. On a
+/// roomy volume it answers the configured number whether or not any
+/// publication ever reached the retention cell a pass measures against.
+/// That makes it a statement about this machine's disk and not about this
 /// process. Every test below whose premise is "the stream ran past its
 /// budget" rests on the second assertion, not the first.
 fn published_budget(fixture: &Fixture, bytes: u64) -> anyhow::Result<()> {
@@ -2002,20 +2003,20 @@ fn published_budget(fixture: &Fixture, bytes: u64) -> anyhow::Result<()> {
 
 /// Wait until the cache has stopped moving.
 ///
-/// A chunk is written from a task nobody joins and a retention pass runs on
-/// another, so a listing of the cache root taken the moment a body ends is a
+/// A chunk is written from a task nobody joins, and a retention pass runs on
+/// another. So a listing of the cache root taken the moment a body ends is a
 /// listing of a directory more chunks are still landing in and a pass is
 /// still deleting from. Two counts either side of a pass are then counts of
-/// two different caches: a count taken too early can report *more* chunks
-/// after a reclaim than before it, a number that cannot be the pass having
-/// taken anything and the sign that the count was never measuring the
-/// window at all.
+/// two different caches. A count taken too early can report *more* chunks
+/// after a reclaim than before it. That number cannot be the pass having
+/// taken anything, and it is the sign that the count was never measuring
+/// the window at all.
 ///
 /// Called after a body has been read to its end, this is a real quiescence
-/// and not a guess: no byte of that stream is delivered afterwards, so
+/// and not a guess. No byte of that stream is delivered afterwards, so
 /// nothing can start a write or a pass the wait has not already seen
-/// (`proxy_cache::DiskWork`). Bounded, and generously, because the bound is
-/// not the assertion.
+/// (`proxy_cache::DiskWork`). It is bounded, and generously, because the
+/// bound is not the assertion.
 fn settled(fixture: &Fixture) {
     fixture
         .handle
@@ -2026,10 +2027,10 @@ fn settled(fixture: &Fixture) {
 /// Wait until no body is open on the proxy cache.
 ///
 /// A read holds its window and its promise until it is dropped, which is
-/// after the last byte of it has reached the player -- so a test that has
+/// after the last byte of it has reached the player. So a test that has
 /// just read a body to its end and asks what is disposable is asking while
-/// somebody is still inside those bytes. Bounded so a
-/// regression fails instead of hanging.
+/// somebody is still inside those bytes. It is bounded so a regression
+/// fails instead of hanging.
 fn nothing_is_reading(fixture: &Fixture) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while std::time::Instant::now() < deadline {
@@ -2045,26 +2046,26 @@ fn nothing_is_reading(fixture: &Fixture) {
 }
 
 /// The cache holds no more than `chunks` of them, once it has stopped
-/// moving -- so the reclaim really has happened by the time this returns,
+/// moving. So the reclaim really has happened by the time this returns,
 /// rather than being given ten seconds to.
 ///
 /// **With the overhang of one pass on top.** What a pass gives back is
-/// what no consumer is asking for, and what a consumer is asking for
-/// includes the run it is reading ahead over and every chunk an open body
-/// has been promised; both of those sit over the line while the body is
-/// open, and what the fill wrote since the last pass sits over it too. The
-/// allowance keeps a margin back for that, which bounds the steady state
-/// rather than the instant -- see `docs/design/read-pattern-retention.md` section
-/// 4, and `stream_past_the_cache_budget` in `enginefs`, which measures the
-/// same shape against a swarm.
+/// what no consumer is asking for. What a consumer is asking for includes
+/// the run it is reading ahead over and every chunk an open body has been
+/// promised. Both of those sit over the line while the body is open, and
+/// what the fill wrote since the last pass sits over it too. The allowance
+/// keeps a margin back for that, which bounds the steady state rather than
+/// the instant. See `docs/design/read-pattern-retention.md` section 4, and
+/// `stream_past_the_cache_budget` in `enginefs`, which measures the same
+/// shape against a swarm.
 ///
-/// Proportional, because what an open body is promised is proportional to
-/// what it is being served and not to the cap: a response framed over
-/// "bytes=X-" is promised everything the cache held from X when it was
-/// framed, and every one of those chunks is bytes a player has been told it
-/// is being sent. How much that is depends on how much was there, which
-/// depends on how often the passes ran, which is the machine's business --
-/// a slower runner settles higher. What this still catches is a cache that
+/// The allowance is proportional, because what an open body is promised is
+/// proportional to what it is being served and not to the cap. A response
+/// framed over "bytes=X-" is promised everything the cache held from X when
+/// it was framed. Every one of those chunks is bytes a player has been told
+/// it is being sent. How much that is depends on how much was there, which
+/// depends on how often the passes ran. That is the machine's business: a
+/// slower runner settles higher. What this still catches is a cache that
 /// does not come down at all.
 fn overhang(chunks: usize) -> usize {
     chunks + 8
@@ -2081,27 +2082,27 @@ fn holds_no_more_than(fixture: &Fixture, chunks: usize) {
 
 /// [`holds_no_more_than`], for a body that has just been read to its end.
 ///
-/// **A pass is armed by a byte reaching a player**, so the chunks that land
+/// **A pass is armed by a byte reaching a player.** So the chunks that land
 /// after the last pass of a play-through concluded are still on the disk
-/// when the body ends: there is no byte left to arm the pass that would take
-/// them. That tail is a real property and not a fault -- it goes at the next
-/// byte, at the next stream, or at the next boot -- but its *size* is whatever
-/// the last pass happened to be behind by, which is a property of the
-/// machine: measured here, a run that leaves 32 chunks on Linux left 73 on a
-/// Windows runner, where the unlinks are slower and the fill outruns them
-/// further. A bound asserted on it is a bound on the runner.
+/// when the body ends. There is no byte left to arm the pass that would
+/// take them. That tail is a real property and not a fault: it goes at the
+/// next byte, at the next stream, or at the next boot. But its *size* is
+/// whatever the last pass happened to be behind by, which is a property of
+/// the machine. Measured here, a run that leaves 32 chunks on Linux left 73
+/// on a Windows runner, where the unlinks are slower and the fill outruns
+/// them further. A bound asserted on it is a bound on the runner.
 ///
 /// So one byte is read first, from inside the window at the end of the film.
 /// It is served from the cache, and it arms the pass that concludes at the
-/// playhead playback really ended at; what that pass leaves is what the
+/// playhead playback really ended at. What that pass leaves is what the
 /// bound is about.
 fn holds_no_more_than_after_the_last_byte(fixture: &Fixture, url: &str, at: u64, chunks: usize) {
-    // Settled *first*, and this is the whole of why: the byte below has to be
+    // Settled *first*, and this is the whole of why. The byte below has to be
     // served from the cache, and the last chunk of a body that has just ended
-    // may still be on its way to the disk. Asked too early it misses, goes to
-    // the origin, and the next `next_request()` in the test gets this probe
-    // instead of the fetch it was waiting for, silently confusing the two --
-    // a risk that grows on a slower disk, where the write lags further
+    // may still be on its way to the disk. Asked too early, it misses and
+    // goes to the origin. The next `next_request()` in the test then gets
+    // this probe instead of the fetch it was waiting for, silently confusing
+    // the two. The risk grows on a slower disk, where the write lags further
     // behind the read.
     settled(fixture);
     let byte = reqwest::blocking::Client::new()
@@ -2113,11 +2114,11 @@ fn holds_no_more_than_after_the_last_byte(fixture: &Fixture, url: &str, at: u64,
     assert_eq!(byte.bytes().expect("the byte").len(), 1);
     // And nothing is asserted here about the origin, though the byte missing
     // the cache is exactly what this helper must not do. `Origin`'s record of
-    // what it was asked is a queue, and both ways of looking at it --
-    // `next_request` and `was_asked_for_nothing_more` -- take an entry off:
-    // a helper that looked would decide what the test sees next. The settle
-    // above is what keeps the byte a cache hit, and a caller that counts the
-    // origin's requests is what says so when it is not.
+    // what it was asked is a queue. Both ways of looking at it
+    // (`next_request` and `was_asked_for_nothing_more`) take an entry off,
+    // so a helper that looked would decide what the test sees next. The
+    // settle above is what keeps the byte a cache hit. A caller that counts
+    // the origin's requests is what says so when it is not.
     //
     // Settled again, for the pass the byte armed.
     holds_no_more_than(fixture, chunks);
@@ -2126,15 +2127,15 @@ fn holds_no_more_than_after_the_last_byte(fixture: &Fixture, url: &str, at: u64,
 /// **The bound, on the other kind of stream.**
 ///
 /// A proxied response streamed end to end, well past a cache budget it does
-/// not fit in, never has more on disk than that budget -- and plays: every
+/// not fit in, never has more on disk than that budget. And it plays: every
 /// byte the player is handed is the byte at that offset of the origin's
 /// file.
 ///
 /// This is the same proof `enginefs::backend::librqbit`'s
 /// `a_stream_past_the_cache_budget_stays_under_it_and_still_plays` makes for
-/// a torrent, and it is the same policy making it true: without a playhead,
-/// nothing here would bound a proxied stream but a periodic sweep, which
-/// cannot keep pace with a fast write -- a stream at 20 MB/s writes a
+/// a torrent, and it is the same policy making it true. Without a playhead,
+/// nothing here would bound a proxied stream but a periodic sweep. A sweep
+/// cannot keep pace with a fast write: a stream at 20 MB/s writes a
 /// gigabyte a minute.
 ///
 /// Measured, not asserted about: the occupancy is the chunk files really on
@@ -2156,13 +2157,13 @@ fn a_proxied_stream_past_the_cache_budget_stays_under_it_and_still_plays() -> an
 
     // **While a body is open, what it has been promised is not the cap's
     // to bound.** A response framed over `bytes=X-` is promised every chunk
-    // its `Content-Length` covers -- bytes a player has already been told
-    // it is being sent, which nothing may take -- and how many of those
-    // there are depends on how much was cached when it was framed, which
-    // depends on how often the passes have run. So the reading taken *during*
-    // playback says only that the cache is not simply keeping the film,
-    // which is the failure this test was written for; the reading after the
-    // last byte, below, is the one the cap binds.
+    // its `Content-Length` covers. Those are bytes a player has already been
+    // told it is being sent, which nothing may take. How many there are
+    // depends on how much was cached when it was framed, which depends on
+    // how often the passes have run. So the reading taken *during* playback
+    // says only that the cache is not simply keeping the film. That is the
+    // failure this test was written for. The reading after the last byte,
+    // below, is the one the cap binds.
     let bound = RETENTION_ORIGIN / CHUNK as usize - 1;
     let mut read = 0usize;
     let mut worst = 0usize;
@@ -2195,7 +2196,7 @@ fn a_proxied_stream_past_the_cache_budget_stays_under_it_and_still_plays() -> an
     }
     assert_eq!(read, RETENTION_ORIGIN, "and it played to the end");
 
-    // And the cache really filled, or the bound above proves nothing: a
+    // And the cache really filled, or the bound above proves nothing. A
     // stream that never reached the budget would satisfy it by having
     // written almost nothing.
     assert!(
@@ -2215,24 +2216,23 @@ fn a_proxied_stream_past_the_cache_budget_stays_under_it_and_still_plays() -> an
 /// bounded.**
 ///
 /// Every other test here states the budget by changing a setting, which is
-/// a client acting on a running server. This one has no client and no pass:
-/// the `cacheSize` is on the disk before the process starts and nothing
-/// calls `POST /settings`. So the only thing that
-/// can have stated a budget is the process's own publisher
-/// (`server::cache_budget::start`), and if it has not, the budget is
-/// `CacheBudget::Unknown`, which installs no retention policy at all -- and
-/// all 32 MiB of the origin stays on the disk.
+/// a client acting on a running server. This one has no client and no pass.
+/// The `cacheSize` is on the disk before the process starts, and nothing
+/// calls `POST /settings`. So the only thing that can have stated a budget
+/// is the process's own publisher (`server::cache_budget::start`). If it
+/// has not, the budget is `CacheBudget::Unknown`, which installs no
+/// retention policy at all, and all 32 MiB of the origin stays on the disk.
 ///
-/// That window is the reason the publisher exists: a budget stated as the
+/// That window is the reason the publisher exists. A budget stated as the
 /// tail of an eviction pass would leave a device with sixteen thousand
 /// cache files on eMMC with no budget until the first walk of the root
-/// finishes, minutes in, and a player is inside the first stream long
-/// before that.
+/// finishes. That is minutes in, and a player is inside the first stream
+/// long before that.
 #[test]
 fn a_stream_relayed_before_anything_has_walked_the_cache_is_still_bounded() -> anyhow::Result<()> {
     use std::io::Read;
 
-    // Before the first request, as `fixture_with` does: this test starts its
+    // Before the first request, as `fixture_with` does. This test starts its
     // own server, so it is the ordering point for its own binary.
     enginefs::http_client::trust_roots_for_tests(vec![TEST_CA.pem.clone()]);
     let origin = Origin::start_sized(RETENTION_ORIGIN)?;
@@ -2241,7 +2241,7 @@ fn a_stream_relayed_before_anything_has_walked_the_cache_is_still_bounded() -> a
     let config = config_dir.path().join("config");
     std::fs::create_dir_all(&config)?;
     // Configuration the process reads at start, not a change made to a
-    // running one. `cacheRoot` is left empty on purpose: the loader fills an
+    // running one. `cacheRoot` is left empty on purpose. The loader fills an
     // empty one in from `ServerConfig::cache_dir`, whereas the default is
     // this machine's real cache directory, which no test may write to.
     let settings = stream_server::ServerSettings {
@@ -2263,7 +2263,7 @@ fn a_stream_relayed_before_anything_has_walked_the_cache_is_still_bounded() -> a
         cache_root,
         _config_dir: config_dir,
     };
-    // The same guard `published_budget` makes: the arithmetic, not an
+    // The same guard `published_budget` makes. It is the arithmetic, not an
     // eviction, so a volume too full to give the configured cap fails the
     // test loudly instead of quietly making it prove nothing.
     assert_eq!(
@@ -2281,8 +2281,8 @@ fn a_stream_relayed_before_anything_has_walked_the_cache_is_still_bounded() -> a
         .send()?;
     assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
 
-    // As above: while a body is open its promise is not the cap's to
-    // bound, so the reading during playback says only that the cache is not
+    // As above, while a body is open its promise is not the cap's to
+    // bound. So the reading during playback says only that the cache is not
     // keeping the film. The cap binds the reading after the last byte.
     let bound = RETENTION_ORIGIN / CHUNK as usize - 1;
     let mut read = 0usize;
@@ -2329,10 +2329,10 @@ fn a_stream_relayed_before_anything_has_walked_the_cache_is_still_bounded() -> a
 /// **What a playback panel is told about a proxied stream, end to end.**
 ///
 /// A client holding the URL it handed its player asks one question and gets
-/// the run its reader is standing in -- the disk, not the policy's
+/// the run its reader is standing in. That is the disk, not the policy's
 /// intentions, and the *unbroken* part of it rather than every chunk on
 /// that side of the head. A cache reclaiming round a head leaves holes, and
-/// a player reads in order: chunks beyond a hole are not in hand, however
+/// a player reads in order. Chunks beyond a hole are not in hand, however
 /// many of them there are. The expectation here is derived from the chunk
 /// files themselves, so it says that and not a number somebody typed.
 ///
@@ -2370,19 +2370,19 @@ fn a_panel_asking_about_a_proxied_stream_is_told_the_run_its_reader_is_in() -> a
         .expect("this server is holding that stream");
     let window = numbers.window.expect("a bounded stream has a window");
     // The chunk the last byte read came out of, and the unbroken run of
-    // chunk files around it -- or nothing at all, if the reclaim has since
-    // taken the head's own chunk, which is a reader that would have to
+    // chunk files around it. Or nothing at all, if the reclaim has since
+    // taken the head's own chunk: that is a reader that would have to
     // fetch again to carry on.
     // What can be said of the halves without knowing which reader each
-    // came from -- and that is not knowable here: the window is the worst
-    // reader at *each* half, the probe above is a reader of its own, and
-    // the reclaim is the LRU's. Their sum is therefore not a run length
-    // and is not asserted as one; that was this test's first form, and it
-    // held on one machine's reclaim and not another's. What does hold: a
-    // half is never more than its reader's run, so together they never
-    // exceed the disk; and the reader that read to the end of what is
-    // held has less than one chunk in front of it, which bounds the
-    // minimum from above whichever reader wins it.
+    // came from? That is not knowable here. The window is the worst reader
+    // at *each* half, the probe above is a reader of its own, and the
+    // reclaim is the LRU's. Their sum is therefore not a run length, and it
+    // is not asserted as one. That was this test's first form, and it held
+    // on one machine's reclaim and not another's. What does hold: a half is
+    // never more than its reader's run, so together they never exceed the
+    // disk. And the reader that read to the end of what is held has less
+    // than one chunk in front of it, which bounds the minimum from above
+    // whichever reader wins it.
     let held = cached_chunk_indices(&fixture);
     assert!(
         window.behind_bytes + window.ahead_bytes <= held.len() as u64 * CHUNK,
@@ -2398,8 +2398,8 @@ fn a_panel_asking_about_a_proxied_stream_is_told_the_run_its_reader_is_in() -> a
         "a proxied response is not seeded, so there is no sharing row"
     );
 
-    // The same server, asked about streams it is not holding: not an error,
-    // just no rows.
+    // The same server, asked about streams it is not holding. That is not
+    // an error, just no rows.
     assert_eq!(
         fixture.handle.stream_numbers(&format!(
             "{}/proxy/d={}/other-film.mp4",
@@ -2431,8 +2431,8 @@ fn a_panel_asking_about_a_proxied_stream_is_told_the_run_its_reader_is_in() -> a
 /// **The boundary a fixed window draws.** A short seek back is answered
 /// off the disk; a long one is not.
 ///
-/// The window is roughly 90% ahead of the playhead and 10% behind it, and
-/// the 10% is what a scan back is for -- a few seconds of rewind, a player
+/// The window is roughly 90% ahead of the playhead and 10% behind it. The
+/// 10% is what a scan back is for: a few seconds of rewind, or a player
 /// re-reading its container index. Under a budget that does not cover the
 /// file, that region is the difference between a rewind the origin never
 /// hears about and a rewind that costs a fresh fetch over the network.
@@ -2452,9 +2452,9 @@ fn a_seek_back_inside_the_window_is_served_from_disk_and_one_outside_it_is_not()
     let url = format!("{}/proxy/d={}/movie.mp4", fixture.base, encode(&origin));
     let client = reqwest::blocking::Client::new();
 
-    // Play the first half and stop there, deliberately short of the end: a
+    // Play the first half and stop there, deliberately short of the end. A
     // window that has slid back to fit inside the file sits entirely behind
-    // a playhead at the last byte, and every backward seek would be served
+    // a playhead at the last byte. Every backward seek would then be served
     // whatever the 10% said.
     const PLAYED_CHUNKS: u64 = 64;
     let mut response = client
@@ -2473,26 +2473,25 @@ fn a_seek_back_inside_the_window_is_served_from_disk_and_one_outside_it_is_not()
     );
 
     // The reclaim has caught up: what is left is about a window, not the
-    // sixteen megabytes that went past. The budget and not twice it, which
-    // is what the sentence above says even though the call's bound alone
-    // would allow twice it -- and the bound alone still cannot bite here,
-    // since `overhang` leaves more room than this play-through ever wrote.
-    // It is the settle and the last pass it arms that this call is here
-    // for; what says the cache really came down is `reclaimed_chunk_below`
-    // at the end.
+    // sixteen megabytes that went past. The sentence above says the budget
+    // and not twice it, even though the call's bound alone would allow
+    // twice it. And the bound alone still cannot bite here, since
+    // `overhang` leaves more room than this play-through ever wrote. This
+    // call is here for the settle and the last pass it arms. What says the
+    // cache really came down is `reclaimed_chunk_below` at the end.
     holds_no_more_than_after_the_last_byte(
         &fixture,
         &url,
         PLAYED_CHUNKS * CHUNK - 1,
         (RETENTION_BUDGET / CHUNK) as usize,
     );
-    // What the player's own reads miss is the LRU's business -- a chunk it
+    // What the player's own reads miss is the LRU's business. A chunk it
     // read once and moved past is scrub-back, and scrub-back is what a full
     // disk gives up. What this test is about is the scan back below.
     fixture.origin.drain();
 
     // The scan back, into a chunk the cache still holds. Which chunks those
-    // are is the LRU's answer and not a window's: what was read survives
+    // are is the LRU's answer and not a window's. What was read survives
     // what merely arrived, and what is left is a run of it. Taking the
     // target out of the cache rather than out of an arithmetic is the only
     // honest way to ask "is a scan back into what we kept served from the
@@ -2519,10 +2518,10 @@ fn a_seek_back_inside_the_window_is_served_from_disk_and_one_outside_it_is_not()
         "a scan back inside the window is the cache's to answer"
     );
 
-    // And a chunk the cache gave up is not: that is the reclaim having
-    // really happened. Which chunk that is comes out of the cache too --
-    // what a full disk gives up is the coldest of what nothing is reading,
-    // and where that lands is the LRU's answer.
+    // And a chunk the cache gave up is not. That is the reclaim having
+    // really happened. Which chunk that is comes out of the cache too. A
+    // full disk gives up the coldest of what nothing is reading, and where
+    // that lands is the LRU's answer.
     let gone = reclaimed_chunk_below(&fixture, PLAYED_CHUNKS);
     let at = gone * CHUNK;
     let response = client
@@ -2546,19 +2545,19 @@ fn a_seek_back_inside_the_window_is_served_from_disk_and_one_outside_it_is_not()
 
 /// **What the window kept, a player may read back whole.**
 ///
-/// A response is framed before its first byte goes out: the `Content-Length`
+/// A response is framed before its first byte goes out. The `Content-Length`
 /// and the `Content-Range` a player is handed are a promise about bytes that
 /// are still on the disk when it reads them. The window that keeps a run is
-/// 90% ahead of the playhead and 10% behind it, so a body that starts at the
+/// 90% ahead of the playhead and 10% behind it. So a body that starts at the
 /// front of a run a whole window long has its own tail *outside* the window
-/// the moment its first chunk goes out -- and the pass that its own reading
+/// the moment its first chunk goes out. The pass that its own reading
 /// starts is what would unlink it. The player then gets a `206` of
 /// 8 388 608 bytes that dies after 7 602 176 of them, which is exactly nine
 /// tenths of the window, with `IncompleteBody`.
 ///
-/// A torrent's reader is refused this by librqbit -- `drop_pieces` will not
-/// forget a piece a reader is waiting on. A proxied read makes the refusal
-/// for itself, and this is the whole of what it is for.
+/// For a torrent's reader, librqbit makes this refusal: `drop_pieces` will
+/// not forget a piece a reader is waiting on. A proxied read makes the
+/// refusal for itself, and this is the whole of what it is for.
 #[test]
 fn the_run_the_window_kept_is_served_back_whole() -> anyhow::Result<()> {
     use std::io::Read;
@@ -2572,8 +2571,8 @@ fn the_run_the_window_kept_is_served_back_whole() -> anyhow::Result<()> {
 
     // Play the whole film. What is left when the last byte has gone past is
     // the window round the end of it, which is a window's worth of
-    // contiguous chunks -- the shape a player rewinding into the credits
-    // asks for.
+    // contiguous chunks. That is the shape a player rewinding into the
+    // credits asks for.
     let mut response = client
         .get(&url)
         .header(reqwest::header::RANGE, "bytes=0-")
@@ -2617,13 +2616,13 @@ fn the_run_the_window_kept_is_served_back_whole() -> anyhow::Result<()> {
     assert_eq!(body.len() as u64, want, "and delivers it");
     assert_eq!(body[0], byte_at(first as usize), "at the right offset");
     // What this test does not assert: that none of it came off the
-    // origin. What the cache holds moves under an LRU -- a pass between the
+    // origin. What the cache holds moves under an LRU. A pass between the
     // reading above and the request arriving may have given a chunk of the
-    // run back -- and then the body stitches that chunk from the origin and
+    // run back. The body then stitches that chunk from the origin and
     // delivers the run all the same. The promise this test is about is the
-    // one the response makes when it is framed, and that is what the
-    // `Content-Length` and the body length above assert: once a player has
-    // been told a length, it gets those bytes.
+    // one the response makes when it is framed. The `Content-Length` and
+    // the body length above assert it: once a player has been told a
+    // length, it gets those bytes.
 
     drop(fixture.handle);
     Ok(())
@@ -2633,10 +2632,10 @@ fn the_run_the_window_kept_is_served_back_whole() -> anyhow::Result<()> {
 ///
 /// `p=` is out of the cache key on purpose, so two players reading one
 /// stream share its chunks and read it at two offsets. The window follows a
-/// playhead, and there are two of them; what neither of them may do is
-/// delete the bytes the other has already been promised. Here the second
-/// player fetches the head of the film, which drags the window to the front
-/// while the first player is still reading the run at the back off the disk.
+/// playhead, and there are two of them. Neither of them may delete the
+/// bytes the other has already been promised. Here the second player
+/// fetches the head of the film, which drags the window to the front while
+/// the first player is still reading the run at the back off the disk.
 #[test]
 fn a_second_player_fetching_does_not_truncate_the_first_ones_read() -> anyhow::Result<()> {
     use std::io::Read;
@@ -2682,7 +2681,7 @@ fn a_second_player_fetching_does_not_truncate_the_first_ones_read() -> anyhow::R
     one.read_exact(&mut head)?;
 
     // The second player, at the other end of the film, on bytes the window
-    // let go of long ago: its fetch is what moves the window away from the
+    // let go of long ago. Its fetch is what moves the window away from the
     // body still being read above.
     let two = client
         .get(url("two"))
@@ -2717,37 +2716,37 @@ fn a_second_player_fetching_does_not_truncate_the_first_ones_read() -> anyhow::R
 
 /// **A clean is refused the chunks a proxied player is inside.**
 ///
-/// A torrent's reader is protected from a delete by librqbit: it goes
+/// librqbit protects a torrent's reader from a delete. The delete goes
 /// through `drop_pieces`, which will not forget a piece a reader is waiting
-/// on. A proxied stream has no backend to refuse for it, so what protects
-/// its bytes is the owner itself -- the entity being played is not slack,
-/// and the window and the promises of a body in flight are what a pass may
-/// not take. Without that, a pass under a tight cap would unlink the chunk
-/// under the player's head and the player would find out by failing
+/// on. A proxied stream has no backend to refuse for it, so the owner
+/// itself protects its bytes. The entity being played is not slack, and a
+/// pass may not take the window or the promises of a body in flight.
+/// Without that, a pass under a tight cap would unlink the chunk under the
+/// player's head, and the player would find out by failing
 /// (`proxy_cache::Cached::body` ends the body in an error rather than
 /// serving a hole).
 ///
-/// So the cap is set below what one live window holds and the clean is run
-/// on purpose. It leaves the chunks somebody is inside, and it says it
-/// could not get under the cap -- which is the honest answer, and the same
+/// So the cap is set below what one live window holds, and the clean is
+/// run on purpose. It leaves the chunks somebody is inside, and it says it
+/// could not get under the cap. That is the honest answer, and the same
 /// one it gives for a torrent whose pieces the have-set will not give up.
-/// That it takes what nobody is playing is the other half of the claim and
+/// That it takes what nobody is playing is the other half of the claim, and
 /// it has a test of its own above
 /// (`cleaning_now_takes_the_proxied_stream_the_viewer_left_and_not_the_one_playing`).
 ///
 /// **The chunks are named, and that is the whole point of the shape of this
 /// test.** A count of the files before the pass and after it, asserted
-/// equal, cannot express this claim: a count cannot tell a chunk a player
-/// is inside from one nobody is reading, so an equality of counts passes
+/// equal, cannot express this claim. A count cannot tell a chunk a player
+/// is inside from one nobody is reading. So an equality of counts passes
 /// when a pass takes a protected chunk and happens to leave an unprotected
-/// one. It cannot even be relied on to fail honestly -- with chunks still
+/// one. It cannot even be relied on to fail honestly. With chunks still
 /// landing while the first number is taken, the count can *rise* across a
 /// reclaim often enough to fail about one run in ten. What is asserted here
 /// instead is identity: these files, named before the pass by the response
 /// the player was handed, are on the disk after it. Whether the chunks
-/// outside the window went away is a different claim, and it is asserted
-/// here only as a direction -- the pass did not grow the disk -- never as
-/// an equality.
+/// outside the window went away is a different claim. It is asserted here
+/// only as a direction (the pass did not grow the disk), never as an
+/// equality.
 #[test]
 fn a_clean_leaves_the_chunks_a_proxied_player_is_inside() -> anyhow::Result<()> {
     use std::io::Read;
@@ -2760,7 +2759,7 @@ fn a_clean_leaves_the_chunks_a_proxied_player_is_inside() -> anyhow::Result<()> 
     let client = reqwest::blocking::Client::new();
 
     // Play the film through. What is left when the last byte has gone past
-    // is the window round the end of it, which is where the player is: a
+    // is the window round the end of it, which is where the player is. A
     // player between two requests has no body open, and the entity stays
     // live, window and all, until a stream opens on something else.
     let mut response = client
@@ -2786,22 +2785,22 @@ fn a_clean_leaves_the_chunks_a_proxied_player_is_inside() -> anyhow::Result<()> 
         "and it is a run of it rather than scattered chunks: {kept:?}"
     );
     // The window, and not the whole run. The two are the same size only
-    // when no chunk landed after the last retention pass -- and one that
-    // does arms no pass of its own, because a pass is armed by a byte
+    // when no chunk landed after the last retention pass. A chunk that does
+    // land arms no pass of its own, because a pass is armed by a byte
     // reaching a player and there are no bytes left to deliver. So the run
-    // can be wider than the window by whatever the final stride wrote, and
-    // that surplus is the pass's to take: it is over the cap and nobody
-    // is inside it. Asserting the whole run is protected would be asserting
-    // that retention leaves no overshoot, which is a different claim, and
-    // one this test would make only on the platforms where the last pass
+    // can be wider than the window by whatever the final stride wrote. That
+    // surplus is the pass's to take: it is over the cap and nobody is
+    // inside it. Asserting the whole run is protected would be asserting
+    // that retention leaves no overshoot. That is a different claim, and
+    // this test would make it only on the platforms where the last pass
     // happened to catch everything.
-    // What the player is *inside* is the run its own reads caused, which is
-    // what the pass concluded and what the clean has to respect -- not an
+    // What the player is *inside* is the run its own reads caused. That is
+    // what the pass concluded and what the clean has to respect, not an
     // arithmetic over the budget. The run the cache kept is that run.
     let inside: Vec<u64> = kept.clone().collect();
     let before = cached_chunk_indices(&fixture);
 
-    // A cap of one chunk: everything on the disk is over it, so the only
+    // A cap of one chunk. Everything on the disk is over it, so the only
     // thing that can keep a byte is a window or a promise.
     fixture
         .handle
@@ -2818,7 +2817,7 @@ fn a_clean_leaves_the_chunks_a_proxied_player_is_inside() -> anyhow::Result<()> 
         report.over_limit > 0,
         "and it says so rather than pretending it got under the cap: {report:?}"
     );
-    // A direction and not an equality: what a pass may take is a different
+    // A direction and not an equality. What a pass may take is a different
     // claim from what it is refused, and the two are not one number.
     assert!(
         left.len() <= before.len(),
@@ -2826,13 +2825,13 @@ fn a_clean_leaves_the_chunks_a_proxied_player_is_inside() -> anyhow::Result<()> 
     );
 
     // Now the player comes back for those bytes, and this time it is inside
-    // them with a body open: the response is framed round the window, which
+    // them with a body open. The response is framed round the window, which
     // is a promise about chunks that have to still be there when it reads
-    // them. The window and not the run, for the reason given above: the
-    // run's surplus over the window was the pass's to take, and on the
-    // platforms where the last pass left one it did take it -- so a request
+    // them. It is the window and not the run, for the reason given above.
+    // The run's surplus over the window was the pass's to take, and on the
+    // platforms where the last pass left one it did take it. So a request
     // for the whole run is a request for bytes this test has just agreed
-    // may be gone, and the origin answering for them is not a failure of
+    // may be gone. The origin answering for them is not a failure of
     // anything.
     let (first, last) = (inside[0] * CHUNK, kept.end * CHUNK - 1);
     let mut player = client
@@ -2860,9 +2859,9 @@ fn a_clean_leaves_the_chunks_a_proxied_player_is_inside() -> anyhow::Result<()> 
     settled(&fixture);
 
     // The clean goes round again with that body open. What it may not take
-    // now is what the body has yet to deliver -- and *that* is asserted in
-    // bytes rather than in file names, because the chunks still owed are not
-    // the test's to name: the socket takes bytes ahead of the reader, and a
+    // now is what the body has yet to deliver. *That* is asserted in bytes
+    // rather than in file names, because the chunks still owed are not the
+    // test's to name. The socket takes bytes ahead of the reader, and a
     // megabyte or three of this run has already been handed over by the time
     // the player has read its first chunk. What the player must be handed is
     // exactly what it was promised, and the read below is the whole of that
@@ -2872,12 +2871,12 @@ fn a_clean_leaves_the_chunks_a_proxied_player_is_inside() -> anyhow::Result<()> 
     let left = cached_chunk_indices(&fixture);
     // **What protects a proxied stream is one consumer's window**, not a
     // floor apiece for every phantom stream a detector might make of one
-    // body (`docs/design/read-pattern-retention.md`, "What a stream is") --
-    // thirty-two of those would cover more than the whole allowance, so a
+    // body (`docs/design/read-pattern-retention.md`, "What a stream is").
+    // Thirty-two of those would cover more than the whole allowance, so a
     // clean here could never reach the cap whatever it took. A run that
-    // leaves the disk at exactly one chunk reports nothing over the cap --
-    // correctly, since what still has to hold is that the report describes
-    // the disk it left rather than the cap it was handed.
+    // leaves the disk at exactly one chunk reports nothing over the cap.
+    // That is correct, since what still has to hold is that the report
+    // describes the disk it left rather than the cap it was handed.
     assert_eq!(
         report.over_limit,
         report
@@ -2909,8 +2908,8 @@ fn a_clean_leaves_the_chunks_a_proxied_player_is_inside() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Which of `named` are not in `left`: what a pass took of the chunks a test
-/// named before it ran.
+/// Which of `named` are not in `left`. That is what a pass took of the
+/// chunks a test named before it ran.
 fn taken_from(named: &[u64], left: &[u64]) -> Vec<u64> {
     named
         .iter()
@@ -2923,11 +2922,11 @@ fn taken_from(named: &[u64], left: &[u64]) -> Vec<u64> {
 ///
 /// It empties the proxy cache: the chunk a kill was writing and the chunk
 /// beside it that was committed. Nothing here outlives a process, because a
-/// proxied entity is kept only while something is playing it -- and a process
-/// that has served nothing is playing nothing, so a chunk from the last run is
-/// a byte no owner in this one would ever count or reclaim. The piece store's
-/// sweep beside it keeps exactly one thing, the pin, for the same reason: a
-/// pin is the only claim that was ever meant to survive a restart.
+/// proxied entity is kept only while something is playing it. A process
+/// that has served nothing is playing nothing. So a chunk from the last run
+/// is a byte no owner in this one would ever count or reclaim. The piece
+/// store's sweep beside it keeps exactly one thing, the pin, for the same
+/// reason: a pin is the only claim that was ever meant to survive a restart.
 #[test]
 fn a_restart_empties_the_proxy_cache() -> anyhow::Result<()> {
     let config_dir = tempfile::tempdir()?;
@@ -2975,9 +2974,9 @@ fn a_restart_empties_the_proxy_cache() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A Core-format target whose own query carries a `d` -- a name the proxy
+/// A Core-format target whose own query carries a `d`, a name the proxy
 /// URL format uses too. Reading `d` out of the *request's* query would take
-/// `d="1"` for the whole target and answer `400 Invalid target URL`; the
+/// `d="1"` for the whole target and answer `400 Invalid target URL`. The
 /// format is decided by the path shape instead, so the parameter goes to
 /// the origin like any other.
 #[test]
@@ -3002,9 +3001,9 @@ fn a_target_query_may_carry_its_own_d_parameter() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The same, with a `d` shaped like a URL: parsing it out of the query
-/// would fetch a URL-shaped value instead of the target the caller named,
-/// which is a worse answer than the 400 -- an addon's own `d=` could
+/// The same, with a `d` shaped like a URL. Parsing it out of the query
+/// would fetch a URL-shaped value instead of the target the caller named.
+/// That is a worse answer than the 400, because an addon's own `d=` could
 /// redirect the whole stream. Here it must reach the origin as a query
 /// parameter and nothing else.
 #[test]
@@ -3021,7 +3020,7 @@ fn a_url_shaped_d_in_the_target_query_is_not_fetched_instead_of_the_target() -> 
         .send()?;
 
     // Answered from the origin the path named, not from the `d=` in its
-    // query -- which does not resolve at all, so a fetch of it would have
+    // query. That one does not resolve at all, so a fetch of it would have
     // been a 502 rather than these bytes.
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(response.bytes()?.len(), ORIGIN_LENGTH);
@@ -3037,9 +3036,9 @@ fn a_url_shaped_d_in_the_target_query_is_not_fetched_instead_of_the_target() -> 
 /// What the caller encoded is what the origin is asked for. axum decodes
 /// the wildcard capture, so reading the path from there would turn `%2F`
 /// into a separator, `%3F` into the start of a query and drop everything
-/// from `%23` on -- a signed link whose path segment carries a base64
+/// from `%23` on. A signed link whose path segment carries a base64
 /// signature would 403, and a file named with a `#` would 404. The `%20`
-/// the earlier test used round-tripped by accident: a space survives being
+/// the earlier test used round-tripped by accident. A space survives being
 /// decoded and re-encoded, and the other three do not.
 #[test]
 fn percent_encoding_in_the_path_reaches_the_origin_as_the_caller_wrote_it() -> anyhow::Result<()> {
@@ -3066,14 +3065,14 @@ fn percent_encoding_in_the_path_reaches_the_origin_as_the_caller_wrote_it() -> a
     Ok(())
 }
 
-/// A compressed origin response. This client decodes nothing -- the server's
-/// reqwest has no gzip/brotli/deflate feature -- so two things have to hold:
-/// the origin is asked for `identity` rather than being handed the player's
-/// `accept-encoding: gzip`, and if it compresses anyway the bytes come back
-/// with the `content-encoding` that names them. Dropping that header would
-/// hand the player gzip labelled as identity. The target is a playlist as
-/// well, so it also pins that we do not try to rewrite lines that are not
-/// text yet.
+/// A compressed origin response. This client decodes nothing (the server's
+/// reqwest has no gzip/brotli/deflate feature), so two things have to hold.
+/// The origin is asked for `identity` rather than being handed the player's
+/// `accept-encoding: gzip`. And if it compresses anyway, the bytes come
+/// back with the `content-encoding` that names them. Dropping that header
+/// would hand the player gzip labelled as identity. The target is a
+/// playlist as well, so it also pins that we do not try to rewrite lines
+/// that are not text yet.
 #[test]
 fn a_compressed_origin_response_keeps_the_header_that_names_its_coding() -> anyhow::Result<()> {
     use std::io::Write as _;
@@ -3128,7 +3127,7 @@ fn a_compressed_origin_response_keeps_the_header_that_names_its_coding() -> anyh
 /// The playlist an HLS origin serves, and what the proxy must hand the
 /// player instead: every line pointing back through the proxy, which makes
 /// the body *longer* than the one the origin sent. That length difference is
-/// the whole of defect 1 -- a relayed `Content-Length` describing 82 bytes in
+/// the whole of defect 1. A relayed `Content-Length` describing 82 bytes in
 /// front of 180 is a response hyper refuses to write.
 const ORIGIN_PLAYLIST: &str =
     "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:10,\nseg-0.ts\n#EXTINF:10,\nseg-1.ts\n";
@@ -3138,8 +3137,8 @@ fn expected_playlist(origin: SocketAddr) -> String {
 }
 
 /// [`ORIGIN_PLAYLIST`] rewritten with every segment resolved against
-/// `directory` -- the directory of the URL the playlist *came from*, which
-/// a redirect can move -- and spelled in the path format the rewrite
+/// `directory`, the directory of the URL the playlist *came from* (a
+/// redirect can move it). It is spelled in the path format the rewrite
 /// writes: the proxy's mount, the origin in `d=`, then the segment's own
 /// path on it. The path format is what leaves a rewritten line a directory
 /// of its own, which is what a nested playlist's relative lines need.
@@ -3160,8 +3159,9 @@ fn expected_playlist_at(directory: &str) -> String {
 }
 
 /// An origin that serves [`ORIGIN_PLAYLIST`] with the framing `framing`
-/// spells -- the three ways an origin can delimit a body, all of which the
-/// proxy has to survive, because it replaces that body with a longer one.
+/// spells. Those are the three ways an origin can delimit a body. The proxy
+/// has to survive all of them, because it replaces that body with a longer
+/// one.
 fn playlist_origin(framing: Framing) -> anyhow::Result<Origin> {
     Origin::start_with(move |_request: &Request, socket: &mut TcpStream| {
         let head = format!(
@@ -3253,14 +3253,14 @@ fn a_playlist_from_a_chunked_origin_arrives_whole() -> anyhow::Result<()> {
 }
 
 /// A close-delimited origin gives the proxy no framing header to relay at
-/// all, so this shape needs no special handling -- and must keep working.
+/// all, so this shape needs no special handling. It must keep working.
 #[test]
 fn a_playlist_from_a_close_delimited_origin_arrives_whole() -> anyhow::Result<()> {
     assert_playlist_arrives_whole(Framing::CloseDelimited)
 }
 
 /// An origin that serves [`ORIGIN_PLAYLIST`] under `content_type`, whatever
-/// path it is asked for -- so a test can name a URL with no extension to
+/// path it is asked for. So a test can name a URL with no extension to
 /// fall back on and see whether the content type alone was enough.
 fn playlist_origin_typed(content_type: &'static str) -> anyhow::Result<Origin> {
     Origin::start_with(move |_request: &Request, socket: &mut TcpStream| {
@@ -3277,11 +3277,11 @@ fn playlist_origin_typed(content_type: &'static str) -> anyhow::Result<Origin> {
 }
 
 /// The content type that says "playlist" is matched with its case folded
-/// away. Apple writes `application/x-mpegURL`; so does this repo's `docs/proxy.md`,
-/// and so does the `r=` stremio-core sends for an HLS stream. A
-/// case-sensitive `contains("mpegurl")` would see none of them, and the URL
-/// here has no `.m3u8` to fall back on -- which is exactly the shape a
-/// playlist behind a redirect arrives in.
+/// away. Apple writes `application/x-mpegURL`. So does this repo's
+/// `docs/proxy.md`, and so does the `r=` stremio-core sends for an HLS
+/// stream. A case-sensitive `contains("mpegurl")` would see none of them.
+/// The URL here has no `.m3u8` to fall back on, which is exactly the shape
+/// a playlist behind a redirect arrives in.
 #[test]
 fn a_playlist_is_recognised_however_its_content_type_is_capitalised() -> anyhow::Result<()> {
     for content_type in ["application/x-mpegURL", "application/X-MPEGURL"] {
@@ -3309,11 +3309,11 @@ fn a_playlist_is_recognised_however_its_content_type_is_capitalised() -> anyhow:
 
 /// The redirect that makes the fetched path the wrong thing to ask. A CDN
 /// sends a `.m3u8` request on to an edge that serves the same playlist at
-/// an extension-less URL under a content type that says nothing -- an
-/// ordinary signed-URL deployment -- and the only evidence left that this
-/// is a playlist is the URL the caller named. Testing the post-redirect
-/// path alone would relay it whole, so a player would get a playlist of
-/// origin URLs and every segment would bypass the proxy, `h=` and all.
+/// an extension-less URL, under a content type that says nothing. That is
+/// an ordinary signed-URL deployment. The only evidence left that this is a
+/// playlist is the URL the caller named. Testing the post-redirect path
+/// alone would relay it whole. A player would then get a playlist of origin
+/// URLs, and every segment would bypass the proxy, `h=` and all.
 #[test]
 fn a_playlist_is_recognised_by_the_url_the_caller_named() -> anyhow::Result<()> {
     let edge = Origin::start_with(|_request: &Request, socket: &mut TcpStream| {
@@ -3356,9 +3356,9 @@ fn a_playlist_is_recognised_by_the_url_the_caller_named() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// How long the film is. Not a round number and not the playlist's length:
-/// the assertion is that the byte count survives, and a length the rewriter
-/// could have arrived at by accident would prove nothing.
+/// How long the film is. It is not a round number and not the playlist's
+/// length. The assertion is that the byte count survives, and a length the
+/// rewriter could have arrived at by accident would prove nothing.
 const FILM_LENGTH: usize = 39_998;
 
 /// An origin serving [`FILM_LENGTH`] bytes of `video/mp4`, ranges and all,
@@ -3397,18 +3397,18 @@ fn film_origin() -> anyhow::Result<Origin> {
     })
 }
 
-/// A `.m3u8` URL that serves a film, which is the shape the URL test above
-/// cannot tell from a real playlist -- and the origin gets the last word.
+/// A `.m3u8` URL that serves a film. The URL test above cannot tell that
+/// shape from a real playlist, so the origin gets the last word.
 ///
-/// Without the content type's veto: the caller names `/s/index.m3u8`, the
-/// origin sends it on to `/movie.mp4` and serves [`FILM_LENGTH`] bytes of
-/// `video/mp4`, and what comes back would have no `Content-Length`,
-/// `Accept-Ranges: none`, no `Content-Range`, no `ETag` -- and the video's
-/// bytes through the line rewriter. ffmpeg fails on that.
+/// Here is what happens without the content type's veto. The caller names
+/// `/s/index.m3u8`. The origin sends it on to `/movie.mp4` and serves
+/// [`FILM_LENGTH`] bytes of `video/mp4`. What comes back would have no
+/// `Content-Length`, `Accept-Ranges: none`, no `Content-Range`, no `ETag`,
+/// and the video's bytes through the line rewriter. ffmpeg fails on that.
 ///
 /// The reference is wrong here in exactly the same way (`path.extname` of
-/// the caller-named, pre-redirect path, with nothing to overrule it) and
-/// this is a deliberate divergence from it.
+/// the caller-named, pre-redirect path, with nothing to overrule it). This
+/// is a deliberate divergence from it.
 #[test]
 fn a_playlist_url_that_serves_a_film_is_relayed_as_the_film_it_is() -> anyhow::Result<()> {
     let film = film_origin()?;
@@ -3461,8 +3461,8 @@ fn a_playlist_url_that_serves_a_film_is_relayed_as_the_film_it_is() -> anyhow::R
         "nothing here went through the line rewriter"
     );
 
-    // The other half of the same mistake: a `206` that happens to cover the
-    // whole entity was rewritten and answered as a `200`, so a player
+    // The other half of the same mistake. A `206` that happens to cover the
+    // whole entity was rewritten and answered as a `200`. So a player
     // opening the stream with `Range: bytes=0-` to find out whether the
     // origin is seekable was told it is not.
     let ranged = client
@@ -3490,12 +3490,12 @@ fn a_playlist_url_that_serves_a_film_is_relayed_as_the_film_it_is() -> anyhow::R
 /// The veto the test above relies on, and the escape hatch that has to
 /// survive it: an origin serving a real playlist under `video/mp2t`.
 ///
-/// Unasked, the content type wins and the body is relayed -- which is the
-/// veto doing its job, since from here a mislabelled playlist and a film at
-/// a `.m3u8` URL are the same response. `r=Content-Type:application/
+/// Unasked, the content type wins and the body is relayed. That is the veto
+/// doing its job, since from here a mislabelled playlist and a film at a
+/// `.m3u8` URL are the same response. `r=Content-Type:application/
 /// x-mpegURL` is how a caller says otherwise, and it is what stremio-core
-/// sends for an HLS stream, so the type the *player* will be given is the
-/// one the classification asks.
+/// sends for an HLS stream. So the classification asks about the type the
+/// *player* will be given.
 #[test]
 fn a_content_type_override_still_forces_the_playlist_path() -> anyhow::Result<()> {
     let fixture = fixture_with(playlist_origin_typed("video/mp2t")?)?;
@@ -3540,20 +3540,20 @@ fn a_content_type_override_still_forces_the_playlist_path() -> anyhow::Result<()
 /// have: `r=` may *force* the playlist path and may never veto it.
 ///
 /// A caller labelling the stream it is describing `video/mp4` is an
-/// ordinary thing for an addon to do, and it says nothing about the bytes
-/// -- the origin here serves a real `application/x-mpegURL` playlist. If
-/// `r=` were merged over the origin's own type before the classification
-/// asked, that label would suppress the rewrite: the playlist would come
-/// back verbatim, so the player would resolve every segment against the
-/// origin and fetch it direct -- without the `h=` an authenticated stream
-/// needs and without the `p=` a close is addressed by. The whole feature
-/// falls out of the response.
+/// ordinary thing for an addon to do, and it says nothing about the bytes.
+/// The origin here serves a real `application/x-mpegURL` playlist. If `r=`
+/// were merged over the origin's own type before the classification asked,
+/// that label would suppress the rewrite. The playlist would come back
+/// verbatim, so the player would resolve every segment against the origin
+/// and fetch it direct. It would go without the `h=` an authenticated
+/// stream needs and without the `p=` a close is addressed by. The whole
+/// feature falls out of the response.
 ///
 /// An empty `r=Content-Type:` would do the same by shadowing the origin's
-/// type with nothing at all -- the same failure with no label to blame it
-/// on. The URL names no playlist in either case, so the origin's own header
-/// is the only evidence there is -- and it is evidence `r=` does not get to
-/// erase.
+/// type with nothing at all. That is the same failure with no label to
+/// blame it on. The URL names no playlist in either case, so the origin's
+/// own header is the only evidence there is. It is evidence `r=` does not
+/// get to erase.
 #[test]
 fn an_r_content_type_cannot_suppress_the_rewrite_of_a_real_playlist() -> anyhow::Result<()> {
     for forced in ["Content-Type:video/mp4", "Content-Type:"] {
@@ -3578,8 +3578,8 @@ fn an_r_content_type_cannot_suppress_the_rewrite_of_a_real_playlist() -> anyhow:
         drop(fixture.handle);
     }
 
-    // And the override still reaches the player, which is what `r=` is for:
-    // forcing the rewrite is not the same as ignoring the header.
+    // And the override still reaches the player, which is what `r=` is for.
+    // Forcing the rewrite is not the same as ignoring the header.
     let fixture = fixture_with(playlist_origin_typed("application/x-mpegURL")?)?;
     let target = format!("http://{}/live/stream", fixture.origin.addr);
     let response = reqwest::blocking::Client::new()
@@ -3608,11 +3608,11 @@ fn an_r_content_type_cannot_suppress_the_rewrite_of_a_real_playlist() -> anyhow:
 ///
 /// An absolute URL on the playlist's own origin, an absolute URL on
 /// another, an absolute path and a relative one. The reference reads all
-/// four and this is the port of that. Without the path format, an absolute
+/// four, and this is the port of that. Without the path format, an absolute
 /// path would resolve against the origin the same way a relative one does
-/// (right answer, by accident of `Url::join`), and every line would come
-/// back in the query format, which has no directory for a nested playlist
-/// to hang its own lines off.
+/// (right answer, by accident of `Url::join`). Every line would come back
+/// in the query format, which has no directory for a nested playlist to
+/// hang its own lines off.
 #[test]
 fn every_form_a_playlist_line_can_take_comes_back_through_the_proxy() -> anyhow::Result<()> {
     fn serve(name: &'static str) -> impl Fn(&Request, &mut TcpStream) + Send + Sync + 'static {
@@ -3701,13 +3701,12 @@ fn every_form_a_playlist_line_can_take_comes_back_through_the_proxy() -> anyhow:
     Ok(())
 }
 
-/// Master playlist, media playlist, segments -- the ordinary shape of an
+/// Master playlist, media playlist, segments: the ordinary shape of an
 /// HLS stream, and the one the query format cannot serve. A rewritten
-/// line has to keep a directory of its own, because the media playlist's
-/// own relative lines are resolved by the player against the URL it fetched
-/// the media playlist at: under `/proxy/?d=<whole url>` that makes
-/// `/proxy/seg-0.ts`, a 404 from our own router before the origin is ever
-/// asked.
+/// line has to keep a directory of its own. The player resolves the media
+/// playlist's own relative lines against the URL it fetched the media
+/// playlist at. Under `/proxy/?d=<whole url>` that makes `/proxy/seg-0.ts`,
+/// a 404 from our own router before the origin is ever asked.
 #[test]
 fn a_nested_playlist_resolves_its_own_relative_lines_through_the_proxy() -> anyhow::Result<()> {
     let origin = Origin::start_with(|request: &Request, socket: &mut TcpStream| {
@@ -3791,13 +3790,13 @@ fn a_nested_playlist_resolves_its_own_relative_lines_through_the_proxy() -> anyh
     Ok(())
 }
 
-/// An authenticated HLS stream, end to end: the playlist and every segment
+/// An authenticated HLS stream, end to end. The playlist and every segment
 /// need the same `Authorization` the addon put in `h=`, and only the
 /// playlist's own URL was carrying it.
 ///
 /// A rewritten line that carried only `d=` and `p=` would come back through
-/// the proxy stripped of the header that makes it fetchable: the playlist
-/// answers `200` and every segment `403`, the origin logging `auth=[]`.
+/// the proxy stripped of the header that makes it fetchable. The playlist
+/// answers `200` and every segment `403`, with the origin logging `auth=[]`.
 #[test]
 fn an_authenticated_playlist_carries_its_headers_into_every_segment() -> anyhow::Result<()> {
     const SECRET: &str = "Bearer s3cret";
@@ -3878,20 +3877,20 @@ fn an_authenticated_playlist_carries_its_headers_into_every_segment() -> anyhow:
 
 /// `r=` labels the resource the caller named, and the caller named a
 /// playlist. Copying it onto every rewritten line would tell the player
-/// that the MPEG-TS segments and the 16-byte AES key are playlists too --
-/// and `r=Content-Type:application/x-mpegurl` is exactly what stremio-core
+/// that the MPEG-TS segments and the 16-byte AES key are playlists too.
+/// `r=Content-Type:application/x-mpegurl` is exactly what stremio-core
 /// sends for an HLS stream, so this would be every proxied HLS stream, not
 /// a corner.
 ///
 /// The reference copies it (its virtual root is the caller's whole opts
-/// string) and compounds it: it classifies a response by the content type
-/// it has already merged `r=` into, so a segment reached through such a
-/// line is called a playlist and run through the line rewriter -- MPEG-TS,
+/// string) and compounds it. It classifies a response by the content type
+/// it has already merged `r=` into. So a segment reached through such a
+/// line is called a playlist and run through the line rewriter: MPEG-TS,
 /// rewritten as text. We ask the merged type too, deliberately, since that
-/// is how `r=` corrects an origin that mislabels; what keeps the same
-/// thing from happening here is this test's subject, that `r=` never
-/// reaches the line. Its cross-origin branch drops `r=`, and that is the
-/// half ported.
+/// is how `r=` corrects an origin that mislabels. What keeps the same
+/// thing from happening here is this test's subject: `r=` never reaches
+/// the line. The reference's cross-origin branch drops `r=`, and that is
+/// the half ported.
 #[test]
 fn a_segment_named_by_a_rewritten_line_does_not_carry_the_playlist_s_r() -> anyhow::Result<()> {
     let origin = Origin::start_with(|request: &Request, socket: &mut TcpStream| {
@@ -3959,10 +3958,10 @@ fn a_segment_named_by_a_rewritten_line_does_not_carry_the_playlist_s_r() -> anyh
     Ok(())
 }
 
-/// `r=` comes from addon metadata, and one of its names is a loaded gun:
+/// `r=` comes from addon metadata, and one of its names is a loaded gun.
 /// `r=Content-Length:1` in front of a megabyte is a response hyper will not
-/// write. In a debug build the connection task panics on it; in a release
-/// build the player is told the film is one byte long and waits for the
+/// write. In a debug build the connection task panics on it. In a release
+/// build the player is told the film is one byte long, and waits for the
 /// rest of a body that has already been sent. The framing of this hop is
 /// dropped from `r=` exactly as it is dropped from the origin's own
 /// headers.
@@ -4002,14 +4001,14 @@ fn a_custom_response_header_cannot_reframe_the_response() -> anyhow::Result<()> 
 /// from, generated once and registered with `enginefs`'s trust set by
 /// [`fixture_with`].
 ///
-/// The fixture issues a real certificate chain: a self-signed CA certificate
-/// served as the end entity is refused by rustls whatever it is trusted as,
-/// and `/proxy` verifies the chain it is handed rather than downgrading to
-/// accepting an unverifiable one.
+/// The fixture issues a real certificate chain. rustls refuses a
+/// self-signed CA certificate served as the end entity, whatever it is
+/// trusted as. And `/proxy` verifies the chain it is handed rather than
+/// downgrading to accepting an unverifiable one.
 struct TestCa {
-    /// What signs the leaves: rcgen 0.14 takes the issuer's parameters and
-    /// key as one value rather than a certificate and a key side by side,
-    /// so the pair is kept in that shape instead of being rebuilt per leaf.
+    /// What signs the leaves. rcgen 0.14 takes the issuer's parameters and
+    /// key as one value rather than a certificate and a key side by side.
+    /// So the pair is kept in that shape instead of being rebuilt per leaf.
     issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
     pem: Vec<u8>,
 }
@@ -4050,9 +4049,9 @@ impl TlsOrigin {
         let cert = certificates.path().join("cert.pem");
         let key = certificates.path().join("key.pem");
 
-        // Both spellings: the tests reach this listener as `localhost` and as
+        // Both spellings. The tests reach this listener as `localhost` and as
         // `127.0.0.1`, and a certificate valid for one is refused for the
-        // other -- which is the whole point of checking the name.
+        // other. That is the whole point of checking the name.
         let leaf_params =
             rcgen::CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])?;
         let leaf_key = rcgen::KeyPair::generate()?;
@@ -4086,9 +4085,9 @@ impl TlsOrigin {
         })
     }
 
-    /// An origin serving a certificate no trust set here will accept: signed
-    /// by a second, unregistered CA, so it fails on the issuer rather than on
-    /// the name or on a date that will one day pass.
+    /// An origin serving a certificate no trust set here will accept. It is
+    /// signed by a second, unregistered CA, so it fails on the issuer rather
+    /// than on the name or on a date that will one day pass.
     fn start_untrusted() -> anyhow::Result<Self> {
         let certificates = tempfile::tempdir()?;
         let cert = certificates.path().join("cert.pem");
@@ -4097,7 +4096,7 @@ impl TlsOrigin {
         let mut ca_params = rcgen::CertificateParams::new(Vec::new())?;
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         let ca_key = rcgen::KeyPair::generate()?;
-        // No self-signed certificate for this one: nothing here has to trust
+        // No self-signed certificate for this one. Nothing here has to trust
         // it, and rcgen 0.14 signs from the parameters and the key rather
         // than from an issued certificate.
         let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
@@ -4142,14 +4141,14 @@ impl TlsOrigin {
 ///
 /// A retry that fires on a certificate error and falls back to fetching
 /// without verification would leave every promise the trust policy makes
-/// advisory: an on-path attacker can produce a certificate error as easily
-/// as a misconfigured CDN can, so such a retry would hand the attacker
-/// exactly what verification exists to deny -- with the stream URL's
+/// advisory. An on-path attacker can produce a certificate error as easily
+/// as a misconfigured CDN can. So such a retry would hand the attacker
+/// exactly what verification exists to deny, with the stream URL's
 /// credential still attached.
 ///
 /// `enginefs::http_client_builder` trusts the platform's own store alongside
 /// the compiled-in roots, so a device or organisation that installed a CA
-/// verifies, and what fails here is a chain nothing on the device trusts
+/// verifies. What fails here is a chain nothing on the device trusts
 /// either.
 #[test]
 fn an_endpoint_whose_certificate_fails_is_refused() -> anyhow::Result<()> {
@@ -4175,15 +4174,15 @@ fn an_endpoint_whose_certificate_fails_is_refused() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The same failure one redirect away: reqwest attributes a connect failure
-/// to the URL the request *started* at, so without walking the chain here
+/// The same failure one redirect away. reqwest attributes a connect failure
+/// to the URL the request *started* at. So without walking the chain here,
 /// the redirecting host would be marked unverified for a certificate it
-/// never presented. Walking the chain is what gives the failing hop a name;
-/// what has to hold is that the failure still stops the fetch rather than
+/// never presented. Walking the chain is what gives the failing hop a name.
+/// What has to hold is that the failure still stops the fetch rather than
 /// being lost behind the hop that succeeded.
 ///
 /// The redirector is plain HTTP because a verifiable first hop would need a
-/// certificate authority; the hop that fails is the second either way.
+/// certificate authority. The hop that fails is the second either way.
 #[test]
 fn a_certificate_failure_behind_a_redirect_still_refuses() -> anyhow::Result<()> {
     let tls = TlsOrigin::start_untrusted()?;
@@ -4222,7 +4221,7 @@ fn a_certificate_failure_behind_a_redirect_still_refuses() -> anyhow::Result<()>
 /// already there: the player's `User-Agent` on the way out, the origin's
 /// `Content-Type` on the way back. Both would be *added* rather than
 /// replacing, so the origin would see two user agents and the player two
-/// content types -- and a client reading the first of two would read the
+/// content types. A client reading the first of two would read the
 /// origin's, which is the value stremio-core sends `r=` to correct.
 #[test]
 fn a_header_override_replaces_the_header_it_names() -> anyhow::Result<()> {
@@ -4271,8 +4270,8 @@ fn a_header_override_replaces_the_header_it_names() -> anyhow::Result<()> {
 /// A CDN that redirects to an edge, which is what an ordinary HLS
 /// deployment looks like. The playlist's relative lines are relative to
 /// where it *came from*, so they have to be resolved against the edge and
-/// its directory -- rewriting against the URL we asked for would point
-/// every segment back at the CDN, which does not serve them.
+/// its directory. Rewriting against the URL we asked for would point every
+/// segment back at the CDN, which does not serve them.
 #[test]
 fn a_playlist_reached_through_a_redirect_is_rewritten_against_the_edge() -> anyhow::Result<()> {
     let edge = Origin::start_with(|_request: &Request, socket: &mut TcpStream| {
@@ -4326,20 +4325,20 @@ fn a_playlist_reached_through_a_redirect_is_rewritten_against_the_edge() -> anyh
 }
 
 /// An authenticated stream behind a redirect, which is a shape reqwest's
-/// default policy silently breaks: it strips `Authorization`, `Cookie` and
+/// default policy silently breaks. It strips `Authorization`, `Cookie` and
 /// `Proxy-Authorization` on any cross-host *or cross-port* redirect, and a
 /// CDN handing off to an edge is exactly that. Left to that policy, the
-/// playlist fetches `200` from the CDN, the edge sees no credential at all
+/// playlist fetches `200` from the CDN. The edge sees no credential at all
 /// and answers `403`, with nothing in the log to say a header was dropped.
 ///
-/// The redirect chain is walked here, so `h=` is applied to every hop
-/// -- which is the reference's answer too (`redirect: "manual"`, its own
-/// loop, and `opts.h.forEach(headers.set(...))` re-applied per hop). Both
-/// hops are `https`, which is the whole of the condition: the credentials
-/// leave the origin the caller named only over TLS, and over TLS they cross
-/// hosts, because that is what buys this `403` back. Both origins are on
-/// loopback, so this is a same-host, cross-*port* redirect as well -- the
-/// case that reads as safe and is stripped just the same.
+/// The redirect chain is walked here, so `h=` is applied to every hop.
+/// That is the reference's answer too (`redirect: "manual"`, its own loop,
+/// and `opts.h.forEach(headers.set(...))` re-applied per hop). Both hops are
+/// `https`, which is the whole of the condition. The credentials leave the
+/// origin the caller named only over TLS. Over TLS they cross hosts,
+/// because that is what buys this `403` back. Both origins are on loopback,
+/// so this is a same-host, cross-*port* redirect as well. That case reads
+/// as safe and is stripped just the same.
 #[test]
 fn an_https_redirect_to_another_host_still_carries_the_h_credentials() -> anyhow::Result<()> {
     const SECRET: &str = "Bearer s3cret";
@@ -4355,7 +4354,7 @@ fn an_https_redirect_to_another_host_still_carries_the_h_credentials() -> anyhow
             }
         },
     )))?;
-    // What the CDN itself was asked with: without this the test would pass
+    // What the CDN itself was asked with. Without this the test would pass
     // on a proxy that dropped `h=` at the first hop and an edge that never
     // saw a request at all.
     let seen: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>> = Default::default();
@@ -4414,16 +4413,16 @@ fn an_https_redirect_to_another_host_still_carries_the_h_credentials() -> anyhow
 /// from `https` to plain `http`.
 ///
 /// `h=` is re-applied on every hop, and `redirect_target` takes any
-/// `http`/`https` target without comparing it to the scheme it came from --
-/// so an `https` origin answering `302 Location: http://...` could have the
+/// `http`/`https` target without comparing it to the scheme it came from.
+/// So an `https` origin answering `302 Location: http://...` could have the
 /// caller's `Authorization` (or `Cookie`) written onto a cleartext hop that
 /// anybody on the path can read. That is not the credential following the
-/// resource; it is the origin choosing to publish it, and no `403` is
+/// resource. It is the origin choosing to publish it, and no `403` is
 /// avoided by obliging. reqwest's own policy strips those three names
 /// across such a hop (`remove_sensitive_headers`), and walking the chain
 /// ourselves takes that protection away.
 ///
-/// The rest of `h=` still travels: a `User-Agent` an addon needs is a
+/// The rest of `h=` still travels. A `User-Agent` an addon needs is a
 /// description, not a secret to spend, and dropping it would break the
 /// stream for nothing.
 #[test]
@@ -4431,7 +4430,7 @@ fn a_redirect_that_steps_down_to_http_does_not_carry_the_h_credentials() -> anyh
     const SECRET: &str = "Bearer s3cret";
 
     // The cleartext hop, which must be asked for the film with no
-    // credential on it -- and with the `h=` that is not one.
+    // credential on it, and with the `h=` that is not one.
     let cleartext = Origin::start_with(|request: &Request, socket: &mut TcpStream| {
         let body = format!(
             "authorization={:?} cookie={:?} user-agent={:?}",
@@ -4451,8 +4450,8 @@ fn a_redirect_that_steps_down_to_http_does_not_carry_the_h_credentials() -> anyh
     })?;
     let cleartext_addr = cleartext.addr;
 
-    // The TLS origin that sends us there, recording what it was asked with:
-    // the credential has to reach the hop the caller actually named, or
+    // The TLS origin that sends us there, recording what it was asked with.
+    // The credential has to reach the hop the caller actually named, or
     // this test would pass on a proxy that simply dropped `h=`.
     let seen: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>> = Default::default();
     let recorder = seen.clone();
@@ -4539,7 +4538,7 @@ fn echo_header_map(headers: &axum::http::HeaderMap) -> String {
 }
 
 /// An origin that answers every request with a report of what it was asked
-/// with -- so a test can assert on what reached the wire rather than on
+/// with. So a test can assert on what reached the wire rather than on
 /// what it believes was sent.
 fn echoing_origin() -> anyhow::Result<Origin> {
     Origin::start_with(|request: &Request, socket: &mut TcpStream| {
@@ -4566,17 +4565,17 @@ fn rewritten_lines(body: &str) -> Vec<&str> {
 /// The redirect guard above, defeated in one line by the playlist rewrite:
 /// an `https` origin whose playlist names an `http://` segment.
 ///
-/// `h=` travels into every rewritten line, deliberately -- that is what
+/// `h=` travels into every rewritten line, deliberately. That is what
 /// keeps an authenticated stream's segments fetchable. But a rewritten line
-/// is the *player's* next request, made automatically, and it is written by
-/// us: putting the caller's `Authorization` into a line that names cleartext
-/// is walking the credential onto a cleartext hop with the redirect loop's
-/// guard bypassed. Without a guard here, the cleartext origin, fetched
-/// exactly as a player fetches the line, would log
+/// is the *player's* next request, made automatically, and we write it.
+/// Putting the caller's `Authorization` into a line that names cleartext
+/// walks the credential onto a cleartext hop with the redirect loop's guard
+/// bypassed. Without a guard here, the cleartext origin, fetched exactly as
+/// a player fetches the line, would log
 /// `authorization=Some("Bearer s3cret") cookie=Some("session=abc")`.
 ///
 /// The positive halves are here too, because a rule that drops everything
-/// passes the negative one: the line naming the `https` origin still
+/// passes the negative one. The line naming the `https` origin still
 /// carries the credential, and the cleartext line still carries the
 /// `User-Agent` that is a description rather than a secret.
 #[test]
@@ -4586,8 +4585,8 @@ fn a_rewritten_line_that_steps_down_to_cleartext_carries_no_credential() -> anyh
     let cleartext = echoing_origin()?;
     let cleartext_addr = cleartext.addr;
 
-    // The TLS origin: the playlist under `.m3u8`, an echo of what it was
-    // asked with anywhere else -- so the `https` line can be fetched and
+    // The TLS origin: the playlist under `.m3u8`, and an echo of what it was
+    // asked with anywhere else. So the `https` line can be fetched and
     // shown to have kept the credential.
     let tls = TlsOrigin::start_with(axum::Router::new().fallback(axum::routing::any(
         move |uri: axum::http::Uri, headers: axum::http::HeaderMap| async move {
@@ -4646,7 +4645,7 @@ fn a_rewritten_line_that_steps_down_to_cleartext_carries_no_credential() -> anyh
     );
 
     // And what a player does with those lines, which is the measurement
-    // that matters: it fetches them.
+    // that matters. It fetches them.
     let segment = client
         .get(format!("{}{cleartext_line}", fixture.base))
         .send()?;
@@ -4673,15 +4672,15 @@ fn a_rewritten_line_that_steps_down_to_cleartext_carries_no_credential() -> anyh
 /// The chain the redirect guard was written for, defeated end to end: an
 /// `https` origin redirecting to a plain-`http` playlist.
 ///
-/// The playlist hop is asked with no credentials -- that is the guard
+/// The playlist hop is asked with no credentials. That is the guard
 /// working. What the guard cannot reach on its own is the body that comes
-/// back over that cleartext hop: rewritten with `h=` re-armed, it would
+/// back over that cleartext hop. Rewritten with `h=` re-armed, it would
 /// hand the player a segment URL carrying the caller's `Authorization` to
 /// the very host the credential had just been withheld from, one line
 /// later.
 ///
 /// So the drop is sticky through the rewrite as well, `https` lines
-/// included: a playlist fetched over cleartext is told what to name in the
+/// included. A playlist fetched over cleartext is told what to name in the
 /// clear too, and an `https` line in it is not the caller's origin talking.
 #[test]
 fn a_playlist_fetched_over_a_downgraded_chain_arms_no_line_with_the_credential()
@@ -4785,24 +4784,24 @@ fn a_playlist_fetched_over_a_downgraded_chain_arms_no_line_with_the_credential()
     Ok(())
 }
 
-/// The cleartext exception at the scope it actually earns: a playlist that
+/// The cleartext exception at the scope it actually earns. A playlist that
 /// arrived over `http` arms the lines naming the origin **the caller
 /// named**, and no others. Here that is also the origin the playlist came
-/// from; the test above is where a redirect tells the two apart.
+/// from. The test above is where a redirect tells the two apart.
 ///
 /// A caller that names an `http://` target has spent the credential on that
-/// wire itself, which is why such a playlist's own segments still carry it
-/// -- an authenticated plain-`http` stream would lose every segment
+/// wire itself. That is why such a playlist's own segments still carry it:
+/// an authenticated plain-`http` stream would lose every segment
 /// otherwise. But a wire belongs to one host. Keyed only on the playlist's
-/// *scheme*, the exception would arm every `http` line in it whoever it
-/// named: a caller naming `http://A/live/master.m3u8` with
+/// *scheme*, the exception would arm every `http` line in it, whoever it
+/// named. A caller naming `http://A/live/master.m3u8` with
 /// `h=Authorization:Bearer s3cret` would get back a playlist naming
-/// `http://B/seg-0.ts`, and B -- a host nothing in this chain
-/// authenticated to -- would log `authorization=Some("Bearer s3cret")` when
-/// the line is fetched the way a player fetches it.
+/// `http://B/seg-0.ts`. B is a host nothing in this chain authenticated
+/// to, and it would log `authorization=Some("Bearer s3cret")` when the line
+/// is fetched the way a player fetches it.
 ///
 /// The positive halves are here because a rule that drops everything passes
-/// the negative one: the line back to A still carries the credential, and
+/// the negative one. The line back to A still carries the credential, and
 /// B's line still carries the `User-Agent` that is a description rather
 /// than a secret.
 #[test]
@@ -4811,9 +4810,9 @@ fn a_cleartext_line_naming_another_host_carries_no_credential() -> anyhow::Resul
 
     let elsewhere = echoing_origin()?;
     let elsewhere_addr = elsewhere.addr;
-    // The host the caller names: the playlist at a `.m3u8` URL, an echo of
-    // what it was asked with anywhere else, so its own segment line can be
-    // fetched and reported on too.
+    // The host the caller names: the playlist at a `.m3u8` URL, and an echo
+    // of what it was asked with anywhere else. So its own segment line can
+    // be fetched and reported on too.
     let named = Origin::start_with(move |request: &Request, socket: &mut TcpStream| {
         let (content_type, body) = if request.target().ends_with(".m3u8") {
             (
@@ -4873,7 +4872,7 @@ fn a_cleartext_line_naming_another_host_carries_no_credential() -> anyhow::Resul
     );
 
     // And what a player does with those lines, which is the measurement
-    // that matters: it fetches them.
+    // that matters. It fetches them.
     let segment = client.get(format!("{}{other_host}", fixture.base)).send()?;
     assert_eq!(segment.status(), reqwest::StatusCode::OK);
     assert_eq!(
@@ -4895,20 +4894,20 @@ fn a_cleartext_line_naming_another_host_carries_no_credential() -> anyhow::Resul
     Ok(())
 }
 
-/// Nothing would bound the depth if the exception were keyed on the scheme,
-/// because a rewritten line is not a hop of the request that wrote it: it
-/// is a fresh `/proxy` request the player makes, and it re-arms `h=` from
-/// scratch. Under that design, A's playlist naming `http://B/b.m3u8`, B's
-/// naming `http://C/seg-c.ts`, and C -- two origins removed from anything
-/// the caller named -- would log `authorization=Some("Bearer s3cret")`.
-/// `MAX_REDIRECTS` has nothing to say about this; it counts the hops inside
-/// one request.
+/// Nothing would bound the depth if the exception were keyed on the scheme.
+/// A rewritten line is not a hop of the request that wrote it. It is a
+/// fresh `/proxy` request the player makes, and it re-arms `h=` from
+/// scratch. Under that design, take A's playlist naming `http://B/b.m3u8`
+/// and B's naming `http://C/seg-c.ts`. C is two origins removed from
+/// anything the caller named, and it would log
+/// `authorization=Some("Bearer s3cret")`. `MAX_REDIRECTS` has nothing to
+/// say about this. It counts the hops inside one request.
 ///
-/// Scoped by origin it stops at the first line: B's line is written without
-/// the credential, so the request for B's playlist has none to re-arm, and
-/// what B names cannot inherit what B was never given. And it stays
-/// stopped for a cleartext walk of any depth, because the other way a new
-/// cleartext origin could be armed -- a `302` out of an armed line -- no
+/// Scoped by origin, it stops at the first line. B's line is written
+/// without the credential, so the request for B's playlist has none to
+/// re-arm. What B names cannot inherit what B was never given. And it stays
+/// stopped for a cleartext walk of any depth. The other way a new cleartext
+/// origin could be armed is a `302` out of an armed line, and that no
 /// longer carries the credential either (see the redirect test above).
 #[test]
 fn a_nested_playlist_on_another_host_arms_none_of_its_own_lines() -> anyhow::Result<()> {
@@ -4917,7 +4916,7 @@ fn a_nested_playlist_on_another_host_arms_none_of_its_own_lines() -> anyhow::Res
     // C, the far end: it reports whatever it was asked with.
     let last = echoing_origin()?;
     let last_addr = last.addr;
-    // B, which the caller never named either -- a playlist naming C.
+    // B, which the caller never named either: a playlist naming C.
     let middle = Origin::start_with(move |request: &Request, socket: &mut TcpStream| {
         let (content_type, body) = if request.target().ends_with(".m3u8") {
             (
@@ -5006,20 +5005,20 @@ fn a_nested_playlist_on_another_host_arms_none_of_its_own_lines() -> anyhow::Res
 }
 
 /// Which cleartext origin a playlist arms is the **caller's**, not the one
-/// the body came from -- and a cleartext `302` is what tells those two
-/// apart.
+/// the body came from. A cleartext `302` is what tells those two apart.
 ///
-/// If the scope were keyed on the URL the body came from instead: a caller
-/// naming `http://A/live/master.m3u8` with `h=Authorization:Bearer s3cret`,
-/// redirected to `http://B/edge/master.m3u8`, whose playlist names
-/// `http://A/back-on-a.ts`, would have the line home to A come out with no
-/// `h=` at all -- A logging `authorization=None` when fetched, every
-/// segment `403`ing on a real authenticated stream -- while B's own line
-/// would be armed, handing the credential to a host the caller never named.
+/// Suppose the scope were keyed on the URL the body came from instead. A
+/// caller names `http://A/live/master.m3u8` with
+/// `h=Authorization:Bearer s3cret`. It is redirected to
+/// `http://B/edge/master.m3u8`, whose playlist names
+/// `http://A/back-on-a.ts`. The line home to A would come out with no `h=`
+/// at all. A would log `authorization=None` when fetched, and every segment
+/// would `403` on a real authenticated stream. Meanwhile B's own line would
+/// be armed, handing the credential to a host the caller never named.
 ///
-/// Both halves are the one rule. A is the origin the caller named and so
-/// the origin the credential was spent on, wherever the playlist came from;
-/// and the credentials do not cross a cleartext redirect, so B is asked for
+/// Both halves are the one rule. A is the origin the caller named, and so
+/// the origin the credential was spent on, wherever the playlist came from.
+/// And the credentials do not cross a cleartext redirect, so B is asked for
 /// the playlist without them and writes none into its own lines.
 #[test]
 fn a_cleartext_redirect_arms_the_origin_the_caller_named_not_the_one_it_landed_on()
@@ -5127,7 +5126,7 @@ fn a_cleartext_redirect_arms_the_origin_the_caller_named_not_the_one_it_landed_o
     );
 
     // What a player does with those lines, which is the measurement that
-    // matters: it fetches them.
+    // matters. It fetches them.
     let segment = client.get(format!("{}{home}", fixture.base)).send()?;
     assert_eq!(segment.status(), reqwest::StatusCode::OK);
     assert_eq!(
@@ -5149,28 +5148,28 @@ fn a_cleartext_redirect_arms_the_origin_the_caller_named_not_the_one_it_landed_o
     Ok(())
 }
 
-/// The other end of the same recursion: an armed cleartext line's own fetch
+/// The other end of the same recursion. An armed cleartext line's own fetch
 /// can redirect, and a redirect target is not a line the scoping ever
 /// looked at.
 ///
-/// Without a rule for this: A's playlist naming A's own `inner.m3u8`, armed
-/// and rightly so, has that line's fetch answered `302 Location:
-/// http://C/far/inner.m3u8`; if the hop rule let a cleartext chain carry
-/// the credential across a redirect, C -- which the caller never named --
-/// would be asked with `Bearer s3cret`, and C's playlist, scoped to C,
-/// would arm its lines too. One new origin per redirect, with
+/// Here is what happens without a rule for this. A's playlist names A's own
+/// `inner.m3u8`, armed and rightly so. That line's fetch is answered
+/// `302 Location: http://C/far/inner.m3u8`. If the hop rule let a cleartext
+/// chain carry the credential across a redirect, C would be asked with
+/// `Bearer s3cret`, though the caller never named it. C's playlist, scoped
+/// to C, would arm its lines too. That is one new origin per redirect, with
 /// `MAX_REDIRECTS` bounding only the hops inside a single request.
 ///
 /// The credentials do not cross a cleartext redirect, so the chain ends
-/// where it starts: A is asked with them at any depth, C is asked without,
+/// where it starts. A is asked with them at any depth, C is asked without,
 /// and what C names inherits nothing.
 #[test]
 fn a_cleartext_redirect_out_of_an_armed_line_reaches_the_next_host_without_the_credential()
 -> anyhow::Result<()> {
     const SECRET: &str = "Bearer s3cret";
 
-    // C, two steps from anything the caller named: a playlist of its own,
-    // and an echo for the segment that playlist names.
+    // C, two steps from anything the caller named. It has a playlist of its
+    // own, and an echo for the segment that playlist names.
     let far = Origin::start_with(|request: &Request, socket: &mut TcpStream| {
         let (content_type, body) = if request.target().ends_with(".m3u8") {
             (
@@ -5191,7 +5190,7 @@ fn a_cleartext_redirect_out_of_an_armed_line_reaches_the_next_host_without_the_c
         let _ = socket.flush();
     })?;
     let far_addr = far.addr;
-    // A: a master naming its own media playlist -- same origin, so armed --
+    // A: a master naming its own media playlist (same origin, so armed),
     // and that playlist redirecting to C.
     let named = Origin::start_with(move |request: &Request, socket: &mut TcpStream| {
         if request.target().ends_with("/inner.m3u8") {
@@ -5279,14 +5278,14 @@ fn a_cleartext_redirect_out_of_an_armed_line_reaches_the_next_host_without_the_c
 /// caller named** carries the credentials again, even on a cleartext chain
 /// that has been away.
 ///
-/// The rewriter arms that line: a playlist fetched from B may name
-/// `http://A/seg.ts` and A is asked with the credential, because the caller
-/// published it on A by naming A. A `302` to the same URL is the same
-/// request with the same recipient, so the two must agree: one predicate
-/// answers both, and an authenticated plain-`http` stream that bounces off
-/// a CDN and back home plays instead of `403`ing.
+/// The rewriter arms that line. A playlist fetched from B may name
+/// `http://A/seg.ts`, and A is asked with the credential, because the
+/// caller published it on A by naming A. A `302` to the same URL is the
+/// same request with the same recipient, so the two must agree. One
+/// predicate answers both. An authenticated plain-`http` stream that
+/// bounces off a CDN and back home then plays instead of `403`ing.
 ///
-/// What the bounce passes through gets nothing: B, which only the redirect
+/// What the bounce passes through gets nothing. B, which only the redirect
 /// named, is asked with nothing.
 #[test]
 fn a_cleartext_redirect_home_to_the_origin_the_caller_named_carries_the_credential()
@@ -5294,13 +5293,13 @@ fn a_cleartext_redirect_home_to_the_origin_the_caller_named_carries_the_credenti
     const SECRET: &str = "Bearer s3cret";
 
     // A and B name each other, so one address is only known after both
-    // listeners are up; nothing is fetched until the request below.
+    // listeners are up. Nothing is fetched until the request below.
     let a_addr: std::sync::Arc<std::sync::OnceLock<SocketAddr>> = Default::default();
     let b_addr: std::sync::Arc<std::sync::OnceLock<SocketAddr>> = Default::default();
     let b_for_a = b_addr.clone();
     let a_for_b = a_addr.clone();
-    // A: the film is sent away to B, and whatever comes back home is
-    // answered with a report of what it was asked with.
+    // A sends the film away to B, and answers whatever comes back home with
+    // a report of what it was asked with.
     let named = Origin::start_with(move |request: &Request, socket: &mut TcpStream| {
         if request.target().ends_with("/film.mkv") {
             let b = b_for_a.get().expect("B is up before anything is fetched");
@@ -5325,7 +5324,7 @@ fn a_cleartext_redirect_home_to_the_origin_the_caller_named_carries_the_credenti
         let _ = socket.flush();
     })?;
     a_addr.set(named.addr).expect("set once, before any fetch");
-    // B, which the caller never named: it sends us straight back to A.
+    // B, which the caller never named. It sends us straight back to A.
     let away = Origin::start_with(move |_request: &Request, socket: &mut TcpStream| {
         let a = a_for_b.get().expect("A is up before anything is fetched");
         let _ = socket.write_all(
@@ -5377,24 +5376,25 @@ fn a_cleartext_redirect_home_to_the_origin_the_caller_named_carries_the_credenti
 /// The remaining direction the two halves need proving together in: a
 /// **cleartext** chain whose playlist names an `https` host.
 ///
-/// The redirect loop refuses that hop -- a cleartext chain carries the
+/// The redirect loop refuses that hop. A cleartext chain carries the
 /// credentials to the origin the caller named and nowhere else, an `https`
 /// target included, because a playlist named in the clear is not the
 /// caller's origin talking. Asking only whether the chain had ever stepped
-/// off `https` would not catch this: a chain that started in the clear
+/// off `https` would not catch this. A chain that started in the clear
 /// never has.
 ///
-/// Under that weaker rule: a caller naming `http://A/live/master.m3u8` with
-/// `h=Authorization:Bearer s3cret` would get back a playlist naming
-/// `https://C/live/master.m3u8` with the credential written into the line;
-/// C would log `authorization=Some("Bearer s3cret")` when the line is
-/// fetched the way a player fetches it, and C's own playlist -- now an
-/// `https` chain of its own -- would arm `https://D/seg.ts`, so D would log
-/// it too. Two hosts the caller never named, from a chain the loop should
-/// not carry one hop of.
+/// Here is what happens under that weaker rule. A caller naming
+/// `http://A/live/master.m3u8` with `h=Authorization:Bearer s3cret` would
+/// get back a playlist naming `https://C/live/master.m3u8`, with the
+/// credential written into the line. C would log
+/// `authorization=Some("Bearer s3cret")` when the line is fetched the way a
+/// player fetches it. C's own playlist, now an `https` chain of its own,
+/// would arm `https://D/seg.ts`, so D would log it too. That is two hosts
+/// the caller never named, from a chain the loop should not carry one hop
+/// of.
 ///
-/// The positives are here too: A, the origin the caller named and spent the
-/// credential on, is still asked with it, and every line still carries the
+/// The positives are here too. A, the origin the caller named and spent the
+/// credential on, is still asked with it. And every line still carries the
 /// `h=` that is a description rather than a secret.
 #[test]
 fn a_cleartext_playlist_naming_an_https_host_arms_no_line_with_the_credential() -> anyhow::Result<()>
@@ -5411,9 +5411,10 @@ fn a_cleartext_playlist_naming_an_https_host_arms_no_line_with_the_credential() 
         },
     )))?;
     let deep_addr = deep.addr;
-    // C, the `https` host A's playlist names: a playlist of its own naming
-    // D, with what C itself was asked with reported in a comment line --
-    // which the rewriter leaves alone, so it survives into the body we read.
+    // C, the `https` host A's playlist names. It has a playlist of its own
+    // naming D, with what C itself was asked with reported in a comment
+    // line. The rewriter leaves that line alone, so it survives into the
+    // body we read.
     let edge = TlsOrigin::start_with(axum::Router::new().fallback(axum::routing::any(
         move |uri: axum::http::Uri, headers: axum::http::HeaderMap| async move {
             if uri.path().ends_with(".m3u8") {
@@ -5432,8 +5433,8 @@ fn a_cleartext_playlist_naming_an_https_host_arms_no_line_with_the_credential() 
         },
     )))?;
     let edge_addr = edge.addr;
-    // A, the cleartext host the caller does name: a playlist naming C, and
-    // an echo for its own segment line.
+    // A, the cleartext host the caller does name. It has a playlist naming
+    // C, and an echo for its own segment line.
     let named = Origin::start_with(move |request: &Request, socket: &mut TcpStream| {
         let (content_type, body) = if request.target().ends_with(".m3u8") {
             (
@@ -5497,7 +5498,7 @@ fn a_cleartext_playlist_naming_an_https_host_arms_no_line_with_the_credential() 
     );
 
     // What a player does with that line, which is the measurement that
-    // matters: it fetches it, and what comes back is another playlist.
+    // matters. It fetches it, and what comes back is another playlist.
     let nested = client.get(format!("{}{to_edge}", fixture.base)).send()?;
     assert_eq!(nested.status(), reqwest::StatusCode::OK);
     let nested = nested.text()?;
@@ -5568,7 +5569,7 @@ fn a_relative_location_resolves_beside_the_resource_that_sent_it() -> anyhow::Re
     Ok(())
 }
 
-/// A redirect that never ends. The hop count is the loop detection: a ring
+/// A redirect that never ends. The hop count is the loop detection. A ring
 /// is a chain that does not stop, and a player has to be told so rather
 /// than left waiting.
 #[test]
@@ -5594,9 +5595,9 @@ fn a_redirect_ring_is_given_up_on_rather_than_followed_forever() -> anyhow::Resu
     Ok(())
 }
 
-/// A chain that goes somewhere new every time, which a ring does not: the
+/// A chain that goes somewhere new every time, which a ring does not. The
 /// hop bound is what ends it, and this is what pins the number. Ten
-/// redirects followed (`MAX_REDIRECTS`), so eleven requests, and the
+/// redirects are followed (`MAX_REDIRECTS`), so eleven requests, and the
 /// eleventh's `Location` is where we stop.
 #[test]
 fn a_redirect_chain_longer_than_the_hop_bound_is_given_up_on() -> anyhow::Result<()> {
@@ -5644,8 +5645,8 @@ fn a_redirect_chain_longer_than_the_hop_bound_is_given_up_on() -> anyhow::Result
 }
 
 /// An origin that never answers the SYN is given up on within the proxy's
-/// connect bound (15 s), not whatever the platform happens to give up at:
-/// the kernel's retry budget is two minutes on Linux, cut to 30 s there
+/// connect bound (15 s), not whatever the platform happens to give up at.
+/// The kernel's retry budget is two minutes on Linux, cut to 30 s there
 /// only by reqwest's default `TCP_USER_TIMEOUT`, and the player's request
 /// is held open all the while. `10.255.255.1` is a private address nothing
 /// routes an answer back from, which is the shape of a dead host. The
@@ -5673,8 +5674,8 @@ fn an_origin_that_never_accepts_is_given_up_on_within_the_connect_bound() -> any
 }
 
 /// A redirect back into this server's own `/proxy` is a ring the hop count
-/// cannot see: each turn through the route is a new request with a count
-/// of its own, holding a connection open while it opens the next, so an
+/// cannot see. Each turn through the route is a new request with a count
+/// of its own, holding a connection open while it opens the next. So an
 /// origin that answers `302 {base}/proxy/d=<itself>` would turn one request
 /// into an unbounded chain of ours. The hop is refused, as a ring is, and
 /// the origin is asked exactly once.
@@ -5723,14 +5724,14 @@ fn a_redirect_back_into_this_server_is_refused_not_followed() -> anyhow::Result<
     Ok(())
 }
 
-/// A `302` this proxy will not follow because of where it points: only
-/// `http`/`https` is fetched, since the one thing a route that fetches
-/// whatever a caller names must not do is let an *origin* send it somewhere
-/// no caller could have asked for.
+/// A `302` this proxy will not follow because of where it points. Only
+/// `http`/`https` is fetched. A route that fetches whatever a caller names
+/// must above all not let an *origin* send it somewhere no caller could
+/// have asked for.
 ///
 /// Without this, the player would get `302 Found`, CORS headers and
-/// `content-length: 0` for this -- an unfollowable redirect and a
-/// headerless one spelled the same way, with nothing in either saying what
+/// `content-length: 0` for this. An unfollowable redirect and a headerless
+/// one would be spelled the same way, with nothing in either saying what
 /// happened. The `Location` comes back exactly as the origin wrote it
 /// instead.
 #[test]
@@ -5746,8 +5747,8 @@ fn an_unfollowed_redirect_still_says_where_it_pointed() -> anyhow::Result<()> {
     let fixture = fixture_with(origin)?;
     let target = format!("http://{}/cdn/film.mkv", fixture.origin.addr);
     // A client that does not follow it either, which is the only way to
-    // look at the `302` itself -- reqwest's default policy would chase the
-    // `Location` and fail on the scheme, which is a fair account of what
+    // look at the `302` itself. reqwest's default policy would chase the
+    // `Location` and fail on the scheme. That is a fair account of what
     // this header is worth to whoever reads it.
     let response = reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -5773,18 +5774,18 @@ fn an_unfollowed_redirect_still_says_where_it_pointed() -> anyhow::Result<()> {
 /// cannot be handed on as written.
 ///
 /// A relative `Location` is relative to the URL it came from, and the
-/// player never saw that URL -- it asked this proxy. Relayed byte for byte,
-/// `Location: /elsewhere` would resolve against *us*: a player following the
-/// `302` we relay would come back to `http://127.0.0.1:<proxy>/elsewhere`, a
-/// path this server does not serve, instead of going to the origin that
-/// named it. Resolving it against the
-/// URL the response came from makes no request of our own -- it just says
+/// player never saw that URL: it asked this proxy. Relayed byte for byte,
+/// `Location: /elsewhere` would resolve against *us*. A player following
+/// the `302` we relay would come back to
+/// `http://127.0.0.1:<proxy>/elsewhere`, a path this server does not serve,
+/// instead of going to the origin that named it. Resolving it against the
+/// URL the response came from makes no request of our own. It just says
 /// where the origin pointed, in a form that means the same thing to
 /// somebody who was not on the hop.
 #[test]
 fn a_relative_location_we_will_not_follow_is_relayed_absolute() -> anyhow::Result<()> {
-    // `305 Use Proxy`: a status this route relays rather than follows, so
-    // the `Location` is ours to hand on and nothing has resolved it already.
+    // `305 Use Proxy` is a status this route relays rather than follows. So
+    // the `Location` is ours to hand on, and nothing has resolved it already.
     let origin = Origin::start_with(|_request: &Request, socket: &mut TcpStream| {
         let _ = socket.write_all(
             b"HTTP/1.1 305 Use Proxy\r\nLocation: /elsewhere\r\n\
@@ -5823,13 +5824,13 @@ fn a_relative_location_we_will_not_follow_is_relayed_absolute() -> anyhow::Resul
 }
 
 /// The statuses in `300..400` that are not "the resource is over there".
-/// Following any status with a `Location` -- what the reference does --
-/// would have the proxy fetch and serve the `Location` of a `300`, a `304`,
-/// a `305` and a `306`, answering `200` where the HTTP client this loop
-/// replaced relays the status untouched.
+/// The reference follows any status with a `Location`. That would have the
+/// proxy fetch and serve the `Location` of a `300`, a `304`, a `305` and a
+/// `306`, answering `200` where the HTTP client this loop replaced relays
+/// the status untouched.
 ///
-/// `305 Use Proxy` is the one that matters: it names a proxy to send the
-/// request *through*, not a new home for the resource, so an origin that
+/// `305 Use Proxy` is the one that matters. It names a proxy to send the
+/// request *through*, not a new home for the resource. So an origin that
 /// answers it was choosing the host our `h=` credentials get sent to.
 #[test]
 fn a_3xx_that_does_not_move_the_resource_is_not_followed() -> anyhow::Result<()> {
@@ -5900,8 +5901,8 @@ fn a_3xx_that_does_not_move_the_resource_is_not_followed() -> anyhow::Result<()>
 }
 
 /// A `.m3u8` URL that answers with an error. There is no playlist in a
-/// 404, and rewriting it would say otherwise: the error page would come
-/// back as a playlist of proxy URLs built out of the words in it, a
+/// 404, and rewriting it would say otherwise. The error page would come
+/// back as a playlist of proxy URLs built out of the words in it: a
 /// fabricated segment list an HLS player would dutifully try to fetch.
 ///
 /// (The `HEAD` case has its own test below, because what a `HEAD` must
@@ -5960,17 +5961,18 @@ fn an_error_page_at_a_playlist_url_is_not_rewritten_as_a_playlist() -> anyhow::R
 
 /// A `HEAD` and a `GET` at the same playlist URL, field by field.
 ///
-/// The `HEAD` is not rewritten -- there is no body to rewrite -- but
+/// The `HEAD` is not rewritten, because there is no body to rewrite. But
 /// falling through to the plain relay along with that would advertise the
-/// origin's framing for a body this proxy would never serve: the `HEAD`
-/// would say `Content-Length: 67` and `Accept-Ranges: bytes` where the
-/// `GET` returns 199 chunked bytes and `Accept-Ranges: none`, so a client
+/// origin's framing for a body this proxy would never serve. The `HEAD`
+/// would say `Content-Length: 67` and `Accept-Ranges: bytes`, where the
+/// `GET` returns 199 chunked bytes and `Accept-Ranges: none`. A client
 /// that sized the resource and then asked for `Range: bytes=0-66` would get
 /// a `200` carrying 199 of them.
 ///
 /// What a `HEAD` describes is the response a `GET` would get, so every
-/// field but the body is the same for both: no length, because the length
-/// is not known until the rewrite has been written, and no claim to ranges.
+/// field but the body is the same for both. There is no length, because
+/// the length is not known until the rewrite has been written, and no claim
+/// to ranges.
 #[test]
 fn a_head_and_a_get_at_a_playlist_url_describe_the_same_response() -> anyhow::Result<()> {
     let origin = Origin::start_with(|request: &Request, socket: &mut TcpStream| {
@@ -6038,15 +6040,15 @@ fn a_head_and_a_get_at_a_playlist_url_describe_the_same_response() -> anyhow::Re
 }
 
 /// A ranged request for a playlist, which is a shape naive rewriting gets
-/// wrong the same way in both this proxy and the reference: a `206`
+/// wrong the same way in both this proxy and the reference. A `206`
 /// rewritten yields a `Content-Range` describing an entity the rewritten
 /// body is not.
 ///
-/// The two `206`s mean different things. `Range: bytes=0-` -- what a player
-/// sends to find out whether the origin is seekable -- comes back as the
-/// whole entity, and that is a playlist to rewrite and to answer as the
+/// The two `206`s mean different things. A player sends `Range: bytes=0-`
+/// to find out whether the origin is seekable. That comes back as the
+/// whole entity, and it is a playlist to rewrite and to answer as the
 /// `200` it has become. A `206` carrying a *part* is a fragment whose edge
-/// lines are cut in half: it is relayed exactly as the origin sent it,
+/// lines are cut in half. It is relayed exactly as the origin sent it,
 /// range headers and all, with a WARN saying its segments will bypass the
 /// proxy.
 #[test]
@@ -6150,7 +6152,7 @@ fn endless_origin() -> anyhow::Result<Origin> {
             return;
         }
         // Until the far end goes away. The pause is not sequencing
-        // anything -- every assertion below waits on a read -- it just
+        // anything, because every assertion below waits on a read. It just
         // keeps this thread from spinning.
         while socket.write_all(&[0u8; 4096]).is_ok() {
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -6161,10 +6163,10 @@ fn endless_origin() -> anyhow::Result<Origin> {
 /// The whole point of the token: one player's stream ends when the client
 /// asks for it, at once, and the other player never notices.
 ///
-/// Both URL shapes carry the token, so one player is given each: the query
-/// format's `p=` sits beside `d=`, the Core format's inside the `d=`/`h=`
-/// path segment -- where, unlike the request's own query, it cannot leak to
-/// the origin.
+/// Both URL shapes carry the token, so one player is given each. The query
+/// format's `p=` sits beside `d=`. The Core format's sits inside the
+/// `d=`/`h=` path segment, where, unlike the request's own query, it cannot
+/// leak to the origin.
 #[test]
 fn closing_one_player_token_ends_that_stream_and_leaves_the_other_playing() -> anyhow::Result<()> {
     use std::io::Read as _;
@@ -6232,14 +6234,14 @@ fn closing_one_player_token_ends_that_stream_and_leaves_the_other_playing() -> a
     Ok(())
 }
 
-/// The half that makes closing stick: the token is retired, so the
+/// The half that makes closing stick. The token is retired, so the
 /// reconnect ffmpeg makes through the URL it already has is refused rather
 /// than served.
 ///
-/// Without it: three closes on one live libmpv reader would answer
-/// `{"closed":1}` three times, each answer followed by a fresh origin fetch
-/// at the offset the close had interrupted. A close that only breaks the
-/// read is a stutter.
+/// Without it, three closes on one live libmpv reader would answer
+/// `{"closed":1}` three times. Each answer would be followed by a fresh
+/// origin fetch at the offset the close had interrupted. A close that only
+/// breaks the read is a stutter.
 #[test]
 fn a_closed_token_is_refused_a_new_stream_and_the_origin_is_never_asked() -> anyhow::Result<()> {
     use std::io::Read as _;
@@ -6262,8 +6264,8 @@ fn a_closed_token_is_refused_a_new_stream_and_the_origin_is_never_asked() -> any
     std::io::copy(&mut watching, &mut std::io::sink())
         .expect_err("the closed stream breaks, as it always did");
 
-    // The reconnect: the same URL, the same token, and this time there is
-    // nothing behind it.
+    // The reconnect: the same URL and the same token, and this time there
+    // is nothing behind it.
     let refused = client.get(&film).send()?;
     assert_eq!(
         refused.status(),
@@ -6282,8 +6284,8 @@ fn a_closed_token_is_refused_a_new_stream_and_the_origin_is_never_asked() -> any
         .send()?;
     assert_eq!(refused.status(), reqwest::StatusCode::GONE);
 
-    // Neither refusal reached the origin: the next thing it was asked for
-    // is the request made after them, under a token nobody closed -- which
+    // Neither refusal reached the origin. The next thing it was asked for
+    // is the request made after them, under a token nobody closed. That
     // still works, because retiring one player's name retires only that
     // player's.
     let mut other = client
@@ -6305,19 +6307,19 @@ fn a_closed_token_is_refused_a_new_stream_and_the_origin_is_never_asked() -> any
 }
 
 /// A live-HLS player refreshing its playlist against an origin that has
-/// stopped answering: the read is wedged in the playlist branch, which is
-/// precisely the wedge this feature exists for -- and precisely the one it
-/// could not reach, because that branch returned before the read was ever
-/// registered.
+/// stopped answering. The read is wedged in the playlist branch, which is
+/// precisely the wedge this feature exists for. It is also precisely the
+/// one it could not reach, because that branch returned before the read
+/// was ever registered.
 ///
 /// What the close ends is the body, not the headers. The rewrite streams,
-/// so the player has its `200` as soon as the origin's own headers arrive
-/// and is then waiting on bytes that never come -- exactly the shape a
+/// so the player has its `200` as soon as the origin's own headers arrive.
+/// It is then waiting on bytes that never come. That is exactly the shape a
 /// wedged media read has, and it fails the same way.
 #[test]
 fn a_playlist_read_is_registered_and_can_be_closed() -> anyhow::Result<()> {
     // Headers, then nothing, ever. The socket stays open: no FIN, no reset,
-    // nothing for a timeout to notice quickly.
+    // and nothing for a timeout to notice quickly.
     let origin = Origin::start_with(|_request: &Request, socket: &mut TcpStream| {
         let _ = socket.write_all(
             b"HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n\
@@ -6333,12 +6335,12 @@ fn a_playlist_read_is_registered_and_can_be_closed() -> anyhow::Result<()> {
     let fixture = fixture_with(origin)?;
     let target = format!("http://{}/live/master.m3u8", fixture.origin.addr);
     let url = format!("{}/proxy/?d={}&p=player-hls", fixture.base, encode(&target));
-    // The player's headers, reported the moment they arrive: what is being
-    // closed below is a body a player already has a `200` for, and a close
-    // that landed before those headers would leave the player holding a
+    // The player's headers, reported the moment they arrive. What is being
+    // closed below is a body a player already has a `200` for. A close that
+    // landed before those headers would leave the player holding a
     // connection that ended rather than a stream that stopped. That is a
-    // different thing to test -- the very next test does -- and waiting for
-    // the headers here is what tells the two apart instead of leaving it to
+    // different thing to test, and the very next test does. Waiting for the
+    // headers here is what tells the two apart, instead of leaving it to
     // how loaded the machine is.
     let (headers, arrived) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
@@ -6378,12 +6380,12 @@ fn a_playlist_read_is_registered_and_can_be_closed() -> anyhow::Result<()> {
 
 /// The close arriving during the origin's time-to-first-byte. The token was
 /// live when `/proxy` checked it, before the fetch, and retired by the time
-/// the origin's headers came back -- so the check that costs the origin
+/// the origin's headers came back. So the check that costs the origin
 /// nothing is exactly the check that cannot see this.
 ///
-/// Without registration during the fetch: the close would answer
-/// `{"closed":0}`, because nothing is registered yet, and 3.9 MB would then
-/// be relayed under a token that no longer exists. The registration is what
+/// Without registration during the fetch, the close would answer
+/// `{"closed":0}`, because nothing is registered yet. 3.9 MB would then be
+/// relayed under a token that no longer exists. The registration is what
 /// refuses instead, so the answer is the same `410` a later request would
 /// get.
 #[test]
@@ -6392,7 +6394,7 @@ fn closing_during_the_origin_s_time_to_first_byte_ends_that_stream() -> anyhow::
 
     const PAYLOAD: usize = 64 * 1024;
 
-    // Nothing at all until the test says so: the request has arrived, the
+    // Nothing at all until the test says so. The request has arrived, the
     // pre-fetch check has passed, and not a header has been written back.
     let answer = std::sync::Arc::new(AtomicBool::new(false));
     let origin_answer = answer.clone();
@@ -6445,23 +6447,23 @@ fn closing_during_the_origin_s_time_to_first_byte_ends_that_stream() -> anyhow::
     Ok(())
 }
 
-/// A stitched response -- the cached head off disk, the origin's tail behind
-/// it -- is one body under one registration, so a close during the head
+/// A stitched response (the cached head off disk, the origin's tail behind
+/// it) is one body under one registration. So a close during the head
 /// breaks the read there. Registering only the tail and chaining the head
-/// in front of that would not: `Chain` never polls its second stream until
-/// the first has ended, so the close would answer `{"closed":1}`, `live()`
+/// in front of that would not. `Chain` never polls its second stream until
+/// the first has ended. So the close would answer `{"closed":1}`, `live()`
 /// would fall to zero, and every remaining chunk of the head would keep
-/// coming off disk to a player whose client had finished with it; the read
+/// coming off disk to a player whose client had finished with it. The read
 /// would break only when the tail was first polled.
 #[test]
 fn closing_during_the_cached_head_of_a_stitched_response_breaks_the_read() -> anyhow::Result<()> {
     use std::io::Read as _;
 
-    // A head longer than anything between hyper and this socket can buffer,
-    // so what the client can still read after the close is bounded by that
-    // buffering and not by the head's length: 64 chunks, 16 MiB. (Linux
+    // A head longer than anything between hyper and this socket can buffer:
+    // 64 chunks, 16 MiB. So what the client can still read after the close
+    // is bounded by that buffering and not by the head's length. (Linux
     // autotunes a loopback socket's send and receive buffers to a few MiB
-    // each at most; hyper's own write buffer is smaller than that.)
+    // each at most. hyper's own write buffer is smaller than that.)
     const HEAD_CHUNKS: u64 = 64;
     let head_len = HEAD_CHUNKS * CHUNK;
     let fixture = fixture_with(Origin::start_sized((head_len + 4 * CHUNK) as usize)?)?;
@@ -6508,7 +6510,7 @@ fn closing_during_the_cached_head_of_a_stitched_response_breaks_the_read() -> an
     assert_eq!(fixture.handle.close_proxy_streams("player-stitched"), 1);
 
     // What can still be read is what was already buffered on the way to this
-    // socket; then the read breaks -- inside the head, far short of where a
+    // socket. Then the read breaks inside the head, far short of where a
     // tail-only registration would place the boundary.
     let mut read_after_close = 0u64;
     let mut buffer = vec![0u8; 64 * 1024];
@@ -6524,9 +6526,9 @@ fn closing_during_the_cached_head_of_a_stitched_response_breaks_the_read() -> an
         "the closed stream must break, not end tidily"
     );
     // Half the head is far more than any buffering accounts for (measured:
-    // one chunk), and far less than an unregistered head would serve -- all
-    // of the head but the chunk hyper had in hand when the tail's first
-    // poll broke it.
+    // one chunk). It is far less than an unregistered head would serve,
+    // which is all of the head but the chunk hyper had in hand when the
+    // tail's first poll broke it.
     assert!(
         read_after_close < head_len / 2,
         "the read broke inside the head: {read_after_close} more bytes after the close, \
@@ -6539,7 +6541,7 @@ fn closing_during_the_cached_head_of_a_stitched_response_breaks_the_read() -> an
 }
 
 /// The proxy cache's chunk size, which is what every range in the tests
-/// above is spelled in: a range shorter than one stores nothing, and a
+/// above is spelled in. A range shorter than one stores nothing, and a
 /// boundary is where a narrowed fetch begins.
 const CHUNK: u64 = stream_server::PROXY_CACHE_CHUNK_BYTES;
 
@@ -6551,10 +6553,10 @@ fn header<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> Option<&'a
 /// The bytes a `206` says it is carrying, as a half-open range, read off its
 /// `Content-Range`.
 ///
-/// What a response was *framed* round, which is not always what was asked
-/// for: the cache narrows a range to the run it holds. That framing is the
-/// promise a body makes, so it is what a test naming the chunks a player is
-/// inside has to read them from.
+/// This is what a response was *framed* round, which is not always what was
+/// asked for. The cache narrows a range to the run it holds. That framing
+/// is the promise a body makes, so a test naming the chunks a player is
+/// inside has to read them from it.
 fn content_range(headers: &reqwest::header::HeaderMap) -> std::ops::Range<u64> {
     let value = header(headers, "content-range").expect("a 206 carries a Content-Range");
     let (range, _) = value
@@ -6583,8 +6585,8 @@ fn cached_chunks(fixture: &Fixture) -> Vec<std::path::PathBuf> {
                 && path
                     .components()
                     .any(|component| component.as_os_str() == ".proxy")
-                // A chunk still being written is not one the cache holds --
-                // it has no name a read would look at. Counting them made a
+                // A chunk still being written is not one the cache holds. It
+                // has no name a read would look at. Counting them made a
                 // waiting test return on a chunk that had not landed yet.
                 && !path.to_string_lossy().ends_with(".part")
         })
@@ -6592,13 +6594,13 @@ fn cached_chunks(fixture: &Fixture) -> Vec<std::path::PathBuf> {
 }
 
 /// The chunk files the proxy cache holds, grouped by the entity directory
-/// they are in: the bucket directories are per thousand chunks, and their
+/// they are in. The bucket directories are per thousand chunks. Their
 /// parent is the one directory a response's chunks share and no other
 /// response's are in (`server::proxy_cache`'s key, then the framing the
 /// entity is filed under).
 ///
 /// What the cache holds is read this way wherever more than one URL is
-/// fetched, because a total over the whole root is a moving number now: one
+/// fetched, because a total over the whole root is a moving number now. One
 /// stream opening makes the one before it disposable, and its chunks go
 /// while the next response is still arriving.
 fn cached_chunks_by_entity(fixture: &Fixture) -> std::collections::BTreeMap<PathBuf, usize> {
@@ -6617,8 +6619,8 @@ fn cached_entities(fixture: &Fixture) -> std::collections::BTreeSet<PathBuf> {
 }
 
 /// Nothing outside `before` holds a chunk: the response under test was not
-/// cached. Said of the entities rather than of a count, so an entity being
-/// deleted meanwhile -- which a stream opening starts -- cannot make a
+/// cached. It is said of the entities rather than of a count. So an entity
+/// being deleted meanwhile (which a stream opening starts) cannot make a
 /// refusal look like one.
 fn assert_nothing_new_is_cached(
     fixture: &Fixture,
@@ -6671,24 +6673,24 @@ fn cached_chunk_indices(fixture: &Fixture) -> Vec<u64> {
 
 /// A chunk below `played` that the cache has given up, waited for.
 ///
-/// The bound asserted before a caller reaches here is an *upper* one -- the
-/// cache holds no more than a window -- and an upper bound is satisfied by
-/// a cache that has given nothing up yet. Reading the reclaimed set once and
+/// The bound asserted before a caller reaches here is an *upper* one: the
+/// cache holds no more than a window. An upper bound is satisfied by a
+/// cache that has given nothing up yet. Reading the reclaimed set once and
 /// trusting it would leave a run with no chunk yet reclaimed looking
-/// identical to one that never will, so this waits for the reclaim rather
-/// than asking whether it has already happened. Bounded, so one that never
-/// happens fails instead of hanging.
+/// identical to one that never will. So this waits for the reclaim rather
+/// than asking whether it has already happened. It is bounded, so one that
+/// never happens fails instead of hanging.
 ///
 /// **And the premise is stated here rather than assumed by the wait.** A
-/// wait says nothing about why it ended, so what has to be true before a
-/// reclaim is owed at all -- a cap reached the owner a pass measures
-/// against, and what was played does not fit under it -- is asserted before
-/// the deadline starts: a run where they do not hold says which one was
-/// missing instead of blaming the reclaim. What is left over after that --
-/// the cache is over its cap, every pass has run, and not one chunk came
-/// back -- is a statement about the policy, and the panic says so in those
-/// words. See "What a stream is" in `docs/design/read-pattern-retention.md`
-/// for the detector rule that gets the cache there.
+/// wait says nothing about why it ended. So what has to be true before a
+/// reclaim is owed at all is asserted before the deadline starts: a cap
+/// reached the owner a pass measures against, and what was played does not
+/// fit under it. A run where they do not hold says which one was missing,
+/// instead of blaming the reclaim. Then the cache is over its cap, every
+/// pass has run, and not one chunk came back. What is left over is a
+/// statement about the policy, and the panic says so in those words. See
+/// "What a stream is" in `docs/design/read-pattern-retention.md` for the
+/// detector rule that gets the cache there.
 fn reclaimed_chunk_below(fixture: &Fixture, played: u64) -> u64 {
     let cap = fixture
         .handle
@@ -6737,9 +6739,9 @@ fn longest_cached_run(fixture: &Fixture) -> std::ops::Range<u64> {
 /// Wait until the cache holds at least `chunks` of them.
 ///
 /// A chunk is written on the blocking pool once its last byte has gone past,
-/// so it lands a moment after the response the test already read. Bounded so
-/// a regression fails instead of hanging, and the bound is generous because
-/// it is not a timing assertion.
+/// so it lands a moment after the response the test already read. It is
+/// bounded so a regression fails instead of hanging. The bound is generous
+/// because it is not a timing assertion.
 fn wait_for_chunks(fixture: &Fixture, chunks: usize) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
@@ -6772,23 +6774,23 @@ fn walk(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// **A player is read ahead of; a lone range is not.**
 ///
 /// The retention owner draws a want-window ahead of every proxied stream's
-/// head; without something fetching it, a Drive or a debrid stream would
-/// have the window's retention and none of its lookahead -- the player's
-/// own `Range` being the only thing that ever pulls a byte. The proxy
+/// head. Without something fetching it, a Drive or a debrid stream would
+/// have the window's retention and none of its lookahead. The player's own
+/// `Range` would be the only thing that ever pulls a byte. The proxy
 /// backing hands each pass's windows to a prefetcher that reads them
 /// through the entity's own source, quietly (`proxy_retention::Prefetcher`).
 /// What this pins down:
 ///
-/// 1. A request with no player token -- a probe, an archive's index read,
-///    every other test in this file -- is not a player's, and fetches
-///    exactly what it asked for; the origin hears nothing else however
-///    long we wait. (A rate alone could not tell the two apart: one
-///    256 KiB read is enough to measure one.) This half is what keeps
-///    every "asked for nothing more" claim above true.
+/// 1. A request with no player token (a probe, an archive's index read,
+///    every other test in this file) is not a player's. It fetches exactly
+///    what it asked for, and the origin hears nothing else however long we
+///    wait. (A rate alone could not tell the two apart: one 256 KiB read is
+///    enough to measure one.) This half is what keeps every "asked for
+///    nothing more" claim above true.
 /// 2. A reader with the app's player token (`p=`) that consumes chunk
-///    after chunk has a rate, and chunks it has not asked for arrive from
-///    the origin and land on the disk; its next request for one of them
-///    is answered from the disk.
+///    after chunk has a rate. Chunks it has not asked for arrive from the
+///    origin and land on the disk. Its next request for one of them is
+///    answered from the disk.
 #[test]
 fn a_reader_with_a_rate_is_read_ahead_of_and_a_lone_range_is_not() -> anyhow::Result<()> {
     use std::io::Read;
@@ -6822,7 +6824,7 @@ fn a_reader_with_a_rate_is_read_ahead_of_and_a_lone_range_is_not() -> anyhow::Re
         "a request with no player token is not a player's and is not read ahead of"
     );
 
-    // 2. A player -- the URL carries the app's token for it -- that plays:
+    // 2. A player (the URL carries the app's token for it) that plays:
     //    chunk after chunk, each asked for after the last arrived.
     let url = format!(
         "{}/proxy/d={}&p=viewer-one/movie.mp4",
@@ -6896,7 +6898,7 @@ fn a_reader_with_a_rate_is_read_ahead_of_and_a_lone_range_is_not() -> anyhow::Re
     );
 
     // And the player's next request, for a chunk that was read ahead, is
-    // answered off the disk: the origin does not hear it.
+    // answered off the disk. The origin does not hear it.
     let next = *ahead.first().expect("a chunk ahead");
     fixture.origin.drain();
     let mut response = client
