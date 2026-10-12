@@ -1533,11 +1533,11 @@ fn stream_open_failure_status(err: &GetFileError) -> (StatusCode, String) {
             ),
             Some(TorrentInitError::Failed { .. }) => (
                 StatusCode::BAD_GATEWAY,
-                "Torrent failed to initialize; see server logs for details".to_string(),
+                "The torrent could not be started".to_string(),
             ),
             None => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to open stream reader; see server logs for details".to_string(),
+                "The stream could not be opened".to_string(),
             ),
         },
     }

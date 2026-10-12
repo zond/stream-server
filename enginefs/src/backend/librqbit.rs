@@ -350,7 +350,8 @@ impl<S: tokio::io::AsyncSeek + Unpin> tokio::io::AsyncSeek for PositionedStream<
 /// naming absolute cache and download paths. So only this fixed message
 /// crosses the boundary. As with `MagnetAddError::client_message` and
 /// `PinDownloadError::client_message`, the chain itself is for the log.
-pub const TORRENT_ERROR_MESSAGE: &str = "the torrent is in an error state (its download folder may be unwritable, full or gone); see server logs";
+pub const TORRENT_ERROR_MESSAGE: &str =
+    "this torrent cannot be downloaded: its download folder may be unwritable, full or gone";
 
 /// Whether a torrent's error is the volume running out of space.
 ///
