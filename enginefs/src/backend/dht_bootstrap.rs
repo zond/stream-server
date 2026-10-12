@@ -736,7 +736,7 @@ fn apply_ipv6_route_policy(resolved: &mut [ResolvedEntry], has_ipv6_route: bool)
 
     if resolved.iter().all(|entry| entry.addrs.is_empty()) {
         warn!(
-            "every DHT bootstrap address is IPv6 and this host has no IPv6 route; keeping them \
+            "every DHT bootstrap address is IPv6 and this host has no IPv6 route. Keeping them \
              anyway, because an empty bootstrap list fails librqbit's bootstrap outright and \
              takes the DHT worker with it"
         );
@@ -868,8 +868,8 @@ fn report(resolved: &[ResolvedEntry]) {
     if nothing_resolved(resolved) {
         warn!(
             entries = %summary,
-            "no DHT bootstrap host could be resolved by the system resolver, DNS over HTTPS or \
-             the address cache; librqbit will keep retrying the names itself. Peer discovery \
+            "neither the system resolver, DNS over HTTPS nor the address cache resolved a DHT \
+             bootstrap host. librqbit will keep retrying the names itself. Peer discovery \
              falls back to trackers, which is enough for any torrent that has them."
         );
     } else {

@@ -454,7 +454,7 @@ impl<H: TorrentHandle> FileHandle<H> {
                         .collect::<Vec<_>>()
                         .join("; "),
                     stage = "blocked_read_claims",
-                    "a read is waiting on a piece; who holds it"
+                    "a read is waiting on a piece; listing the claims that hold it"
                 );
             }
         });

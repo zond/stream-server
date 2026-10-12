@@ -712,7 +712,7 @@ impl<H: TorrentHandle> TorrentBacking<H> {
                         tracing::debug!(
                             info_hash = %self.info_hash,
                             pieces = arrived.len(),
-                            "pieces outside the window arrived under the pass; unlinking what the backend forgot"
+                            "pieces outside the window arrived during the pass; unlinking what the backend forgot"
                         );
                         crate::retention::unlink(store, &self.info_hash, arrived, claim).await;
                     }
@@ -1219,7 +1219,7 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
             tracing::debug!(
                 info_hash = %self.info_hash,
                 ?run_state,
-                "the torrent is not settled, so its want-set is left as it is this pass"
+                "the torrent is not settled, so this pass leaves its want-set as it is"
             );
             return;
         }
@@ -1350,7 +1350,7 @@ impl<H: TorrentHandle> Backing for TorrentBacking<H> {
                 tracing::debug!(
                     info_hash = %self.info_hash,
                     ?run_state,
-                    "the torrent is not settled, so nothing of it is reclaimed this pass"
+                    "the torrent is not settled, so this pass reclaims none of it"
                 );
                 break;
             }
@@ -1461,7 +1461,7 @@ async fn adopt_pins<H: TorrentHandle>(
             info_hash,
             file_idx,
             ?outcome,
-            "a pinned file nothing has opened gets an entity, and every piece of it wanted again"
+            "a pinned file nothing has opened gets an entity, and all its pieces are wanted again"
         );
     }
 }

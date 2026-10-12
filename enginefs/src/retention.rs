@@ -780,7 +780,7 @@ pub(crate) async fn unlink(
                 tracing::warn!(
                     info_hash = %hash,
                     pieces = pieces.len(),
-                    "not deleting under a running hash check; the pieces stay held"
+                    "not deleting while a hash check runs; the pieces stay held"
                 );
                 0
             }

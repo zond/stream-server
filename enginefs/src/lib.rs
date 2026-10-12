@@ -1815,7 +1815,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             tracing::warn!(
                 info_hash = %engine.info_hash,
                 error = %format!("{error:#}"),
-                "could not make a stopped torrent's advertised set again; the next reconcile tries again"
+                "could not rebuild a stopped torrent's advertised set; the next reconcile tries again"
             );
         }
         // The volume the pieces land on. It is one folder for every torrent
@@ -2115,7 +2115,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 info_hash = %engine.info_hash,
                 short_secs = short_for.as_secs(),
                 available = ?conditions.available,
-                "the volume a stopped torrent writes to has been short for a while; \
+                "the volume a stopped torrent writes to has been short of space for a while; \
                  failing its readers rather than leaving them parked"
             );
             engine.refuse_reads_for_space();
@@ -2616,7 +2616,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             drop(held);
             debug!(
                 info_hash = %handle.info_hash(),
-                "the torrent this add was handed was removed under it; adding it again"
+                "the torrent handed to this add was removed while it ran; adding it again"
             );
             handle = add_again().await?;
             readded = true;
@@ -2947,7 +2947,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 if engines.read().await.contains_key(hash) {
                     debug!(
                         info_hash = %hash,
-                        "another add published the torrent while this one timed out; left alone"
+                        "another add published the torrent while this one timed out; leaving it alone"
                     );
                 } else if let Err(error) = backend.remove_torrent(hash).await {
                     debug!(
@@ -3150,13 +3150,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         if engine.is_pinned() || self.errored_torrent_is_used(&engine.info_hash).await {
             debug!(
                 info_hash = %engine.info_hash,
-                "an errored torrent was pinned or opened before its removal took the lock; kept"
+                "an errored torrent was pinned or opened before its removal took the lock; keeping it"
             );
             return;
         }
         tracing::info!(
             info_hash = %engine.info_hash,
-            "removing an errored torrent nobody is playing and nobody pinned, with its files"
+            "removing an errored torrent and its files: nobody is playing it and nobody pinned it"
         );
         // Both halves go under the [`RemovalGate`], like the idle sweep's.
         // The session's torrent and the registry's engine go as one step, so
@@ -3447,7 +3447,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let unregistered = tokio::task::spawn_blocking(move || registry.unregistered_bytes())
             .await
             .unwrap_or_else(|error| {
-                tracing::warn!(%error, "the piece store's unregistered bytes could not be read");
+                tracing::warn!(%error, "could not read the piece store's unregistered bytes");
                 0
             });
         let mut holdings = CacheHoldings {
@@ -3490,7 +3490,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             })
             .await
             .unwrap_or_else(|error| {
-                tracing::warn!(%error, "a dormant pin's bytes could not be read");
+                tracing::warn!(%error, "could not read a dormant pin's bytes");
                 0
             });
             holdings.protected_bytes += bytes;
@@ -3935,7 +3935,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 tracing::debug!(
                     token,
                     ?played,
-                    "a request of an older player screen moved nothing"
+                    "a request from an older player screen moved nothing"
                 );
             }
             crate::retention::sessions::Heard::Current { moved: false } => {}
@@ -5037,7 +5037,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     file_idx,
                     folder = %folder.display(),
                     %error,
-                    "could not take the dormant download's pieces out of its name"
+                    "could not rename the dormant download's piece folder aside for deletion"
                 );
                 return false;
             }
@@ -5189,8 +5189,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                         info_hash = %engine.info_hash,
                         file_idx,
                         announced = announced.len(),
-                        "some of the deleted download's pieces are still announced; they go \
-                         once the torrent leaves the swarm, and the rest go now"
+                        "the rest of the deleted download's pieces go now; the ones still \
+                         announced go once the torrent leaves the swarm"
                     );
                     let mut claims = Vec::new();
                     let mut error = None;
@@ -5741,7 +5741,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             info_hash = %info_hash,
             file_idx = next,
             from = ?switch.from,
-            "the live file's last read closed while another file of it is read; that one is playing"
+            "the live file's last read closed while another file of the torrent is read; that file is the one playing"
         );
         self.activate_multifile_file(info_hash, next, None, "hand-on")
             .await;
