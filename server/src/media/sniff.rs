@@ -2,18 +2,18 @@
 //! §2.9): a plain file whose first bytes carry a container's signature is
 //! answered as the member a container URL would have named.
 //!
-//! What the head is asked is `enginefs::retention::sniff::containers` --
+//! The head is asked `enginefs::retention::sniff::containers`. These are
 //! the same signatures that decide a torrent file's play session shares
-//! nothing -- and what it names is only which readers to try: each
-//! translator's `index` verifies its own format (7z's signature header, a
-//! RAR's through `unrar`, a ZIP's end record at the tail, a TAR header's
-//! checksum, a disc image's descriptors), and the first that indexes wins.
-//! A signature nothing indexes is that translator's refusal, never a film.
+//! nothing. What it names is only which readers to try. Each translator's
+//! `index` verifies its own format (7z's signature header, a RAR's through
+//! `unrar`, a ZIP's end record at the tail, a TAR header's checksum, a
+//! disc image's descriptors), and the first that indexes wins. A
+//! signature nothing indexes is that translator's refusal, never a film.
 //!
-//! **The head read is bounded** ([`SNIFF_BOUND`]): a torrent whose first
-//! pieces are not here yet, a link whose origin is slow, answer the plain
-//! file unsniffed after it, so a playable file is never a wait or a
-//! refusal because of the sniff; [`crate::media::Resolved::sniffed`] tells
+//! **The head read is bounded** ([`SNIFF_BOUND`]). A torrent whose first
+//! pieces are not here yet, or a link whose origin is slow, answers the
+//! plain file unsniffed after it. So a playable file is never a wait or a
+//! refusal because of the sniff. [`crate::media::Resolved::sniffed`] tells
 //! the app the server did not get to look.
 
 use crate::routes::archive::{self, Format};
@@ -32,10 +32,10 @@ use std::time::Duration;
 use super::Refusal;
 
 /// How long `resolve` waits for a file's head before it answers the plain
-/// file unsniffed: the stream route's own patience with a disk or an
+/// file unsniffed. It is the stream route's own patience with a disk or an
 /// origin that has stopped answering (`SLACK_DROP_BOUND`), so the sniff
 /// never holds a player longer than a stalled start would. A head that is
-/// held answers at once; this is spent only on one being fetched.
+/// held answers at once. This is spent only on one being fetched.
 pub(crate) const SNIFF_BOUND: Duration = Duration::from_secs(10);
 
 /// The readers `head` names, in the order they are tried: 7z, RAR, ZIP,
@@ -80,10 +80,10 @@ pub(super) async fn head_of(source: &dyn ByteSource, bound: Duration) -> Option<
     tokio::time::timeout(bound, read).await.ok().flatten()
 }
 
-/// File `file_idx` of a torrent's head, read through an aside -- which
-/// registers a stream, so a stopped torrent is started for it, and reads
-/// the store's held pieces or asks the swarm for the rest -- within
-/// `bound`.
+/// File `file_idx` of a torrent's head, read through an aside within
+/// `bound`. The aside registers a stream, so a stopped torrent is started
+/// for it. It reads the store's held pieces or asks the swarm for the
+/// rest.
 pub(super) async fn torrent_head(
     state: &AppState,
     info_hash: &str,
@@ -108,9 +108,10 @@ pub(super) async fn torrent_head(
     head
 }
 
-/// A container found in a file that is not a torrent's, kept with the id's
-/// answer so its session can be made again once the archive map has let
-/// it go: there is no create to run again and no `torrent:` key to index.
+/// A container found in a file that is not a torrent's. It is kept with
+/// the id's answer so its session can be made again once the archive map
+/// has let it go. There is no create to run again and no `torrent:` key to
+/// index.
 #[derive(Clone)]
 pub(crate) enum Sniffed {
     /// A link, read through the proxy cache with the `/proxy` id's `h=`.
@@ -124,9 +125,9 @@ pub(crate) enum Sniffed {
 }
 
 impl Sniffed {
-    /// The sources a session over this container holds: a link and a Drive
-    /// file as `/create`'s are held, so a play reads ahead of them; a file
-    /// already on this device as itself.
+    /// The sources a session over this container holds. A link and a Drive
+    /// file are held as `/create`'s are, so a play reads ahead of them. A
+    /// file already on this device is held as itself.
     pub(super) fn session_sources(&self) -> SessionSources {
         match self {
             Self::Link(source) => SessionSources::Held(vec![source.clone()]),
@@ -159,8 +160,8 @@ impl Sniffed {
     }
 
     /// The container indexed by the first of `formats` whose translator
-    /// takes it, as a session under a key of its own -- or the first
-    /// refusal, when none does.
+    /// takes it, as a session under a key of its own. When none does, the
+    /// first refusal.
     pub(super) async fn index(
         &self,
         state: &AppState,
@@ -192,8 +193,8 @@ impl Sniffed {
         }))
     }
 
-    /// Whether this answer has gone bad, as the plain file's would have: a
-    /// Drive grant found dead, a download no longer pinned.
+    /// Whether this answer has gone bad, as the plain file's would have.
+    /// That is a Drive grant found dead, or a download no longer pinned.
     pub(super) fn is_stale(&self, state: &AppState) -> bool {
         match self {
             Self::Drive(source) => source.needs_pairing_again(),
@@ -203,8 +204,8 @@ impl Sniffed {
     }
 }
 
-/// A sniffed session's origin: never a URL, so a `/create` naming one
-/// never finds it (`routes::archive::create_session` reuses by origin).
+/// A sniffed session's origin. It is never a URL, so a `/create` naming
+/// one never finds it (`routes::archive::create_session` reuses by origin).
 fn origin_of(key: &str) -> String {
     format!("sniffed:{key}")
 }
@@ -236,9 +237,10 @@ pub(super) async fn first_index(
 
 /// The session over a torrent's file `path` by the first of `formats`
 /// whose translator indexes it, made as the `torrent:` form makes one
-/// (`routes::archive::session_for`): by the file's name, so a RAR's
-/// sibling volumes are found by the naming rules. The format and the
-/// session's key with it; the first refusal when none indexes it.
+/// (`routes::archive::session_for`). It goes by the file's name, so a
+/// RAR's sibling volumes are found by the naming rules. It answers the
+/// format and the session's key with it, or the first refusal when none
+/// indexes it.
 pub(super) async fn torrent_session(
     state: &AppState,
     info_hash: &str,

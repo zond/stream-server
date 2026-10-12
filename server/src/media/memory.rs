@@ -1,22 +1,22 @@
 //! **Where the last play session on a torrent file ended**, kept across
-//! restarts: what a resumed film's pre-want asks for first
+//! restarts. A resumed film's pre-want asks for it first
 //! (`super::prewant`, [`crate::ServerHandle::note_media_position`]).
 //!
-//! One small JSON file beside `settings.json` (`read-positions.json`),
-//! holding the last [`MEMORY_CAP`] files by when they were left, the oldest
-//! let go first. Keyed by info hash and file index, never by anything the
-//! app named: a media id does not outlive a restart, and the bytes of a
-//! torrent file are where they are whatever id reads them. A file that
-//! will not parse is a memory of nothing, never an error: the worst it
-//! costs is an estimate where a memory would have been.
+//! It is one small JSON file beside `settings.json` (`read-positions.json`).
+//! It holds the last [`MEMORY_CAP`] files by when they were left, and lets
+//! the oldest go first. It is keyed by info hash and file index, never by
+//! anything the app named. A media id does not outlive a restart, and the
+//! bytes of a torrent file are where they are whatever id reads them. A
+//! file that will not parse is a memory of nothing, never an error. The
+//! worst it costs is an estimate where a memory would have been.
 
 use super::prewant::Remembered;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
-/// How many files are remembered: far more than anybody leaves half
-/// watched, and a file of a few kilobytes.
+/// How many files are remembered. It is far more than anybody leaves half
+/// watched, and it makes a file of a few kilobytes.
 pub const MEMORY_CAP: usize = 64;
 
 /// The file's name, beside `settings.json` in the config directory.
@@ -31,7 +31,8 @@ struct Kept {
     at: Remembered,
 }
 
-/// The memory: in memory, and written through to its file when it has one.
+/// The memory. It is kept in memory and written through to its file when
+/// it has one.
 pub struct ReadMemory {
     path: Option<PathBuf>,
     kept: std::sync::Mutex<VecDeque<Kept>>,
@@ -81,7 +82,7 @@ impl ReadMemory {
             .map(|kept| kept.at)
     }
 
-    /// Remember where a session on `file_idx` of `info_hash` ended, the
+    /// Remember where a session on `file_idx` of `info_hash` ended, as the
     /// newest entry, and write the memory to its file. A write that fails is
     /// logged and the memory stands for this process.
     pub async fn remember(&self, info_hash: &str, file_idx: usize, at: Remembered) {
@@ -126,8 +127,8 @@ mod tests {
         }
     }
 
-    /// **Remembered across a restart**, the newest session on a file
-    /// replacing the last, and the oldest files let go past the cap.
+    /// **Remembered across a restart.** The newest session on a file
+    /// replaces the last, and the oldest files are let go past the cap.
     #[tokio::test]
     async fn the_memory_outlives_a_restart_and_keeps_the_newest_files() {
         let dir = tempfile::tempdir().unwrap();

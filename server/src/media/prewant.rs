@@ -6,15 +6,15 @@
 //! keeps it -- mpv asks, and nothing here guesses), and then the data at
 //! the resume point. Each is fetched only once mpv blocks on it, so on a
 //! weak swarm the waits add up: 38 s, then 26 s, then seconds per piece.
-//! The resume point is the one of the three the server can know ahead --
-//! from where the last session on the file ended, or from the resume time
-//! and the film's length -- and all three are needed before the first
-//! frame, so it is asked for **at the open, beside the head**: fetched one
-//! after the other the waits add up, and sharing the swarm between them
-//! costs the head little and the total nothing.
+//! The resume point is the one of the three the server can know ahead. It
+//! comes from where the last session on the file ended, or from the resume
+//! time and the film's length. All three are needed before the first
+//! frame, so it is asked for **at the open, beside the head**. Fetched one
+//! after the other, the waits add up. Sharing the swarm between them costs
+//! the head little and the total nothing.
 //!
-//! This module is the policy, and nothing in it touches a torrent: where
-//! the window is and where in it the resume point is taken to be
+//! This module is the policy, and nothing in it touches a torrent. It says
+//! where the window is and where in it the resume point is taken to be
 //! ([`plan`]), the order it is asked for in ([`Plan::steps`]), and when it
 //! is let go ([`Tracker`]). The reader task applies it (`super::reader`)
 //! and the engine does the asking (`enginefs::engine::Engine::prewant`).
@@ -54,7 +54,7 @@ pub enum Basis {
     Estimated,
 }
 
-/// The numbers the policy runs on. [`Rules::default`] is the policy; a test
+/// The numbers the policy runs on. [`Rules::default`] is the policy. A test
 /// shrinks them to fit a fixture's few pieces
 /// ([`crate::ServerHandle::set_prewant_rules`]).
 #[doc(hidden)]
@@ -63,7 +63,7 @@ pub struct Rules {
     /// The least an estimated window reaches either side of its centre.
     pub min_half: u64,
     /// The share of the file an estimated window reaches either side, in
-    /// thousandths: a variable bitrate puts the resume point a few percent
+    /// thousandths. A variable bitrate puts the resume point a few percent
     /// away from its share of the length.
     pub half_per_mille: u64,
     /// The most a window reaches either side, whatever the file.
@@ -79,14 +79,14 @@ pub struct Rules {
     /// remembered offset to be used.
     pub near_ms: u64,
     /// How much of the window is asked for at once ([`Plan::steps`]): the
-    /// reach of the one stream the window is walked with. It is what
-    /// bounds the pre-want's place in the swarm's priorities, whatever the
-    /// window's size -- the backend takes one piece of each stream in
-    /// turn, and this is all the pre-want's stream ever has there.
+    /// reach of the one stream the window is walked with. It bounds the
+    /// pre-want's place in the swarm's priorities, whatever the window's
+    /// size. The backend takes one piece of each stream in turn, and this
+    /// is all the pre-want's stream ever has there.
     pub step: u64,
-    /// The bytes one run of reads -- from an open or a seek -- may deliver
+    /// The bytes one run of reads (from an open or a seek) may deliver
     /// outside the window before the player is taken to be playing
-    /// somewhere else, and the pre-want is let go. The head and the index
+    /// somewhere else and the pre-want is let go. The head and the index
     /// are each far less.
     pub elsewhere: u64,
 }
@@ -113,15 +113,15 @@ impl Default for Rules {
 pub struct Plan {
     /// Everything that may be asked for.
     pub window: Range<u64>,
-    /// The likeliest byte of the resume point, inside the window: what is
-    /// asked for first, and outward from.
+    /// The likeliest byte of the resume point, inside the window. It is
+    /// asked for first, and the asking goes outward from it.
     pub centre: u64,
     /// Why the window is where it is.
     pub basis: Basis,
 }
 
 /// **Where to ask for**, in a file of `len` bytes, for a playback resuming
-/// as `hint` says, or `None` when there is nothing to ask ahead for: a
+/// as `hint` says. It is `None` when there is nothing to ask ahead for: a
 /// playback from the top, or no memory near the resume time and no length
 /// to share the file out by.
 ///
@@ -129,7 +129,7 @@ pub struct Plan {
 ///   [`Rules::near_ms`] of the resume time: from [`Rules::behind`] before
 ///   the offset it was reading to [`Rules::ahead`] past it, moved by the
 ///   gap in time at the film's own rate when the length is known. The
-///   centre is the middle of that: the picture was somewhere in the
+///   centre is the middle of that. The picture was somewhere in the
 ///   player's buffer behind its last read, so with the default numbers the
 ///   first two steps are the 32 MiB behind the remembered byte, the half
 ///   nearer it first.
@@ -137,7 +137,7 @@ pub struct Plan {
 ///   centre, and either side of it the larger of [`Rules::half_per_mille`]
 ///   of the file and [`Rules::min_half`], never past [`Rules::max_half`].
 ///
-/// Clamped to the file either way.
+/// The window is clamped to the file either way.
 pub fn plan(
     len: u64,
     hint: ResumeHint,
@@ -187,15 +187,15 @@ pub fn plan(
 
 impl Plan {
     /// **The window in the order it is asked for**: `step` bytes at a time,
-    /// from the centre outward -- the step ahead of the centre, the step
-    /// behind it, the next ahead, the next behind -- until both sides
-    /// reach the window's ends. Each step touches what was asked before
+    /// from the centre outward, until both sides reach the window's ends.
+    /// The order is the step ahead of the centre, the step behind it, the
+    /// next ahead, the next behind. Each step touches what was asked before
     /// it, so what has been asked for is always one run of the file.
     ///
-    /// Outward, because the centre is a guess with an error either way and
-    /// a sweep from the window's front would spend its first minute on a
-    /// weak swarm on bytes far before the resume point; ahead first,
-    /// because a player reads forward from wherever it lands.
+    /// It goes outward because the centre is a guess with an error either
+    /// way. A sweep from the window's front would spend its first minute on
+    /// a weak swarm on bytes far before the resume point. It goes ahead
+    /// first because a player reads forward from wherever it lands.
     pub fn steps(&self, step: u64) -> Vec<Range<u64>> {
         let step = step.max(1);
         let (mut back, mut ahead) = (self.centre, self.centre);
@@ -217,19 +217,19 @@ impl Plan {
 }
 
 /// **When the pre-want is let go**, from the reads the player is served.
-/// Clock-free: every transition is a read.
+/// It reads no clock: every transition is a read.
 ///
 /// It is asked for from the open. It is let go when the player reaches
-/// the window -- a read inside it, and from there its own stream reads
-/// ahead -- or plays elsewhere: one run of reads delivering
-/// [`Rules::elsewhere`] bytes outside it, which a wrong estimate looks like
-/// and the head and index never do. Once let go it stays so, for the
-/// reader's life.
+/// the window, or when it plays elsewhere. Reaching the window is a read
+/// inside it; from there the player's own stream reads ahead. Playing
+/// elsewhere is one run of reads delivering [`Rules::elsewhere`] bytes
+/// outside the window. A wrong estimate looks like that, and the head and
+/// index never do. Once let go, it stays so for the reader's life.
 #[derive(Debug)]
 pub struct Tracker {
     window: Range<u64>,
-    /// What this run of reads -- since the open or the last seek -- has
-    /// delivered outside the window; `None` once the pre-want is let go.
+    /// What this run of reads (since the open or the last seek) has
+    /// delivered outside the window. `None` once the pre-want is let go.
     outside: Option<u64>,
     elsewhere: u64,
 }
@@ -244,8 +244,8 @@ impl Tracker {
         }
     }
 
-    /// A read was served from `begin` to `end`. Whether the pre-want is to
-    /// be let go now -- answered `true` once.
+    /// A read was served from `begin` to `end`. Answers whether the
+    /// pre-want is to be let go now, and answers `true` only once.
     pub fn served(&mut self, begin: u64, end: u64) -> bool {
         let Some(outside) = self.outside.as_mut() else {
             return false;
@@ -332,10 +332,11 @@ mod tests {
     }
 
     /// **A memory near the resume time wins**: the window is around where
-    /// the last session was reading -- mostly behind it, since the player
-    /// read ahead of what it showed -- its centre the middle of the player's
-    /// buffer behind that byte, and all of it moved by the gap in time at
-    /// the film's rate. Too far away in time, the estimate stands.
+    /// the last session was reading. It is mostly behind that byte, since
+    /// the player read ahead of what it showed. Its centre is the middle of
+    /// the player's buffer behind that byte, and all of it is moved by the
+    /// gap in time at the film's rate. The estimate stands when the memory
+    /// is too far away in time.
     #[test]
     fn a_memory_near_the_resume_time_is_where_the_window_goes() {
         let len = 7200 * MIB;
@@ -366,8 +367,8 @@ mod tests {
     }
 
     /// **The window is asked for from the centre outward, a step at a
-    /// time, ahead first**: every step touches what was asked before it,
-    /// the ends are cut to the window, and a side that has reached its end
+    /// time, ahead first.** Every step touches what was asked before it,
+    /// and the ends are cut to the window. A side that has reached its end
     /// leaves the rest to the other. A remembered window's first two steps
     /// are the player's buffer behind the byte it last read.
     #[test]
@@ -436,8 +437,8 @@ mod tests {
     }
 
     /// **Asked for from the open, and let go when the player reaches the
-    /// window**: the head and the index, read elsewhere, let nothing go,
-    /// a read inside the window does -- once, and for good.
+    /// window.** The head and the index, read elsewhere, let nothing go. A
+    /// read inside the window does, once and for good.
     #[test]
     fn the_window_is_let_go_when_the_player_reaches_it() {
         let mut tracker = tracker();
@@ -452,7 +453,7 @@ mod tests {
     }
 
     /// **A player that plays elsewhere lets the window go**: one run of
-    /// reads delivering the threshold outside it. A seek starts a new run,
+    /// reads delivers the threshold outside it. A seek starts a new run,
     /// so the head and the index, each short, never add up to it.
     #[test]
     fn a_player_playing_elsewhere_lets_the_window_go() {

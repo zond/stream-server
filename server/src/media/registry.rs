@@ -1,7 +1,7 @@
 //! **The id registry**: what each [`MediaId`] names, and what resolving it
 //! found.
 //!
-//! `register` parses and records -- no I/O, so it answers at once and the
+//! `register` parses and records, with no I/O. It answers at once, and the
 //! app has its id before it knows whether to wait for a magnet's metadata.
 //! `resolve` does the work and keeps its answer on the entry, so the next
 //! `resolve` and every `open_reader` after it are a lookup. A resolution
@@ -9,12 +9,13 @@
 //! again at the next ask rather than kept.
 //!
 //! The entries live in a [`Sessions`] map, the one the archive sessions
-//! and the Drive opens live in: at most [`MEDIA_ID_CAP`] of them, the least
-//! recently used entry **nobody holds** evicted when a new one takes the
-//! map over, and no clock. An open reader holds a lease on its entry
-//! (`super::reader`), so an id being read is never the one let go; an id
-//! nobody reads is, once enough newer ones are registered, and resolving it
-//! then is [`Refusal::UnknownId`] -- which costs the app one `register`.
+//! and the Drive opens live in. It holds at most [`MEDIA_ID_CAP`] of them
+//! and reads no clock. The least recently used entry **nobody holds** is
+//! evicted when a new one takes the map over. An open reader holds a lease
+//! on its entry (`super::reader`), so an id being read is never the one let
+//! go. An id nobody reads is let go once enough newer ones are registered.
+//! Resolving it then is [`Refusal::UnknownId`], which costs the app one
+//! `register`.
 
 use super::prewant::{self, ResumeHint, Rules, Tracker};
 use super::reader::ReadWatch;
@@ -38,11 +39,11 @@ use url::Url;
 /// How many ids the registry holds before a new one evicts the least
 /// recently used id that no reader holds.
 ///
-/// A backstop, as [`crate::translators::session::SESSION_CAP`] is for the
-/// archive sessions: an entry is a parsed URL and, once resolved, a source
-/// that holds no bytes of its own, and the app registers what it opens, so
-/// sixty-four distinct titles opened with none of them read in between is
-/// not a viewing pattern.
+/// It is a backstop, as [`crate::translators::session::SESSION_CAP`] is
+/// for the archive sessions. An entry is a parsed URL and, once resolved, a
+/// source that holds no bytes of its own. The app registers what it opens,
+/// so sixty-four distinct titles opened with none of them read in between
+/// is not a viewing pattern.
 pub const MEDIA_ID_CAP: usize = 64;
 
 /// Every id this server has issued and not let go.
@@ -50,8 +51,8 @@ pub const MEDIA_ID_CAP: usize = 64;
 pub(crate) struct Registry {
     entries: Sessions<Entry>,
     /// How long `resolve` waits for a file's head before answering it
-    /// unsniffed: [`sniff::SNIFF_BOUND`], or what a test set
-    /// ([`Registry::set_sniff_bound`]). Milliseconds.
+    /// unsniffed, in milliseconds: [`sniff::SNIFF_BOUND`], or what a test
+    /// set ([`Registry::set_sniff_bound`]).
     sniff_bound: Arc<std::sync::atomic::AtomicU64>,
     /// The numbers the pre-want runs on: [`Rules::default`], or what a
     /// test set ([`Registry::set_prewant_rules`]).
@@ -61,30 +62,30 @@ pub(crate) struct Registry {
 /// One id: what it names, parsed at registration, and what resolving it
 /// found, once something has.
 pub(crate) struct Entry {
-    /// The parse, or the refusal it ended in: a URL whose shape is none of
+    /// The parse, or the refusal it ended in. A URL whose shape is none of
     /// this server's is registered all the same (registration does not
-    /// fail) and every resolve of it answers why.
+    /// fail), and every resolve of it answers why.
     target: Result<Target, Refusal>,
-    /// What `resolve` found, kept. The lock is what makes two resolves of
-    /// one id one piece of work: the second waits and finds the first's
-    /// answer.
+    /// What `resolve` found, kept. The lock makes two resolves of one id
+    /// one piece of work: the second waits and finds the first's answer.
     resolution: tokio::sync::Mutex<Option<Arc<Resolution>>>,
     /// What [`Self::resolution`] last kept, for the questions asked by id
-    /// ([`Registry::peek`]): read without the lock a resolve holds, so a
-    /// question asked while one is under way -- or while another reader
-    /// holds that lock for the moment it takes to find the kept answer --
-    /// is answered with what the id resolved to, not with nothing. A
-    /// player's last report of where it left a film was dropped that way.
+    /// ([`Registry::peek`]). It is read without the lock a resolve holds.
+    /// So a question asked while a resolve is under way is answered with
+    /// what the id resolved to, not with nothing. The same holds while
+    /// another reader holds that lock for the moment it takes to find the
+    /// kept answer. A player's last report of where it left a film was
+    /// dropped that way.
     resolved: std::sync::Mutex<Option<Arc<Resolution>>>,
     /// The viewer's read-ahead choice for this id, as
     /// [`Registry::set_buffer`] last stated it; `None` until it has. It
-    /// outranks a [`PlayToken`]'s buffer, which is only the initial value:
-    /// a reader opens with this one when there is one, and applies it at
+    /// outranks a [`PlayToken`]'s buffer, which is only the initial value.
+    /// A reader opens with this one when there is one, and applies it at
     /// every reopen.
     pub(super) buffer: std::sync::Mutex<Option<BufferProfile>>,
     /// Where the playback this id is opened for resumes, as
-    /// [`Registry::set_resume`] last stated it: what a played torrent
-    /// reader's pre-want is planned from (`super::prewant`).
+    /// [`Registry::set_resume`] last stated it. A played torrent reader's
+    /// pre-want is planned from it (`super::prewant`).
     resume: std::sync::Mutex<Option<ResumeHint>>,
     /// What this id's reader tasks show of their reads: who is waiting,
     /// where the player was last served, what is pre-wanted.
@@ -110,8 +111,8 @@ enum Target {
         request_headers: BTreeMap<String, String>,
         /// `r=Content-Type:...`, which a player would be told.
         content_type: Option<String>,
-        /// The registered URL's path and query: what a player is handed,
-        /// on this server, for an origin nothing here can seek.
+        /// The registered URL's path and query. A player is handed it, on
+        /// this server, for an origin nothing here can seek.
         path_and_query: String,
     },
     Drive {
@@ -158,8 +159,8 @@ pub(crate) enum Container {
 /// What resolving an id found.
 ///
 /// A plain file's `sniffed` says whether its head was read and found to be
-/// no container's (`super::sniff`); one whose head was a container's is a
-/// [`Resolution::Member`] instead.
+/// no container's (`super::sniff`). A file whose head was a container's is
+/// a [`Resolution::Member`] instead.
 pub(crate) enum Resolution {
     Torrent {
         /// Lowercase.
@@ -190,8 +191,9 @@ pub(crate) enum Resolution {
         name: String,
         sniffed: bool,
     },
-    /// A pinned download of the link or the Drive file, whole on the disk:
-    /// read off it, with no origin asked -- what plays it offline.
+    /// A pinned download of the link or the Drive file, whole on the disk.
+    /// It is read off the disk with no origin asked, which is what plays
+    /// it offline.
     Held {
         source: Arc<HeldSource>,
         /// What the proxy cache files the entity's reads under: the link,
@@ -206,9 +208,9 @@ pub(crate) enum Resolution {
         sniffed: bool,
     },
     /// A member of a container. The session is found again at each open
-    /// ([`member_session`]), not kept here: a session no reader leases is
-    /// the archive map's to let go when the viewer moves on, and made again
-    /// from this -- a key, and for a link-borne container its create.
+    /// ([`member_session`]), not kept here. The archive map lets a session
+    /// no reader leases go when the viewer moves on. It is made again from
+    /// this: a key, and for a link-borne container its create.
     Member {
         format: Format,
         /// The session's key in the archive map.
@@ -232,11 +234,11 @@ pub(crate) enum Resolution {
 
 impl Resolution {
     /// Whether this answer has gone bad since it was found, and the next
-    /// ask should find another: a Drive source whose grant has died holds a
+    /// ask should find another. A Drive source whose grant has died holds a
     /// credential that can only fail, and the grant supplier may hold a
     /// new one.
     ///
-    /// A held download is stale once it is no longer pinned: its bytes are
+    /// A held download is stale once it is no longer pinned. Its bytes are
     /// no longer kept, and the origin has to be asked again.
     fn is_stale(&self, state: &AppState) -> bool {
         match self {
@@ -353,9 +355,9 @@ impl Resolution {
     }
 
     /// The torrent files a member lies in, when it lies in a torrent: its
-    /// one container file, or every volume of its multi-volume set. What
-    /// the film's duration is told to, for the member's draw alone
-    /// ([`enginefs::EngineFS::on_set_duration`]): a container's length over
+    /// one container file, or every volume of its multi-volume set. The
+    /// film's duration is told to these, for the member's draw alone
+    /// ([`enginefs::EngineFS::on_set_duration`]). A container's length over
     /// an episode's duration, or a volume's, is no rate of anything, so no
     /// file's stream takes one from it.
     fn member_files(&self) -> Option<(String, Vec<usize>)> {
@@ -368,9 +370,9 @@ impl Resolution {
         }
     }
 
-    /// The one torrent file a member's container is, when it is one: what
-    /// its play session is on, and what a player's reports about playing
-    /// are about. `None` for a set and for a container behind links.
+    /// The one torrent file a member's container is, when it is one. Its
+    /// play session is on this file, and a player's reports about playing
+    /// are about it. `None` for a set and for a container behind links.
     fn container_file(&self) -> Option<(String, usize)> {
         match self {
             Self::Member {
@@ -403,8 +405,8 @@ impl Registry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Plan pre-wants with `rules` instead: a test's, so a fixture of a few
-    /// pieces can tell a window from the whole file.
+    /// Plan pre-wants with `rules` instead. A test sets these, so a fixture
+    /// of a few pieces can tell a window from the whole file.
     pub(crate) fn set_prewant_rules(&self, rules: Rules) {
         *self
             .prewant_rules
@@ -420,9 +422,9 @@ impl Registry {
         )
     }
 
-    /// Wait `bound` for a head instead: a test's, so a head that never
-    /// comes is proven not to hold a resolve without spending the real
-    /// bound.
+    /// Wait `bound` for a head instead. A test sets this, so a head that
+    /// never comes is proven not to hold a resolve without spending the
+    /// real bound.
     pub(crate) fn set_sniff_bound(&self, bound: std::time::Duration) {
         self.sniff_bound.store(
             bound.as_millis() as u64,
@@ -474,7 +476,7 @@ impl Registry {
         Ok(entry.resolution(state).await?.resolved())
     }
 
-    /// Record the viewer's read-ahead choice for `id`; a reader open on it
+    /// Record the viewer's read-ahead choice for `id`. A reader open on it
     /// applies it at its next reopen.
     pub(crate) fn set_buffer(&self, id: &MediaId, buffer: BufferProfile) -> Result<(), Refusal> {
         let entry = self.entry(id)?;
@@ -486,7 +488,7 @@ impl Registry {
     }
 
     /// Record where the playback `id` is opened for resumes (`None`: from
-    /// the top). Read by the next [`Self::open_reader`] with a play.
+    /// the top). The next [`Self::open_reader`] with a play reads it.
     pub(crate) fn set_resume(&self, id: &MediaId, hint: Option<ResumeHint>) -> Result<(), Refusal> {
         let entry = self.entry(id)?;
         *entry
@@ -501,14 +503,14 @@ impl Registry {
         Ok(self.entry(id)?.watch.wait(std::time::Instant::now()))
     }
 
-    /// The window a reader of `id` is pre-wanting now, if any: a probe for
-    /// the tests of the pre-want.
+    /// The window a reader of `id` is pre-wanting now, if any. It is a
+    /// probe for the tests of the pre-want.
     pub(crate) fn prewanting(&self, id: &MediaId) -> Option<Vec<std::ops::Range<u64>>> {
         self.entries.get(id.as_str())?.watch.prewanting()
     }
 
     /// The torrent file `id` plays and where a played reader of it was last
-    /// served to: what a play session's end is remembered as
+    /// served to. A play session's end is remembered as this
     /// (`ServerHandle::note_media_position`). `None` for anything but a
     /// torrent file read as the viewer's playback.
     pub(crate) fn left_at(&self, id: &MediaId) -> Option<(String, usize, u64)> {
@@ -518,9 +520,9 @@ impl Registry {
     }
 
     /// What `id` last resolved to, if it has been. **A peek**: it resolves
-    /// nothing and waits for nothing, so the questions asked by id -- a
-    /// panel's numbers, a player's reports -- never become the I/O
-    /// `resolve` is, and none is lost to a resolve under way.
+    /// nothing and waits for nothing. So the questions asked by id (a
+    /// panel's numbers, a player's reports) never become the I/O `resolve`
+    /// is, and none is lost to a resolve under way.
     fn peek(&self, id: &MediaId) -> Option<Arc<Resolution>> {
         let entry = self.entries.get(id.as_str())?;
         entry.resolved()
@@ -560,7 +562,8 @@ impl Registry {
     }
 
     /// Whether the entity `id` resolved to has a source registered for
-    /// read-ahead: a probe for the test that a played reader turns it on.
+    /// read-ahead. It is a probe for the test that a played reader turns it
+    /// on.
     pub(crate) fn read_ahead_registered(&self, state: &AppState, id: &MediaId) -> bool {
         let Some(resolution) = self.peek(id) else {
             return false;
@@ -591,9 +594,9 @@ impl Registry {
     /// `note_player_stalled`). `None` for anything else, which those reports
     /// are not about, and for an id not resolved yet.
     ///
-    /// For a member of a single-file container in a torrent, that file --
-    /// though not for the film's duration, which is the member's and goes
-    /// to [`Self::member_files`].
+    /// For a member of a single-file container in a torrent, it is that
+    /// file. The film's duration is the exception: it is the member's and
+    /// goes to [`Self::member_files`].
     pub(crate) fn torrent_file(&self, id: &MediaId) -> Option<(String, usize)> {
         match &*self.peek(id)? {
             Resolution::Torrent {
@@ -606,10 +609,10 @@ impl Registry {
         }
     }
 
-    /// The torrent files the member `id` resolved to lies in -- its one
-    /// container file, or its set's volumes -- for the film's duration
-    /// (`note_media_duration`), which they take for the member's draw
-    /// alone. `None` for anything else, and for an id not resolved yet.
+    /// The torrent files the member `id` resolved to lies in (its one
+    /// container file, or its set's volumes), for the film's duration
+    /// (`note_media_duration`). They take it for the member's draw alone.
+    /// `None` for anything else, and for an id not resolved yet.
     pub(crate) fn member_files(&self, id: &MediaId) -> Option<(String, Vec<usize>)> {
         self.peek(id)?.member_files()
     }
@@ -619,10 +622,10 @@ impl Registry {
     /// are an aside, which moves no play session and shares nothing.
     ///
     /// **The stream is registered here**, before this returns, and not at
-    /// the first read: the reconciler is told a read is about to start
+    /// the first read. The reconciler is then told a read is about to start
     /// while there is still time for it to start a torrent an earlier pass
-    /// stopped, and a viewer's play session is where the viewer is from the
-    /// moment their player opened.
+    /// stopped. A viewer's play session is also where the viewer is from
+    /// the moment their player opened.
     pub(crate) async fn open_reader(
         &self,
         state: &AppState,
@@ -639,11 +642,12 @@ impl Registry {
         reader::open(entry, source, prewant).await
     }
 
-    /// The pre-want a played torrent reader over `id` is opened with: where
-    /// its playback resumes ([`Self::set_resume`]), against where the last
-    /// session on the file ended (`AppState::read_memory`) or the file's
-    /// length. `None` for anything else, a playback from the top, or one
-    /// with nothing to place a window by.
+    /// The pre-want a played torrent reader over `id` is opened with. It is
+    /// planned from where its playback resumes ([`Self::set_resume`]),
+    /// against where the last session on the file ended
+    /// (`AppState::read_memory`) or the file's length. `None` for anything
+    /// else, a playback from the top, or one with nothing to place a window
+    /// by.
     fn plan_prewant(
         &self,
         state: &AppState,
@@ -679,18 +683,18 @@ impl Registry {
         })
     }
 
-    /// A lease on `id`'s entry, so it is not evicted while it is held: what
-    /// a published cast holds for as long as it is published
+    /// A lease on `id`'s entry, so it is not evicted while it is held. A
+    /// published cast holds one for as long as it is published
     /// (`crate::cast`), as an open reader does.
     pub(crate) fn lease(&self, id: &MediaId) -> Result<Lease<Entry>, Refusal> {
         self.entry(id)
     }
 
     /// The source a reader over `id` reads, resolving it first if nothing
-    /// has, with the lease on its entry: [`Self::open_reader`]'s open
+    /// has, with the lease on its entry. It is [`Self::open_reader`]'s open
     /// without the reader task, for a caller that reads it on the runtime
-    /// itself -- a cast body (`crate::cast`). The same play rules, and the
-    /// stream registered by the source's first open, ended by its drop.
+    /// itself: a cast body (`crate::cast`). The same play rules apply. The
+    /// source's first open registers the stream, and its drop ends it.
     pub(crate) async fn open_source(
         &self,
         state: &AppState,
@@ -712,7 +716,7 @@ impl Registry {
                 name,
                 ..
             } => {
-                // Found or added again: the idle sweep may have removed the
+                // Found or added again. The idle sweep may have removed the
                 // engine since the resolve, and the stream route asks on
                 // every request for the same reason.
                 if let Ok(Target::Torrent { query, .. }) = &entry.target {
@@ -727,7 +731,7 @@ impl Registry {
                             Play {
                                 token: play.token,
                                 buffer: set_buffer.unwrap_or(play.buffer),
-                                // Decided here and never by the app: a
+                                // Decided here and never by the app. A
                                 // container played as itself shares
                                 // nothing. Its member played through an id
                                 // is the member path below, which does.
@@ -744,9 +748,9 @@ impl Registry {
             }
             Resolution::Http { source, .. } => {
                 if let Some(play) = &play {
-                    // What a `p=` request through `/proxy` does: the
-                    // viewer's player is on a proxied stream now, so its
-                    // session is off every torrent file, and what the
+                    // This does what a `p=` request through `/proxy` does.
+                    // The viewer's player is on a proxied stream now, so
+                    // its session is off every torrent file, and what the
                     // player reads is read ahead of.
                     state.engine.note_player(
                         &play.token,
@@ -786,7 +790,7 @@ impl Registry {
             }
             Resolution::Local { source, .. } => {
                 // The viewer's player is on a file of this device's now,
-                // which is no torrent file: its session goes to
+                // which is no torrent file. Its session goes to
                 // `Elsewhere`, as a `p=` request through `/proxy` puts it,
                 // so a torrent it played before is left and goes slack.
                 // Nothing is read ahead: every byte is here.
@@ -816,10 +820,10 @@ impl Registry {
     }
 }
 
-/// The session a member's container is in, leased: found under its key, or
-/// made again -- indexed off the torrent's file for the `torrent:` form, the
-/// create run again for a container behind links, the file a sniff found it
-/// in indexed again.
+/// The session a member's container is in, leased. It is found under its
+/// key, or made again. The `torrent:` form is indexed off the torrent's
+/// file. A container behind links has its create run again. A container a
+/// sniff found has that file indexed again.
 async fn member_session(
     state: &AppState,
     format: Format,
@@ -853,16 +857,17 @@ async fn member_session(
 /// the reader's life.
 ///
 /// **What it shares.** With a play, a member of a **single-file container
-/// in a torrent** is the viewer's playback of that file: its source is
+/// in a torrent** is the viewer's playback of that file. Its source is
 /// played, with the member's byte extent, so the play session is on the
 /// container file, draws, and draws inside the member. A member of a
-/// **multi-volume set** is played across it: every volume is opened
-/// played, sharing, with the member's bytes in each, so the play session is
-/// on the set -- one thing played, which the reader crossing a volume
-/// boundary does not move -- and the set draws once, over the member's
-/// bytes in all of its volumes. A container **behind links** is a proxied entity: the session goes off
-/// every torrent file and what the player reads is read ahead of, as for a
-/// `/proxy` id. Without a play every volume is an aside, and nothing moves.
+/// **multi-volume set** is played across it. Every volume is opened
+/// played, sharing, with the member's bytes in each. The play session is
+/// then on the set: one thing played, which the reader crossing a volume
+/// boundary does not move. The set draws once, over the member's bytes in
+/// all of its volumes. A container **behind links** is a proxied entity.
+/// The session goes off every torrent file, and what the player reads is
+/// read ahead of, as for a `/proxy` id. Without a play every volume is an
+/// aside, and nothing moves.
 async fn open_member(
     state: &AppState,
     session: Lease<TranslatedSession>,
@@ -899,7 +904,7 @@ async fn open_member(
             );
         }
         SessionSources::Kept(kept) => {
-            // On this device already: the player is off every torrent
+            // On this device already. The player is off every torrent
             // file, as for the file played as itself, and nothing is read
             // ahead of.
             if let Some(play) = &play {
@@ -964,7 +969,7 @@ async fn open_member(
         .view(&member, sources)
         .map_err(|error| Refusal::OpenFailed(error.to_string()))?;
     // The viewer's play session moves, and the stream registers, before
-    // the reader is handed over, as a torrent id's does: a view opens its
+    // the reader is handed over, as a torrent id's does. A view opens its
     // sources lazily, at its first read, so the first extent's is opened
     // here.
     if let Some(first) = extents.first()
@@ -982,8 +987,8 @@ async fn open_member(
     })
 }
 
-/// The bytes of its one file a member occupies, first to last: the hull of
-/// its extents, which for a stored member is the one run it is.
+/// The bytes of its one file a member occupies, first to last. This is the
+/// hull of its extents, which for a stored member is the one run it is.
 fn extent_of(extents: &[crate::sources::Extent]) -> Option<std::ops::Range<u64>> {
     let start = extents.iter().map(|extent| extent.offset).min()?;
     let end = extents
@@ -1022,7 +1027,7 @@ fn volumes_of(
 }
 
 /// Register `source`'s entity for read-ahead, as `/proxy` does for a
-/// request carrying `p=`: quiet, since the passes' fetches are not a
+/// request carrying `p=`. It is quiet, since the passes' fetches are not a
 /// viewer's.
 fn read_ahead(state: &AppState, source: &ProxySource) {
     if let Some(key_dir) = source.key_dir() {
@@ -1035,17 +1040,18 @@ fn read_ahead(state: &AppState, source: &ProxySource) {
 
 impl Entry {
     /// **The torrent this id reads, and its files, as far as is known
-    /// without waiting**: resolved, the file (or a member's volumes); a
-    /// torrent's streaming URL not resolved yet names the torrent alone
-    /// (`None`: every file). What a published cast holds
-    /// (`crate::cast`); `None` for an id read from anywhere else, or a
-    /// member not resolved yet -- which a cast never is, since the player
-    /// resolved it to play it.
+    /// without waiting.** Once resolved, it is the file (or a member's
+    /// volumes). A torrent's streaming URL not resolved yet names the
+    /// torrent alone (`None`: every file). A published cast holds this
+    /// (`crate::cast`). `None` for an id read from anywhere else, or for a
+    /// member not resolved yet. A cast's member is always resolved, since
+    /// the player resolved it to play it.
     pub(crate) fn torrent_now(&self) -> Option<(String, Option<Vec<usize>>)> {
         // What the id last resolved to, read without the resolve lock
-        // ([`Self::resolved`]): asked while a reader held that lock for a
-        // moment, this answered as if nothing had resolved, and a cast of
-        // a member got no hold, a cast of a torrent file the whole torrent.
+        // ([`Self::resolved`]). When it was asked while a reader held that
+        // lock for a moment, this answered as if nothing had resolved. A
+        // cast of a member then got no hold, and a cast of a torrent file
+        // got the whole torrent.
         let resolved = self.resolved();
         match resolved.as_deref() {
             Some(Resolution::Torrent {
@@ -1096,9 +1102,9 @@ impl Entry {
     }
 }
 
-/// Read a streaming URL by its shape, with the routes' own parsers:
+/// Read a streaming URL by its shape, with the routes' own parsers.
 /// `torrent_stream` is the torrent route's `/{infoHash}/{fileIdx}` (and
-/// `/stream/...`), `-1` with its `f=` filters included; `requested` is
+/// `/stream/...`), `-1` with its `f=` filters included. `requested` is
 /// `/proxy`'s own reading of `d=`, `h=` and `r=` in both spellings.
 fn parse(url: &Url) -> Result<Target, Refusal> {
     if let Some((info_hash, file)) = crate::stream_numbers::torrent_stream(url) {
@@ -1205,8 +1211,8 @@ fn parse_member(url: &Url, format: Format) -> Result<Target, Refusal> {
     }
 }
 
-/// A media id's torrent, found or added (with the URL's `tr=`), or why
-/// not as the refusal a client switches on ([`Refusal::of_magnet_add`]):
+/// A media id's torrent, found or added (with the URL's `tr=`). On failure
+/// it answers the refusal a client switches on ([`Refusal::of_magnet_add`]):
 /// wait for a swarm that has not answered, stop on one the backend refused.
 async fn torrent_engine(
     state: &AppState,
@@ -1251,7 +1257,7 @@ async fn resolve(state: &AppState, target: &Target) -> Result<Resolution, Refusa
                 sniffed,
             };
             // The container sniff: the file's head off the store, or
-            // fetched within the bound -- and a head not here in time is
+            // fetched within the bound. A head not here in time answers
             // the file as itself, so the player can start on it.
             let Some(head) =
                 sniff::torrent_head(state, info_hash, file_idx, state.media.sniff_bound()).await
@@ -1262,7 +1268,7 @@ async fn resolve(state: &AppState, target: &Target) -> Result<Resolution, Refusa
             if formats.is_empty() {
                 return Ok(plain(true));
             }
-            // By the file's name, as the `torrent:` form is made: a RAR's
+            // By the file's name, as the `torrent:` form is made. A RAR's
             // other volumes are its siblings by the naming rules.
             let (format, key, session) =
                 sniff::torrent_session(state, info_hash, &file.name, &formats).await?;
@@ -1291,7 +1297,7 @@ async fn resolve(state: &AppState, target: &Target) -> Result<Resolution, Refusa
             path_and_query,
         } => {
             let name = link_name(target);
-            // A finished download of this link first, and off the disk: it
+            // A finished download of this link first, and off the disk. It
             // plays without the origin, which is what a download is for.
             let pin = crate::proxy_downloads::ProxyPinKey::Url {
                 target: target.to_string(),
@@ -1356,7 +1362,7 @@ async fn resolve(state: &AppState, target: &Target) -> Result<Resolution, Refusa
         } => {
             let endpoints = state.drive.as_ref().ok_or(Refusal::NoPairingService)?;
             // A finished download first, off the disk and before the grant
-            // is asked for: it plays on a device with no network, as
+            // is asked for. It plays on a device with no network, as
             // `open_drive_file` lets it (`complete_drive_download`).
             let pin = crate::proxy_downloads::ProxyPinKey::Drive {
                 file_id: file_id.clone(),
@@ -1464,8 +1470,8 @@ fn chosen_member(
 }
 
 /// The member `name` of `session`'s container, refused if it cannot be
-/// served by range: its length, and the torrent the container is in with
-/// its volumes' file indices, when it is in one.
+/// served by range. It answers the member's length, and the torrent the
+/// container is in with its volumes' file indices, when it is in one.
 async fn member_in(
     state: &AppState,
     session: &TranslatedSession,
@@ -1507,9 +1513,9 @@ enum Sniff {
 }
 
 /// Read the head of the link, Drive file or file on this device
-/// `sniffed` names, within the bound, and on a container's signature
-/// answer its member -- or the first translator's refusal when none of
-/// those it names indexes it.
+/// `sniffed` names, within the bound. On a container's signature, answer
+/// its member. When none of the translators it names indexes it, answer
+/// the first one's refusal.
 async fn sniffed_file(state: &AppState, sniffed: Sniffed) -> Result<Sniff, Refusal> {
     let source = sniffed.source();
     let Some(head) = sniff::head_of(source.as_ref(), state.media.sniff_bound()).await else {
@@ -1519,9 +1525,9 @@ async fn sniffed_file(state: &AppState, sniffed: Sniffed) -> Result<Sniff, Refus
     if formats.is_empty() {
         return Ok(Sniff::Plain { sniffed: true });
     }
-    // One volume: a set behind links or Drive needs its volume list
-    // stated, and nothing supplies one yet -- the first volume alone is
-    // what the translator is handed, and its refusal is the answer.
+    // One volume. A set behind links or Drive needs its volume list
+    // stated, and nothing supplies one yet. The translator is handed the
+    // first volume alone, and its refusal is the answer.
     let (format, key, session) = sniffed.index(state, &formats).await?;
     let name = chosen_member(&session, None, &[])?;
     let (len, torrent) = member_in(state, &session, &name).await?;
@@ -1555,12 +1561,12 @@ fn link_name(target: &Url) -> String {
         .unwrap_or_else(|| "link".to_string())
 }
 
-/// **Pins and unpins by id** (`docs/design/media-pipeline.md` §2.6): the
-/// dispatch from what an id names to the two pin paths there are -- the
+/// **Pins and unpins by id** (`docs/design/media-pipeline.md` §2.6). This
+/// dispatches from what an id names to the two pin paths there are: the
 /// piece store's (`routes::downloads::pin_download`) for a torrent file,
 /// the proxy cache's (`proxy_downloads::pin_url`, `pin_drive`) for a link
 /// or a Drive file. A member pins its container's files, every volume of a
-/// set; a file on this device has nothing to download.
+/// set. A file on this device has nothing to download.
 impl Registry {
     /// Pin what `id` names as an offline download, and answer its rows:
     /// one, or one per volume for a member of a set.
@@ -1582,7 +1588,7 @@ impl Registry {
                 name,
                 grant,
             } => {
-                // The grant is asked for here, as a resolve asks for it; a
+                // The grant is asked for here, as a resolve asks for it. A
                 // file already whole on the disk needs none.
                 let token = grant();
                 let dir = crate::proxy_downloads::pin_drive(
@@ -1672,9 +1678,9 @@ impl Registry {
 
     /// Drop the pin on what `id` names, with `delete_files` its bytes too:
     /// [`crate::ServerHandle::unpin_download`] or
-    /// [`crate::ServerHandle::unpin_proxy_download`] for each file it pinned,
-    /// the outcomes joined -- `unpinned` if any pin went, `deleted_files` if
-    /// any bytes did.
+    /// [`crate::ServerHandle::unpin_proxy_download`] for each file it pinned.
+    /// The outcomes are joined: `unpinned` if any pin went, `deleted_files`
+    /// if any bytes did.
     pub(crate) async fn unpin(
         &self,
         state: &AppState,
@@ -1721,10 +1727,10 @@ impl Registry {
                 })
                 .await
             }
-            // An index needs no resolve: an unpin must not add a torrent
-            // the session does not hold (a dormant pin's) to learn it --
-            // unless a resolve already found the file a container's, whose
-            // pin was every volume.
+            // An index needs no resolve. An unpin must not add a torrent
+            // the session does not hold (a dormant pin's) to learn it. The
+            // exception is a resolve that already found the file a
+            // container's, whose pin was every volume.
             Target::Torrent {
                 info_hash,
                 file: StreamFile::Index(file_idx),
@@ -1790,9 +1796,9 @@ enum Volume {
     Link(Url),
 }
 
-/// Every file `resolution`'s container is made of, in set order: a
-/// member's pin is its container's, all of it -- a member is ranges of
-/// those files and nothing else holds its bytes.
+/// Every file `resolution`'s container is made of, in set order. A
+/// member's pin is its container's, all of it. A member is ranges of those
+/// files, and nothing else holds its bytes.
 async fn member_volumes(
     state: &AppState,
     resolution: &Resolution,
@@ -1817,8 +1823,8 @@ async fn member_volumes(
             })
             .collect());
     }
-    // Behind links: the create's own list when the id carries one, else the
-    // session's sources.
+    // Behind links: the create's own list when the id carries one, or else
+    // the session's sources.
     if let Some(payload) = create {
         return payload
             .urls
@@ -1913,7 +1919,7 @@ mod tests {
         assert_eq!(link_name(&target), "The Film.mkv");
     }
 
-    /// Recognised, and refused for now: the FTP form is a later step, and
+    /// Recognised, and refused for now. The FTP form is a later step, and
     /// saying so beats calling it unknown.
     #[test]
     fn an_ftp_url_is_not_yet_playable_by_id() {
@@ -1931,11 +1937,11 @@ mod tests {
         );
     }
 
-    /// **A player's reports about a member are about its container file**
-    /// -- the one torrent file a single-file container is, where the play
-    /// session draws and the film's duration divides the member's extent
-    /// -- and about nothing for a set (`a_sets_duration_is_its_volumes`) or
-    /// a container behind links.
+    /// **A player's reports about a member are about its container file**:
+    /// the one torrent file a single-file container is. The play session
+    /// draws there, and the film's duration divides the member's extent.
+    /// They are about nothing for a set (`a_sets_duration_is_its_volumes`)
+    /// or a container behind links.
     #[test]
     fn a_members_reports_are_its_single_container_files() {
         let registry = Registry::new();
@@ -1964,8 +1970,8 @@ mod tests {
             let mut held = entry.resolution.try_lock().expect("nobody resolving");
             entry.keep(&mut held, Arc::new(member(torrent)));
             // **Still held**: a resolve under way, or a reader finding the
-            // kept answer, takes no question's answer away -- not from the
-            // reports by id, and not from what a cast holds.
+            // kept answer, takes no question's answer away. That holds for
+            // the reports by id, and for what a cast holds.
             assert_eq!(registry.torrent_file(&id), expected);
             let held_now = entry.torrent_now();
             drop(held);
@@ -1981,11 +1987,11 @@ mod tests {
     }
 
     /// **The film's duration for a member is told to the files it lies
-    /// in, for the member's draw alone** (`ServerHandle::note_media_duration`):
-    /// every volume of a set, the one file of a single-file container --
-    /// whose stream would otherwise take a container's length over an
-    /// episode's duration as its rate -- and nothing for a container behind
-    /// links.
+    /// in, for the member's draw alone** (`ServerHandle::note_media_duration`).
+    /// It goes to every volume of a set and to the one file of a
+    /// single-file container, and to nothing for a container behind links.
+    /// The single file's stream would otherwise take a container's length
+    /// over an episode's duration as its rate.
     #[test]
     fn a_members_duration_is_its_files() {
         let registry = Registry::new();
@@ -2021,12 +2027,13 @@ mod tests {
         }
     }
 
-    /// **An archive URL is read as its route reads it**: a `/create`'s
-    /// `lz` payload by the route's own decoder, which refuses a payload it
-    /// cannot decode or a create with none as the route's `400` does; the
-    /// `torrent:` form's key and member path decoded as the stream route's
-    /// path extractor decodes them; and a `/stream/{key}` with no member
-    /// keeps the redirect's `fileIdx` and `f` for the rule to pick with.
+    /// **An archive URL is read as its route reads it.** A `/create`'s
+    /// `lz` payload goes through the route's own decoder. That refuses a
+    /// payload it cannot decode, or a create with none, as the route's
+    /// `400` does. The `torrent:` form's key and member path are decoded as
+    /// the stream route's path extractor decodes them. A `/stream/{key}`
+    /// with no member keeps the redirect's `fileIdx` and `f` for the rule
+    /// to pick with.
     #[test]
     fn an_archive_url_is_read_as_its_route_reads_it() {
         let lz = lz_str::compress_to_encoded_uri_component(

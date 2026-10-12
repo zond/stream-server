@@ -1,10 +1,10 @@
 //! **The reader task**: a blocking reader over async sources
 //! (`docs/design/media-pipeline.md` §2.4).
 //!
-//! A [`MediaReader`] is what a foreign thread holds -- mpv's cookie. Its
-//! calls block that thread and never poll a future on it: each one is a
+//! A foreign thread holds a [`MediaReader`] (mpv's cookie). Its calls
+//! block that thread and never poll a future on it. Each call is a
 //! [`Command`] to the one runtime task that owns the reader, answered over
-//! a oneshot. The module docs of [`crate::media`] state who owns what; in
+//! a oneshot. The module docs of [`crate::media`] state who owns what. In
 //! this file's terms:
 //!
 //! * the task owns the [`Source`], the [`SeekableReader`] open on it, the
@@ -12,7 +12,7 @@
 //!   on the runtime when the command channel ends;
 //! * the [`MediaReader`] owns the sender, the [`CancellationToken`], the
 //!   length, the source's kind, the counters it shares with the task and
-//!   the runtime's `Handle` -- nothing whose drop spawns;
+//!   the runtime's `Handle`, none of which spawns when dropped;
 //! * a cancel is the token, never a command, and every read and seek the
 //!   task makes is raced against it.
 
@@ -30,23 +30,23 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-/// The most one read answers, whatever it asks for: one allocation per
-/// read, and a player asks for far less.
+/// The most one read answers, whatever it asks for. It is one allocation
+/// per read, and a player asks for far less.
 const MAX_READ: usize = 1 << 20;
 
-/// What the foreign side asks of the task. One in flight at a time: the
+/// What the foreign side asks of the task. One is in flight at a time: the
 /// channel holds one, and a [`MediaReader`]'s calls take it by `&mut`.
 pub enum Command {
     /// Up to `max` bytes from the current position; the position advances
-    /// by what is returned. `Ok(empty)` is end of file. Whatever has
-    /// arrived, at least one byte -- not a filled buffer -- so a slow
-    /// torrent delivers as it arrives, as an HTTP body does.
+    /// by what is returned. `Ok(empty)` is end of file. It answers whatever
+    /// has arrived, at least one byte, not a filled buffer. A slow torrent
+    /// then delivers as it arrives, as an HTTP body does.
     Read {
         max: usize,
         reply: oneshot::Sender<io::Result<Bytes>>,
     },
-    /// Move to `offset`; answers the offset it is at. A reopen of the
-    /// source there, for every source, unless it is where the reader
+    /// Move to `offset`, and answer the offset it is at. For every source
+    /// this reopens the source there, unless it is where the reader
     /// already is.
     Seek {
         offset: u64,
@@ -59,15 +59,15 @@ pub(crate) enum Source {
     /// One per reader: its stream registration and play are this reader's.
     Torrent(Box<TorrentSource>),
     /// Shared with the registry entry: a link, a Drive file, a finished
-    /// download read off the cache, or a file on this device -- whose
-    /// source holds no registration of its own. Its kind is `http` for
-    /// every one of them.
+    /// download read off the cache, or a file on this device. Its source
+    /// holds no registration of its own. Its kind is `http` for every one
+    /// of them.
     Shared(Arc<dyn ByteSource>),
     /// A member of a container: the view over its volumes, the volumes
     /// opened as the viewer's playback (none for an aside or a container
-    /// behind links), and the lease on the container's session -- held for
-    /// the reader's life, so the session, and a set's volume hold with it,
-    /// is not let go under a reader (§2.4).
+    /// behind links), and the lease on the container's session. The lease
+    /// is held for the reader's life, so the session, and a set's volume
+    /// hold with it, is not let go under a reader (§2.4).
     Member {
         view: MemberView,
         played: Vec<Arc<TorrentSource>>,
@@ -127,9 +127,10 @@ struct Shown {
 }
 
 /// **What a source has been asked for**, summed over every reader counted
-/// into it ([`MediaReader::count_into`]) -- every run of a rendition, every
-/// body of a plain cast: the bytes read, the opens, and the seeks (each a
-/// reopen at another offset). Monotonic; the caller makes the rates.
+/// into it ([`MediaReader::count_into`]): every run of a rendition, every
+/// body of a plain cast. It counts the bytes read, the opens, and the
+/// seeks (each a reopen at another offset). The counts only grow. The
+/// caller makes the rates.
 #[derive(Default)]
 pub(crate) struct SourceTally {
     kind: std::sync::OnceLock<&'static str>,
@@ -172,23 +173,23 @@ impl SourceTally {
 /// JNI export hold. See the module docs.
 ///
 /// **Not for a runtime thread.** Every call blocks the calling thread
-/// until the task answers; one made from inside a tokio runtime answers an
-/// error at once rather than blocking a worker.
+/// until the task answers. A call made from inside a tokio runtime answers
+/// an error at once rather than blocking a worker.
 pub struct MediaReader {
     commands: mpsc::Sender<Command>,
     cancel: CancellationToken,
     len: u64,
     /// What the source is (`Source::kind`).
     kind: &'static str,
-    /// The runtime the task runs on. Entered while the reader is dropped,
-    /// so nothing a drop does could ever spawn off a runtime.
+    /// The runtime the task runs on. It is entered while the reader is
+    /// dropped, so nothing a drop does could ever spawn off a runtime.
     runtime: tokio::runtime::Handle,
     shown: Arc<Shown>,
 }
 
 /// A handle that cancels a [`MediaReader`] from another thread while one
-/// of its calls blocks the thread that holds it: what mpv's `cancel_fn`
-/// is. It does not block.
+/// of its calls blocks the thread that holds it. It is mpv's `cancel_fn`.
+/// It does not block.
 #[derive(Clone)]
 pub struct Canceller {
     cancel: CancellationToken,
@@ -197,7 +198,8 @@ pub struct Canceller {
 
 impl Canceller {
     /// Cancel the call in flight, and every later one: each answers
-    /// [`io::ErrorKind::Interrupted`]. Sticky, as mpv's contract says.
+    /// [`io::ErrorKind::Interrupted`]. The cancel is sticky, as mpv's
+    /// contract says.
     pub fn cancel(&self) {
         self.cancel.cancel();
     }
@@ -220,8 +222,8 @@ pub(crate) struct Planned {
 /// **What an id's reader tasks show of their reads**, kept on its registry
 /// entry: which of them is waiting on a read and since when
 /// ([`ReadWait`]), where the viewer's playback was last served to, and the
-/// window a pre-want is asking for. Written by the tasks, read by the
-/// handle's cheap questions; no clock is read here but the one handed in.
+/// window a pre-want is asking for. The tasks write it and the handle's
+/// cheap questions read it. No clock is read here but the one handed in.
 #[derive(Default)]
 pub(crate) struct ReadWatch {
     /// The reads in flight: the task's number, since when, and where.
@@ -310,7 +312,7 @@ impl MediaReader {
     }
 
     /// Move to `offset` and answer it. A seek to where the reader is
-    /// already costs nothing -- mpv makes one right after every open to
+    /// already costs nothing. mpv makes one right after every open to
     /// learn whether the stream seeks.
     pub fn seek(&mut self, offset: u64) -> io::Result<u64> {
         let (reply, answer) = oneshot::channel();
@@ -342,9 +344,9 @@ impl MediaReader {
     }
 
     /// The read-ahead choice the torrent stream's last open was made with,
-    /// `None` for anything that is not a played torrent. A probe for the
-    /// test of `set_buffer`: what the profile changes -- how far ahead the
-    /// engine fetches -- is not a number this crate is shown.
+    /// `None` for anything that is not a played torrent. It is a probe for
+    /// the test of `set_buffer`. What the profile changes (how far ahead
+    /// the engine fetches) is not a number this crate is shown.
     #[doc(hidden)]
     pub fn opened_with_buffer(&self) -> Option<BufferProfile> {
         *self
@@ -355,8 +357,8 @@ impl MediaReader {
     }
 
     fn send(&self, command: Command) -> io::Result<()> {
-        // A cancelled reader is answered by the task, which checks the token
-        // before it touches the source: at once, and in one place.
+        // The task answers a cancelled reader at once, and in one place: it
+        // checks the token before it touches the source.
         if tokio::runtime::Handle::try_current().is_ok() {
             return Err(io::Error::other(
                 "a MediaReader blocks its caller, and was called from inside a tokio runtime",
@@ -393,8 +395,8 @@ impl MediaReader {
     }
 
     /// Count this reader's open, and from now on its reads and seeks, into
-    /// `tally`. Once: a second tally is ignored. Called before the reader
-    /// is handed on, so no read goes uncounted.
+    /// `tally`. It counts into one tally only, and a second is ignored. It
+    /// is called before the reader is handed on, so no read goes uncounted.
     pub(crate) fn count_into(&self, tally: Arc<SourceTally>) {
         tally.opened(self.kind);
         let _ = self.shown.tally.set(tally);
@@ -412,13 +414,14 @@ impl Drop for MediaReader {
 }
 
 /// Open `source` at the top and hand the reader to a task of its own.
-/// Called on the runtime: the registration a torrent's first open makes is
-/// made here, before the caller has its reader.
+/// It is called on the runtime. The registration a torrent's first open
+/// makes is made here, before the caller has its reader.
 ///
 /// `prewant` is the played torrent reader's pre-want, planned by the
-/// registry: **asked for here, at the open**, beside the head the caller
-/// is about to read -- the file is open, so its entity is there to promise
-/// on -- and let go by the task as its reads are served (see [`Tracker`]).
+/// registry. It is **asked for here, at the open**, beside the head the
+/// caller is about to read. The file is open, so its entity is there to
+/// promise on. The task lets it go as its reads are served (see
+/// [`Tracker`]).
 pub(crate) async fn open(
     entry: Lease<Entry>,
     source: Source,
@@ -497,7 +500,7 @@ struct Task {
     /// When to let the pre-want go; `None` for a reader with nothing to
     /// pre-want.
     prewant: Option<Tracker>,
-    /// The pre-want standing now: dropping the guard cancels the task that
+    /// The pre-want standing now. Dropping the guard cancels the task that
     /// holds it, which lets the engine's ask go.
     prewanting: Option<tokio_util::sync::DropGuard>,
 }
@@ -526,9 +529,9 @@ impl Task {
                         Err(_) => begin,
                     };
                     // Where the playback has got to is written before the
-                    // answer goes: a report made the moment a read returns
+                    // answer goes. A report made the moment a read returns
                     // (a player leaving, `note_media_position`) must see
-                    // this read, not the one before -- CI saw the first
+                    // this read, not the one before. CI saw the first
                     // session's end remembered as nothing, twice.
                     self.watch_served(begin, end);
                     let _ = reply.send(answer);
@@ -552,7 +555,7 @@ impl Task {
             }
         }
         // The channel has ended: the reader was dropped. Everything the
-        // task holds goes here, on the runtime -- the file handle, the
+        // task holds goes here, on the runtime: the file handle, the
         // stream registration and its spawned end, the entry's lease.
         tracing::info!(
             source = self.source.kind(),
@@ -566,10 +569,11 @@ impl Task {
     }
 
     /// **Ask the swarm for `steps` of the file now**, at the open: the
-    /// pre-want (`super::prewant`). On a task of its own, since the engine's
-    /// answer can wait on a torrent still checking and an open must not;
-    /// the guard kept in [`Self::prewanting`] ends it: what the engine
-    /// holds for it is let go, at once if the answer comes after the end.
+    /// pre-want (`super::prewant`). It runs on a task of its own, since the
+    /// engine's answer can wait on a torrent still checking and an open
+    /// must not. The guard kept in [`Self::prewanting`] ends it. What the
+    /// engine holds for it is then let go, at once if the answer comes
+    /// after the end.
     fn ask_ahead(&mut self, steps: Vec<std::ops::Range<u64>>) {
         let Source::Torrent(torrent) = &self.source else {
             return;
@@ -658,7 +662,7 @@ impl Task {
                 format!("a seek to {offset} is past the end of {} bytes", self.len),
             ));
         }
-        // The viewer's read-ahead choice, if it has changed: the lookahead
+        // The viewer's read-ahead choice, if it has changed. The lookahead
         // is worked out at an open, and this is one.
         let buffer = *self
             .entry
@@ -686,9 +690,9 @@ impl Task {
     }
 }
 
-/// Show the read-ahead choice `source`'s torrent stream opens with. Takes
-/// the two pieces rather than the task: the task's reader is not `Sync`,
-/// so a borrow of the whole task cannot be held across the await.
+/// Show the read-ahead choice `source`'s torrent stream opens with. It
+/// takes the two pieces rather than the task. The task's reader is not
+/// `Sync`, so a borrow of the whole task cannot be held across the await.
 async fn show_buffer(source: &Source, shown: &Shown) {
     let mut buffer = None;
     for played in source.played() {

@@ -2,16 +2,17 @@
 //! (`docs/design/media-pipeline.md` §2.3, §2.4).
 //!
 //! The app names what it wants played by an opaque id this server issued
-//! ([`MediaId`]), never by a path or a URL a string from outside could
-//! forge, and reads it through a [`MediaReader`] whose calls block -- what
-//! mpv's `stream_cb` callbacks and a JNI export are. Two halves:
+//! ([`MediaId`]). It never names a path, or a URL a string from outside
+//! could forge. It reads the id through a [`MediaReader`] whose calls
+//! block, because mpv's `stream_cb` callbacks and a JNI export are blocking
+//! calls. There are two halves:
 //!
 //! * [`registry`](crate::media::registry) -- [`MediaSpec`](crate::media::MediaSpec) in, [`MediaId`](crate::media::MediaId) out, with no I/O
-//!   (`Registry::register`); the work -- adding the torrent,
-//!   probing the origin, renewing the Drive grant -- is `resolve`'s, and
-//!   its answer is kept on the entry. The entries are a
-//!   [`Sessions`](crate::translators::session::Sessions) map: a count cap
-//!   and least-recently-used eviction of entries nobody holds, and no
+//!   (`Registry::register`). The work is `resolve`'s: adding the torrent,
+//!   probing the origin, renewing the Drive grant. Its answer is kept on
+//!   the entry. The entries are a
+//!   [`Sessions`](crate::translators::session::Sessions) map, with a count
+//!   cap, least-recently-used eviction of entries nobody holds, and no
 //!   clock. An open reader holds a lease on its entry, so an id being
 //!   read is never the one evicted.
 //! * [`reader`](crate::media::reader) -- the reader task.
@@ -21,29 +22,29 @@
 //! **One runtime task per open reader owns the reader** and everything a
 //! reader holds: the byte source, its file handle, the stream registration
 //! and the play session's move (a torrent's `TorrentStream`), and the
-//! lease on the registry entry. The foreign side -- the thread mpv calls
-//! in on -- owns a [`MediaReader`]: a command sender, a cancellation token,
-//! a length, the source's kind, the runtime's handle and the counters it
-//! shares with the task (whether a read waits, for how long, what was
-//! read). Nothing whose drop spawns.
+//! lease on the registry entry. The foreign side (the thread mpv calls in
+//! on) owns a [`MediaReader`]. That holds a command sender, a cancellation
+//! token, a length, the source's kind, the runtime's handle and the
+//! counters it shares with the task (whether a read waits, for how long,
+//! what was read). None of these spawns when dropped.
 //!
 //! * **Nothing a foreign thread drops can spawn.** A torrent source's end
 //!   (`StreamLifecycleGuard::notify_end`, an aside's `on_stream_end`) calls
 //!   `tokio::spawn`, which panics off a runtime. Dropping a
-//!   [`MediaReader`] drops a sender; the task sees its channel end and
+//!   [`MediaReader`] drops a sender. The task sees its channel end and
 //!   drops the reader where it lives, on the runtime.
 //! * **A cancel overtakes the read it interrupts.** It is not a queued
-//!   command -- a queued command waits behind the read it is meant to
-//!   interrupt. [`MediaReader::cancel`] trips a token, which does not
-//!   block; the task races every read, seek and reopen against it and
-//!   answers the one in flight with [`std::io::ErrorKind::Interrupted`],
-//!   and every later command the same, at once. Dropping the in-flight read
-//!   is what wakes one parked on a piece nobody has: it is what a closed
-//!   socket does to an HTTP body.
+//!   command, because a queued command waits behind the read it is meant
+//!   to interrupt. [`MediaReader::cancel`] trips a token, which does not
+//!   block. The task races every read, seek and reopen against the token.
+//!   It answers the one in flight with [`std::io::ErrorKind::Interrupted`]
+//!   at once, and every later command the same. Dropping the in-flight read
+//!   is what wakes a read parked on a piece nobody has. A closed socket
+//!   does the same to an HTTP body.
 //! * **A runtime that goes away is an error, never a hang.** Its tasks are
-//!   dropped with it, a reply sender with each, and the foreign thread's
-//!   wait for the reply returns an error; a command sent afterwards finds
-//!   the channel closed.
+//!   dropped with it, and a reply sender with each. The foreign thread's
+//!   wait for the reply then returns an error. A command sent afterwards
+//!   finds the channel closed.
 //! * **Neither side holds the `ServerHandle`.** An embedder stops the
 //!   server by waiting for its last `Arc` of the handle, so a reader holding
 //!   one would hold the stop up for as long as a player held the stream.
@@ -68,10 +69,10 @@ use enginefs::backend::priorities::BufferProfile;
 use std::sync::Arc;
 use url::Url;
 
-/// Where a Google Drive file's grant comes from, asked each time the file
-/// is resolved: the refresh token, or `None` when this device holds no
-/// link to the account any more. The server keeps no grant of its own
-/// beyond an open source's; the embedder does (xtremio's
+/// Where a Google Drive file's grant comes from. It is asked each time the
+/// file is resolved, and answers the refresh token, or `None` when this
+/// device holds no link to the account any more. The server keeps no grant
+/// of its own beyond an open source's. The embedder does (xtremio's
 /// `ServerState::drive_grant`).
 pub type GrantSupplier = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
@@ -81,7 +82,7 @@ pub enum MediaSpec {
     /// torrent (`/{infoHash}/{fileIdx}`, `-1` and `f=` and `tr=`
     /// included), `/proxy` in either spelling, an archive's member by
     /// `/{fmt}/create?lz=` or `/{fmt}/stream/{key}[/member]` (the
-    /// `torrent:` form included). Read by the routes' own parsers, so the
+    /// `torrent:` form included). The routes' own parsers read it, so the
     /// core stays the one place these URLs are *built* and this server the
     /// one place they are *read*. `/ftp` is recognised and refused as
     /// [`Refusal::NotYet`] for now.
@@ -97,24 +98,24 @@ pub enum MediaSpec {
     },
     /// A file on this device: a path, or an fd the app hands over (on
     /// Android, `ParcelFileDescriptor.detachFd()`). **Only ever named
-    /// here**, through [`crate::ServerHandle::register`]: no HTTP route
+    /// here**, through [`crate::ServerHandle::register`]. No HTTP route
     /// resolves an id and nothing deserializes a `MediaSpec`, so no URL
     /// and no request body can name a file on this device. Resolving it
-    /// opens it, proves it can seek -- a pipe is refused, never streamed
-    /// forward -- and reads its length.
+    /// opens it, proves it can seek and reads its length. A pipe is
+    /// refused, never streamed forward.
     Local {
         /// The file.
         file: LocalFile,
-        /// What to call it. A path's file name when `None`; an fd has
-        /// no name of its own, so the app should say. Its extension is
-        /// where the content type comes from.
+        /// What to call it. A path's file name is used when `None`. An fd
+        /// has no name of its own, so the app should say. The content type
+        /// comes from its extension.
         name: Option<String>,
     },
 }
 
 /// An id [`crate::ServerHandle::register`] issued: 128 random bits, hex.
-/// Nothing in it says what it names, no HTTP route resolves one, and a
-/// restart forgets every one of them -- the app registers at open.
+/// Nothing in it says what it names, and no HTTP route resolves one. A
+/// restart forgets every one of them, so the app registers at open.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct MediaId(String);
@@ -151,11 +152,11 @@ impl std::fmt::Display for MediaId {
 
 /// The viewer's player behind a reader: the token `p=` carries today
 /// (`<viewer>.<screen>`) and its read-ahead choice. Whether the file
-/// shares is decided here, not by the app: a torrent file shares unless it
-/// is an archive or a disc image played as itself; a member of a container
-/// in a torrent shares its own bytes -- its extent of a single container
+/// shares is decided here, not by the app. A torrent file shares unless it
+/// is an archive or a disc image played as itself. A member of a container
+/// in a torrent shares its own bytes: its extent of a single container
 /// file, or its bytes in every volume of a multi-volume set, drawn once for
-/// the set; a container behind links shares nothing.
+/// the set. A container behind links shares nothing.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlayToken {
     /// `<viewer>.<screen>`, as `p=` carries it.
@@ -166,14 +167,15 @@ pub struct PlayToken {
 }
 
 /// **Whether the player is waiting on a read of an id right now**
-/// ([`crate::ServerHandle::media_read_wait`]): what a player shows its
-/// "buffering" card from when its own engine says nothing -- mpv blocked
-/// in a read reports neither a stall nor a cache to wait for, and its
-/// picture simply stops.
+/// ([`crate::ServerHandle::media_read_wait`]). A player shows its
+/// "buffering" card from this when its own engine says nothing. mpv
+/// blocked in a read reports neither a stall nor a cache to wait for, and
+/// its picture simply stops.
 ///
-/// Read off the reader tasks, no I/O: cheap enough to poll every half
-/// second. A read served off the disk returns in microseconds, so a wait a
-/// second long is a read parked on a piece the swarm has not delivered.
+/// It is read off the reader tasks with no I/O, so it is cheap enough to
+/// poll every half second. A read served off the disk returns in
+/// microseconds, so a wait a second long is a read parked on a piece the
+/// swarm has not delivered.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReadWait {
@@ -215,22 +217,23 @@ pub struct Resolved {
     pub member: Option<MemberInfo>,
     /// Whether the server has settled what this is: it read the file's
     /// head and asked it for a container signature, or the URL named the
-    /// container. `false` when it could not look -- a torrent whose first
-    /// pieces were not here within the bound, an origin that will not
-    /// range -- and the file is answered as itself; asking again needs a
+    /// container. `false` when it could not look: a torrent whose first
+    /// pieces were not here within the bound, or an origin that will not
+    /// range. The file is then answered as itself. Asking again needs a
     /// new [`crate::ServerHandle::register`], since the answer is kept.
     pub sniffed: bool,
-    /// `false` only for an HTTP origin that will not serve ranges: nothing
+    /// `false` only for an HTTP origin that will not serve ranges. Nothing
     /// in this process can seek it, so a player has to be handed
-    /// [`Self::proxy_url`] and read it forward itself. Not a refusal.
+    /// [`Self::proxy_url`] and read it forward itself. This is not a
+    /// refusal.
     pub in_process: bool,
     /// The absolute `/proxy` URL on this server to hand a player when
     /// [`Self::in_process`] is false, and `None` otherwise.
     pub proxy_url: Option<String>,
 }
 
-/// Why an id cannot be resolved or read. Each carries the sentence a
-/// player can show, and [`Self::kind`] is what a client switches on: the
+/// Why an id cannot be resolved or read. Each variant carries the sentence
+/// a player can show, and a client switches on [`Self::kind`]. This is the
 /// `{refused, message}` shape the archive routes answer with a `415`,
 /// `422` or `501` (`docs/design/translated-sources.md`), carried typed
 /// over FFI instead of as a status. It serializes as that same object.
@@ -251,20 +254,21 @@ pub enum Refusal {
     Translated(crate::translators::Refusal),
     /// An origin that will not serve ranges, where ranges are the only way
     /// in: a member inside one, or a reader asked of one (`501 noRanges`).
-    /// Resolving such a link is *not* this: it is `in_process: false`.
+    /// Resolving such a link is *not* this. It is `in_process: false`.
     NoRanges,
     /// A build with no reader for the format (`501 noReader`).
     NoReader(String),
-    /// The torrent is not here yet: its swarm did not hand over the info
-    /// dictionary in time (or the add was let go), and asking again starts
-    /// a fresh add -- a client waits on this one. The engine's own
-    /// non-leaking sentence.
+    /// The torrent is not here yet. Its swarm did not hand over the info
+    /// dictionary in time, or the add was let go. Asking again starts a
+    /// fresh add, so a client waits on this one. It carries the engine's
+    /// own non-leaking sentence.
     TorrentUnavailable(String),
-    /// The backend refused the torrent: asking again gets the same answer,
-    /// so a client stops here. The engine's own non-leaking sentence.
+    /// The backend refused the torrent. Asking again gets the same answer,
+    /// so a client stops here. It carries the engine's own non-leaking
+    /// sentence.
     TorrentRefused(String),
-    /// The torrent has no file by that index, or `-1` matched nothing; an
-    /// archive has no such member, or no session under that key.
+    /// The torrent has no file by that index, or `-1` matched nothing. Or
+    /// an archive has no such member, or no session under that key.
     NoSuchFile(String),
     /// An archive `/create` whose payload cannot be taken: no `lz`, one
     /// that does not decode, or a URL in it that is not a web address (the
@@ -446,9 +450,9 @@ impl serde::Serialize for Refusal {
 /// ([`crate::ServerHandle::pin`], [`crate::ServerHandle::unpin`]).
 #[derive(Debug)]
 pub enum PinError {
-    /// The id names nothing pinnable: unknown here, or a URL whose shape
-    /// is none of this server's -- or resolving it, which a torrent's `-1`
-    /// and a member need, was refused.
+    /// The id names nothing pinnable. It is unknown here, or a URL whose
+    /// shape is none of this server's. Or resolving it was refused (a
+    /// torrent's `-1` and a member need resolving).
     Refused(Refusal),
     /// A file on this device: it is here already, and there is nothing to
     /// download.
