@@ -4,7 +4,7 @@
 //! directory record inside the descriptor that was chosen, then the
 //! directory records of that root read recursively. Each record gives an
 //! extent (a logical block number and a byte length), a flags byte and a
-//! name; a record whose directory bit is set is walked, and is not a file.
+//! name. A record whose directory bit is set is walked, and is not a file.
 //!
 //! Three things about names, in the order they are preferred:
 //!
@@ -20,9 +20,9 @@
 //!
 //! A file over 4 GiB cannot be one record: the record's data length is 32
 //! bits. Such a file is written as several consecutive records with the
-//! same name, all but the last carrying the multi-extent flag, and the
-//! result is one file with several extents -- which is why [`ImageFile`]
-//! holds a `Vec` and not a range.
+//! same name, all but the last carrying the multi-extent flag. The result
+//! is one file with several extents, which is why [`ImageFile`] holds a
+//! `Vec` and not a range.
 
 use super::{
     Budget, Extent, ImageFile, ImageFormat, ImageIndex, ImageReader, Refusal, SECTOR,
@@ -35,7 +35,7 @@ const FORMAT: &str = "ISO 9660";
 const FIRST_DESCRIPTOR_SECTOR: u64 = 16;
 
 /// How many descriptors are read before the sequence is called malformed.
-/// A real image has a handful; a terminator (type 255) stops the scan
+/// A real image has a handful, and a terminator (type 255) stops the scan
 /// sooner. The cap is what stops an image whose sequence never terminates.
 const MAX_DESCRIPTORS: u64 = 64;
 
@@ -43,7 +43,7 @@ const MAX_DESCRIPTORS: u64 = 64;
 /// one-byte name).
 const MIN_RECORD_LEN: usize = 34;
 
-/// How deep the tree is walked. ISO 9660 level 1 allows eight; images in
+/// How deep the tree is walked. ISO 9660 level 1 allows eight. Images in
 /// the wild go deeper, and a depth bomb goes much deeper still.
 const MAX_DEPTH: usize = 64;
 
@@ -57,7 +57,7 @@ pub async fn index(reader: &dyn ImageReader) -> Result<ImageIndex, Refusal> {
     let mut budget = Budget::new(reader, FORMAT);
     let descriptors = read_descriptors(&mut budget).await?;
 
-    // Joliet first: it is a whole tree with real names, so when it exists
+    // Joliet first. It is a whole tree with real names, so when it exists
     // nothing else has to be guessed at.
     let (chosen, joliet) = match descriptors.joliet {
         Some(d) => (d, true),
@@ -117,7 +117,7 @@ async fn read_descriptors(budget: &mut Budget<'_>) -> Result<Descriptors, Refusa
     for i in 0..MAX_DESCRIPTORS {
         let sector = FIRST_DESCRIPTOR_SECTOR + i;
         // Past the end of the image is the end of the sequence, not a
-        // refusal: a truncated tail after a terminator changes nothing.
+        // refusal. A truncated tail after a terminator changes nothing.
         if (sector + 1) * SECTOR > budget.image_len() {
             break;
         }
@@ -137,7 +137,7 @@ async fn read_descriptors(budget: &mut Budget<'_>) -> Result<Descriptors, Refusa
             }
             // Supplementary/enhanced: Joliet when its escape sequence says
             // UCS-2. Any other supplementary descriptor is some other
-            // character set and is left alone -- the primary tree still
+            // character set and is left alone. The primary tree still
             // answers, so this is not a refusal.
             2 if out.joliet.is_none() && is_joliet_escape(&d[88..120]) => {
                 out.joliet = Some(parse_volume(budget, &d)?);
@@ -164,7 +164,7 @@ fn is_joliet_escape(esc: &[u8]) -> bool {
 }
 
 fn parse_volume(budget: &Budget<'_>, d: &[u8]) -> Result<Volume, Refusal> {
-    // Both-endian field; the little-endian half is first.
+    // Both-endian field. The little-endian half is first.
     let block_size = le_u16(d, 128).unwrap_or(0) as u64;
     if block_size == 0 || !block_size.is_power_of_two() || !(512..=65_536).contains(&block_size) {
         return Err(budget.malformed(format!(
@@ -180,8 +180,9 @@ fn parse_volume(budget: &Budget<'_>, d: &[u8]) -> Result<Volume, Refusal> {
     Ok(Volume { block_size, root })
 }
 
-/// One directory record, as read. Untrusted: every field here came out of
-/// the image and is checked by the caller before it is used as an offset.
+/// One directory record, as read. It is untrusted. Every field here came
+/// out of the image and is checked by the caller before it is used as an
+/// offset.
 struct DirRecord {
     /// Length of the record in the directory's bytes.
     record_len: usize,
@@ -223,7 +224,7 @@ impl DirRecord {
         let ext_attr_len = rec[1] as u64;
         if ext_attr_len != 0 {
             // Extended attribute records sit before the file's data and
-            // would shift every extent; no image this is for writes them,
+            // would shift every extent. No image this is for writes them,
             // and guessing the shift would serve the wrong bytes.
             return Err(
                 budget.unsupported("extended attribute records on a directory record".to_string())
@@ -265,10 +266,10 @@ struct Walk {
     joliet: bool,
     rock_ridge: bool,
     files: Vec<ImageFile>,
-    /// Extents of directories already entered, to stop a cycle. A list and
-    /// not a set: the depth limit bounds it to the path from the root, so
-    /// it is at most [`MAX_DEPTH`] long and a scan of it is cheaper than a
-    /// hash.
+    /// Extents of directories already entered, to stop a cycle. It is a
+    /// list and not a set. The depth limit bounds it to the path from the
+    /// root, so it is at most [`MAX_DEPTH`] long and a scan of it is
+    /// cheaper than a hash.
     visited: Vec<u32>,
     /// Bytes the Rock Ridge `SP` entry says to skip at the start of every
     /// system use area.
@@ -280,8 +281,8 @@ impl Walk {
     /// path back to the root is in `visited`, so a directory that points at
     /// one of its own ancestors is a refusal rather than a loop.
     ///
-    /// Boxed because the recursion is through an `async fn`, which cannot
-    /// name its own future otherwise.
+    /// It is boxed because the recursion is through an `async fn`, which
+    /// cannot name its own future otherwise.
     fn directory<'a>(
         &'a mut self,
         budget: &'a mut Budget<'_>,
@@ -312,8 +313,8 @@ impl Walk {
             // own bytes are not held across the whole subtree.
             let mut subdirs: Vec<(DirRecord, String)> = Vec::new();
             let mut pos = 0usize;
-            // A file over 4 GiB is several records in a row for one name;
-            // this is the one being built.
+            // A file over 4 GiB is several records in a row for one name.
+            // This is the one being built.
             let mut pending: Option<(String, Vec<Extent>)> = None;
 
             while pos < bytes.len() {
@@ -342,7 +343,7 @@ impl Walk {
 
                 if rec.is_dir {
                     // A directory that is also mid-multi-extent is a
-                    // contradiction; a directory ends any pending file.
+                    // contradiction. A directory ends any pending file.
                     finish_pending(&mut pending, &mut self.files, budget)?;
                     subdirs.push((rec, child_path));
                     continue;
@@ -355,8 +356,8 @@ impl Walk {
                     len: rec.data_len as u64,
                 };
                 match &mut pending {
-                    // Same name, still open: another extent of the file
-                    // the last record began.
+                    // Same name, still open. This is another extent of the
+                    // file the last record began.
                     Some((pending_path, extents)) if *pending_path == child_path => {
                         extents.push(extent);
                     }
@@ -376,9 +377,9 @@ impl Walk {
             }
             // A last record with the multi-extent flag still set is a file
             // whose continuation the directory does not hold. It is kept
-            // with what it has rather than dropped: the flag says "more
-            // follows", and nothing does, which the length check below
-            // catches if the file is short.
+            // with what it has rather than dropped. The flag says "more
+            // follows", and nothing does. The length check below catches
+            // that if the file is short.
             finish_pending(&mut pending, &mut self.files, budget)?;
             drop(bytes);
 
@@ -406,9 +407,9 @@ impl Walk {
     }
 }
 
-/// A name out of an image is untrusted: one holding a separator would build
-/// a path that is not the path the image describes, and a caller resolving
-/// it against a directory would be resolving something else entirely.
+/// A name out of an image is untrusted. One holding a separator would build
+/// a path that is not the path the image describes. A caller resolving it
+/// against a directory would be resolving something else entirely.
 fn check_name(name: &str, budget: &Budget<'_>) -> Result<String, Refusal> {
     if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
         return Err(budget.malformed(format!("a directory record's name is `{name}`")));
@@ -445,7 +446,7 @@ fn iso_name(raw: &[u8]) -> String {
 }
 
 /// Joliet names are UCS-2, big-endian. An unpaired surrogate is replaced
-/// rather than refused: it is a name, not an offset.
+/// rather than refused, because it is a name, not an offset.
 fn joliet_name(raw: &[u8]) -> String {
     let units = raw
         .as_chunks::<2>()
@@ -484,8 +485,8 @@ fn system_use_entries(su: &[u8], skip: usize, mut f: impl FnMut(&[u8; 2], &[u8])
 /// the CONTINUE flag. `NM` for `.` and `..` (the CURRENT and PARENT flags)
 /// is not a name and is ignored.
 ///
-/// A name continued into a `CE` continuation area -- another block
-/// entirely -- is not followed: that is a second read per record, and the
+/// A name continued into a `CE` continuation area (another block
+/// entirely) is not followed. That would be a second read per record. The
 /// ISO name is a correct fallback, so the cost is a less pretty name and
 /// never a wrong extent.
 fn rock_ridge_name(su: &[u8], skip: usize) -> Option<String> {
@@ -509,9 +510,9 @@ fn rock_ridge_name(su: &[u8], skip: usize) -> Option<String> {
     }
 }
 
-/// Rock Ridge `SP`, in the root's `.` record: how many bytes to skip at the
-/// start of every system use area (non-zero only on a disc whose records
-/// carry another system's data first).
+/// Rock Ridge `SP`, in the root's `.` record. It says how many bytes to
+/// skip at the start of every system use area (non-zero only on a disc
+/// whose records carry another system's data first).
 fn rock_ridge_sp_skip(su: &[u8]) -> usize {
     let mut skip = 0usize;
     system_use_entries(su, 0, |sig, data| {
@@ -554,7 +555,7 @@ mod tests {
     #[tokio::test]
     async fn a_file_over_four_gib_is_several_records_and_one_file() {
         // Two records for one name, the first flagged multi-extent. The
-        // image itself is small: the extents' *stated* lengths are what
+        // image itself is small. The extents' *stated* lengths are what
         // make the file large, and nothing reads them.
         let image = iso::multi_extent_image();
         let idx = index(&image).await.expect("indexed");
@@ -604,9 +605,9 @@ mod tests {
     #[tokio::test]
     async fn indexing_reads_descriptors_and_directories_only() {
         // The bound: the descriptor scan (sectors 16..=17 here, stopping at
-        // the terminator) plus one sector per directory. Asserted as a
-        // number so that a parser that starts reading a file's data fails
-        // rather than merely getting slower.
+        // the terminator) plus one sector per directory. It is asserted as
+        // a number, so that a parser that starts reading a file's data
+        // fails rather than merely getting slower.
         let bytes = iso::iso_with_subdirectory();
         let image = CountingImage::new(bytes);
         index(&image).await.expect("indexed");
@@ -694,7 +695,7 @@ mod tests {
     async fn every_single_byte_corruption_of_a_header_is_a_refusal_or_an_index() {
         // Each byte of the descriptor and directory region flipped, one at
         // a time. The assertion is that the parser always terminates with
-        // an answer or a typed refusal -- the file data region is left
+        // an answer or a typed refusal. The file data region is left
         // alone, since nothing reads it.
         let full = iso::iso_with_subdirectory();
         for at in (32_768..36_864.min(full.len())).step_by(7) {

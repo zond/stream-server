@@ -1,14 +1,15 @@
 //! Images built byte by byte for the tests.
 //!
-//! Nothing binary is committed: every fixture here is assembled from the
-//! field layouts in the standards, which is also what makes the hostile
-//! cases possible at all -- a cycle, a record that points past the end, a
-//! descriptor whose CRC no longer matches are all one line each, and no
-//! tool will write them for you.
+//! Nothing binary is committed. Every fixture here is assembled from the
+//! field layouts in the standards. That is also what makes the hostile
+//! cases possible at all. A cycle, a record that points past the end, and
+//! a descriptor whose CRC no longer matches are one line each, and no tool
+//! will write them for you.
 //!
 //! The readers here are the other half of the bargain the module makes.
-//! [`CountingImage`](crate::images::fixtures::CountingImage) records every range that was read so a test can assert
-//! that the file's own bytes were never among them, and [`SparseImage`](crate::images::fixtures::SparseImage)
+//! [`CountingImage`](crate::images::fixtures::CountingImage) records every
+//! range that was read, so a test can assert that the file's own bytes
+//! were never among them. [`SparseImage`](crate::images::fixtures::SparseImage)
 //! reports a length far larger than the bytes it holds, which is how a
 //! multi-gibibyte file is tested in a few kilobytes.
 
@@ -39,9 +40,9 @@ impl CountingImage {
         self.reads().iter().map(|(_, l)| l).sum()
     }
 
-    /// Whether any read overlapped `[offset, offset + len)`. The assertion
-    /// that matters: an index that touched the film's bytes is not an
-    /// index.
+    /// Whether any read overlapped `[offset, offset + len)`. This is the
+    /// assertion that matters: an index that touched the film's bytes is
+    /// not an index.
     pub fn read_any_of(&self, offset: u64, len: u64) -> bool {
         self.reads()
             .iter()
@@ -70,8 +71,8 @@ impl ImageReader for CountingImage {
     }
 }
 
-/// An image whose stated length is `len` and whose first bytes are `head`;
-/// everything after that reads as zeros. A 8 GiB image in 64 KiB.
+/// An image whose stated length is `len` and whose first bytes are `head`.
+/// Everything after that reads as zeros. A 8 GiB image in 64 KiB.
 pub struct SparseImage {
     pub head: Vec<u8>,
     pub len: u64,
@@ -132,7 +133,8 @@ pub mod iso {
     use super::*;
 
     /// Where the file's data goes in the one-file images, and how long it
-    /// is. Not a whole sector, so a parser that rounded up would be caught.
+    /// is. It is not a whole sector, so a parser that rounded up would be
+    /// caught.
     pub const DATA_SECTOR: u64 = 19;
     pub const DATA_LEN: u64 = 1234;
 
@@ -157,7 +159,8 @@ pub mod iso {
     }
 
     /// One directory record. `name` is the raw name bytes (`\0` for `.`,
-    /// `\x01` for `..`), `system_use` whatever Rock Ridge data follows.
+    /// `\x01` for `..`), and `system_use` is whatever Rock Ridge data
+    /// follows.
     pub fn record(name: &[u8], lba: u32, len: u32, flags: u8, system_use: &[u8]) -> Vec<u8> {
         let name_len = name.len();
         let su_start = 33 + name_len + usize::from(name_len.is_multiple_of(2));
@@ -268,7 +271,7 @@ pub mod iso {
 
     /// One name, two records, the first flagged multi-extent: a file over
     /// 4 GiB. The image reports eight gibibytes and holds twenty-four
-    /// sectors, which is exactly the point -- nothing reads the data.
+    /// sectors. That is exactly the point: nothing reads the data.
     pub fn multi_extent_image() -> SparseImage {
         let mut head = image(24);
         let root = record(&[0x00], 18, SECTOR as u32, 0x02, &[]);
@@ -367,7 +370,7 @@ pub mod iso {
         image
     }
 
-    /// A record whose name holds a path separator: a name that would
+    /// A record whose name holds a path separator. Such a name would
     /// build a path the image does not describe.
     pub fn iso_with_a_separator_in_a_name() -> Vec<u8> {
         let mut image = image(24);
@@ -439,7 +442,7 @@ pub mod udf {
         /// 1 allocated but not recorded, 3 a continuation.
         Short { kind: u32, len: u32, block: u32 },
         /// `part` is the partition *reference* number, which only a long
-        /// descriptor carries -- a short one is always in its file entry's
+        /// descriptor carries. A short one is always in its file entry's
         /// own partition.
         Long {
             kind: u32,
@@ -497,9 +500,10 @@ pub mod udf {
             d[4] = (sum & 0xff) as u8;
         }
 
-        /// The volume recognition sequence at sector 16. Not read by the
-        /// parser -- the anchor is what it looks for -- but a real image
-        /// has it and the bridge fixture needs the sectors accounted for.
+        /// The volume recognition sequence at sector 16. The parser does
+        /// not read it, since the anchor is what it looks for. But a real
+        /// image has it, and the bridge fixture needs the sectors accounted
+        /// for.
         pub fn vrs(&mut self) -> &mut Self {
             for (i, id) in [b"BEA01", b"NSR03", b"TEA01"].iter().enumerate() {
                 let d = self.sector(16 + i as u64);
@@ -1002,8 +1006,8 @@ pub mod udf {
     }
 
     /// A good image whose root directory's first file identifier (the
-    /// parent entry, 40 bytes) claims a CRC over the whole directory, with
-    /// the CRC and checksum resealed to match: every byte it covers is
+    /// parent entry, 40 bytes) claims a CRC over the whole directory. The
+    /// CRC and checksum are resealed to match. Every byte it covers is
     /// real, and all but its own belong to the identifier after it.
     pub fn udf_with_a_fid_crc_past_its_end() -> Vec<u8> {
         let mut b = volume();
@@ -1149,7 +1153,7 @@ pub mod udf {
         let mut image = minimal_udf();
         let iso = super::iso::minimal_iso();
         // The 9660 descriptors and tree sit where the volume recognition
-        // sequence was; a real bridge disc shares the area the same way.
+        // sequence was. A real bridge disc shares the area the same way.
         image[(16 * SECTOR) as usize..iso.len()].copy_from_slice(&iso[(16 * SECTOR) as usize..]);
         image
     }

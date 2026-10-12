@@ -1,14 +1,14 @@
 //! Disc images, as an index: which byte ranges of the image are each file's
 //! data.
 //!
-//! This module answers one question and nothing else. Given an image -- an
-//! ISO 9660 CD/DVD image, a UDF Blu-ray image, or a bridge disc that is both
-//! -- it reads the descriptors and the directory tree and returns, per file,
-//! the ranges of the *image's own bytes* that hold that file's data. It does
-//! not decode, does not copy, does not decide policy and does not write. A
-//! caller that wants a file's bytes reads those ranges from wherever the
-//! image's bytes come from, which is the whole point: a disc image is a
-//! translation of byte ranges, never a download.
+//! This module answers one question and nothing else. Given an image (an
+//! ISO 9660 CD/DVD image, a UDF Blu-ray image, or a bridge disc that is
+//! both), it reads the descriptors and the directory tree. It returns, per
+//! file, the ranges of the *image's own bytes* that hold that file's data.
+//! It does not decode, does not copy, does not decide policy and does not
+//! write. A caller that wants a file's bytes reads those ranges from
+//! wherever the image's bytes come from. That is the whole point: a disc
+//! image is a translation of byte ranges, never a download.
 //!
 //! What follows from that:
 //!
@@ -17,18 +17,18 @@
 //!   [`Budget`] enforces that as a hard number rather than as an intention,
 //!   and the tests assert against it.
 //! * **A refusal is typed and names its reason** ([`Refusal`]). There is no
-//!   guess: an image whose structure this parser does not implement is a
+//!   guess. An image whose structure this parser does not implement is a
 //!   refusal that says which structure, not a partial answer with files
-//!   missing. Everything read out of the image is untrusted -- every offset,
-//!   every length, every name -- so every arithmetic step is checked and
+//!   missing. Everything read out of the image is untrusted (every offset,
+//!   every length, every name). So every arithmetic step is checked and
 //!   every bound is compared against the image's real length.
 //! * **A file is a list of extents, in order.** ISO 9660 stores a file over
 //!   4 GiB as several directory records for one name, which is several
-//!   extents; UDF's allocation descriptors are a list by construction. The
+//!   extents. UDF's allocation descriptors are a list by construction. The
 //!   result type carries that for both. Directories are not files.
 //!
-//! `crate::translators::iso` is what uses it: it adapts [`ImageReader`] to
-//! the repository's `ByteSource` and maps [`Refusal`] onto the translators'
+//! `crate::translators::iso` uses it. It adapts [`ImageReader`] to the
+//! repository's `ByteSource` and maps [`Refusal`] onto the translators'
 //! refusals, and so onto the route's answers. The module is `pub` for its
 //! [`fixtures`], which the integration tests read.
 
@@ -40,11 +40,11 @@ use std::sync::Arc;
 pub mod iso9660;
 pub mod udf;
 
-/// **Not behind `#[cfg(test)]`**: the integration tests put these images
-/// inside a torrent and behind a URL and read them back through the routes,
-/// and a fixture that existed only in unit builds would leave the
-/// end-to-end claim untested.
-/// Nothing in it reads a file or opens a socket; it is a few functions
+/// **Not behind `#[cfg(test)]`.** The integration tests put these images
+/// inside a torrent and behind a URL and read them back through the routes.
+/// A fixture that existed only in unit builds would leave the end-to-end
+/// claim untested.
+/// Nothing in it reads a file or opens a socket. It is a few functions
 /// that fill a `Vec<u8>` with descriptors.
 pub mod fixtures;
 
@@ -56,20 +56,20 @@ pub const SECTOR: u64 = 2048;
 
 /// Random access to an image's bytes, and nothing more.
 ///
-/// Deliberately the smallest trait that can be implemented over anything:
-/// a file, a slice in memory, a torrent's piece store, a ranged HTTP
-/// entity. `crate::translators::iso` wraps the repository's `ByteSource` in
-/// one of these (`len` and `read_at` are the same two calls under different
-/// names), which is why nothing here asks for seeking, buffering or a
-/// stream.
+/// It is deliberately the smallest trait that can be implemented over
+/// anything: a file, a slice in memory, a torrent's piece store, a ranged
+/// HTTP entity. `crate::translators::iso` wraps the repository's
+/// `ByteSource` in one of these (`len` and `read_at` are the same two calls
+/// under different names). That is why nothing here asks for seeking,
+/// buffering or a stream.
 #[async_trait]
 pub trait ImageReader: Send + Sync {
-    /// The image's length in bytes. Known up front for every source there
-    /// is; an index cannot be bounded against an unknown end.
+    /// The image's length in bytes. It is known up front for every source
+    /// there is. An index cannot be bounded against an unknown end.
     fn len(&self) -> u64;
 
-    /// Whether the image is empty. Exists because [`ImageReader::len`] does;
-    /// an empty image is a refusal, not a parse.
+    /// Whether the image is empty. It exists because [`ImageReader::len`]
+    /// does. An empty image is a refusal, not a parse.
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -118,7 +118,7 @@ pub struct Extent {
 
 impl Extent {
     /// The end offset, or `None` if the image claims a range that does not
-    /// fit in a `u64` -- which is a malformed image, not a panic.
+    /// fit in a `u64`. That is a malformed image, not a panic.
     fn end(&self) -> Option<u64> {
         self.offset.checked_add(self.len)
     }
@@ -179,7 +179,7 @@ impl fmt::Display for ImageFormat {
 pub struct ImageIndex {
     pub format: ImageFormat,
     /// Every regular file, in the order the tree was walked. Directories
-    /// are not here: a directory is not a file and has no bytes to serve.
+    /// are not here. A directory is not a file and has no bytes to serve.
     pub files: Vec<ImageFile>,
 }
 
@@ -191,7 +191,7 @@ pub enum Refusal {
     /// at. Not an image, or an image of a filesystem this is not for.
     NotAnImage { detail: String },
     /// A structure this parser does not implement, named. The image is
-    /// well-formed as far as it was read; the answer would be wrong rather
+    /// well-formed as far as it was read. The answer would be wrong rather
     /// than late, so there is no answer.
     Unsupported { format: &'static str, what: String },
     /// The image contradicts itself, or points outside itself, or is
@@ -200,7 +200,7 @@ pub enum Refusal {
         format: &'static str,
         detail: String,
     },
-    /// The reader failed. The image may be fine; these bytes are not
+    /// The reader failed. The image may be fine, but these bytes are not
     /// available.
     Unreadable { detail: String },
 }
@@ -222,14 +222,14 @@ impl std::error::Error for Refusal {}
 
 /// Index whatever the image is.
 ///
-/// ISO 9660 is tried first, because a bridge disc -- a DVD-Video image,
-/// which is both ISO 9660 and UDF -- holds the same files in both trees and
-/// the 9660 tree is the cheaper walk. A UDF-only image (every Blu-ray) has
-/// no `CD001` descriptor at all and falls through to UDF.
+/// ISO 9660 is tried first. A bridge disc (a DVD-Video image, which is both
+/// ISO 9660 and UDF) holds the same files in both trees, and the 9660 tree
+/// is the cheaper walk. A UDF-only image (every Blu-ray) has no `CD001`
+/// descriptor at all and falls through to UDF.
 ///
-/// The refusal returned when neither recognises the image is the *9660*
-/// one only when 9660 got far enough to recognise something; otherwise the
-/// UDF refusal is the more informative and is what comes back.
+/// When neither recognises the image, the refusal returned is the *9660*
+/// one only when 9660 got far enough to recognise something. Otherwise the
+/// UDF refusal is the more informative, and it is what comes back.
 pub async fn index(reader: &dyn ImageReader) -> Result<ImageIndex, Refusal> {
     let iso = iso9660::index(reader).await;
     match iso {
@@ -247,11 +247,11 @@ pub async fn index(reader: &dyn ImageReader) -> Result<ImageIndex, Refusal> {
 
 /// How many bytes an index is allowed to read.
 ///
-/// Not a guideline: the parsers go through this and nothing else, so an
-/// image that would make the walk read forever -- a directory claiming a
-/// gigabyte of records, a tree of a million empty directories -- stops at a
-/// stated number with a refusal that says so, instead of being discovered
-/// by a stopwatch. The tests count against the same counter the parser is
+/// It is not a guideline. The parsers go through this and nothing else. So
+/// an image that would make the walk read forever (a directory claiming a
+/// gigabyte of records, a tree of a million empty directories) stops at a
+/// stated number with a refusal that says so. It is not discovered by a
+/// stopwatch. The tests count against the same counter the parser is
 /// bounded by.
 pub struct Budget<'a> {
     reader: &'a dyn ImageReader,
@@ -262,9 +262,9 @@ pub struct Budget<'a> {
     format: &'static str,
 }
 
-/// The index read budget, per image. Generous against any real disc --
+/// The index read budget, per image. It is generous against any real disc:
 /// a DVD-Video image's descriptors and `VIDEO_TS` directory are a few
-/// tens of kilobytes, and a Blu-ray's UDF metadata a few hundred -- and
+/// tens of kilobytes, and a Blu-ray's UDF metadata a few hundred. It is
 /// small enough that a hostile image cannot turn an index into a download.
 pub const INDEX_READ_BUDGET: u64 = 8 * 1024 * 1024;
 
@@ -287,8 +287,8 @@ impl<'a> Budget<'a> {
     }
 
     /// Exactly `len` bytes at `offset`. A short read is the image ending
-    /// early, which for a structure the index needs is a truncated image
-    /// and therefore malformed -- never a shorter structure parsed anyway.
+    /// early. For a structure the index needs, that is a truncated image
+    /// and therefore malformed, never a shorter structure parsed anyway.
     pub async fn read_exact(&mut self, offset: u64, len: usize) -> Result<Vec<u8>, Refusal> {
         let need = len as u64;
         if need > self.left {
@@ -367,9 +367,9 @@ impl<'a> Budget<'a> {
     }
 }
 
-// Little-endian readers over untrusted bytes, the translators' own: each
-// returns `None` rather than panicking when the slice is too short, since a
-// descriptor that ends early is a malformed image and the caller turns it
+// Little-endian readers over untrusted bytes, the translators' own. Each
+// returns `None` rather than panicking when the slice is too short. A
+// descriptor that ends early is a malformed image, and the caller turns it
 // into that refusal, with the name of the field it was reading.
 pub(crate) use crate::translators::{le_u16, le_u32, le_u64};
 
@@ -379,7 +379,7 @@ pub(crate) use crate::translators::{le_u16, le_u32, le_u64};
 /// states the real length separately in the file entry. Serving the padding
 /// would append the block's tail to the film, so the extents are cut to the
 /// stated length here, once, for both parsers. Extents that sum to *less*
-/// than the stated length are a contradiction the caller refuses; this
+/// than the stated length are a contradiction the caller refuses. This
 /// returns the sum so it can.
 pub(crate) fn trim_to_len(extents: &mut Vec<Extent>, len: u64) -> u64 {
     let mut kept = 0u64;
@@ -443,9 +443,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_bridge_image_is_indexed_through_its_9660_tree() {
-        // Both descriptor sets present: the 9660 answer is the one taken,
-        // which is what `docs/design/translated-sources.md` §2.2 says a bridge
-        // disc should cost.
+        // Both descriptor sets are present, and the 9660 answer is the one
+        // taken. That is what `docs/design/translated-sources.md` §2.2 says
+        // a bridge disc should cost.
         let image = MemoryImage::new(udf_fx::bridge_image());
         let idx = index(&image).await.expect("indexed");
         assert!(matches!(idx.format, ImageFormat::Iso9660 { .. }));
@@ -473,9 +473,9 @@ mod tests {
     #[tokio::test]
     async fn indexing_never_reads_the_file_data() {
         // The one assertion this whole module exists for: the bytes of the
-        // file are never among the bytes read. Counted by range, not by
-        // total, so a parser that read the film in small pieces would still
-        // fail this.
+        // file are never among the bytes read. It is counted by range, not
+        // by total, so a parser that read the film in small pieces would
+        // still fail this.
         let bytes = iso::minimal_iso();
         let data_range = iso::data_range(&bytes);
         let image = CountingImage::new(bytes);
@@ -554,13 +554,13 @@ mod tests {
     }
 
     /// A real image, written by a real tool, indexed through both of its
-    /// trees -- and the extents checked against the bytes they claim to
+    /// trees, with the extents checked against the bytes they claim to
     /// be. A fixture built in the test proves the parser matches this
-    /// reading of the standard; only a tool's image proves it matches
+    /// reading of the standard. Only a tool's image proves it matches
     /// what tools write.
     ///
-    /// Skipped, loudly, when no tool is installed: this must not be the
-    /// test that fails on a machine that never had `genisoimage`.
+    /// It is skipped, loudly, when no tool is installed. This must not be
+    /// the test that fails on a machine that never had `genisoimage`.
     #[tokio::test]
     async fn a_real_bridge_image_indexes_identically_through_9660_and_udf() {
         let Some(tool) = image_writer() else {
@@ -607,8 +607,8 @@ mod tests {
         let udf_index = udf::index(&image).await.expect("indexed as UDF");
 
         // The same files, at the same ranges of the same image, through
-        // two completely separate parsers: the strongest check there is
-        // that neither is reading the standard wrong.
+        // two completely separate parsers. That is the strongest check
+        // there is that neither is reading the standard wrong.
         let mut iso_files = iso_index.files.clone();
         let mut udf_files = udf_index.files.clone();
         iso_files.sort_by(|a, b| a.path.cmp(&b.path));

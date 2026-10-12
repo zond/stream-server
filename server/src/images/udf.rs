@@ -2,7 +2,7 @@
 //! Blu-ray.
 //!
 //! A DVD-Video image is a bridge disc and can be read through its ISO 9660
-//! tree; a Blu-ray image has **no ISO 9660 tree at all** and is UDF 2.50
+//! tree. A Blu-ray image has **no ISO 9660 tree at all** and is UDF 2.50
 //! only, so without this there is no BD image support of any kind.
 //!
 //! The walk, each step reading one or two sectors:
@@ -23,26 +23,26 @@
 //!    descriptors are its extents.
 //!
 //! Every descriptor carries a tag with a checksum over the tag itself and a
-//! CRC over the descriptor's body. Both are checked: they are small, they
+//! CRC over the descriptor's body. Both are checked. They are small, they
 //! are the format's own, and they are exactly the "header checksum" case
 //! `docs/design/translated-sources.md` §2.2, rule 4, keeps.
 //!
 //! What is refused rather than guessed at, each naming itself:
 //!
 //! * **Virtual, sparable and metadata partition maps** (type 2). A metadata
-//!   partition -- which UDF 2.50, and therefore some Blu-ray images, uses
-//!   -- remaps logical blocks through a metadata file, so every extent this
-//!   parser computed would be the wrong range of the image. That is the one
-//!   thing worse than refusing.
+//!   partition (which UDF 2.50, and therefore some Blu-ray images, uses)
+//!   remaps logical blocks through a metadata file. Every extent this
+//!   parser computed would then be the wrong range of the image. That is
+//!   the one thing worse than refusing.
 //! * **Extended allocation descriptors**, **ICB strategies other than 4**,
 //!   and **indirect entries**.
-//! * **Unrecorded (sparse) extents**: a hole reads as zeros, which are not
+//! * **Unrecorded (sparse) extents**. A hole reads as zeros, which are not
 //!   bytes of the image and cannot be a range of it.
 //! * A **file set descriptor sequence that continues** into another extent.
 //!
-//! Short, long and inline (embedded) allocation descriptors are supported;
-//! inline data is a real byte range of the image -- the bytes sit inside the
-//! file entry -- so it is an extent like any other.
+//! Short, long and inline (embedded) allocation descriptors are supported.
+//! Inline data is a real byte range of the image (the bytes sit inside the
+//! file entry), so it is an extent like any other.
 
 use super::{
     Budget, Extent, ImageFile, ImageFormat, ImageIndex, ImageReader, Refusal, SECTOR,
@@ -72,7 +72,7 @@ const FILE_TYPE_DIRECTORY: u8 = 4;
 const FILE_TYPE_REGULAR: u8 = 5;
 
 /// The only ICB strategy this reads. Strategy 4 is one direct entry, which
-/// is what every UDF writer produces; 4096 is a chained pair and would need
+/// is what every UDF writer produces. 4096 is a chained pair and would need
 /// following, and the others are not written at all.
 const ICB_STRATEGY_DIRECT: u16 = 4;
 
@@ -138,7 +138,7 @@ impl LongAd {
         })
     }
 
-    /// The low 30 bits are the byte length; the top two are the extent's
+    /// The low 30 bits are the byte length. The top two are the extent's
     /// kind (see [`ExtentKind`]).
     fn bytes(&self) -> u64 {
         (self.len & 0x3fff_ffff) as u64
@@ -155,7 +155,7 @@ enum ExtentKind {
     /// Recorded and allocated: real bytes of the image.
     Recorded,
     /// Allocated but not recorded, or neither: a hole that reads as zeros.
-    /// Not a range of the image, so a file holding one is refused.
+    /// It is not a range of the image, so a file holding one is refused.
     Unrecorded,
     /// The extent holds the *next* run of allocation descriptors, not data.
     Continuation,
@@ -197,7 +197,7 @@ impl<'a> Volume<'a> {
             let sector = vds.1 as u64 + i;
             let d = budget.read_sector(sector).await?;
             let Some(ident) = check_tag(&d, &budget)? else {
-                // A zeroed sector ends the sequence; a sequence whose
+                // A zeroed sector ends the sequence. A sequence whose
                 // stated length runs past what was written is ordinary.
                 break;
             };
@@ -367,7 +367,7 @@ impl<'a> Volume<'a> {
         }
 
         let extents = match flags & 0x07 {
-            // Short allocation descriptors: block numbers in this file
+            // Short allocation descriptors give block numbers in this file
             // entry's own partition.
             0 => {
                 self.allocation_descriptors(&d[ad_at..ad_end], 8, icb.partition)
@@ -380,7 +380,7 @@ impl<'a> Volume<'a> {
             2 => {
                 return Err(self.budget.unsupported("extended allocation descriptors"));
             }
-            // Inline: the file's bytes are in the file entry itself, which
+            // Inline. The file's bytes are in the file entry itself, which
             // is a real range of the image and needs no descriptor at all.
             3 => vec![Extent {
                 offset: offset + ad_at as u64,
@@ -493,9 +493,9 @@ impl<'a> Volume<'a> {
     /// Walk a directory's file identifier descriptors, recursing into
     /// subdirectories and collecting regular files.
     ///
-    /// Boxed for the same reason the ISO 9660 walk is: an `async fn` cannot
-    /// name its own future. `path_icbs` is the chain of ICBs from the root,
-    /// which is what makes a directory pointing at its own ancestor a
+    /// It is boxed for the same reason the ISO 9660 walk is: an `async fn`
+    /// cannot name its own future. `path_icbs` is the chain of ICBs from the
+    /// root. It is what makes a directory pointing at its own ancestor a
     /// refusal instead of a loop.
     fn walk<'b>(
         &'b mut self,
@@ -538,10 +538,10 @@ impl<'a> Volume<'a> {
                 let total = 38 + len_iu + len_fi;
                 let padded = total.next_multiple_of(4);
                 // The tag is checked against this descriptor's own bytes and
-                // no more: a CRC length is sixteen bits, and one that ran on
-                // into the directory's later identifiers would CRC up to 64
-                // KiB for every 40 bytes stepped -- quadratic in the size of
-                // a directory somebody else wrote.
+                // no more. A CRC length is sixteen bits. One that ran on into
+                // the directory's later identifiers would CRC up to 64 KiB
+                // for every 40 bytes stepped. That is quadratic in the size
+                // of a directory somebody else wrote.
                 match check_tag(&fid[..padded.min(fid.len())], &self.budget)? {
                     Some(TAG_FILE_IDENTIFIER) => {}
                     // An all-zero tag is unwritten space at the end of the
@@ -592,9 +592,9 @@ impl<'a> Volume<'a> {
 
                 let child = self.file_entry(child_icb).await?;
                 // Anything that is not a directory and not a regular file
-                // -- a symbolic link, a device node, a named stream
-                // directory -- is not a file whose bytes a player can be
-                // handed, and is left out the way a directory is.
+                // (a symbolic link, a device node, a named stream
+                // directory) is not a file whose bytes a player can be
+                // handed. It is left out the way a directory is.
                 if child.file_type != FILE_TYPE_REGULAR {
                     continue;
                 }
@@ -628,8 +628,8 @@ impl<'a> Volume<'a> {
         })
     }
 
-    /// A directory's own bytes, which are the only file-entry data this
-    /// parser ever reads -- and they are an index, not content.
+    /// A directory's own bytes. They are the only file-entry data this
+    /// parser ever reads, and they are an index, not content.
     async fn read_extents(&mut self, entry: &FileEntry) -> Result<Vec<u8>, Refusal> {
         let mut out = Vec::new();
         let mut left = entry.info_len;
@@ -679,7 +679,7 @@ fn parse_logical_volume(d: &[u8], budget: &Budget<'_>) -> Result<LogicalVolume, 
         )));
     }
     // The domain identifier's suffix carries the UDF revision as a
-    // little-endian BCD-ish u16: 0x0250 is UDF 2.50, the Blu-ray one.
+    // little-endian BCD-ish u16. 0x0250 is UDF 2.50, the Blu-ray one.
     let domain = &d[216..248];
     let revision = if domain[1..20] == *b"*OSTA UDF Compliant" {
         le_u16(domain, 24)
@@ -706,7 +706,7 @@ fn parse_logical_volume(d: &[u8], budget: &Budget<'_>) -> Result<LogicalVolume, 
                 map_to_partition.push(number);
             }
             2 => {
-                // The identifier says which kind: every one of them remaps
+                // The identifier says which kind. Every one of them remaps
                 // blocks through another structure, so an extent computed
                 // without it would be the wrong bytes of the image.
                 let name = d
@@ -740,7 +740,7 @@ fn parse_logical_volume(d: &[u8], budget: &Budget<'_>) -> Result<LogicalVolume, 
 /// as `(length in bytes, first sector)`.
 ///
 /// The standard puts an anchor at sector 256, at the last sector, and at
-/// 256 before the last; an image cut from a disc may have any of the three.
+/// 256 before the last. An image cut from a disc may have any of the three.
 async fn find_anchor(budget: &mut Budget<'_>) -> Result<(u32, u32), Refusal> {
     let sectors = budget.image_len() / SECTOR;
     let mut candidates = vec![ANCHOR_SECTOR];
@@ -761,7 +761,7 @@ async fn find_anchor(budget: &mut Budget<'_>) -> Result<(u32, u32), Refusal> {
         let len = le_u32(&d, 16).expect("a sector is 2048 bytes");
         let location = le_u32(&d, 20).expect("a sector is 2048 bytes");
         if len == 0 {
-            // The main sequence is empty; the reserve sequence is at 24.
+            // The main sequence is empty. The reserve sequence is at 24.
             let len = le_u32(&d, 24).expect("a sector is 2048 bytes");
             let location = le_u32(&d, 28).expect("a sector is 2048 bytes");
             if len == 0 {
@@ -780,8 +780,8 @@ async fn find_anchor(budget: &mut Budget<'_>) -> Result<(u32, u32), Refusal> {
 ///
 /// `None` means the tag is all zeros, which is an unwritten sector and ends
 /// a sequence rather than failing it. A tag whose checksum or CRC is wrong
-/// is a refusal: those are the format's own two-hundred-byte integrity
-/// checks, they cost nothing, and a descriptor that fails one is a
+/// is a refusal. Those are the format's own two-hundred-byte integrity
+/// checks, and they cost nothing. A descriptor that fails one is a
 /// descriptor whose offsets must not be believed.
 fn check_tag(d: &[u8], budget: &Budget<'_>) -> Result<Option<u16>, Refusal> {
     let Some(tag) = d.get(..16) else {
@@ -829,9 +829,9 @@ pub(crate) fn crc_itu_t(bytes: &[u8]) -> u16 {
     crc
 }
 
-/// OSTA CS0: a name whose first byte says how the rest is encoded -- 8 for
-/// one byte per character (Latin-1), 16 for UCS-2 big-endian. An empty name
-/// is the parent entry's and is not decoded here.
+/// OSTA CS0: a name whose first byte says how the rest is encoded. It is 8
+/// for one byte per character (Latin-1), and 16 for UCS-2 big-endian. An
+/// empty name is the parent entry's and is not decoded here.
 fn cs0_name(raw: &[u8]) -> Option<String> {
     match raw.split_first() {
         None => Some(String::new()),
@@ -902,7 +902,7 @@ mod tests {
 
     #[tokio::test]
     async fn long_allocation_descriptors_are_read() {
-        // Asserted as the exact extent: a parser reading these with the
+        // Asserted as the exact extent. A parser reading these with the
         // short descriptor's eight-byte stride still finds *an* extent,
         // just the wrong one.
         let image = MemoryImage::new(fx::udf_with_long_ads());
@@ -919,8 +919,8 @@ mod tests {
     #[tokio::test]
     async fn a_long_allocation_descriptor_names_its_own_partition() {
         // The partition reference is the one field a short descriptor
-        // does not have, and the only way to tell the two strides apart:
-        // the first eight bytes of a long descriptor are a short one.
+        // does not have. It is the only way to tell the two strides apart,
+        // since the first eight bytes of a long descriptor are a short one.
         let image = MemoryImage::new(fx::udf_with_a_long_ad_in_another_partition());
         let err = index(&image).await.expect_err("refused");
         assert!(
@@ -965,8 +965,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_last_extent_is_trimmed_to_the_stated_length() {
-        // The allocation descriptor is a whole block; the file entry says
-        // the file is shorter. Serving the block's tail would append
+        // The allocation descriptor is a whole block, and the file entry
+        // says the file is shorter. Serving the block's tail would append
         // padding to the film.
         let image = MemoryImage::new(fx::udf_with_padded_last_extent());
         let idx = index(&image).await.expect("indexed");
@@ -1056,8 +1056,8 @@ mod tests {
             image.reads()
         );
         // Anchor, four volume descriptors, the file set descriptor, two
-        // file entries and one directory block: nine sectors' worth, and
-        // the anchor search may read two more.
+        // file entries and one directory block. That is nine sectors'
+        // worth, and the anchor search may read two more.
         assert!(
             image.total() <= 16 * SECTOR,
             "read {} bytes to index a one-file image",
