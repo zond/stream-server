@@ -10,10 +10,10 @@ pub trait FileStreamTrait: AsyncRead + AsyncSeek + Unpin + Send + Sync {}
 impl<T: AsyncRead + AsyncSeek + Unpin + Send + Sync> FileStreamTrait for T {}
 
 /// What [`TorrentHandle::prefetch`] answers: a stream nobody plays from.
-/// Its lookahead is asked of the swarm from wherever it is positioned for
-/// as long as it is held; a seek moves the ask, and a read is how its
-/// holder learns a piece has arrived -- it parks until the piece under the
-/// position is here.
+/// Its lookahead is asked of the swarm from wherever it is positioned, for
+/// as long as it is held. A seek moves the ask. A read is how its holder
+/// learns a piece has arrived: it parks until the piece under the position
+/// is here.
 pub type Prefetch = Box<dyn FileStreamTrait>;
 
 #[derive(Debug, Clone)]
@@ -24,12 +24,12 @@ pub enum TorrentSource {
 
 /// What a torrent wants when it is added. The default is everything.
 ///
-/// It named a directory too, until pinning stopped being a place: an
-/// offline download was written to `<downloadsDir>/<info hash>` -- a
-/// settings key since removed in favour of one torrent-data root -- and a
+/// It named a directory too, until pinning stopped being a place. An
+/// offline download was written to `<downloadsDir>/<info hash>` (a
+/// settings key since removed in favour of one torrent-data root), and a
 /// torrent already managed elsewhere was moved there. Nothing chooses a
-/// directory any more -- the piece store is the session's default storage
-/// and takes one root of its own, so where a backend says a torrent's
+/// directory any more. The piece store is the session's default storage
+/// and takes one root of its own. So where a backend says a torrent's
 /// files are decides nothing about where its bytes go, and a pin is a
 /// retention flag rather than a location.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -38,30 +38,30 @@ pub struct TorrentPlacement {
     pub only_files: Option<Vec<usize>>,
     /// The initial want-set for a caller that knows *which file* it means
     /// but not its index, because the index is an index into a file list
-    /// this very add is what produces. Used only when `only_files` is
-    /// `None` -- a caller that can name indices has already answered the
+    /// this very add is what produces. It is used only when `only_files` is
+    /// `None`. A caller that can name indices has already answered the
     /// question.
     ///
-    /// Resolved and applied by the backend as part of the add, before the
-    /// handle reaches anyone: a create that names its file leaves the
+    /// The backend resolves and applies it as part of the add, before the
+    /// handle reaches anyone. So a create that names its file leaves the
     /// torrent wanting that file, not the whole season pack, for the whole
     /// stretch between `/create` and the first stream request. It is never
-    /// allowed to end in an empty want-set -- a choice that resolves to
+    /// allowed to end in an empty want-set. A choice that resolves to
     /// nothing leaves the torrent wanting everything, because an empty
     /// `only_files` makes librqbit's `is_finished()` true and parks the
     /// torrent on the NotInterested path, which is the opposite of the
     /// point.
     ///
     /// **This moves the progress denominator.** The backend's
-    /// `wanted_on_disk` sums the *selected* files, so narrowing here makes
-    /// a `stats.json` poller between create and stream read the chosen
-    /// file's completeness instead of the whole torrent's --
+    /// `wanted_on_disk` sums the *selected* files. So narrowing here makes a
+    /// `stats.json` poller between create and stream read the chosen file's
+    /// completeness instead of the whole torrent's: in
     /// [`EngineStats::is_finished`] and the torrent-level half of
-    /// [`StartupPhase`]. That
-    /// is the answer it is asking for: it polls to find out whether the
-    /// stream it is about to open can play. It is also the same answer it
-    /// would get a moment later, since the stream request narrows to that
-    /// file anyway; all this changes is when it becomes true.
+    /// [`StartupPhase`]. That is the answer it is asking for, because it
+    /// polls to find out whether the stream it is about to open can play. It
+    /// is also the same answer it would get a moment later, since the stream
+    /// request narrows to that file anyway. All this changes is when it
+    /// becomes true.
     pub choose: Option<crate::engine::FileChoice>,
 }
 
@@ -76,8 +76,8 @@ pub trait TorrentBackend: Send + Sync {
     ) -> Result<Self::Handle>;
 
     /// [`Self::add_torrent`] with an explicit [`TorrentPlacement`]. The
-    /// default ignores it -- the only possible answer for a backend with no
-    /// per-file selection -- so a caller learns what it got from the
+    /// default ignores it, which is the only possible answer for a backend
+    /// with no per-file selection. A caller learns what it got from the
     /// handle's own file list rather than by assuming.
     async fn add_torrent_placed(
         &self,
@@ -92,8 +92,8 @@ pub trait TorrentBackend: Send + Sync {
     /// Stop managing the torrent, keeping whatever it wrote on disk.
     async fn remove_torrent(&self, info_hash: &str) -> Result<()>;
     /// [`Self::remove_torrent`] that also deletes the torrent's files and
-    /// its (then empty) per-torrent folder -- for a torrent whose data is
-    /// known to be worthless, like one added only for a pin that was then
+    /// its (then empty) per-torrent folder. It is for a torrent whose data
+    /// is known to be worthless, like one added only for a pin that was then
     /// refused. The default keeps the files, as for a backend that cannot
     /// tell them apart from other data.
     async fn remove_torrent_and_files(&self, info_hash: &str) -> Result<()> {
@@ -106,18 +106,18 @@ pub trait TorrentBackend: Send + Sync {
         DhtStatus::default()
     }
     /// Upload to peers, or stop: every torrent at once, and nothing else
-    /// about them changed -- they stay connected and go on downloading.
-    /// Re-asserted on every reconciler tick
+    /// about them changed. They stay connected and go on downloading. This
+    /// is re-asserted on every reconciler tick
     /// (`BackendEngineFS::apply_upload_switch`), so saying what is already
     /// in force must be cheap. The default does nothing, for a backend with
     /// no peers to upload to.
     fn set_upload_enabled(&self, _enabled: bool) {}
 
-    /// Shrink to, or grow back from, a [`Footprint`]: applied to every
+    /// Shrink to, or grow back from, a [`Footprint`]. It applies to every
     /// torrent the backend has and to every one it adds afterwards, until
-    /// the next call. Idempotent, cheap, and fine before any torrent
+    /// the next call. It is idempotent, cheap, and fine before any torrent
     /// exists. What each footprint costs and keeps is documented on the
-    /// enum; the default is a no-op for a backend with nothing to shed.
+    /// enum. The default is a no-op for a backend with nothing to shed.
     fn set_footprint(&self, _footprint: Footprint) {}
 
     /// The footprint in force (see [`Self::set_footprint`]).
@@ -126,31 +126,32 @@ pub trait TorrentBackend: Send + Sync {
     }
     /// Whether adds here set piece reclaim, which the backend can only do on
     /// a storage that can release a single piece. When it does, a torrent
-    /// the backend *restores* at startup comes back paused whatever it was
-    /// doing at shutdown -- its per-session want-set did not survive, so
-    /// librqbit forces it paused until the caller re-applies the want-set --
-    /// and the engine layer starts it again once the want-set is back
+    /// the backend *restores* at startup comes back paused, whatever it was
+    /// doing at shutdown. Its per-session want-set did not survive, so
+    /// librqbit forces it paused until the caller re-applies the want-set.
+    /// The engine layer starts it again once the want-set is back
     /// (`BackendEngineFS::apply_pins`, which is what marks
-    /// each restored engine settled -- see
+    /// each restored engine settled; see
     /// [`crate::reconcile::Conditions::settled`]).
     ///
-    /// The shipped session answers **true**: its default storage is the
+    /// The shipped session answers **true**. Its default storage is the
     /// piece store, one file per piece, and releasing a piece is deleting
     /// its file. So every torrent comes back paused on every restart, and
     /// nothing but the reconciler starts one. The default here is `false`,
-    /// for a backend whose storage keeps whole files: it cannot reclaim, and
-    /// its restored torrents keep whatever paused state they had.
+    /// for a backend whose storage keeps whole files. Such a backend cannot
+    /// reclaim, and its restored torrents keep whatever paused state they
+    /// had.
     fn sets_piece_reclaim(&self) -> bool {
         false
     }
 
     /// The registry the backend's piece stores report to, for whoever
-    /// decides retention: the held set of a running torrent is read there,
+    /// decides retention. The held set of a running torrent is read there,
     /// and every unlink of a registered torrent's piece goes through it.
-    /// `None` for a backend whose storage keeps no such registry -- the
-    /// filesystem storage, the tests' fakes -- and the engine layer then
-    /// keeps an empty one of its own over the download root, so a hash it
-    /// asks about answers "no store" rather than a listing.
+    /// It is `None` for a backend whose storage keeps no such registry (the
+    /// filesystem storage, the tests' fakes). The engine layer then keeps an
+    /// empty one of its own over the download root, so a hash it asks about
+    /// answers "no store" rather than a listing.
     fn store_registry(&self) -> Option<std::sync::Arc<crate::piece_store::StoreRegistry>> {
         None
     }
@@ -160,28 +161,28 @@ pub trait TorrentBackend: Send + Sync {
 /// and bytes sent to them, as the backend itself counts them.
 ///
 /// `fetched`, not "downloaded", on purpose. [`EngineStats::downloaded`] is
-/// have-bytes -- what the torrent holds verified, which librqbit mirrors
-/// from the hash check's progress while a torrent initializes -- so it grows
+/// have-bytes: what the torrent holds verified, which librqbit mirrors from
+/// the hash check's progress while a torrent initializes. So it grows
 /// through the initial check of every restored torrent at every startup,
 /// with no network in sight. That is exactly the reading the activity light
 /// must not take, and giving the two counters two names keeps one from
-/// standing in for the other. `fetched` is the peer-received counter and
+/// standing in for the other. `fetched` is the peer-received counter, and
 /// nothing else feeds it.
 ///
-/// Both are the live state's counters: they start at zero when a torrent
-/// goes live and are gone when it leaves that state (paused, errored,
+/// Both are the live state's counters. They start at zero when a torrent
+/// goes live, and are gone when it leaves that state (paused, errored,
 /// removed). A sum over torrents can therefore drop, which reads as "not
-/// grown" to anyone comparing readings -- the right answer, since a torrent
-/// that stopped is not using the connection.
+/// grown" to anyone comparing readings. That is the right answer, since a
+/// torrent that stopped is not using the connection.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TransferTotals {
     /// Bytes received from peers.
     pub fetched: u64,
-    /// Bytes received from peers that went on to verify and be kept --
-    /// librqbit's `downloaded_and_checked_bytes`.
+    /// Bytes received from peers that went on to verify and be kept
+    /// (librqbit's `downloaded_and_checked_bytes`).
     ///
     /// **The difference from [`Self::fetched`] is unverified**, and it is
-    /// the number that made the retention bug visible: a phone that
+    /// the number that made the retention bug visible. A phone that
     /// fetched 1.6 GB to play a hundred megabytes had fetched pieces the
     /// next retention pass deleted, or pieces a peer beat us to, and
     /// nothing downstream could see either.
@@ -189,14 +190,14 @@ pub struct TransferTotals {
     /// **Unverified, not "wasted": the subtraction cannot tell which.**
     /// It is every byte a peer sent that no piece hash has vouched for
     /// yet, and three different things sit in it. Chunks of a piece still
-    /// in flight are in it and leave it the moment that piece completes
+    /// in flight are in it, and leave it the moment that piece completes
     /// and checks. So is the deliberate second copy of a chunk, asked of
-    /// a fast peer to get a piece out from under a stalled one -- bytes
-    /// spent on purpose to rescue a read. And so is what really was
+    /// a fast peer to get a piece out from under a stalled one. Those bytes
+    /// are spent on purpose to rescue a read. And so is what really was
     /// thrown away: a piece deleted before it could complete, or one a
     /// peer beat us to. Nothing here separates the three, so read it as a
-    /// level and not as a verdict on anybody: a few per cent of what was
-    /// played is the ordinary cost of duplication in flight; a multiple
+    /// level and not as a verdict on anybody. A few per cent of what was
+    /// played is the ordinary cost of duplication in flight. A multiple
     /// of it is a session whose window is fighting its own fetches.
     pub verified: u64,
     /// Bytes sent to peers.
@@ -214,40 +215,39 @@ impl TransferTotals {
     }
 
     /// Bytes fetched that no piece hash has vouched for: `fetched` less
-    /// [`Self::verified`], which is in-flight chunks and deliberate
-    /// duplication as much as it is anything thrown away -- see
+    /// [`Self::verified`]. That is in-flight chunks and deliberate
+    /// duplication as much as it is anything thrown away. See
     /// [`Self::verified`] for what is in it and how to read it.
     ///
-    /// Saturating, and defensively: `verified` counts only pieces
-    /// completed off peers in this session -- a torrent restored from disk
-    /// seeds its `have` bytes and not this counter, and a partial piece it
-    /// restored is fetched whole again -- so within a live torrent
-    /// `verified <= fetched` always and the subtraction cannot go
-    /// negative. The saturation is for a fork rev that seeds the counter
-    /// from disk, which the pinned one does not.
+    /// It saturates, defensively. `verified` counts only pieces completed
+    /// off peers in this session. A torrent restored from disk seeds its
+    /// `have` bytes and not this counter, and a partial piece it restored is
+    /// fetched whole again. So within a live torrent `verified <= fetched`
+    /// always, and the subtraction cannot go negative. The saturation is for
+    /// a fork rev that seeds the counter from disk, which the pinned one
+    /// does not.
     pub fn unverified(self) -> u64 {
         self.fetched.saturating_sub(self.verified)
     }
 }
 
 /// What the backend does with the pieces once the claim on them is
-/// released -- the one thing that differs between the two callers of
+/// released. This is the one thing that differs between the two callers of
 /// [`TorrentHandle::drop_pieces`].
 ///
 /// The drop itself is the same either way: not have, not wanted, not
-/// advertised. What is not the same is what the caller wanted the space
-/// for.
+/// advertised. What differs is what the caller wanted the space for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AfterRelease {
-    /// Want the range again. For the per-file delete: a file that shares
-    /// its first or last piece with a neighbour still pinned takes that
-    /// piece down with it, and the neighbour would be left a piece short
-    /// with no way to fetch it. Re-selecting queues the pieces of files
-    /// that are still selected and leaves the deleted file's own as plain
-    /// missing pieces.
+    /// Want the range again. This is for the per-file delete. A file that
+    /// shares its first or last piece with a neighbour still pinned takes
+    /// that piece down with it, and the neighbour would be left a piece
+    /// short with no way to fetch it. Re-selecting queues the pieces of
+    /// files that are still selected, and leaves the deleted file's own as
+    /// plain missing pieces.
     Reselect,
-    /// Leave the range dropped. For a reclaim: the caller asked for the
-    /// bytes back, and a piece re-wanted the moment it is deleted is a
+    /// Leave the range dropped. This is for a reclaim. The caller asked for
+    /// the bytes back, and a piece re-wanted the moment it is deleted is a
     /// download that undoes the reclaim within the second. A reader that
     /// seeks back into the range gets it again through the stream's own
     /// lookahead.
@@ -262,8 +262,8 @@ pub enum AfterRelease {
 /// gone. Dropping is not tidiness: it is what tells the backend the release
 /// is over. Until then the pieces are neither had nor wanted, so a stream's
 /// lookahead cannot download one of them back into the range that is being
-/// deleted under it; afterwards the backend does what
-/// [`AfterRelease`] asked for.
+/// deleted under it. Afterwards the backend does what [`AfterRelease`]
+/// asked for.
 #[must_use = "the pieces stay claimed until this is dropped: delete their bytes first"]
 pub struct DroppedFilePieces {
     pieces: Vec<u32>,
@@ -271,10 +271,10 @@ pub struct DroppedFilePieces {
     /// this trait cannot name librqbit's `DroppedPieces` without making
     /// every backend depend on librqbit.
     _claim: Box<dyn std::any::Any + Send>,
-    /// A test backend's witness of what leaves the disk under this claim:
-    /// handed the pieces the unlink really took, on the task that awaited
-    /// it ([`crate::retention::unlink`]), so a fake that knows what it
-    /// announced can fail the test that deleted one of those pieces while
+    /// A test backend's witness of what leaves the disk under this claim.
+    /// It is handed the pieces the unlink really took, on the task that
+    /// awaited it ([`crate::retention::unlink`]). So a fake that knows what
+    /// it announced can fail the test that deleted one of those pieces while
     /// it was in the swarm.
     #[cfg(test)]
     unlinked: Option<UnlinkWitness>,
@@ -285,7 +285,7 @@ pub struct DroppedFilePieces {
 pub(crate) type UnlinkWitness = Box<dyn FnOnce(&[u32]) + Send>;
 
 impl DroppedFilePieces {
-    /// `pieces` are the indices actually dropped; `claim` is whatever the
+    /// `pieces` are the indices actually dropped. `claim` is whatever the
     /// backend needs dropped at the end of the release.
     pub fn new(pieces: Vec<u32>, claim: impl std::any::Any + Send) -> Self {
         Self {
@@ -330,25 +330,26 @@ pub struct RetryOutlook {
     pub starving: bool,
     /// Peers marked dead, waiting out a retry.
     pub dead: u32,
-    /// Of those, the ones that have delivered a verified piece -- the
+    /// Of those, the ones that have delivered a verified piece: the
     /// addresses known to be sources.
     pub proven_dead: u32,
-    /// How long until the soonest of those retries; `None` with none waiting.
+    /// How long until the soonest of those retries. `None` with none waiting.
     pub next_retry: Option<std::time::Duration>,
 }
 
 /// What a torrent is actually doing, read from the backend's own state
 /// machine rather than from its persisted "paused" flag.
 ///
-/// The two are not the same thing, and the difference is not academic:
+/// The two are not the same thing, and the difference is not academic.
 /// librqbit keeps a `paused` bool on the torrent *and* a
 /// `ManagedTorrentState` enum, writes them at different moments, and lets
 /// them disagree in **both** directions across a torrent's initial check
-/// (see [`TorrentHandle::run_state`] for the two sequences). A caller that asks "is it paused?" therefore gets an answer that
-/// can be wrong either way; a caller that asks "what is it doing?" gets the
-/// state the torrent will actually behave as.
+/// (see [`TorrentHandle::run_state`] for the two sequences). A caller that
+/// asks "is it paused?" therefore gets an answer that can be wrong either
+/// way. A caller that asks "what is it doing?" gets the state the torrent
+/// will actually behave as.
 ///
-/// Nothing here is a claim about *why* a torrent is stopped -- that is the
+/// Nothing here is a claim about *why* a torrent is stopped. That is the
 /// caller's policy to recompute, not the backend's to remember.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
@@ -359,16 +360,16 @@ pub enum RunState {
     /// transition the backend can make synchronously, with no re-check.
     Paused,
     /// Hash-checking, or between checks. **Not a settled state**: nothing may
-    /// be concluded from it about where the torrent will end up, because that
-    /// is decided when the check finishes, by the pause intent as it stands
+    /// be concluded from it about where the torrent will end up. That is
+    /// decided when the check finishes, by the pause intent as it stands
     /// then.
     ///
     /// `pause_requested` is the backend's persisted pause intent for a
-    /// torrent in this state -- see [`TorrentHandle::run_state`] for exactly
+    /// torrent in this state. See [`TorrentHandle::run_state`] for exactly
     /// what it can and cannot tell you.
     Initializing { pause_requested: bool },
-    /// Stopped by an error. Whose error, and whether it is worth clearing, is
-    /// [`TorrentHandle::is_out_of_space`]'s question.
+    /// Stopped by an error. Whose error it is, and whether it is worth
+    /// clearing, is [`TorrentHandle::is_out_of_space`]'s question.
     Error,
     /// The backend holds no state for this torrent at all, so it is neither
     /// running nor restartable.
@@ -376,8 +377,8 @@ pub enum RunState {
 }
 
 /// One holder of a claim on a piece a read is waiting on, as the blocked
-/// read's diagnostic prints it: the two halves of the backend's takeover
-/// rule (rqbit's `CLAIMS.md`) beside what is left to fetch.
+/// read's diagnostic prints it. It shows the two halves of the backend's
+/// takeover rule (rqbit's `CLAIMS.md`) beside what is left to fetch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimLine {
     /// The peer, as an address.
@@ -389,7 +390,7 @@ pub struct ClaimLine {
     /// How long we have waited on its last delivery of this piece, or
     /// since it was asked if it has delivered nothing.
     pub waited_ms: u64,
-    /// How long its own last chunk took, request to arrival; `None` for a
+    /// How long its own last chunk took, request to arrival. `None` for a
     /// peer that has never delivered.
     pub latency_ms: Option<u64>,
 }
@@ -424,44 +425,44 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     async fn stats(&self) -> EngineStats;
     /// The torrent's [`TransferTotals`], and nothing else: no file list, no
     /// tracker snapshot, no scrape scheduled, no lifecycle bookkeeping.
-    /// Unlike `stats()` this is polled every second or two by the activity
-    /// light for every torrent that exists, so it has to be a handful of
-    /// atomic loads under the state lock and must never reach the network.
+    /// Unlike `stats()`, this is polled every second or two by the activity
+    /// light for every torrent that exists. So it has to be a handful of
+    /// atomic loads under the state lock, and must never reach the network.
     ///
     /// **`None` is "this backend cannot say", and it is not zero.** A
-    /// backend that keeps these counters in its running state -- librqbit
-    /// does -- has nothing to read for a torrent that is paused, still
-    /// checking, stopped for space or in error, and a torrent that has
-    /// moved gigabytes and then paused has not moved nothing. A caller
-    /// taking a *difference* may read the absence as `default()` (see
+    /// backend that keeps these counters in its running state (librqbit
+    /// does) has nothing to read for a torrent that is paused, still
+    /// checking, stopped for space or in error. A torrent that has moved
+    /// gigabytes and then paused has not moved nothing. A caller taking a
+    /// *difference* may read the absence as `default()` (see
     /// [`crate::traffic`], where a torrent that stops takes its bytes out
-    /// of the sum and the sum reads as "not grown"); a caller reporting the
+    /// of the sum and the sum reads as "not grown"). A caller reporting the
     /// totals themselves must pass the absence on.
     fn transfer_totals(&self) -> Option<TransferTotals>;
     /// Cheap check for whether every file the torrent wants is whole on the
-    /// disk -- [`EngineStats::is_finished`] without the rest of the
+    /// disk: [`EngineStats::is_finished`] without the rest of the
     /// statistics. Unlike `stats()`, this must not rebuild the full statistics
-    /// or walk every piece -- it is called on the hot stream-start path, and
-    /// the reconciler asks it of every torrent on every tick: a torrent that
+    /// or walk every piece. It is called on the hot stream-start path, and
+    /// the reconciler asks it of every torrent on every tick. A torrent that
     /// answers `true` writes nothing and is left running on a full volume,
     /// and a stream on it skips the disk-space gate. Defaults to `false`
     /// (treat as still needing the swarm) for backends that cannot tell.
     async fn is_finished(&self) -> bool {
         false
     }
-    /// Whether the torrent's info dictionary is known -- for a magnet, that
-    /// the metadata fetch has finished. A torrent without it has no files,
-    /// no length and nothing to write to disk; what it is doing is fetching
-    /// the dictionary from the swarm, which is why the reconciler
+    /// Whether the torrent's info dictionary is known. For a magnet, that
+    /// means the metadata fetch has finished. A torrent without it has no
+    /// files, no length and nothing to write to disk. What it is doing is
+    /// fetching the dictionary from the swarm. That is why the reconciler
     /// ([`crate::reconcile::desired`]) keeps such a torrent running whatever
     /// else is true of it.
     ///
-    /// Cheap, like [`Self::is_finished`] and [`Self::run_state`] beside it:
-    /// polled for every torrent on the reconciler's tick, so it must read
-    /// the slot the backend already holds. The default answers from
-    /// `stats()` -- correct for any backend, but `stats()` is a per-file
-    /// walk plus a copy of the piece bitfield, so a backend that can answer
-    /// from one load should override it.
+    /// It is cheap, like [`Self::is_finished`] and [`Self::run_state`]
+    /// beside it. It is polled for every torrent on the reconciler's tick,
+    /// so it must read the slot the backend already holds. The default
+    /// answers from `stats()`. That is correct for any backend, but
+    /// `stats()` is a per-file walk plus a copy of the piece bitfield, so a
+    /// backend that can answer from one load should override it.
     async fn has_metadata(&self) -> bool {
         self.stats().await.has_metadata
     }
@@ -471,122 +472,123 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     /// The flag is what `is_paused()` returns and what every "did we pause
     /// this?" question is tempted to ask. The flag and the state are two
     /// separate writes, and across a torrent's initial check they can
-    /// disagree in both directions: an unpause racing the check's own
+    /// disagree in both directions. An unpause racing the check's own
     /// continuation can leave the flag saying "running" on a torrent that
-    /// is still stopped, and a pause during a fastresume check can leave the
-    /// flag saying "paused" on a torrent that has gone live -- measured as a
-    /// 3 MiB -> 12 MiB overshoot past the free-space floor.
+    /// is still stopped. A pause during a fastresume check can leave the
+    /// flag saying "paused" on a torrent that has gone live. That was
+    /// measured as a 3 MiB -> 12 MiB overshoot past the free-space floor.
     ///
     /// The fork has the continuation read the intent under the lock as it
-    /// stands when the check finishes, which closes both; the librqbit
+    /// stands when the check finishes, which closes both. The librqbit
     /// tests `an_unpause_during_the_initial_check_starts_the_torrent` and
     /// `a_pause_during_a_fastresume_check_leaves_the_torrent_parked` guard
-    /// that fix -- a rebase that loses it fails here. This reader still
+    /// that fix, so a rebase that loses it fails there. This reader still
     /// prefers the state over the flag regardless, because two writes are
     /// two writes.
     ///
     /// There is a third shape with no flag divergence but no settled state
-    /// either: a pause during a *full* check does stop it (`FileOps::
-    /// initial_check` bails on the request), and the continuation leaves the
-    /// torrent `Initializing` with no check running and nothing but an
-    /// unpause to run it again -- `ManagedTorrent::wait_until_initialized`
-    /// refuses a waiter on exactly that pair. `Paused` and `Initializing
-    /// { .. }` are different answers here for that reason: only the first is
+    /// either. A pause during a *full* check does stop it (`FileOps::
+    /// initial_check` bails on the request). The continuation then leaves
+    /// the torrent `Initializing`, with no check running and nothing but an
+    /// unpause to run it again. `ManagedTorrent::wait_until_initialized`
+    /// refuses a waiter on exactly that pair. That is why `Paused` and
+    /// `Initializing { .. }` are different answers here: only the first is
     /// a state a caller can start again in one transition.
     ///
     /// `pause_requested` on that variant is the backend's *persisted pause
-    /// intent*, not librqbit's private `pause_requested` bool, which is
+    /// intent*, not librqbit's private `pause_requested` bool. That bool is
     /// `pub(crate)` on `TorrentStateInitializing` and cannot be read from
     /// outside the crate. For an initializing torrent the two agree wherever
     /// `ManagedTorrent::pause` set them, since it writes both under the one
-    /// write guard; they differ for a torrent *added* paused, where
+    /// write guard. They differ for a torrent *added* paused, where
     /// `start_paused` sets the flag and `_start`'s `Initializing` arm clears
-    /// the bool. Both mean the same
-    /// thing to a caller -- a pause is pending on this check -- which is why
-    /// the flag is the honest thing to report. What it does **not** tell you
-    /// is whether the check is still running.
+    /// the bool. Both mean the same thing to a caller (a pause is pending on
+    /// this check), which is why the flag is the honest thing to report.
+    /// What it does **not** tell you is whether the check is still running.
     ///
-    /// Must be cheap: it is polled on a timer for every torrent that exists,
-    /// so it is a couple of lock reads and no I/O, never a `stats()` walk.
+    /// It must be cheap. It is polled on a timer for every torrent that
+    /// exists, so it is a couple of lock reads and no I/O, never a `stats()`
+    /// walk.
     fn run_state(&self) -> RunState;
 
     /// The peers this torrent is waiting to dial again, and whether it is
-    /// short of sources -- what tells "nobody answers" from "waiting out a
-    /// retry" in a stall report (`download progress`). Walks the peer table,
-    /// so it is for a report every few seconds and not the per-second stats
-    /// poll. A backend with no such notion answers the default: nothing
-    /// waiting, not starving.
+    /// short of sources. This is what tells "nobody answers" from "waiting
+    /// out a retry" in a stall report (`download progress`). It walks the
+    /// peer table, so it is for a report every few seconds and not the
+    /// per-second stats poll. A backend with no such notion answers the
+    /// default: nothing waiting, not starving.
     fn retry_outlook(&self) -> RetryOutlook {
         RetryOutlook::default()
     }
 
     /// Whether the backend stopped this torrent because the volume it writes
-    /// to ran out of space -- the one torrent error that is a statement about
-    /// the device rather than about the torrent, and the one worth reclaiming
-    /// space for and retrying. Must be cheap: it is polled while the process
-    /// runs, so it reads the state the backend already holds and does no I/O.
-    /// `false` for backends that cannot tell one error from another.
+    /// to ran out of space. That is the one torrent error that is a
+    /// statement about the device rather than about the torrent, and the one
+    /// worth reclaiming space for and retrying. It must be cheap. It is
+    /// polled while the process runs, so it reads the state the backend
+    /// already holds and does no I/O. `false` for backends that cannot tell
+    /// one error from another.
     async fn is_out_of_space(&self) -> bool {
         false
     }
     /// Whether the backend has stopped this torrent with an error of any
-    /// kind -- its error state, where nothing is read or written until
+    /// kind. That is its error state, where nothing is read or written until
     /// something restarts it. Together with [`Self::is_out_of_space`] this
     /// tells a torrent that died of the device (worth reclaiming space for)
     /// from one that died of itself (a storage bug, an unwritable folder),
-    /// whose files nothing will ever resume into. As cheap as that one: it
-    /// reads state the backend already holds. `false` for a backend with no
-    /// such state.
+    /// whose files nothing will ever resume into. It is as cheap as that one:
+    /// it reads state the backend already holds. `false` for a backend with
+    /// no such state.
     async fn is_in_error_state(&self) -> bool {
         false
     }
     /// Put a torrent the backend stopped with an **error** back to work,
-    /// after whatever caused the error has been dealt with -- and only that
-    /// transition. Errs for a backend that cannot restart one, so a caller
-    /// never mistakes silence for recovery.
+    /// after whatever caused the error has been dealt with. It makes only
+    /// that transition. It errs for a backend that cannot restart one, so a
+    /// caller never mistakes silence for recovery.
     ///
     /// This has exactly one caller, the reconciler's ladder
-    /// (`crate::reconcile::Decision::RestartFromError`): one method reached
+    /// (`crate::reconcile::Decision::RestartFromError`). One method reached
     /// from two callers meaning different things ("the error was dealt
-    /// with" and "the space came back") cannot be made correct for both, so
-    /// the free-space case goes through [`Self::start_torrent`] instead. It
-    /// is taken only for an error a full volume caused and only once the
-    /// volume has cleared the resume line: restarting means re-running a
-    /// storage check that would fail again on a device that has not
+    /// with" and "the space came back") cannot be made correct for both. So
+    /// the free-space case goes through [`Self::start_torrent`] instead. This
+    /// one is taken only for an error a full volume caused, and only once the
+    /// volume has cleared the resume line. Restarting means re-running a
+    /// storage check, which would fail again on a device that has not
     /// actually gained anything.
     async fn restart_from_error(&self) -> Result<()> {
         anyhow::bail!("this backend cannot restart a stopped torrent")
     }
-    /// Stop the torrent -- no more reads from peers, no more writes to
-    /// disk, files and piece map kept.
+    /// Stop the torrent: no more reads from peers, no more writes to disk,
+    /// files and piece map kept.
     ///
-    /// The reconciler's stop, and it deliberately carries **no reason**:
-    /// whether a torrent should be running is recomputed from present
-    /// conditions on every pass (`crate::reconcile::desired`), so a backend
-    /// that recorded which policy asked for a pause would be keeping a note
-    /// that outlives the condition behind it -- and, in a fresh process
-    /// where the note is empty and the pause is not, reads as "nobody
-    /// paused this".
+    /// This is the reconciler's stop, and it deliberately carries **no
+    /// reason**. Whether a torrent should be running is recomputed from
+    /// present conditions on every pass (`crate::reconcile::desired`). A
+    /// backend that recorded which policy asked for a pause would be keeping
+    /// a note that outlives the condition behind it. In a fresh process,
+    /// where the note is empty and the pause is not, that note reads as
+    /// "nobody paused this".
     ///
-    /// It must actually stop the writes: the alternative is the filesystem
+    /// It must actually stop the writes. The alternative is the filesystem
     /// stopping them with ENOSPC and the backend declaring the torrent
-    /// dead. Errs for a backend that cannot, and for a torrent that is not
-    /// running -- the reconciler calls it only on a torrent its state
+    /// dead. It errs for a backend that cannot, and for a torrent that is
+    /// not running. The reconciler calls it only on a torrent its state
     /// machine reports [`RunState::Live`], never on an initializing one,
     /// which a pause wedges (see [`Self::run_state`]).
     async fn stop_torrent(&self) -> Result<()> {
         anyhow::bail!("this backend cannot stop a torrent")
     }
-    /// Start a torrent that is stopped, whoever stopped it and whenever --
+    /// Start a torrent that is stopped, whoever stopped it and whenever,
     /// the previous process included.
     ///
     /// The counterpart of [`Self::stop_torrent`] and the other half of the
-    /// reconciler's control. **Unconditional is the whole point**: a
+    /// reconciler's control. **Unconditional is the whole point.** A
     /// `resume_torrent` that lifted only the pauses the backend itself had
     /// recorded as idle ones would stay silent for a pause that survived a
-    /// restart -- exactly the pause somebody has to be able to lift. Errs
-    /// for a torrent that is not stopped, so a caller cannot mistake
-    /// "already running" for a start it made.
+    /// restart, and that is exactly the pause somebody has to be able to
+    /// lift. It errs for a torrent that is not stopped, so a caller cannot
+    /// mistake "already running" for a start it made.
     async fn start_torrent(&self) -> Result<()> {
         anyhow::bail!("this backend cannot start a stopped torrent")
     }
@@ -595,54 +597,54 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     async fn reconcile_file_priorities(&self, _plan: TorrentFilePriorityPlan) -> Result<()> {
         Ok(())
     }
-    /// Keep `file_idx` wanted regardless of playback selection: every later
+    /// Keep `file_idx` wanted regardless of playback selection. Every later
     /// `prepare_file_for_streaming` / `reconcile_file_priorities` keeps it in
-    /// the want-set until
-    /// `unpin_file`. This is the backend half of an offline download; the
-    /// engine layer (`BackendEngineFS::pin_download`) also exempts the torrent
-    /// from idle removal and has the reconciler run it. Backends that cannot
-    /// select files per file (or always want everything) may leave this as a
-    /// no-op. Err only for a provably-bad file index.
+    /// the want-set until `unpin_file`. This is the backend half of an
+    /// offline download. The engine layer (`BackendEngineFS::pin_download`)
+    /// also exempts the torrent from idle removal and has the reconciler run
+    /// it. Backends that cannot select files per file (or always want
+    /// everything) may leave this as a no-op. Err only for a provably-bad
+    /// file index.
     async fn pin_file(&self, _file_idx: usize) -> Result<()> {
         Ok(())
     }
-    /// Undo `pin_file`. Only forgets the pin: the file stays wanted until
+    /// Undo `pin_file`. It only forgets the pin. The file stays wanted until
     /// the next selection update recomputes the want-set without it, which
     /// the caller drives (`BackendEngineFS::unpin_download` reconciles).
     async fn unpin_file(&self, _file_idx: usize) -> Result<()> {
         Ok(())
     }
-    /// Where a file lies in the torrent's pieces -- what a reader's offset
-    /// has to go through to become a piece index, and what the retention
-    /// policy governs. `None` without metadata or for a bad index.
+    /// Where a file lies in the torrent's pieces. A reader's offset goes
+    /// through this to become a piece index, and the retention policy
+    /// governs what it describes. `None` without metadata or for a bad index.
     async fn file_pieces(&self, _file_idx: usize) -> Option<FilePieceSpan> {
         None
     }
 
     /// Where this torrent's files lie in its pieces and which of them it
-    /// still wants: what a caller has to know before it deletes a piece two
+    /// still wants. A caller has to know this before it deletes a piece two
     /// files share. See [`FileWants`].
     ///
-    /// `None` is a backend that keeps no file table of its own, and there is
-    /// no boundary for a caller to find without one.
+    /// `None` is a backend that keeps no file table of its own. Without one
+    /// there is no boundary for a caller to find.
     async fn file_wants(&self) -> Option<FileWants> {
         None
     }
 
     /// Forget that the torrent has `pieces`, because the caller is about to
     /// delete the bytes behind them and the backend's have-set is the other
-    /// record of them. Deleting the bytes alone leaves that record standing:
-    /// the backend goes on reporting them complete, advertising them to
-    /// peers and answering a request with a read past the end of nothing,
-    /// and a later re-pin finds nothing to download. Anything still wanting
+    /// record of them. Deleting the bytes alone leaves that record standing.
+    /// The backend goes on reporting them complete, advertising them to
+    /// peers and answering a request with a read past the end of nothing.
+    /// And a later re-pin finds nothing to download. Anything still wanting
     /// the range must already be out of the want-set, or the drop would only
     /// queue the pieces again.
     ///
-    /// Returns the claim to hold while the bytes go -- see
+    /// Returns the claim to hold while the bytes go (see
     /// [`DroppedFilePieces`], and [`AfterRelease`] for what dropping it
-    /// does. `Ok(None)` is a backend with no have-set of its own for a
+    /// does). `Ok(None)` is a backend with no have-set of its own for a
     /// deletion to disagree with. `Err` is a backend that has one and could
-    /// not drop it: it still believes it holds the pieces, so the caller
+    /// not drop it. It still believes it holds the pieces, so the caller
     /// must not take them.
     async fn drop_pieces(
         &self,
@@ -657,9 +659,9 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     /// boundary piece a still-pinned neighbour shares.
     ///
     /// A file whose pieces the backend cannot name is an `Err` and not an
-    /// `Ok(None)`: `None` means "this backend keeps no have-set", and a
-    /// backend that keeps one but could not tell us where the file is has
-    /// not agreed to forget anything.
+    /// `Ok(None)`. `None` means "this backend keeps no have-set". A backend
+    /// that keeps one but could not tell us where the file is has not
+    /// agreed to forget anything.
     async fn drop_file_pieces(&self, file_idx: usize) -> Result<Option<DroppedFilePieces>> {
         let Some(span) = self.file_pieces(file_idx).await else {
             anyhow::bail!(
@@ -669,8 +671,8 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
         self.drop_pieces(span.pieces, AfterRelease::Reselect).await
     }
 
-    /// Want `pieces` again after a [`Self::drop_pieces`] left them dropped:
-    /// the retention window has moved onto them. Pieces that were never
+    /// Want `pieces` again after a [`Self::drop_pieces`] left them dropped,
+    /// because the retention window has moved onto them. Pieces that were never
     /// dropped, and pieces of a file the user has deselected, are left as
     /// they are. Returns how many pieces stopped being dropped. `Ok(0)` for
     /// a backend with no want-set of its own to edit.
@@ -682,19 +684,19 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     /// torrent advertises (`false`).
     ///
     /// **Nothing is advertised until this says so**, from the moment a
-    /// torrent exists: the librqbit backend runs its session under the
-    /// fork's `explicit_piece_advertising`. A piece is announced -- in the
-    /// handshake bitfield, by a Have as it completes -- when it is ours and
-    /// advertised, and a request for one we did not advertise is not served.
+    /// torrent exists. The librqbit backend runs its session under the
+    /// fork's `explicit_piece_advertising`. A piece is announced (in the
+    /// handshake bitfield, by a Have as it completes) when it is ours and
+    /// advertised. A request for one we did not advertise is not served.
     /// Advertising a piece before it arrives is how a set chosen up front is
     /// shared: each piece is announced the moment it completes.
     ///
     /// **An announcement is never taken back while the torrent is in the
     /// swarm.** There is no un-Have in BitTorrent, and librqbit refuses a
     /// `false` over an announced piece of a live torrent. `false` is for a
-    /// stopped torrent only -- the end of a play session, which stops the
-    /// torrent first ([`crate::BackendEngineFS`]'s `EndShares`) -- and
-    /// nothing else calls it. Returns how many pieces changed. A backend
+    /// stopped torrent only: the end of a play session, which stops the
+    /// torrent first ([`crate::BackendEngineFS`]'s `EndShares`). Nothing
+    /// else calls it. Returns how many pieces changed. A backend
     /// with no advertised set answers `Ok(0)`.
     async fn set_pieces_advertised(
         &self,
@@ -704,29 +706,29 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
         Ok(0)
     }
 
-    /// What [`Self::set_pieces_advertised`] has left advertised, ascending,
-    /// or `None` when the backend keeps no such set -- and then there is no
-    /// announcement of ours to end. Read, never remembered: the backend's
-    /// set is the truth, and it outlives every record this crate keeps (a
-    /// restart out of an error keeps it; a torrent removed and added again
-    /// starts with none).
+    /// What [`Self::set_pieces_advertised`] has left advertised, ascending.
+    /// It is `None` when the backend keeps no such set, and then there is no
+    /// announcement of ours to end. It is read, never remembered. The
+    /// backend's set is the truth, and it outlives every record this crate
+    /// keeps (a restart out of an error keeps it, and a torrent removed and
+    /// added again starts with none).
     async fn advertised_pieces(&self) -> Option<Vec<u32>> {
         None
     }
 
     /// The first `len` bytes of `file_idx` (fewer if the file is shorter),
-    /// if every piece they lie in is held -- read off the disk, never
-    /// fetched -- or `None`: not held yet, or a backend that cannot say.
-    /// What tells an archive from a film by its content
+    /// if every piece they lie in is held. They are read off the disk, never
+    /// fetched. `None` means not held yet, or a backend that cannot say.
+    /// This is what tells an archive from a film by its content
     /// ([`crate::retention::sniff`]).
     async fn read_file_head(&self, _file_idx: usize, _len: u64) -> Option<Vec<u8>> {
         None
     }
 
     /// A test backend's check of what a torrent is about to announce as it
-    /// starts: `shares` is every piece a play session drew or a pin covers,
-    /// and a fake that keeps an advertised set fails the test whose start
-    /// would announce anything outside it -- a stale set the fork kept
+    /// starts. `shares` is every piece a play session drew or a pin covers.
+    /// A fake that keeps an advertised set fails the test whose start would
+    /// announce anything outside it, such as a stale set the fork kept
     /// across a pause or an error.
     #[cfg(test)]
     fn check_start(&self, _shares: &std::collections::BTreeSet<u32>) {}
@@ -734,9 +736,9 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     /// The file's on-disk path, as the backend names it (librqbit: the
     /// torrent's own output folder joined with the file's relative name).
     ///
-    /// **A name, not a file.** Nothing writes a whole file any more -- the
-    /// bytes are piece files in the store -- so this is what the backend
-    /// *calls* the file, reported to a client and used to sweep up a
+    /// **A name, not a file.** Nothing writes a whole file any more (the
+    /// bytes are piece files in the store). So this is what the backend
+    /// *calls* the file. It is reported to a client, and used to sweep up a
     /// whole-file copy an earlier version of this server left there.
     /// Nothing may decide anything about placement, protection or
     /// accounting from it. `None` when the backend does not know (no
@@ -745,15 +747,15 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     async fn file_path(&self, _file_idx: usize) -> Option<std::path::PathBuf> {
         None
     }
-    /// The torrent's piece length -- the unit a read blocks on, so the one
-    /// number that makes "this read waited 28 seconds" legible. `None`
-    /// until metadata resolves, or for a backend without pieces.
+    /// The torrent's piece length. It is the unit a read blocks on, so it is
+    /// the one number that makes "this read waited 28 seconds" legible.
+    /// `None` until metadata resolves, or for a backend without pieces.
     fn piece_length(&self) -> Option<u64> {
         None
     }
     /// Who holds the piece under `offset` of `file_idx`, and how each is
-    /// doing -- the diagnostic a read that has waited seconds on that piece
-    /// logs, so the log says why nobody took the claim over rather than
+    /// doing. A read that has waited seconds on that piece logs this
+    /// diagnostic, so the log says why nobody took the claim over rather than
     /// leaving it to be guessed. Empty for a backend without claims, a
     /// piece nobody holds, or a torrent that is not live.
     fn piece_claims_at(&self, _file_idx: usize, _offset: u64) -> Vec<ClaimLine> {
@@ -761,15 +763,15 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     }
     /// **How many pieces at the head of a stream's lookahead the backend
     /// splits** into claims a faster peer may join, and asks for before
-    /// anything deeper -- the depth [`crate::retention::deadline`] sizes
+    /// anything deeper. [`crate::retention::deadline`] sizes this depth
     /// from the median below and the player's stalls. A backend without
-    /// claims has nothing to set. Applied at once to a live torrent and
-    /// kept for one that is not yet.
+    /// claims has nothing to set. It is applied at once to a live torrent,
+    /// and kept for one that is not live yet.
     fn set_deadline_pieces(&self, _pieces: usize) {}
     /// **How long a piece has been taking**: the backend's median over the
     /// last pieces completed, whole and split alike, from the first claim
     /// to the last chunk. Whole pieces are most of the sample and the
-    /// point of it -- a piece is one peer's whole reservation until the
+    /// point of it. A piece is one peer's whole reservation until the
     /// split reaches it, so theirs is the time the split has to start
     /// ahead of. `None` for a backend without claims, a torrent not live,
     /// or one that has finished no piece yet.
@@ -781,26 +783,27 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
     ///
     /// The number is the caller's: the smaller of the intent's cap
     /// ([`priorities::librqbit_stream_lookahead_bytes`]) and the retention
-    /// window's reach ahead of the reader, which is what keeps the pieces a
-    /// stream pulls in inside the pieces the next pass keeps. Fixed for the
-    /// reader's life -- a seek is a new reader with a fresh number. Must be
-    /// positive; a backend that opens streams refuses zero.
+    /// window's reach ahead of the reader. That is what keeps the pieces a
+    /// stream pulls in inside the pieces the next pass keeps. The number is
+    /// fixed for the reader's life: a seek is a new reader with a fresh
+    /// number. It must be positive. A backend that opens streams refuses
+    /// zero.
     async fn get_file_reader(
         &self,
         file_idx: usize,
         start_offset: u64,
         lookahead_bytes: u64,
     ) -> Result<Box<dyn FileStreamTrait>>;
-    /// **A stream over `file_idx` that is nobody's position**: it asks the
+    /// **A stream over `file_idx` that is nobody's position.** It asks the
     /// backend to fetch `lookahead_bytes` ahead of wherever it stands,
     /// starting at `start_offset`, for as long as it is held, as a reader's
-    /// stream does. What a resumed film's pre-want walks its window with
-    /// ([`crate::engine::Engine::prewant`]): a seek moves the ask, and a
+    /// stream does. A resumed film's pre-want walks its window with it
+    /// ([`crate::engine::Engine::prewant`]). A seek moves the ask, and a
     /// read parks until the piece under the position has arrived.
     ///
-    /// Not [`Self::get_file_reader`], whose reader is *where a stream is*:
-    /// the startup window a client is shown follows the newest one, and a
-    /// pre-want is nobody's position. `Ok(None)` is a backend with no
+    /// It is not [`Self::get_file_reader`], whose reader is *where a stream
+    /// is*. The startup window a client is shown follows the newest reader,
+    /// and a pre-want is nobody's position. `Ok(None)` is a backend with no
     /// streams to ask through. Must be positive, as a reader's lookahead.
     async fn prefetch(
         &self,
@@ -828,7 +831,7 @@ pub trait TorrentHandle: Send + Sync + Clone + 'static {
 
 /// Which files of a multi-file torrent playback wants: the one being
 /// played, and one fetched beside it (a subtitle opened during a film).
-/// Files, and nothing else about them -- no backend reads an offset, a
+/// Files, and nothing else about them: no backend reads an offset, a
 /// priority or a bitrate of either.
 #[derive(Debug, Clone)]
 pub struct TorrentFilePriorityPlan {
@@ -838,26 +841,26 @@ pub struct TorrentFilePriorityPlan {
 
 /// What the mainline DHT looks like from this host, as the backend sees it.
 ///
-/// The DHT is a *peer source*, not a requirement: a torrent with working
-/// trackers downloads fine without one. On a network that drops the UDP the
-/// DHT needs -- carrier-grade NAT, a captive portal, a firewalled mobile APN
-/// -- bootstrap simply never completes, and librqbit retries forever. This is
-/// the one place that state is observable, so a client can say "DHT
+/// The DHT is a *peer source*, not a requirement. A torrent with working
+/// trackers downloads fine without one. A network may drop the UDP the DHT
+/// needs (carrier-grade NAT, a captive portal, a firewalled mobile APN).
+/// There bootstrap simply never completes, and librqbit retries forever.
+/// This is the one place that state is observable. So a client can say "DHT
 /// unavailable, using trackers only" instead of the server logging a warning
 /// per retry for the length of the session.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DhtStatus {
     /// Whether a DHT is running at all (`false` when the backend was built
-    /// without one -- the hermetic test session, for instance).
+    /// without one, as the hermetic test session is).
     pub enabled: bool,
     /// Nodes in the IPv4 routing table right now.
     pub nodes: u64,
     /// Nodes in the IPv6 routing table right now.
     pub nodes_v6: u64,
     /// Whether either routing table has *ever* been non-empty this session.
-    /// Sticky: a table that empties out again (peers aged out, the network
-    /// changed) still counts as having bootstrapped once, which is the
+    /// It is sticky. A table that empties out again (peers aged out, the
+    /// network changed) still counts as having bootstrapped once. That is the
     /// difference between "the DHT is idle" and "the DHT never worked here".
     pub ever_bootstrapped: bool,
 }
@@ -880,28 +883,28 @@ pub struct BackendFileInfo {
 /// wants bytes of.
 ///
 /// The two halves are one fact and are read together. A piece is a fixed
-/// length across the whole torrent, so a file that does not begin and end on
-/// a piece boundary -- which is every file of a torrent without BEP-47
-/// padding -- shares its first and its last piece with its neighbours, and
-/// what deleting such a piece costs depends on whether a neighbour still
+/// length across the whole torrent. So a file that does not begin and end
+/// on a piece boundary shares its first and its last piece with its
+/// neighbours, and that is every file of a torrent without BEP-47 padding.
+/// What deleting such a piece costs depends on whether a neighbour still
 /// wants it.
 #[derive(Debug, Clone)]
 pub struct FileWants {
     /// Where every file of the torrent lies in the torrent's pieces.
     pub layout: std::sync::Arc<crate::piece_store::PieceLayout>,
-    /// The files the torrent still wants, or `None` for every one of them
-    /// -- librqbit's own spelling of a want-set nothing has narrowed.
+    /// The files the torrent still wants, or `None` for every one of them.
+    /// `None` is librqbit's own spelling of a want-set nothing has narrowed.
     pub wanted: Option<std::collections::BTreeSet<usize>>,
 }
 
 impl FileWants {
     /// Whether a file other than `except` still wants a byte of `piece`.
     ///
-    /// The rule `crate::piece_store::PieceStore::remove_file` deletes a
-    /// boundary piece by, asked the other way round: a file holds a piece
-    /// back if it owns payload bytes in it -- a padding file's are zeroes
-    /// nobody transfers and a zero-length file has none -- and the torrent
-    /// has not stopped wanting it.
+    /// This is the rule `crate::piece_store::PieceStore::remove_file`
+    /// deletes a boundary piece by, asked the other way round. A file holds
+    /// a piece back if it owns payload bytes in it and the torrent has not
+    /// stopped wanting it. A padding file's bytes are zeroes nobody
+    /// transfers, and a zero-length file has none.
     pub fn shared_with_another(&self, piece: u32, except: usize) -> bool {
         self.layout.files_overlapping_piece(piece).any(|file| {
             file != except
@@ -917,7 +920,7 @@ impl FileWants {
 /// Where one file of a torrent lies, in pieces.
 ///
 /// The unit here is the piece and not the file, because the piece is what
-/// the store keeps and what a reclaim takes: a file that begins or ends
+/// the store keeps and what a reclaim takes. A file that begins or ends
 /// inside a piece shares that piece with its neighbour, and neither of them
 /// can have it without the other.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -927,29 +930,29 @@ pub struct FilePieceSpan {
     /// The file's first byte within the torrent, so a reader's offset
     /// inside the file becomes a torrent piece index.
     pub offset: u64,
-    /// What [`Self::pieces`] holds on disk -- **not** the file's length.
+    /// What [`Self::pieces`] holds on disk, **not** the file's length.
     /// A file that shares its first or last piece with a neighbour is
     /// shorter than the pieces it lies in, and the pieces are what the
     /// budget has to cover.
     pub bytes: u64,
 }
 
-/// Byte progress of the single piece an open reader is sitting on -- the
+/// Byte progress of the single piece an open reader is sitting on: the
 /// piece that has to arrive before that reader can advance.
 ///
 /// A piece is the unit that becomes readable, and on a multi-gigabyte
 /// torrent it is 8-16 MiB. Whole verified pieces are all the have-bitfield
 /// can show, so a player waiting on its first piece could only ever be told
-/// 0% or 100%. librqbit counts a piece's 16 KiB chunks as they are written,
-/// which is what this turns into bytes a client can render directly --
-/// "waiting for the first piece, 6.2 of 16 MB" -- without knowing anything
-/// about chunks.
+/// 0% or 100%. librqbit counts a piece's 16 KiB chunks as they are written.
+/// This turns that count into bytes a client can render directly ("waiting
+/// for the first piece, 6.2 of 16 MB") without knowing anything about
+/// chunks.
 ///
 /// **The numbers can go backwards.** A chunk counts as downloaded the moment
-/// it is written, *not* when it is verified: the hash is only checked once
+/// it is written, *not* when it is verified. The hash is only checked once
 /// every chunk is in, and a piece that fails is discarded, dropping the
 /// count back to zero. [`Self::verified`] is the only field that means
-/// "known good" -- a full `downloaded_bytes` on its own means nothing more
+/// "known good". A full `downloaded_bytes` on its own means nothing more
 /// than "complete enough to be hashed". A client should hold a nearly-full
 /// bar where it is until `verified`, and never animate a decrease.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -974,11 +977,11 @@ impl InFlightPiece {
     /// Build one from librqbit's `PieceChunkProgress` counts.
     ///
     /// Chunks are a fixed `chunk_size` (16 KiB) each **except the last chunk
-    /// of the torrent's last piece**, which is short -- so chunks-to-bytes
-    /// is not a flat multiplication and the product is clamped to
+    /// of the torrent's last piece**, which is short. So chunks-to-bytes is
+    /// not a flat multiplication, and the product is clamped to
     /// `piece_bytes`, the piece's real length. A fully downloaded short last
-    /// piece therefore reports exactly its own length rather than a rounded-
-    /// up one, and no piece can ever report more bytes than it has.
+    /// piece therefore reports exactly its own length rather than a
+    /// rounded-up one. No piece can ever report more bytes than it has.
     pub fn from_chunks(
         index: u64,
         downloaded_chunks: u32,
@@ -1021,7 +1024,7 @@ pub struct StatsFile {
     pub initial_window_bytes: Option<u64>,
     /// Byte progress of the piece an open reader on *this* file is sitting
     /// on, see [`InFlightPiece`]. Omitted unless a reader is open on the
-    /// file -- one that has closed is sitting on nothing -- and the torrent
+    /// file (one that has closed is sitting on nothing) and the torrent
     /// has a chunk map (live or paused).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_flight_piece: Option<InFlightPiece>,
@@ -1037,10 +1040,10 @@ pub struct StatsFile {
 }
 
 /// Coarse torrent startup phase for pre-playback progress UIs (the official
-/// Stremio UI polls `stats.json` for its loading overlay). Purely additive to
-/// the server.js-compatible fields; derived from the backend's torrent state
-/// plus, once a stream file is chosen (`EngineStats::focus_stream_file`),
-/// that file's initial-window readiness.
+/// Stremio UI polls `stats.json` for its loading overlay). It is purely
+/// additive to the server.js-compatible fields. It is derived from the
+/// backend's torrent state plus, once a stream file is chosen
+/// (`EngineStats::focus_stream_file`), that file's initial-window readiness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum StartupPhase {
@@ -1057,7 +1060,7 @@ pub enum StartupPhase {
     /// The focused file's initial window is fully on disk (or the whole
     /// torrent is finished): playback can start without stalling on the head.
     Ready,
-    /// The backend put the torrent into an error state; it will not progress
+    /// The backend put the torrent into an error state. It will not progress
     /// without intervention.
     Error,
 }
@@ -1068,33 +1071,33 @@ pub enum StartupPhase {
 /// [`Footprint::Lean`] is for the background: a media app the OS has put
 /// behind something else, on a device whose low-memory killer takes the
 /// fattest background process first. The session keeps every torrent
-/// running -- **seeding goes on**, downloads in progress go on -- but with
-/// [`LEAN_PEER_LIMIT`] peers per torrent instead of the configured limit,
-/// and with its peer table pruned of every `Dead` and `NotNeeded` entry.
-/// Nothing is paused, nothing on disk is touched, and a stream request
-/// that arrives while lean is served like any other, just from fewer
-/// peers.
+/// running (**seeding goes on**, downloads in progress go on). But it runs
+/// with [`LEAN_PEER_LIMIT`] peers per torrent instead of the configured
+/// limit, and with its peer table pruned of every `Dead` and `NotNeeded`
+/// entry. Nothing is paused and nothing on disk is touched. A stream
+/// request that arrives while lean is served like any other, just from
+/// fewer peers.
 ///
-/// **What the pruning costs.** Only the `NotNeeded` half is free: those
+/// **What the pruning costs.** Only the `NotNeeded` half is free. Those
 /// are peers we hung up on because there was nothing to exchange, and the
 /// table was keeping them to remember not to dial them again. A `Dead`
-/// entry is the opposite -- a peer that died and is waiting out a backoff
-/// *to be re-dialled* -- and forgetting one cancels that: the pending
-/// reconnect finds no entry and does nothing, so the peer comes back only
-/// when a tracker, the DHT or PEX names it again, or when it dials us.
-/// Both halves go anyway, because the table is what lean is shrinking (a
-/// real one held 4224 addresses after a single download, each with its
-/// counters and backoff state) and a reconnect is the last thing a
-/// backgrounded app wants to keep on a timer. The fork offers no
-/// state-filtered variant, and asking for one would trade the larger half
-/// of the saving for reconnects we are trying not to make.
+/// entry is the opposite: a peer that died and is waiting out a backoff
+/// *to be re-dialled*. Forgetting one cancels that. The pending reconnect
+/// finds no entry and does nothing, so the peer comes back only when a
+/// tracker, the DHT or PEX names it again, or when it dials us. Both halves
+/// go anyway. The table is what lean is shrinking (a real one held 4224
+/// addresses after a single download, each with its counters and backoff
+/// state), and a reconnect is the last thing a backgrounded app wants to
+/// keep on a timer. The fork offers no state-filtered variant. Asking for
+/// one would trade the larger half of the saving for reconnects we are
+/// trying not to make.
 ///
 /// [`Footprint::Full`] restores the configured limit and re-queues the
-/// peers the lean cap parked -- onto the **tail of the same FIFO queue**
-/// that every tracker, DHT and PEX address goes onto, so they are not
-/// jumped to the front: with a backlog waiting they are dialled after it.
-/// It also re-queues every *other* `NotNeeded` outgoing peer, not only the
-/// ones the cap parked.
+/// peers the lean cap parked. They go onto the **tail of the same FIFO
+/// queue** that every tracker, DHT and PEX address goes onto, so they do
+/// not jump to the front. With a backlog waiting, they are dialled after
+/// it. It also re-queues every *other* `NotNeeded` outgoing peer, not only
+/// the ones the cap parked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Footprint {
@@ -1108,15 +1111,15 @@ pub enum Footprint {
 /// Peers per torrent under [`Footprint::Lean`].
 ///
 /// Why eight: a peer costs about 48 KiB of protocol buffers plus its task
-/// and channel, so two hundred of them are the biggest single line of a
+/// and channel. So two hundred of them are the biggest single line of a
 /// backgrounded server's heap, and the number that keeps growing as the
-/// swarm churns. Seeding does not need them -- a BitTorrent client uploads
-/// to four or five unchoked peers at a time and a home uplink saturates
-/// before that -- while a handful keeps the torrent visible (PEX still
-/// flows, trackers still see a seeder, incoming leechers still get a slot)
-/// and keeps a pinned download moving from its best few sources. Eight is
-/// the unchoke set with headroom for churn: a peer that hangs up is
-/// replaced from the queue, not from a re-dial storm.
+/// swarm churns. Seeding does not need them. A BitTorrent client uploads
+/// to four or five unchoked peers at a time, and a home uplink saturates
+/// before that. A handful keeps the torrent visible (PEX still flows,
+/// trackers still see a seeder, incoming leechers still get a slot) and
+/// keeps a pinned download moving from its best few sources. Eight is the
+/// unchoke set with headroom for churn. A peer that hangs up is replaced
+/// from the queue, not from a re-dial storm.
 pub const LEAN_PEER_LIMIT: usize = 8;
 
 /// Peer-discovery breakdown straight from the backend's per-torrent peer
@@ -1133,10 +1136,10 @@ pub struct PeerDiscovery {
     pub connecting: u64,
     /// Peers with a completed handshake we exchange data with.
     pub live: u64,
-    /// Every address the peer table holds right now, in whatever state --
+    /// Every address the peer table holds right now, in whatever state:
     /// what `seen` counts cumulatively, minus what has been forgotten. This
     /// is the table [`Footprint::Lean`] prunes, so it is the figure that
-    /// shows the pruning; `seen` never goes down.
+    /// shows the pruning. `seen` never goes down.
     pub known: u64,
 }
 
@@ -1194,23 +1197,23 @@ pub struct TorrentSpeedProfile {
 ///
 /// 200 peers (what 800 would derive) is the wrong default for the device this server is aimed at.
 /// A peer costs about 75 KiB once its protocol buffers, task, channel and
-/// table entry are counted, so 200 of them are ~15 MB per torrent -- on a
-/// 2 GB television whose low-memory killer fires at around 300 MB, which
-/// is the same measurement that produced [`LEAN_PEER_LIMIT`] and
-/// [`Footprint`]. Lean already brings the background down to 8; this is
-/// the number the *foreground* runs at, and 40 is the figure a television
-/// wants there: enough to keep a stream's window ahead of the playhead
-/// from a fast handful with room for churn, and well past the four or
-/// five peers a client unchokes at a time.
+/// table entry are counted, so 200 of them are ~15 MB per torrent. That is
+/// on a 2 GB television whose low-memory killer fires at around 300 MB.
+/// The same measurement produced [`LEAN_PEER_LIMIT`] and [`Footprint`].
+/// Lean already brings the background down to 8. This is the number the
+/// *foreground* runs at, and 40 is the figure a television wants there.
+/// It is enough to keep a stream's window ahead of the playhead from a
+/// fast handful with room for churn, and well past the four or five peers
+/// a client unchokes at a time.
 ///
-/// A user who wants more still has it -- the setting is honoured up to
+/// A user who wants more still has it. The setting is honoured up to
 /// [`MAX_EFFECTIVE_BT_CONNECTIONS`], and it applies live, so it costs no
 /// restart to try. Raising the *default* is what a small device cannot
 /// argue with.
 ///
 /// **This reaches a fresh install, not an existing one.** The first run
 /// writes the default into `settings.json`, so an install that persisted
-/// 800 keeps it: nothing here can tell that from a user who typed it, and
+/// 800 keeps it. Nothing here can tell that from a user who typed it, and
 /// rewriting a persisted setting behind their back is the worse of the two.
 pub const DEFAULT_BT_MAX_CONNECTIONS: u64 = 160;
 pub const LEGACY_UNLIMITED_BT_MAX_CONNECTIONS: u64 = 65535;
@@ -1218,17 +1221,17 @@ pub const MAX_EFFECTIVE_BT_CONNECTIONS: u64 = 1200;
 pub const MIN_EFFECTIVE_BT_CONNECTIONS: u64 = 80;
 
 impl TorrentSpeedProfile {
-    /// The per-torrent live-peer cap `btMaxConnections` makes: librqbit's
+    /// The per-torrent live-peer cap `btMaxConnections` makes. librqbit's
     /// cap is per torrent, and there is no session-wide one to set. The
     /// setting is normalised first (0 or the legacy "unlimited" is the
     /// default, anything else clamped to
-    /// [`MIN_EFFECTIVE_BT_CONNECTIONS`]..=[`MAX_EFFECTIVE_BT_CONNECTIONS`]),
-    /// and the derivation is `/4` clamped to 40..=200: the divisor is there
-    /// because the setting is a session-wide number in Stremio's model and
-    /// a device usually has a few torrents alive, and the floor of 40 is
-    /// what a stream needs to keep its window ahead of the playhead. With
-    /// the default of [`DEFAULT_BT_MAX_CONNECTIONS`] that lands exactly on
-    /// the floor, which is deliberate -- see that constant.
+    /// [`MIN_EFFECTIVE_BT_CONNECTIONS`]..=[`MAX_EFFECTIVE_BT_CONNECTIONS`]).
+    /// The derivation is then `/4` clamped to 40..=200. The divisor is there
+    /// because the setting is a session-wide number in Stremio's model, and
+    /// a device usually has a few torrents alive. The floor of 40 is what a
+    /// stream needs to keep its window ahead of the playhead. With the
+    /// default of [`DEFAULT_BT_MAX_CONNECTIONS`] that lands exactly on the
+    /// floor, which is deliberate (see that constant).
     pub fn effective_connection_limits(&self) -> usize {
         let requested = self.bt_max_connections;
         let normalized = if requested == 0 || requested >= LEGACY_UNLIMITED_BT_MAX_CONNECTIONS {
@@ -1332,18 +1335,18 @@ impl Default for TorrentPrivacyConfig {
     }
 }
 
-/// Where a `bt*` setting ends up in the backend -- the answer a client is
-/// owed for every one of them, since every one is accepted, echoed back and
-/// persisted whether or not anything reads it.
+/// Where a `bt*` setting ends up in the backend. A client is owed this
+/// answer for every one of them, since every one is accepted, echoed back
+/// and persisted whether or not anything reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum BtSettingEffect {
     /// Applied to the running session the moment it is set.
     Live,
-    /// Read once when the session opens; a change waits for the next start.
+    /// Read once when the session opens. A change waits for the next start.
     NextStart,
-    /// Accepted and persisted, and reaches nothing: the backend has no knob
-    /// for it. The note says what stands instead.
+    /// Accepted and persisted, but it reaches nothing, because the backend
+    /// has no knob for it. The note says what stands instead.
     NotHonoured,
 }
 
@@ -1369,8 +1372,8 @@ pub struct BtSettingsReport {
     /// Session-start settings whose value now differs from the one the
     /// running session opened with: they take effect at the next start.
     pub pending_restart: Vec<&'static str>,
-    /// Settings the backend never reads. Always the full list, whether or
-    /// not the call changed them: the point is that a client can never
+    /// Settings the backend never reads. It is always the full list, whether
+    /// or not the call changed them. The point is that a client can never
     /// mistake their acceptance for an effect.
     pub not_honoured: Vec<&'static str>,
 }
@@ -1383,21 +1386,21 @@ pub const DEFAULT_LISTEN_PORT_RANGE: std::ops::Range<u16> = 42000..42010;
 /// Which port librqbit's incoming BitTorrent (TCP) listener binds.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TorrentListenPort {
-    /// Try each port of the range in order and keep the first that binds;
-    /// fail if none does. A stable, forwardable port, which is what a
-    /// UPnP mapping needs to be worth taking -- an embedder that wants one
-    /// asks for this explicitly.
+    /// Try each port of the range in order and keep the first that binds.
+    /// Fail if none does. This gives a stable, forwardable port, which is
+    /// what a UPnP mapping needs to be worth taking. An embedder that wants
+    /// one asks for this explicitly.
     Fixed(std::ops::Range<u16>),
     /// Port 0: the OS picks a free port (librqbit reads the bound address
-    /// back and announces that port). The default -- here, in
-    /// `BackendConfig` and in `ServerConfig` -- so any number of embedded
+    /// back and announces that port). This is the default here, in
+    /// `BackendConfig` and in `ServerConfig`. So any number of embedded
     /// servers and tests coexist on one machine, and nothing binds a fixed
     /// port it was not asked to.
     #[default]
     Ephemeral,
     /// Port 0 on **127.0.0.1 alone**: a listener nothing off this machine
-    /// can reach. For a test, whose made-up torrents have no business being
-    /// served to the LAN; the other two bind every interface.
+    /// can reach. It is for a test, whose made-up torrents have no business
+    /// being served to the LAN. The other two bind every interface.
     Loopback,
 }
 
@@ -1423,18 +1426,19 @@ impl TorrentListenPort {
     /// making at all.
     ///
     /// Only for [`Self::Fixed`]. A forwarded mapping is a lease on the
-    /// router for one external port number, and it is only worth anything if
-    /// the same port comes back next launch -- which is precisely what
-    /// `Fixed` means, and why only an embedder that asked for a fixed port
-    /// gets a mapping. An [`Self::Ephemeral`] listener -- the `ServerConfig`
-    /// default -- binds a different port every launch, so each run asks the
-    /// router for a fresh mapping and leaves the previous one to expire on
-    /// its own; the embedders that use it get nothing durable out of it. On Android the request cannot succeed at all --
-    /// SSDP discovery is multicast the app sandbox is not permitted to send
-    /// ("Operation not permitted (os error 1)" in a real device log), and on
-    /// a cellular APN there is no gateway to ask -- while librqbit's
-    /// forwarder retries on an interval *forever*, so every failure is a
-    /// `librqbit_upnp` WARN for the whole life of the process.
+    /// router for one external port number. It is only worth anything if
+    /// the same port comes back next launch. That is precisely what `Fixed`
+    /// means, and why only an embedder that asked for a fixed port gets a
+    /// mapping. An [`Self::Ephemeral`] listener (the `ServerConfig` default)
+    /// binds a different port every launch. So each run asks the router for
+    /// a fresh mapping and leaves the previous one to expire on its own, and
+    /// the embedders that use it get nothing durable out of it. On Android
+    /// the request cannot succeed at all. SSDP discovery is multicast the app
+    /// sandbox is not permitted to send ("Operation not permitted (os error
+    /// 1)" in a real device log), and on a cellular APN there is no gateway
+    /// to ask. Meanwhile librqbit's forwarder retries on an interval
+    /// *forever*, so every failure is a `librqbit_upnp` WARN for the whole
+    /// life of the process.
     pub fn wants_upnp_forwarding(&self) -> bool {
         matches!(self, Self::Fixed(_))
     }
@@ -1448,13 +1452,13 @@ pub struct BackendConfig {
     pub privacy: TorrentPrivacyConfig,
     /// DHT bootstrap nodes (`host:port`), read once at session start like
     /// `listen_port`. Empty uses the backend's own default set (see
-    /// `librqbit::DEFAULT_DHT_BOOTSTRAP_NODES`); the `dhtBootstrapNodes`
+    /// `librqbit::DEFAULT_DHT_BOOTSTRAP_NODES`). The `dhtBootstrapNodes`
     /// server setting REPLACES it entirely when non-empty.
     pub dht_bootstrap_nodes: Vec<String>,
     /// Whether those bootstrap names are resolved to address literals before
     /// librqbit sees them (see `dht_bootstrap`). Defaults to
-    /// `DhtBootstrapDns::Resolve`; `Off` is for callers that must make no
-    /// outbound request at start-up, and every test.
+    /// `DhtBootstrapDns::Resolve`. `Off` is for callers that must make no
+    /// outbound request at start-up, and for every test.
     #[serde(default)]
     pub dht_bootstrap_dns: dht_bootstrap::DhtBootstrapDns,
     /// Whether a torrent is added with the built-in public tracker list and
@@ -1462,7 +1466,7 @@ pub struct BackendConfig {
     /// trackers its caller supplied.
     ///
     /// `Use` for anything that means to find peers. `Off` is the other half
-    /// of `DhtBootstrapDns::Off`: together they are what "makes no outbound
+    /// of `DhtBootstrapDns::Off`. Together they are what "makes no outbound
     /// request of its own" means, and neither is enough alone. A test that
     /// adds a torrent with `trackers: Vec::new()` still announced to
     /// twenty-seven public trackers and scraped them, because the list is
@@ -1502,8 +1506,8 @@ pub struct StatsOptions {
 
 impl StatsOptions {
     /// The `opts` every stats answer carries: server.js's option block, in
-    /// the shape stremio-core parses. Nothing here reads it -- librqbit runs
-    /// no peer search and no growler -- so it is one fixed answer, built in
+    /// the shape stremio-core parses. Nothing here reads it (librqbit runs
+    /// no peer search and no growler). So it is one fixed answer, built in
     /// one place, and a torrent resolving its metadata says the same as one
     /// that has it.
     pub fn reported() -> Self {
@@ -1534,15 +1538,16 @@ pub struct Source {
     pub num_found_uniq: u64,
     pub num_requests: u64,
     pub url: String,
-    /// Seeders this tracker reported at the last scrape (BEP-48). Absent
-    /// from the JSON when the tracker has not answered -- absent, not zero,
-    /// because a swarm with no seeders is a real and different state.
+    /// Seeders this tracker reported at the last scrape (BEP-48). It is
+    /// absent from the JSON when the tracker has not answered. It is absent,
+    /// not zero, because a swarm with no seeders is a real and different
+    /// state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seeders: Option<u64>,
-    /// Leechers this tracker reported; same rules as `seeders`.
+    /// Leechers this tracker reported. The same rules as `seeders` apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub leechers: Option<u64>,
-    /// Completed downloads this tracker has recorded; same rules.
+    /// Completed downloads this tracker has recorded. The same rules apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed: Option<u64>,
 }
@@ -1567,7 +1572,7 @@ pub struct EngineStats {
     /// (a `u64` with no default, so neither absent nor `null` parses), and
     /// that fork is changed as little as possible. librqbit counts
     /// connection attempts per peer only, so a total would mean a per-peer
-    /// snapshot on every stats poll; nothing reads the number, xtremio
+    /// snapshot on every stats poll. Nothing reads the number, xtremio
     /// included.
     pub connection_tries: u64,
     pub peer_search_running: bool,
@@ -1575,34 +1580,34 @@ pub struct EngineStats {
     pub stream_name: String,
     pub stream_progress: f64,
     pub swarm_connections: u64,
-    /// Whether the torrent is stopped -- `swarmPaused` on the wire, and the
-    /// one field of this server.js-compatible shape that says whether the
+    /// Whether the torrent is stopped. It is `swarmPaused` on the wire, and
+    /// the one field of this server.js-compatible shape that says whether the
     /// torrent is running at all.
     ///
     /// The backend answers it from its state machine
-    /// ([`TorrentHandle::run_state`]), never from a persisted `paused`
-    /// flag and never from a note about who stopped it: this server keeps
+    /// ([`TorrentHandle::run_state`]). It never answers from a persisted
+    /// `paused` flag, nor from a note about who stopped it. This server keeps
     /// no such note, because whether a torrent should be running is
     /// recomputed from live conditions on every reconciler pass (see
     /// [`crate::reconcile::desired`]). `false` for a backend with no state
     /// to read.
     pub swarm_paused: bool,
-    /// NOT a swarm-size estimate, despite the name: it is currently just an
+    /// NOT a swarm-size estimate, despite the name. It is currently just an
     /// alias of `peers` (connected peers), kept because it is part of the
     /// server.js-compatible wire shape stremio-core parses. For "how many of
     /// the peers we are connected to have the whole file", read
     /// [`EngineStats::connected_seeders`].
     pub swarm_size: u64,
     /// Connected peers whose bitfield covers the whole torrent, i.e. peers we
-    /// can get any piece from. Not the swarm's seeder count: we do not scrape
-    /// trackers, so this only ever counts peers of our own connections.
+    /// can get any piece from. It is not the swarm's seeder count. We do not
+    /// scrape trackers, so this only ever counts peers of our own connections.
     #[serde(default)]
     pub connected_seeders: u64,
     /// Seeders in the **whole swarm** as the trackers report them, from our
     /// own BEP-48/BEP-15 scrapes, aggregated with `max` over the trackers
     /// that answered (see `crate::scrape`).
     ///
-    /// `None` -- serialized as `null`, never `0` -- whenever we do not know:
+    /// `None` (serialized as `null`, never `0`) whenever we do not know:
     /// a DHT-only torrent with no trackers, a private torrent (never
     /// scraped), trackers that have not answered yet or at all, or a last
     /// success too old to present. A client must be able to tell that apart
@@ -1612,8 +1617,8 @@ pub struct EngineStats {
     /// connections and is bounded by `peers`.
     #[serde(default)]
     pub swarm_seeders: Option<u64>,
-    /// Leechers in the whole swarm; same rules as
-    /// [`EngineStats::swarm_seeders`].
+    /// Leechers in the whole swarm. The same rules as
+    /// [`EngineStats::swarm_seeders`] apply.
     #[serde(default)]
     pub swarm_leechers: Option<u64>,
     /// Age in seconds of the freshest scrape the swarm figures rest on, so a
@@ -1621,11 +1626,11 @@ pub struct EngineStats {
     #[serde(default)]
     pub swarm_scrape_age_secs: Option<u64>,
     /// Every file the torrent wants is whole on the disk (libtorrent
-    /// `is_finished`). A finished torrent is only seeding and can be paused;
-    /// an unfinished one still needs the swarm to download data or fetch
-    /// metadata. Measured on the disk, not on what the backend still means
-    /// to fetch: a torrent whose want-set the retention pass has trimmed to
-    /// its window has nothing left to fetch and is not finished.
+    /// `is_finished`). A finished torrent is only seeding and can be paused.
+    /// An unfinished one still needs the swarm to download data or fetch
+    /// metadata. It is measured on the disk, not on what the backend still
+    /// means to fetch. A torrent whose want-set the retention pass has
+    /// trimmed to its window has nothing left to fetch, and is not finished.
     pub is_finished: bool,
     /// Torrent metadata is available (false for a freshly added magnet that is
     /// still resolving its info dictionary).
@@ -1636,14 +1641,14 @@ pub struct EngineStats {
     /// [`EngineStats::focus_stream_file`].
     #[serde(default)]
     pub phase: StartupPhase,
-    /// Bytes hash-checked so far; `Some` only while `phase == checking`.
+    /// Bytes hash-checked so far. `Some` only while `phase == checking`.
     #[serde(default)]
     pub checked_bytes: Option<u64>,
-    /// Bytes the hash check covers (torrent total); `Some` only while
+    /// Bytes the hash check covers (torrent total). `Some` only while
     /// `phase == checking`.
     #[serde(default)]
     pub check_total_bytes: Option<u64>,
-    /// The focused stream file's `StatsFile::initial_window_ready_bytes`;
+    /// The focused stream file's `StatsFile::initial_window_ready_bytes`.
     /// `Some` only in `buffering`/`ready` once a stream file is focused.
     #[serde(default)]
     pub initial_window_ready_bytes: Option<u64>,
@@ -1653,8 +1658,8 @@ pub struct EngineStats {
     /// The torrent's piece length, `None` until metadata resolves.
     ///
     /// A piece is the unit that becomes readable, and on a multi-gigabyte
-    /// torrent it is 8-16 MiB -- bigger than the whole startup window, so
-    /// `initial_window_ready_bytes` can only read 0 or "all of it" and a
+    /// torrent it is 8-16 MiB. That is bigger than the whole startup window,
+    /// so `initial_window_ready_bytes` can only read 0 or "all of it". A
     /// percentage built from the pair sits at 0% for tens of seconds while
     /// the download runs perfectly. A client should render the wait in
     /// pieces ("waiting for the first piece (16 MiB)"), optionally with an
@@ -1664,7 +1669,7 @@ pub struct EngineStats {
     /// The focused stream file's `StatsFile::in_flight_piece`: sub-piece
     /// progress for the one piece a reader is waiting on, so a client can
     /// draw a bar that moves inside a 16 MiB piece instead of a percentage
-    /// stuck at 0. `null` -- never a zeroed object -- whenever we do not
+    /// stuck at 0. `null` (never a zeroed object) whenever we do not
     /// know: no reader open on the file, no metadata yet, or a torrent
     /// without a chunk map (resolving/checking/error). See
     /// [`InFlightPiece`] for why the number can regress.
@@ -1675,13 +1680,13 @@ pub struct EngineStats {
     pub peer_discovery: PeerDiscovery,
     /// Why `phase` is `error`, when anything knows: a magnet whose add
     /// ended without an engine (see [`EngineStats::magnet_add_failed`]),
-    /// or a torrent the backend put in an error state -- a broken
-    /// download folder, a full disk. Always a client-safe message; the
-    /// backend's own error text names server paths and stays in the log
+    /// or a torrent the backend put in an error state (a broken
+    /// download folder, a full disk). It is always a client-safe message.
+    /// The backend's own error text names server paths and stays in the log
     /// (`librqbit::TORRENT_ERROR_MESSAGE`). Absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Indices of the files pinned as offline downloads (ascending); the
+    /// Indices of the files pinned as offline downloads (ascending). The
     /// same files carry `StatsFile::pinned`.
     #[serde(default)]
     pub pinned_files: Vec<usize>,
@@ -1692,7 +1697,7 @@ impl EngineStats {
     /// the backend has a torrent to report on: `phase` is
     /// `resolvingMetadata`, `has_metadata` is false, there are no files and no
     /// stream, and `sources` lists the trackers the add was started with.
-    /// Peer counters are 0 -- librqbit consumes the discovery stream
+    /// Peer counters are 0. librqbit consumes the discovery stream
     /// internally while resolving, so nothing honest can be reported yet.
     pub fn resolving_metadata(info_hash: &str, trackers: &[String]) -> Self {
         Self {
@@ -1753,9 +1758,9 @@ impl EngineStats {
         }
     }
 
-    /// Refine `phase` for the file the client is about to play: in
-    /// `buffering`/`ready` copy that file's initial-window progress and
-    /// in-flight piece to the top level and flip the phase on whether the
+    /// Refine `phase` for the file the client is about to play. In
+    /// `buffering`/`ready`, copy that file's initial-window progress and
+    /// in-flight piece to the top level, and flip the phase on whether the
     /// window is fully on disk.
     /// Other phases (and files without a window, e.g. no piece map) are left
     /// untouched. Out-of-range indices are a no-op.
@@ -1799,20 +1804,20 @@ mod tests {
     /// **Overlapping a piece is not the same as wanting it back.**
     ///
     /// The question this answers is whether deleting a shared piece will
-    /// cost the swarm a refetch, and only a file with payload bytes of its
-    /// own can make it cost anything. A BEP-47 padding file's bytes are
-    /// zeroes nobody ever transfers and a zero-length file has no bytes at
-    /// all, so neither will ever pull the piece back down -- but both sit
-    /// in the torrent's global byte space, both land in
+    /// cost the swarm a refetch. Only a file with payload bytes of its own
+    /// can make it cost anything. A BEP-47 padding file's bytes are zeroes
+    /// nobody ever transfers, and a zero-length file has no bytes at all. So
+    /// neither will ever pull the piece back down. But both sit in the
+    /// torrent's global byte space, both land in
     /// `PieceLayout::files_overlapping_piece`, and both are ordinary members
     /// of a want-set nothing has narrowed.
     ///
     /// Counting them as neighbours would hold the boundary piece back for
-    /// ever: the padding is never deselected, so the piece is refused on
-    /// this pass and on every pass after it, and the file's last piece stays
-    /// on the disk as long as the torrent does -- the "two pieces of every
-    /// file on the disk for ever" this rule exists to avoid, arrived at from
-    /// the other side.
+    /// ever. The padding is never deselected, so the piece is refused on
+    /// this pass and on every pass after it. The file's last piece then
+    /// stays on the disk as long as the torrent does. That is the "two
+    /// pieces of every file on the disk for ever" this rule exists to avoid,
+    /// arrived at from the other side.
     #[test]
     fn a_neighbour_with_no_payload_bytes_of_its_own_holds_no_boundary_piece_back() {
         // Piece four is bytes 100..125. A hundred-byte file ends on its
@@ -1852,8 +1857,8 @@ mod tests {
             "a neighbour that owns bytes in the piece keeps it"
         );
 
-        // A zero-length file lands in whatever piece its offset falls in --
-        // here at 110, inside piece four -- and has nothing to fetch back
+        // A zero-length file lands in whatever piece its offset falls in
+        // (here at 110, inside piece four), and has nothing to fetch back
         // either.
         let empty = wants(
             vec![

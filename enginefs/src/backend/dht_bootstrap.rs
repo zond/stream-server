@@ -5,26 +5,26 @@
 //!
 //! librqbit takes `bootstrap_addrs: Vec<String>` and resolves each one with
 //! `tokio::net::lookup_host` in `bootstrap_hostname`
-//! (`crates/dht/src/dht.rs`), retrying forever on failure: a system resolver
+//! (`crates/dht/src/dht.rs`), retrying forever on failure. A system resolver
 //! that returns `No address associated with hostname` for every bootstrap
-//! name can leave the DHT down indefinitely even though the bootstrap hosts
-//! themselves are up -- one measured session stayed stuck this way for 28
+//! name can leave the DHT down indefinitely, even though the bootstrap hosts
+//! themselves are up. One measured session stayed stuck this way for 28
 //! minutes, because **DNS** was broken, not the bootstrap hosts.
 //!
 //! `lookup_host` also accepts an address *literal* (`"67.215.246.10:6881"`
-//! parses straight to a `SocketAddr` without touching a resolver), so
-//! resolving the names ourselves and handing librqbit literals keeps a
+//! parses straight to a `SocketAddr` without touching a resolver). So we
+//! resolve the names ourselves and hand librqbit literals. That keeps a
 //! broken system resolver from being fatal, with no fork change needed.
 //!
 //! # What this does
 //!
 //! For each `host:port` entry, in order, stopping at the first that works:
 //!
-//! 1. **Literal** -- the host part already parses as an IP address. Passed
-//!    through untouched; no DNS of any kind is attempted.
+//! 1. **Literal** -- the host part already parses as an IP address. It is
+//!    passed through untouched, and no DNS of any kind is attempted.
 //! 2. **System resolver** -- `tokio::net::lookup_host`, under
-//!    [`SYSTEM_LOOKUP_TIMEOUT`]. The normal path, and the only one that runs
-//!    on a healthy network.
+//!    [`SYSTEM_LOOKUP_TIMEOUT`]. This is the normal path, and the only one
+//!    that runs on a healthy network.
 //! 3. **DNS over HTTPS** -- only when the system resolver yielded *no*
 //!    address. `https://dns.google/resolve` then
 //!    `https://cloudflare-dns.com/dns-query`, both with the
@@ -36,34 +36,33 @@
 //!    broken can still bootstrap.
 //! 5. **Give up, keep the name** -- the original `host:port` string is
 //!    passed to librqbit unchanged so it can try the lookup itself. A name
-//!    we could not resolve is never *dropped*: librqbit retrying forever is
+//!    we could not resolve is never *dropped*. librqbit retrying forever is
 //!    better than a bootstrap list that lost an entry.
 //!
 //! What comes out of that ladder is then filtered by this host's own IPv6
 //! route (`apply_ipv6_route_policy`, probed once per pass by
-//! [`Ipv6RouteProbe`]): a device with no route to global IPv6 is handed the
+//! [`Ipv6RouteProbe`]). A device with no route to global IPv6 is handed the
 //! v4 addresses only, because librqbit would otherwise retry the v6 ones
 //! forever. A dual-stack device keeps both, v4 first.
 //!
-//! Entries are resolved concurrently, each entry's live steps (2 and 3) are
-//! bounded by [`LIVE_RESOLUTION_BUDGET`] so the cache is still reached on a
-//! network whose DNS times out rather than refuses, and the whole pass is
-//! bounded by [`RESOLUTION_BUDGET`]; if that elapses, the raw entries are
+//! Entries are resolved concurrently. Each entry's live steps (2 and 3) are
+//! bounded by [`LIVE_RESOLUTION_BUDGET`], so the cache is still reached on a
+//! network whose DNS times out rather than refuses. The whole pass is
+//! bounded by [`RESOLUTION_BUDGET`]. If that elapses, the raw entries are
 //! handed to librqbit and start-up continues. **Nothing here may fail start-up or
 //! stall it for long.** The DHT bootstrapping late (or never) is a degraded
-//! peer source; a server that will not start is an outage.
+//! peer source. A server that will not start is an outage.
 //!
 //! # The limit, stated plainly
 //!
-//! **This fixes the DNS half only.** If the network drops the DHT's UDP
-//! outright -- carrier-grade NAT, a firewalled mobile APN, a captive portal
-//! -- then perfectly correct bootstrap addresses change nothing, because the
-//! queries never leave; SSDP refused with `EPERM` and UPnP timing out
-//! alongside a DNS failure is what a network that blocks this traffic
-//! wholesale looks like. Resolving names ourselves removes one specific,
-//! observed cause of bootstrap failure; it is not a fix for "the DHT does
-//! not work on this network", and `diagnostics::dht_health` still exists to
-//! say so once.
+//! **This fixes the DNS half only.** The network may drop the DHT's UDP
+//! outright: carrier-grade NAT, a firewalled mobile APN, a captive portal.
+//! Then perfectly correct bootstrap addresses change nothing, because the
+//! queries never leave. A network that blocks this traffic wholesale looks
+//! like SSDP refused with `EPERM` and UPnP timing out alongside a DNS
+//! failure. Resolving names ourselves removes one specific, observed cause
+//! of bootstrap failure. It is not a fix for "the DHT does not work on this
+//! network", and `diagnostics::dht_health` still exists to say so once.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
@@ -74,10 +73,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-/// How long the system resolver gets for one host. Short: on a healthy
-/// network it answers in milliseconds, and the point of the budget is that a
-/// resolver which is going to fail fails quickly enough to leave time for
-/// the DoH attempt.
+/// How long the system resolver gets for one host. It is short. On a
+/// healthy network the resolver answers in milliseconds. The point of the
+/// budget is that a resolver which is going to fail fails quickly enough to
+/// leave time for the DoH attempt.
 pub const SYSTEM_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long one DoH provider gets for one host.
@@ -89,27 +88,27 @@ pub const DOH_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 /// bound only exists so a pathological resolver cannot hold up start-up.
 ///
 /// It is a backstop, and must never be what ends a pass whose resolvers
-/// merely failed slowly: when it fires every entry is handed over as a
-/// name, the cache fallback included and the hosts that did resolve
-/// included. That is what the live ladder's own, shorter
-/// [`LIVE_RESOLUTION_BUDGET`] is for.
+/// merely failed slowly. When it fires, every entry is handed over as a
+/// name, including the cache fallback and the hosts that did resolve. The
+/// live ladder's own, shorter [`LIVE_RESOLUTION_BUDGET`] is there to stop
+/// that.
 pub const RESOLUTION_BUDGET: Duration = Duration::from_secs(8);
 
-/// Ceiling on one entry's *live* resolution -- the system resolver and then
-/// DoH -- after which the entry falls through to the cache.
+/// Ceiling on one entry's *live* resolution (the system resolver and then
+/// DoH), after which the entry falls through to the cache.
 ///
 /// The live ladder's worst case is [`SYSTEM_LOOKUP_TIMEOUT`] plus one
-/// [`DOH_REQUEST_TIMEOUT`] per endpoint, 2 + 3 + 3 s: exactly
+/// [`DOH_REQUEST_TIMEOUT`] per endpoint, 2 + 3 + 3 s. That is exactly
 /// [`RESOLUTION_BUDGET`], whose clock starts earlier (the cache load). On a
-/// network that drops DNS rather than refusing it -- where every step runs
-/// to its timeout -- the pass budget fired first, and the cache that exists
+/// network that drops DNS rather than refusing it, every step runs to its
+/// timeout. There the pass budget fired first, and the cache that exists
 /// for exactly that network was never read. Bounded here, each entry still
-/// reaches its cache step with [`RESOLUTION_BUDGET`] to spare; the second
-/// DoH endpoint gets what is left of this budget, which is the price.
+/// reaches its cache step with [`RESOLUTION_BUDGET`] to spare. The price is
+/// that the second DoH endpoint gets only what is left of this budget.
 pub const LIVE_RESOLUTION_BUDGET: Duration = Duration::from_secs(6);
 
 /// Most addresses kept per host. A bootstrap node needs one working address,
-/// not every address its name has; the cap keeps a round-robin name from
+/// not every address its name has. The cap keeps a round-robin name from
 /// turning three bootstrap entries into thirty.
 const MAX_ADDRS_PER_HOST: usize = 4;
 
@@ -124,8 +123,8 @@ pub const DOH_ENDPOINTS: &[&str] = &[
 /// touching the network.
 #[async_trait::async_trait]
 pub trait SystemDnsResolver: Send + Sync {
-    /// Addresses for `host:port`, or an empty vec for "no address". Never
-    /// errors: every failure mode here is just "no address", and the
+    /// Addresses for `host:port`, or an empty vec for "no address". It never
+    /// errors. Every failure mode here is just "no address", and the
     /// caller's next step is the same either way.
     async fn lookup(&self, host: &str, port: u16) -> Vec<SocketAddr>;
 }
@@ -139,11 +138,11 @@ pub trait DohDnsResolver: Send + Sync {
     async fn lookup(&self, host: &str) -> Vec<IpAddr>;
 }
 
-/// Whether this host has a usable route to the global IPv6 internet,
-/// behind a trait for the same reason the two resolvers above are: no test
-/// may depend on whether the machine running it happens to have IPv6.
+/// Whether this host has a usable route to the global IPv6 internet.
+/// It is behind a trait for the same reason the two resolvers above are: no
+/// test may depend on whether the machine running it happens to have IPv6.
 ///
-/// Sync, unlike the resolvers: the production probe neither blocks nor
+/// It is sync, unlike the resolvers. The production probe neither blocks nor
 /// sends anything (see [`UdpConnectIpv6Probe`]), so there is nothing to
 /// await and no timeout to bound.
 pub trait Ipv6RouteProbe: Send + Sync {
@@ -187,8 +186,9 @@ pub struct HttpsDohResolver {
 impl HttpsDohResolver {
     /// The production resolver: a client of its own (so a proxy or timeout
     /// configured elsewhere cannot surprise us here) against
-    /// [`DOH_ENDPOINTS`]. `None` if the TLS stack will not build, in which
-    /// case there simply is no DoH fallback -- not a start-up failure.
+    /// [`DOH_ENDPOINTS`]. Returns `None` if the TLS stack will not build.
+    /// There is then simply no DoH fallback, and that is not a start-up
+    /// failure.
     pub fn new() -> Option<Self> {
         let client = crate::http_client_builder().build().ok()?;
         Some(Self {
@@ -212,8 +212,8 @@ impl DohDnsResolver for HttpsDohResolver {
         let name = urlencoding::encode(host);
         for endpoint in &self.endpoints {
             let url = format!("{endpoint}?name={name}&type=A");
-            // One bound, on the request: it runs from the connect to the
-            // last byte of the body, so it covers the whole exchange, and an
+            // One bound, on the request. It runs from the connect to the
+            // last byte of the body, so it covers the whole exchange. An
             // injected client (`with_client`) is bounded the same way.
             let request = self
                 .client
@@ -253,7 +253,7 @@ impl DohDnsResolver for HttpsDohResolver {
 
 /// The address [`UdpConnectIpv6Probe`] asks the kernel to route to: a
 /// global unicast address out of `2000::/3` (Google public DNS). Nothing is
-/// ever sent to it, so any stable global address would do -- the question
+/// ever sent to it, so any stable global address would do. The question
 /// asked is about this host's routing table, not about that host.
 pub const IPV6_PROBE_TARGET: SocketAddr = SocketAddr::new(
     IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)),
@@ -266,16 +266,16 @@ pub struct UdpConnectIpv6Probe;
 
 impl Ipv6RouteProbe for UdpConnectIpv6Probe {
     fn has_ipv6_route(&self) -> bool {
-        // `connect()` on a UDP socket sends no packet: it only asks the
+        // `connect()` on a UDP socket sends no packet. It only asks the
         // kernel to pick a route and a source address, and fails
         // immediately with `ENETUNREACH` when there is no route. That makes
         // it the cheap, standard way to ask "could v6 leave this host at
-        // all" -- no traffic, no DNS, no timeout to wait out.
+        // all", with no traffic, no DNS and no timeout to wait out.
         //
         // A link-local address is deliberately not enough to answer yes,
         // which is why the target is a *global* address. The device this
         // was measured on (an IPv4-only Chromecast) has `fe80::/64` on
-        // `wlan0` and no v6 default route: the bind below succeeds and the
+        // `wlan0` and no v6 default route. The bind below succeeds and the
         // socket has a v6 address, yet nothing outside its own link is
         // reachable. Only the route lookup tells those two cases apart.
         let Ok(socket) = std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)) else {
@@ -288,7 +288,7 @@ impl Ipv6RouteProbe for UdpConnectIpv6Probe {
 
 /// An [`Ipv6RouteProbe`] that answers yes without looking.
 ///
-/// This is the hermetic choice, and yes is the *inert* answer: it drops
+/// This is the hermetic choice, and yes is the *inert* answer. It drops
 /// nothing, so [`BootstrapResolvers::offline`] still hands back exactly
 /// what it was given.
 #[derive(Debug, Default, Clone, Copy)]
@@ -303,8 +303,8 @@ impl Ipv6RouteProbe for AssumeIpv6Route {
 /// Pull the A/AAAA addresses out of an `application/dns-json` body.
 ///
 /// The `Answer` array also carries the CNAME hops (`"type": 5`) a name went
-/// through, so entries are filtered by record type -- 1 (`A`) and 28
-/// (`AAAA`) -- and then by whether `data` actually parses as an IP. A body
+/// through. So entries are filtered by record type, 1 (`A`) and 28
+/// (`AAAA`), and then by whether `data` actually parses as an IP. A body
 /// that is not JSON, has no `Answer`, or answers `"Status": 3` (NXDOMAIN,
 /// which carries no `Answer` at all) yields nothing.
 fn parse_doh_answer(body: &str) -> Vec<IpAddr> {
@@ -332,12 +332,12 @@ fn parse_doh_answer(body: &str) -> Vec<IpAddr> {
         .collect()
 }
 
-/// Which path produced an entry's addresses. Reported at INFO once per
-/// start-up so a log says *how* bootstrap addresses were obtained, instead
-/// of leaving that invisible.
+/// Which path produced an entry's addresses. It is reported at INFO once
+/// per start-up, so a log says *how* bootstrap addresses were obtained
+/// instead of leaving that invisible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolvedVia {
-    /// The entry was already an address literal; no DNS was attempted.
+    /// The entry was already an address literal. No DNS was attempted.
     Literal,
     /// `tokio::net::lookup_host`.
     System,
@@ -345,7 +345,7 @@ pub enum ResolvedVia {
     Doh,
     /// The on-disk cache, after both live paths returned nothing.
     Cache,
-    /// Nothing resolved it; the name goes to librqbit as a name.
+    /// Nothing resolved it. The name goes to librqbit as a name.
     Unresolved,
 }
 
@@ -374,8 +374,8 @@ pub struct ResolvedEntry {
 
 /// Host -> last known addresses, persisted next to the DHT routing table.
 ///
-/// Deliberately not expiring: it is consulted *only* when both live paths
-/// found nothing, and on that network a two-month-old address for a
+/// It deliberately does not expire. It is consulted *only* when both live
+/// paths found nothing, and on that network a two-month-old address for a
 /// bootstrap node is strictly better than no address. A stale entry costs
 /// one unanswered UDP packet.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -392,15 +392,15 @@ pub struct BootstrapCache {
 pub struct CachedHost {
     /// IP addresses without a port.
     pub addrs: Vec<String>,
-    /// Unix seconds when these addresses last resolved live. Informational:
-    /// nothing expires on it (see [`BootstrapCache`]).
+    /// Unix seconds when these addresses last resolved live. It is only
+    /// informational: nothing expires on it (see [`BootstrapCache`]).
     #[serde(default)]
     pub updated_at: i64,
 }
 
 impl BootstrapCache {
     /// Read the cache, treating every failure (missing, unreadable, corrupt
-    /// JSON) as an empty cache. A cache is an optimisation; a start-up
+    /// JSON) as an empty cache. A cache is an optimisation, and a start-up
     /// failure over one would be absurd.
     pub async fn load(path: &Path) -> Self {
         match tokio::fs::read(path).await {
@@ -457,7 +457,7 @@ impl BootstrapCache {
 
 fn unix_now() -> i64 {
     // A dead RTC (Android/embedded before its first time sync) reports a
-    // pre-1970 clock; `unwrap_or_default` records 0 rather than panicking,
+    // pre-1970 clock. `unwrap_or_default` records 0 rather than panicking,
     // and nothing reads this field for a decision anyway.
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -474,19 +474,18 @@ pub struct BootstrapResolvers {
     /// provider that answers nothing.
     pub doh: Option<Arc<dyn DohDnsResolver>>,
     /// Asked once per pass whether IPv6 bootstrap addresses are worth
-    /// handing to librqbit at all -- see `apply_ipv6_route_policy`.
+    /// handing to librqbit at all (see `apply_ipv6_route_policy`).
     pub ipv6: Arc<dyn Ipv6RouteProbe>,
-    /// Where to read and write the address cache; `None` disables caching.
+    /// Where to read and write the address cache. `None` disables caching.
     pub cache_path: Option<PathBuf>,
 }
 
 /// Whether a caller wants bootstrap names resolved at all.
 ///
-/// `Off` is not a performance knob: it exists so hermetic callers (tests,
+/// `Off` is not a performance knob. It exists so hermetic callers (tests,
 /// and any embed that must not make outbound requests at start-up) do no DNS
 /// and no HTTP. With it, names reach librqbit as names, with no resolution
-/// step in front of them, and address literals reach it as literals either
-/// way.
+/// step in front of them. Address literals reach it as literals either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DhtBootstrapDns {
@@ -508,15 +507,15 @@ impl DhtBootstrapDns {
     }
 }
 
-/// Cache file name, written in the same directory librqbit keeps `dht.json`
-/// in so the two halves of "what this DHT knew last time" live together and
-/// are wiped together.
+/// Cache file name. The cache is written in the same directory librqbit
+/// keeps `dht.json` in, so the two halves of "what this DHT knew last time"
+/// live together and are wiped together.
 pub const CACHE_FILE_NAME: &str = "dht-bootstrap.json";
 
 impl BootstrapResolvers {
     /// The production set: the system resolver, DoH over
-    /// [`DOH_ENDPOINTS`], and a [`CACHE_FILE_NAME`] cache in `dht_dir` --
-    /// the directory holding librqbit's `dht.json`.
+    /// [`DOH_ENDPOINTS`], and a [`CACHE_FILE_NAME`] cache in `dht_dir`
+    /// (the directory holding librqbit's `dht.json`).
     pub fn production_in(dht_dir: &Path) -> Self {
         Self {
             system: Arc::new(TokioSystemResolver),
@@ -553,7 +552,7 @@ impl SystemDnsResolver for NoDnsResolver {
 
 /// Split a `host:port` entry. Handles the bracketed IPv6 literal form
 /// (`[::1]:6881`) as well as `name:port`, and returns `None` for anything
-/// that is not a `host:port` at all -- such an entry is passed through
+/// that is not a `host:port` at all. Such an entry is passed through
 /// untouched rather than mangled.
 fn split_host_port(entry: &str) -> Option<(&str, u16)> {
     if let Some(rest) = entry.strip_prefix('[') {
@@ -593,7 +592,7 @@ async fn resolve_entry(
 
     let Some((host, port)) = split_host_port(entry) else {
         // Not a `host:port` at all. The settings route validates this, but
-        // a library caller can hand us anything; pass it through and let
+        // a library caller can hand us anything. Pass it through and let
         // librqbit reject it.
         return unresolved(ResolvedVia::Unresolved);
     };
@@ -664,14 +663,14 @@ async fn resolve_entry(
     }
 
     // 5. Keep the name. librqbit retries its own lookup forever, which may
-    // yet succeed if DNS comes back; dropping the entry could not.
+    // yet succeed if DNS comes back. A dropped entry could not.
     unresolved(ResolvedVia::Unresolved)
 }
 
 /// Deduplicate a host's addresses, order IPv4 first, and cap the result.
 ///
 /// v4 leads for two reasons. It is the family more likely to connect on the
-/// devices this server runs on (see [`apply_ipv6_route_policy`]), and the
+/// devices this server runs on (see [`apply_ipv6_route_policy`]). And the
 /// cap is applied *after* the ordering, so a name whose AAAA records come
 /// back first cannot spend every slot on addresses a host with no v6 route
 /// would then have to drop. (`apply_ipv6_route_policy` is what drops them.)
@@ -690,7 +689,7 @@ fn dedup_capped(addrs: impl Iterator<Item = IpAddr>) -> Vec<IpAddr> {
 
 /// Whether a `bootstrap_addrs` entry is an IPv6 address literal. A name we
 /// could not resolve (`dht.libtorrent.org:25401`) does not parse, and so
-/// answers `false` -- it is not an address at all, and dropping it is not
+/// answers `false`. It is not an address at all, and dropping it is not
 /// this function's business.
 fn is_ipv6_literal(addr: &str) -> bool {
     addr.parse::<SocketAddr>().is_ok_and(|a| a.is_ipv6())
@@ -713,14 +712,14 @@ fn is_ipv6_literal(addr: &str) -> bool {
 ///
 /// The v4 literals of those same hosts brought the DHT up to 66-69 nodes in
 /// under a second on that device, so the v6 entries bought nothing there.
-/// This is not a fallback or a preference: it is removing addresses the
-/// host provably cannot reach, and the noise they generate with them.
+/// This is not a fallback or a preference. It removes addresses the host
+/// provably cannot reach, and the noise they generate with them.
 ///
 /// An entry left with no address at all keeps its place in the list with an
-/// empty `addrs`: nothing is handed to librqbit for it either way, but the
-/// report can then say it was dropped for want of a route instead of
+/// empty `addrs`. Nothing is handed to librqbit for it either way, but the
+/// report can then say it was dropped for want of a route, instead of
 /// counting it as a host DNS never answered for. The one exception is a
-/// list that would end up *entirely* empty, which is worse than the noise:
+/// list that would end up *entirely* empty, which is worse than the noise.
 /// librqbit's `bootstrap` counts successes and returns `BootstrapFailed`
 /// when there are none, and a failed bootstrap kills the DHT worker. So an
 /// operator who configured a v6-only list on a host with no v6 route keeps
@@ -763,7 +762,8 @@ fn addr_count(entries: &[ResolvedEntry]) -> usize {
 ///
 /// Returns the flat list to hand `SessionOptions.dht.bootstrap_addrs`: the
 /// same entries in the same order, each replaced by its addresses or kept as
-/// a name. Never empty when `entries` is non-empty, and never fails.
+/// a name. The list is never empty when `entries` is non-empty, and this
+/// never fails.
 pub async fn resolve_bootstrap_addrs(
     entries: &[String],
     resolvers: &BootstrapResolvers,
@@ -788,7 +788,7 @@ pub async fn resolve_bootstrap_addrs(
 
 /// The resolution pass proper, without the budget or the reporting.
 async fn resolve_all(entries: &[String], resolvers: &BootstrapResolvers) -> Vec<ResolvedEntry> {
-    // Once per pass, not once per address: the answer is a property of this
+    // Once per pass, not once per address. The answer is a property of this
     // host's routing table, so asking again per entry could only cost
     // syscalls and risk an inconsistent list.
     let has_ipv6_route = resolvers.ipv6.has_ipv6_route();
@@ -817,7 +817,7 @@ async fn resolve_all(entries: &[String], resolvers: &BootstrapResolvers) -> Vec<
         updated.store(path).await;
     }
 
-    // After caching, not before: what a host resolves to does not depend on
+    // After caching, not before. What a host resolves to does not depend on
     // whether we can reach it today, and a device that gains IPv6 later
     // should find both families in the cache.
     apply_ipv6_route_policy(&mut resolved, has_ipv6_route);
@@ -829,10 +829,10 @@ async fn resolve_all(entries: &[String], resolvers: &BootstrapResolvers) -> Vec<
 /// but this host has no route to what came back.
 ///
 /// The third case is why the entry survives `apply_ipv6_route_policy` with
-/// an empty `addrs` rather than being removed: "resolved to AAAA records we
+/// an empty `addrs` rather than being removed. "Resolved to AAAA records we
 /// cannot reach" and "DNS answered nothing" are different faults with
-/// different fixes, and a report that cannot tell them apart sends the
-/// reader after the wrong one.
+/// different fixes. A report that cannot tell them apart sends the reader
+/// after the wrong one.
 fn report_summary(resolved: &[ResolvedEntry]) -> String {
     resolved
         .iter()
@@ -850,7 +850,7 @@ fn report_summary(resolved: &[ResolvedEntry]) -> String {
 }
 
 /// Whether every entry failed the whole DNS ladder. A host that resolved
-/// and then lost its addresses to the IPv6 route filter is *not* this: DNS
+/// and then lost its addresses to the IPv6 route filter is *not* this. DNS
 /// worked for it, so saying DNS failed would be a wrong diagnosis.
 fn nothing_resolved(resolved: &[ResolvedEntry]) -> bool {
     resolved.iter().all(|r| r.via == ResolvedVia::Unresolved)
@@ -973,7 +973,7 @@ mod tests {
         BootstrapResolvers {
             system,
             doh,
-            // The inert probe: these tests are about the DNS ladder, and
+            // The inert probe. These tests are about the DNS ladder, and
             // an assumed v6 route drops nothing.
             ipv6: Arc::new(AssumeIpv6Route),
             cache_path,
@@ -1013,9 +1013,9 @@ mod tests {
         assert_eq!(out, ["185.157.221.247:25401"]);
     }
 
-    /// A dual-stack host keeps every address it resolved -- v6 is only
-    /// dropped where it cannot be reached -- but v4 still leads, because
-    /// it is the family more likely to connect.
+    /// A dual-stack host keeps every address it resolved, since v6 is only
+    /// dropped where it cannot be reached. But v4 still leads, because it is
+    /// the family more likely to connect.
     #[tokio::test]
     async fn a_dual_stack_host_keeps_both_families_with_v4_first() {
         let out = resolve_bootstrap_addrs(
@@ -1029,7 +1029,7 @@ mod tests {
         assert_eq!(out, ["185.157.221.247:25401", "[2a02:752:0:18::128]:25401"]);
     }
 
-    /// One routing table, one answer: the probe is a per-pass decision, not
+    /// One routing table, one answer. The probe is a per-pass decision, not
     /// a per-address one.
     #[tokio::test]
     async fn the_ipv6_route_is_probed_once_per_pass() {
@@ -1047,8 +1047,8 @@ mod tests {
         assert_eq!(probe.asked.load(Ordering::SeqCst), 1);
     }
 
-    /// A configured v6 literal is an address like any other and goes; a
-    /// name nothing could resolve is not an address at all and stays, so
+    /// A configured v6 literal is an address like any other, and it goes. A
+    /// name nothing could resolve is not an address at all, and it stays, so
     /// librqbit can keep trying its own lookup.
     #[tokio::test]
     async fn a_v6_literal_is_dropped_but_an_unresolved_name_is_kept() {
@@ -1067,9 +1067,9 @@ mod tests {
         assert_eq!(out, ["unresolvable.test:6881", "9.9.9.9:6881"]);
     }
 
-    /// Filtering may not empty the list: librqbit's `bootstrap` returns
+    /// Filtering may not empty the list. librqbit's `bootstrap` returns
     /// `BootstrapFailed` when no entry succeeds, and that kills the DHT
-    /// worker. Unreachable addresses are noise; no addresses is no DHT.
+    /// worker. Unreachable addresses are noise. No addresses is no DHT.
     #[tokio::test]
     async fn a_v6_only_list_is_kept_whole_rather_than_emptied() {
         let entries = vec![
@@ -1090,8 +1090,8 @@ mod tests {
     /// A host whose only records are AAAA on a device with no v6 route is a
     /// *routing* failure, not a DNS one. Reporting it as "no DHT bootstrap
     /// host could be resolved" sends the reader after the resolver when the
-    /// resolver worked fine, so the entry stays in the report with no
-    /// addresses and the WARN does not fire.
+    /// resolver worked fine. So the entry stays in the report with no
+    /// addresses, and the WARN does not fire.
     #[tokio::test]
     async fn a_host_dropped_for_want_of_an_ipv6_route_is_not_reported_as_unresolved() {
         let entries = [
@@ -1122,7 +1122,7 @@ mod tests {
             "the host DNS really did fail for is still reported as unresolved: {summary}"
         );
 
-        // What librqbit gets is unchanged: an entry with no addresses
+        // What librqbit gets is unchanged. An entry with no addresses
         // contributes none.
         assert_eq!(
             resolve_bootstrap_addrs(&entries, &resolvers).await,
@@ -1130,9 +1130,9 @@ mod tests {
         );
     }
 
-    /// An address literal is what librqbit wants already; resolving it would
-    /// be a pointless round trip and, on the broken network this whole
-    /// module is for, a failing one.
+    /// An address literal is what librqbit wants already. Resolving it would
+    /// be a pointless round trip, and a failing one on the broken network
+    /// this whole module is for.
     #[tokio::test]
     async fn an_address_literal_passes_through_without_any_dns() {
         let system = Arc::new(FakeSystem::default());
@@ -1197,7 +1197,7 @@ mod tests {
     }
 
     /// Every path failing must leave the name in the list. librqbit retrying
-    /// its own lookup forever can still succeed if DNS comes back; an entry
+    /// its own lookup forever can still succeed if DNS comes back. An entry
     /// we dropped cannot.
     #[tokio::test]
     async fn a_name_nothing_can_resolve_is_kept_for_librqbit_to_try() {
@@ -1220,8 +1220,8 @@ mod tests {
         );
     }
 
-    /// With no DoH resolver at all (client construction failed) the ladder
-    /// still works, it just has one rung fewer.
+    /// The ladder still works with no DoH resolver at all (client
+    /// construction failed). It just has one rung fewer.
     #[tokio::test]
     async fn a_missing_doh_resolver_is_not_an_error() {
         let out = resolve_bootstrap_addrs(
@@ -1275,8 +1275,8 @@ mod tests {
     }
 
     /// A system resolver and a DoH resolver that answer nothing, each
-    /// only after `delay` -- a network that drops DNS instead of refusing
-    /// it, where every step runs to its timeout.
+    /// only after `delay`. This is a network that drops DNS instead of
+    /// refusing it, where every step runs to its timeout.
     struct Stalling(Duration);
 
     #[async_trait::async_trait]
@@ -1296,7 +1296,7 @@ mod tests {
         }
     }
 
-    /// Only the host it names answers, at once; everything else stalls.
+    /// Only the host it names answers, at once. Everything else stalls.
     struct OneHostAnswers {
         host: &'static str,
         addr: SocketAddr,
@@ -1314,9 +1314,9 @@ mod tests {
     }
 
     /// A dropped (not refused) DNS: the system resolver runs to its 2 s
-    /// timeout and both DoH endpoints to their 3 s each, 8 s in all -- the
-    /// whole pass budget, whose clock started before. The cache that exists
-    /// for exactly this network must still be read, and a host that did
+    /// timeout and both DoH endpoints to their 3 s each, 8 s in all. That is
+    /// the whole pass budget, whose clock started before. The cache that
+    /// exists for exactly this network must still be read. A host that did
     /// resolve live must not be thrown away with the one that stalled.
     #[tokio::test(start_paused = true)]
     async fn a_dns_that_times_out_still_reaches_the_cache() {
@@ -1438,8 +1438,9 @@ mod tests {
     }
 
     /// Live check of the real production ladder against the real DoH
-    /// providers. Ignored: it does actual DNS and actual HTTPS. Run it when
-    /// touching this module, or to re-verify a provider still answers:
+    /// providers. It is ignored because it does actual DNS and actual HTTPS.
+    /// Run it when touching this module, or to re-verify a provider still
+    /// answers:
     ///
     /// ```sh
     /// cargo test -p enginefs the_real_resolvers -- --ignored --nocapture
@@ -1528,7 +1529,7 @@ mod tests {
     }
 
     /// An entry that is not a `host:port` at all is passed through rather
-    /// than dropped or mangled -- the settings route rejects these, but a
+    /// than dropped or mangled. The settings route rejects these, but a
     /// library caller is not bound by it.
     #[tokio::test]
     async fn a_malformed_entry_is_passed_through_untouched() {
