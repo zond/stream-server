@@ -1,12 +1,13 @@
 //! **The run task**: one producer run, on the server's runtime. It opens
 //! the reader, hands the producer its [`Job`], and takes the samples off
-//! the sink's channel -- applying the cut rule ([`Cutter`]), muxing each
-//! segment as it completes and putting it in the ring -- while it judges
-//! the run's speed, stops taking samples once its lookahead
-//! ([`LOOKAHEAD_TIME`](super::LOOKAHEAD_TIME)) is made past the last request, and lets the run go when it has been idle for
-//! the release period. Dropping the task's channel is what makes the sink
-//! answer [`super::Stopped`]; cancelling the reader is what wakes a
-//! producer parked in a read.
+//! the sink's channel. It applies the cut rule ([`Cutter`]), muxes each
+//! segment as it completes and puts it in the ring. Meanwhile it judges
+//! the run's speed. It stops taking samples once its lookahead
+//! ([`LOOKAHEAD_TIME`](super::LOOKAHEAD_TIME)) is made past the last
+//! request. It lets the run go when it has been idle for the release
+//! period. Dropping the task's channel is what makes the sink answer
+//! [`super::Stopped`]. Cancelling the reader is what wakes a producer
+//! parked in a read.
 
 use super::layout::Layout;
 use super::mux::{self, Formats, MuxSample};
@@ -22,13 +23,13 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// How far before a segment's cut its sound begins: an audio frame that
+/// How far before a segment's cut its sound begins. An audio frame that
 /// starts this little before the cut is the segment's. FFmpeg seeks the
 /// sound to the sync sample's decode time, which is
 /// [`DECODE_AHEAD_US`](super::mux::DECODE_AHEAD_US) before the cut, and
-/// takes the frame at or before that: it must be in the sync sample's
-/// fragment, so the lead is that and more than one AAC frame at any rate
-/// (HE-AAC at 44.1 kHz is 46 ms).
+/// takes the frame at or before that. That frame must be in the sync
+/// sample's fragment. So the lead is that and more than one AAC frame at
+/// any rate (HE-AAC at 44.1 kHz is 46 ms).
 pub(crate) const AUDIO_LEAD_US: i64 = super::mux::DECODE_AHEAD_US + 64_000;
 
 /// One segment's samples, as the cut rule assigned them.
@@ -50,11 +51,11 @@ pub(crate) struct Cut {
 /// **The cut rule**, applied to one run's samples in the order the
 /// producer wrote them. Segment N begins at the first video sync sample at
 /// or after its cut (`cuts[N]`, from the layout: an indexed sync sample's
-/// time, or N x T); each audio sample goes to the segment whose cuts its
-/// presentation time falls between, [`AUDIO_LEAD_US`] early; what precedes the run's first segment
-/// is discarded. A segment is complete once video has moved past it (a
-/// later cut) and audio has reached the next cut -- or, for a track the run
-/// does not have, at once.
+/// time, or N x T). Each audio sample goes to the segment whose cuts its
+/// presentation time falls between, [`AUDIO_LEAD_US`] early. What precedes
+/// the run's first segment is discarded. A segment is complete once video
+/// has moved past it (a later cut) and audio has reached the next cut. For
+/// a track the run does not have, that side is complete at once.
 pub(crate) struct Cutter {
     /// `cuts[0]` is [`i64::MIN`].
     cuts: Arc<[i64]>,
@@ -94,25 +95,26 @@ impl Cutter {
                 None if !sample.key => return Vec::new(),
                 None => self.segment_of(sample.pts_us),
                 // A sync sample cuts when it is at or after the next
-                // segment's cut; the segments it passes over are empty.
+                // segment's cut. The segments it passes over are empty.
                 Some(current) if sample.key => current.max(self.segment_of(sample.pts_us)),
                 Some(current) => current,
             },
-            // Sound before the film's start -- an AAC encoder's priming
-            // frame, which a container's edit list hides -- has no time a
-            // fragment can say (`tfdt` counts from nought); its presentation
-            // is nothing, and every later frame keeps its own time.
+            // Sound before the film's start (an AAC encoder's priming
+            // frame, which a container's edit list hides) has no time a
+            // fragment can say, since `tfdt` counts from nought. Its
+            // presentation is nothing, and every later frame keeps its own
+            // time.
             TrackKind::Audio if sample.pts_us < 0 => return Vec::new(),
             TrackKind::Audio if self.has_audio => {
                 self.segment_of(sample.pts_us.saturating_add(AUDIO_LEAD_US))
             }
-            // A track with no format: nothing in the init segment describes
+            // A track with no format. Nothing in the init segment describes
             // it, so nothing can carry it.
             _ => return Vec::new(),
         };
-        // Before the run's first segment -- the producer starts well before
-        // it, at a sync sample -- or behind a segment already out:
-        // discarded, and not kept.
+        // A sample before the run's first segment, or behind a segment
+        // already out, is discarded and not kept. The producer starts well
+        // before the first segment, at a sync sample.
         if segment < self.next_out {
             return Vec::new();
         }
@@ -133,7 +135,7 @@ impl Cutter {
         self.complete(false)
     }
 
-    /// The source ended: every segment begun is complete.
+    /// The source ended. Every segment begun is complete.
     pub(crate) fn finish(&mut self) -> Vec<Cut> {
         self.complete(true)
     }
@@ -184,7 +186,8 @@ impl Cutter {
 
 /// How a run ended.
 enum Outcome {
-    /// Cut, superseded by a seek, or failed elsewhere: nothing to record.
+    /// Cut, superseded by a seek, or failed elsewhere. There is nothing to
+    /// record.
     Stopped,
     /// Let go after the release period with no request.
     Released,
@@ -194,7 +197,7 @@ enum Outcome {
     Failed(String),
 }
 
-/// Cancels the reader when the run ends, however it ends: a producer
+/// Cancels the reader when the run ends, however it ends. A producer
 /// parked in a read is woken, and its next read answers at once.
 struct CancelOnDrop(crate::media::Canceller);
 
@@ -204,8 +207,8 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// Run `generation` of `rendition` until it ends: the producer handed
-/// `from`, the output starting at slot `start` (or, for the run that
+/// Run `generation` of `rendition` until it ends. The producer is handed
+/// `from`, and the output starts at slot `start` (or, for the run that
 /// freezes the layout, at the first slot cut at or after `from`).
 pub(crate) async fn run(
     rendition: Arc<Rendition>,
@@ -289,8 +292,8 @@ struct Making {
 
 impl Making {
     /// Take the segments the cutter completed and make every slot they
-    /// complete (all that are left, at the film's `ending`); `false` once
-    /// the run is no longer the live one.
+    /// complete (all that are left, at the film's `ending`). Answers `false`
+    /// once the run is no longer the live one.
     fn take(
         &mut self,
         rendition: &Rendition,
@@ -306,7 +309,7 @@ impl Making {
         while self.slot < count && (ending || self.cutter.next_out > self.slot) {
             let slot = self.slot;
             let content = slots::gather(&self.segments, self.cursor, slot);
-            // At its label: mirrored (the label is the cut) and opening
+            // At its label: mirrored (the label is the cut), and opening
             // with its own segment, not with what the slot before spilled.
             let at_label = self.layout.exact && self.cursor == Cursor::at(slot);
             let mux = |video: &[MuxSample],
@@ -320,7 +323,7 @@ impl Making {
             let size = self.layout.slots[slot as usize].size;
             let filled = content.fill(size, &mux);
             // The end the slot was first made with, which says where the
-            // next starts: the same prefix whichever it is now.
+            // next starts. It is the same prefix whichever it is now.
             let Some(end) = rendition.publish_slot(generation, slot, filled) else {
                 return false;
             };
@@ -336,7 +339,7 @@ impl Making {
     }
 }
 
-/// Sleeps until the idle deadline `at` -- forever, with none -- on the
+/// Sleeps until the idle deadline `at` (forever, with none), on the
 /// clock it was read on ([`super::RequestInstant`]).
 async fn until(at: Option<super::RequestInstant>) {
     match at {
@@ -346,7 +349,7 @@ async fn until(at: Option<super::RequestInstant>) {
 }
 
 /// Whether the idle deadline `at` has passed, on the same clock [`until`]
-/// slept on: with two clocks, a sleep under paused tokio time ends at a
+/// slept on. With two clocks, a sleep under paused tokio time ends at a
 /// deadline the comparison says is still ahead, and the run is never
 /// released.
 fn passed(at: Option<super::RequestInstant>) -> bool {
@@ -424,7 +427,7 @@ async fn drive(
             biased;
             () = stop.cancelled() => return Outcome::Stopped,
             () = until(idle_at) => {
-                // Looked at again under the lock: a request may have come
+                // Looked at again under the lock. A request may have come
                 // in, or begun waiting, since the deadline was read.
                 let idle_at = rendition
                     .inner()
@@ -542,7 +545,7 @@ async fn drive(
 
 /// Why a run could not freeze the layout.
 pub(crate) enum Frozen {
-    /// The rendition cannot go on: the sentence.
+    /// The rendition cannot go on, with the sentence.
     Failed(String),
     /// The run is no longer the live one.
     Stopped,
@@ -564,8 +567,8 @@ mod tests {
     }
 
     /// **An idle deadline has passed once the sleep on it ends**, under
-    /// paused tokio time too: the deadline, the sleep and the check are one
-    /// clock.
+    /// paused tokio time too. The deadline, the sleep and the check are on
+    /// one clock.
     #[tokio::test(start_paused = true)]
     async fn an_idle_deadline_has_passed_once_its_sleep_ends() {
         let at = Some(super::super::request_now() + Duration::from_secs(30));
@@ -589,7 +592,7 @@ mod tests {
         samples.iter().map(|sample| sample.pts_us).collect()
     }
 
-    /// Keys every 400 ms, frames every 200 ms, from 0: segment 1 begins at
+    /// Keys every 400 ms, frames every 200 ms, from 0. Segment 1 begins at
     /// the key at 1.2 s, the first at or after 1 s.
     #[test]
     fn a_segment_begins_at_the_first_key_at_or_after_its_time() {
@@ -613,8 +616,9 @@ mod tests {
         assert_eq!(rest[0].video.first().map(|s| s.pts_us), Some(1_200_000));
     }
 
-    /// A run from segment 2, handed the key before it: nothing before the
-    /// first key at or after 2 s, and no audio before 2 s less the lead.
+    /// A run from segment 2, handed the key before it. It keeps nothing
+    /// before the first key at or after 2 s, and no audio before 2 s less
+    /// the lead.
     #[test]
     fn what_precedes_the_runs_cut_is_discarded() {
         let mut cutter = Cutter::new(grid(), 2, true, true);
@@ -672,9 +676,10 @@ mod tests {
         assert_eq!(pts(&out[1].audio).first(), Some(&799_999));
     }
 
-    /// **A segment waits for its audio**: video moving past the next cut
-    /// does not complete it while audio before that cut can still come --
-    /// a container that stores audio after the video it plays beside.
+    /// **A segment waits for its audio.** Video moving past the next cut
+    /// does not complete it while audio before that cut can still come.
+    /// That happens with a container that stores audio after the video it
+    /// plays beside.
     #[test]
     fn a_segment_waits_for_audio_up_to_the_next_cut() {
         let cuts: Arc<[i64]> = vec![i64::MIN, 1_000_000].into();
@@ -690,10 +695,10 @@ mod tests {
         assert_eq!(pts(&out[0].audio), vec![0, 400_000]);
     }
 
-    /// **A segment's sound begins at or before its picture**: the audio
-    /// frame playing at the cut is the segment's, not the one before's --
-    /// a demuxer seeking every stream to the sync sample's time looks for
-    /// sound at or before it in the same fragment, and finding none goes
+    /// **A segment's sound begins at or before its picture.** The audio
+    /// frame playing at the cut is the segment's, not the one before's. A
+    /// demuxer seeking every stream to the sync sample's time looks for
+    /// sound at or before it in the same fragment. Finding none, it goes
     /// back to the last it read (FFmpeg n6's `mov_read_seek`, measured).
     #[test]
     fn a_segments_sound_begins_at_or_before_its_sync_sample() {

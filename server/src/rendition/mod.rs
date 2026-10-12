@@ -1,31 +1,31 @@
 //! **Renditions**: a cast the receiver can decode, produced on demand,
-//! nothing on disk (`docs/design/renditions.md`, step F1 of
+//! with nothing on disk (`docs/design/renditions.md`, step F1 of
 //! `docs/design/media-pipeline.md` §5).
 //!
 //! A rendition is a published cast token ([`crate::ServerHandle::publish_rendition`])
 //! with **one progressive fragmented MP4** behind it
-//! (`/cast/{token}/stream.mp4`, `crate::cast`), its media segments each
+//! (`/cast/{token}/stream.mp4`, `crate::cast`). Each media segment is
 //! produced on demand by a [`Producer`](crate::rendition::Producer) the
-//! embedder installed -- the thing that demuxes, decodes and encodes, which
+//! embedder installed. The producer demuxes, decodes and encodes, which
 //! the server never does itself. The server's half is everything else: the
 //! route, the file's byte layout, the cut rule, the fMP4 muxer (`mux.rs`),
 //! the ring of fragments in memory, and the speed a run is judged by.
 //!
 //! **Not HLS, and seekable by bytes.** zond's Chromecast with Google TV
-//! plays no HLS above 720p through its Media Source path, and plays a
-//! progressive fragmented MP4 through its plain `<video src>` path -- and
+//! plays no HLS above 720p through its Media Source path. It plays a
+//! progressive fragmented MP4 through its plain `<video src>` path. It
 //! seeks in one with a single `Range` when it has a length, exact bytes and
 //! a `sidx` (`docs/design/renditions.md` §2.8). So the file's layout is
-//! fixed before it is made (`layout.rs`): a header (`ftyp` + `moov` +
+//! fixed before it is made (`layout.rs`). It is a header (`ftyp` + `moov` +
 //! `sidx`), then one slot per segment, mirrored from the source's index or
-//! estimated, each its segment's fragment padded to the slot's end
+//! estimated. Each slot is its segment's fragment padded to the slot's end
 //! (`slots.rs` says what goes in one and what happens when it does not
 //! fit).
 //!
 //! # The rules this keeps
 //!
 //! * **Nothing on disk.** Fragments live in a ring in memory of at most
-//!   [`RING_CAP`](crate::rendition::RING_CAP) bytes; over it, the slot
+//!   [`RING_CAP`](crate::rendition::RING_CAP) bytes. Over it, the slot
 //!   farthest from where any run was last asked goes first, never one
 //!   within the lookahead ahead of a run's last request.
 //! * **Every byte is the same however often it is made**: the layout is
@@ -34,37 +34,40 @@
 //!   producer for [`SEEK_BACK`](crate::rendition::SEEK_BACK) before its first cut, so a slot's samples do
 //!   not depend on where its run started.
 //! * **The cut rule**: segment N begins at the first video sync sample at or
-//!   after its cut -- an indexed sync sample's time (every one a second or
-//!   more apart: `layout::MIRROR_GRID_US`), or N x T -- and ends
-//!   where N+1 begins; an audio sample belongs to the segment whose cuts its
-//!   presentation time falls between. What a run is handed before its first
-//!   cut is discarded. A slot is produced whole before it is sent.
-//! * **A request for slot N** is answered from the ring; or waits, when N is
-//!   the slot in production or within the lookahead past it (and joins that
-//!   production, never restarts it); or starts a run at N -- beside the
-//!   others while fewer than [`MAX_RUNS`](crate::rendition::MAX_RUNS) are
-//!   live, else in place of the least recently asked one nobody is waiting
-//!   on ([`Ask`](crate::rendition::Ask)). **Requests make slots** -- the
-//!   receiver's, or a preparation's asking in its place through the same
-//!   path -- never where a player was told to start.
-//! * **The lookahead blocks the producer**: a run completes the slots
+//!   after its cut, and ends where N+1 begins. The cut is an indexed sync
+//!   sample's time (every one a second or more apart:
+//!   `layout::MIRROR_GRID_US`), or N x T. An audio sample belongs to the
+//!   segment whose cuts its presentation time falls between. What a run is
+//!   handed before its first cut is discarded. A slot is produced whole
+//!   before it is sent.
+//! * **A request for slot N** is answered from the ring. Or it waits, when
+//!   N is the slot in production or within the lookahead past it, and joins
+//!   that production, never restarts it. Or it starts a run at N: beside
+//!   the others while fewer than [`MAX_RUNS`](crate::rendition::MAX_RUNS)
+//!   are live, or else in place of the least recently asked one nobody is
+//!   waiting on ([`Ask`](crate::rendition::Ask)). **Requests make slots**:
+//!   the receiver's, or a preparation's asking in its place through the
+//!   same path. Where a player was told to start never does.
+//! * **The lookahead blocks the producer**. A run completes the slots
 //!   that begin within [`LOOKAHEAD_TIME`](crate::rendition::LOOKAHEAD_TIME)
 //!   of the last request's, and at least [`LOOKAHEAD`](crate::rendition::LOOKAHEAD)
-//!   past it, then stops reading its sink, and the producer's next write
+//!   past it. Then it stops reading its sink, and the producer's next write
 //!   blocks.
-//! * **An idle run is let go** after [`IDLE_RELEASE`](crate::rendition::IDLE_RELEASE) without a request,
+//! * **An idle run is let go** after
+//!   [`IDLE_RELEASE`](crate::rendition::IDLE_RELEASE) without a request,
 //!   and never while a request waits for it to make a slot (a source that
-//!   stalls is waited for, however long); the ring is kept and the next
+//!   stalls is waited for, however long). The ring is kept, and the next
 //!   request starts a new run where it asks.
-//! * **The first run's formats are frozen** into the init segment; a later run
-//!   whose formats differ fails the rendition.
-//! * **A run slower than real time fails the rendition with a sentence**:
-//!   under 1.0x over [`SPEED_WINDOW`](crate::rendition::SPEED_WINDOW) of busy time once its first slot
-//!   is out, where busy time leaves out the sink's and the reader's waits
-//!   (`speed.rs`).
-//! * **Cut by unpublish**, as a plain cast is: the run is dropped (its sink
-//!   answers [`Stopped`](crate::rendition::Stopped), its reader is cancelled), the ring goes, and a
-//!   request waiting on a slot is answered with an error.
+//! * **The first run's formats are frozen** into the init segment. A later
+//!   run whose formats differ fails the rendition.
+//! * **A run slower than real time fails the rendition with a sentence**.
+//!   That is under 1.0x over [`SPEED_WINDOW`](crate::rendition::SPEED_WINDOW)
+//!   of busy time once its first slot is out. Busy time leaves out the
+//!   sink's and the reader's waits (`speed.rs`).
+//! * **Cut by unpublish**, as a plain cast is. The run is dropped (its sink
+//!   answers [`Stopped`](crate::rendition::Stopped), its reader is
+//!   cancelled), the ring goes, and a request waiting on a slot is answered
+//!   with an error.
 
 pub(crate) mod layout;
 pub(crate) mod mux;
@@ -88,41 +91,42 @@ pub(crate) use speed::WaitClock;
 /// made to wait (`L`, §2.1).
 pub const LOOKAHEAD: u64 = 2;
 /// How much of the film is produced past the last request before the
-/// producer is made to wait, when that is more than [`LOOKAHEAD`] slots: a
-/// mirrored layout has a slot per sync sample, a few seconds each, and the
+/// producer is made to wait, when that is more than [`LOOKAHEAD`] slots. A
+/// mirrored layout has a slot per sync sample, a few seconds each. The
 /// lookahead was two six-second segments when it was counted in slots.
 pub const LOOKAHEAD_TIME: Duration = Duration::from_secs(12);
-/// How many runs may be live at once: two reads far apart (a receiver's
+/// How many runs may be live at once. Two reads far apart (a receiver's
 /// demuxer reading one place while its data source fills another) each
 /// have one, rather than take one from each other in turn.
 pub const MAX_RUNS: usize = 2;
 /// The most the ring holds, whatever the segment count says. Slots are
-/// kept until it is full, the farthest from where any run is asked first.
+/// kept until it is full. Then the farthest from where any run is asked go
+/// first.
 pub const RING_CAP: usize = 96 * 1024 * 1024;
 /// How long a run is kept with no request before it is let go.
 pub const IDLE_RELEASE: Duration = Duration::from_secs(60);
 /// The busy time a run's speed is judged over.
 pub const SPEED_WINDOW: Duration = Duration::from_secs(10);
-/// How far before a segment's cut a run asks its producer to start: a
+/// How far before a segment's cut a run asks its producer to start. A
 /// container may store a sample shown at or after the cut before the sync
-/// sample it seeks to (audio interleaved ahead of video), and a segment
-/// made by a run started at it must hold exactly what one made by a run
-/// passing through it holds. What comes before the cut is discarded.
+/// sample it seeks to (audio interleaved ahead of video). A segment made
+/// by a run started at it must hold exactly what one made by a run passing
+/// through it holds. What comes before the cut is discarded.
 pub const SEEK_BACK: Duration = Duration::from_secs(2);
 /// Samples in flight between a producer and its run.
 const SINK_CAPACITY: usize = 32;
 /// How much of the film after the receiver's start a preparation makes
-/// ([`crate::ServerHandle::prepare_rendition`]): the slots from the one
-/// the receiver will ask for to the one holding the start plus this, so
-/// it has this much film in hand when it begins to play. Nothing before
-/// that slot: see [`Rendition::prepare`].
+/// ([`crate::ServerHandle::prepare_rendition`]). It makes the slots from
+/// the one the receiver will ask for to the one holding the start plus
+/// this, so the receiver has this much film in hand when it begins to play.
+/// Nothing before that slot is made: see [`Rendition::prepare`].
 pub const PREPARED_AFTER: Duration = Duration::from_secs(6);
 
-/// What the app asks for. Crosses FFI from Dart, so plain data.
+/// What the app asks for. It crosses FFI from Dart, so it is plain data.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RenditionSpec {
-    /// The film's duration, from mpv: how many segments there are.
+    /// The film's duration, from mpv. It sets how many segments there are.
     pub duration_ms: u64,
     /// Target segment length (6000; `docs/design/renditions.md` §6), for a
     /// source without an index, whose slots are estimated on this grid. A
@@ -130,10 +134,10 @@ pub struct RenditionSpec {
     /// (`docs/design/renditions.md`, *A slot per sync sample*), whatever
     /// this says.
     pub segment_ms: u32,
-    /// Where the receiver will be told to start. Production never reads it
-    /// -- the receiver's requests decide what is made -- only a preparation
-    /// does, to ask for the slot the receiver will ask for first
-    /// ([`crate::ServerHandle::prepare_rendition`]).
+    /// Where the receiver will be told to start. Production never reads it,
+    /// because the receiver's requests decide what is made. Only a
+    /// preparation does, to ask for the slot the receiver will ask for
+    /// first ([`crate::ServerHandle::prepare_rendition`]).
     pub start_ms: u64,
     pub video: VideoPlan,
     pub audio: AudioPlan,
@@ -178,7 +182,7 @@ pub enum RenditionState {
     /// No run: none asked for yet, one let go after [`IDLE_RELEASE`], or the
     /// last one reached the end of the film. The next request starts one.
     Idle,
-    /// The rendition cannot go on; `sentence` is what the viewer is shown.
+    /// The rendition cannot go on. `sentence` is what the viewer is shown.
     Failed { sentence: String },
     /// The token is not published (any more): unpublished, the listener
     /// stopped, or never a rendition this server published.
@@ -189,23 +193,23 @@ pub enum RenditionState {
 /// starts in**, as the app asks before it tells the receiver to load
 /// ([`crate::ServerHandle::rendition_readiness`]): the phase a preparation
 /// ([`crate::ServerHandle::prepare_rendition`]) is in. A receiver's first
-/// answer waits for exactly this, and a receiver gives up on a load whose
-/// first answer stays silent too long -- so the app waits here instead,
+/// answer waits for exactly this. A receiver gives up on a load whose
+/// first answer stays silent too long. So the app waits here instead,
 /// where the viewer can see why and cancel.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "phase", rename_all = "camelCase")]
 pub enum RenditionReadiness {
-    /// The first run is reading the source's formats and index -- for a
-    /// Matroska file, its Cues, usually at the end -- and the file's layout
-    /// is not fixed yet: nothing of it can be answered.
+    /// The first run is reading the source's formats and index (for a
+    /// Matroska file, its Cues, usually at the end). The file's layout is
+    /// not fixed yet, so nothing of it can be answered.
     Index,
     /// The layout is fixed, so the header (`ftyp`, `moov`, `sidx`) is
-    /// answerable; the slot the receiver starts in is being made.
+    /// answerable. The slot the receiver starts in is being made.
     Start,
-    /// The slot the receiver starts in is made: told to load now, the
-    /// receiver's first requests are answered at once.
+    /// The slot the receiver starts in is made. If the receiver is told to
+    /// load now, its first requests are answered at once.
     Ready,
-    /// The rendition cannot go on; `sentence` is what the viewer is shown.
+    /// The rendition cannot go on. `sentence` is what the viewer is shown.
     Failed { sentence: String },
     /// Not published (any more), or not a rendition.
     Ended,
@@ -254,13 +258,13 @@ impl TrackFormat {
 }
 
 /// **One sync sample of the source's video, where the source's index puts
-/// it**: what a rendition's byte layout mirrors (`layout.rs`). The producer
-/// reports the index once, when [`Job::wants_index`] asks, before its first
-/// sample ([`SampleSink::index`]).
+/// it.** A rendition's byte layout mirrors these (`layout.rs`). The
+/// producer reports the index once, when [`Job::wants_index`] asks, before
+/// its first sample ([`SampleSink::index`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IndexEntry {
-    /// Presentation time, microseconds on the film's clock -- the clock the
-    /// samples are on.
+    /// Presentation time, in microseconds on the film's clock (the clock
+    /// the samples are on).
     pub pts_us: i64,
     /// The byte in the source where the sync sample begins (or the
     /// container unit that begins with it).
@@ -277,8 +281,8 @@ pub struct Sample {
     pub data: Bytes,
 }
 
-/// The run is gone -- unpublished, superseded by a seek, let go while
-/// idle, or failed -- and the producer should stop.
+/// The run is gone, and the producer should stop. It was unpublished,
+/// superseded by a seek, let go while idle, or it failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stopped;
 
@@ -303,12 +307,12 @@ impl std::fmt::Display for ProducerRefusal {
 impl std::error::Error for ProducerRefusal {}
 
 /// **What the server asks the embedder**: turn a reader over a media id
-/// into encoded samples, from a time. Installed once
+/// into encoded samples, from a time. It is installed once
 /// ([`crate::ServerHandle::install_producer`]).
 pub trait Producer: Send + Sync + 'static {
     /// Begin a run and return at once. The run reads `job.reader` and
     /// writes to `job.sink` **on the producer's own thread**, never the
-    /// caller's (which is the server's runtime); it ends when the sink
+    /// caller's (which is the server's runtime). It ends when the sink
     /// answers [`Stopped`], the reader fails, or the source ends
     /// ([`SampleSink::end`]).
     fn start(&self, job: Job) -> Result<(), ProducerRefusal>;
@@ -316,15 +320,15 @@ pub trait Producer: Send + Sync + 'static {
 
 /// One run's work.
 pub struct Job {
-    /// Opened by the server with the publication's play, as a cast body is:
-    /// the reads are the viewer's playback.
+    /// The server opens it with the publication's play, as a cast body is
+    /// opened. Its reads are the viewer's playback.
     pub reader: MediaReader,
     pub spec: RenditionSpec,
     /// Start here: [`SEEK_BACK`] before the cut of the first segment the
-    /// run makes. The producer starts at the sync sample at or before it;
-    /// the server discards what precedes the cut.
+    /// run makes. The producer starts at the sync sample at or before it.
+    /// The server discards what precedes the cut.
     pub from: Duration,
-    /// The rendition's layout is not fixed yet: report the source's index
+    /// The rendition's layout is not fixed yet. Report the source's index
     /// ([`SampleSink::index`]) before the first sample, if it has one.
     pub wants_index: bool,
     pub sink: SampleSink,
@@ -348,20 +352,20 @@ pub(crate) struct SinkShown {
     blocked: AtomicBool,
 }
 
-/// **A run's way back into the server.** Blocking, for a foreign thread, in
-/// [`MediaReader`]'s mould: called from inside a tokio runtime it answers
-/// [`Stopped`] rather than block a worker.
+/// **A run's way back into the server.** It blocks, for a foreign thread,
+/// in [`MediaReader`]'s mould. Called from inside a tokio runtime, it
+/// answers [`Stopped`] rather than block a worker.
 ///
 /// A producer reports every track's format ([`Self::format`]) before its
-/// first sample: the formats are taken as they stand at the first sample.
+/// first sample. The formats are taken as they stand at the first sample.
 pub struct SampleSink {
     tx: mpsc::Sender<SinkMessage>,
     stop: CancellationToken,
     shown: Arc<SinkShown>,
 }
 
-/// A probe on a sink, for the tests of the lookahead: whether the producer
-/// is blocked in it right now.
+/// A probe on a sink, for the tests of the lookahead. It says whether the
+/// producer is blocked in it right now.
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct SinkProbe {
@@ -388,21 +392,21 @@ impl SampleSink {
         self.send(SinkMessage::Format(track, format))
     }
 
-    /// The source's index of the video's sync samples, when
-    /// [`Job::wants_index`] asks -- before the first sample. Without one the
-    /// layout is estimated.
+    /// The source's index of the video's sync samples, before the first
+    /// sample, when [`Job::wants_index`] asks. Without one the layout is
+    /// estimated.
     pub fn index(&self, entries: Vec<IndexEntry>) -> Result<(), Stopped> {
         self.send(SinkMessage::Index(entries))
     }
 
-    /// One access unit. Blocks while the run is its lookahead
-    /// ([`LOOKAHEAD_TIME`]) ahead of the last request (the pause), and answers [`Stopped`] once
-    /// the run is dropped.
+    /// One access unit. It blocks while the run is its lookahead
+    /// ([`LOOKAHEAD_TIME`]) ahead of the last request (the pause). It
+    /// answers [`Stopped`] once the run is dropped.
     pub fn sample(&self, sample: Sample) -> Result<(), Stopped> {
         self.send(SinkMessage::Sample(sample))
     }
 
-    /// The source ended: the last segment is whatever is buffered.
+    /// The source ended. The last segment is whatever is buffered.
     pub fn end(self) {
         let _ = self.send(SinkMessage::End);
     }
@@ -443,22 +447,23 @@ impl SampleSink {
     }
 }
 
-/// When a request reached a run, and so when the run goes idle: tokio's
-/// clock, because the run task sleeps until that deadline with
+/// When a request reached a run, and so when the run goes idle. It is on
+/// tokio's clock. The run task sleeps until that deadline with
 /// `tokio::time::sleep_until` and then asks whether it has passed
-/// (`run.rs`'s `drive`), and a `std` reading there disagrees with the
-/// sleep under paused tokio time. Outside a paused test the two read the
-/// same. The speed rule's busy time is the producer threads' real work,
+/// (`run.rs`'s `drive`). A `std` reading there disagrees with the sleep
+/// under paused tokio time. Outside a paused test the two read the same.
+/// The speed rule's busy time is the producer threads' real work. It is
 /// measured and compared on `std` alone (`speed.rs`), and never slept on.
 pub(crate) type RequestInstant = tokio::time::Instant;
 
-/// Now, on [`RequestInstant`]'s clock: what the request edges
-/// ([`Rendition::slot`], `start_run`, `freeze`) hand `Inner::note_request`.
+/// Now, on [`RequestInstant`]'s clock. The request edges
+/// ([`Rendition::slot`], `start_run`, `freeze`) hand it to
+/// `Inner::note_request`.
 pub(crate) fn request_now() -> RequestInstant {
     tokio::time::Instant::now()
 }
 
-/// The durations a rendition runs by, settable for the tests so a release
+/// The durations a rendition runs by. The tests can set them, so a release
 /// or a speed window is not a minute of a test's life.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -468,7 +473,7 @@ pub struct RenditionTuning {
     /// The ring's cap in bytes ([`RING_CAP`]).
     pub ring_cap: usize,
     /// How much of the film a run makes past its last request
-    /// ([`LOOKAHEAD_TIME`]); never fewer than [`LOOKAHEAD`] slots.
+    /// ([`LOOKAHEAD_TIME`]). It is never fewer than [`LOOKAHEAD`] slots.
     pub lookahead: Duration,
 }
 
@@ -497,7 +502,7 @@ pub struct RenditionProbe {
     pub live_runs: usize,
     /// The slots in the ring.
     pub ring: Vec<u64>,
-    /// Whether the layout -- and with it the init segment -- is frozen.
+    /// Whether the layout (and with it the init segment) is frozen.
     pub init: bool,
     /// The file's length, once the layout is frozen.
     pub total: Option<u64>,
@@ -511,8 +516,8 @@ pub struct RenditionProbe {
 
 /// **What a rendition has made, and where**, for the app's cast panel
 /// ([`crate::cast::CastNumbers`]): what is sent, the layout, the live runs,
-/// and counts that only grow. No rate and no clock: the app takes two and
-/// divides by the time between them.
+/// and counts that only grow. It has no rate and no clock. The app takes
+/// two and divides by the time between them.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RenditionNumbers {
@@ -520,31 +525,30 @@ pub struct RenditionNumbers {
     /// copied or converted.
     pub video: VideoPlan,
     pub audio: AudioPlan,
-    /// What the first run reported it makes, once it has: the tracks the
-    /// init segment describes.
+    /// What the first run reported it makes, once it has. These are the
+    /// tracks the init segment describes.
     pub video_out: Option<TrackOut>,
     pub audio_out: Option<TrackOut>,
     /// The file's layout, once the first run has fixed it.
     pub layout: Option<LayoutNumbers>,
     /// The runs live now.
     pub runs: Vec<RunNumbers>,
-    /// Runs begun since the publish: one more for every seek that started
-    /// one, every restart after an idle release.
+    /// Runs begun since the publish. It is one more for every seek that
+    /// started one, and for every restart after an idle release.
     pub runs_started: u64,
     /// Slots made since the publish, every making counted (a slot dropped
     /// from the ring and asked for again is made again), and the film
     /// they hold, in milliseconds.
     pub slots_made: u64,
     pub film_made_ms: u64,
-    /// The slot the receiver last asked for -- the first slot of a range,
-    /// or one a range read on into -- and where it begins on the film's
-    /// clock.
+    /// The slot the receiver last asked for (the first slot of a range, or
+    /// one a range read on into), and where it begins on the film's clock.
     pub asked_slot: Option<u64>,
     pub asked_ms: Option<u64>,
     /// The last slot of the unbroken run of slots in the ring from
-    /// [`Self::asked_slot`] on, and where it ends on the film's clock: how
-    /// far ahead of the receiver the film is made. `None` when the slot
-    /// asked for is not in the ring.
+    /// [`Self::asked_slot`] on, and where it ends on the film's clock. This
+    /// is how far ahead of the receiver the film is made. `None` when the
+    /// slot asked for is not in the ring.
     pub made_to: Option<u64>,
     pub made_to_ms: Option<u64>,
 }
@@ -617,24 +621,24 @@ pub struct RunNumbers {
 pub enum NotServed {
     /// Past the last slot.
     NotFound,
-    /// The rendition failed; the sentence.
+    /// The rendition failed, with the sentence.
     Failed(String),
     /// The publication was cut while the request waited.
     Cut,
 }
 
 /// What a request for a slot is (`docs/design/renditions.md` §2.8). A
-/// slot in the ring is answered; one a live run will make within its
-/// lookahead is waited for (the request **joins** that run); otherwise the
-/// request starts a run there when fewer than [`MAX_RUNS`] are live -- two
-/// readers far apart each get their own -- and, with every run taken,
-/// replaces one **nobody is waiting on** (the least recently asked), or --
-/// a [`Ask::Seek`] on its first look -- any, the least recently asked. A
-/// request waited on is never taken from, so two readers never take the
-/// runs from each other in turn; a request that may do none of this waits.
-/// **Nothing else makes a slot**: production is the receiver's requests --
-/// or a preparation making the ones the receiver will ask first, through
-/// this same path -- and never where a player was told to start.
+/// slot in the ring is answered. A slot a live run will make within its
+/// lookahead is waited for (the request **joins** that run). Otherwise the
+/// request starts a run there when fewer than [`MAX_RUNS`] are live, so two
+/// readers far apart each get their own. With every run taken, it replaces
+/// one **nobody is waiting on** (the least recently asked). An
+/// [`Ask::Seek`] on its first look replaces any, the least recently asked.
+/// A request waited on is never taken from, so two readers never take the
+/// runs from each other in turn. A request that may do none of this waits.
+/// **Nothing else makes a slot.** Production is the receiver's requests,
+/// or a preparation making the ones the receiver will ask first through
+/// this same path. It is never where a player was told to start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ask {
     /// The first slot of a range the receiver chose.
@@ -644,7 +648,7 @@ pub enum Ask {
 }
 
 /// A request counted in its run's waiters while it waits for that run to
-/// make its slot; uncounted when it stops waiting, however it stops.
+/// make its slot. It is uncounted when it stops waiting, however it stops.
 struct Joined {
     rendition: Arc<Rendition>,
     run: Option<u64>,
@@ -693,14 +697,14 @@ enum Start {
 }
 
 impl Ask {
-    /// What a range asks for the slot after this one: it reads on into it.
+    /// What a range asks for the slot after this one. It reads on into it.
     pub(crate) fn then(self) -> Self {
         Ask::Continue
     }
 
-    /// What a request may do (see [`Ask`]): on its `first` look or later,
-    /// with `live` runs live, of which `unwaited` have nobody waiting on
-    /// them.
+    /// What a request may do (see [`Ask`]). It is on its `first` look or
+    /// later, with `live` runs live, of which `unwaited` have nobody
+    /// waiting on them.
     fn start(self, first: bool, live: usize, unwaited: usize) -> Start {
         if live < MAX_RUNS {
             Start::Beside
@@ -717,16 +721,16 @@ impl Ask {
 /// A live run, as a request sees it.
 pub(crate) struct RunSlot {
     generation: u64,
-    /// The slot it began at; for the run that freezes the layout, known
-    /// once it has.
+    /// The slot it began at. For the run that freezes the layout, it is
+    /// known once that run has frozen it.
     from: u64,
     /// The slot in production: the lowest not yet in the ring.
     next_out: u64,
-    /// The last slot a request asked of it -- the lookahead counts from
-    /// here -- and when.
+    /// The last slot a request asked of it, and when. The lookahead counts
+    /// from here.
     last_request: u64,
     last_request_at: RequestInstant,
-    /// Requests waiting for it to make their slot: while any is, it is not
+    /// Requests waiting for it to make their slot. While any is, it is not
     /// idle, however long the making takes (a source that stalls is waited
     /// for).
     joined: usize,
@@ -746,8 +750,8 @@ impl RunSlot {
 struct SlotPlan {
     /// How each slot made so far ended.
     ends: BTreeMap<u64, slots::End>,
-    /// Slots a run was started at before the slot ahead of them was made:
-    /// their start is their own segment's beginning, decided.
+    /// Slots a run was started at before the slot ahead of them was made.
+    /// Their start is decided as their own segment's beginning.
     fixed: std::collections::BTreeSet<u64>,
 }
 
@@ -763,8 +767,8 @@ impl SlotPlan {
         }
     }
 
-    /// Whether slot `slot`'s start is decided: the slot before it was made,
-    /// or a run started at it.
+    /// Whether slot `slot`'s start is decided. It is when the slot before
+    /// it was made, or when a run started at it.
     fn decided(&self, slot: u64) -> bool {
         self.fixed.contains(&slot)
             || slot
@@ -776,7 +780,7 @@ impl SlotPlan {
 pub(crate) struct Inner {
     formats: Option<mux::Formats>,
     layout: Option<Arc<layout::Layout>>,
-    /// Each slot's fragment, by slot; the padding is not kept.
+    /// Each slot's fragment, by slot. The padding is not kept.
     ring: BTreeMap<u64, Bytes>,
     ring_bytes: usize,
     /// The live runs, at most [`MAX_RUNS`].
@@ -804,7 +808,7 @@ impl Inner {
             .find(|run| run.generation == generation)
     }
 
-    /// A request for `slot` reached run `generation`: its lookahead counts
+    /// A request for `slot` reached run `generation`. Its lookahead counts
     /// from there, and it is not idle.
     fn note_request(&mut self, generation: u64, slot: u64, now: RequestInstant) {
         if let Some(run) = self.run_mut(generation) {
@@ -815,8 +819,8 @@ impl Inner {
 
     /// **The last slot of the lookahead from slot `slot`**: the last
     /// whose start is at most [`RenditionTuning::lookahead`] after
-    /// `slot`'s, and never fewer than [`LOOKAHEAD`] slots on -- in slots
-    /// alone before the layout is fixed.
+    /// `slot`'s, and never fewer than [`LOOKAHEAD`] slots on. Before the
+    /// layout is fixed, it is counted in slots alone.
     fn ahead(&self, slot: u64) -> u64 {
         let least = slot + LOOKAHEAD;
         match &self.layout {
@@ -831,15 +835,15 @@ impl Inner {
         slot >= run.next_out && slot <= self.ahead(run.next_out)
     }
 
-    /// Whether `run` made `slot` or is making it: what a request answered
-    /// from the ring moves the lookahead of.
+    /// Whether `run` made `slot` or is making it. A request answered from
+    /// the ring moves the lookahead of that run.
     fn covers(&self, run: &RunSlot, slot: u64) -> bool {
         slot >= run.from && slot <= self.ahead(run.next_out)
     }
 
     /// Whether run `generation` must wait for a request before it makes
-    /// slot `next_out`: it is past the lookahead from the last one asked of
-    /// it, or the ring is full and it is past that.
+    /// slot `next_out`. It must when it is past the lookahead from the last
+    /// slot asked of it, or when the ring is full and it is past that.
     pub(crate) fn gated(&self, generation: u64, next_out: u64) -> bool {
         self.run(generation).is_none_or(|run| {
             next_out > self.ahead(run.last_request)
@@ -847,8 +851,8 @@ impl Inner {
         })
     }
 
-    /// The run a new one takes the place of: the least recently asked --
-    /// of those nobody waits on, when `unwaited_only`.
+    /// The run a new one takes the place of: the least recently asked. With
+    /// `unwaited_only`, only those nobody waits on count.
     fn replaced(&self, unwaited_only: bool) -> Option<usize> {
         self.runs
             .iter()
@@ -859,15 +863,15 @@ impl Inner {
     }
 
     /// When run `generation` is idle: `release` after the last request asked
-    /// of it -- or never, while a request waits for it to make a slot.
+    /// of it. It is never idle while a request waits for it to make a slot.
     pub(crate) fn idle_at(&self, generation: u64, release: Duration) -> Option<RequestInstant> {
         self.run(generation)
             .and_then(|run| (run.joined == 0).then(|| run.last_request_at + release))
     }
 
     /// Over the cap, the slots farthest from where any run is asked go
-    /// first; none at or ahead of a run's last request within its
-    /// lookahead.
+    /// first. None goes that is at or ahead of a run's last request within
+    /// its lookahead.
     fn trim(&mut self) {
         let anchors: Vec<(u64, u64)> = self
             .runs
@@ -915,14 +919,15 @@ pub(crate) struct Rendition {
     spec: RenditionSpec,
     producer: Arc<dyn Producer>,
     tuning: RenditionTuning,
-    /// The publication's cut: every run's stop is a child of it.
+    /// The publication's cut. Every run's stop is a child of it.
     cut: CancellationToken,
     /// What every run's reader reads, counted for the publication.
     pub(crate) source: Arc<crate::media::reader::SourceTally>,
     inner: Mutex<Inner>,
     /// Bumped on every change a request or a run may be waiting for.
     version: watch::Sender<u64>,
-    /// A preparation was asked for ([`Self::begin_prepare`]): once.
+    /// A preparation was asked for ([`Self::begin_prepare`]). It is asked
+    /// for once.
     prepare_begun: AtomicBool,
     /// The preparation made the slot the receiver starts in.
     prepared: AtomicBool,
@@ -1034,41 +1039,41 @@ impl Rendition {
         }
     }
 
-    /// Whether this is the first ask for a preparation: the caller starts
+    /// Whether this is the first ask for a preparation. The caller starts
     /// one ([`Self::prepare`]) only then.
     pub(crate) fn begin_prepare(&self) -> bool {
         !self.prepare_begun.swap(true, Ordering::SeqCst)
     }
 
-    /// **Ask for what the receiver will ask for first, before it does** --
-    /// a simulated receiver, through the same request path as the real
-    /// one, so nothing here produces anything a request would not: the
-    /// header (which waits for the layout: the source's formats and index),
-    /// slot 0 (Chrome's FFmpeg demuxer reads on from the header into the
-    /// first fragment before it seeks), then every slot from the one a
-    /// receiver told to start at `spec.start_ms` jumps to
-    /// ([`layout::Layout::slot_for_time`]) to the one for
+    /// **Ask for what the receiver will ask for first, before it does.**
+    /// This is a simulated receiver, through the same request path as the
+    /// real one, so nothing here produces anything a request would not. It
+    /// asks for the header (which waits for the layout: the source's
+    /// formats and index). Then slot 0 (Chrome's FFmpeg demuxer reads on
+    /// from the header into the first fragment before it seeks). Then every
+    /// slot from the one a receiver told to start at `spec.start_ms` jumps
+    /// to ([`layout::Layout::slot_for_time`]) to the one for
     /// [`PREPARED_AFTER`] after it, in order, so one run makes them all.
     ///
     /// **Nothing before the start's slot.** zond's TV used to ask first for
     /// a slot before it, and for a while the 12 s before the start were
     /// prepared against that. It was Chrome asking from the start of the
-    /// 32 KiB block the slot's first byte was in -- the tail of the slot
-    /// before -- and slots begin on those blocks now
-    /// ([`layout::SLOT_ALIGN`]): three loads on the TV at 123.0 s, 97.3 s
-    /// (the last half second before a key) and 45.0 s each asked for the
-    /// file's start and then this slot, nothing else. Film before the
-    /// start is film a torrent would have to fetch before the cast begins.
-    /// The film after it is a slot in hand once it plays.
+    /// 32 KiB block the slot's first byte was in (the tail of the slot
+    /// before). Slots begin on those blocks now ([`layout::SLOT_ALIGN`]).
+    /// Three loads on the TV at 123.0 s, 97.3 s (the last half second
+    /// before a key) and 45.0 s each asked for the file's start and then
+    /// this slot, nothing else. Film before the start is film a torrent
+    /// would have to fetch before the cast begins. The film after it is a
+    /// slot in hand once it plays.
     ///
-    /// Its first requests then find these in the ring -- held by its cap
-    /// like any slot ([`RING_CAP`]: slot 0 with its run's lookahead and the
-    /// prepared slots with theirs are some 30 s of film, which fit it up to
-    /// some 25 Mbit/s; past that the farthest from the last one asked go
-    /// first). Waits as long as the source takes, as a request does: a run
-    /// with a request waiting on it is never let go, and nothing gives up
-    /// (the viewer cancels by unpublishing, which ends this with
-    /// [`NotServed::Cut`]).
+    /// The receiver's first requests then find these in the ring. The ring
+    /// holds them by its cap like any slot ([`RING_CAP`]). Slot 0 with its
+    /// run's lookahead and the prepared slots with theirs are some 30 s of
+    /// film, which fit the cap up to some 25 Mbit/s. Past that the farthest
+    /// from the last one asked go first. This waits as long as the source
+    /// takes, as a request does. A run with a request waiting on it is
+    /// never let go, and nothing gives up. The viewer cancels by
+    /// unpublishing, which ends this with [`NotServed::Cut`].
     pub(crate) async fn prepare(self: &Arc<Self>, state: &AppState) -> Result<u64, NotServed> {
         let layout = self.layout(state).await?;
         let us = |duration: Duration| i64::try_from(duration.as_micros()).unwrap_or(i64::MAX);
@@ -1096,8 +1101,8 @@ impl Rendition {
     }
 
     /// **What it has made, and where** ([`RenditionNumbers`]), with
-    /// `asked` the slot the receiver last asked for. One look under the
-    /// lock; nothing waits.
+    /// `asked` the slot the receiver last asked for. It takes one look
+    /// under the lock, and nothing waits.
     pub(crate) fn numbers(&self, asked: Option<u64>) -> RenditionNumbers {
         let inner = self.inner();
         let layout = inner.layout.as_deref();
@@ -1191,7 +1196,7 @@ impl Rendition {
         }
     }
 
-    /// Fail the rendition: nothing more is produced, and every request
+    /// Fail the rendition. Nothing more is produced, and every request
     /// waiting is answered with the sentence.
     fn fail(&self, inner: &mut Inner, sentence: String) {
         if inner.failed.is_none() {
@@ -1203,10 +1208,10 @@ impl Rendition {
         }
     }
 
-    /// Start a run -- at `slot` (the seek path), or, with no layout yet, the
-    /// run that will freeze it, from the film's start --
-    /// dropping the least recently asked run if [`MAX_RUNS`] are live (of
-    /// those nobody waits on, when `unwaited_only`). Answers its generation.
+    /// Start a run at `slot` (the seek path). With no layout yet, it is the
+    /// run that will freeze it, from the film's start. It drops the least
+    /// recently asked run if [`MAX_RUNS`] are live (of those nobody waits
+    /// on, when `unwaited_only`). Answers the new run's generation.
     fn start_run(
         self: &Arc<Self>,
         inner: &mut Inner,
@@ -1223,9 +1228,9 @@ impl Rendition {
         let back = i64::try_from(SEEK_BACK.as_micros()).unwrap_or(i64::MAX);
         let (from_us, from_slot) = match (slot, inner.layout.clone()) {
             (Some(slot), Some(layout)) => {
-                // A run is started here: the slot's start is decided now, if
-                // the slot before has not decided it, and the lookahead is
-                // counted from it -- whoever asked last.
+                // A run is started here. The slot's start is decided now, if
+                // the slot before has not decided it. The lookahead is
+                // counted from it, whoever asked last.
                 inner.plan.fixed.insert(slot);
                 let anchor = inner.plan.start(slot).anchor();
                 let from = if anchor == 0 {
@@ -1235,9 +1240,10 @@ impl Rendition {
                 };
                 (from, slot)
             }
-            // The run that fixes the layout, for the file's header: from
-            // the film's start, which is what a reader of the header reads
-            // on into. Never from where a player was told to start.
+            // The run that fixes the layout, for the file's header. It
+            // starts from the film's start, which is what a reader of the
+            // header reads on into. It never starts from where a player was
+            // told to start.
             _ => (0, 0),
         };
         let stop = self.cut.child_token();
@@ -1269,10 +1275,10 @@ impl Rendition {
         generation
     }
 
-    /// **The first sample of a run**: the layout frozen from the first run's
-    /// formats and index -- or, for a later run, its formats checked against
-    /// it -- and where the run's output starts: `start`, or the first slot
-    /// cut at or after `from` for the run that froze the layout. That
+    /// **The first sample of a run.** The first run's formats and index
+    /// freeze the layout. A later run has its formats checked against it.
+    /// It also answers where the run's output starts: `start`, or the first
+    /// slot cut at or after `from` for the run that froze the layout. That
     /// slot's start is decided, and with it the run's first cursor.
     pub(crate) fn freeze(
         &self,
@@ -1333,8 +1339,8 @@ impl Rendition {
         inner.plan.fixed.insert(slot);
         let cursor = inner.plan.start(slot);
         if start.is_none() {
-            // The run that froze the layout, for the header's reader: it
-            // reads on into slot 0.
+            // The run that froze the layout, for the header's reader. That
+            // reader reads on into slot 0.
             if let Some(run) = inner.run_mut(generation) {
                 run.from = slot;
                 run.next_out = slot;
@@ -1346,11 +1352,12 @@ impl Rendition {
         Ok((layout, slot, cursor))
     }
 
-    /// Slot `slot` made by run `generation`: its fragment in the ring, and
-    /// its end recorded the first time -- a spill that a run started at the
-    /// next slot has made impossible since recorded as the truncation it
-    /// keeps the same bytes of. Answers the end recorded -- this one, or the
-    /// one it was first made with -- or `None` when the run is not live.
+    /// Slot `slot` made by run `generation`. Its fragment goes in the ring,
+    /// and its end is recorded the first time. A spill that a run started
+    /// at the next slot has made impossible since is recorded as the
+    /// truncation it keeps the same bytes of. Answers the end recorded
+    /// (this one, or the one it was first made with), or `None` when the
+    /// run is not live.
     pub(crate) fn publish_slot(
         &self,
         generation: u64,
@@ -1375,16 +1382,16 @@ impl Rendition {
         Some(recorded)
     }
 
-    /// **The file's layout**: frozen by the first run's first sample --
-    /// starting that run, from the film's start, if none is live.
+    /// **The file's layout**, frozen by the first run's first sample. If no
+    /// run is live, this starts that run from the film's start.
     pub(crate) async fn layout(
         self: &Arc<Self>,
         state: &AppState,
     ) -> Result<Arc<layout::Layout>, NotServed> {
         let mut seen = self.version.subscribe();
-        // Counted among the first run's waiters while this waits: a run is
-        // never let go while something waits for what it makes, and the
-        // source's index can take minutes behind a thin swarm.
+        // This is counted among the first run's waiters while it waits. A
+        // run is never let go while something waits for what it makes, and
+        // the source's index can take minutes behind a thin swarm.
         let mut joined = Joined {
             rendition: self.clone(),
             run: None,
@@ -1503,17 +1510,17 @@ impl Rendition {
 
     /// Wait for the next change. `false` when nothing can change any more.
     ///
-    /// The cut reaches a waiting request through the run: a request waits
-    /// only with a run live (it starts one if none is), that run's stop is a
-    /// child of the cut, and a run's end always bumps the version -- after
-    /// which the request finds the cut at the top of its loop.
+    /// The cut reaches a waiting request through the run. A request waits
+    /// only with a run live (it starts one if none is), and that run's stop
+    /// is a child of the cut. A run's end always bumps the version. The
+    /// request then finds the cut at the top of its loop.
     async fn wait(&self, seen: &mut watch::Receiver<u64>) -> bool {
         seen.changed().await.is_ok()
     }
 }
 
-/// Where slot `slot` begins on the film's clock: its cut, the first slot
-/// from the film's first sync sample.
+/// Where slot `slot` begins on the film's clock: its cut. The first slot
+/// begins at the film's first sync sample.
 fn slot_start_us(layout: &layout::Layout, slot: u64) -> i64 {
     match slot {
         0 => layout.first_us,
@@ -1545,9 +1552,10 @@ mod tests {
         }
     }
 
-    /// **What a request may start**: with room, a run beside the live ones;
-    /// with every run taken, a seek on its first look in place of any, and
-    /// anything else in place of one nobody waits on -- or nothing.
+    /// **What a request may start.** With room, it starts a run beside the
+    /// live ones. With every run taken, a seek on its first look starts one
+    /// in place of any. Anything else starts one in place of one nobody
+    /// waits on, or nothing.
     #[test]
     fn a_request_starts_a_run_with_room_and_takes_none_waited_on() {
         for ask in [Ask::Seek, Ask::Continue] {
@@ -1599,7 +1607,7 @@ mod tests {
     }
 
     /// **A run is waited on** while a request waits for its making, and
-    /// while it is the first run nobody has asked yet; otherwise another
+    /// while it is the first run nobody has asked yet. Otherwise another
     /// request may take its place.
     #[test]
     fn a_run_is_unwaited_only_with_nobody_waiting() {
@@ -1612,9 +1620,9 @@ mod tests {
         assert!(run.unwaited());
     }
 
-    /// **A run taken in place of is the least recently asked**, and -- for
-    /// a request that may take only an unwaited one -- never one a request
-    /// waits on.
+    /// **A run taken in place of is the least recently asked.** For a
+    /// request that may take only an unwaited one, it is never one a
+    /// request waits on.
     #[test]
     fn the_run_replaced_is_the_least_recently_asked_unwaited() {
         let mut inner = inner_with(&[4, 30], &[], usize::MAX);
@@ -1630,8 +1638,8 @@ mod tests {
         assert_eq!(inner.replaced(true), None);
     }
 
-    /// **The ring keeps what it can hold**, and over its cap drops the
-    /// slots farthest from where any run is asked -- never one a run is
+    /// **The ring keeps what it can hold.** Over its cap it drops the slots
+    /// farthest from where any run is asked. It never drops one a run is
     /// asked at or within its lookahead.
     #[test]
     fn the_ring_drops_the_slots_farthest_from_any_run() {

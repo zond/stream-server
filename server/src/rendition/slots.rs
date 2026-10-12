@@ -1,29 +1,29 @@
 //! **What goes in a slot**, and what happens when it does not fit.
 //!
-//! A slot's size is fixed before anything is produced (`layout.rs`); its
+//! A slot's size is fixed before anything is produced (`layout.rs`). Its
 //! content is its segment's samples, muxed into one fragment, which must
 //! leave [`MIN_PAD`] of the slot over. Mirrored from an index, a segment
-//! fits its slot by construction, up to the headroom; estimated, or with
+//! fits its slot by construction, up to the headroom. Estimated, or with
 //! an index that put a sync sample's cluster well before the sample, it may
-//! not. **The overflow rule**, deterministic so that every byte of the file
-//! is the same however often it is made:
+//! not. **The overflow rule** is deterministic, so that every byte of the
+//! file is the same however often it is made:
 //!
 //! 1. **Spill**: the slot keeps the longest prefix of its samples that
-//!    fits -- cut, in decode order, only where no sample kept is shown
-//!    after a sample left over, so decode times stay in order across the
-//!    two fragments -- and the rest begins the next slot's content, before
-//!    that segment's own samples. Allowed only while the next slot's start
-//!    is not decided yet: nothing of it has been made, and no run has been
-//!    started at it.
-//! 2. **Truncate**, when it is: the same prefix, and what does not fit is
-//!    dropped (logged). The picture freezes for those frames; the file
-//!    stays the file every earlier answer described.
+//!    fits, and the rest begins the next slot's content, before that
+//!    segment's own samples. The prefix is cut, in decode order, only where
+//!    no sample kept is shown after a sample left over, so decode times
+//!    stay in order across the two fragments. A spill is allowed only
+//!    while the next slot's start is not decided yet: nothing of it has
+//!    been made, and no run has been started at it.
+//! 2. **Truncate**, when it is decided: the same prefix, and what does not
+//!    fit is dropped (logged). The picture freezes for those frames. The
+//!    file stays the file every earlier answer described.
 //!
-//! Spilled or truncated, the slot keeps the same prefix -- a function of its
-//! content and its size alone -- so a slot made again, after the ring let it
-//! go or by a run started at it, is the same bytes whichever it is now. What
-//! the first decision fixes is where the next slot starts: the spill's end
-//! ([`Cursor`]), or its own segment's beginning; it is recorded once, by
+//! Spilled or truncated, the slot keeps the same prefix, a function of its
+//! content and its size alone. So a slot made again, after the ring let it
+//! go or by a run started at it, is the same bytes whichever it is now. The
+//! first decision fixes where the next slot starts: the spill's end
+//! ([`Cursor`]), or its own segment's beginning. It is recorded once, by
 //! `Rendition`'s plan, and kept.
 
 use super::layout::MIN_PAD;
@@ -32,8 +32,8 @@ use super::run::Cut;
 use bytes::Bytes;
 use std::collections::BTreeMap;
 
-/// A place in the sequence of segments' samples: the next video sample is
-/// the `video.1`-th of segment `video.0`, the next audio sample the
+/// A place in the sequence of segments' samples. The next video sample is
+/// the `video.1`-th of segment `video.0`, and the next audio sample the
 /// `audio.1`-th of segment `audio.0`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Cursor {
@@ -50,8 +50,8 @@ impl Cursor {
         }
     }
 
-    /// The earliest segment the cursor is in: where a run that makes the
-    /// slot starting here has to start.
+    /// The earliest segment the cursor is in. A run that makes the slot
+    /// starting here has to start there.
     pub(crate) fn anchor(&self) -> u64 {
         self.video.0.min(self.audio.0)
     }
@@ -64,8 +64,8 @@ pub(crate) enum End {
     Natural,
     /// Earlier, where the next slot's content begins.
     Spill(Cursor),
-    /// Earlier, the rest dropped: the first `video` and `audio` samples
-    /// kept.
+    /// Earlier, with the rest dropped. The first `video` and `audio`
+    /// samples are kept.
     Truncated { video: usize, audio: usize },
 }
 
@@ -93,8 +93,8 @@ pub(crate) struct Content {
 }
 
 /// The content of slot `slot` starting at `start`, from the segments a run
-/// made (`segments` holds every one from `start.anchor()` to `slot`; one
-/// missing -- past the film's end -- is empty).
+/// made. `segments` holds every one from `start.anchor()` to `slot`. One
+/// that is missing (past the film's end) is empty.
 pub(crate) fn gather(segments: &BTreeMap<u64, Cut>, start: Cursor, slot: u64) -> Content {
     let mut video = Vec::new();
     let mut audio = Vec::new();
@@ -135,16 +135,16 @@ pub(crate) type Muxer<'a> =
 pub(crate) struct Filled {
     pub end: End,
     pub fragment: Bytes,
-    /// The samples kept, `(video, audio)`: what a spill keeps is what a
-    /// truncation would, so a spill no longer allowed when it is recorded
-    /// is recorded as this truncation, with the same bytes.
+    /// The samples kept, `(video, audio)`. What a spill keeps is what a
+    /// truncation would keep. So a spill no longer allowed when it is
+    /// recorded is recorded as this truncation, with the same bytes.
     pub kept: (usize, usize),
 }
 
 impl Filled {
-    /// The end to record, the next slot's start being `decided` now (or
-    /// there being no next slot): a spill not allowed -- the next slot was
-    /// made, or a run started at it, maybe while this one was filled -- is
+    /// The end to record, with the next slot's start `decided` now (or no
+    /// next slot). A spill is not allowed when the next slot was made, or
+    /// a run started at it, maybe while this one was filled. It is then
     /// the truncation that keeps the same samples, and so the same bytes.
     pub(crate) fn end_now(&self, decided: bool) -> End {
         match self.end {
@@ -193,9 +193,9 @@ impl Content {
     }
 
     /// The prefixes a slot may keep, smallest first, each a `(video, audio)`
-    /// count: video cut only where every sample kept is shown before every
-    /// sample left over, audio up to the first left-over video's time. The
-    /// whole content is last; nothing at all is first.
+    /// count. Video is cut only where every sample kept is shown before
+    /// every sample left over. Audio goes up to the first left-over video's
+    /// time. The whole content is last, and nothing at all is first.
     fn prefixes(&self) -> Vec<(usize, usize)> {
         let mut out = vec![(0, 0)];
         if self.video.is_empty() {
@@ -238,10 +238,10 @@ impl Content {
         }
     }
 
-    /// **Fill a slot of `size` bytes**: everything when it fits; otherwise
-    /// the longest prefix that does, the rest spilled into the next slot --
-    /// or, if that is not allowed when the end is recorded, dropped
-    /// ([`Filled::end_now`]).
+    /// **Fill a slot of `size` bytes**: everything when it fits. Otherwise
+    /// the longest prefix that does, with the rest spilled into the next
+    /// slot. If that is not allowed when the end is recorded, the rest is
+    /// dropped ([`Filled::end_now`]).
     pub(crate) fn fill(&self, size: u64, mux: Muxer<'_>) -> Filled {
         let fits = |fragment: &Bytes| fragment.len() as u64 + MIN_PAD <= size;
         let whole = self.mux_prefix(self.video.len(), self.audio.len(), mux);
@@ -253,8 +253,9 @@ impl Content {
             };
         }
         let prefixes = self.prefixes();
-        // The largest that fits: fragments only grow along the list, the
-        // empty one always fits a slot (SLOT_BASE), the whole one did not.
+        // The largest that fits. Fragments only grow along the list. The
+        // empty one always fits a slot (SLOT_BASE), and the whole one did
+        // not.
         let (mut low, mut high) = (0, prefixes.len() - 1);
         while high - low > 1 {
             let mid = (low + high) / 2;
@@ -287,7 +288,7 @@ mod tests {
     }
 
     /// Segment `index`: video frames at `pts` (decode order), 100 bytes
-    /// each, the first a key; audio every 250 ms of its second, 10 bytes.
+    /// each, the first a key. Audio every 250 ms of its second, 10 bytes.
     fn cut(index: u64, pts: &[i64]) -> Cut {
         let start = index as i64 * 1_000_000;
         Cut {
@@ -305,8 +306,8 @@ mod tests {
         }
     }
 
-    /// A muxer whose fragment is one byte per byte of sample, and whose
-    /// bytes say what was kept: the presentation times, in order.
+    /// A muxer whose fragment is one byte per byte of sample. Its bytes say
+    /// what was kept: the presentation times, in order.
     fn fake(video: &[MuxSample], _: Option<i64>, audio: &[MuxSample], _: Option<i64>) -> Bytes {
         let mut out = Vec::new();
         for sample in video.iter().chain(audio) {
@@ -342,9 +343,10 @@ mod tests {
         assert_eq!(filled.fragment.len(), 440);
     }
 
-    /// **A segment that does not fit spills its end into the next slot**:
-    /// the longest prefix that fits, audio up to the first video left over,
-    /// and the next slot starts there and holds the rest before its own.
+    /// **A segment that does not fit spills its end into the next slot.**
+    /// It keeps the longest prefix that fits, audio up to the first video
+    /// left over. The next slot starts there and holds the rest before its
+    /// own.
     #[test]
     fn an_overflow_spills_into_the_next_slot() {
         let segments = segments(vec![
@@ -368,10 +370,10 @@ mod tests {
         assert_eq!(all.fragment.len(), 4 * 100 + 6 * 10);
     }
 
-    /// **The cut never puts a frame shown earlier after one shown later**:
-    /// with B-frames (decode order I P B B), a prefix may end after the I,
-    /// or after a P's B-frames, never between a P and the B-frames shown
-    /// before it.
+    /// **The cut never puts a frame shown earlier after one shown later.**
+    /// With B-frames (decode order I P B B), a prefix may end after the I,
+    /// or after a P's B-frames. It never ends between a P and the B-frames
+    /// shown before it.
     #[test]
     fn a_spill_cuts_only_between_whole_groups() {
         // I0 P3 B1 B2 | P6 B4 B5, frames at 100 ms.
@@ -397,10 +399,11 @@ mod tests {
         );
     }
 
-    /// **When the next slot's start is decided, the overflow is dropped**:
-    /// the prefix a spill would keep, recorded as truncated -- decided when
-    /// the end is recorded, so a run started at the next slot while this
-    /// one was filled is counted; anything that fitted stays as it is.
+    /// **When the next slot's start is decided, the overflow is dropped.**
+    /// The prefix a spill would keep is recorded as truncated. It is
+    /// decided when the end is recorded, so a run started at the next slot
+    /// while this one was filled is counted. Anything that fitted stays as
+    /// it is.
     #[test]
     fn an_overflow_with_the_next_slot_decided_is_truncated() {
         let segments = segments(vec![cut(3, &[0, 250_000, 500_000, 750_000])]);
@@ -416,7 +419,7 @@ mod tests {
         assert_eq!(whole.end_now(true), End::Natural);
     }
 
-    /// Nothing fits but the empty fragment: everything spills.
+    /// Nothing fits but the empty fragment, so everything spills.
     #[test]
     fn a_slot_too_small_for_one_frame_spills_it_all() {
         let segments = segments(vec![cut(3, &[0, 250_000])]);

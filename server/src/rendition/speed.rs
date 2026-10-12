@@ -1,9 +1,9 @@
 //! **Production speed** (`docs/design/renditions.md` §2.5): media time
-//! written to the sink over the run's busy time, where busy time leaves out
-//! the two waits the producer is not responsible for -- the sink blocking
-//! (the lookahead is full: the receiver is paused or ahead) and the reader
-//! waiting for bytes (the source is slow: a torrent stalling, an origin
-//! taking its time). Both are measured where they happen, on the
+//! written to the sink over the run's busy time. Busy time leaves out the
+//! two waits the producer is not responsible for. One is the sink blocking
+//! (the lookahead is full: the receiver is paused or ahead). The other is
+//! the reader waiting for bytes (the source is slow: a torrent stalling, an
+//! origin taking its time). Both are measured where they happen, on the
 //! producer's thread, by a [`WaitClock`] each.
 //!
 //! Every function here takes `now`: the clock is a parameter.
@@ -58,8 +58,8 @@ pub(crate) struct TooSlow {
 }
 
 /// The media time a sink has been written: the furthest presentation time,
-/// from the first. Measured at the sink, as the samples are written, so a
-/// sample waiting in the channel counts for the producer that made it.
+/// from the first. It is measured at the sink, as the samples are written,
+/// so a sample waiting in the channel counts for the producer that made it.
 #[derive(Default)]
 pub(crate) struct MediaClock {
     inner: Mutex<Option<(i64, i64)>>,
@@ -106,7 +106,7 @@ impl Speed {
         }
     }
 
-    /// The first segment is out: from here on the run is judged, so a
+    /// The first segment is out. From here on the run is judged, so a
     /// codec's start-up is never counted against it.
     pub(crate) fn start(&mut self, busy: Duration, media: Duration) {
         if !self.started {
@@ -115,8 +115,8 @@ impl Speed {
         }
     }
 
-    /// A reading at `busy`, with `media` written: `Some` when the last
-    /// window of busy time made less than its own length of film.
+    /// A reading at `busy`, with `media` written. It answers `Some` when the
+    /// last window of busy time made less than its own length of film.
     pub(crate) fn check(&mut self, busy: Duration, media: Duration) -> Option<TooSlow> {
         if !self.started {
             return None;

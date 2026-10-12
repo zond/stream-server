@@ -1,33 +1,36 @@
 //! **The fMP4 muxer** (`docs/design/renditions.md` §2.2): an init segment
 //! from the tracks' formats, and a media segment from one segment's
-//! samples. Hand-written, because the boxes are a short list and a crate
-//! for them would be a dependency for forty lines of byte layout.
+//! samples. It is hand-written, because the boxes are a short list and a
+//! crate for them would be a dependency for forty lines of byte layout.
 //!
-//! The init segment is `ftyp` + `moov` (`mvhd`, `mvex` with `mehd` and one
-//! `trex` per track, and one `trak` per track: `tkhd`, `mdia` with `mdhd`,
-//! `hdlr` and `minf` -- `vmhd`/`smhd`, `dinf`/`dref`, and an `stbl` whose
-//! only entry is the sample description: `avc1`+`avcC`, `hvc1`+`hvcC` --
-//! the `hvcC` with the SEI messages beside the parameter sets, and a `colr`
-//! after it when the SPS describes its colours -- or `mp4a`+`esds`, every
-//! sample table empty). A media segment is a `styp`
-//! unless it opens at its `sidx` label (see [`media_segment`]), then per
-//! half second of it ([`CHUNK_US`]) a `moof` (`mfhd`, and per track with
-//! samples in the chunk one `traf`: `tfhd` with default-base-is-moof,
-//! `tfdt` version 1, `trun` version 1) + `mdat`, the chunk's picture and
-//! then the sound beside it, so a reader going straight through never
-//! goes back and forth between the two.
+//! The init segment is `ftyp` + `moov`. The `moov` holds `mvhd`, `mvex`
+//! with `mehd` and one `trex` per track, and one `trak` per track. A
+//! `trak` is `tkhd`, then `mdia` with `mdhd`, `hdlr` and `minf`. The
+//! `minf` holds `vmhd`/`smhd`, `dinf`/`dref`, and an `stbl` whose only
+//! entry is the sample description, with every sample table empty. The
+//! description is `avc1`+`avcC`, `hvc1`+`hvcC`, or `mp4a`+`esds`. The
+//! `hvcC` carries the SEI messages beside the parameter sets, with a `colr`
+//! after it when the SPS describes its colours.
+//!
+//! A media segment is a `styp`, unless it opens at its `sidx` label (see
+//! [`media_segment`]). Then comes a `moof` + `mdat` per half second of it
+//! ([`CHUNK_US`]). The `moof` holds `mfhd`, and one `traf` per track with
+//! samples in the chunk: `tfhd` with default-base-is-moof, `tfdt` version
+//! 1, `trun` version 1. The `mdat` holds the chunk's picture and then the
+//! sound beside it, so a reader going straight through never goes back and
+//! forth between the two.
 //!
 //! **Times.** Video is on a 90 kHz clock, and audio too when there is a
 //! picture (its sample rate when there is none), both from the producer's
 //! microseconds. A video sample's decode time is not reported (only a
-//! presentation time is), so the decode times of a slot are its
+//! presentation time is). So the decode times of a slot are its
 //! presentation times sorted, run `D` ([`DECODE_AHEAD_US`], half a second)
-//! ahead and fitted to the slot's span (`slot_dts`), and each sample's
-//! composition offset is the difference, in a version-1 `trun`: never
-//! negative while `D` covers the slot's reordering.
+//! ahead and fitted to the slot's span (`slot_dts`). Each sample's
+//! composition offset is the difference, in a version-1 `trun`. It is
+//! never negative while `D` covers the slot's reordering.
 //!
 //! **Samples** come in Annex-B (start codes) and leave length-prefixed
-//! with four-byte lengths, access unit delimiters dropped; a sample that
+//! with four-byte lengths, access unit delimiters dropped. A sample that
 //! does not begin with a start code is taken as length-prefixed already.
 
 use super::TrackFormat;
@@ -37,50 +40,50 @@ use bytes::Bytes;
 pub(crate) const VIDEO_TIMESCALE: u32 = 90_000;
 
 /// **How far a slot's decode times run ahead of its presentation times**
-/// (`D`): a slot's sync sample decodes this long before it is shown, and
-/// every sample after it in step, so that **no composition offset is ever
+/// (`D`). A slot's sync sample decodes this long before it is shown, and
+/// every sample after it in step. So **no composition offset is ever
 /// negative** while `D` covers a GOP's leading pictures and its reordering.
 ///
 /// That is the whole point of it. FFmpeg shows a picture at its decode
 /// time plus its composition offset plus `dts_shift`, the largest
 /// *negative* offset it has read so far (`mov_update_dts_shift`;
-/// `pkt->pts = pkt->dts + sc->dts_shift + ctts`, n4.4 `mov.c:8011`): one
-/// negative offset anywhere and every picture from there on is late by it,
-/// against a sound that is not. With none, the shift is nothing and a
-/// picture is shown at its decode time plus its offset -- which is also
-/// all the file format says, so a reader that knows nothing of FFmpeg's
-/// shift shows the same.
+/// `pkt->pts = pkt->dts + sc->dts_shift + ctts`, n4.4 `mov.c:8011`). With
+/// one negative offset anywhere, every picture from there on is late by
+/// it, against a sound that is not. With none, the shift is nothing, and a
+/// picture is shown at its decode time plus its offset. That is also all
+/// the file format says, so a reader that knows nothing of FFmpeg's shift
+/// shows the same.
 ///
 /// (Tried and dropped, 2026-10-05: writing every offset `D` too small, so
 /// that FFmpeg's shift is exactly `D` from the film's first `moof` on and
-/// puts it back. Exact in FFmpeg, seeks included -- and half a second out
-/// of step in any reader without the shift, and in FFmpeg itself for a
-/// slot read without the film's first `moof`.)
+/// puts it back. It was exact in FFmpeg, seeks included. It was half a
+/// second out of step in any reader without the shift, and in FFmpeg
+/// itself for a slot read without the film's first `moof`.)
 ///
-/// **What it costs is where a seek lands**: FFmpeg picks a fragment by its
+/// **What it costs is where a seek lands.** FFmpeg picks a fragment by its
 /// label, and a slot's label is its first decode time, `D` before its sync
 /// sample is shown (4.4, the Chromecast's, takes the label *as* that decode
 /// time). So a seek to the last `D` before a sync sample lands on that sync
 /// sample, up to `D` after the time asked for, not on the one before.
 ///
-/// Half a second: twelve frames at 24 a second, more than x264's and
-/// x265's leading pictures and reordering at their defaults. A GOP that
+/// Half a second is twelve frames at 24 a second. That is more than x264's
+/// and x265's leading pictures and reordering at their defaults. A GOP that
 /// needs more has negative offsets for the excess, and FFmpeg shows its
-/// pictures late by it -- never out of order.
+/// pictures late by it, never out of order.
 pub(crate) const DECODE_AHEAD_US: i64 = 500_000;
 
 /// **How long the first part of a slot is**: its first chunk's `moof`
-/// (after the `styp`, when there is one), padded with `free` boxes; the
-/// slot's second part -- the first chunk's `mdat` and every other chunk --
+/// (after the `styp`, when there is one), padded with `free` boxes. The
+/// slot's second part (the first chunk's `mdat` and every other chunk)
 /// begins here, and the `sidx` gives each part a reference of its own.
 ///
-/// FFmpeg's demuxer, seeking, reads the slot's first `moof` and then, as it
-/// seeks each other track to the sync sample, sets where it reads on to
+/// FFmpeg's demuxer, seeking, reads the slot's first `moof`. Then, as it
+/// seeks each other track to the sync sample, it sets where it reads on to
 /// the fragment after that one in its index (`mov_seek_fragment`:
 /// `next_root_atom = frag_index.item[index + 1].moof_offset`, n4.4
 /// `mov.c:8081`). It knows of a slot's later chunks only once it has read
-/// them, so it went on at the next slot and skipped the rest of the one it
-/// landed in -- seconds of picture after every seek, in every version.
+/// them. So it went on at the next slot and skipped the rest of the one it
+/// landed in: seconds of picture after every seek, in every version.
 /// With the second part referenced, the fragment after the first `moof` is
 /// the slot's own second part, and it reads on through the slot.
 pub(crate) const FIRST_PART: usize = 8 * 1024;
@@ -106,8 +109,8 @@ impl Formats {
         if self.video.is_some() { 2 } else { 1 }
     }
 
-    /// The sound's track when there is a picture too: the one an estimated
-    /// layout indexes again, early (see [`super::layout::Layout::new`]).
+    /// The sound's track when there is a picture too. An estimated layout
+    /// indexes it again, early (see [`super::layout::Layout::new`]).
     pub(crate) fn sound_beside_picture(&self) -> Option<u32> {
         (self.video.is_some() && self.audio.is_some()).then(|| self.audio_track_id())
     }
@@ -136,8 +139,8 @@ impl Formats {
     /// The sound's clock: the picture's when there is one, so that every
     /// track counts time alike, or else its sample rate. FFmpeg before 6.0
     /// (commit e1e981c, 2022) places a track the `sidx` does not index by
-    /// comparing its seek time against the indexed track's times unscaled:
-    /// with sound on 48 kHz and picture on 90 kHz, a seek to 85 s placed
+    /// comparing its seek time against the indexed track's times unscaled.
+    /// With sound on 48 kHz and picture on 90 kHz, a seek to 85 s placed
     /// the sound at 45 s, and the Chromecast read on from there.
     fn audio_timescale(&self) -> u32 {
         if self.video.is_some() {
@@ -237,8 +240,9 @@ fn starts_with_start_code(data: &[u8]) -> bool {
     data.starts_with(&[0, 0, 1]) || data.starts_with(&[0, 0, 0, 1])
 }
 
-/// A video sample, length-prefixed: Annex-B's units each behind a four-byte
-/// length, access unit delimiters dropped (H.264 type 9, HEVC type 35).
+/// A video sample, length-prefixed. Each of Annex-B's units goes behind a
+/// four-byte length, and access unit delimiters are dropped (H.264 type 9,
+/// HEVC type 35).
 fn length_prefixed(data: &Bytes, hevc: bool) -> Bytes {
     if !starts_with_start_code(data) {
         return data.clone();
@@ -464,14 +468,14 @@ fn parse_hevc_sps(sps: &[u8]) -> Option<HevcSps> {
 }
 
 /// **The colour description in an HEVC SPS's VUI** (H.265 7.3.2.2 and
-/// E.2.1), read on from just after the bit depths: everything between is
+/// E.2.1), read on from just after the bit depths. Everything between is
 /// walked only to reach it. `None` when the SPS has no VUI, the VUI no
-/// colour description, or the walk runs off the end -- the `hvcC` is still
-/// written, without a `colr`.
+/// colour description, or the walk runs off the end. The `hvcC` is then
+/// still written, without a `colr`.
 ///
-/// It is what tells a receiver an HDR10 film is PQ on BT.2020 (and an HLG
-/// one HLG) from the sample entry, the way a Matroska file says it in its
-/// `Colour` element; the SPS says it too, but a demuxer reading the
+/// It tells a receiver from the sample entry that an HDR10 film is PQ on
+/// BT.2020 (and an HLG one HLG), the way a Matroska file says it in its
+/// `Colour` element. The SPS says it too, but a demuxer reading the
 /// container (FFmpeg's, inside a Cast receiver's Chrome) takes the
 /// container's word.
 fn hevc_vui_colour(bits: &mut Bits, max_sub_layers_minus1: u8) -> Option<Colour> {
@@ -492,7 +496,7 @@ fn hevc_vui_colour(bits: &mut Bits, max_sub_layers_minus1: u8) -> Option<Colour>
     }
     if bits.u(1)? == 1 && bits.u(1)? == 1 {
         // scaling_list_enabled_flag, sps_scaling_list_data_present_flag:
-        // scaling_list_data() (7.3.4); a signed value is as long as an
+        // scaling_list_data() (7.3.4). A signed value is as long as an
         // unsigned one, so `ue` steps over `se` too.
         for size_id in 0..4u32 {
             let step = if size_id == 3 { 3 } else { 1 };
@@ -610,11 +614,10 @@ pub(crate) fn hevc_colr(csd0: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// `hvcC` from the VPS, SPS and PPS in `csd-0`, in Annex-B, and the SEI
-/// messages beside them: a film's mastering display and light levels (an
-/// HDR10 encode's) are often there and nowhere in its samples -- x265
+/// messages beside them. A film's mastering display and light levels (an
+/// HDR10 encode's) are often there and nowhere in its samples. x265
 /// writes them with its headers, which a Matroska file keeps in its
-/// `hvcC` -- so dropping them would leave the receiver's decoder without
-/// them.
+/// `hvcC`. Dropping them would leave the receiver's decoder without them.
 pub(crate) fn hvcc(csd0: &[u8]) -> Result<Vec<u8>, String> {
     let units = annex_b_units(csd0);
     let of_type = |kind: u8| -> Vec<&[u8]> {
@@ -735,7 +738,7 @@ fn audio_entry(sample_rate: u32, channels: u32, config: &[u8]) -> Vec<u8> {
 }
 
 /// The film's length on the movie clock (milliseconds) for the 32-bit
-/// fields of `mvhd` and `tkhd`: some 49 days fit.
+/// fields of `mvhd` and `tkhd`. Some 49 days fit.
 fn movie_duration(duration_ms: u64) -> u32 {
     u32::try_from(duration_ms).unwrap_or(u32::MAX - 1)
 }
@@ -872,7 +875,7 @@ fn trex(track_id: u32) -> Vec<u8> {
 }
 
 /// The init segment: `ftyp` and `moov` for `formats`, the film
-/// `duration_ms` long. An error is the sentence a viewer is shown: a
+/// `duration_ms` long. An error is the sentence a viewer is shown, for a
 /// codec configuration the muxer cannot describe.
 pub(crate) fn init_segment(formats: &Formats, duration_ms: u64) -> Result<Bytes, String> {
     if formats.video.is_none() && formats.audio.is_none() {
@@ -926,9 +929,9 @@ pub(crate) fn init_segment(formats: &Formats, duration_ms: u64) -> Result<Bytes,
 /// file, on `track`'s clock (`timescale`), the first starting at
 /// `earliest` and `first_offset` bytes after this box. Each reference
 /// is `(size, duration)`: a media reference of `size` bytes and
-/// `duration` ticks that starts with a stream access point of unknown type
-/// -- what FFmpeg's MP4 demuxer (the one in a Cast receiver's Chrome) reads
-/// to jump to the slot that holds a time with one `Range`.
+/// `duration` ticks that starts with a stream access point of unknown
+/// type. FFmpeg's MP4 demuxer (the one in a Cast receiver's Chrome) reads
+/// it to jump to the slot that holds a time with one `Range`.
 pub(crate) fn sidx(
     track: u32,
     timescale: u32,
@@ -960,24 +963,23 @@ pub(crate) fn ticks(us: i64, timescale: u32) -> u64 {
 }
 
 /// **How long a stretch of a slot's picture is laid down before the
-/// sound that plays beside it**: a slot's samples go into the file in
-/// chunks this long, each a `moof` and an `mdat` of its own -- the
-/// picture's samples whose decode times fall in the chunk, then the
-/// sound's.
+/// sound that plays beside it.** A slot's samples go into the file in
+/// chunks this long, each a `moof` and an `mdat` of its own. A chunk holds
+/// the picture's samples whose decode times fall in it, then the sound's.
 ///
-/// FFmpeg's MP4 demuxer -- the one in a Cast receiver's Chrome -- takes
-/// the next sample by its byte position while the tracks' next samples are
+/// FFmpeg's MP4 demuxer (the one in a Cast receiver's Chrome) takes the
+/// next sample by its byte position while the tracks' next samples are
 /// within a second of each other, and by time when they are further apart
-/// (`mov_find_next_sample`, `AV_TIME_BASE`), and seeks its reader to the
+/// (`mov_find_next_sample`, `AV_TIME_BASE`). It seeks its reader to the
 /// sample it takes. With a slot's picture whole and then its sound, a
 /// reader went to the sound at the fragment's end every time the picture
-/// got a second ahead, and back: on zond's TV a 7.5 s, 8 MB slot was a new
+/// got a second ahead, and back. On zond's TV a 7.5 s, 8 MB slot was a new
 /// request every half second, and the cast "worked for a second before
 /// failing". Chunked, a reader going straight through finds the next
 /// sample of either track in the next bytes.
 pub(crate) const CHUNK_US: i64 = 500_000;
 
-/// The most chunks a slot is cut into: a slot whose samples span more than
+/// The most chunks a slot is cut into. A slot whose samples span more than
 /// this many [`CHUNK_US`] is cut into chunks a whole multiple of it long,
 /// so the slot's `mfhd` numbers stay its own ([`sequence`]).
 pub(crate) const MAX_CHUNKS: u64 = 4096;
@@ -985,11 +987,11 @@ pub(crate) const MAX_CHUNKS: u64 = 4096;
 /// What one chunk beyond a slot's first costs at most: a `moof` header and
 /// its `mfhd`, per track a `traf` with its `tfhd`, `tfdt` and `trun`
 /// header, and an `mdat` header. A sample's own `trun` entry costs the same
-/// whichever chunk it is in. What the layout reserves per chunk
+/// whichever chunk it is in. The layout reserves this per chunk
 /// ([`super::layout::interleave_room`]).
 pub(crate) const CHUNK_OVERHEAD: u64 = 8 + 16 + 2 * (8 + 16 + 20 + 20) + 8;
 
-/// The `mfhd` sequence number of chunk `chunk` of slot `slot`: increasing
+/// The `mfhd` sequence number of chunk `chunk` of slot `slot`. It increases
 /// through the file, whichever run makes which slot.
 fn sequence(slot: u64, chunk: u64) -> u32 {
     u32::try_from(slot * MAX_CHUNKS + chunk + 1).unwrap_or(u32::MAX)
@@ -1002,7 +1004,7 @@ struct Laid {
     track_id: u32,
     timescale: u32,
     /// Each sample's decode time: the first sample's, then each the one
-    /// before it plus that one's duration -- so a chunk's `tfdt` is exactly
+    /// before it plus that one's duration. So a chunk's `tfdt` is exactly
     /// where the chunk before it ended.
     times: Vec<u64>,
     entries: Vec<(u32, u32, u32, i32)>,
@@ -1045,8 +1047,8 @@ impl Laid {
     }
 }
 
-/// Sync or not, as `trun`'s sample flags say it: a sync sample depends on
-/// nothing; any other depends on others and is not a sync sample.
+/// Sync or not, as `trun`'s sample flags say it. A sync sample depends on
+/// nothing. Any other depends on others and is not a sync sample.
 fn sample_flags(key: bool) -> u32 {
     if key { 0x0200_0000 } else { 0x0101_0000 }
 }
@@ -1058,10 +1060,10 @@ fn lay_video(samples: &[MuxSample], next_pts: Option<i64>, hevc: bool, first_slo
         .collect();
     let ahead = ticks(DECODE_AHEAD_US, VIDEO_TIMESCALE) as i64;
     // Decode times: the presentation times sorted, moved so that the slot's
-    // first sample -- its sync sample, at its label -- decodes `D` before
-    // it is shown, and every other with them; none is after its own
-    // presentation time while `D` covers the leading pictures and the
-    // reordering ([`slot_dts`]: inside the slot's own span).
+    // first sample (its sync sample, at its label) decodes `D` before it is
+    // shown, and every other with them. None is after its own presentation
+    // time while `D` covers the leading pictures and the reordering
+    // ([`slot_dts`]: inside the slot's own span).
     let mut sorted = pts.clone();
     sorted.sort_unstable();
     let lead = match (pts.first(), sorted.first()) {
@@ -1103,39 +1105,40 @@ fn lay_video(samples: &[MuxSample], next_pts: Option<i64>, hevc: bool, first_slo
 }
 
 /// **A slot's decode times**, strictly increasing and inside the slot's
-/// own span: from its first decode time -- its sync sample's presentation
-/// time less `D` (`ahead`), or for the film's first slot that time itself
-/// (nothing decodes before the film starts) -- to before `end`, the next
-/// slot's first decode time (its sync sample's presentation time less `D`,
-/// which the layout's cuts give, whatever run makes which slot).
+/// own span. They run from its first decode time to before `end`. The
+/// first decode time is its sync sample's presentation time less `D`
+/// (`ahead`), or for the film's first slot that time itself (nothing
+/// decodes before the film starts). `end` is the next slot's first decode
+/// time: its sync sample's presentation time less `D`, which the layout's
+/// cuts give, whatever run makes which slot.
 ///
-/// **The rule.** The natural times: the presentation times sorted, moved
-/// so that the first is the slot's first decode time -- one frame apart
-/// where the frames are. They fit while the last is before `end`, and are
-/// kept (the last sample lasts to `end`). They do not fit when the slot
-/// has more samples than frames between its first decode time and the
-/// next slot's: an open GOP whose leading pictures outnumber the next
-/// GOP's (x265 varies them), or the film's first slot, which begins `D`
-/// later than the rest would have it begin. Then the times past a pivot
-/// are drawn in towards it in proportion -- each keeps its share of the
-/// distance from the pivot, so the steps all shrink by one factor -- until
-/// the last is a mean step before `end`:
-/// the pivot is the slot's first decode time, or for the film's first
-/// slot its first chunk's end ([`CHUNK_US`] later), so that the first
-/// `moof` FFmpeg reads -- with the header, the one it takes its average
-/// frame rate from -- keeps the natural steps. Drawn in, a time is earlier
-/// than natural, never later, so no sample decodes later than it would
-/// have; a millisecond apart at least ([`MIN_STEP`]) where rounding or the
-/// first slot's limits below meet.
+/// **The rule.** The natural times are the presentation times sorted, and
+/// moved so that the first is the slot's first decode time. They are one
+/// frame apart where the frames are. They fit while the last is before
+/// `end`, and are then kept (the last sample lasts to `end`). They do not
+/// fit when the slot has more samples than frames between its first decode
+/// time and the next slot's. That happens for an open GOP whose leading
+/// pictures outnumber the next GOP's (x265 varies them), and for the
+/// film's first slot, which begins `D` later than the rest would have it
+/// begin. Then the times past a pivot are drawn in towards it in
+/// proportion, until the last is a mean step before `end`. Each keeps its
+/// share of the distance from the pivot, so the steps all shrink by one
+/// factor. The pivot is the slot's first decode time. For the film's first
+/// slot it is its first chunk's end ([`CHUNK_US`] later). That way the
+/// first `moof` FFmpeg reads keeps the natural steps, since FFmpeg takes
+/// its average frame rate from it, with the header. Drawn in, a time is
+/// earlier than natural, never later, so no sample decodes later than it
+/// would have. Times are a millisecond apart at least ([`MIN_STEP`]) where
+/// rounding or the first slot's limits below meet.
 ///
 /// The film's first slot's natural times are its sorted presentation times
 /// moved back by its reordering, never before its first sample's time (the
-/// first few a millisecond apart from there): none is after its own
+/// first few a millisecond apart from there). None is after its own
 /// sample's presentation time, so none of its offsets is negative. A later
-/// slot is not held to that: while `D` covers its leading pictures and its
-/// reordering its times are before its presentation times anyway, and when
-/// it does not the excess is a negative offset and the picture is shown
-/// late by it (FFmpeg's `dts_shift`) -- never are the times out of order.
+/// slot is not held to that. While `D` covers its leading pictures and its
+/// reordering, its times are before its presentation times anyway. When it
+/// does not, the excess is a negative offset and the picture is shown late
+/// by it (FFmpeg's `dts_shift`). The times are never out of order.
 fn slot_dts(
     pts: &[i64],
     sorted: &[i64],
@@ -1151,8 +1154,8 @@ fn slot_dts(
     let mut dts: Vec<i64> = if first_slot {
         // The film's first slot: the sorted times moved back by its
         // reordering (the most any is after its own sample's presentation
-        // time), so none is after its presentation time and the steps stay
-        // a frame -- what FFmpeg guesses the frame rate from -- but never
+        // time). So none is after its presentation time, and the steps stay
+        // a frame, which FFmpeg guesses the frame rate from. They are never
         // before the first sample's time (the first few then a millisecond
         // apart from there, below).
         let reorder = sorted
@@ -1175,8 +1178,8 @@ fn slot_dts(
         && end > start
     {
         // The first chunk's end: the first natural time at or after it,
-        // which keeps its own time, so the first chunk's durations add up
-        // to its frames' -- no later than halfway to `end`.
+        // no later than halfway to `end`. That time keeps its own time, so
+        // the first chunk's durations add up to its frames'.
         let chunk_end = start + ticks(CHUNK_US, VIDEO_TIMESCALE) as i64;
         let pivot = if first_slot {
             let at = dts.partition_point(|at| *at < chunk_end);
@@ -1205,8 +1208,8 @@ fn slot_dts(
     dts
 }
 
-/// The least two decode times are apart: a millisecond, so that times
-/// read in milliseconds still rise (90 ticks of the 90 kHz clock).
+/// The least two decode times are apart. It is a millisecond, so that
+/// times read in milliseconds still rise (90 ticks of the 90 kHz clock).
 const MIN_STEP: i64 = 90;
 
 fn lay_audio(
@@ -1273,14 +1276,14 @@ fn traf(laid: &Laid, range: std::ops::Range<usize>, data_offset: u32) -> Vec<u8>
 
 /// **A slot's samples cut into chunks** ([`CHUNK_US`]): per chunk, the range
 /// of each laid-out track's samples in it, in the order they go into the
-/// file. A pure function of the samples' times, so the same samples make
-/// the same chunks whichever run made them and wherever it started.
+/// file. It is a pure function of the samples' times, so the same samples
+/// make the same chunks whichever run made them and wherever it started.
 ///
 /// The picture's samples go by their decode time (they stay in decode
-/// order); the sound's by theirs, held within the picture's chunks -- the
+/// order). The sound's go by theirs, held within the picture's chunks. The
 /// sound that begins a segment just before its sync sample (the audio
-/// lead) goes with the sync sample, and sound that runs past the last
-/// picture goes with it -- so no chunk is sound alone while there is a
+/// lead) goes with the sync sample. Sound that runs past the last picture
+/// goes with that picture. So no chunk is sound alone while there is a
 /// picture. Chunks are [`CHUNK_US`] long on the film's clock, or a whole
 /// multiple of it when the samples would make more than [`MAX_CHUNKS`].
 fn chunks(laid: &[Laid]) -> Vec<Vec<std::ops::Range<usize>>> {
@@ -1344,18 +1347,19 @@ fn chunks(laid: &[Laid]) -> Vec<Vec<std::ops::Range<usize>>> {
         .collect()
 }
 
-/// Slot `slot`'s fragment: its samples -- the video in decode order -- as
-/// a `moof` and an `mdat` per chunk ([`chunks`]), each `mdat` the chunk's
-/// picture and then its sound, after a `styp` unless the slot opens
-/// `at_label` -- its first samples at the time its slot's `sidx` reference
-/// says. `next_*` is the presentation time of the track's first sample
-/// after this slot, when it is known, which is the last sample's duration.
+/// Slot `slot`'s fragment: its samples (the video in decode order) as a
+/// `moof` and an `mdat` per chunk ([`chunks`]). Each `mdat` is the chunk's
+/// picture and then its sound. A `styp` goes first unless the slot opens
+/// `at_label`, with its first samples at the time its slot's `sidx`
+/// reference says. `next_*` is the presentation time of the track's first
+/// sample after this slot, when it is known, which is the last sample's
+/// duration.
 ///
 /// **A `moof` per chunk, not a `trun` per chunk in one `moof`.** FFmpeg
 /// records, per fragment and track, where its samples begin in the index
-/// as each `trun` is read, so with several `trun`s it records the last
-/// one's; a fragment read later from earlier in the file -- a seek back to
-/// a slot not read before -- is put in front of that last `trun`, in the
+/// as each `trun` is read. So with several `trun`s it records the last
+/// one's. A fragment read later from earlier in the file (a seek back to
+/// a slot not read before) is put in front of that last `trun`, in the
 /// middle of the slot read before it, and the index is out of order
 /// (`mov_read_trun`, 4.4 to master). A `moof` per chunk is a fragment per
 /// chunk, each recorded where it begins. The slot's first `moof` is at the
@@ -1365,21 +1369,22 @@ fn chunks(laid: &[Laid]) -> Vec<Vec<std::ops::Range<usize>>> {
 /// and only then. FFmpeg keeps one fragment-index entry per offset, the
 /// `sidx`'s reference and each `moof` it reads:
 ///
-/// * apart (a `styp` first), they are two entries for one fragment, and
-///   after a seek to it every version (4.4 to master) parsed its `moof`
-///   twice -- seeking the second stream picks the `moof`'s own entry,
-///   unread -- doubling its samples in the index. A later seek back to a
-///   fragment read neither at the start nor since then lost the index's
-///   order and landed at the end of what was read at the start: zond's
-///   TV, back to 0:43 after seeks to 1:55, 7:05 and 8:41, read fragment
-///   after fragment, buffering.
+/// * apart (a `styp` first), they are two entries for one fragment. After
+///   a seek to it, every version (4.4 to master) parsed its `moof` twice,
+///   doubling its samples in the index: seeking the second stream picks
+///   the `moof`'s own entry, unread. A later seek back to a fragment read
+///   neither at the start nor since then lost the index's order. It landed
+///   at the end of what was read at the start. zond's TV, back to 0:43
+///   after seeks to 1:55, 7:05 and 8:41, read fragment after fragment,
+///   buffering.
 /// * together, FFmpeg up to 4.4 (the TV's Chrome 92) takes the fragment's
 ///   decode time from the `sidx` label, not the `tfdt` (5.0 added
-///   `use_tfdt`, on by default). Right when the label is the segment's
-///   start -- a mirrored layout's cut -- and wrong otherwise: an estimated
-///   layout labels its slots a GOP late (and its sound early), and a slot
-///   that opens with what the slot before spilled opens before its cut.
-///   The later chunks' `moof`s have no label and are read by their `tfdt`.
+///   `use_tfdt`, on by default). That is right when the label is the
+///   segment's start (a mirrored layout's cut), and wrong otherwise. An
+///   estimated layout labels its slots a GOP late (and its sound early).
+///   A slot that opens with what the slot before spilled opens before its
+///   cut. The later chunks' `moof`s have no label and are read by their
+///   `tfdt`.
 pub(crate) fn media_segment(
     formats: &Formats,
     slot: u64,
@@ -1413,8 +1418,9 @@ pub(crate) fn media_segment(
         // Nothing at all: a `moof` with only its `mfhd`, and an empty `mdat`.
         chunks.push(Vec::new());
     }
-    // The first chunk's `moof` must fit the slot's first part: at most
-    // FIRST_SAMPLES of a track's samples in it, the rest a chunk of their own.
+    // The first chunk's `moof` must fit the slot's first part. It holds at
+    // most FIRST_SAMPLES of a track's samples, and the rest are a chunk of
+    // their own.
     let first = chunks[0].clone();
     if first.iter().any(|range| range.len() > FIRST_SAMPLES) {
         let kept: Vec<std::ops::Range<usize>> = first
@@ -1441,8 +1447,8 @@ pub(crate) fn media_segment(
             .zip(ranges.iter().cloned())
             .filter(|(_, range)| !range.is_empty())
             .collect();
-        // The moof's size does not depend on the offsets written into it,
-        // so lay it out once with zeros to learn it, then with the offsets.
+        // The moof's size does not depend on the offsets written into it.
+        // So lay it out once with zeros to learn it, then with the offsets.
         let sized: usize = 8
             + mfhd.len()
             + tracks
@@ -1555,11 +1561,11 @@ mod tests {
     }
 
     /// x265's headers for a 320x240 Main 10 HDR10 encode (BT.2020, PQ,
-    /// a mastering display and light levels), as `csd-0` carries them: the
-    /// VPS, the SPS -- whose VUI says BT.2020 primaries (9), PQ (16), the
-    /// BT.2020 non-constant matrix (9), limited range -- the PPS, and the
-    /// two SEI messages x265 writes with its headers (light levels, then
-    /// the mastering display).
+    /// a mastering display and light levels), as `csd-0` carries them. They
+    /// are the VPS, the SPS, the PPS, and the two SEI messages x265 writes
+    /// with its headers (light levels, then the mastering display). The
+    /// SPS's VUI says BT.2020 primaries (9), PQ (16), the BT.2020
+    /// non-constant matrix (9), and limited range.
     const X265_HDR10_CSD: &[u8] = &[
         0, 0, 0, 1, 0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x02, 0x20, 0x00, 0x00, 0x03, 0x00, 0x90,
         0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c, 0x95, 0x98, 0x09, 0, 0, 0, 1, 0x42, 0x01,
@@ -1573,7 +1579,8 @@ mod tests {
     ];
 
     /// x265's SPS for 320x240 Main, BT.709 in full range, eight B-frames
-    /// in a pyramid and six references: more reference picture sets to walk.
+    /// in a pyramid and six references. It has more reference picture sets
+    /// to walk.
     const X265_709_FULL_SPS: &[u8] = &[
         0, 0, 0, 1, 0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03,
         0x00, 0x00, 0x03, 0x00, 0x3c, 0xa0, 0x0a, 0x08, 0x0f, 0x16, 0x59, 0xd8, 0xa9, 0x24, 0xca,
@@ -1583,8 +1590,8 @@ mod tests {
 
     /// **An HDR10 film's `hvc1` says what it is**: Main 10 and ten bits in
     /// the `hvcC`, the two SEI messages kept beside the parameter sets, and
-    /// a `colr` with the VUI's colour description -- what a receiver's
-    /// demuxer reads to show PQ as PQ.
+    /// a `colr` with the VUI's colour description. A receiver's demuxer
+    /// reads that to show PQ as PQ.
     #[test]
     fn an_hdr10_hvcc_keeps_its_sei_and_its_colours_go_in_a_colr() {
         let hvcc = hvcc(X265_HDR10_CSD).expect("an hvcC");
@@ -1661,10 +1668,10 @@ mod tests {
         }
     }
 
-    /// Decode order I P B B, in a slot after the film's first: the decode
+    /// Decode order I P B B, in a slot after the film's first. The decode
     /// times are the presentation times sorted, `D` early, and each offset
-    /// is the true difference -- never negative, though a B-frame is shown
-    /// before the P-frame decoded ahead of it.
+    /// is the true difference. It is never negative, though a B-frame is
+    /// shown before the P-frame decoded ahead of it.
     #[test]
     fn reordered_video_gets_offsets_that_are_never_negative() {
         let at = 4_000_000;
@@ -1696,9 +1703,9 @@ mod tests {
         assert_eq!(laid.entries[1].2, 0x0101_0000);
     }
 
-    /// Beside a picture the sound counts on the picture's clock: one AAC
+    /// Beside a picture the sound counts on the picture's clock. One AAC
     /// frame with nothing after it lasts 1024 samples there (1920 ticks of
-    /// 90 kHz at 48 kHz); alone it keeps its sample rate.
+    /// 90 kHz at 48 kHz). Alone, the sound keeps its sample rate.
     #[test]
     fn the_sound_counts_on_the_pictures_clock() {
         let aac = |sample_rate| TrackFormat::Aac {
@@ -1763,7 +1770,7 @@ mod tests {
         let segment = media_segment(&formats, 0, true, &[sample(0, true)], None, &audio, None);
         assert_eq!(&segment[4..8], b"moof", "the segment begins with its moof");
         let moof = &segment[..];
-        // The audio traf's trun is the last box in the moof: its data
+        // The audio traf's trun is the last box in the moof. Its data
         // offset is the 4 bytes after its sample count.
         let find = |needle: &[u8]| {
             moof.windows(4)
@@ -1787,9 +1794,9 @@ mod tests {
         );
     }
     /// Every sample of a fragment as a demuxer indexes it: `(track, decode
-    /// time in microseconds, byte position, size)`, read from each `moof`'s
-    /// `traf`s -- the `tfdt`, the `trun`'s durations and sizes, its data
-    /// offset from its own `moof`.
+    /// time in microseconds, byte position, size)`. It is read from each
+    /// `moof`'s `traf`s: the `tfdt`, the `trun`'s durations and sizes, and
+    /// its data offset from its own `moof`.
     fn indexed(fragment: &[u8]) -> Vec<(u32, i64, usize, usize)> {
         let u32_at =
             |data: &[u8], at: usize| u32::from_be_bytes(data[at..at + 4].try_into().unwrap());
@@ -1845,12 +1852,13 @@ mod tests {
     /// **A reader taking a slot's samples as FFmpeg's MP4 demuxer does
     /// reads it front to back** (`mov_find_next_sample`: the next sample by
     /// byte position while the tracks are within a second of each other,
-    /// by time when they are not, and a seek of the reader to it). An 8 s
-    /// slot of an 8 Mbit/s film, picture and sound: laid picture-first,
-    /// such a reader went to the sound at the slot's end every time the
-    /// picture got a second ahead, and back -- a request each on zond's TV,
-    /// every half second. Chunked, every sample it takes begins where the
-    /// one before ended, or a `moof` and `mdat` header later.
+    /// by time when they are not, and a seek of the reader to it). The
+    /// fixture is an 8 s slot of an 8 Mbit/s film, picture and sound. Laid
+    /// picture-first, such a reader went to the sound at the slot's end
+    /// every time the picture got a second ahead, and back. On zond's TV
+    /// that was a request each, every half second. Chunked, every sample it
+    /// takes begins where the one before ended, or a `moof` and `mdat`
+    /// header later.
     #[test]
     fn ffmpegs_reader_takes_a_slot_front_to_back() {
         let formats = Formats {
@@ -1938,7 +1946,7 @@ mod tests {
         );
     }
     /// **A slot longer than 4096 half seconds is cut into longer chunks**,
-    /// so its `mfhd` numbers stay its own: a picture every 0.4 s for 40
+    /// so its `mfhd` numbers stay its own. A picture every 0.4 s for 40
     /// minutes would be 4800 chunks, and slot 7's numbers would run into
     /// slot 8's.
     #[test]
@@ -2025,20 +2033,21 @@ mod tests {
         out
     }
 
-    /// **Every reader shows every picture at its own time** -- modelled, so
-    /// it holds on every CI job: as FFmpeg computes it (`pkt->pts =
-    /// pkt->dts + sc->dts_shift + ctts`, n4.4 `mov.c:8011`, with `dts_shift`
-    /// the largest negative offset read so far, `mov_update_dts_shift`), and
-    /// as the file format says it (decode time plus offset). The film's
-    /// first slot -- a closed GOP with B-frames -- and a later one of an
-    /// open GOP (a CRA, two leading pictures shown before it, B-frames
-    /// after), read straight after it, after a seek, or with nothing of the
-    /// film read before it: no offset is negative, so FFmpeg's shift is
+    /// **Every reader shows every picture at its own time.** This is
+    /// modelled, so it holds on every CI job. It checks the time as FFmpeg
+    /// computes it (`pkt->pts = pkt->dts + sc->dts_shift + ctts`, n4.4
+    /// `mov.c:8011`, with `dts_shift` the largest negative offset read so
+    /// far, `mov_update_dts_shift`), and as the file format says it
+    /// (decode time plus offset). The slots are the film's first slot (a
+    /// closed GOP with B-frames) and a later one of an open GOP (a CRA, two
+    /// leading pictures shown before it, B-frames after). The later one is
+    /// read straight after the first, after a seek, or with nothing of the
+    /// film read before it. No offset is negative, so FFmpeg's shift is
     /// nothing whatever it has read, and both show the source's times.
     /// Each slot's first decode time is its label: the first slot's sync
     /// sample's time, a later slot's less `D`. (With the decode times the
     /// presentation times sorted and nothing more, the B-frames' offsets
-    /// were negative and every picture a frame or two late; started at each
+    /// were negative and every picture a frame or two late. Started at each
     /// slot's sync sample, an open GOP's leading pictures made it three.)
     #[test]
     fn every_reader_shows_every_picture_at_its_own_time() {
@@ -2104,8 +2113,8 @@ mod tests {
                 }
             }
         };
-        // Straight through; the header's read then a seek to the second;
-        // and the second with nothing read before it.
+        // Straight through. The header's read, then a seek to the second.
+        // And the second with nothing read before it.
         read(&[(&slot0, shown(&first)), (&slot1, shown(&open))]);
         read(&[
             (&slot0[..1], shown(&first)[..1].to_vec()),
@@ -2114,8 +2123,8 @@ mod tests {
         read(&[(&slot1, shown(&open))]);
     }
     /// **A slot's first part is always `FIRST_PART` long**: its first
-    /// chunk's `moof` and its padding, the `mdat` right after --
-    /// however many samples the first half second holds: past
+    /// chunk's `moof` and its padding, with the `mdat` right after. This
+    /// holds however many samples the first half second holds. Past
     /// `FIRST_SAMPLES` of a track they go into a chunk of their own.
     #[test]
     fn a_slots_first_part_is_always_the_same_length() {
@@ -2164,16 +2173,16 @@ mod tests {
         assert_eq!(formats.decode_ahead_us(), DECODE_AHEAD_US);
     }
     /// **Decode times only ever increase, across every slot, whatever the
-    /// leading pictures** -- modelled, so it holds on every CI job. An
-    /// open-GOP film of four slots, a second a GOP, whose GOPs have 0, 3,
-    /// 1 and 4 leading pictures (shown before their sync sample, decoded
-    /// after it, so each slot holds its GOP's frames less the next GOP's
-    /// leading pictures, plus its own): each slot's decode times begin `D`
-    /// before its sync sample and end before the next slot's begin, every
-    /// one after the one before -- and every picture is still shown at its
-    /// time, no offset negative. Stepped by the frames from
-    /// each slot's own beginning, the slot of 3 ran 2 frames past the next
-    /// slot's beginning, and the one of 4 left a gap.
+    /// leading pictures.** This is modelled, so it holds on every CI job.
+    /// The fixture is an open-GOP film of four slots, a second a GOP, whose
+    /// GOPs have 0, 3, 1 and 4 leading pictures. Leading pictures are shown
+    /// before their sync sample and decoded after it. So each slot holds
+    /// its GOP's frames less the next GOP's leading pictures, plus its own.
+    /// Each slot's decode times begin `D` before its sync sample and end
+    /// before the next slot's begin, every one after the one before. Every
+    /// picture is still shown at its time, with no offset negative. Stepped
+    /// by the frames from each slot's own beginning, the slot of 3 ran 2
+    /// frames past the next slot's beginning, and the one of 4 left a gap.
     #[test]
     fn decode_times_increase_across_slots_whatever_the_leading_pictures() {
         let formats = Formats {
@@ -2233,14 +2242,14 @@ mod tests {
         }
     }
     /// **The film's first slot**: its first sample decodes at its own time,
-    /// no sample after its own presentation time, any two a millisecond
-    /// apart at least -- and its first chunk keeps whole frames' steps once
-    /// past the reordering, though the slot is drawn in by `D` to meet the
-    /// next. A film starting at 21 ms with x264's B-frames (I0 P3 B1 B2
-    /// ...), the next sync sample at 2 s. Stepped by a tick, two decode
-    /// times read in milliseconds were equal and FFmpeg's muxer refused
-    /// them ("4 >= 4"); drawn in from the start, the first chunk's frame
-    /// rate read high.
+    /// no sample after its own presentation time, and any two a millisecond
+    /// apart at least. Its first chunk keeps whole frames' steps once past
+    /// the reordering, though the slot is drawn in by `D` to meet the next.
+    /// The fixture is a film starting at 21 ms with x264's B-frames (I0 P3
+    /// B1 B2 ...), the next sync sample at 2 s. Stepped by a tick, two
+    /// decode times read in milliseconds were equal and FFmpeg's muxer
+    /// refused them ("4 >= 4"). Drawn in from the start, the first chunk's
+    /// frame rate read high.
     #[test]
     fn the_first_slot_decodes_from_its_first_sample_at_whole_steps() {
         let frame = 3600i64;

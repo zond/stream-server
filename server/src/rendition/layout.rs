@@ -6,37 +6,38 @@
 //! the file has to have a length, and every byte of it a value that is the
 //! same however often and from wherever it is asked for, before most of it
 //! has been produced. That is this layout: the header (`ftyp` + `moov` +
-//! `sidx`), then one **slot** per segment, each holding that segment's
+//! `sidx`), then one **slot** per segment. Each slot holds that segment's
 //! fragment (`moof` + `mdat`, after a `styp` unless the slot opens at its
-//! `sidx` label: `mux::media_segment`) padded with `free` boxes to the
-//! slot's end ([`padding`]). Slot sizes are decided here, from the source, and never
-//! change; what goes in a slot is the run's business (`run.rs`), which
-//! makes it fit.
+//! `sidx` label: `mux::media_segment`), padded with `free` boxes to the
+//! slot's end ([`padding`]). Slot sizes are decided here, from the source,
+//! and never change. What goes in a slot is the run's business (`run.rs`),
+//! and the run makes it fit.
 //!
 //! **Mirrored, when the source has an index.** The segments are cut at the
 //! source's own sync samples (the first indexed one at or after each
-//! `k x T`), and slot `k` is as long as the source's bytes from segment
-//! `k`'s sync sample to segment `k+1`'s -- the same samples, so about the
-//! same bytes -- plus [`headroom`]: a fragment carries a `moof` per segment
-//! where a Matroska cluster carries a few bytes per block, and an MP4
-//! source's sample tables are in its `moov`, not beside the samples. The
-//! last slot runs to the source's end. The `sidx` says each slot's length
-//! and the indexed times, so it is exact by construction.
+//! `k x T`). Slot `k` is as long as the source's bytes from segment `k`'s
+//! sync sample to segment `k+1`'s, plus [`headroom`]. These are the same
+//! samples, so about the same bytes. The headroom is there because a
+//! fragment carries a `moof` per segment where a Matroska cluster carries
+//! a few bytes per block, and an MP4 source's sample tables are in its
+//! `moov`, not beside the samples. The last slot runs to the source's end.
+//! The `sidx` says each slot's length and the indexed times, so it is
+//! exact by construction.
 //!
 //! **Estimated, when it has none** (a transport stream, a Matroska file
-//! with no cues): segments on the `k x T` grid, slots in proportion to time
-//! over the source's average bytes per second, [`ESTIMATE_SLACK_PERCENT`]
-//! larger, plus [`SLOT_BASE`].
+//! with no cues). Segments are on the `k x T` grid. Slots are in
+//! proportion to time over the source's average bytes per second,
+//! [`ESTIMATE_SLACK_PERCENT`] larger, plus [`SLOT_BASE`].
 //!
 //! **Every slot after the first begins on a 32 KiB boundary**
-//! ([`SLOT_ALIGN`]), each lengthened by less than a block to end where the
-//! next begins: the block Chrome asks a seek's byte in is then the slot's
-//! own, not the tail of the one before.
+//! ([`SLOT_ALIGN`]). Each is lengthened by less than a block to end where
+//! the next begins. The block Chrome asks a seek's byte in is then the
+//! slot's own, not the tail of the one before.
 //!
 //! **The last [`TAIL_ZEROS`] bytes of every slot are zeros**, whatever the
-//! fragment: a fit leaves at least [`MIN_PAD`] (`run.rs`), and a `free`
-//! box's header is eight bytes. A read of a slot's tail -- a demuxer
-//! peeking at the file's last bytes for an `mfra` size -- is answered
+//! fragment. A fit leaves at least [`MIN_PAD`] (`run.rs`), and a `free`
+//! box's header is eight bytes. A read of a slot's tail (a demuxer
+//! peeking at the file's last bytes for an `mfra` size) is answered
 //! without producing anything.
 
 use super::IndexEntry;
@@ -52,52 +53,53 @@ pub(crate) const HEADROOM_DIVISOR: u64 = 64;
 pub(crate) const ESTIMATE_SLACK_PERCENT: u64 = 15;
 /// How much later than its cut an estimated slot's time in the `sidx` is:
 /// the longest GOP assumed. An estimated segment begins at the first sync
-/// sample at or after its cut -- up to a GOP after it -- and a demuxer that
-/// picks the slot whose time is at or before a target must find a sync
-/// sample at or before the target in it, or it falls back to what it read
-/// before and decodes forward from there (Chrome did, from 24 s to 5:00, on
-/// zond's 10-minute film as a transport stream).
+/// sample at or after its cut, up to a GOP after it. A demuxer picks the
+/// slot whose time is at or before a target. It must find a sync sample at
+/// or before the target in it, or it falls back to what it read before and
+/// decodes forward from there. Chrome did, from 24 s to 5:00, on zond's
+/// 10-minute film as a transport stream.
 pub(crate) const ESTIMATE_LABEL_LATE_US: i64 = 10_000_000;
 /// The bytes at the end of every slot that are always zero.
 pub(crate) const TAIL_ZEROS: u64 = 16;
 /// **Every slot after the first begins on a multiple of this**: the block
 /// Chrome fetches a file in (`kBlockSizeShift`, 32 KiB, in the Chromecast's
 /// Chrome 92 and today's). A demuxer seeking to a slot asks for the byte
-/// its `sidx` says, and Chrome asks the server from the start of the block
-/// that byte is in -- up to 32 KiB before it. Unaligned, that was the end
-/// of the slot before, whose bytes there nothing can say without making it:
-/// every seek on zond's TV asked from a round 32 KiB (`bytes=139886592-`
-/// for a slot some kilobytes on) and the run started a slot early, a whole
-/// GOP made and, from a torrent, fetched before the one wanted. Aligned,
-/// the block the demuxer's byte is in begins at the slot.
+/// its `sidx` says. Chrome asks the server from the start of the block
+/// that byte is in, up to 32 KiB before it. Unaligned, that was the end
+/// of the slot before, and nothing can say those bytes without making
+/// that slot. Every seek on zond's TV asked from a round 32 KiB
+/// (`bytes=139886592-` for a slot some kilobytes on). The run then started
+/// a slot early, and a whole GOP was made (and, from a torrent, fetched)
+/// before the one wanted. Aligned, the block the demuxer's byte is in
+/// begins at the slot.
 pub(crate) const SLOT_ALIGN: u64 = 32 * 1024;
-/// The least room a fragment leaves in its slot: a `free` box's header and
-/// the zero tail.
+/// The least room a fragment leaves in its slot: room for a `free` box's
+/// header and the zero tail.
 pub(crate) const MIN_PAD: u64 = 8 + TAIL_ZEROS;
-/// The length of a `free` box in a run of padding, the last of a run
-/// under twice it ([`padding`]). A demuxer steps over a `free` box, and
-/// libavformat makes of a step past what it holds read -- by more than its
-/// `short_seek_threshold`, 4096 bytes in the 4.4 a Chromecast with Google
-/// TV runs -- a seek; Chrome's reader makes of a seek past what has
-/// arrived a new request. Boxes this short are stepped over by reading,
-/// whatever the padding's length (measured: `tools/lavf-harness`).
+/// The length of a `free` box in a run of padding. The last box of a run
+/// is under twice it ([`padding`]). A demuxer steps over a `free` box.
+/// libavformat turns a step past what it holds read into a seek when the
+/// step is more than its `short_seek_threshold` (4096 bytes in the 4.4 a
+/// Chromecast with Google TV runs). Chrome's reader turns a seek past what
+/// has arrived into a new request. Boxes this short are stepped over by
+/// reading, whatever the padding's length (measured: `tools/lavf-harness`).
 pub(crate) const PAD_BOX: u64 = 1024;
 // The longest step over one, under libavformat 4.4's threshold.
 const _: () = assert!(2 * PAD_BOX - 8 <= 4096);
-/// How far from the film's end an index may stop and still be one: a GOP
+/// How far from the film's end an index may stop and still be one. A GOP
 /// is seconds, so an index that stops minutes short is a few entries a
 /// demuxer added as it read, not the source's index.
 const INDEX_REACH_US: i64 = 60_000_000;
 
-/// **How far apart a mirrored layout's cuts are at least**: a slot is
-/// cut at the first indexed sync sample at or after each `k` x this, so a
+/// **How far apart a mirrored layout's cuts are at least.** A slot is
+/// cut at the first indexed sync sample at or after each `k` x this. So a
 /// film whose sync samples are a second or more apart has **a slot per
-/// sync sample** -- what a seek lands on (FFmpeg's demuxer knows the sync
-/// samples of the fragments it has read, and a seek reads one slot's first
-/// chunk: the slot's start is where it lands) -- and one whose sync
-/// samples are closer has slots of about a second. The spec's segment
-/// length is not used: it was the receiver's landing a whole segment early
-/// (`docs/design/renditions.md`, *A slot per sync sample*).
+/// sync sample**, which is what a seek lands on. FFmpeg's demuxer knows
+/// the sync samples of the fragments it has read, and a seek reads one
+/// slot's first chunk, so the slot's start is where it lands. A film whose
+/// sync samples are closer has slots of about a second. The spec's segment
+/// length is not used. It was why the receiver landed a whole segment
+/// early (`docs/design/renditions.md`, *A slot per sync sample*).
 pub(crate) const MIRROR_GRID_US: i64 = 1_000_000;
 
 /// The most slots a `sidx` can count.
@@ -116,35 +118,35 @@ pub(crate) fn headroom(span: u64) -> u64 {
     SLOT_BASE + span / HEADROOM_DIVISOR
 }
 
-/// **The room a slot's chunks take**, for a segment `duration_us` long:
-/// the muxer lays a slot down as a `moof` and an `mdat` per
-/// [`mux::CHUNK_US`] of decode time (`mux::media_segment`), and a segment
-/// that long touches at most `duration_us / CHUNK_US + 2` chunks, and the
-/// first may be split in two to fit the slot's first part: at most that
-/// many beyond the first, each [`mux::CHUNK_OVERHEAD`] bytes, and the first
-/// part's padding ([`mux::FIRST_PART`]). Exact in the count of headers,
-/// not a share of the bytes: what the samples weigh is the same whichever
-/// chunk they are in.
+/// **The room a slot's chunks take**, for a segment `duration_us` long.
+/// The muxer lays a slot down as a `moof` and an `mdat` per
+/// [`mux::CHUNK_US`] of decode time (`mux::media_segment`). A segment that
+/// long touches at most `duration_us / CHUNK_US + 2` chunks, and the first
+/// may be split in two to fit the slot's first part. So the room is at
+/// most that many beyond the first, each [`mux::CHUNK_OVERHEAD`] bytes,
+/// and the first part's padding ([`mux::FIRST_PART`]). It is exact in the
+/// count of headers, not a share of the bytes. What the samples weigh is
+/// the same whichever chunk they are in.
 pub(crate) fn interleave_room(duration_us: i64) -> u64 {
     let chunks = duration_us.max(0) as u64 / mux::CHUNK_US as u64 + 2;
     chunks * mux::CHUNK_OVERHEAD + mux::FIRST_PART as u64
 }
 
-/// Where the segments are cut and how long each slot is, from the source;
-/// no header yet.
+/// Where the segments are cut and how long each slot is, from the source.
+/// There is no header yet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Plan {
-    /// Segment `k` begins at `cuts[k]` (microseconds, the film's clock):
-    /// its video at the first sync sample at or after it, its audio there.
-    /// `cuts[0]` is [`i64::MIN`]: everything before the second cut is the
-    /// first segment's.
+    /// Segment `k` begins at `cuts[k]` (microseconds, the film's clock).
+    /// Its video begins at the first sync sample at or after it, and its
+    /// audio there. `cuts[0]` is [`i64::MIN`]: everything before the second
+    /// cut is the first segment's.
     pub cuts: Vec<i64>,
     /// Where the first segment's video begins, for the `sidx`.
     pub first_us: i64,
-    /// How much later than its cut each later slot's time in the `sidx` is
-    /// ([`ESTIMATE_LABEL_LATE_US`] for an estimate: its segment's real
-    /// start is not known; none mirrored, where the cut is the sync
-    /// sample).
+    /// How much later than its cut each later slot's time in the `sidx` is.
+    /// It is [`ESTIMATE_LABEL_LATE_US`] for an estimate, whose segment's real
+    /// start is not known. It is none mirrored, where the cut is the sync
+    /// sample.
     pub label_late_us: i64,
     /// Each slot's length in bytes.
     pub sizes: Vec<u64>,
@@ -182,8 +184,8 @@ impl Plan {
         segment_us: i64,
     ) -> Self {
         // Segment k's sync sample: the first candidate at or after k x T,
-        // never one already taken -- a GOP longer than T makes no empty
-        // segment, it makes fewer.
+        // never one already taken. A GOP longer than T makes no empty
+        // segment. It makes fewer.
         let mut chosen: Vec<IndexEntry> = vec![candidates[0]];
         let mut next = 1;
         let mut k = 1i64;
@@ -251,13 +253,14 @@ impl Plan {
     }
 }
 
-/// The entries of `index` a layout can mirror -- sorted by time, each
-/// after the last in the file, inside the source -- or `None` when it is no
-/// index of the whole film: fewer than two, starting or stopping more than
-/// [`INDEX_REACH_US`] from the film's ends (the end: or a twentieth of the
-/// film), or with a gap longer than that between two entries -- the few
-/// entries a demuxer adds while reading or seeking in a file that has none
-/// (a transport stream's seek leaves its start and its end).
+/// The entries of `index` a layout can mirror: sorted by time, each after
+/// the last in the file, inside the source. It is `None` when `index` is
+/// no index of the whole film. That is fewer than two entries, starting or
+/// stopping more than [`INDEX_REACH_US`] from the film's ends (the end: or
+/// a twentieth of the film), or a gap longer than that between two
+/// entries. Those are the few entries a demuxer adds while reading or
+/// seeking in a file that has none (a transport stream's seek leaves its
+/// start and its end).
 pub(crate) fn usable(
     index: &[IndexEntry],
     source_len: u64,
@@ -318,8 +321,8 @@ pub(crate) struct Layout {
     pub exact: bool,
     /// How far after its cut each slot's `sidx` label is (0 mirrored, a GOP
     /// for an estimated layout), and how far before it (the indexed track's
-    /// decode times' run ahead, `D` for a picture): what
-    /// [`Self::slot_for_time`] reads.
+    /// decode times' run ahead, `D` for a picture).
+    /// [`Self::slot_for_time`] reads these.
     pub label_late_us: i64,
     pub label_ahead_us: i64,
     /// Where the first slot's video begins.
@@ -331,20 +334,20 @@ impl Layout {
     /// (a track and its clock, which every track shares, and how far its
     /// decode times run ahead of its presentation times: `D` for a picture,
     /// [`mux::DECODE_AHEAD_US`]), the film `duration_us` long. A slot after
-    /// the first is labelled at its first decode time -- its cut less `D`:
-    /// FFmpeg 4.4 takes the label *as* that time (the at-label rule), so no
-    /// other label shows the slot's first chunk at its own time there. Every
-    /// version picks a slot by its label against the time sought, so a slot
-    /// begins `D` before its sync sample is shown ([`Self::slot_for_time`]).
-    /// An error is the sentence a viewer is shown, for a film no `sidx` can
-    /// describe.
+    /// the first is labelled at its first decode time, which is its cut
+    /// less `D`. FFmpeg 4.4 takes the label *as* that time (the at-label
+    /// rule), so no other label shows the slot's first chunk at its own
+    /// time there. Every version picks a slot by its label against the time
+    /// sought, so a slot begins `D` before its sync sample is shown
+    /// ([`Self::slot_for_time`]). An error is the sentence a viewer is
+    /// shown, for a film no `sidx` can describe.
     ///
     /// An estimated layout indexes `sound` (the sound's track beside a
     /// picture) again, in a second `sidx` labelled at each cut less the
     /// sound's lead, not a GOP late. A seek places the picture on a sync
     /// sample inside the slot its late label picked, which can be before
-    /// that label; FFmpeg then seeks the sound to that sample's time, and
-    /// by the picture's labels that is the slot before -- 6.0 to 8.0
+    /// that label. FFmpeg then seeks the sound to that sample's time, and
+    /// by the picture's labels that is the slot before. FFmpeg 6.0 to 8.0
     /// asked for it (master does not). Labelled early, the sound's slot is
     /// the picture's or a later one, never an earlier.
     pub(crate) fn new(
@@ -382,10 +385,10 @@ impl Layout {
         }
         let earliest = mux::ticks(plan.first_us, timescale);
         let end = mux::ticks(duration_us, timescale).max(earliest);
-        // Two references a slot: its first part, labelled at its time and
-        // lasting to the next slot's, and the rest, lasting nothing --
-        // labelled at the next slot's time, so a seek never picks it, and
-        // there in FFmpeg's index after the first part (`mux::FIRST_PART`).
+        // Two references a slot. The first part is labelled at its time and
+        // lasts to the next slot's. The rest lasts nothing. It is labelled
+        // at the next slot's time, so a seek never picks it, and it is there
+        // in FFmpeg's index after the first part (`mux::FIRST_PART`).
         let refs = |late_us: i64, ahead_us: i64| -> Vec<(u32, u32, bool)> {
             let starts: Vec<u64> = (0..count)
                 .map(|k| {
@@ -398,9 +401,9 @@ impl Layout {
                                 .saturating_sub(ahead_us),
                             timescale,
                         )
-                        // Short of the film's end by a tick a slot still to
-                        // come, so every slot's first part lasts something:
-                        // only a slot's rest lasts nothing.
+                        // Short of the film's end by a tick for each slot
+                        // still to come, so every slot's first part lasts
+                        // something. Only a slot's rest lasts nothing.
                         .clamp(
                             earliest,
                             end.saturating_sub((count - k) as u64).max(earliest),
@@ -472,16 +475,16 @@ impl Layout {
         Some(at as u64 - 1)
     }
 
-    /// **The slot whose `sidx` label is the last at or before `at_us`**:
-    /// what a receiver told to start there asks for -- FFmpeg picks a
-    /// fragment by its label against the time sought
-    /// (`search_frag_timestamp`), nothing taken off it, no composition
-    /// offset being negative. A mirrored slot is labelled `D` before its
-    /// sync sample is shown, so this is the slot holding the time, or the
-    /// next one when the time is in the last `D` before that slot's sync
-    /// sample; an estimated layout's labels are a GOP late, so there it can
-    /// be an earlier one. A preparation makes it and its neighbours before
-    /// the receiver is told to load.
+    /// **The slot whose `sidx` label is the last at or before `at_us`.** A
+    /// receiver told to start there asks for it. FFmpeg picks a fragment by
+    /// its label against the time sought (`search_frag_timestamp`), with
+    /// nothing taken off it, since no composition offset is negative. A
+    /// mirrored slot is labelled `D` before its sync sample is shown. So
+    /// this is the slot holding the time, or the next one when the time is
+    /// in the last `D` before that slot's sync sample. An estimated layout's
+    /// labels are a GOP late, so there it can be an earlier one. A
+    /// preparation makes it and its neighbours before the receiver is told
+    /// to load.
     pub(crate) fn slot_for_time(&self, at_us: i64) -> u64 {
         let label = |cut: &i64| {
             cut.saturating_add(self.label_late_us)
@@ -493,8 +496,8 @@ impl Layout {
         picked.min(self.slots.len() as u64 - 1)
     }
 
-    /// Where slot `slot` begins on the film's clock: its cut, the first
-    /// slot from the film's first sync sample.
+    /// Where slot `slot` begins on the film's clock: its cut. The first
+    /// slot begins at the film's first sync sample.
     fn start_us(&self, slot: u64) -> i64 {
         match slot {
             0 => self.first_us,
@@ -503,16 +506,16 @@ impl Layout {
     }
 
     /// **The last slot that begins at most `ahead_us` after slot `slot`
-    /// does** (`slot` itself at least): how far a run's lookahead reaches
-    /// from it, and a preparation's from a start.
+    /// does** (`slot` itself at least). This is how far a run's lookahead
+    /// reaches from it, and a preparation's from a start.
     pub(crate) fn reach(&self, slot: u64, ahead_us: i64) -> u64 {
         let until = self.start_us(slot).saturating_add(ahead_us);
         let last = (self.cuts.partition_point(|cut| *cut <= until) as u64).saturating_sub(1);
         last.max(slot)
     }
 
-    /// The first slot whose cut is at or after `from_us`: the first a run
-    /// handed samples from `from_us` on can make whole.
+    /// The first slot whose cut is at or after `from_us`. It is the first a
+    /// run handed samples from `from_us` on can make whole.
     pub(crate) fn first_slot_from(&self, from_us: i64) -> u64 {
         if from_us <= 0 {
             return 0;
@@ -529,15 +532,15 @@ fn free_header(size: u64) -> [u8; 8] {
     out
 }
 
-/// How many [`PAD_BOX`]-long boxes `pad` bytes of padding begin with; one
-/// more, the rest, ends them.
+/// How many [`PAD_BOX`]-long boxes `pad` bytes of padding begin with. One
+/// more box, the rest, ends them.
 fn pad_boxes(pad: u64) -> u64 {
     (pad / PAD_BOX).saturating_sub(1)
 }
 
 /// Bytes `from..to` of `pad` bytes of padding (`pad >= 8`, `to <= pad`),
-/// appended to `out`: `free` boxes [`PAD_BOX`] long, the last one the rest
-/// -- under two of them -- and every body zeros.
+/// appended to `out`. The padding is `free` boxes [`PAD_BOX`] long, the
+/// last one the rest (under two of them), and every body zeros.
 pub(crate) fn padding(pad: u64, from: u64, to: u64, out: &mut Vec<u8>) {
     let whole = pad_boxes(pad);
     let mut at = from;
@@ -566,10 +569,10 @@ mod tests {
     const T: i64 = 1_000_000;
 
     /// **Padding is boxes a demuxer reads its way over**: `free` boxes
-    /// that fill it exactly, none two [`PAD_BOX`] long -- libavformat 4.4
+    /// that fill it exactly, none two [`PAD_BOX`] long. libavformat 4.4
     /// seeks over a step past its buffer of more than 4096 bytes, and a
-    /// receiver with nothing buffered then asks again, once a slot -- the
-    /// last holding the zero tail, and any range of it the same bytes.
+    /// receiver with nothing buffered then asks again, once a slot. The
+    /// last box holds the zero tail, and any range of it is the same bytes.
     #[test]
     fn padding_is_short_boxes_whatever_its_length() {
         for pad in [
@@ -622,7 +625,7 @@ mod tests {
 
     /// **Mirrored**: segment k at the first indexed sync sample at or after
     /// k x T, each slot the source's bytes to the next one plus headroom,
-    /// the last to the source's end; a GOP longer than T makes one segment,
+    /// the last to the source's end. A GOP longer than T makes one segment,
     /// not an empty one.
     #[test]
     fn an_index_is_mirrored_slot_by_slot() {
@@ -652,12 +655,12 @@ mod tests {
         );
     }
 
-    /// **Mirrored, a slot per sync sample, whatever the segment length**:
-    /// keys every 2.8 s in 6 s segments are a slot each -- a seek lands on
-    /// a slot's start, so the slot must start at the key before the target
-    /// -- and keys every 0.4 s make slots of about a second, the first key
-    /// at or after each second. A film too long for a `sidx`'s count of
-    /// slots at one a second is cut on a wider grid.
+    /// **Mirrored, a slot per sync sample, whatever the segment length.**
+    /// Keys every 2.8 s in 6 s segments are a slot each. A seek lands on a
+    /// slot's start, so the slot must start at the key before the target.
+    /// Keys every 0.4 s make slots of about a second, at the first key at
+    /// or after each second. A film too long for a `sidx`'s count of slots
+    /// at one a second is cut on a wider grid.
     #[test]
     fn a_mirrored_layout_has_a_slot_per_sync_sample() {
         let keys: Vec<i64> = (0..11).map(|k| k * 2_800_000).collect();
@@ -684,8 +687,8 @@ mod tests {
         assert!(days / mirror_grid(days) < 65_535);
     }
 
-    /// **How far a lookahead reaches**: the last slot beginning within the
-    /// time of the slot it is counted from, that slot at least.
+    /// **How far a lookahead reaches**: to the last slot beginning within
+    /// the time of the slot it is counted from, or that slot at least.
     #[test]
     fn reach_is_the_last_slot_beginning_within_the_time() {
         let keys: Vec<i64> = (0..11).map(|k| 40_000 + k * 2_800_000).collect();
@@ -712,7 +715,7 @@ mod tests {
     }
 
     /// Entries that share a position (several keys in one cluster) or go
-    /// back in the file are not slot starts; entries out of order in time
+    /// back in the file are not slot starts. Entries out of order in time
     /// are sorted first.
     #[test]
     fn only_entries_further_into_the_file_are_candidates() {
@@ -754,7 +757,7 @@ mod tests {
             .collect();
         assert!(usable(&whole, 1 << 30, hour).is_some());
         // What a transport stream's seek leaves: its start and its end, an
-        // hour apart -- no index.
+        // hour apart. That is no index.
         let ends = [entry(0, 0), entry(hour - 50_000_000, 1000)];
         assert!(usable(&ends, 1 << 30, hour).is_none());
         // Nor one that begins a minute in.
@@ -762,7 +765,7 @@ mod tests {
     }
 
     /// **Estimated**: the grid, slots in proportion to time over the
-    /// source's bytes, the slack and the base on top; the last slot is the
+    /// source's bytes, the slack and the base on top. The last slot is the
     /// film's remainder.
     #[test]
     fn no_index_is_estimated_on_the_grid() {
@@ -789,11 +792,11 @@ mod tests {
         u32::from_be_bytes(data[at..at + 4].try_into().unwrap())
     }
 
-    /// **The header is the init segment and a `sidx`** -- version 1, the
-    /// track's clock, the first sync sample's time, offsets from right after
-    /// it -- with one reference per slot: its size, its duration from the
-    /// cuts (the last to the film's end), starting with a SAP. The slots
-    /// follow it back to back, to the total.
+    /// **The header is the init segment and a `sidx`.** The `sidx` is
+    /// version 1, with the track's clock, the first sync sample's time, and
+    /// offsets from right after it. It has one reference per slot: its
+    /// size, its duration from the cuts (the last to the film's end),
+    /// starting with a SAP. The slots follow it back to back, to the total.
     #[test]
     fn the_sidx_references_every_slot() {
         let index: Vec<IndexEntry> = (0..6)
@@ -823,9 +826,9 @@ mod tests {
         assert_eq!(u16::from_be_bytes([sidx[38], sidx[39]]), 12, "two a slot");
         let mut offset = layout.header.len() as u64;
         for (k, size) in sizes.iter().enumerate() {
-            // The slot's first part, then the rest: lasting nothing, no
-            // SAP, there to be the fragment after the first in FFmpeg's
-            // index (`mux::FIRST_PART`).
+            // The slot's first part, then the rest. The rest lasts nothing
+            // and has no SAP. It is there to be the fragment after the first
+            // in FFmpeg's index (`mux::FIRST_PART`).
             let at = 40 + 2 * k * 12;
             let rest = at + 12;
             assert_eq!(
@@ -876,8 +879,8 @@ mod tests {
 
     /// **Every slot after the first begins on a 32 KiB boundary**, so the
     /// block Chrome fetches for the byte a seek asks is the slot's own
-    /// first, not the tail of the slot before: each slot is its plan's
-    /// length and less than a block more, the `sidx` says the lengths as
+    /// first, not the tail of the slot before. Each slot is its plan's
+    /// length and less than a block more. The `sidx` says the lengths as
     /// lengthened, and the last slot ends the file where the plan ends it.
     #[test]
     fn every_slot_after_the_first_begins_on_a_block() {
@@ -937,10 +940,10 @@ mod tests {
 
     /// **The slot a receiver asks first is the one its time's label picks**:
     /// the last slot labelled at or before the time, read back from the
-    /// `sidx` the receiver is handed. Keys at 0.04, 1.04, ... 5.04 s, each
-    /// slot labelled half a second (`D`) before its key: 1.0 s is the first
-    /// slot's (its key at 0.04 s), 1.03 s -- a frame before the second
-    /// key -- and 0.6 s -- in the last `D` before it -- are the second's
+    /// `sidx` the receiver is handed. Keys are at 0.04, 1.04, ... 5.04 s,
+    /// and each slot is labelled half a second (`D`) before its key. 1.0 s
+    /// is the first slot's (its key at 0.04 s). 1.03 s (a frame before the
+    /// second key) and 0.6 s (in the last `D` before it) are the second's
     /// already, and 0.5 s is still the first's.
     #[test]
     fn the_slot_for_a_time_is_the_last_labelled_at_or_before_it() {
@@ -1009,7 +1012,7 @@ mod tests {
         // Two references a slot.
         assert!(layout(plan(32_767, 10_000)).is_ok());
         assert!(layout(plan(32_768, 10_000)).is_err());
-        // The last slot's length is the plan's; one before it may be up
+        // The last slot's length is the plan's. One before it may be up
         // to a block longer, to end where the next begins.
         assert!(layout(plan(1, (1 << 31) - 1)).is_ok());
         assert!(layout(plan(1, 1 << 31)).is_err());
@@ -1017,7 +1020,7 @@ mod tests {
         assert!(layout(plan(2, (1 << 31) - 1)).is_err());
     }
 
-    /// **An estimated slot's time in the `sidx` is a GOP late**: its segment
+    /// **An estimated slot's time in the `sidx` is a GOP late.** Its segment
     /// begins at the first sync sample at or after the cut, so the slot a
     /// demuxer picks for a time must be one that began before it. The times
     /// stop at the film's end.
@@ -1036,8 +1039,8 @@ mod tests {
         let durations: Vec<u32> = (0..5).map(|k| u32_at(sidx, 40 + 2 * k * 12 + 4)).collect();
         // A GOP late less the half second its decode times run ahead (`D`):
         // slot 0 from 0 to 15.5 s, slot 1 from 15.5 to 21.5, ..., slot 3
-        // from 27.5 to the end at 30 less a tick, slot 4 that last tick --
-        // a slot's first part never lasts nothing, which marks its rest.
+        // from 27.5 to the end at 30 less a tick, slot 4 that last tick. A
+        // slot's first part never lasts nothing, which marks its rest.
         assert_eq!(durations, vec![15_500, 6_000, 6_000, 2_499, 1]);
         let mirrored = Plan::new(
             Some(&[entry(0, 0), entry(6 * T + 40_000, 500), entry(12 * T, 900)]),
@@ -1052,9 +1055,9 @@ mod tests {
     }
 
     /// **A slot's room for its chunks' headers**: 160 bytes for each half
-    /// second its segment lasts and two more -- the chunks a segment that
-    /// long can touch less the first, and one the first may be split into
-    /// -- and the slot's first part (`mux::FIRST_PART`).
+    /// second its segment lasts and two more, and the slot's first part
+    /// (`mux::FIRST_PART`). The two more are the chunks a segment that long
+    /// can touch less the first, and one the first may be split into.
     #[test]
     fn a_slot_has_room_for_its_chunks_headers() {
         assert_eq!(mux::CHUNK_OVERHEAD, 160);
