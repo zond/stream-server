@@ -1,14 +1,13 @@
 //! The cache's figures, and the one call that gives its slack back.
 //!
-//! **There is no cleaner here any more, and the module keeps the name it
-//! was given.** Every byte under the torrent-data root has exactly one
-//! owner that knows whether anybody wants it: the torrent engine's
-//! retention passes and the proxy cache's, which delete what nobody is
-//! playing and nobody is reading at the tick, at a switch, on the bell and
-//! at boot. So "clean" is a request to those owners for their slack
-//! ([`drop_slack`]), not a choice of victims, and the figures a client
-//! reads ([`usage`]) come from what the owners say they hold rather than
-//! from a walk of what is there.
+//! **There is no cleaner here any more, and the module keeps the name it was
+//! given.** Every byte under the torrent-data root has exactly one owner that
+//! knows whether anybody wants it. The owners are the torrent engine's
+//! retention passes and the proxy cache's. They delete what nobody is playing
+//! and nobody is reading at the tick, at a switch, on the bell and at boot.
+//! So "clean" is a request to those owners for their slack ([`drop_slack`]),
+//! not a choice of victims. The figures a client reads ([`usage`]) come from
+//! what the owners say they hold, not from a walk of what is there.
 //!
 //! What is left is therefore the wire types ([`CacheUsage`],
 //! [`EvictionReport`]) and the two functions behind
@@ -18,27 +17,26 @@ use crate::cache_budget::CacheLimit;
 use crate::state::AppState;
 
 /// Give back everything nobody is playing and nobody is reading, now, and
-/// report what is left -- what `ServerHandle::clean_cache_now` answers.
+/// report what is left. This is what `ServerHandle::clean_cache_now` answers.
 ///
 /// **A clean is a request to the owners for their slack, not a choice of
-/// victims** (see the module doc for why). This asks both of them for
-/// their slack -- the same passes the tick and the switch run -- and
-/// nothing else is touched: a pin is kept until it is unpinned, and the
-/// window of the one entity being played is kept until something else is.
+/// victims** (see the module doc for why). This asks both of them for their
+/// slack, with the same passes the tick and the switch run. Nothing else is
+/// touched. A pin is kept until it is unpinned, and the window of the one
+/// entity being played is kept until something else is.
 ///
-/// So a clean that frees nothing is the ordinary answer on a device with
-/// one film playing and one pinned, and [`EvictionReport::over_limit`] is
-/// what says the cache is still over its cap. The cap is restated first
+/// So a clean that frees nothing is the ordinary answer on a device with one
+/// film playing and one pinned. [`EvictionReport::over_limit`] is what says
+/// the cache is still over its cap. The cap is restated first
 /// ([`crate::cache_budget::publish_now`]), so the owners are sized against
 /// the volume as the clean left it. The `limit` reported is the one [`usage`]
-/// answers, which is the same rule applied to a different
-/// figure: [`usage`]'s total also counts the bytes no owner's count prices
-/// -- a torrent held in Error, a directory a previous process left, the
-/// staged copies of pieces being written -- and the published cap does
-/// not. With any of those on the disk the reported
-/// limit is larger than the cap the owners are sized against, by up to
-/// those bytes (not when `cacheSize` is what binds), so `over_limit` is
-/// the excess of the whole root and not of what the owners hold.
+/// answers. That is the same rule applied to a different figure. [`usage`]'s
+/// total also counts the bytes no owner's count prices (a torrent held in
+/// Error, a directory a previous process left, the staged copies of pieces
+/// being written), and the published cap does not. With any of those on the
+/// disk, the reported limit is larger than the cap the owners are sized
+/// against, by up to those bytes (not when `cacheSize` is what binds). So
+/// `over_limit` is the excess of the whole root, not of what the owners hold.
 pub(crate) async fn drop_slack(state: &AppState) -> EvictionReport {
     let before = usage(state).await;
     let deleted =
@@ -58,20 +56,20 @@ pub(crate) async fn drop_slack(state: &AppState) -> EvictionReport {
     }
 }
 
-/// **Clear the cache**: stop everything that streams a torrent and take
-/// every byte no download keeps off the disk -- what
-/// `ServerHandle::clear_cache` answers. Not a request for slack, as
-/// [`drop_slack`] is: the user asked for the space back, and what a player
+/// **Clear the cache**: stop everything that streams a torrent and take every
+/// byte no download keeps off the disk. This is what
+/// `ServerHandle::clear_cache` answers. It is not a request for slack, as
+/// [`drop_slack`] is. The user asked for the space back, and what a player
 /// was in the middle of is part of it.
 ///
-/// The torrents first (`enginefs::BackendEngineFS::clear_cache`): every
-/// hold overridden, every read stopped, every torrent stopped but a
-/// download's, every piece no pin covers taken. That also leaves the
-/// liveness cell naming nothing, so the proxy cache's slack pass that
-/// follows takes the stream played last as well -- every entity but a
-/// pinned download and one a body is being read off now, whose chunks are
-/// promised to it (a link a player is still streaming goes on, and its
-/// window goes once its read has closed). The cap is restated after both.
+/// The torrents go first (`enginefs::BackendEngineFS::clear_cache`). Every
+/// hold is overridden, every read stopped, every torrent stopped but a
+/// download's, and every piece no pin covers taken. That also leaves the
+/// liveness cell naming nothing. So the proxy cache's slack pass that follows
+/// takes the stream played last as well. It takes every entity but a pinned
+/// download and one a body is being read off now, whose chunks are promised
+/// to it. A link a player is still streaming goes on, and its window goes
+/// once its read has closed. The cap is restated after both.
 pub(crate) async fn clear(state: &AppState) -> CacheClearReport {
     let before = usage(state).await;
     let torrents = state.engine.clear_cache().await;
@@ -99,28 +97,27 @@ pub(crate) async fn clear(state: &AppState) -> CacheClearReport {
 /// of it.
 ///
 /// **No listing of the root, and none of the tree.** The piece store counts
-/// its own bytes from the bits it keeps, the proxy cache counts its chunks
-/// as they land and as they go, and the only filesystem work left is
-/// `enginefs::piece_store::StoreRegistry::unregistered_bytes`: one
-/// `read_dir` of the store root and a `stat` of each directory no live
-/// store speaks for -- a torrent held in Error, a directory a previous
-/// process left -- plus a `stat` of each staged (`.part`) copy a registered
-/// store has, because its held bits price complete pieces only. On the
-/// device this exists for that is a handful of syscalls against sixteen
-/// thousand files, and the answer is current rather than as old as a walk
-/// would be.
+/// its own bytes from the bits it keeps. The proxy cache counts its chunks as
+/// they land and as they go. The only filesystem work left is
+/// `enginefs::piece_store::StoreRegistry::unregistered_bytes`. That is one
+/// `read_dir` of the store root and a `stat` of each directory no live store
+/// speaks for (a torrent held in Error, a directory a previous process left).
+/// It adds a `stat` of each staged (`.part`) copy a registered store has,
+/// because its held bits price complete pieces only. On the device this
+/// exists for, that is a handful of syscalls against sixteen thousand files.
+/// The answer is current rather than as old as a walk would be.
 ///
-/// What it does not count is a **legacy whole-file download** left by an
-/// earlier version of this server, which lives beside the store
-/// (`<download dir>/<torrent name>/<file>`) rather than under it: no store
-/// speaks for it and nothing here wrote it. It is not converted -- "there
-/// is no migration" (see `enginefs::piece_store`) -- but it is deleted:
-/// `enginefs::piece_store::sweep::sweep_legacy_downloads` removes whatever under
-/// the download root is not another component's directory or a session
-/// file, at launch, on every boot that is handed a pin set. On a boot with
-/// none the sweep does not run, and an unpin asked to delete the file's
-/// data is then the only thing that takes one -- as it always is for a
-/// copy in an output folder outside the root. Named rather than hidden:
+/// It does not count a **legacy whole-file download** left by an earlier
+/// version of this server. Such a file lives beside the store (`<download
+/// dir>/<torrent name>/<file>`) rather than under it. No store speaks for it
+/// and nothing here wrote it. It is not converted ("there is no migration",
+/// see `enginefs::piece_store`), but it is deleted.
+/// `enginefs::piece_store::sweep::sweep_legacy_downloads` removes whatever
+/// under the download root is not another component's directory or a session
+/// file. It runs at launch, on every boot that is handed a pin set. On a boot
+/// with none the sweep does not run. An unpin asked to delete the file's data
+/// is then the only thing that takes one, as it always is for a copy in an
+/// output folder outside the root. This is named rather than hidden, because
 /// adding a category of byte with no deleter is how the disk becomes
 /// unbounded again.
 ///
@@ -130,9 +127,9 @@ pub(crate) async fn usage(state: &AppState) -> CacheUsage {
         let settings = state.settings.read().await;
         crate::routes::system::cache_size_bytes(settings.cache_size)
     };
-    // The root the session was opened on, not `settings.cacheRoot`: the
-    // setting is where the data will be after the next start, and the
-    // engine is where it is now.
+    // The root the session was opened on, not `settings.cacheRoot`. The
+    // setting is where the data will be after the next start, and the engine
+    // is where it is now.
     let limit = CacheLimit {
         configured,
         available: crate::cache_budget::available_space_off_the_reactor(
@@ -158,24 +155,24 @@ pub(crate) async fn usage(state: &AppState) -> CacheUsage {
 /// [`usage`]'s arithmetic, with the `AppState` plumbing taken off: the two
 /// owners' readings against the cap.
 ///
-/// Protection is added rather than intersected because the two owners hold
-/// two disjoint sets of bytes -- a piece of a torrent is never a chunk of a
-/// proxied URL -- and each has already made its own sum over sets that do
+/// Protection is added rather than intersected, because the two owners hold
+/// two disjoint sets of bytes. A piece of a torrent is never a chunk of a
+/// proxied URL. Each owner has already made its own sum over sets that do
 /// overlap inside it.
 ///
 /// **And then held to the total, because the two are priced from different
-/// bases.** A protection is read off the disk -- the pieces a store holds,
-/// the chunks in a live window that are really there -- while the proxy's
-/// half of the total is what *this process* booked as it wrote it
-/// (`crate::proxy_retention::ProxyRetention::occupancy`). A cache the last
-/// process filled is therefore protected bytes against a total that has
-/// not heard of them: resume a fully cached film after a restart and the
-/// window protects four gigabytes the count reads as nothing. `protected`
-/// is documented as part of `total` and read as one -- a client compares
-/// the two to decide whether cleaning can help -- so the sum is held to it
-/// rather than allowed to exceed it. What removes the divergence is the
-/// launch sweep emptying the proxy cache before the session opens, after
-/// which every chunk on the disk is one this process wrote.
+/// bases.** A protection is read off the disk: the pieces a store holds, the
+/// chunks in a live window that are really there. The proxy's half of the
+/// total is what *this process* booked as it wrote it
+/// (`crate::proxy_retention::ProxyRetention::occupancy`). So a cache the last
+/// process filled is protected bytes against a total that has not heard of
+/// them. Resume a fully cached film after a restart, and the window protects
+/// four gigabytes the count reads as nothing. `protected` is documented as
+/// part of `total` and read as one: a client compares the two to decide
+/// whether cleaning can help. So the sum is held to the total rather than
+/// allowed to exceed it. What removes the divergence is the launch sweep
+/// emptying the proxy cache before the session opens. After it, every chunk
+/// on the disk is one this process wrote.
 fn cache_usage(
     torrents: enginefs::CacheHoldings,
     proxy_bytes: u64,
@@ -195,8 +192,8 @@ fn cache_usage(
 
 /// What the cache currently occupies against its configured limit
 /// ([`usage`]), in the one occupancy accounting this repository has
-/// ([`enginefs::chunk_store::occupied_bytes`] -- allocated blocks, never
-/// apparent length). `serde`-serializable so it crosses the
+/// ([`enginefs::chunk_store::occupied_bytes`]: allocated blocks, never
+/// apparent length). It is `serde`-serializable, so it crosses the
 /// `ServerHandle::cache_usage` boundary (FFI, as JSON) as is.
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -207,73 +204,74 @@ pub struct CacheUsage {
     pub total_bytes: u64,
     /// The limit actually enforced, in the same accounting: the smaller of
     /// `settings.cacheSize` and what the volume can give while keeping
-    /// [`enginefs::CACHE_FREE_SPACE_FLOOR`] free. `None` only
-    /// when neither caps anything -- `cacheSize` unlimited (JSON `null`)
-    /// *and* the volume's free space unreadable.
+    /// [`enginefs::CACHE_FREE_SPACE_FLOOR`] free. It is `None` only when
+    /// neither caps anything: `cacheSize` unlimited (JSON `null`) *and* the
+    /// volume's free space unreadable.
     pub limit_bytes: Option<u64>,
-    /// How much of `total_bytes` nothing may take right now: a pin keeps
-    /// it, or it is inside the window of the one stream being played. When
-    /// this equals `total_bytes` and the cache is still over `limit_bytes`,
-    /// nothing is evictable -- cleaning cannot help until playback moves on
-    /// or something is unpinned. Never more than `total_bytes`: it is a
-    /// part of that figure and a client reads it as one (see
+    /// How much of `total_bytes` nothing may take right now: a pin keeps it,
+    /// or it is inside the window of the one stream being played. When this
+    /// equals `total_bytes` and the cache is still over `limit_bytes`,
+    /// nothing is evictable. Cleaning cannot help until playback moves on or
+    /// something is unpinned. It is never more than `total_bytes`, because it
+    /// is a part of that figure and a client reads it as one. See
     /// [`cache_usage`] for the one case where the two readings would
-    /// otherwise disagree).
+    /// otherwise disagree.
     pub protected_bytes: u64,
-    /// How many **files and proxied entities** that is -- not how many
-    /// piece files. A pinned file is one, whatever it is stored as, which
-    /// is the unit a client can put in front of a user.
+    /// How many **files and proxied entities** that is, not how many piece
+    /// files. A pinned file is one, whatever it is stored as, which is the
+    /// unit a client can put in front of a user.
     pub protected_files: usize,
 }
 
 /// What one [`drop_slack`] call left behind, in occupancy bytes
-/// ([`enginefs::chunk_store::occupied_bytes`]) throughout.
-/// `serde`-serializable so it crosses the `ServerHandle::clean_cache_now`
+/// ([`enginefs::chunk_store::occupied_bytes`]) throughout. It is
+/// `serde`-serializable, so it crosses the `ServerHandle::clean_cache_now`
 /// boundary (FFI, as JSON) as is.
 ///
-/// The name is the wire's and stays: nothing is evicted here any more --
-/// the owners are asked for their slack and report what is left -- but the
-/// JSON an app already reads is the same JSON.
+/// The name is the wire's and stays. Nothing is evicted here any more: the
+/// owners are asked for their slack and report what is left. But the JSON an
+/// app already reads is the same JSON.
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EvictionReport {
     /// Occupancy of the cache once the owners had given their slack back,
     /// as [`CacheUsage::total_bytes`] counts it.
     pub total: u64,
-    /// How much of `total` nothing may take: a pin keeps it, or it is
-    /// inside the window of the one entity being played, or an open body
-    /// was framed to deliver it. Same reading as
+    /// How much of `total` nothing may take: a pin keeps it, or it is inside
+    /// the window of the one entity being played, or an open body was framed
+    /// to deliver it. It is the same reading as
     /// [`CacheUsage::protected_bytes`], taken after the passes ran.
     pub protected: u64,
     /// How many files and proxied entities that is.
     pub protected_files: usize,
-    /// How far `total` fell across the call -- what the two passes really
-    /// took off the volume. Zero is the ordinary answer on a device with
-    /// one film playing and one pinned: there was no slack to give.
+    /// How far `total` fell across the call: what the two passes really took
+    /// off the volume. Zero is the ordinary answer on a device with one film
+    /// playing and one pinned, because there was no slack to give.
     pub freed: u64,
     /// How many piece files and chunks that took.
     pub deleted: usize,
     /// The limit in force when this answered: the smaller of
     /// `settings.cacheSize` and what the volume could give while keeping
-    /// [`enginefs::CACHE_FREE_SPACE_FLOOR`] free, so on a device
-    /// with no `cacheSize` set this is still a number. Worked out over
+    /// [`enginefs::CACHE_FREE_SPACE_FLOOR`] free. So on a device with no
+    /// `cacheSize` set this is still a number. It is worked out over
     /// [`Self::total`], which is not quite the cap the owners are sized
-    /// against (see `drop_slack`). `None` only when neither caps
-    /// anything -- `cacheSize` unlimited *and* the volume's free space
+    /// against (see `drop_slack`). It is `None` only when neither caps
+    /// anything: `cacheSize` unlimited *and* the volume's free space
     /// unreadable, matching [`CacheUsage::limit_bytes`].
     ///
-    /// Not a `u64` with 0 for "none": a cap of exactly 0 is reachable -- any
-    /// volume whose occupancy plus free space is under the floor gets one --
-    /// and it is the tightest cap there is, the opposite of no cap. Read as
-    /// the sentinel it silenced [`Self::shortfall_message`] on the one
-    /// device that needed it and told a client the cache was unlimited.
+    /// It is not a `u64` with 0 for "none", because a cap of exactly 0 is
+    /// reachable. Any volume whose occupancy plus free space is under the
+    /// floor gets one, and it is the tightest cap there is, the opposite of
+    /// no cap. Read as the sentinel, it silenced [`Self::shortfall_message`]
+    /// on the one device that needed it, and told a client the cache was
+    /// unlimited.
     pub limit: Option<u64>,
     /// How far over its cap the cache still is (`total - limit`), and the
-    /// only thing [`Self::shortfall_message`] reads. Reported rather than
-    /// left to the client to derive, so that "still stuck" is one field
-    /// and not a comparison every reader has to get right. With no walk
-    /// left to choose victims, this is what says a cache over its cap is
-    /// over it because a pin and a live window are holding it.
+    /// only thing [`Self::shortfall_message`] reads. It is reported rather
+    /// than left to the client to derive, so that "still stuck" is one field
+    /// and not a comparison every reader has to get right. With no walk left
+    /// to choose victims, this is what says a cache over its cap is over it
+    /// because a pin and a live window are holding it.
     pub over_limit: u64,
 }
 
@@ -298,21 +296,21 @@ pub struct CacheClearReport {
 
 impl EvictionReport {
     /// Whether this call reclaimed anything. Nothing in this process reads
-    /// it -- what decides whether a torrent a full disk stopped goes back
-    /// to work is the reconciler's own reading of the volume, and never
-    /// whether some pass happened to free a byte first -- but it is part of
-    /// the type an embedder is handed, and a clean that freed nothing is
-    /// still the thing a storage screen wants to know about.
+    /// it. What decides whether a torrent a full disk stopped goes back to
+    /// work is the reconciler's own reading of the volume, never whether some
+    /// pass happened to free a byte first. But it is part of the type an
+    /// embedder is handed, and a clean that freed nothing is still the thing
+    /// a storage screen wants to know about.
     pub fn made_room(&self) -> bool {
         self.freed > 0
     }
 
     /// The line to log when the cache is still over the limit, naming what
-    /// protection kept -- "cleaned up 0 files, freed 0 bytes" on a phone
-    /// that is filling up says nothing about *why*, and the why is always
-    /// that the rest of the cache belongs to a live or pinned entity. That
-    /// includes a pinned download the user has not unpinned. `None` when
-    /// the cache is under its limit (or has none).
+    /// protection kept. "cleaned up 0 files, freed 0 bytes" on a phone that
+    /// is filling up says nothing about *why*. The why is always that the
+    /// rest of the cache belongs to a live or pinned entity, including a
+    /// pinned download the user has not unpinned. `None` when the cache is
+    /// under its limit (or has none).
     pub fn shortfall_message(&self) -> Option<String> {
         if self.over_limit == 0 {
             return None;
@@ -347,17 +345,17 @@ mod tests {
     /// One piece file of `info_hash`, written where the store will find it
     /// and aged, and its path so a test can say whether it is still there.
     ///
-    /// Placed through the store's own `PieceStore`, never by spelling the
-    /// bucketed layout out here: a test that hardcoded `<hash>/<n/1000>/<n>`
-    /// would be a second copy of the very knowledge this layering exists to
-    /// keep in one place, and would keep passing after the shape changed
-    /// under it.
+    /// It is placed through the store's own `PieceStore`, never by spelling
+    /// the bucketed layout out here. A test that hardcoded
+    /// `<hash>/<n/1000>/<n>` would be a second copy of the very knowledge
+    /// this layering exists to keep in one place. It would also keep passing
+    /// after the shape changed under it.
     /// Unix only, because its one caller is: a sparse file is what that
     /// test is about, and Windows does not make one the same way.
     #[cfg(unix)]
     fn piece_store_for(root: &Path, info_hash: &str, pieces: u32) -> PieceStore {
-        // One file spanning the whole torrent: the layout only has to be
-        // wide enough to name the piece, since nothing here reads through it.
+        // One file spanning the whole torrent. The layout only has to be wide
+        // enough to name the piece, since nothing here reads through it.
         let piece_len = 4u64 << 20;
         let total = piece_len * u64::from(pieces);
         let layout = PieceLayout::new(
@@ -385,24 +383,23 @@ mod tests {
             .unwrap();
     }
 
-    /// What a usage figure will count this file as. Derived, never
-    /// hardcoded: a 4 KiB payload occupies one block on ext4 and rather
-    /// more on a filesystem with a bigger allocation unit, so a figure
-    /// written as a literal would be a filesystem assumption, not an
-    /// assertion.
+    /// What a usage figure will count this file as. It is derived, never
+    /// hardcoded. A 4 KiB payload occupies one block on ext4 and rather more
+    /// on a filesystem with a bigger allocation unit. So a figure written as
+    /// a literal would be a filesystem assumption, not an assertion.
     fn occupancy(path: &Path) -> u64 {
         occupied_bytes(&std::fs::metadata(path).unwrap())
     }
 
-    /// **A usage figure counts a sparse file by what it allocated**, and
-    /// it is the bytes no live store speaks for that make the question
-    /// arise at all: those are `stat`ed, where a registered torrent's are
-    /// summed from the store's own bits and cannot be sparse.
+    /// **A usage figure counts a sparse file by what it allocated.** The
+    /// question arises only for the bytes no live store speaks for. Those are
+    /// `stat`ed, while a registered torrent's bytes are summed from the
+    /// store's own bits and cannot be sparse.
     ///
     /// librqbit's old filesystem storage pre-allocated every file it wanted
-    /// at its full length, so a part-streamed film was a multi-gigabyte
-    /// apparent length over a handful of blocks -- a "Storage" screen
-    /// reading `len()` reported 17 GB on a device holding 3.85 GB.
+    /// at its full length. So a part-streamed film was a multi-gigabyte
+    /// apparent length over a handful of blocks. A "Storage" screen reading
+    /// `len()` reported 17 GB on a device holding 3.85 GB.
     #[cfg(unix)]
     #[test]
     fn usage_reports_occupancy_not_apparent_length_for_a_sparse_file() {
@@ -427,8 +424,8 @@ mod tests {
             std::fs::metadata(&sparse).unwrap().blocks() * 512
         };
         if allocated >= apparent {
-            // No sparse-file support on this filesystem -- nothing to
-            // assert about occupancy that would not be a tautology.
+            // No sparse-file support on this filesystem. Anything asserted
+            // about occupancy would be a tautology.
             return;
         }
 
@@ -447,17 +444,17 @@ mod tests {
     /// **The two halves of what the cache holds: a registered store's own
     /// count, and a `stat` of what no store speaks for.**
     ///
-    /// A running torrent's occupancy is the bits its store keeps priced by
-    /// the layout -- no syscall, so it is current the instant a piece
-    /// lands. Nothing keeps bits for a directory no store is registered for
-    /// (a previous process's, a torrent held in Error, debris the store
-    /// would never have written), and those bytes are on the volume, so
-    /// they are `stat`ed: a figure that left them out would read smaller
-    /// than the disk does, and a caller told "over the limit and nothing is
-    /// evictable" would see two numbers that do not add up.
+    /// A running torrent's occupancy is the bits its store keeps, priced by
+    /// the layout. That costs no syscall, so it is current the instant a
+    /// piece lands. Nothing keeps bits for a directory no store is registered
+    /// for (a previous process's, a torrent held in Error, debris the store
+    /// would never have written). Those bytes are on the volume, so they are
+    /// `stat`ed. A figure that left them out would read smaller than the disk
+    /// does. A caller told "over the limit and nothing is evictable" would
+    /// then see two numbers that do not add up.
     ///
-    /// The second half is what the owners hand up: protection is theirs to
-    /// decide -- a pin, a live window -- and this only has to add the two
+    /// The second half is what the owners hand up. Protection is theirs to
+    /// decide (a pin, a live window), and this only has to add the two
     /// owners' answers and cap the total.
     #[tokio::test]
     async fn usage_counts_a_registered_store_and_stats_what_no_store_speaks_for() {
@@ -498,11 +495,11 @@ mod tests {
         );
 
         // `u64::MAX` is what `cache_size_bytes(None)` produces for an
-        // unlimited cache -- the only value [`cache_usage`] treats as "no
+        // unlimited cache. It is the only value [`cache_usage`] treats as "no
         // limit". `0` is a distinct, explicit zero-size cap, per
-        // `ServerSettings.cache_size` -- `Some(0.0)`, not `None` -- and
-        // `CacheUsage` must not blur the two the way
-        // `EvictionReport::shortfall_message` does.
+        // `ServerSettings.cache_size` (`Some(0.0)`, not `None`). `CacheUsage`
+        // must not blur the two the way `EvictionReport::shortfall_message`
+        // does.
         // What the proxy owner would hand up beside it: one chunk of a
         // stream a player is inside.
         const CHUNK: u64 = crate::proxy_cache::CHUNK_BYTES;
@@ -545,27 +542,27 @@ mod tests {
 
     /// **A protection is never more than the total it is part of.**
     ///
-    /// The two figures are priced from different bases and one of them can
+    /// The two figures are priced from different bases, and one of them can
     /// name bytes the other has not heard of. A protection is read off the
-    /// disk -- the pieces a store holds, the chunks of a live window that
-    /// are really there -- while the proxy's half of the total is what
-    /// *this process* booked as it wrote it. So the ordinary case on the
-    /// device this is for: the server restarts over a cache full of a film
-    /// somebody watched yesterday, a player resumes it, the entity's window
-    /// covers four gigabytes of chunks on the disk, and the count says the
-    /// proxy cache holds nothing, because this process has written nothing.
+    /// disk: the pieces a store holds, the chunks of a live window that are
+    /// really there. The proxy's half of the total is what *this process*
+    /// booked as it wrote it. This is the ordinary case on the device this is
+    /// for. The server restarts over a cache full of a film somebody watched
+    /// yesterday, and a player resumes it. The entity's window covers four
+    /// gigabytes of chunks on the disk, and the count says the proxy cache
+    /// holds nothing, because this process has written nothing.
     ///
     /// `protected_bytes` is documented as part of `total_bytes` and read as
-    /// one -- a client compares them to decide whether cleaning can help --
-    /// so it is held to it. What removes the divergence is the launch sweep
+    /// one: a client compares them to decide whether cleaning can help. So it
+    /// is held to the total. What removes the divergence is the launch sweep
     /// emptying the proxy cache before the session opens.
     #[test]
     fn a_protection_is_never_more_than_the_total_it_is_part_of() {
         const CHUNK: u64 = crate::proxy_cache::CHUNK_BYTES;
         let usage = cache_usage(
             enginefs::CacheHoldings::default(),
-            // Nothing booked: every chunk under the proxy root was written
-            // by the process before this one.
+            // Nothing booked. Every chunk under the proxy root was written by
+            // the process before this one.
             0,
             crate::proxy_retention::ProxyProtection {
                 bytes: 16 * CHUNK,
@@ -622,10 +619,10 @@ mod tests {
         };
         assert!(over.shortfall_message().is_some());
 
-        // A cap of exactly 0 is the tightest cap there is, not the absence
-        // of one: any volume whose occupancy plus free space is under the
-        // floor gets one, and that is the device most in need of the line
-        // that says what is holding the cache up.
+        // A cap of exactly 0 is the tightest cap there is, not the absence of
+        // one. Any volume whose occupancy plus free space is under the floor
+        // gets one. That is the device most in need of the line that says
+        // what is holding the cache up.
         let capped_at_nothing = EvictionReport {
             total: 4096,
             protected: 4096,
@@ -642,9 +639,9 @@ mod tests {
 
     /// The shape the two sentinels cross the wire in.
     /// `ServerHandle::clean_cache_now` and the FFI call behind the app's
-    /// storage screen all read this JSON, and the app distinguishes "no cap"
-    /// from "a cap of nothing" by exactly this difference -- so it is pinned
-    /// here rather than left to serde's defaults being what one assumes.
+    /// storage screen all read this JSON. The app tells "no cap" from "a cap
+    /// of nothing" by exactly this difference. So it is pinned here rather
+    /// than left to serde's defaults being what one assumes.
     #[test]
     fn the_reported_limit_crosses_as_null_or_a_number_never_a_sentinel() {
         let json = |limit| {
@@ -659,7 +656,7 @@ mod tests {
         assert_eq!(json(Some(0)), serde_json::json!(0), "a cap of nothing");
         assert_eq!(json(Some(1024)), serde_json::json!(1024));
 
-        // And the shortfall beside it, camelCase like the rest: it is what a
+        // And the shortfall beside it, camelCase like the rest. It is what a
         // client reads to know the cache is still stuck.
         let over = serde_json::to_value(EvictionReport {
             over_limit: 4096,
@@ -681,14 +678,13 @@ mod tests {
     }
 
     /// A clean is worth reporting as having done something only when it
-    /// actually reclaimed bytes. Nothing in this process reads the answer
-    /// -- what decides whether a torrent a full disk stopped goes back to
-    /// work is the reconciler's own reading of the volume, never whether
-    /// some pass happened to free a byte first -- but it is part of the
-    /// type an embedder is handed, and "clean freed nothing" is the answer
-    /// a storage screen has to be able to tell from "clean freed
-    /// something". A run that freed nothing still says what protection
-    /// held instead.
+    /// actually reclaimed bytes. Nothing in this process reads the answer.
+    /// What decides whether a torrent a full disk stopped goes back to work
+    /// is the reconciler's own reading of the volume, never whether some pass
+    /// happened to free a byte first. But it is part of the type an embedder
+    /// is handed, and a storage screen has to be able to tell "clean freed
+    /// nothing" from "clean freed something". A run that freed nothing still
+    /// says what protection held instead.
     #[test]
     fn a_clean_made_room_only_when_it_actually_reclaimed_something() {
         let freed_nothing = EvictionReport {

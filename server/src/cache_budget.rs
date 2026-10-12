@@ -1,53 +1,50 @@
 //! What the torrent-data volume may hold, and the one place the process
 //! says so.
 //!
-//! **Publishing a budget is not the same job as evicting.** The number
-//! lives in this module, with a trigger of its own ([`start`]) that takes
-//! one `statvfs` and walks nothing:
-//! `enginefs::retention::CacheBudget::Unknown` installs no policy at all,
-//! so a process that has never published one holds no window over a
-//! proxied stream and reclaims none of it -- and the whole retention story
-//! must not hang off a walk whose only purpose is eviction.
+//! **Publishing a budget is not the same job as evicting.** The number lives
+//! in this module, with a trigger of its own ([`start`]) that takes one
+//! `statvfs` and walks nothing. `enginefs::retention::CacheBudget::Unknown`
+//! installs no policy at all, so a process that has never published a budget
+//! holds no window over a proxied stream and reclaims none of it. The whole
+//! retention story must not hang off a walk whose only purpose is eviction.
 //!
 //! # What supplies each input
 //!
 //! [`CacheLimit::effective`] wants two numbers.
 //!
-//! `available` is a `statvfs` of the volume ([`available_space`]): one
+//! `available` is a `statvfs` of the volume ([`available_space`]). It is one
 //! syscall, no walk, taken fresh at every publication.
 //!
-//! `occupied` is what the cache holds, and **the things that write the
-//! cache are what count it**. The piece store keeps a bit per piece it
-//! holds and the layout that gives each bit a size, so a torrent's
-//! occupancy is a sum over words in memory
-//! (`enginefs::EngineFS::cache_occupancy`); the proxy cache adds what each
-//! chunk occupied as it lands and takes it off again when the owner unlinks
-//! it (`crate::proxy_retention::ProxyRetention::occupancy`). Neither costs
-//! a syscall, so the cap is restated on a timer against a reading of the
-//! cache that is current rather than against a walk: a walk of sixteen
-//! thousand cache files on eMMC costs minutes, and a cap read as 0 until
-//! it finished would run every stream over that stretch under a window as
-//! small as whatever headroom happened to be free -- eighty-eight
-//! megabytes measured on a four-gigabyte television already near full. The
-//! owners' count has no such window: a process that has held a piece for a
-//! millisecond can say so.
+//! `occupied` is what the cache holds, and **the things that write the cache
+//! are what count it**. The piece store keeps a bit per piece it holds and
+//! the layout that gives each bit a size, so a torrent's occupancy is a sum
+//! over words in memory (`enginefs::EngineFS::cache_occupancy`). The proxy
+//! cache adds what each chunk occupied as it lands, and takes it off again
+//! when the owner unlinks it
+//! (`crate::proxy_retention::ProxyRetention::occupancy`). Neither costs a
+//! syscall, so the cap is restated on a timer against a current reading of
+//! the cache rather than against a walk. A walk of sixteen thousand cache
+//! files on eMMC costs minutes. A cap read as 0 until the walk finished would
+//! run every stream over that stretch under a window as small as whatever
+//! headroom happened to be free. That was eighty-eight megabytes, measured on
+//! a four-gigabyte television already near full. The owners' count has no
+//! such window: a process that has held a piece for a millisecond can say so.
 //!
-//! What it does not count is what the held bits do not price -- a torrent
-//! held in Error, a directory a previous run left, the strays, and the
-//! staged copies of the pieces being written. Reading those costs a
-//! `read_dir` and a `stat` each, so they are read on demand for
-//! `ServerHandle::cache_usage` (`enginefs::EngineFS::cache_holdings`) and not on the
-//! minute timer. The cap is therefore stated over the complete pieces this
-//! session holds, which understates the volume by whatever an earlier one
-//! left and by the pieces in flight -- the safe
-//! direction, since a smaller `occupied` is a tighter cap, and **this gap
-//! is a claim about a cache this process filled**: on a warm cache the
-//! first minute is still the volume's headroom alone. The proxy cache has
-//! this same gap only once a pin record is named: its launch sweep
-//! (`crate::proxy_cache::sweep`) then empties it before the router serves
-//! anything, so what its owner counts is all it holds; with no pin record
-//! named the sweep counts nothing, and a previous run's strays sit
-//! uncounted, same as the torrent side.
+//! It does not count what the held bits do not price: a torrent held in
+//! Error, a directory a previous run left, the strays, and the staged copies
+//! of the pieces being written. Reading those costs a `read_dir` and a `stat`
+//! each, so they are read on demand for `ServerHandle::cache_usage`
+//! (`enginefs::EngineFS::cache_holdings`) and not on the minute timer. The
+//! cap is therefore stated over the complete pieces this session holds. That
+//! understates the volume by whatever an earlier run left and by the pieces
+//! in flight. It is the safe direction, since a smaller `occupied` is a
+//! tighter cap. **This gap is a claim about a cache this process filled**: on
+//! a warm cache the first minute is still the volume's headroom alone. The
+//! proxy cache has this same gap only once a pin record is named. Its launch
+//! sweep (`crate::proxy_cache::sweep`) then empties it before the router
+//! serves anything, so what its owner counts is all it holds. With no pin
+//! record named the sweep counts nothing, and a previous run's strays sit
+//! uncounted, the same as on the torrent side.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,34 +54,34 @@ use tracing::debug;
 
 use crate::state::AppState;
 
-/// Free space on the cache's volume that the published cap keeps the
-/// torrent cache out of -- `enginefs`'s constant, re-exported, because it is
-/// one line read three ways and the three may not drift apart.
+/// Free space on the cache's volume that the published cap keeps the torrent
+/// cache out of. It is `enginefs`'s constant, re-exported, because it is one
+/// line read three ways and the three may not drift apart.
 ///
 /// `routes::stream::ensure_download_disk_ready` refuses to stream a torrent
-/// that still wants bytes unless this much is free -- a failed check asks
-/// both owners for their slack and, if the disk is still short, answers the
-/// stream `507 Insufficient Storage`. Below this line the server has
-/// therefore already decided the disk is unusable, so it is exactly the line
-/// [`CacheLimit::effective`] must keep the cache out of. Both read the
-/// volume with the same call, [`available_space`] (`fs4`'s, a `statvfs` of
-/// the path on Unix), and both on the blocking pool: the gate inside its
-/// `spawn_blocking`, the publisher through
+/// that still wants bytes unless this much is free. A failed check asks both
+/// owners for their slack. If the disk is still short, it answers the stream
+/// `507 Insufficient Storage`. So below this line the server has already
+/// decided the disk is unusable, and this is exactly the line
+/// [`CacheLimit::effective`] must keep the cache out of. Both read the volume
+/// with the same call, [`available_space`] (`fs4`'s, a `statvfs` of the path
+/// on Unix), and both read it on the blocking pool. The gate reads it inside
+/// its `spawn_blocking`, the publisher through
 /// [`available_space_off_the_reactor`]. Neither writes to the volume to ask.
 ///
-/// The third reader is the engine's reconciler, whose free-space arm this
-/// is (`enginefs::reconcile::desired`), and it is what turns the target into
-/// something close to a guarantee. A cap only bounds what the owners keep;
-/// it cannot throttle a writer, and librqbit writes the file it wants
-/// straight through this line to ENOSPC -- measured going to nothing in
-/// 40 s rather than stopping at 512 MiB. The reconciler stops a writing
-/// torrent when the volume falls under the floor and rings the
-/// running-low bell, so what the owners are asked to
-/// give back is asked of a volume with a torrent paused a few MB under the
-/// line, not one dead at zero. Offline downloads keep a margin of their own
-/// (`enginefs::PIN_FREE_SPACE_MARGIN`, 500 MiB, checked once when a pin is
-/// accepted), so a pin can settle the volume below this line by design; the
-/// reconciler stops it there like any other writer.
+/// The third reader is the engine's reconciler, whose free-space arm this is
+/// (`enginefs::reconcile::desired`). The reconciler is what turns the target
+/// into something close to a guarantee. A cap only bounds what the owners
+/// keep. It cannot throttle a writer, and librqbit writes the file it wants
+/// straight through this line to ENOSPC. That was measured going to nothing
+/// in 40 s rather than stopping at 512 MiB. The reconciler stops a writing
+/// torrent when the volume falls under the floor, and rings the running-low
+/// bell. So the owners are asked to give back space on a volume with a
+/// torrent paused a few MB under the line, not one dead at zero. Offline
+/// downloads keep a margin of their own (`enginefs::PIN_FREE_SPACE_MARGIN`,
+/// 500 MiB, checked once when a pin is accepted). So a pin can settle the
+/// volume below this line by design, and the reconciler stops it there like
+/// any other writer.
 #[cfg(test)]
 pub(crate) use enginefs::CACHE_FREE_SPACE_FLOOR;
 
@@ -92,35 +89,35 @@ pub(crate) use enginefs::CACHE_FREE_SPACE_FLOOR;
 /// filesystem can still give.
 ///
 /// `settings.cacheSize` on its own is `u64::MAX` unless somebody set a number
-/// (`routes::system::cache_size_bytes`), so on a 4 GB television nothing
-/// bounded the cache and librqbit wrote until the filesystem refused -- and
-/// that refusal arrives as a fatal torrent error, mid-film. The enforced cap
-/// is therefore the smaller of the two, which is a number even when
-/// `cacheSize` is not.
+/// (`routes::system::cache_size_bytes`). So on a 4 GB television nothing
+/// bounded the cache, and librqbit wrote until the filesystem refused. That
+/// refusal arrives as a fatal torrent error, mid-film. The enforced cap is
+/// therefore the smaller of the two, which is a number even when `cacheSize`
+/// is not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CacheLimit {
-    /// `settings.cacheSize` in bytes: `u64::MAX` when unset, and 0 for the
-    /// "no caching" it means to stremio-core and to the app -- a cap of
-    /// zero, the tightest there is, never "no limit".
+    /// `settings.cacheSize` in bytes. It is `u64::MAX` when unset, and 0 for
+    /// the "no caching" it means to stremio-core and to the app. That 0 is a
+    /// cap of zero, the tightest there is, never "no limit".
     pub(crate) configured: u64,
     /// Bytes the volume holding the cache will still give an unprivileged
     /// writer, or `None` when it could not be read.
     pub(crate) available: Option<u64>,
-    /// The free space to hold back, read from the same volume as
-    /// `available` -- a second `statvfs` of the same path rather than the
-    /// same one, which is fine for a size that does not move between two
-    /// calls the way the free space can ([`enginefs::volume_total`]): see
-    /// [`enginefs::free_space_floor`]. Carried rather than looked up,
+    /// The free space to hold back, read from the same volume as `available`.
+    /// It comes from a second `statvfs` of the same path rather than the same
+    /// one. That is fine for a size that does not move between two calls the
+    /// way the free space can ([`enginefs::volume_total`]). See
+    /// [`enginefs::free_space_floor`]. It is carried rather than looked up,
     /// because a cap sized against one volume's floor and another's free
     /// space is not a cap at all.
     pub(crate) floor: u64,
 }
 
 impl CacheLimit {
-    /// A limit with no filesystem reading behind it: what the cap falls
-    /// back to when the volume cannot be probed. Written that way only by
-    /// the tests -- [`publish_now`] always carries whatever the probe
-    /// returned, `None` included.
+    /// A limit with no filesystem reading behind it: what the cap falls back
+    /// to when the volume cannot be probed. Only the tests write it that way.
+    /// [`publish_now`] always carries whatever the probe returned, `None`
+    /// included.
     #[cfg(test)]
     pub(crate) const fn configured(configured: u64) -> Self {
         Self {
@@ -132,19 +129,19 @@ impl CacheLimit {
 
     /// The cap to enforce against `occupied` bytes of cache.
     ///
-    /// Always a number: `configured` is one even when unset (`u64::MAX`),
-    /// and 0 is a cap of zero ("no caching"), not the absence of one. The
-    /// `Option` is the shape the publication takes
-    /// (`RetentionBudget::set`, whose `None` is an unbounded budget), which
-    /// this never asks for.
+    /// It is always a number. `configured` is one even when unset
+    /// (`u64::MAX`), and 0 is a cap of zero ("no caching"), not the absence
+    /// of one. The `Option` is the shape the publication takes
+    /// (`RetentionBudget::set`, whose `None` is an unbounded budget), and
+    /// this never asks for that.
     ///
     /// `occupied + available` is what the volume would offer if the cache
-    /// were empty, so holding [`Self::floor`] of that back leaves
-    /// the most the cache may occupy without the free space crossing the
-    /// floor. Saturating throughout: a volume already under the floor yields
-    /// a cap below current occupancy, which is exactly the case where
-    /// something has to be evicted -- and where an unsaturated subtraction
-    /// would have wrapped to a cap of "everything".
+    /// were empty. Holding [`Self::floor`] of that back leaves the most the
+    /// cache may occupy without the free space crossing the floor. The
+    /// arithmetic saturates throughout. A volume already under the floor
+    /// yields a cap below current occupancy, which is exactly the case where
+    /// something has to be evicted. There an unsaturated subtraction would
+    /// have wrapped to a cap of "everything".
     pub(crate) fn effective(&self, occupied: u64) -> Option<u64> {
         let from_disk = self.available.map(|available| {
             occupied
@@ -162,26 +159,26 @@ impl CacheLimit {
 /// `None` when that cannot be read.
 ///
 /// `fs4::available_space` -> `rustix::fs::statvfs` -> `f_frsize * f_bavail`,
-/// the "Available" column of `df` (which excludes the blocks reserved for
-/// root, so it is what this process may actually write). One syscall against
-/// the path itself, no mount table to parse. rustix reaches it two ways and
-/// both are shipped here: on Linux its `linux_raw` backend issues the
-/// `statfs` syscall and converts, and on Android its build script picks the
-/// `libc` backend, which calls bionic's `statvfs` -- verified by building
-/// this call for `aarch64-linux-android` and by running a bionic-linked
-/// `statvfs` probe against a real directory, which agreed with glibc and with
-/// `df` to the block.
+/// the "Available" column of `df`. That column excludes the blocks reserved
+/// for root, so it is what this process may actually write. It is one syscall
+/// against the path itself, with no mount table to parse. rustix reaches it
+/// two ways, and both are shipped here. On Linux its `linux_raw` backend
+/// issues the `statfs` syscall and converts. On Android its build script
+/// picks the `libc` backend, which calls bionic's `statvfs`. This was
+/// verified by building this call for `aarch64-linux-android`, and by running
+/// a bionic-linked `statvfs` probe against a real directory, which agreed
+/// with glibc and with `df` to the block.
 ///
-/// Failure -- a filesystem that refuses the call, a path on no volume the OS
-/// can name -- is `None`, never 0: an unreadable volume must not be read as
-/// "no room" and evict a healthy cache. The configured `cacheSize` then
-/// stands alone. Which paths fail is the platform's business, not this
-/// function's: `statvfs` wants the path to exist, so on Unix a root not
-/// yet created is unreadable, while
-/// Windows resolves the volume from the drive letter (`GetVolumePathNameW`)
-/// and answers for a directory nothing has made yet. The test for what an
-/// unreadable volume does therefore writes the `None` straight into a
-/// [`CacheLimit`] rather than finding a path the OS will refuse.
+/// Failure is `None`, never 0. Failure means a filesystem that refuses the
+/// call, or a path on no volume the OS can name. An unreadable volume must
+/// not be read as "no room" and evict a healthy cache. The configured
+/// `cacheSize` then stands alone. Which paths fail is the platform's
+/// business, not this function's. `statvfs` wants the path to exist, so on
+/// Unix a root not yet created is unreadable. Windows resolves the volume
+/// from the drive letter (`GetVolumePathNameW`) and answers for a directory
+/// nothing has made yet. So the test for what an unreadable volume does
+/// writes the `None` straight into a [`CacheLimit`] rather than finding a
+/// path the OS will refuse.
 pub(crate) fn available_space(path: &std::path::Path) -> Option<u64> {
     match fs4::available_space(path) {
         Ok(available) => Some(available),
@@ -198,11 +195,11 @@ pub(crate) fn available_space(path: &std::path::Path) -> Option<u64> {
 
 /// [`available_space`] on the blocking pool, for an async caller.
 ///
-/// A `statvfs` is one syscall, and on a spun-down disk or a mount that has
-/// stopped answering it is one that does not return: taken on a reactor
-/// worker it parks every task scheduled there. The engine takes its own
-/// readings this way for the same reason (`EngineFS::reread_volume`). A
-/// probe task that failed is an unreadable volume.
+/// A `statvfs` is one syscall, but on a spun-down disk or a mount that has
+/// stopped answering it does not return. Taken on a reactor worker, it parks
+/// every task scheduled there. The engine takes its own readings this way for
+/// the same reason (`EngineFS::reread_volume`). A probe task that failed is
+/// an unreadable volume.
 pub(crate) async fn available_space_off_the_reactor(path: std::path::PathBuf) -> Option<u64> {
     tokio::task::spawn_blocking(move || available_space(&path))
         .await
@@ -213,19 +210,19 @@ pub(crate) async fn available_space_off_the_reactor(path: std::path::PathBuf) ->
 /// How often the process restates the budget on its own, with nothing
 /// writing to the cache and no pass running.
 ///
-/// One `statvfs` per tick and no walk, so the interval is set by how long
-/// the cap may be wrong for rather than by what it costs: the number it
-/// re-reads is what the *rest* of the device has done to the volume, and a
-/// player is inside a window for minutes at a time. A minute keeps a busy
-/// cache and an idle one on the same schedule, with no separate fallback
-/// needed for the idle case.
+/// A tick is one `statvfs` and no walk, so the interval is set by how long
+/// the cap may be wrong for, not by what it costs. The number it re-reads is
+/// what the *rest* of the device has done to the volume, and a player is
+/// inside a window for minutes at a time. A minute keeps a busy cache and an
+/// idle one on the same schedule, with no separate fallback needed for the
+/// idle case.
 const BUDGET_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The cap a publication states, from the three readings behind it.
 ///
-/// `configured` is `settings.cacheSize`, `available` one `statvfs` of the
-/// volume, and `occupied` what the owners of the cache say they hold -- see
-/// this module's header for what each of the three costs.
+/// `configured` is `settings.cacheSize`, `available` is one `statvfs` of the
+/// volume, and `occupied` is what the owners of the cache say they hold. This
+/// module's header says what each of the three costs.
 fn cap_to_publish(
     configured: u64,
     available: Option<u64>,
@@ -243,10 +240,10 @@ fn cap_to_publish(
 /// Publish `limit` as the cache budget.
 ///
 /// **The one writer.** Every publication in the process goes through here,
-/// which is what makes the cap one number rather than one per caller: a
-/// `RetentionBudget::set` beside this one is a second copy of a figure the
-/// torrent half and the proxy half both read, and two copies is how two
-/// layers come to evict against different limits.
+/// which makes the cap one number rather than one per caller. The torrent
+/// half and the proxy half both read this figure. A `RetentionBudget::set`
+/// beside this one is a second copy of it, and two copies is how two layers
+/// come to evict against different limits.
 ///
 /// It is handed the shared cell (`EngineFS::cache_budget`) rather than an
 /// engine to tell, because the cell is the dependency.
@@ -261,26 +258,25 @@ pub(crate) fn publish(
 /// Read the volume and publish what it allows, now, without walking
 /// anything.
 ///
-/// **The one publisher.** `cacheSize` from the settings, `available` from
-/// one `statvfs`, `occupied` from the two owners that count the cache as
-/// they write it -- so this is as cheap on the minute timer as it is after
-/// `POST /settings`, and there is no second path with a different reading
-/// behind it. Returns the cap it stated, or `None` for no cap -- which is
-/// not the same as having published nothing, since a publication of `None`
+/// **The one publisher.** It takes `cacheSize` from the settings, `available`
+/// from one `statvfs`, and `occupied` from the two owners that count the
+/// cache as they write it. So it is as cheap on the minute timer as it is
+/// after `POST /settings`, and there is no second path with a different
+/// reading behind it. Returns the cap it stated, or `None` for no cap. That
+/// is not the same as having published nothing, since a publication of `None`
 /// is still a publication.
 ///
 /// **`occupied` is what the owners hold, and deliberately not the whole
-/// figure `ServerHandle::cache_usage` reports.** That one adds
-/// `StoreRegistry::unregistered_bytes` -- a torrent the session is holding
-/// in Error, a directory a previous process left, and the staged copies of
-/// the pieces a live store is writing -- which costs a `read_dir` and a
-/// `stat` each and cannot be on a minute timer. The difference never
-/// loosens the cap: those bytes are already out of `available`, so the
-/// volume arm stays exact and it is only `cacheSize` that is a bound on the
-/// owners' half rather than on every byte under the root. What bounds the
-/// first two is the launch sweep, which takes every directory the
-/// embedder's pin set does not name before the session opens; the staged
-/// copies are the pieces being fetched at that moment.
+/// figure `ServerHandle::cache_usage` reports.** That figure adds
+/// `StoreRegistry::unregistered_bytes`: a torrent the session is holding in
+/// Error, a directory a previous process left, and the staged copies of the
+/// pieces a live store is writing. Those cost a `read_dir` and a `stat` each
+/// and cannot be on a minute timer. The difference never loosens the cap.
+/// Those bytes are already out of `available`, so the volume arm stays exact.
+/// Only `cacheSize` becomes a bound on the owners' half rather than on every
+/// byte under the root. The launch sweep bounds the first two: it takes every
+/// directory the embedder's pin set does not name, before the session opens.
+/// The staged copies are the pieces being fetched at that moment.
 pub(crate) async fn publish_now(state: &AppState) -> Option<u64> {
     publish_in_turn(
         &state.budget_publication,
@@ -290,15 +286,16 @@ pub(crate) async fn publish_now(state: &AppState) -> Option<u64> {
                 let settings = state.settings.read().await;
                 crate::routes::system::cache_size_bytes(settings.cache_size)
             };
-            // The root the session was opened on, not `settings.cacheRoot`:
-            // the setting is where the data will be after the next start,
-            // the engine is where it is now.
+            // The root the session was opened on, not `settings.cacheRoot`.
+            // The setting is where the data will be after the next start. The
+            // engine is where it is now.
             let available =
                 available_space_off_the_reactor(state.engine.download_dir.clone()).await;
-            // The floor is a share of the volume, so it is read from the
-            // same volume as the space it holds back -- beside it, a second
-            // `statvfs` on the same path, which a size that does not move
-            // between two calls can afford; see `enginefs::free_space_floor`.
+            // The floor is a share of the volume, so it is read from the same
+            // volume as the space it holds back. It is a second `statvfs` on
+            // the same path, beside the first, which a size that does not
+            // move between two calls can afford. See
+            // `enginefs::free_space_floor`.
             let root = state.engine.download_dir.clone();
             let floor = enginefs::free_space_floor(
                 tokio::task::spawn_blocking(move || enginefs::volume_total(&root))
@@ -316,14 +313,14 @@ pub(crate) async fn publish_now(state: &AppState) -> Option<u64> {
 
 /// One publication: wait for `turn`, read the inputs, state the cap.
 ///
-/// **The inputs are read inside the turn, so the last publication to
-/// start states the newest of them.** There are three publishers -- the
-/// minute timer, `update_settings` after a new `cacheSize`, and a clean --
-/// and each reads settings, volume and occupancy across awaits before it
-/// publishes. With nothing ordering them, a timer tick that read the old
-/// `cacheSize` just before `update_settings` wrote the new one could
-/// publish after it, and the old cap stood until the next tick, a minute
-/// later, under everything already playing.
+/// **The inputs are read inside the turn, so the last publication to start
+/// states the newest of them.** There are three publishers: the minute timer,
+/// `update_settings` after a new `cacheSize`, and a clean. Each reads
+/// settings, volume and occupancy across awaits before it publishes. Suppose
+/// nothing ordered them. A timer tick that read the old `cacheSize` just
+/// before `update_settings` wrote the new one could publish after it. The old
+/// cap then stood until the next tick, a minute later, under everything
+/// already playing.
 async fn publish_in_turn<F, Fut>(
     turn: &tokio::sync::Mutex<()>,
     budget: &enginefs::retention::RetentionBudget,
@@ -336,12 +333,13 @@ where
     let _turn = turn.lock().await;
     let (configured, available, occupied, floor) = read().await;
     let cap = cap_to_publish(configured, available, occupied, floor);
-    // What the volume will still give before the margin, published beside
-    // the cap because it is the other half of the same `statvfs` and the
-    // two must not be read from different moments: an entity's own
+    // What the volume will still give before the margin. It is published
+    // beside the cap because it is the other half of the same `statvfs`, and
+    // the two must not be read from different moments. An entity's own
     // allowance is this plus what it already holds
-    // (`docs/design/read-pattern-retention.md` section 4), so a fresh cap over a
-    // stale headroom sizes a lookahead against a disk that never existed.
+    // (`docs/design/read-pattern-retention.md` section 4). So a fresh cap
+    // over a stale headroom sizes a lookahead against a disk that never
+    // existed.
     let headroom = available.map(|available| available.saturating_sub(floor));
     // Part of the retention trace (`enginefs::retention::trace`, under the
     // `diagnosticsTrace` setting). The pass reports the budget in force;
@@ -359,19 +357,18 @@ where
 /// The budget's own trigger: state it now, and restate it every
 /// [`BUDGET_INTERVAL`] thereafter.
 ///
-/// Started unconditionally: without a published budget nothing bounds what
-/// a relayed stream leaves behind, since
+/// It is started unconditionally. Without a published budget nothing bounds
+/// what a relayed stream leaves behind, since
 /// `enginefs::retention::CacheBudget::Unknown` installs no policy at all.
 ///
 /// **The first publication is this function's own, before it returns**,
 /// rather than the first tick of the task it spawns. Both would happen at
 /// about the same moment, and "about" is the difference between a claim a
-/// test can make and one it cannot: awaited here, the budget exists before
-/// `run` builds the router, so the first request of the process is served
-/// by a bounded cache rather than by one that will be bounded shortly.
-/// That is the whole point on a device with sixteen thousand cache files,
-/// where a walk of the root would still be minutes away
-/// (`server/tests/proxy.rs`,
+/// test can make and one it cannot. Awaited here, the budget exists before
+/// `run` builds the router. So the first request of the process is served by
+/// a bounded cache, not by one that will be bounded shortly. That is the
+/// whole point on a device with sixteen thousand cache files, where a walk of
+/// the root would still be minutes away (`server/tests/proxy.rs`,
 /// `a_stream_relayed_before_anything_has_walked_the_cache_is_still_bounded`).
 pub async fn start(state: Arc<AppState>) -> JoinHandle<()> {
     let cap = publish_now(&state).await;
@@ -394,12 +391,11 @@ pub async fn start(state: Arc<AppState>) -> JoinHandle<()> {
 /// The metronome under [`start`]: `restate` once every `every`, and not
 /// before the first `every` has passed.
 ///
-/// A tokio interval's first tick is immediate, and [`start`] has just
-/// published before it spawns this, so that tick is taken here rather than
-/// restating the same reading of the same volume microseconds later. Apart
-/// from that this is the loop it looks like; it is a function so that the
-/// interval can be pinned with the clock paused, without an `AppState` to
-/// publish into.
+/// A tokio interval's first tick is immediate. [`start`] has just published
+/// before it spawns this, so that tick is taken here instead of restating the
+/// same reading of the same volume microseconds later. Apart from that this
+/// is the loop it looks like. It is a function so that the interval can be
+/// pinned with the clock paused, without an `AppState` to publish into.
 async fn restate_every<F, Fut>(every: Duration, mut restate: F)
 where
     F: FnMut() -> Fut,
@@ -431,11 +427,10 @@ mod tests {
     /// **A process that has counted nothing still states a cap, and one
     /// held piece moves it by that piece's size.**
     ///
-    /// A cache that really holds nothing is capped at the volume's
-    /// headroom, which is the first half here. The second half pins that
-    /// the figure never waits for a walk: the store books a piece the
-    /// instant it lands, so the very next publication states a cap that
-    /// piece's size bigger.
+    /// A cache that really holds nothing is capped at the volume's headroom,
+    /// which is the first half here. The second half pins that the figure
+    /// never waits for a walk. The store books a piece the instant it lands,
+    /// so the very next publication states a cap bigger by that piece's size.
     #[test]
     fn a_cache_nothing_has_counted_is_capped_at_the_volumes_headroom() {
         let free = CACHE_FREE_SPACE_FLOOR + 8 * MIB;
@@ -469,7 +464,7 @@ mod tests {
         std::fs::create_dir_all(piece.parent().unwrap()).unwrap();
         std::fs::write(&piece, vec![7u8; MIB as usize]).unwrap();
         // The seed a start makes, over a directory that now has a piece in
-        // it: the same bit a completion would set.
+        // it. It is the same bit a completion would set.
         store.init_for_tests().unwrap();
 
         assert_eq!(registry.occupancy(), MIB);
@@ -488,11 +483,11 @@ mod tests {
 
     /// **The cap is sized from both owners of the cache, added.**
     ///
-    /// A torrent's pieces and a proxied URL's chunks are two disjoint sets
-    /// of bytes on one volume, and a cap sized from either alone is a cap
-    /// over half the cache: a server relaying nothing would state the same
-    /// number as one relaying a film. Neither reading costs a syscall,
-    /// which is what lets [`super::publish_now`] take both on the minute.
+    /// A torrent's pieces and a proxied URL's chunks are two disjoint sets of
+    /// bytes on one volume. A cap sized from either alone is a cap over half
+    /// the cache: a server relaying nothing would state the same number as
+    /// one relaying a film. Neither reading costs a syscall, which is what
+    /// lets [`super::publish_now`] take both on the minute.
     #[tokio::test]
     async fn the_cap_is_sized_from_both_owners_of_the_cache() {
         let free = CACHE_FREE_SPACE_FLOOR + 8 * MIB;
@@ -534,10 +529,10 @@ mod tests {
 
     /// **The headroom is published with the cap, from the same reading.**
     ///
-    /// It is the other half of one `statvfs` -- what the volume will still
-    /// give before the margin -- and what an entity is allowed is that plus
-    /// what it already holds (`docs/design/read-pattern-retention.md` section 4).
-    /// A publication that stated one and not the other would leave a pass
+    /// It is the other half of one `statvfs`: what the volume will still give
+    /// before the margin. What an entity is allowed is that plus what it
+    /// already holds (`docs/design/read-pattern-retention.md` section 4). A
+    /// publication that stated one and not the other would leave a pass
     /// sizing a lookahead against a disk that never existed.
     #[tokio::test]
     async fn a_publication_states_the_volumes_headroom_beside_the_cap() {
@@ -562,8 +557,8 @@ mod tests {
         );
     }
 
-    /// An unreadable volume publishes no headroom, which is not a headroom
-    /// of nothing: an entity then falls back to the cap, exactly as it did
+    /// An unreadable volume publishes no headroom, which is not a headroom of
+    /// nothing. An entity then falls back to the cap, exactly as it did
     /// before any of this existed.
     #[tokio::test]
     async fn an_unreadable_volume_publishes_no_headroom_rather_than_none_of_it() {
@@ -580,9 +575,9 @@ mod tests {
     }
 
     /// **A publication that had to wait reads its inputs after the wait.**
-    /// One publication is in its turn; a second one starts, and while it
+    /// One publication is in its turn. A second one starts, and while it
     /// waits the `cacheSize` behind it changes. What it states is the new
-    /// setting's cap: had it read before waiting, it would land the old one
+    /// setting's cap. Had it read before waiting, it would land the old cap
     /// over whatever the first stated.
     #[tokio::test]
     async fn a_publication_reads_its_inputs_in_its_turn() {
@@ -646,10 +641,10 @@ mod tests {
         );
     }
 
-    /// The cap is the smaller of the two, and which one binds depends only
-    /// on the numbers: plenty of room and `cacheSize` governs; a nearly full
-    /// volume and the filesystem does, whatever `cacheSize` says -- including
-    /// the unset `u64::MAX` that let a 4 GB television fill up.
+    /// The cap is the smaller of the two, and which one binds depends only on
+    /// the numbers. With plenty of room, `cacheSize` governs. With a nearly
+    /// full volume the filesystem does, whatever `cacheSize` says. That
+    /// includes the unset `u64::MAX` that let a 4 GB television fill up.
     #[test]
     fn the_effective_limit_is_the_smaller_of_the_setting_and_the_volume() {
         let gib = 1024 * 1024 * 1024;
@@ -665,7 +660,7 @@ mod tests {
 
         // The owner's box: nothing configured, 3 GiB of cache and 523 MiB
         // free. The cache may keep what it has plus the free space above the
-        // floor -- 11 MiB of headroom, not the 1.4 GiB film.
+        // floor. That is 11 MiB of headroom, not the 1.4 GiB film.
         let television = CacheLimit {
             configured: u64::MAX,
             available: Some(523 * 1024 * 1024),
@@ -712,9 +707,9 @@ mod tests {
     }
 
     /// The floor is never eaten into, and the arithmetic that keeps it out of
-    /// reach saturates rather than wrapping: a volume already below the floor
-    /// asks for eviction below current occupancy, and one with no room at all
-    /// asks for everything -- neither may come out as "no limit".
+    /// reach saturates rather than wrapping. A volume already below the floor
+    /// asks for eviction below current occupancy. One with no room at all
+    /// asks for everything. Neither may come out as "no limit".
     #[test]
     fn the_free_space_floor_is_never_eaten_into() {
         // Whatever occupancy the cache is at, the cap leaves the floor free.
@@ -752,17 +747,17 @@ mod tests {
         assert_eq!(full.effective(0), Some(0));
     }
 
-    /// An unreadable volume leaves the configured limit exactly as it was --
-    /// never 0 free space, which would evict a healthy cache on the strength
-    /// of a failed syscall.
+    /// An unreadable volume leaves the configured limit exactly as it was. It
+    /// is never read as 0 free space, which would evict a healthy cache on
+    /// the strength of a failed syscall.
     ///
     /// The `None` is written straight into the [`CacheLimit`] rather than
-    /// staged with a path the OS will not answer for, because there is no
-    /// such path on every platform: `statvfs` fails on a directory not yet
-    /// created, but Windows names the volume from the drive letter and
-    /// answers for it with the drive's real free space. What a cap made
-    /// from a probe that answered `None` is, is the property under test,
-    /// and it is the same regardless of which path fails to produce one.
+    /// staged with a path the OS will not answer for. No such path exists on
+    /// every platform. `statvfs` fails on a directory not yet created, but
+    /// Windows names the volume from the drive letter and answers for it with
+    /// the drive's real free space. The property under test is what a cap
+    /// made from a probe that answered `None` is. It is the same whichever
+    /// path fails to produce one.
     #[test]
     fn an_unreadable_volume_leaves_the_configured_limit_alone() {
         assert_eq!(CacheLimit::configured(1024).effective(4096), Some(1024));
@@ -787,19 +782,18 @@ mod tests {
             assert_eq!(limit.effective(4096), expected);
         }
 
-        // Whereas a real directory answers with a real number -- on every
-        // platform, which is all that can be said of the real probe here.
+        // Whereas a real directory answers with a real number, on every
+        // platform. That is all that can be said of the real probe here.
         let tmp = tempfile::tempdir().unwrap();
         assert!(available_space(tmp.path()).unwrap() > 0);
     }
 
     /// **The cap is restated on the minute, and not before the first one.**
     ///
-    /// The interval is set by how long the cap may be wrong for: the
-    /// number it re-reads is what the rest of the device did to the volume.
-    /// So the value is pinned, not only the loop: a
-    /// longer interval is a cap wrong for longer, a shorter one is a
-    /// `statvfs` the device does not need.
+    /// The interval is set by how long the cap may be wrong for. The number
+    /// it re-reads is what the rest of the device did to the volume. So the
+    /// value is pinned, not only the loop. A longer interval is a cap wrong
+    /// for longer, and a shorter one is a `statvfs` the device does not need.
     #[tokio::test(start_paused = true)]
     async fn the_budget_is_restated_once_a_minute_and_not_at_once() {
         use std::sync::atomic::{AtomicUsize, Ordering};
