@@ -1,16 +1,16 @@
 //! TAR, read as an index: one 512-byte header per member, and the data
 //! skipped by the size the header states.
 //!
-//! There is no directory at the end of a tar and none is wanted: every
+//! There is no directory at the end of a tar and none is wanted. Every
 //! entry says how long it is, so the walk steps from header to header
 //! without touching a byte of anyone's data. A regular file is always
-//! [`Body::Direct`] -- a tar stores what it is given, byte for byte, and
+//! [`Body::Direct`]. A tar stores what it is given, byte for byte, and
 //! that is the whole reason a film ships in one.
 //!
-//! The two extensions that carry what the 100-byte name field cannot are
-//! read as the entries they are: GNU's `L` type, whose data *is* the next
-//! entry's name, and POSIX's `x` type, whose data is a run of
-//! `len key=value\n` records of which `path` and `size` matter here. Both
+//! Two extensions carry what the 100-byte name field cannot, and they are
+//! read as the entries they are. GNU's `L` type has data that *is* the
+//! next entry's name. POSIX's `x` type has data that is a run of
+//! `len key=value\n` records, of which `path` and `size` matter here. Both
 //! are index data, so reading them is reading the index.
 //!
 //! **`tar.gz` is not this**: see [`super::TarGz`]. A gzip stream has no way
@@ -61,8 +61,8 @@ impl Translator for Tar {
                 // looking for more.
                 break;
             }
-            // The one checksum this design does check: it is the header's
-            // own, over 512 bytes that have just been read, and it is what
+            // The one checksum this design does check. It is the header's
+            // own, over 512 bytes that have just been read. It is what
             // tells a tar from a file that happens to have bytes here.
             // A member's CRC would be a read of the member, which is the
             // thing translators do not do.
@@ -91,13 +91,13 @@ impl Translator for Tar {
             }
             let flag = header[TYPE_FLAG];
             match flag {
-                // GNU long name: this entry's data is the next entry's
+                // GNU long name. This entry's data is the next entry's
                 // name, and the next entry's own name field is a stub.
                 b'L' => {
                     let data = budget.read_exact(data_at, size as usize).await?;
                     pending_name = Some(trim_nul(&data));
                 }
-                // A PAX extended header: `path` overrides the name and
+                // A PAX extended header. `path` overrides the name and
                 // `size` the length, which is how a tar carries a file
                 // larger than the octal field can say.
                 b'x' | b'X' => {
@@ -125,8 +125,8 @@ impl Translator for Tar {
                         body: extents,
                     });
                 }
-                // Directories, links, devices, the GNU long *link* name:
-                // none of them is a file with bytes to serve, and each one
+                // Directories, links, devices, the GNU long *link* name.
+                // None of them is a file with bytes to serve, and each one
                 // consumes whatever name was pending for it.
                 _ => {
                     pending_name = None;
@@ -148,7 +148,7 @@ impl Translator for Tar {
 }
 
 /// The name as the header spells it: the `ustar` prefix field joined to
-/// the name field, which is how a path longer than 100 bytes is carried
+/// the name field. That is how a path longer than 100 bytes is carried
 /// without a GNU extension.
 fn name_of(header: &[u8]) -> String {
     let name = trim_nul(&header[NAME]);
@@ -161,7 +161,7 @@ fn name_of(header: &[u8]) -> String {
     name
 }
 
-/// A NUL-padded field as a string, lossily: a name that is not UTF-8 still
+/// A NUL-padded field as a string, lossily. A name that is not UTF-8 still
 /// names a member, and one nobody asks for by that name is never selected.
 fn trim_nul(field: &[u8]) -> String {
     let end = field
@@ -172,8 +172,8 @@ fn trim_nul(field: &[u8]) -> String {
 }
 
 /// A tar's numbers are octal in ASCII, NUL- or space-terminated. The GNU
-/// base-256 form (high bit set) is the other spelling, and it is read too:
-/// it is what carries a member over 8 GiB.
+/// base-256 form (high bit set) is the other spelling, and it is read too.
+/// It is what carries a member over 8 GiB.
 fn octal(field: &[u8]) -> Option<u64> {
     if field.first().is_some_and(|byte| byte & 0x80 != 0) {
         let mut value: u64 = u64::from(field[0] & 0x7f);
@@ -229,7 +229,7 @@ fn pax_fields(data: &[u8]) -> (Option<String>, Option<u64>) {
             break;
         };
         // A record's length counts its own digits and the space, so one
-        // that ends at or before the space is malformed; slicing it would
+        // that ends at or before the space is malformed. Slicing it would
         // panic, and a panic here aborts the process.
         if len <= space || len > rest.len() {
             break;
@@ -261,7 +261,7 @@ mod tests {
         (0..len).map(|i| (i.wrapping_mul(37) % 251) as u8).collect()
     }
 
-    /// A tar of `members`, written by the `tar` crate -- the one this
+    /// A tar of `members`, written by the `tar` crate. That is the one this
     /// server already depends on, and not the parser under test.
     fn tar_of(members: &[(&str, Vec<u8>)]) -> Vec<u8> {
         let mut builder = ::tar::Builder::new(Vec::new());
@@ -282,7 +282,7 @@ mod tests {
     }
 
     /// Every member is one range of the archive, at the offset its bytes
-    /// really are -- checked against the archive, not against the walk
+    /// really are. It is checked against the archive, not against the walk
     /// that produced it.
     #[tokio::test]
     async fn every_member_is_the_range_of_the_archive_its_bytes_are_at() {
@@ -337,8 +337,8 @@ mod tests {
         );
     }
 
-    /// A PAX header names the entry after it, and its data is index data:
-    /// read, and not mistaken for a member of its own.
+    /// A PAX header names the entry after it, and its data is index data.
+    /// It is read, and not mistaken for a member of its own.
     #[tokio::test]
     async fn a_pax_header_names_the_entry_after_it() {
         let name = "videos/a name the header cannot hold/movie.mkv";
@@ -373,7 +373,7 @@ mod tests {
     }
 
     /// A name stored as `./movie.mkv` (what `tar cf x.tar ./movie.mkv`
-    /// writes) is the member `movie.mkv`: the name a request selects by.
+    /// writes) is the member `movie.mkv`, the name a request selects by.
     #[tokio::test]
     async fn a_name_stored_under_dot_slash_is_named_without_it() {
         let mut archive = Vec::new();
@@ -395,8 +395,8 @@ mod tests {
         assert!(index.find("movie.mkv").is_some());
     }
 
-    /// One PAX record, `len key=value\n`, where `len` counts itself --
-    /// so it is found by trying, exactly as the writers do.
+    /// One PAX record, `len key=value\n`, where `len` counts itself. So it
+    /// is found by trying, exactly as the writers do.
     fn pax_record(key: &str, value: &str) -> String {
         let mut len = key.len() + value.len() + 3;
         loop {
@@ -450,7 +450,7 @@ mod tests {
             counts.ranges()
         );
         // One 512-byte header per entry, and the two zero blocks that end
-        // the archive. Nothing was opened: an index is `read_at`s.
+        // the archive. Nothing was opened, since an index is `read_at`s.
         assert!(
             counts.read_at_bytes() <= 4 * BLOCK,
             "{} bytes read for two headers",
@@ -460,7 +460,7 @@ mod tests {
     }
 
     /// Bytes that are not a tar are refused as such, rather than walked
-    /// into nonsense: the first header has to check out.
+    /// into nonsense. The first header has to check out.
     #[tokio::test]
     async fn bytes_that_are_not_a_tar_are_refused() {
         let refusal = Tar
@@ -480,13 +480,13 @@ mod tests {
         header.set_mode(0o644);
         header.set_cksum();
         archive[..512].copy_from_slice(header.as_bytes());
-        // The name field went with the header; only the size matters here.
+        // The name field went with the header. Only the size matters here.
         let refusal = Tar.index(&sources(archive)).await.expect_err("truncated");
         assert!(matches!(refusal, Refusal::Malformed(_)), "{refusal:?}");
     }
 
     /// A record whose stated length ends before its own space is
-    /// malformed, and reading it stops -- it must not slice backwards.
+    /// malformed, and reading it stops. It must not slice backwards.
     #[test]
     fn a_pax_record_shorter_than_its_length_field_is_refused() {
         assert_eq!(pax_fields(b"1 path=x\n"), (None, None));

@@ -1,23 +1,24 @@
 //! ZIP, read as an index and never as a decoder.
 //!
-//! The walk is the format's own: the end-of-central-directory record in
-//! the last 64 KiB (through the zip64 locator where one is there), the
-//! central directory it points at, and -- for every member that is
-//! *stored* -- that member's **local** header, for where its bytes start.
+//! The walk is the format's own. It reads the end-of-central-directory
+//! record in the last 64 KiB (through the zip64 locator where one is
+//! there), and the central directory it points at. For every member that
+//! is *stored*, it reads that member's **local** header, for where its
+//! bytes start.
 //!
 //! **The local header and not the central directory**, because the spec
-//! lets a member's extra field differ in length between the two, and an
+//! lets a member's extra field differ in length between the two. An
 //! offset wrong by a few bytes is a film that will not decode. That is
 //! also the whole of what this costs: 30 bytes per stored member. A
 //! compressed member is refused and never has its local header read, so an
 //! archive of a thousand deflated files costs the directory and nothing
 //! more.
 //!
-//! Parsed by hand rather than through `async_zip`, which is still a
-//! dependency of this workspace but reads through a `BufReader` whose
-//! fills are its own business: what is wanted here is a stated number of
-//! bytes at stated offsets, counted (see [`Budget`]), because the claim
-//! being made is about what was *not* read.
+//! It is parsed by hand rather than through `async_zip`. That crate is
+//! still a dependency of this workspace, but it reads through a
+//! `BufReader` whose fills are its own business. What is wanted here is a
+//! stated number of bytes at stated offsets, counted (see [`Budget`]),
+//! because the claim being made is about what was *not* read.
 
 use super::{
     Body, Budget, Index, Member, Refusal, Translator, direct_extent, le_u16, le_u32, le_u64,
@@ -41,11 +42,11 @@ const LOCAL_HEADER_BYTES: u64 = 30;
 const ZIP64_LOCATOR_BYTES: usize = 20;
 const ZIP64_EOCD_BYTES: usize = 56;
 
-/// How far back the end-of-central-directory record is looked for: its own
-/// 22 bytes plus the longest comment the format can put after it.
+/// How far back the end-of-central-directory record is looked for. It is
+/// its own 22 bytes plus the longest comment the format can put after it.
 const EOCD_SEARCH_BYTES: u64 = EOCD_BYTES + 0xffff;
 
-/// General-purpose bit 0: the member's bytes are encrypted.
+/// General-purpose bit 0, which says the member's bytes are encrypted.
 const ENCRYPTED_FLAG: u16 = 1;
 
 /// The one field value that means "look in the zip64 record instead".
@@ -68,7 +69,7 @@ impl Translator for Zip {
         let mut at = 0usize;
         while at + CENTRAL_ENTRY_BYTES <= directory.len() {
             if le_u32(&directory, at) != Some(CENTRAL_SIGNATURE) {
-                // The directory is a run of entries and nothing else, so a
+                // The directory is a run of entries and nothing else. So a
                 // byte that is not one means the record said a size the
                 // entries do not fill.
                 return Err(budget.malformed(format!(
@@ -112,10 +113,10 @@ async fn central_directory(budget: &mut Budget<'_>) -> Result<Vec<u8>, Refusal> 
         ));
     }
 
-    // zip64, when the 32-bit fields have run out: the locator sits
+    // zip64, when the 32-bit fields have run out. The locator sits
     // immediately before the end record and points at the record that
-    // carries the real figures. Twenty bytes, read only when a sentinel
-    // says they are there.
+    // carries the real figures. It is twenty bytes, read only when a
+    // sentinel says they are there.
     if (offset == u64::from(ZIP64_U32) || size == u64::from(ZIP64_U32))
         && eocd_at >= ZIP64_LOCATOR_BYTES as u64
     {
@@ -150,12 +151,12 @@ async fn central_directory(budget: &mut Budget<'_>) -> Result<Vec<u8>, Refusal> 
 /// there to the end of the file.
 ///
 /// **Twenty-two bytes first.** A zip with no comment ends exactly at its
-/// end record, which is every zip anything writes, and those 22 bytes are
-/// the whole of what has to be read to find the directory. The 64 KiB
-/// window the format allows for a comment is read only when they are not
-/// it -- because that window is not free: over a torrent it is 64 KiB of
-/// pieces fetched from the swarm, and it lands in the last member's data,
-/// which is the one place an index has no business reading.
+/// end record, which is every zip anything writes. Those 22 bytes are the
+/// whole of what has to be read to find the directory. The 64 KiB window
+/// the format allows for a comment is read only when they are not it,
+/// because that window is not free. Over a torrent it is 64 KiB of pieces
+/// fetched from the swarm. It lands in the last member's data, which is
+/// the one place an index has no business reading.
 async fn end_record(budget: &mut Budget<'_>) -> Result<(u64, Vec<u8>), Refusal> {
     let total = budget.source_len();
     if total >= EOCD_BYTES {
@@ -204,7 +205,7 @@ impl Entry {
             return None;
         }
         let name_at = at + CENTRAL_ENTRY_BYTES;
-        // Lossy on purpose: a name that is not UTF-8 (general-purpose bit
+        // Lossy on purpose. A name that is not UTF-8 (general-purpose bit
         // 11 unset means cp437) still names a member, and a member nobody
         // asks for by that name is simply never selected.
         let name = String::from_utf8_lossy(&directory[name_at..name_at + name_len]).into_owned();
@@ -225,7 +226,7 @@ impl Entry {
 
     /// The zip64 extra field (header id 1) carries whichever of the four
     /// figures overflowed 32 bits, in a fixed order and only for those
-    /// that did -- so it is read against the sentinels, not by position.
+    /// that did. So it is read against the sentinels, not by position.
     fn apply_zip64(&mut self, extra: &[u8]) {
         let mut at = 0usize;
         while at + 4 <= extra.len() {
@@ -266,7 +267,7 @@ impl Entry {
         }
     }
 
-    /// A directory entry is not a file: it has no bytes and nothing asks
+    /// A directory entry is not a file. It has no bytes and nothing asks
     /// for it by name.
     fn is_directory(&self) -> bool {
         self.name.ends_with('/')
@@ -299,8 +300,8 @@ impl Entry {
                 self.name, self.compressed_size, self.uncompressed_size
             ))));
         }
-        // The one read per stored member, and the reason it is per member:
-        // the extra field may be a different length here than in the
+        // The one read per stored member. It is per member because the
+        // extra field may be a different length here than in the
         // directory, so only this header says where the bytes start.
         let header = budget
             .read_exact(self.local_header_at, LOCAL_HEADER_BYTES as usize)
@@ -311,7 +312,7 @@ impl Entry {
                 self.name
             ))));
         }
-        // Checked again here rather than trusted from the directory: the
+        // Checked again here rather than trusted from the directory. The
         // two copies of the flags may differ, and the local one describes
         // the bytes that follow it.
         if le_u16(&header, 6).unwrap_or(0) & ENCRYPTED_FLAG != 0 {
@@ -323,8 +324,8 @@ impl Entry {
         match direct_extent(source, "zip", &self.name, data_at, self.uncompressed_size) {
             Ok(extents) => Ok(Body::Direct(extents)),
             // A member whose stated range is outside the file is refused
-            // as that member, not as the archive: the rest of it is still
-            // readable and the player asked for one file.
+            // as that member, not as the archive. The rest of it is still
+            // readable, and the player asked for one file.
             Err(refusal) => Ok(Body::Opaque(refusal)),
         }
     }
@@ -352,8 +353,8 @@ mod tests {
     use crate::sources::Extent;
     use crate::sources::testing::{CountingSource, MemorySource};
 
-    /// Deterministic, mildly incompressible bytes: a member a test can
-    /// find in the archive by value.
+    /// Deterministic, mildly incompressible bytes, so a test can find a
+    /// member in the archive by value.
     pub(crate) fn payload(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i.wrapping_mul(31) % 251) as u8).collect()
     }
@@ -378,8 +379,8 @@ mod tests {
     }
 
     /// A stored member is one range of the archive, and it is the range
-    /// its bytes really are at -- checked against the archive itself, not
-    /// against the arithmetic that produced it.
+    /// its bytes really are at. It is checked against the archive itself,
+    /// not against the arithmetic that produced it.
     #[tokio::test]
     async fn a_stored_member_is_the_range_of_the_archive_its_bytes_are_at() {
         let data = payload(4096);
@@ -417,7 +418,7 @@ mod tests {
         );
     }
 
-    /// Directories are not members: they have no bytes, and a player that
+    /// Directories are not members. They have no bytes, and a player that
     /// asked for one by name would be asking for nothing.
     #[tokio::test]
     async fn directories_are_not_members() {
@@ -435,10 +436,11 @@ mod tests {
         assert_eq!(index.members[0].name, "videos/movie.mkv");
     }
 
-    /// **The index reads the index and not the film.** Counted by range
-    /// and not by total, so a parser that read the member in small pieces
-    /// would still fail this; and counted against the format's own bound,
-    /// so one that read the whole archive into a buffer first would too.
+    /// **The index reads the index and not the film.** It is counted by
+    /// range and not by total, so a parser that read the member in small
+    /// pieces would still fail this. It is counted against the format's own
+    /// bound, so one that read the whole archive into a buffer first would
+    /// fail too.
     #[tokio::test]
     async fn indexing_reads_the_directory_and_one_local_header_and_nothing_else() {
         const LEN: usize = 512 * 1024;
@@ -475,7 +477,7 @@ mod tests {
 
         // The stated bound: the end record, the central directory (two
         // entries, well under a kibibyte), and 30 bytes per stored member.
-        // Nothing was opened at all -- an index is `read_at`s.
+        // Nothing was opened at all, since an index is `read_at`s.
         let bound = EOCD_BYTES + 1024 + 2 * LOCAL_HEADER_BYTES;
         assert!(
             counts.read_at_bytes() <= bound,
@@ -510,7 +512,7 @@ mod tests {
     }
 
     /// A local header that is not where the directory says it is means the
-    /// member's bytes are not where the arithmetic would put them, so that
+    /// member's bytes are not where the arithmetic would put them. So that
     /// member is refused rather than served from an offset nobody checked.
     #[tokio::test]
     async fn a_member_whose_local_header_is_missing_is_refused() {

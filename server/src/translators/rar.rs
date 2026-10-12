@@ -1,27 +1,28 @@
-//! RAR, read as an index and never as a decoder -- and read as a **set**,
+//! RAR, read as an index and never as a decoder. It is read as a **set**,
 //! because a film in a RAR is a film across `.part1.rar`, `.part2.rar`, ...
 //! or `.rar`, `.r00`, `.r01`, ... far more often than in one file.
 //!
 //! The walk is `unrar-rs`'s own: [`RarArchive::parse_volume_facts`] over a
-//! blocking shim of each volume ([`IndexReader`]), which reads the volume's
-//! headers and seeks past every member's data by its stated size -- so a
+//! blocking shim of each volume ([`IndexReader`]). It reads the volume's
+//! headers and seeks past every member's data by its stated size. So a
 //! volume costs its headers, whatever the film inside it weighs. The facts
 //! of every volume go into a [`StoredLayoutBuilder`], which is the part of
-//! the format no header states: a split part's offset *within its member*
+//! the format no header states. A split part's offset *within its member*
 //! is the sum of the earlier parts' sizes, known only once every earlier
 //! volume has been read. What comes out is, per member, the physical
-//! `(volume, offset, len)` of each part -- which is an [`Extent`] list --
-//! or the reason it cannot be one.
+//! `(volume, offset, len)` of each part (an [`Extent`] list), or the
+//! reason it cannot be one.
 //!
-//! What is refused here that the crate could serve: an **encrypted stored
-//! member**, whose bytes the crate can map and decrypt by range, is
-//! `Encrypted` all the same -- there is no password UX, and a wrong guess
-//! is ciphertext to the player. And what is served here that the crate
-//! would not: a member whose only checksum is BLAKE2sp, or none, which the
-//! crate marks ineligible because *it* cannot verify such a member out of
-//! order. Verification is the fetcher's (`docs/design/translated-sources.md`
-//! §2.2, rule 4): the bytes are piece-checked or they are what the origin served,
-//! and a checksum over a member is a read of the whole member.
+//! One thing is refused here that the crate could serve. An **encrypted
+//! stored member**, whose bytes the crate can map and decrypt by range, is
+//! `Encrypted` all the same. There is no password UX, and a wrong guess
+//! is ciphertext to the player. One thing is served here that the crate
+//! would not: a member whose only checksum is BLAKE2sp, or none. The crate
+//! marks it ineligible because *it* cannot verify such a member out of
+//! order. Verification is the fetcher's
+//! (`docs/design/translated-sources.md` §2.2, rule 4). The bytes are
+//! piece-checked or they are what the origin served, and a checksum over a
+//! member is a read of the whole member.
 //!
 //! LICENSING: `unrar-rs` is GPL-3.0-or-later, and this module is what the
 //! `rar` cargo feature turns on. See `server/Cargo.toml` and AGENTS.md.
@@ -38,7 +39,7 @@ use unrar_rs::{
 };
 
 /// The hand-built archives the tests read, shared with the integration
-/// tests by path. Declared here rather than inside `tests` because a
+/// tests by path. It is declared here rather than inside `tests`. A
 /// `#[path]` is resolved through the module's directory, and an inline
 /// module's directory does not exist on disk for `..` to walk through.
 #[cfg(test)]
@@ -58,12 +59,12 @@ impl Translator for Rar {
             return Err(Refusal::Malformed("no rar to read".to_string()));
         }
         let mut builder: Option<StoredLayoutBuilder> = None;
-        // The method each member was packed with, off its first part: the
-        // layout reports *that* a member is compressed and the sentence
+        // The method each member was packed with, off its first part. The
+        // layout reports *that* a member is compressed, and the sentence
         // the player sees wants to say how.
         let mut methods: HashMap<String, u8> = HashMap::new();
         for (volume, source) in sources.iter().enumerate() {
-            // Encrypted headers never get this far: the parse answers
+            // Encrypted headers never get this far. The parse answers
             // `EncryptedArchive` at the encryption header, before any
             // member is named, and `volume_facts` turns that into the
             // refusal. (The walk is the physical header chain, never the
@@ -74,9 +75,9 @@ impl Translator for Rar {
                 return Err(Refusal::Solid);
             }
             // A volume that states its number states which position in the
-            // set it is: given in another, the layout would be built from
-            // the wrong prefix sums and every extent after the swap would
-            // be a different part of the film.
+            // set it is. Given in another position, the layout would be
+            // built from the wrong prefix sums. Every extent after the swap
+            // would then be a different part of the film.
             if let Some(stated) = facts.volume_number
                 && stated as usize != volume
             {
@@ -156,7 +157,7 @@ fn member_of(
     let name = member_name(&stored.name);
     let body = match stored.eligibility {
         // Direct, or ineligible for a reason that is the crate's and not
-        // ours: it will not route a member it cannot checksum, and this
+        // ours. It will not route a member it cannot checksum, and this
         // server checksums nothing (see the module doc).
         MemberEligibility::DirectEligible
         | MemberEligibility::Ineligible(
@@ -190,13 +191,13 @@ fn member_of(
 }
 
 /// The member's parts as extents of the volumes they are in, each checked
-/// against its volume's length -- a part a header puts outside its volume
+/// against its volume's length. A part a header puts outside its volume
 /// is a malformed member, told at the index and not as a read error in
 /// the middle of a film.
 ///
-/// Only for a member the layout classified over a **complete** chain
+/// It is only for a member the layout classified over a **complete** chain
 /// (every eligibility this is called for is decided after the chain has
-/// closed and its sizes have been checked), so the parts are in volume
+/// closed and its sizes have been checked). So the parts are in volume
 /// order and each has its logical offset.
 fn direct(stored: &StoredMember, name: &str, sources: &[Arc<dyn ByteSource>]) -> Body {
     let mut extents = Vec::with_capacity(stored.parts.len());
@@ -292,17 +293,17 @@ fn chain_sentence(name: &str, reason: MalformedReason) -> String {
     format!("rar: {name}: {detail}")
 }
 
-/// The volumes of the set `named` belongs to, among `siblings`, in order --
-/// by the two naming rules and nothing else (`docs/design/translated-sources.md`
-/// §6):
+/// The volumes of the set `named` belongs to, among `siblings`, in order.
+/// It goes by the two naming rules and nothing else
+/// (`docs/design/translated-sources.md` §6):
 ///
 /// * `name.partN.rar`, ascending `N`, which may be zero-padded;
 /// * `name.rar`, then `name.r00`, `name.r01`, ...
 ///
 /// A file named neither way is one volume. A run with a gap is a set
-/// missing a volume, refused **naming it** -- what the layout would
-/// otherwise report as a chain whose sizes do not add up, which is true
-/// and unhelpful.
+/// missing a volume, refused **naming it**. The layout would otherwise
+/// report it as a chain whose sizes do not add up, which is true and
+/// unhelpful.
 pub fn volume_set(named: &str, siblings: &[String]) -> Result<Vec<String>, Refusal> {
     // The named file is a volume of its own set whether or not the list it
     // came with mentions it.
@@ -360,7 +361,7 @@ fn part_number<'a>(named: &'a str, lower: &'a str) -> Option<(&'a str, &'a str)>
 fn old_continuation(lower: &str) -> Option<&str> {
     let at = lower.len().checked_sub(4)?;
     // Four bytes from the end can be inside a character ("Amélie", "日本"),
-    // and a slice there panics; such a name is no `.rNN` anyway.
+    // and a slice there panics. Such a name is no `.rNN` anyway.
     let suffix = lower.get(at..)?;
     (suffix.starts_with(".r") && suffix[2..].bytes().all(|byte| byte.is_ascii_digit()))
         .then_some(&lower[..at])
@@ -471,8 +472,8 @@ mod tests {
     }
 
     /// A stored member of a single volume is one range of that volume, and
-    /// it is the range its bytes really are at -- in both generations of
-    /// the format.
+    /// it is the range its bytes really are at, in both generations of the
+    /// format.
     #[tokio::test]
     async fn a_stored_member_is_the_range_of_the_volume_its_bytes_are_at() {
         let data = payload(4096);
@@ -493,7 +494,7 @@ mod tests {
 
     /// **A set is the ordinary case.** A member split across three
     /// volumes is three extents, one per volume, in order, which together
-    /// are the member -- RAR5 and RAR4 alike.
+    /// are the member. RAR5 and RAR4 alike.
     #[tokio::test]
     async fn a_member_across_three_volumes_is_three_extents_in_volume_order() {
         let data = payload(100_000);
@@ -525,9 +526,9 @@ mod tests {
     }
 
     /// **The index reads the headers and not the film**, per volume and by
-    /// range: no read overlapped a part's data, the shim's reads are
+    /// range. No read overlapped a part's data, the shim's reads are
     /// `read_at`s (nothing opened), and each volume cost under a stated
-    /// bound -- so the set costs at most that bound times its volumes.
+    /// bound. So the set costs at most that bound times its volumes.
     #[tokio::test]
     async fn indexing_a_set_reads_each_volumes_headers_and_nothing_else() {
         let data = payload(300_000);
@@ -635,9 +636,9 @@ mod tests {
         }
     }
 
-    /// An encrypted *stored* member -- which the crate can map to ranges,
-    /// and could decrypt by range -- is refused all the same: there is no
-    /// password UX, and a wrong guess is ciphertext to the player.
+    /// An encrypted *stored* member is refused all the same, though the
+    /// crate can map it to ranges and could decrypt it by range. There is
+    /// no password UX, and a wrong guess is ciphertext to the player.
     #[tokio::test]
     async fn an_encrypted_stored_member_is_refused_even_though_it_could_be_mapped() {
         let archive = fixtures::rar5_archive(
@@ -651,9 +652,9 @@ mod tests {
         assert_eq!(index.members[0].body, Body::Opaque(Refusal::Encrypted));
     }
 
-    /// A member whose only checksum is BLAKE2sp is served: the crate will
+    /// A member whose only checksum is BLAKE2sp is served. The crate will
     /// not route what it cannot verify out of order, and this server does
-    /// not verify at all -- the fetcher does.
+    /// not verify at all. The fetcher does.
     #[tokio::test]
     async fn a_member_with_only_a_blake2_checksum_is_served_because_nothing_here_verifies() {
         let data = payload(4096);
@@ -683,7 +684,7 @@ mod tests {
         assert_eq!(gather(&[archive], extents_of(&index.members[0])), data);
     }
 
-    /// Directories are not members: they have no bytes, and a player that
+    /// Directories are not members. They have no bytes, and a player that
     /// asked for one by name would be asking for nothing.
     #[tokio::test]
     async fn directories_are_not_members() {
@@ -694,8 +695,8 @@ mod tests {
         assert_eq!(index.members[0].name, "videos/movie.mkv");
     }
 
-    /// A member carrying the solid bit on its own -- with the archive not
-    /// declared solid -- is refused as solid, by itself.
+    /// A member carrying the solid bit on its own (with the archive not
+    /// declared solid) is refused as solid, by itself.
     #[tokio::test]
     async fn a_member_marked_solid_on_its_own_is_refused_as_solid() {
         let archive = fixtures::rar5_archive(
@@ -719,11 +720,11 @@ mod tests {
         assert_eq!(index.members[0].body, Body::Opaque(Refusal::Encrypted));
     }
 
-    /// A set that states no volume numbers anywhere -- an old `.rar`/`.r00`
-    /// set -- is judged by its chains: a middle volume left out is a
-    /// member whose parts do not add up, and a set given from its second
-    /// volume is a continuation with nothing before it. Both are said as
-    /// sentences about the member.
+    /// A set that states no volume numbers anywhere (an old `.rar`/`.r00`
+    /// set) is judged by its chains. A middle volume left out is a member
+    /// whose parts do not add up. A set given from its second volume is a
+    /// continuation with nothing before it. Both are said as sentences
+    /// about the member.
     #[tokio::test]
     async fn an_unnumbered_set_with_a_hole_is_told_by_its_chain() {
         let data = payload(100_000);
@@ -752,14 +753,14 @@ mod tests {
     }
 
     /// A member that continues past a volume which claims to be the last
-    /// is a chain still open when every volume has been added, and is
-    /// malformed for it -- the case the layout reports as provisional.
+    /// is a chain still open when every volume has been added. It is
+    /// malformed for it. The layout reports this case as provisional.
     #[tokio::test]
     async fn a_chain_left_open_by_the_last_volume_is_malformed() {
         let data = payload(100_000);
         let mut first = fixtures::rar5_volumes(&[("movie.mkv", &data)], 40_000).remove(0);
-        // Rewrite the end header: no more volumes, says the volume whose
-        // one member continues into the next.
+        // Rewrite the end header. The volume whose one member continues
+        // into the next now says there are no more volumes.
         let end = fixtures::rar5_end_header(true);
         assert!(first.ends_with(&end));
         first.truncate(first.len() - end.len());
@@ -775,8 +776,8 @@ mod tests {
     }
 
     /// A set given without its last volume is refused naming the volume
-    /// it wanted, and a set given with its volumes out of order is refused
-    /// as the wrong set -- either would otherwise be a film with a hole.
+    /// it wanted. A set given with its volumes out of order is refused as
+    /// the wrong set. Either would otherwise be a film with a hole.
     #[tokio::test]
     async fn a_set_missing_a_volume_or_given_out_of_order_is_malformed() {
         let data = payload(100_000);
@@ -836,7 +837,7 @@ mod tests {
     async fn a_part_outside_its_volume_is_malformed() {
         let data = payload(4096);
         let mut archive = fixtures::rar5_stored(&[("movie.mkv", &data)]);
-        // Cut the volume short of the member's data: the header still
+        // Cut the volume short of the member's data. The header still
         // claims 4096 bytes follow it.
         archive.truncate(archive.len() - 2048);
         let index = Rar.index(&sources(archive)).await.expect("indexed");
@@ -941,9 +942,9 @@ mod tests {
         );
     }
 
-    /// A name whose last four bytes split a character is one volume, and
-    /// such a name among the siblings of a set is nobody's continuation --
-    /// neither is a slice through a character.
+    /// A name whose last four bytes split a character is one volume. Such
+    /// a name among the siblings of a set is nobody's continuation. Neither
+    /// is a slice through a character.
     #[test]
     fn a_name_ending_in_a_multibyte_character_is_one_volume() {
         assert_eq!(
@@ -969,11 +970,11 @@ mod tests {
     }
 
     /// **The fixtures are archives a real reader accepts.** Where `unrar`
-    /// is installed, every stored fixture -- single volumes and sets under
-    /// both naming rules, both generations -- passes its test mode, which
-    /// checks every header and every checksum. Without it the test says
-    /// so and passes: the rest of this module is asserted against the
-    /// crate's own parser either way.
+    /// is installed, every stored fixture passes its test mode, which
+    /// checks every header and every checksum. That is single volumes and
+    /// sets under both naming rules, in both generations. Without `unrar`
+    /// the test says so and passes. The rest of this module is asserted
+    /// against the crate's own parser either way.
     #[test]
     fn the_stored_fixtures_pass_unrar_where_it_is_installed() {
         let unrar = match std::process::Command::new("unrar").arg("-inul").output() {

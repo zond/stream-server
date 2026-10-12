@@ -1,20 +1,20 @@
 //! 7z, read as an index and never as a decoder.
 //!
 //! The walk is the crate's own: [`Archive::read`] over the blocking shim
-//! ([`IndexReader`]), which costs the 32-byte signature header at the
-//! front and the packed header at the back -- 7z puts its index at the
-//! end, and the signature header says where. Nothing in between is read,
-//! which is the whole claim, and the tests assert it by range.
+//! ([`IndexReader`]). It costs the 32-byte signature header at the front
+//! and the packed header at the back. 7z puts its index at the end, and
+//! the signature header says where. Nothing in between is read, which is
+//! the whole claim, and the tests assert it by range.
 //!
 //! **In practice a 7z of a film is LZMA2 and is refused.** 7-Zip
 //! compresses by default, and a release that wants its film served by
-//! range ships it in a RAR, so the honest answer here is usually a
-//! sentence the player shows. The translator is kept because it is cheap,
-//! because the refusal is the *right* refusal (which method, on which
-//! member, and told apart from a solid block and from encryption), and
-//! because a store-method 7z -- `7z a -mx0`, which is what someone who
-//! wanted a container rather than compression writes -- is served by
-//! range like any other stored member.
+//! range ships it in a RAR. So the honest answer here is usually a
+//! sentence the player shows. The translator is kept for three reasons.
+//! It is cheap. The refusal is the *right* refusal (which method, on which
+//! member, and told apart from a solid block and from encryption). And a
+//! store-method 7z is served by range like any other stored member. That
+//! is `7z a -mx0`, which is what someone who wanted a container rather
+//! than compression writes.
 //!
 //! ## Where a stored member's bytes are
 //!
@@ -24,9 +24,9 @@
 //! SIGNATURE_HEADER_SIZE + pack_pos + pack_stream_offsets[block_first_pack_stream_index[block]]
 //! ```
 //!
-//! which is the crate's own arithmetic -- `ArchiveReader::
+//! which is the crate's own arithmetic. `ArchiveReader::
 //! build_decode_stack` seeks exactly there before handing a block to a
-//! decoder, and `Archive::pack_pos` documents itself as being for
+//! decoder. `Archive::pack_pos` documents itself as being for
 //! "calculating byte offsets when streaming uncompressed (COPY) content".
 //!
 //! When the block's single coder is COPY its output *is* those packed
@@ -35,8 +35,8 @@
 //! is the only part of this not read straight out of a header, and it is
 //! what [`members_of`] carries along as it walks.
 //!
-//! Everything else -- LZMA, LZMA2, PPMd, a filter chain, AES -- is a
-//! [`Refusal`], and which one is decided in [`body_of`].
+//! Everything else (LZMA, LZMA2, PPMd, a filter chain, AES) is a
+//! [`Refusal`], and [`body_of`] decides which one.
 
 use super::{
     Body, Budget, Index, IndexReader, Member, Refusal, Translator, direct_extent, le_u32, le_u64,
@@ -69,10 +69,10 @@ impl Translator for SevenZ {
             [] => return Err(Refusal::Malformed(format!("no {FORMAT} to read"))),
             [source] => source.clone(),
             // `.7z.001`, `.7z.002`, ... is one file cut into pieces rather
-            // than a set of archives: every piece but the first is a
+            // than a set of archives. Every piece but the first is a
             // headless slab of bytes, and there is nothing to index until
             // they are joined back into one. The crate does not join them
-            // and neither does this -- joining them is fetching them all,
+            // and neither does this. Joining them is fetching them all,
             // which is the thing this design exists to stop.
             several => {
                 return Err(Refusal::Malformed(format!(
@@ -82,10 +82,10 @@ impl Translator for SevenZ {
                 )));
             }
         };
-        // The signature header, read here rather than left to the crate:
-        // see `check_signature_header` for the thing it is checked for
-        // that the crate would otherwise answer by reading a mebibyte one
-        // byte at a time.
+        // The signature header, read here rather than left to the crate.
+        // `check_signature_header` says what it is checked for: a shape
+        // the crate would otherwise answer by reading a mebibyte one byte
+        // at a time.
         let mut budget = Budget::new(source.as_ref(), FORMAT);
         check_signature_header(&mut budget).await?;
         let archive = read_archive(source.clone()).await?;
@@ -97,15 +97,15 @@ impl Translator for SevenZ {
 
 /// The 32 bytes at the front, checked before the crate is handed the file.
 ///
-/// Most of this the crate would catch by itself. One thing it would not:
-/// when the start header's CRC field is zero **and** the twenty bytes
+/// The crate would catch most of this by itself. One thing it would not.
+/// When the start header's CRC field is zero **and** the twenty bytes
 /// after it are zero, `Archive::read` falls back to guessing where the end
-/// header is, by reading one byte at a time backwards over the last
+/// header is. It reads one byte at a time backwards over the last
 /// mebibyte of the file. Over a piece store or a proxied entity that is a
 /// million round trips for a file that is broken anyway, so the shape is
 /// refused here instead.
 ///
-/// And one thing it would report unhelpfully: the first part of a
+/// And one thing it would report unhelpfully. The first part of a
 /// **multi-part** set carries the signature but keeps its index in the
 /// last part, so the offset it states is past its own end. That is worth
 /// a sentence of its own, because it is the one refusal here a viewer can
@@ -163,7 +163,7 @@ async fn read_archive(source: Arc<dyn ByteSource>) -> Result<Archive, Refusal> {
         "read a 7z index"
     );
     parsed.map_err(|error| match error {
-        // The index itself is AES: the crate asks for a password at the
+        // The index itself is AES. The crate asks for a password at the
         // first coder, before a file is named. There is no password UX,
         // so this is where it stops (`docs/design/translated-sources.md` §6).
         SevenZError::PasswordRequired | SevenZError::MaybeBadPassword(_) => Refusal::Encrypted,
@@ -190,11 +190,11 @@ async fn read_archive(source: Arc<dyn ByteSource>) -> Result<Archive, Refusal> {
 /// Every file in the archive that has bytes of its own, as a [`Member`].
 ///
 /// One pass over [`Archive::files`], carrying two running figures per
-/// block: how many of its files have been seen (which is what says
-/// whether a block holds several, and so whether it is solid) and how
-/// many of their bytes have gone before (which is where the next one
-/// starts). The file list is in block order and the crate builds the
-/// stream map from the same walk, so a file's place in its block is its
+/// block. One is how many of its files have been seen, which says whether
+/// a block holds several, and so whether it is solid. The other is how
+/// many of their bytes have gone before, which is where the next one
+/// starts. The file list is in block order, and the crate builds the
+/// stream map from the same walk. So a file's place in its block is its
 /// place in this walk.
 fn members_of(archive: &Archive, source: &dyn ByteSource) -> Vec<Member> {
     // Where each block's packed bytes begin, worked out once.
@@ -215,13 +215,13 @@ fn members_of(archive: &Archive, source: &dyn ByteSource) -> Vec<Member> {
     let mut members = Vec::new();
     for (at, file) in archive.files.iter().enumerate() {
         // A directory has no bytes, and an anti-item is a note that a
-        // file was deleted -- neither is something a player can ask for.
+        // file was deleted. Neither is something a player can ask for.
         if file.is_directory || file.is_anti_item {
             continue;
         }
         let name = member_name(&file.name);
         if !file.has_stream {
-            // An empty file: no block, no bytes, and `MemberView` makes a
+            // An empty file has no block and no bytes. `MemberView` makes a
             // zero-length body of it.
             members.push(Member {
                 name,
@@ -277,7 +277,7 @@ fn block_of(archive: &Archive, at: usize, has_stream: bool) -> Option<usize> {
 /// Where `block`'s packed bytes begin in the file, or `None` when the
 /// numbers the header states do not add up inside a `u64`.
 ///
-/// **The arithmetic this module exists for**, and the crate's own: see
+/// **The arithmetic this module exists for**, and the crate's own. See
 /// `ArchiveReader::build_decode_stack`, which seeks exactly here before
 /// handing a block to a decoder.
 fn block_offset(archive: &Archive, block: usize) -> Option<u64> {
@@ -294,10 +294,10 @@ fn block_offset(archive: &Archive, block: usize) -> Option<u64> {
 /// Where a member's bytes are, or why they cannot be pointed at.
 ///
 /// The three refusals are tried in the order of how much of the archive
-/// each is about: encryption is the block's whatever else it does,
-/// solidity says the file cannot be *entered* even by a decoder that
-/// started at the block, and the method is the last and narrowest thing
-/// left to say.
+/// each is about. Encryption is the block's, whatever else it does.
+/// Solidity says the file cannot be *entered* even by a decoder that
+/// started at the block. The method is the last and narrowest thing left
+/// to say.
 #[allow(clippy::too_many_arguments)]
 fn body_of(
     archive: &Archive,
@@ -326,10 +326,10 @@ fn body_of(
         matches!(&block.coders[..], [only] if only.encoder_method_id() == EncoderMethod::ID_COPY);
     if !stored {
         // A block holding several files cannot be entered at one of them
-        // whatever its method: reaching the second file means decoding the
+        // whatever its method. Reaching the second file means decoding the
         // first. That is what 7-Zip calls solid, and it is the more useful
-        // half of the truth -- "compressed" would be true too, and would
-        // not say that even a decoder could not start here.
+        // half of the truth. "Compressed" would be true too, and would not
+        // say that even a decoder could not start here.
         if files_in_block > 1 {
             return Body::Opaque(Refusal::Solid);
         }
@@ -365,15 +365,15 @@ fn body_of(
     match direct_extent(source, FORMAT, name, offset, len) {
         Ok(extents) => Body::Direct(extents),
         // A member whose stated range is outside the file is refused as
-        // that member and not as the archive: the player asked for one
+        // that member and not as the archive. The player asked for one
         // file, and the rest of the archive is still readable.
         Err(refusal) => Body::Opaque(refusal),
     }
 }
 
-/// What a block's coders are called, for the sentence the player shows:
-/// the chain in the order the header lists it, because a filter in front
-/// of a compressor is as much of a reason as the compressor.
+/// What a block's coders are called, for the sentence the player shows.
+/// It is the chain in the order the header lists it, because a filter in
+/// front of a compressor is as much of a reason as the compressor.
 fn method_names(block: &Block) -> String {
     let names: Vec<String> = block
         .coders
@@ -426,8 +426,8 @@ mod tests {
         OneBlock,
     }
 
-    /// A 7z built in memory: `methods` is the coder chain the content goes
-    /// through, `packing` says whether the entries share a block.
+    /// A 7z built in memory. `methods` is the coder chain the content goes
+    /// through, and `packing` says whether the entries share a block.
     fn archive(
         methods: Vec<EncoderConfiguration>,
         encrypt_header: bool,
@@ -474,7 +474,7 @@ mod tests {
         vec![EncoderConfiguration::new(EncoderMethod::LZMA2)]
     }
 
-    /// COPY, and then AES over it: an archive whose *members* are
+    /// COPY, and then AES over it. This is an archive whose *members* are
     /// encrypted but whose index is readable.
     fn encrypted_methods() -> Vec<EncoderConfiguration> {
         vec![
@@ -483,8 +483,8 @@ mod tests {
         ]
     }
 
-    /// A store-method 7z, one block per entry: the shape this translator
-    /// exists to serve.
+    /// A store-method 7z, one block per entry. This is the shape this
+    /// translator exists to serve.
     fn stored(entries: &[(&str, &[u8])]) -> Vec<u8> {
         archive(copy_methods(), false, Packing::PerEntry, entries)
     }
@@ -516,9 +516,9 @@ mod tests {
     }
 
     /// A stored member is one range of the archive, and it is the range
-    /// its bytes really are at -- which is the whole of what this module
-    /// claims, checked against the bytes and not against the sketch that
-    /// produced the arithmetic.
+    /// its bytes really are at. That is the whole of what this module
+    /// claims. It is checked against the bytes and not against the sketch
+    /// that produced the arithmetic.
     #[tokio::test]
     async fn a_stored_member_is_the_range_of_the_archive_its_bytes_are_at() {
         let film = payload(64 * 1024);
@@ -551,11 +551,11 @@ mod tests {
         );
     }
 
-    /// **Several files in one COPY block are each at a stated offset**:
-    /// the block's output is its packed bytes, so they lie end to end and
+    /// **Several files in one COPY block are each at a stated offset.**
+    /// The block's output is its packed bytes, so they lie end to end, and
     /// the one asked for starts after the sum of the ones before it. This
-    /// is the case the design sketch called out, and it is served rather
-    /// than refused -- nothing has to be decoded to reach it.
+    /// is the case the design sketch called out. It is served rather than
+    /// refused, since nothing has to be decoded to reach it.
     #[tokio::test]
     async fn stored_members_sharing_a_block_start_after_the_ones_before_them() {
         let members: [(&str, &[u8]); 3] = [
@@ -590,9 +590,10 @@ mod tests {
         }
     }
 
-    /// **The index reads the two ends and not the film**, by range: the
-    /// signature header at the front and the packed index at the back,
-    /// with nothing of the member's own bytes touched and nothing opened.
+    /// **The index reads the two ends and not the film**, by range. It
+    /// reads the signature header at the front and the packed index at the
+    /// back. Nothing of the member's own bytes is touched and nothing is
+    /// opened.
     #[tokio::test]
     async fn indexing_reads_the_two_ends_and_not_the_film() {
         let film = payload(256 * 1024);
@@ -646,7 +647,7 @@ mod tests {
     }
 
     /// A block holding several files that are not stored is refused as
-    /// **solid** rather than as compressed: reaching the second file means
+    /// **solid** rather than as compressed. Reaching the second file means
     /// decoding the first, which is the more useful half of the truth.
     #[tokio::test]
     async fn a_shared_compressed_block_is_refused_as_solid() {
@@ -666,7 +667,7 @@ mod tests {
     }
 
     /// An encrypted member is refused as encrypted even though its block
-    /// is COPY underneath and its range could be worked out: there is no
+    /// is COPY underneath and its range could be worked out. There is no
     /// password UX, and a wrong guess is ciphertext to the player.
     #[tokio::test]
     async fn an_encrypted_member_is_refused_even_though_it_could_be_mapped() {
@@ -680,7 +681,7 @@ mod tests {
         assert_eq!(index.members[0].body, Body::Opaque(Refusal::Encrypted));
     }
 
-    /// An encrypted index is refused before any member is named: the
+    /// An encrypted index is refused before any member is named. The
     /// crate asks for a password at the first coder, and there is none to
     /// give it.
     #[tokio::test]
@@ -698,9 +699,8 @@ mod tests {
     }
 
     /// The first part of a `.7z.001` set carries the signature and keeps
-    /// its index in the last part, so it is refused as what it is --
-    /// naming the shape, because that is the one thing a viewer can act
-    /// on.
+    /// its index in the last part. So it is refused as what it is, naming
+    /// the shape, because that is the one thing a viewer can act on.
     #[tokio::test]
     async fn the_first_part_of_a_multi_part_set_is_refused_naming_why() {
         let bytes = stored(&[("videos/film.bin", &payload(64 * 1024))]);
@@ -716,7 +716,7 @@ mod tests {
     }
 
     /// And a create that hands over several parts is refused the same
-    /// way: this server reads one file, and joining the parts would be
+    /// way. This server reads one file, and joining the parts would be
     /// fetching all of them.
     #[tokio::test]
     async fn several_parts_at_once_are_refused_as_one_file_cut_up() {
@@ -733,8 +733,8 @@ mod tests {
     }
 
     /// A file that is not a 7z at all, and one whose start header is
-    /// blank -- the shape that would otherwise send the crate reading a
-    /// mebibyte backwards a byte at a time.
+    /// blank. A blank one is the shape that would otherwise send the crate
+    /// reading a mebibyte backwards a byte at a time.
     #[tokio::test]
     async fn a_file_that_is_not_a_7z_is_refused_without_a_search() {
         for bytes in [
@@ -764,7 +764,7 @@ mod tests {
         }
     }
 
-    /// Directories have no bytes and are not members; an empty file has
+    /// Directories have no bytes and are not members. An empty file has
     /// none either, and is a member of no length rather than a refusal.
     #[tokio::test]
     async fn directories_are_not_members_and_an_empty_file_is_an_empty_member() {

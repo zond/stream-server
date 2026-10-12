@@ -1,12 +1,13 @@
-//! **An indexed container, in memory, leased** -- what a `/{fmt}/create`
-//! leaves behind and every response body reads from -- and the keyed map
-//! that hands them out and drops them when the viewer has moved on.
+//! **An indexed container, in memory, leased**, and the keyed map that
+//! hands them out and drops them when the viewer has moved on. A
+//! `/{fmt}/create` leaves one behind, and every response body reads from
+//! it.
 //!
-//! **A session owns no file.** What it holds is the container's [`Index`]
-//! and the [`ByteSource`]s it was read from, so dropping one frees only
-//! memory. For a proxied URL it frees nothing at all: the bytes are the
-//! proxy cache's, under its own retention owner, exactly as if the player
-//! had fetched the file through `/proxy` itself.
+//! **A session owns no file.** It holds the container's [`Index`] and the
+//! [`ByteSource`]s it was read from, so dropping one frees only memory.
+//! For a proxied URL it frees nothing at all. The bytes are the proxy
+//! cache's, under its own retention owner, exactly as if the player had
+//! fetched the file through `/proxy` itself.
 //!
 //! A re-index after a drop is therefore a few small ranged reads, which
 //! the proxy cache answers from disk and a torrent from its piece store.
@@ -15,10 +16,10 @@
 //! ## The map
 //!
 //! A session is created by one request (`/create`) and read by others
-//! (`/stream/{key}/...`), so it has to outlive the request that made it,
-//! and nothing tells the server when the player is done with it:
-//! [`Sessions`] is what decides when one ends (below), rather than leaving
-//! every session for the life of the process.
+//! (`/stream/{key}/...`), so it has to outlive the request that made it.
+//! Nothing tells the server when the player is done with it. So
+//! [`Sessions`] decides when one ends (below), rather than leaving every
+//! session for the life of the process.
 //!
 //! ## What ends a session: a *what*, not a *when*
 //!
@@ -27,42 +28,42 @@
 //! range: "a stream that has stopped is not a stream that has been
 //! replaced. Pausing for an hour changes nothing on the disk; opening
 //! something else changes it at once." Torrent pieces and proxy ranges are
-//! kept while nothing else has become live and go the moment something
+//! kept while nothing else has become live. They go the moment something
 //! has, bounded by the cache budget. A session is the index of the
 //! container those bytes are in, and has the same life:
 //!
-//! * A session with a [`Lease`] out is in use and is never taken -- a route
-//!   keeps the lease inside the response body it is streaming, so a player
+//! * A session with a [`Lease`] out is in use and is never taken. A route
+//!   keeps the lease inside the response body it is streaming. So a player
 //!   reading for two hours holds the session for two hours, and a cast
 //!   receiver reading holds it while it reads.
 //! * A session whose container **is** the entity being played is kept
 //!   ([`TranslatedSession::is_live`]).
 //! * Every other session goes when the live entity moves to something that
-//!   is not it. The map does not decide that: [`Sessions::retain`] is
-//!   handed the rule by whoever watches the cell, which for this server is
-//!   the switch task in `crate::run` -- the same signal the torrent and
-//!   proxy owners drop their slack on.
+//!   is not it. The map does not decide that. Whoever watches the cell
+//!   hands [`Sessions::retain`] the rule. For this server that is the
+//!   switch task in `crate::run`, on the same signal the torrent and proxy
+//!   owners drop their slack on.
 //! * Nothing else ends one, short of the process. A session with no lease
 //!   and no switch after it lasts as long as the server does, which is the
-//!   point: a cast paused overnight comes back to the session it was
-//!   reading, and `/{fmt}/create` is not on the LAN listener, so a
-//!   receiver that lost one had no way to make another (`docs/CASTING.md`
-//!   in xtremio).
+//!   point. A cast paused overnight comes back to the session it was
+//!   reading. `/{fmt}/create` is not on the LAN listener, so a receiver
+//!   that lost one had no way to make another (`docs/CASTING.md` in
+//!   xtremio).
 //!
 //! ## The backstop, and why it is not a timer either
 //!
-//! A live entity that never moves must not let the map grow without bound,
-//! so there is a **cap on entries** ([`SESSION_CAP`]) and the least
+//! A live entity that never moves must not let the map grow without bound.
+//! So there is a **cap on entries** ([`SESSION_CAP`]), and the least
 //! recently used unleased session is evicted when a new one takes the map
-//! over it. A count, not a clock: the thing that must not run away is the
-//! number of indexes held, and evicting by *how long ago* a session was
-//! read would be the timer coming back in through the window. Nothing here
-//! calls `Instant::now()`, and a session that nothing displaces is not
-//! displaced by time passing.
+//! over it. The cap is a count, not a clock. The thing that must not run
+//! away is the number of indexes held. Evicting by *how long ago* a
+//! session was read would be the timer coming back in through the window.
+//! Nothing here calls `Instant::now()`, and a session that nothing
+//! displaces is not displaced by time passing.
 //!
-//! "Least recently used" is an ordering, and it is kept as one -- a
-//! monotonic counter stamped on the map's own uses ([`Usage`]) -- rather
-//! than as an instant that could be compared against a duration.
+//! "Least recently used" is an ordering, and it is kept as one: a
+//! monotonic counter stamped on the map's own uses ([`Usage`]). It is not
+//! kept as an instant that could be compared against a duration.
 
 use super::{Body, Index, Member};
 use crate::sources::{ByteSource, MemberView};
@@ -76,13 +77,13 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 /// How many sessions one map holds before a new one evicts the least
 /// recently used session that has no lease out.
 ///
-/// The backstop and nothing more: what ordinarily ends a session is the
-/// viewer opening something else (see the module doc), and this is the
-/// bound for the case where they never do. An index is kilobytes and a
+/// It is the backstop and nothing more. What ordinarily ends a session is
+/// the viewer opening something else (see the module doc). This is the
+/// bound for the case where they never do. An index is kilobytes, and a
 /// viewer's real working set is one container, or the handful a set of
-/// volumes and a subtitle make; thirty-two distinct containers opened
+/// volumes and a subtitle make. Thirty-two distinct containers opened
 /// without one single switch of the live entity between them is not a
-/// viewing pattern, it is a leak, and the oldest unread of them is the
+/// viewing pattern. It is a leak, and the oldest unread of them is the
 /// honest thing to drop.
 pub const SESSION_CAP: usize = 32;
 
@@ -102,8 +103,8 @@ impl<T> Clone for Sessions<T> {
 struct Inner<T> {
     map: DashMap<String, Entry<T>>,
     cap: usize,
-    /// The map's own use counter: the ordering eviction is by. Bumped once
-    /// per lease taken and once per lease dropped, and never read as a
+    /// The map's own use counter, which eviction orders by. It is bumped
+    /// once per lease taken and once per lease dropped, and never read as a
     /// time.
     uses: Arc<AtomicU64>,
 }
@@ -149,10 +150,10 @@ impl Usage {
     }
 }
 
-/// A session handed out by [`Sessions::get`]. Dereferences to the session;
-/// while it exists the session cannot be taken, by an eviction or by the
-/// live entity moving off it, and dropping it moves the session to the
-/// front of the use order.
+/// A session handed out by [`Sessions::get`]. It dereferences to the
+/// session. While it exists, the session cannot be taken, by an eviction
+/// or by the live entity moving off it. Dropping it moves the session to
+/// the front of the use order.
 pub struct Lease<T> {
     value: Arc<T>,
     usage: Arc<Usage>,
@@ -185,7 +186,7 @@ impl<T> Drop for Lease<T> {
 }
 
 impl<T: Send + Sync + 'static> Sessions<T> {
-    /// A registry holding at most `cap` sessions -- see [`SESSION_CAP`] for
+    /// A registry holding at most `cap` sessions. See [`SESSION_CAP`] for
     /// what the cap is and is not.
     pub fn new(cap: usize) -> Self {
         Self {
@@ -201,11 +202,10 @@ impl<T: Send + Sync + 'static> Sessions<T> {
     /// hand back a lease on it.
     ///
     /// **Leased, and not merely inserted.** The caller of an insert is
-    /// about to use what it inserted, and between the insert and a
-    /// following `get` the live entity can move -- a container's first read
-    /// is what moves it -- so a session inserted and then looked up again
-    /// was a session that could be gone by the time its own maker asked for
-    /// it.
+    /// about to use what it inserted. Between the insert and a following
+    /// `get` the live entity can move, because a container's first read is
+    /// what moves it. So a session inserted and then looked up again could
+    /// be gone by the time its own maker asked for it.
     pub fn insert(&self, key: String, value: T) -> Lease<T> {
         let entry = Entry {
             value: Arc::new(value),
@@ -217,7 +217,7 @@ impl<T: Send + Sync + 'static> Sessions<T> {
         lease
     }
 
-    /// The session under `key`, leased -- see [`Lease`]. No lock on the map
+    /// The session under `key`, leased (see [`Lease`]). No lock on the map
     /// is held once this returns, so the lease may be kept across awaits.
     pub fn get(&self, key: &str) -> Option<Lease<T>> {
         self.inner.map.get(key).map(|entry| Lease::new(&entry))
@@ -226,11 +226,11 @@ impl<T: Send + Sync + 'static> Sessions<T> {
     /// The session under `key`, leased, created by `make` when there is
     /// none.
     ///
-    /// One session per key even when requests race for it, which is the
-    /// point: a player's opening is several requests at once on the same
-    /// member, and two sessions for it would each do the work the session
+    /// There is one session per key even when requests race for it, which
+    /// is the point. A player's opening is several requests at once on the
+    /// same member. Two sessions for it would each do the work the session
     /// exists to do once. `make` runs under the map's own lock, so it is a
-    /// constructor and nothing else -- no I/O, no await.
+    /// constructor and nothing else: no I/O, no await.
     pub fn get_or_insert_with(&self, key: &str, make: impl FnOnce() -> T) -> Lease<T> {
         let uses = self.inner.uses.clone();
         // The map's lock is dropped before the eviction walk, which takes
@@ -250,7 +250,7 @@ impl<T: Send + Sync + 'static> Sessions<T> {
         lease
     }
 
-    /// The first session `matches` accepts, leased. For finding a session
+    /// The first session `matches` accepts, leased. It finds a session
     /// that already holds what a new one would otherwise fetch again.
     pub fn find(&self, mut matches: impl FnMut(&T) -> bool) -> Option<Lease<T>> {
         self.inner
@@ -262,18 +262,18 @@ impl<T: Send + Sync + 'static> Sessions<T> {
 
     /// Drop every session with no lease out that `keep` does not accept.
     ///
-    /// **The rule is the caller's**, which is what keeps this map honest
-    /// for anything else that ever stores something in one: a `Sessions<T>`
+    /// **The rule is the caller's.** That keeps this map honest for
+    /// anything else that ever stores something in one. A `Sessions<T>`
     /// knows what a lease is and knows nothing about what a `T` is for. For
     /// this server the caller is the switch task in `crate::run`, the rule
     /// is [`TranslatedSession::is_live`], and the signal is the one the
-    /// retention owners answer -- the live entity moving.
+    /// retention owners answer: the live entity moving.
     ///
-    /// A lease outranks the rule: a body streaming to a player, or to a
+    /// A lease outranks the rule. A body streaming to a player, or to a
     /// cast receiver, is not taken out from under its reader whatever the
-    /// cell says. `retain` holds each shard's write lock while it decides
-    /// and [`Sessions::get`] takes its lease under the shard's read lock,
-    /// so a session cannot be leased and dropped at once.
+    /// cell says. `retain` holds each shard's write lock while it decides,
+    /// and [`Sessions::get`] takes its lease under the shard's read lock.
+    /// So a session cannot be leased and dropped at once.
     pub fn retain(&self, keep: impl Fn(&T) -> bool) {
         self.inner
             .map
@@ -293,18 +293,18 @@ impl<T> Inner<T> {
     /// Bring the map back to its cap by dropping unleased sessions, oldest
     /// in the use order first.
     ///
-    /// The candidates are read into a list before anything is removed: the
+    /// The candidates are read into a list before anything is removed. The
     /// iterator holds shard locks, and a removal taken under it would be a
     /// deadlock rather than an eviction.
     ///
     /// **Whether a session is leased is asked at the removal and not while
-    /// the list is being read**, under the shard's write lock, which is
-    /// the only place the answer cannot go stale between the asking and
-    /// the unlink -- exactly as [`Sessions::retain`] and
-    /// [`Sessions::get`] pair. A map whose oldest sessions are all leased
-    /// therefore stays over its cap until one of them is let go, which is
-    /// the right way round: the cap bounds what is *kept*, and a reader is
-    /// never dropped under for it.
+    /// the list is being read**, under the shard's write lock. That is the
+    /// only place the answer cannot go stale between the asking and the
+    /// unlink, exactly as [`Sessions::retain`] and [`Sessions::get`] pair.
+    /// A map whose oldest sessions are all leased therefore stays over its
+    /// cap until one of them is let go. That is the right way round: the
+    /// cap bounds what is *kept*, and a reader is never dropped under for
+    /// it.
     fn evict_over_cap(&self) {
         if self.map.len() <= self.cap {
             return;
@@ -327,21 +327,21 @@ impl<T> Inner<T> {
 /// One container, indexed: where its bytes come from, what is in it, and
 /// which member the `/create` that made it chose.
 pub struct TranslatedSession {
-    /// What this was made from -- the volume list, or a
+    /// What this was made from: the volume list, or a
     /// `torrent:<hash>/<path>` key. A set is **every** volume's URL and
-    /// not the first alone (`routes::archive::set_origin`): two sets can
-    /// share a `.part1.rar` and differ after it, and a session found by
-    /// the first URL would then serve one set's index over another's
-    /// bytes. Two creates naming the same origin are the same session's
-    /// business; one naming a different origin under a key already in use
-    /// is refused, because every `/{fmt}/stream/{key}/...` after it would
-    /// read a different archive (`routes::archive`).
+    /// not the first alone (`routes::archive::set_origin`). Two sets can
+    /// share a `.part1.rar` and differ after it. A session found by the
+    /// first URL would then serve one set's index over another's bytes. Two
+    /// creates naming the same origin are the same session's business. One
+    /// naming a different origin under a key already in use is refused,
+    /// because every `/{fmt}/stream/{key}/...` after it would read a
+    /// different archive (`routes::archive`).
     origin: String,
-    /// Where the container's bytes come from -- see [`SessionSources`].
+    /// Where the container's bytes come from. See [`SessionSources`].
     sources: SessionSources,
     index: Index,
     /// The member `fileIdx`/`fileMustInclude` picked, if the create picked
-    /// one: what `/stream/{key}` with no member path redirects to.
+    /// one. `/stream/{key}` with no member path redirects to it.
     selected: Option<usize>,
 }
 
@@ -384,8 +384,8 @@ impl TranslatedSession {
 
     /// `member` as a file: the extents it is made of, over `sources`. An
     /// error here is a translator that computed an offset outside its
-    /// source, which `MemberView::new` refuses to build rather than
-    /// leaving for the middle of a film.
+    /// source. `MemberView::new` refuses to build that, rather than leave
+    /// it for the middle of a film.
     pub fn view(
         &self,
         member: &Member,
@@ -400,14 +400,14 @@ impl TranslatedSession {
         MemberView::new(member.name.clone(), sources, extents.clone())
     }
 
-    /// Whether this session's container is the entity being played -- the
-    /// one question [`Sessions::retain`] is given for this map (see the
-    /// module doc).
+    /// Whether this session's container is the entity being played. This
+    /// is the one question [`Sessions::retain`] is given for this map (see
+    /// the module doc).
     ///
     /// **Per torrent, not per file of one.** A set's volumes are several
-    /// files of one torrent and a body crosses from one to the next as it
-    /// reads, so the cell names `part1` for a while and `part2` after it;
-    /// a rule that asked for the exact file would drop the session at the
+    /// files of one torrent, and a body crosses from one to the next as it
+    /// reads. So the cell names `part1` for a while and `part2` after it. A
+    /// rule that asked for the exact file would drop the session at the
     /// volume boundary of the very container it is reading. The same
     /// reasoning makes a *link*-borne container's rule "any of my sources
     /// is the live one" rather than "the first is".
@@ -424,44 +424,43 @@ impl TranslatedSession {
     }
 }
 
-/// Where a session's bytes come from, and -- the part that matters -- for
-/// how long it holds the way in.
+/// Where a session's bytes come from, and for how long it holds the way
+/// in. The second part is what matters.
 pub enum SessionSources {
     /// Held for the session's life. An HTTP entity read through the proxy
     /// cache owns nothing and registers nothing, so keeping the source is
     /// keeping a URL, a length and a validator.
     Held(Vec<Arc<crate::sources::ProxySource>>),
     /// Bytes already on this device, held for the session's life: a file
-    /// of it, or a download the proxy cache holds whole -- what a sniff in
-    /// `resolve` found a container in (`crate::media`). Nothing to fetch
-    /// and nothing to read ahead of.
+    /// of it, or a download the proxy cache holds whole. A sniff in
+    /// `resolve` found a container in it (`crate::media`). There is nothing
+    /// to fetch and nothing to read ahead of.
     Kept(Vec<Arc<dyn ByteSource>>),
-    /// The files of a torrent the container is made of -- one for an
-    /// ordinary archive, the volumes in order for a set -- **opened per
+    /// The files of a torrent the container is made of (one for an
+    /// ordinary archive, the volumes in order for a set), **opened per
     /// read and dropped with the body**.
     ///
-    /// A `TorrentSource` registers a stream on its torrent for as long
-    /// as it lives (`sources::torrent::TorrentSource`, ended by its drop), and that
-    /// registration is what tells this server a player is reading: hold
-    /// one for the session's life and the reconciler could never stop a
-    /// torrent whose container was once opened -- which, now that a
-    /// session lives until the viewer opens something else, would be for
-    /// as long as they stay on it. So the session
-    /// keeps the *index*, which is what was expensive to read, and each
-    /// body opens its own sources -- which is a file lookup and a
-    /// reconcile per volume, not a fetch.
+    /// A `TorrentSource` registers a stream on its torrent for as long as
+    /// it lives (`sources::torrent::TorrentSource`, ended by its drop).
+    /// That registration is what tells this server a player is reading.
+    /// Hold one for the session's life, and the reconciler could never stop
+    /// a torrent whose container was once opened. Now that a session lives
+    /// until the viewer opens something else, that would be for as long as
+    /// they stay on it. So the session keeps the *index*, which is what was
+    /// expensive to read, and each body opens its own sources. That is a
+    /// file lookup and a reconcile per volume, not a fetch.
     ///
     /// The **paths** are kept and not the file indices, because the index
-    /// list is the torrent's and a session outlives a restart of it; they
-    /// are what `Translator::volumes` answered when the index was read, so
+    /// list is the torrent's and a session outlives a restart of it. They
+    /// are what `Translator::volumes` answered when the index was read. So
     /// a body reopens the same volumes in the same order the extents were
     /// computed against.
     Torrent {
         info_hash: String,
         paths: Vec<String>,
         /// The volumes held as **one thing to watch** for the session's
-        /// life (`enginefs::retention::live::Live::hold_set`): without it
-        /// every volume open moved the live entity and each move's slack
+        /// life (`enginefs::retention::live::Live::hold_set`). Without it,
+        /// every volume open moved the live entity, and each move's slack
         /// pass took the volumes around it. `None` for a set of one file,
         /// which needs no holding.
         hold: Option<enginefs::retention::live::SetHold>,
@@ -495,24 +494,23 @@ mod tests {
 
     /// **Time does not end a session.** Nothing reads this one, nothing
     /// leases it and nothing else becomes live, and a day of the clock
-    /// goes past: it is still there, because what would take it is a
-    /// viewer opening something else and no viewer has.
+    /// goes past. It is still there, because what would take it is a
+    /// viewer opening something else, and no viewer has.
     ///
     /// The paused cast is the case in the field (`docs/CASTING.md` in
-    /// xtremio): the receiver stops reading, its lease goes, and the key
-    /// in the URL it holds is one nothing else can mint again -- there is
-    /// no `/create` on the LAN listener -- so a session taken from under
-    /// it is a `404` with no way back.
+    /// xtremio). The receiver stops reading and its lease goes. Nothing
+    /// else can mint the key in the URL it holds again, since there is no
+    /// `/create` on the LAN listener. So a session taken from under it is
+    /// a `404` with no way back.
     #[tokio::test(start_paused = true)]
     async fn a_session_nothing_reads_outlives_any_clock() {
         let sessions = Sessions::new(SESSION_CAP);
         let dropped = Arc::new(AtomicBool::new(false));
         drop(sessions.insert("paused".into(), session(&dropped)));
 
-        // Advanced in ten-minute steps -- the period an idle-based sweep
-        // would tick on -- so such a sweep would have run repeatedly
-        // rather than being skipped over by one long jump of the paused
-        // clock.
+        // Advanced in ten-minute steps, the period an idle-based sweep
+        // would tick on. Such a sweep would have run repeatedly, rather
+        // than being skipped over by one long jump of the paused clock.
         for _ in 0..(24 * 4) {
             tokio::time::sleep(OLD_IDLE_TIMEOUT).await;
         }
@@ -539,8 +537,8 @@ mod tests {
 
     /// **A lease outranks the rule.** A body streaming to a player, or to
     /// a cast receiver, is not taken out from under its reader whatever
-    /// the cell says -- and the session goes on the first rule that runs
-    /// after the lease is dropped.
+    /// the cell says. The session goes on the first rule that runs after
+    /// the lease is dropped.
     #[test]
     fn a_leased_session_is_not_taken_by_a_rule_that_rejects_it() {
         let sessions = Sessions::new(SESSION_CAP);
@@ -557,7 +555,7 @@ mod tests {
         assert!(dropped.load(Ordering::SeqCst));
     }
 
-    /// The backstop: over the cap, the least recently used session with no
+    /// The backstop. Over the cap, the least recently used session with no
     /// lease out goes, and a leased one is passed over however old it is.
     #[test]
     fn the_cap_evicts_the_least_recently_used_unleased_session() {
@@ -580,8 +578,8 @@ mod tests {
     }
 
     /// **A leased session is passed over by the eviction even when it is
-    /// the oldest thing in the map**, which leaves the map over its cap
-    /// until the lease goes: the cap is a bound on what is *kept*, and a
+    /// the oldest thing in the map.** That leaves the map over its cap
+    /// until the lease goes. The cap is a bound on what is *kept*, and a
     /// reader is never dropped under for it.
     #[test]
     fn the_eviction_passes_over_a_leased_session_and_takes_it_once_it_is_free() {
@@ -605,9 +603,9 @@ mod tests {
     }
 
     /// `insert` hands back a lease, so a session cannot be taken between
-    /// being made and being used by its maker -- which is exactly the
-    /// window a container's first read opens, because that read is what
-    /// moves the live entity.
+    /// being made and being used by its maker. That is exactly the window
+    /// a container's first read opens, because that read is what moves the
+    /// live entity.
     #[test]
     fn insert_leases_what_it_made() {
         let sessions: Sessions<u32> = Sessions::new(SESSION_CAP);
@@ -618,9 +616,9 @@ mod tests {
     }
 
     /// `get_or_insert_with` makes one session per key however many callers
-    /// ask at once -- a player's opening is several requests on the same
-    /// member -- and leases what it hands back, so a session created for
-    /// one request is in use by it.
+    /// ask at once (a player's opening is several requests on the same
+    /// member). It leases what it hands back, so a session created for one
+    /// request is in use by it.
     #[test]
     fn racing_callers_get_one_session() {
         let sessions: Sessions<u32> = Sessions::new(SESSION_CAP);
@@ -658,12 +656,11 @@ mod tests {
     /// key that is not there yet make **one** session between them, because
     /// the map decides who creates it while it holds the key.
     ///
-    /// This is the case the API exists for -- a player's opening is several
-    /// requests on one member at the same instant -- and the one a
-    /// lookup-then-insert pair gets wrong while reading exactly right in a
-    /// sequential test. The maker sleeps so that a pair that lets more than
-    /// one caller in has them all inside it; the assertion is the count, not
-    /// the time.
+    /// This is the case the API exists for: a player's opening is several
+    /// requests on one member at the same instant. A lookup-then-insert pair
+    /// gets it wrong while reading exactly right in a sequential test. The
+    /// maker sleeps so that a pair that lets more than one caller in has
+    /// them all inside it. The assertion is the count, not the time.
     #[test]
     fn one_maker_runs_when_callers_race() {
         let sessions: Sessions<u32> = Sessions::new(SESSION_CAP);
@@ -722,9 +719,9 @@ mod tests {
     /// entity stays, whichever of its files is being read**, and one whose
     /// container is not goes.
     ///
-    /// The second half is the volume boundary: a set's parts are separate
-    /// files of one torrent and the cell names whichever the body is
-    /// inside, so a per-file rule would take the session of the very
+    /// The second half is the volume boundary. A set's parts are separate
+    /// files of one torrent, and the cell names whichever the body is
+    /// inside. So a per-file rule would take the session of the very
     /// container the viewer is watching as it crossed from part one into
     /// part two.
     #[test]
@@ -750,8 +747,8 @@ mod tests {
         assert!(sessions.get("aa").is_some(), "its own container is playing");
         assert!(sessions.get("bb").is_none(), "and nothing else is");
 
-        // The body crosses into the second volume: another file of the
-        // same torrent, and the same container.
+        // The body crosses into the second volume. It is another file of
+        // the same torrent, and the same container.
         switch(
             &live,
             LiveEntity::Torrent {

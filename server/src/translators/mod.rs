@@ -1,26 +1,27 @@
 //! **What a container says about the bytes inside it.**
 //!
-//! A translator reads a container's own index -- a ZIP's central
-//! directory, a TAR's headers -- off a [`ByteSource`](crate::sources::ByteSource) and says, for every
-//! member, either *which byte ranges of which sources hold it* or *why it
-//! cannot be served that way*. It decodes nothing, writes nothing and
-//! reads no member's data: an index is headers, directories and trailers,
-//! and the test suite counts the bytes to prove it (`Budget`).
+//! A translator reads a container's own index (a ZIP's central
+//! directory, a TAR's headers) off a
+//! [`ByteSource`](crate::sources::ByteSource). For every member it says
+//! either *which byte ranges of which sources hold it* or *why it cannot
+//! be served that way*. It decodes nothing, writes nothing and reads no
+//! member's data. An index is headers, directories and trailers, and the
+//! test suite counts the bytes to prove it (`Budget`).
 //!
-//! **A member is [`Body::Direct`](crate::translators::Body::Direct) or it is refused, and there is no third
-//! state.** No "extract it then", no partial decode, no "serve
-//! sequentially but refuse seeks": a compressed film is a [`Refusal`](crate::translators::Refusal) with
-//! a sentence the player shows. That is the decision the whole design
-//! rests on -- only the thing that downloads a file may store it -- and it
-//! is why there is no extraction cache. See
-//! `docs/design/translated-sources.md`.
+//! **A member is [`Body::Direct`](crate::translators::Body::Direct) or it
+//! is refused, and there is no third state.** No "extract it then", no
+//! partial decode, no "serve sequentially but refuse seeks". A compressed
+//! film is a [`Refusal`](crate::translators::Refusal) with a sentence the
+//! player shows. The whole design rests on that decision: only the thing
+//! that downloads a file may store it. It is why there is no extraction
+//! cache. See `docs/design/translated-sources.md`.
 //!
-//! Verification is the fetcher's: a torrent's bytes are piece-verified by
-//! librqbit and a proxied entity is what the origin served, so nothing
-//! here checksums a member on the way past -- a CRC over a member is a
-//! read of the whole member, which is the thing this design forbids. A
-//! *header* checksum a format carries for its own index is small, and is
-//! checked (see `tar`).
+//! Verification is the fetcher's. librqbit piece-verifies a torrent's
+//! bytes, and a proxied entity is what the origin served. So nothing here
+//! checksums a member on the way past. A CRC over a member is a read of
+//! the whole member, which is the thing this design forbids. A *header*
+//! checksum a format carries for its own index is small, and is checked
+//! (see `tar`).
 
 use crate::sources::{ByteSource, Extent};
 use async_trait::async_trait;
@@ -41,7 +42,7 @@ pub mod zip;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Member {
     /// As the container states it, `/`-separated and without a leading
-    /// slash -- which is what the route matches the URL's wildcard against.
+    /// slash. The route matches the URL's wildcard against this.
     pub name: String,
     /// The unpacked length, which for a direct member is the sum of its
     /// extents.
@@ -58,18 +59,18 @@ pub enum Body {
     Opaque(Refusal),
 }
 
-/// Why a member -- or a whole container -- will not be served as byte
+/// Why a member (or a whole container) will not be served as byte
 /// ranges. Every variant is a sentence a player can show, and none of them
 /// means "probably nothing here".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
-    /// Deflate, LZMA, RAR "Normal", gzip: the bytes in the container are
+    /// Deflate, LZMA, RAR "Normal", gzip. The bytes in the container are
     /// not the file's bytes.
     Compressed {
         format: &'static str,
         method: String,
     },
-    /// Any encryption, until there is a password UX: a guess is ciphertext
+    /// Any encryption, until there is a password UX. A guess is ciphertext
     /// to the player.
     Encrypted,
     /// A solid block holding several files, which cannot be entered at one
@@ -78,20 +79,21 @@ pub enum Refusal {
     /// The container contradicts itself, points outside itself, or is
     /// truncated.
     Malformed(String),
-    /// The container as a whole has no way in at the middle: `tar.gz` is
+    /// The container as a whole has no way in at the middle. `tar.gz` is
     /// one gzip stream, and reaching its end means inflating all of it.
     NoRandomAccess { format: &'static str },
     /// A well-formed container using a structure this server does not
-    /// read yet, named: a UDF image's metadata partition map, which remaps
-    /// every block, so an extent computed without it would be the wrong
-    /// bytes. Refused rather than guessed at, and `415` like the others a
-    /// player cannot do anything about.
+    /// read yet, named. One is a UDF image's metadata partition map, which
+    /// remaps every block, so an extent computed without it would be the
+    /// wrong bytes. It is refused rather than guessed at. It is a `415`
+    /// like the others a player cannot do anything about.
     Unsupported { format: &'static str, what: String },
 }
 
 impl Refusal {
     /// The short name the client sees in `{"refused": ...}`, and the one
-    /// xtremio switches on. Stable: it is part of the route's contract.
+    /// xtremio switches on. It is stable, because it is part of the route's
+    /// contract.
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Compressed { .. } => "compressed",
@@ -145,7 +147,7 @@ impl std::error::Error for Refusal {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Index {
     /// Every member with bytes of its own, in the container's own order.
-    /// Directories are not here: a directory is not a file and has nothing
+    /// Directories are not here. A directory is not a file and has nothing
     /// to serve.
     pub members: Vec<Member>,
 }
@@ -163,10 +165,10 @@ impl Index {
 /// A container format, read from its sources.
 ///
 /// The design sketch wrote this as an associated function taking the
-/// sources alone. It takes `&self` instead, because that is what makes the
-/// trait object-safe: the route has a format prefix in the URL and needs
-/// *a* translator for it at run time ([`crate::routes::archive::Format`]),
-/// which a static method cannot give it. Every implementation is a
+/// sources alone. It takes `&self` instead, because that makes the trait
+/// object-safe. The route has a format prefix in the URL and needs *a*
+/// translator for it at run time ([`crate::routes::archive::Format`]). A
+/// static method cannot give it one. Every implementation is a
 /// zero-sized unit struct, so `&self` costs nothing.
 #[async_trait]
 pub trait Translator: Send + Sync {
@@ -176,17 +178,17 @@ pub trait Translator: Send + Sync {
     /// Read the container's index from its sources.
     ///
     /// Reads what the format needs and nothing else. `sources` is the
-    /// volume list, in order; a single-volume format reads `sources[0]`
+    /// volume list, in order. A single-volume format reads `sources[0]`
     /// and says so about the rest.
     async fn index(&self, sources: &[Arc<dyn ByteSource>]) -> Result<Index, Refusal>;
 
     /// The files among `siblings` that make up the container `named` is a
-    /// volume of, in volume order -- what the `torrent:` form hands to
+    /// volume of, in volume order. The `torrent:` form hands this to
     /// [`Translator::index`] when the container is a file of a torrent and
     /// the rest of it is the files beside that one. Every single-file
-    /// format is its own answer, which is the default; a format that comes
-    /// in sets (RAR) knows its naming rules and says which siblings are
-    /// its volumes, or that one of them is missing.
+    /// format is its own answer, which is the default. A format that comes
+    /// in sets (RAR) knows its naming rules. It says which siblings are its
+    /// volumes, or that one of them is missing.
     fn volumes(&self, named: &str, _siblings: &[String]) -> Result<Vec<String>, Refusal> {
         Ok(vec![named.to_string()])
     }
@@ -194,11 +196,11 @@ pub trait Translator: Send + Sync {
 
 /// How many bytes reading one container's index may cost.
 ///
-/// Not a guideline: every translator reads through [`Budget`] and nothing
-/// else, so a container that would make the walk read for ever -- a TAR of
-/// a million empty files, a directory claiming a gigabyte of entries --
-/// stops at a stated number with a refusal that says so, rather than being
-/// found out with a stopwatch. Sixteen mebibytes is far above any real
+/// It is not a guideline. Every translator reads through [`Budget`] and
+/// nothing else. So a container that would make the walk read for ever (a
+/// TAR of a million empty files, a directory claiming a gigabyte of
+/// entries) stops at a stated number with a refusal that says so. It is
+/// not found out with a stopwatch. Sixteen mebibytes is far above any real
 /// archive's index (a ZIP central directory runs about 60 bytes per member)
 /// and far below a film.
 pub const INDEX_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
@@ -231,7 +233,7 @@ impl<'a> Budget<'a> {
         self.used
     }
 
-    /// `len` bytes at `offset`, or a refusal naming which it was: a short
+    /// `len` bytes at `offset`, or a refusal naming which it was. A short
     /// read is a truncated container and not a shorter answer, since every
     /// caller here is reading a fixed-size structure.
     pub async fn read_exact(&mut self, offset: u64, len: usize) -> Result<Vec<u8>, Refusal> {
@@ -247,8 +249,8 @@ impl<'a> Budget<'a> {
         let mut filled = 0;
         while filled < len {
             // A `read_at` may answer short of the buffer at any time (a
-            // torrent's reader ends at a piece, an HTTP body at a chunk);
-            // only a zero says there is nothing more there.
+            // torrent's reader ends at a piece, an HTTP body at a chunk).
+            // Only a zero says there is nothing more there.
             let read = self
                 .source
                 .read_at(offset + filled as u64, &mut buf[filled..])
@@ -291,17 +293,18 @@ impl<'a> Budget<'a> {
 /// reading.
 ///
 /// It runs on the blocking pool and reads through the runtime handle it
-/// was made under, so the source's `read_at` -- a seek of the piece store,
-/// a ranged request through the proxy cache -- is the same call an index
+/// was made under. So the source's `read_at` (a seek of the piece store,
+/// a ranged request through the proxy cache) is the same call an index
 /// read makes anywhere else, and lands in a [`crate::sources::testing::
-/// CountingSource`] the same way. A seek here is a number: nothing is
+/// CountingSource`] the same way. A seek here is a number. Nothing is
 /// fetched until the parser reads, which is how a walk that seeks past
 /// every member's data by its size costs the headers alone.
 ///
-/// The same bound as [`Budget`], per reader -- one reader per volume, so a
-/// set costs at most the bound per volume -- and reached the same way: a
-/// read past it is an error the parser surfaces and the translator turns
-/// into a refusal ([`IndexReader::is_over_budget`]), not a slower answer.
+/// It has the same bound as [`Budget`], per reader. There is one reader
+/// per volume, so a set costs at most the bound per volume. The bound is
+/// reached the same way: a read past it is an error the parser surfaces
+/// and the translator turns into a refusal
+/// ([`IndexReader::is_over_budget`]), not a slower answer.
 pub struct IndexReader {
     source: Arc<dyn ByteSource>,
     runtime: tokio::runtime::Handle,
@@ -330,8 +333,8 @@ impl std::error::Error for OverBudget {}
 
 impl IndexReader {
     /// Over `source`, positioned at its start, with a whole budget to
-    /// spend. Made on a runtime thread (it takes the current handle) and
-    /// used off one.
+    /// spend. It is made on a runtime thread (it takes the current handle)
+    /// and used off one.
     pub fn new(source: Arc<dyn ByteSource>) -> Self {
         Self {
             source,
@@ -348,8 +351,8 @@ impl IndexReader {
         self.used.clone()
     }
 
-    /// Whether `error` -- one a parser handed back -- is this reader
-    /// refusing to read past the budget.
+    /// Whether `error` (one a parser handed back) is this reader refusing
+    /// to read past the budget.
     pub fn is_over_budget(error: &io::Error) -> bool {
         error
             .get_ref()
@@ -394,7 +397,7 @@ impl io::Seek for IndexReader {
     }
 }
 
-/// `sources[0]`, or a refusal when there are none: every translator here
+/// `sources[0]`, or a refusal when there are none. Every translator here
 /// reads one volume, and a create with no URL at all is refused before it
 /// reaches one.
 pub(crate) fn only_source(
@@ -411,8 +414,8 @@ pub(crate) fn only_source(
     }
 }
 
-/// `.tar.gz`, which is not a container this can index at all: one gzip
-/// stream, whose last byte is reachable only by inflating every byte
+/// `.tar.gz`, which is not a container this can index at all. It is one
+/// gzip stream, whose last byte is reachable only by inflating every byte
 /// before it.
 ///
 /// It is a translator rather than a special case in the route because the
@@ -432,9 +435,9 @@ impl Translator for TarGz {
 
 /// A member's name as the route matches it: `/`-separated, with no
 /// leading `/` or `./`. Every translator names its members through this and
-/// nothing else, because a name is what a request selects by: a RAR or 7z
-/// written on Windows (and some ZIPs) store `\\`, and `tar cf x.tar
-/// ./movie.mkv` stores `./movie.mkv` -- a member the route could not find by
+/// nothing else, because a name is what a request selects by. A RAR or 7z
+/// written on Windows (and some ZIPs) store `\\`. `tar cf x.tar
+/// ./movie.mkv` stores `./movie.mkv`, a member the route could not find by
 /// the name the player shows.
 pub(crate) fn member_name(stored: &str) -> String {
     let mut name = stored.replace('\\', "/");
@@ -449,7 +452,7 @@ pub(crate) fn member_name(stored: &str) -> String {
     }
 }
 
-/// Little-endian integers out of a header, `None` past its end -- a
+/// Little-endian integers out of a header, `None` past its end. A
 /// truncated structure is a refusal the caller words, never a panic.
 pub(crate) fn le_u16(bytes: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?))
@@ -464,9 +467,9 @@ pub(crate) fn le_u64(bytes: &[u8], at: usize) -> Option<u64> {
 }
 
 /// The one extent of a member that is one run of one source, checked
-/// against that source's length: an offset a container states wrongly is a
-/// malformed container, told at the index, not a body that ends in a read
-/// error halfway through a film.
+/// against that source's length. An offset a container states wrongly is
+/// a malformed container, told at the index. It is not a body that ends
+/// in a read error halfway through a film.
 pub(crate) fn direct_extent(
     source: &dyn ByteSource,
     format: &'static str,
@@ -537,7 +540,7 @@ mod tests {
         }
     }
 
-    /// A `tar.gz` is refused whole, before a byte of it is read: there is
+    /// A `tar.gz` is refused whole, before a byte of it is read. There is
     /// no member of it this server can point at.
     #[tokio::test]
     async fn a_tar_gz_is_refused_as_a_whole() {
@@ -549,7 +552,7 @@ mod tests {
     }
 
     /// The budget is what stops a container that claims an index larger
-    /// than any index: it refuses rather than reading on.
+    /// than any index. It refuses rather than reading on.
     #[tokio::test]
     async fn a_read_past_the_budget_is_refused() {
         let held = source(vec![0u8; 64]);
@@ -574,9 +577,9 @@ mod tests {
     }
 
     /// The blocking shim is a handle a synchronous parser can seek about
-    /// in, and **a seek fetches nothing**: what a walk that skips past
-    /// every member's data by size costs is the headers it reads, which is
-    /// what the counting source underneath sees.
+    /// in, and **a seek fetches nothing**. A walk that skips past every
+    /// member's data by size costs the headers it reads. The counting
+    /// source underneath sees exactly that.
     #[tokio::test]
     async fn the_blocking_shim_reads_what_it_is_asked_and_seeks_for_free() {
         use std::io::{Read, Seek, SeekFrom};
@@ -610,8 +613,9 @@ mod tests {
         assert_eq!(counts.opens(), 0);
     }
 
-    /// And it stops at the budget the way `Budget` does: with an error the
-    /// parser hands back and the translator recognises, not by reading on.
+    /// And it stops at the budget the way `Budget` does. It answers an
+    /// error the parser hands back and the translator recognises, and does
+    /// not read on.
     #[tokio::test]
     async fn the_blocking_shim_refuses_to_read_past_the_budget() {
         use std::io::Read;
