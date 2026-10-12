@@ -13,6 +13,25 @@ links the `server` crate and starts it in-process over flutter_rust_bridge,
 and nothing else runs it. HTTP is for players and stremio-core only; the app
 asks through `ServerHandle` ([docs/api.md](docs/api.md)).
 
+## Write for the reader, in plain order
+
+Everything a person reads is written for that reader, not for the author.
+This library has one reader, a developer, so docs, doc comments, log lines
+and commit messages may use the internal name when no common word exists,
+and should, since the name is what they will search for; where a common
+word does exist, use it. The sentences shown to a viewer by the app -- the
+refusal sentences a rendition or a pin answers with, which the app shows
+as they are -- are a viewer's words: nothing internal in them.
+
+- **One idea per sentence, in natural order.** Subject, verb, object; the
+  condition after the claim, not before it. Do not front-load a sentence
+  with a qualifying clause, and do not chain ideas with dashes and
+  semicolons. If a sentence has to be read twice, split it.
+- **Shorter beats complete.** Cut what the reader does not need in order
+  to act or to understand the next line.
+- **Read it aloud.** If it would sound odd said to a friend across a
+  table, rewrite it.
+
 ## Licensing
 
 The **source** is MIT and `LICENSE` must stay MIT: it contains no GPL code.
