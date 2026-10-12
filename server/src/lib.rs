@@ -15,11 +15,11 @@ pub use enginefs::{PIN_FREE_SPACE_MARGIN, PinDownloadError, UnpinOutcome};
 use futures_util::future::BoxFuture;
 pub use proxy_downloads::{ProxyPinError, ProxyPinKey};
 pub use routes::downloads::{DownloadInfo, PinKey, ProxyDownloadRequest};
-// What `ServerHandle::open_drive_file` answers. Named here because `routes`
-// is private, so a type only reachable through it is one an embedder can
-// call the method but not write down the result of -- and `DriveError`
-// with them, because `DriveOpenError::Drive` carries one and an embedder
-// that cannot name it cannot construct or match the case that matters.
+// What `ServerHandle::open_drive_file` answers. It is named here because
+// `routes` is private. Without this, an embedder could call the method but
+// could not write down the type of its result. `DriveError` is named with it,
+// because `DriveOpenError::Drive` carries one. An embedder that cannot name
+// it cannot construct or match the case that matters.
 /// What [`ServerHandle::publish`] answers: the last segment of a cast URL.
 pub use cast::CastToken;
 pub use cast::{CastKind, CastNumbers, DeliveryNumbers, SourceNumbers};
@@ -58,84 +58,83 @@ pub use url::Url;
 
 /// Default log directives, applied WITHOUT any environment variable. The
 /// application code lives in the `stream_server` lib crate, so its targets
-/// are `stream_server::*` and that is the name that must be listed here --
-/// the `server` directive beside it was the deleted `server` binary's, and
-/// a rename of the lib would silently filter out every log line the same
-/// way. `RUST_LOG` only overrides this when it is set to a non-empty
-/// value; an unset or blank `RUST_LOG` keeps this.
+/// are `stream_server::*`, and that is the name that must be listed here. The
+/// `server` directive beside it was the deleted `server` binary's. A rename
+/// of the lib would silently filter out every log line the same way.
+/// `RUST_LOG` overrides this only when it is set to a non-empty value. An
+/// unset or blank `RUST_LOG` keeps this.
 ///
-/// `librqbit` is here at WARN because it is the only place a storage
-/// failure is reported at all: a piece that cannot be written (a full or
-/// unwritable cache volume) is librqbit's own error, and with the crate
-/// unlisted it was filtered out entirely -- a phone whose downloads were
-/// failing logged not one line about it. enginefs reports the *torrent*
-/// error state on top of that (`torrent_error_state`), but only when
-/// something polls the torrent's statistics, so it cannot be relied on to
-/// notice a disk problem by itself. WARN, not INFO: librqbit is chatty
-/// per-peer at INFO and would drown the log.
-/// `librqbit_dht::dht` and `librqbit_upnp` are turned back down to ERROR on
-/// top of that, because both retry a network operation forever and WARN on
-/// every single attempt. `librqbit_dht::dht`'s only WARN is the bootstrap
-/// retry notifier (`dht.rs`'s `bootstrap_hostname_with_backoff`), which on a
-/// network that drops the DHT's UDP fires for every host, forever -- a real
-/// 28-minute Android session was hundreds of identical lines and no
-/// conclusion. `librqbit_upnp`'s are the SSDP-discovery and port-forward
-/// loops, which retry on a fixed interval whatever happens. Neither is
-/// actionable per attempt, and the *state* both of them are trying to
-/// describe is now reported once, properly, by
-/// `diagnostics::dht_health` (DHT) or is simply not a problem (UPnP is
-/// only enabled for a fixed listen port at all -- see
-/// `TorrentListenPort::wants_upnp_forwarding`). ERROR rather than OFF so a
-/// genuinely fatal DHT error still lands: `librqbit_dht`'s persistence
+/// `librqbit` is here at WARN because it is the only place a storage failure
+/// is reported at all. A piece that cannot be written (a full or unwritable
+/// cache volume) is librqbit's own error. With the crate unlisted it was
+/// filtered out entirely: a phone whose downloads were failing logged not one
+/// line about it. enginefs reports the *torrent* error state on top of that
+/// (`torrent_error_state`). But it does so only when something polls the
+/// torrent's statistics, so it cannot be relied on to notice a disk problem
+/// by itself. It is WARN, not INFO, because librqbit is chatty per-peer at
+/// INFO and would drown the log. `librqbit_dht::dht` and `librqbit_upnp` are
+/// turned back down to ERROR on top of that. Both retry a network operation
+/// forever and WARN on every single attempt. `librqbit_dht::dht`'s only WARN
+/// is the bootstrap retry notifier (`dht.rs`'s
+/// `bootstrap_hostname_with_backoff`). On a network that drops the DHT's UDP
+/// it fires for every host, forever. A real 28-minute Android session was
+/// hundreds of identical lines and no conclusion. `librqbit_upnp`'s are the
+/// SSDP-discovery and port-forward loops, which retry on a fixed interval
+/// whatever happens. Neither is actionable per attempt. The *state* both are
+/// trying to describe is now reported once, properly, by
+/// `diagnostics::dht_health` (DHT), or is simply not a problem (UPnP). UPnP
+/// is only enabled for a fixed listen port at all (see
+/// `TorrentListenPort::wants_upnp_forwarding`). It is ERROR rather than OFF
+/// so a genuinely fatal DHT error still lands. `librqbit_dht`'s persistence
 /// warnings are on a different target and keep their level.
 pub(crate) const DEFAULT_LOG_FILTER: &str = "stream_server=info,tower_http=info,\
      enginefs=info,librqbit=warn,librqbit_dht::dht=error,librqbit_upnp=error";
 
-/// The port stremio-core's default profile builds `streaming_server_url`
-/// from (`http://127.0.0.1:11470/`), which is why it is what
-/// [`ServerConfig::default`] binds: a client that has never been told
-/// otherwise looks here.
+/// The port stremio-core's default profile builds `streaming_server_url` from
+/// (`http://127.0.0.1:11470/`). That is why [`ServerConfig::default`] binds
+/// it: a client that has never been told otherwise looks here.
 ///
 /// **An embedder that reads the bound address back should ask for `0`
 /// instead**, and xtremio does. Core's URL is retargeted at whatever this
 /// server actually bound the moment it is known, so the number buys nothing
-/// downstream -- while binding it can lose to a desktop Stremio, to a second
-/// instance of the same app, or to whatever else holds 11470. The constant
-/// stays because it is the client-facing contract, not because anything
-/// here needs a fixed port.
+/// downstream. Binding it can lose to a desktop Stremio, to a second instance
+/// of the same app, or to whatever else holds 11470. The constant stays
+/// because it is the client-facing contract, not because anything here needs
+/// a fixed port.
 pub const DEFAULT_HTTP_PORT: u16 = 11470;
 
 /// The directory an **older build** kept its archive extractions in,
-/// `<cacheRoot>/.archives`. Nothing writes it now: a member of a container
-/// is ranges of the container (`crate::translators`), so there is nothing
-/// to extract and nothing to download whole. The name survives for one
-/// purpose, in `run`: deleting what such a build left behind.
+/// `<cacheRoot>/.archives`. Nothing writes it now. A member of a container is
+/// ranges of the container (`crate::translators`), so there is nothing to
+/// extract and nothing to download whole. The name survives for one purpose,
+/// in `run`: deleting what such a build left behind.
 const LEGACY_ARCHIVE_SCRATCH_DIR: &str = ".archives";
 
 /// The name the cache directory had before [`enginefs::CACHE_DIR_NAME`]:
-/// `<cacheRoot>/rqbit-downloads`. **No migration** (the data is cheap): a
-/// boot that finds it deletes it, pieces, proxy cache, session records and
-/// every pinned download's bytes with them. See [`retire_legacy_cache_dir`].
+/// `<cacheRoot>/rqbit-downloads`. **No migration** (the data is cheap). A
+/// boot that finds it deletes it, with the pieces, proxy cache, session
+/// records and every pinned download's bytes in it. See
+/// [`retire_legacy_cache_dir`].
 const LEGACY_CACHE_DIR: &str = "rqbit-downloads";
 
 /// Where [`LEGACY_CACHE_DIR`] is renamed to before the session opens, and
-/// deleted from afterwards: at the cache root, beside `media-cache` and
-/// outside anything the launch sweep walks. A boot that finds one -- left
-/// by a process killed mid-delete -- deletes it too.
+/// deleted from afterwards. It is at the cache root, beside `media-cache` and
+/// outside anything the launch sweep walks. A boot that finds one (left by a
+/// process killed mid-delete) deletes it too.
 const LEGACY_CACHE_DELETING: &str = ".rqbit-downloads.deleting";
 
 /// Take the previous build's cache directory out of the way, **before the
-/// session opens**, and answer what to delete once it has: a rename, which
-/// is cheap, where the delete of a store of one file per piece on an SD
-/// card is seconds -- so the delete goes to the blocking pool after boot
+/// session opens**, and answer what to delete once it has. A rename is cheap.
+/// The delete of a store of one file per piece on an SD card takes seconds.
+/// So the delete goes to the blocking pool after boot
 /// ([`delete_retired_cache_dirs`]) instead of holding the boot up.
 ///
 /// The rename is what lets a killed process's half-finished delete be
 /// recognised: a `.rqbit-downloads.deleting` found here is deleted too. When
-/// both are present the old directory is deleted where it is, after the
-/// leftover; a rename that fails leaves it there to be deleted in place.
-/// Nothing opens either -- the session is on [`enginefs::CACHE_DIR_NAME`] --
-/// so neither is ever read while it goes.
+/// both are present, the old directory is deleted where it is, after the
+/// leftover. A rename that fails leaves it there to be deleted in place.
+/// Nothing opens either (the session is on [`enginefs::CACHE_DIR_NAME`]), so
+/// neither is ever read while it goes.
 fn retire_legacy_cache_dir(root: &std::path::Path) -> Vec<PathBuf> {
     let present = |path: &std::path::Path| std::fs::symlink_metadata(path).is_ok();
     let old = root.join(LEGACY_CACHE_DIR);
@@ -168,9 +167,9 @@ fn retire_legacy_cache_dir(root: &std::path::Path) -> Vec<PathBuf> {
     doomed
 }
 
-/// Delete what [`retire_legacy_cache_dir`] set aside. On the blocking pool,
-/// detached: the boot does not wait for it, and a process killed before it
-/// ends leaves the `.deleting` name for the next boot to finish.
+/// Delete what [`retire_legacy_cache_dir`] set aside. It runs on the blocking
+/// pool, detached. The boot does not wait for it, and a process killed before
+/// it ends leaves the `.deleting` name for the next boot to finish.
 fn delete_retired_cache_dirs(doomed: Vec<PathBuf>) {
     if doomed.is_empty() {
         return;
@@ -207,12 +206,12 @@ mod devices;
 mod diagnostics;
 pub mod images;
 // What an embedder needs to apply this switch itself. xtremio starts this
-// server with `init_logging: false` and owns the process's one subscriber,
-// so [`diagnostics::logging::set_diagnostics_trace`] has no filter to
-// reload there: the setting is persisted and nothing in the log changes.
-// Exporting the builder and the two targets is what lets that embedder
-// build the same filter this crate would have built, from the same
-// strings, rather than keeping a second copy of them that drifts.
+// server with `init_logging: false` and owns the process's one subscriber. So
+// [`diagnostics::logging::set_diagnostics_trace`] has no filter to reload
+// there: the setting is persisted and nothing in the log changes. Exporting
+// the builder and the two targets lets that embedder build the same filter
+// this crate would have built, from the same strings. It need not keep a
+// second copy of them that drifts.
 pub use diagnostics::logging::{PROXY_TRACE_TARGET, RETENTION_TRACE_TARGET, log_filter};
 mod lan_media;
 /// Playable things by id and the blocking reader over them: what the app's
@@ -228,14 +227,14 @@ mod proxy_streams;
 /// (`docs/design/renditions.md`).
 pub mod rendition;
 mod routes;
-/// **The seam every translated container reads through**: a file whose
-/// bytes something else fetched and keeps -- a torrent's piece store, the
-/// proxy cache -- asked for by byte range and never copied anywhere. See
-/// the module's own documentation and `docs/design/translated-sources.md`.
+/// **The seam every translated container reads through**: a file whose bytes
+/// something else fetched and keeps (a torrent's piece store, the proxy
+/// cache), asked for by byte range and never copied anywhere. See the
+/// module's own documentation and `docs/design/translated-sources.md`.
 ///
-/// Public, and `doc(hidden)`, so the integration tests can build the
-/// sources and the counting wrapper the index bounds are stated in. It is
-/// not part of the embeddable API.
+/// It is public, and `doc(hidden)`, so the integration tests can build the
+/// sources and the counting wrapper the index bounds are stated in. It is not
+/// part of the embeddable API.
 #[doc(hidden)]
 pub mod sources;
 mod state;
@@ -243,9 +242,9 @@ pub mod stream_numbers;
 /// What a container says about the bytes inside it: the translators (see
 /// the module's own documentation and `docs/design/translated-sources.md`).
 ///
-/// Public, and `doc(hidden)`, for the same reason [`sources`] is: the
-/// integration tests state what indexing a real archive may read, and say
-/// it in the same types the routes do. Not part of the embeddable API.
+/// It is public, and `doc(hidden)`, for the same reason [`sources`] is. The
+/// integration tests state what indexing a real archive may read, and say it
+/// in the same types the routes do. It is not part of the embeddable API.
 #[doc(hidden)]
 pub mod translators;
 
@@ -255,75 +254,74 @@ pub struct ServerConfig {
     /// Settings and logs. `None` uses the platform config dir (needs
     /// `HOME`/`XDG_*`); embedders must set it explicitly.
     pub config_dir: Option<PathBuf>,
-    /// The default torrent-data root (`settings.cacheRoot`): the piece
-    /// store, the proxy cache and the session's DHT and resume state live
-    /// under its `media-cache`, and a `cacheRoot` saved in `settings.json`
-    /// takes its place. `None`
-    /// means `config_dir/cache` when `config_dir` is set, otherwise the
-    /// platform cache dir. No environment variable is consulted once
+    /// The default torrent-data root (`settings.cacheRoot`). The piece store,
+    /// the proxy cache and the session's DHT and resume state live under its
+    /// `media-cache`. A `cacheRoot` saved in `settings.json` takes its place.
+    /// `None` means `config_dir/cache` when `config_dir` is set, otherwise
+    /// the platform cache dir. No environment variable is consulted once
     /// `config_dir` is given.
     pub cache_dir: Option<PathBuf>,
     pub init_logging: bool,
-    /// Whether this server installs the process-wide crash machinery: the
-    /// panic hook that writes a panic to the log files, and the native
-    /// crash handler that catches a SIGSEGV/SIGABRT the Rust hook never
-    /// sees (`diagnostics::logging`). Off by default, because they are
-    /// *process* globals and the host process may have its own -- but they
-    /// are the only crash-dump machinery in this tree, so an embedder
-    /// whose host installs none should turn this on to get a post-mortem
-    /// out of a torrent or codec crash instead of a silent kill.
+    /// Whether this server installs the process-wide crash machinery. That is
+    /// the panic hook that writes a panic to the log files, and the native
+    /// crash handler that catches a SIGSEGV/SIGABRT the Rust hook never sees
+    /// (`diagnostics::logging`). It is off by default, because they are
+    /// *process* globals and the host process may have its own. But they are
+    /// the only crash-dump machinery in this tree. An embedder whose host
+    /// installs none should turn this on, to get a post-mortem out of a
+    /// torrent or codec crash instead of a silent kill.
     pub manage_process_globals: bool,
     pub graceful_shutdown_timeout: Duration,
     /// How the control API authenticates (media routes are always open).
     /// Defaults to a per-launch generated token; see [`ServerAuth`].
     pub auth: ServerAuth,
-    /// What the embedder says is pinned for offline: every download the
-    /// user asked for, one [`PinKey`] each -- a torrent's file, an addon
-    /// link, a Google Drive file. Handed in rather than read from a file,
-    /// because the one client that pins already keeps that list as the
-    /// downloads the user asked for, and two records of one fact are two
-    /// records that can disagree -- see `enginefs::piece_store::pin_record`.
-    /// The two stores each take their half: the torrent keys are the piece
-    /// store's pin set, the link and Drive keys the proxy cache's.
+    /// What the embedder says is pinned for offline: every download the user
+    /// asked for, one [`PinKey`] each (a torrent's file, an addon link, a
+    /// Google Drive file). It is handed in rather than read from a file. The
+    /// one client that pins already keeps that list as the downloads the user
+    /// asked for, and two records of one fact are two records that can
+    /// disagree (see `enginefs::piece_store::pin_record`). The two stores
+    /// each take their half. The torrent keys are the piece store's pin set,
+    /// and the link and Drive keys are the proxy cache's.
     ///
-    /// **`None` is "nobody told me", and it is not an empty set.** The
-    /// launch sweeps delete everything the set does not claim, before the
-    /// session opens, so silence has to mean *keep everything*: nothing is
-    /// swept -- no torrent's pieces, no proxied body -- every restored
-    /// torrent is kept and reported as pinned, and nothing is deleted for
-    /// want of a claim. An embedder whose own record would not read passes
-    /// `None` and warns its user; passing an empty list instead says "the
-    /// user has pinned nothing", which deletes their downloads.
+    /// **`None` is "nobody told me", and it is not an empty set.** The launch
+    /// sweeps delete everything the set does not claim, before the session
+    /// opens. So silence has to mean *keep everything*. Nothing is swept,
+    /// neither a torrent's pieces nor a proxied body. Every restored torrent
+    /// is kept and reported as pinned, and nothing is deleted for want of a
+    /// claim. An embedder whose own record would not read passes `None` and
+    /// warns its user. Passing an empty list instead says "the user has
+    /// pinned nothing", which deletes their downloads.
     pub pins: Option<Vec<PinKey>>,
-    /// The port librqbit's incoming BitTorrent listener binds.
-    /// [`TorrentListenPort::Ephemeral`] by default, so any number of
-    /// embedded servers (and the tests) coexist; an embedder that needs a
-    /// fixed, forwardable port sets [`TorrentListenPort::Fixed`] itself, and
-    /// one that must not be reachable off the machine -- a test --
+    /// The port librqbit's incoming BitTorrent listener binds. It is
+    /// [`TorrentListenPort::Ephemeral`] by default, so any number of embedded
+    /// servers (and the tests) coexist. An embedder that needs a fixed,
+    /// forwardable port sets [`TorrentListenPort::Fixed`] itself. One that
+    /// must not be reachable off the machine (a test) sets
     /// [`TorrentListenPort::Loopback`].
     pub torrent_listen_port: TorrentListenPort,
-    /// Where the LAN media listener binds when it runs: a second HTTP
+    /// Where the LAN media listener binds when it runs. It is a second HTTP
     /// listener serving `/cast/{token}` (and a rendition's
-    /// `/cast/{token}/stream.mp4`) and nothing else -- what the app
-    /// published with [`ServerHandle::publish`] -- so a Chromecast or other
-    /// receiver on the local network can fetch the bytes of what this
-    /// device casts while the control API and every other route stays on
-    /// the loopback listener only (see [`crate::lan_media`], [`crate::cast`]).
+    /// `/cast/{token}/stream.mp4`) and nothing else: what the app published
+    /// with [`ServerHandle::publish`]. Through it, a Chromecast or other
+    /// receiver on the local network can fetch the bytes of what this device
+    /// casts. The control API and every other route stay on the loopback
+    /// listener only (see [`crate::lan_media`], [`crate::cast`]).
     ///
-    /// `None` -- the default -- means there is no LAN listener at all and
+    /// `None`, the default, means there is no LAN listener at all, and
     /// [`ServerHandle::set_lan_media`] has nothing to start. `Some(addr)`
     /// (typically `0.0.0.0:0`, letting the OS pick the port) is where
     /// [`ServerHandle::set_lan_media`] binds it per cast session, subject to
-    /// the `lanMediaEnabled` setting. Nothing is bound at startup: the
-    /// address says where a cast may put the listener, not that one is up,
-    /// so a port in use fails the cast that asked for it, not the server.
+    /// the `lanMediaEnabled` setting. Nothing is bound at startup. The
+    /// address says where a cast may put the listener, not that one is up, so
+    /// a port in use fails the cast that asked for it, not the server.
     pub lan_media_addr: Option<SocketAddr>,
     /// Whether DHT bootstrap *names* are resolved to address literals before
-    /// librqbit sees them (system resolver, then DNS over HTTPS, then a
-    /// cache next to the routing table -- see
-    /// `enginefs::backend::dht_bootstrap`). `true` by default: the Android
-    /// embed is exactly the case this exists for, since that is where the
-    /// system resolver was observed returning nothing.
+    /// librqbit sees them. Resolution tries the system resolver, then DNS
+    /// over HTTPS, then a cache next to the routing table (see
+    /// `enginefs::backend::dht_bootstrap`). It is `true` by default. The
+    /// Android embed is exactly the case this exists for, since that is where
+    /// the system resolver was observed returning nothing.
     ///
     /// `false` does no DNS and no HTTP at start-up, leaving the names for
     /// librqbit to resolve itself. **Tests set this**, so `cargo test` makes
@@ -332,54 +330,55 @@ pub struct ServerConfig {
     /// Whether a torrent is added with the built-in and fetched public
     /// tracker lists, or with nothing but the trackers a request named.
     ///
-    /// The other half of [`ServerConfig::resolve_dht_bootstrap_names`]:
-    /// together they are what "makes no outbound request of its own" means,
-    /// and neither is enough alone. Defaults to `true`; tests set it false.
+    /// The other half of [`ServerConfig::resolve_dht_bootstrap_names`].
+    /// Together they are what "makes no outbound request of its own" means,
+    /// and neither is enough alone. It defaults to `true`, and tests set it
+    /// false.
     pub use_public_trackers: bool,
     /// Whether a torrent announces itself to the local network by BEP-14
     /// multicast, or is found only by the ways a request named.
     ///
     /// The third of the same family, and the one nobody thought to switch
-    /// off: with the other two false a test still shouted every info hash
-    /// it held at the network it was running on, and -- because a fixture
-    /// built from deterministic bytes has a deterministic info hash --
-    /// **two concurrent test runs found each other and swapped pieces**.
-    /// The symptom was a store holding more than the test's own seeder had
-    /// ever uploaded, which is a measurement no assertion can save.
+    /// off. With the other two false, a test still shouted every info hash it
+    /// held at the network it was running on. A fixture built from
+    /// deterministic bytes has a deterministic info hash, so **two concurrent
+    /// test runs found each other and swapped pieces**. The symptom was a
+    /// store holding more than the test's own seeder had ever uploaded, which
+    /// is a measurement no assertion can save.
     ///
-    /// This is the **default** for `btEnableLsd` rather than a veto over
-    /// it: a viewer who has asked for local discovery keeps it, and the
-    /// settings report goes on describing what the session actually does.
-    /// Defaults to `true`; tests set it false.
+    /// This is the **default** for `btEnableLsd` rather than a veto over it.
+    /// A viewer who has asked for local discovery keeps it, and the settings
+    /// report goes on describing what the session actually does. It defaults
+    /// to `true`, and tests set it false.
     pub enable_local_service_discovery: bool,
     /// The default for `btEnableDht`, the way
     /// [`Self::enable_local_service_discovery`] is `btEnableLsd`'s.
     ///
     /// [`Self::resolve_dht_bootstrap_names`] off does not keep the DHT off
-    /// the network: it stops this server's own resolution, and librqbit
-    /// then resolves the bootstrap names itself and joins the DHT, so a
-    /// test's info hash was looked up by strangers and they dialled in. An
-    /// embedder that must make no outbound connection -- a test -- turns
-    /// this off. Defaults to `true`.
+    /// the network. It stops this server's own resolution, and librqbit then
+    /// resolves the bootstrap names itself and joins the DHT. So a test's
+    /// info hash was looked up by strangers, and they dialled in. An embedder
+    /// that must make no outbound connection (a test) turns this off. It
+    /// defaults to `true`.
     pub enable_dht: bool,
-    /// Where this embedder's Google Drive pairing service is: the `POST`
-    /// that turns a refresh token into an access token, because the OAuth
-    /// client secret lives there and never on the device (see
+    /// Where this embedder's Google Drive pairing service is: the `POST` that
+    /// turns a refresh token into an access token. It is a service because
+    /// the OAuth client secret lives there and never on the device (see
     /// `routes::drive` and `sources::drive`).
     ///
-    /// `None` -- the default -- means [`ServerHandle::open_drive_file`]
-    /// refuses with `noPairingService` and nothing else changes. This repository ships
-    /// no such service and must not invent one: a wrong endpoint is a
+    /// `None`, the default, means [`ServerHandle::open_drive_file`] refuses
+    /// with `noPairingService`, and nothing else changes. This repository
+    /// ships no such service and must not invent one. A wrong endpoint is a
     /// refresh token posted to somebody else's host.
     pub drive_refresh_endpoint: Option<url::Url>,
-    /// Where Drive itself is, for the pairing service above. `None` is
-    /// Google (`sources::drive::GOOGLE_DRIVE_API`), which is every shipped
-    /// build; a test points it at a loopback fake.
+    /// Where Drive itself is, for the pairing service above. `None` is Google
+    /// (`sources::drive::GOOGLE_DRIVE_API`), which is every shipped build. A
+    /// test points it at a loopback fake.
     ///
-    /// `#[doc(hidden)]`-in-spirit and deliberately not a per-request
-    /// parameter: a caller who could name this origin would have the
-    /// server fetch an arbitrary host under a credential it renews, and
-    /// cache the answer under the vouch `DriveSource` makes. See
+    /// It is `#[doc(hidden)]`-in-spirit, and deliberately not a per-request
+    /// parameter. A caller who could name this origin would have the server
+    /// fetch an arbitrary host under a credential it renews, and cache the
+    /// answer under the vouch `DriveSource` makes. See
     /// `routes::drive::DriveEndpoints`.
     pub drive_api_base: Option<url::Url>,
 }
@@ -440,24 +439,24 @@ impl ServerHandle {
     /// test that has to reach a `crate::sources::TorrentSource` rather
     /// than go through a route.
     ///
-    /// `#[doc(hidden)]` and no part of the embeddable API: an embedder
-    /// drives torrents through the methods below. The runtime comes with
-    /// the engine because the two cannot be used apart -- librqbit's
-    /// session spawns on the runtime it was started on, and a reader
-    /// polled anywhere else is a `Handle::current` away from a panic.
+    /// It is `#[doc(hidden)]` and no part of the embeddable API: an embedder
+    /// drives torrents through the methods below. The runtime comes with the
+    /// engine because the two cannot be used apart. librqbit's session spawns
+    /// on the runtime it was started on, and a reader polled anywhere else is
+    /// a `Handle::current` away from a panic.
     #[doc(hidden)]
     pub fn engine_for_tests(&self) -> (Arc<enginefs::EngineFS>, tokio::runtime::Handle) {
         (self.state.engine.clone(), self.runtime.clone())
     }
 
     /// File `file_idx` of the torrent `info_hash` as a
-    /// [`sources::TorrentSource`] played by `play` -- the source whose
-    /// first read is the stream route's own open -- for a test that has to
-    /// hold one. Read it on [`Self::engine_for_tests`]'s runtime, and drop
-    /// it there.
+    /// [`sources::TorrentSource`] played by `play`, for a test that has to
+    /// hold one. It is the source whose first read is the stream route's own
+    /// open. Read it on [`Self::engine_for_tests`]'s runtime, and drop it
+    /// there.
     ///
-    /// `#[doc(hidden)]` for the same reason as that one: a played source
-    /// needs the server's state (the disk gate drops the proxy cache's
+    /// It is `#[doc(hidden)]` for the same reason as that one. A played
+    /// source needs the server's state (the disk gate drops the proxy cache's
     /// slack too), which nothing outside the crate can name.
     #[doc(hidden)]
     pub fn played_torrent_source_for_tests(
@@ -478,9 +477,9 @@ impl ServerHandle {
     }
 
     /// The bearer token the control routes require this launch
-    /// (`Authorization: Bearer <token>`). A started server always has one:
-    /// the `Option` is only what an `AppState` no `run` filled in carries --
-    /// there is no way to leave the control routes open.
+    /// (`Authorization: Bearer <token>`). A started server always has one.
+    /// The `Option` is only what an `AppState` no `run` filled in carries.
+    /// There is no way to leave the control routes open.
     pub fn auth_token(&self) -> Option<&str> {
         self.state.auth_token.as_deref()
     }
@@ -499,9 +498,9 @@ impl ServerHandle {
     }
 
     /// Apply `patch` exactly as `POST /settings` would (same keys, same
-    /// validation and merge semantics, same engine update and persistence)
-    /// and return the resulting settings. The `bt*` settings report the HTTP
-    /// route puts in its response is available to an embedder through
+    /// validation and merge semantics, same engine update and persistence),
+    /// and return the resulting settings. The HTTP route also puts a `bt*`
+    /// settings report in its response. An embedder gets it through
     /// [`Self::update_settings_with_report`].
     pub fn update_settings(&self, patch: serde_json::Value) -> anyhow::Result<ServerSettings> {
         Ok(self.update_settings_with_report(patch)?.0)
@@ -509,8 +508,8 @@ impl ServerHandle {
 
     /// [`Self::update_settings`], also returning the
     /// [`enginefs::backend::BtSettingsReport`] the torrent session gave for
-    /// the `bt*` values -- the same report the `POST /settings` response
-    /// carries as `btSettings`, so an embedder can tell which of its
+    /// the `bt*` values. It is the same report the `POST /settings` response
+    /// carries as `btSettings`. From it an embedder can tell which of its
     /// settings took effect, which wait for a restart, and which the backend
     /// never honours.
     pub fn update_settings_with_report(
@@ -526,31 +525,31 @@ impl ServerHandle {
     ///
     /// The DHT is a peer *source*, not a requirement: a torrent with working
     /// trackers downloads fine without one. A network that drops the DHT's
-    /// UDP -- carrier-grade NAT, a firewalled mobile APN, a captive portal --
-    /// leaves `ever_bootstrapped` false forever, which is what a client
-    /// should surface as "DHT unavailable, using trackers only" rather than
-    /// as an error. Cheap: two routing-table length reads.
+    /// UDP (carrier-grade NAT, a firewalled mobile APN, a captive portal)
+    /// leaves `ever_bootstrapped` false forever. A client should surface that
+    /// as "DHT unavailable, using trackers only" rather than as an error. It
+    /// is cheap: two routing-table length reads.
     pub fn dht_status(&self) -> enginefs::backend::DhtStatus {
         routes::system::dht_status(&self.state)
     }
 
     /// **Tell the server how long the film is**, without saying where the
-    /// player is in it -- which is all a cast can say, the receiver doing
-    /// the reading and reporting only seconds, and which is all anything
-    /// says now: where a viewer is, is where its reads are. The length is
-    /// the one fact about a viewing this server cannot work out for itself,
-    /// and it is what sizes the retention window and the stream's own
-    /// read-ahead, both of which are stated in seconds of film; see
+    /// player is in it. That is all a cast can say, since the receiver does
+    /// the reading and reports only seconds. It is also all anything says
+    /// now: where a viewer is, is where its reads are. The length is the one
+    /// fact about a viewing this server cannot work out for itself. It sizes
+    /// the retention window and the stream's own read-ahead, both of which
+    /// are stated in seconds of film. See
     /// [`enginefs::EngineFS::on_duration`].
     ///
-    /// `file_idx` is the `{fileIdx}` segment of the player's URL as the
-    /// core wrote it, `-1` included, and `filters` its `f=` values: an
-    /// addon that names no file leaves the choice to this server, so the
-    /// file the length is about is the one the stream route resolved it
-    /// to, by the same rule (`routes::compat::resolve_file_idx`, through
-    /// [`stream_numbers::StreamFile`]). Reported against the addon's index
-    /// instead, a length for such a stream never arrived at all -- and
-    /// those are most streams.
+    /// `file_idx` is the `{fileIdx}` segment of the player's URL as the core
+    /// wrote it, `-1` included, and `filters` its `f=` values. An addon that
+    /// names no file leaves the choice to this server. So the file the length
+    /// is about is the one the stream route resolved it to, by the same rule
+    /// (`routes::compat::resolve_file_idx`, through
+    /// [`stream_numbers::StreamFile`]). When the length was reported against
+    /// the addon's index instead, a length for such a stream never arrived at
+    /// all, and those are most streams.
     pub async fn note_duration(
         &self,
         info_hash: &str,
@@ -572,27 +571,27 @@ impl ServerHandle {
     }
 
     /// **Tell the server a player opened on this torrent**, so what it goes
-    /// on to say about buffering is counted for this video and not the
-    /// last; see [`enginefs::EngineFS::on_player_opened`]. Any player, any
-    /// file of the torrent: the count is the torrent's.
+    /// on to say about buffering is counted for this video and not the last.
+    /// See [`enginefs::EngineFS::on_player_opened`]. Any player and any file
+    /// of the torrent count, because the count is the torrent's.
     pub async fn note_player_opened(&self, info_hash: &str) {
         self.state.engine.on_player_opened(info_hash).await;
     }
 
-    /// **Tell the server the player is buffering after having played** --
-    /// its popup is up and the frames have stopped. The one thing a player
-    /// knows that this server cannot see; each report has the backend
-    /// split one more piece ahead of the reader for the rest of this video.
-    /// See [`enginefs::EngineFS::on_player_stalled`].
+    /// **Tell the server the player is buffering after having played**: its
+    /// popup is up and the frames have stopped. It is the one thing a player
+    /// knows that this server cannot see. Each report has the backend split
+    /// one more piece ahead of the reader for the rest of this video. See
+    /// [`enginefs::EngineFS::on_player_stalled`].
     pub async fn note_player_stalled(&self, info_hash: &str) {
         self.state.engine.on_player_stalled(info_hash).await;
     }
 
     /// **Register something to play and get its id.** Parses `spec` and
-    /// records it; no I/O, so it answers at once, and a URL whose shape is
-    /// none of this server's is registered all the same -- every
-    /// [`Self::resolve`] of it answers why. The id is 128 random bits,
-    /// names nothing by itself, and is forgotten by a restart or once
+    /// records it. There is no I/O, so it answers at once. A URL whose shape
+    /// is none of this server's is registered all the same, and every
+    /// [`Self::resolve`] of it answers why. The id is 128 random bits and
+    /// names nothing by itself. It is forgotten by a restart, or once
     /// [`media::MEDIA_ID_CAP`] newer ones have been registered while no
     /// reader held it. See [`media`].
     ///
@@ -603,12 +602,12 @@ impl ServerHandle {
 
     /// **Find out what an id is**: add or find the torrent and choose its
     /// file (`-1` and `f=` as the stream route chooses), probe a link's
-    /// origin, renew a Drive grant -- the I/O `register` does not do,
-    /// which for a magnet whose metadata is not here yet is a wait of up to
-    /// `enginefs::METADATA_RESOLVE_TIMEOUT`. The answer is kept on the id,
-    /// so the next ask is a lookup. A link whose host answers a range with
-    /// the whole file is not a refusal: it resolves `in_process: false`
-    /// with the `/proxy` URL a player can read it forward through.
+    /// origin, renew a Drive grant. This is the I/O `register` does not do.
+    /// For a magnet whose metadata is not here yet it is a wait of up to
+    /// `enginefs::METADATA_RESOLVE_TIMEOUT`. The answer is kept on the id, so
+    /// the next ask is a lookup. A link whose host answers a range with the
+    /// whole file is not a refusal. It resolves `in_process: false` with the
+    /// `/proxy` URL a player can read it forward through.
     pub fn resolve(&self, id: &MediaId) -> Result<Resolved, Refusal> {
         let state = self.state.clone();
         let id = id.clone();
@@ -617,16 +616,17 @@ impl ServerHandle {
     }
 
     /// **Open a blocking reader over an id**, resolving it first if nothing
-    /// has. With `play`, its reads are the viewer's playback: the play
-    /// session moves to the file, and a torrent file shares unless it is
-    /// an archive played as itself (decided here, as the stream route
-    /// decides it for `p=`); a member of a container in a torrent shares
-    /// its own bytes -- its extent of a single container file, or its bytes
-    /// in every volume of a multi-volume set, drawn once for the set -- and
-    /// a member of a container behind links shares nothing. Without one they are an aside, which moves nothing and shares
-    /// nothing. The stream is registered before this returns. A reader
-    /// holds no `ServerHandle`: stopping the server under it makes its
-    /// calls answer an error. See [`media::reader`].
+    /// has. With `play`, its reads are the viewer's playback, and the play
+    /// session moves to the file. A torrent file shares unless it is an
+    /// archive played as itself (decided here, as the stream route decides it
+    /// for `p=`). A member of a container in a torrent shares its own bytes:
+    /// its extent of a single container file, or its bytes in every volume of
+    /// a multi-volume set, drawn once for the set. A member of a container
+    /// behind links shares nothing. Without `play` the reads are an aside,
+    /// which moves nothing and shares nothing. The stream is registered
+    /// before this returns. A reader holds no `ServerHandle`, so stopping the
+    /// server under it makes its calls answer an error. See
+    /// [`media::reader`].
     pub fn open_reader(
         &self,
         id: &MediaId,
@@ -639,11 +639,11 @@ impl ServerHandle {
     }
 
     /// **Change the viewer's read-ahead choice for an id.** It outranks the
-    /// [`PlayToken`]'s buffer, which is only the initial value: set before
-    /// [`Self::open_reader`], the reader opens with it; set after, a reader
-    /// open on the id takes it at its next reopen -- its next seek -- and
-    /// never in the handle already reading, since the lookahead is worked
-    /// out when a torrent file is opened. Nothing for an id that is not a
+    /// [`PlayToken`]'s buffer, which is only the initial value. Set before
+    /// [`Self::open_reader`], the reader opens with it. Set after, a reader
+    /// open on the id takes it at its next reopen (its next seek). It never
+    /// reaches the handle already reading, since the lookahead is worked out
+    /// when a torrent file is opened. It does nothing for an id that is not a
     /// torrent played with a [`PlayToken`].
     pub fn set_buffer(
         &self,
@@ -661,10 +661,10 @@ impl ServerHandle {
         self.state.media.read_ahead_registered(&self.state, id)
     }
 
-    /// How long `resolve` waits for a file's head before it answers the
-    /// file unsniffed (`docs/design/media-pipeline.md` §2.9), set short: a
-    /// test's, so a head that never comes is proven not to hold a resolve
-    /// without spending the real bound. Not part of the embeddable API.
+    /// How long `resolve` waits for a file's head before it answers the file
+    /// unsniffed (`docs/design/media-pipeline.md` §2.9). A test sets it
+    /// short, so a head that never comes is proven not to hold a resolve
+    /// without spending the real bound. It is not part of the embeddable API.
     #[doc(hidden)]
     pub fn set_media_sniff_bound(&self, bound: Duration) {
         self.state.media.set_sniff_bound(bound);
@@ -682,14 +682,14 @@ impl ServerHandle {
         self.block_on_server(async move { state.media.stream_numbers(&state, &id).await })
     }
 
-    /// [`Self::note_duration`] for the torrent file `id` resolved to; a
+    /// [`Self::note_duration`] for the torrent file `id` resolved to. It is a
     /// no-op for anything else, and for an id not resolved yet.
     ///
-    /// For a member -- of one container file, or across a multi-volume set
-    /// -- told to the files it lies in for the member's draw alone
-    /// ([`enginefs::EngineFS::on_set_duration`]): a container's length over
-    /// an episode's duration, or a volume's, is no rate of anything, and a
-    /// stream given one would read ahead a season or starve.
+    /// For a member (of one container file, or across a multi-volume set), it
+    /// is told to the files the member lies in, for the member's draw alone
+    /// ([`enginefs::EngineFS::on_set_duration`]). A container's length over
+    /// an episode's duration, or a volume's, is no rate of anything. A stream
+    /// given one would read ahead a season or starve.
     pub fn note_media_duration(
         &self,
         id: &MediaId,
@@ -711,26 +711,26 @@ impl ServerHandle {
     }
 
     /// **Where the playback `id` is opened for resumes**, and how long the
-    /// film is if the app knows -- `None` for a playback from the top. Set
-    /// before [`Self::open_reader`], as [`Self::set_buffer`] can be: a
-    /// torrent file read with a play then asks the swarm for the resume
-    /// point at the open, beside the file's head, instead of only when the
-    /// player blocks on it (`docs/design/media-pipeline.md`, "Pre-want"):
-    /// from where the resume point is taken to be, outward, a step at a
-    /// time. Where the last session on the file ended
-    /// ([`Self::note_media_position`]) places the window when it is near
-    /// the resume time; the resume time's share of the file does
-    /// otherwise. Nothing for anything but a torrent file.
+    /// film is if the app knows. It is `None` for a playback from the top.
+    /// Set it before [`Self::open_reader`], as [`Self::set_buffer`] can be. A
+    /// torrent file read with a play then asks the swarm for the resume point
+    /// at the open, beside the file's head, instead of only when the player
+    /// blocks on it (`docs/design/media-pipeline.md`, "Pre-want"). It asks
+    /// from where the resume point is taken to be, outward, a step at a time.
+    /// Where the last session on the file ended
+    /// ([`Self::note_media_position`]) places the window when it is near the
+    /// resume time. Otherwise the resume time's share of the file does. It
+    /// does nothing for anything but a torrent file.
     pub fn set_resume(&self, id: &MediaId, resume: Option<ResumeHint>) -> Result<(), Refusal> {
         self.state.media.set_resume(id, resume)
     }
 
-    /// **The player of `id` is leaving at `position`** of the film:
+    /// **The player of `id` is leaving at `position`** of the film. That is
     /// remembered with the byte its reader was last served to, per torrent
     /// file and across restarts (`read-positions.json` beside
-    /// `settings.json`), so the next playback resuming near there asks for
-    /// that region first ([`Self::set_resume`]). A no-op for anything but a
-    /// torrent file read with a play, and before its first byte.
+    /// `settings.json`). So the next playback resuming near there asks for
+    /// that region first ([`Self::set_resume`]). It is a no-op for anything
+    /// but a torrent file read with a play, and before its first byte.
     pub fn note_media_position(
         &self,
         id: &MediaId,
@@ -748,10 +748,11 @@ impl ServerHandle {
     }
 
     /// **Whether the player of `id` is waiting on a read now**, and for how
-    /// long: the truth behind a player's "buffering" card while its own
-    /// engine reports no stall -- mpv blocked in a read of a piece the
-    /// swarm has not delivered shows a frozen picture and says nothing.
-    /// No I/O; cheap enough to poll every half second. See [`ReadWait`].
+    /// long. It is the truth behind a player's "buffering" card while its own
+    /// engine reports no stall. mpv blocked in a read of a piece the swarm
+    /// has not delivered shows a frozen picture and says nothing. There is no
+    /// I/O, and it is cheap enough to poll every half second. See
+    /// [`ReadWait`].
     pub fn media_read_wait(&self, id: &MediaId) -> Result<ReadWait, Refusal> {
         self.state.media.read_wait(id)
     }
@@ -764,15 +765,15 @@ impl ServerHandle {
         self.state.media.prewanting(id)
     }
 
-    /// Plan pre-wants with `rules`: a test's, so a fixture of a few pieces
-    /// can tell a window from its whole file. Not part of the embeddable
-    /// API.
+    /// Plan pre-wants with `rules`. A test uses it, so a fixture of a few
+    /// pieces can tell a window from its whole file. It is not part of the
+    /// embeddable API.
     #[doc(hidden)]
     pub fn set_prewant_rules(&self, rules: media::prewant::Rules) {
         self.state.media.set_prewant_rules(rules);
     }
 
-    /// [`Self::note_player_opened`] for the torrent `id` resolved to; a
+    /// [`Self::note_player_opened`] for the torrent `id` resolved to. It is a
     /// no-op for anything else.
     pub fn note_media_player_opened(&self, id: &MediaId) -> anyhow::Result<()> {
         let Some((info_hash, _)) = self.state.media.torrent_file(id) else {
@@ -782,8 +783,8 @@ impl ServerHandle {
         self.block_on_server(async move { engine.on_player_opened(&info_hash).await })
     }
 
-    /// [`Self::note_player_stalled`] for the torrent `id` resolved to; a
-    /// no-op for anything else.
+    /// [`Self::note_player_stalled`] for the torrent `id` resolved to. It is
+    /// a no-op for anything else.
     pub fn note_media_player_stalled(&self, id: &MediaId) -> anyhow::Result<()> {
         let Some((info_hash, _)) = self.state.media.torrent_file(id) else {
             return Ok(());
@@ -792,30 +793,30 @@ impl ServerHandle {
         self.block_on_server(async move { engine.on_player_stalled(&info_hash).await })
     }
 
-    /// Whether this server is using the connection while nothing is playing
-    /// -- what a client's "working in the background" indicator shows, in
-    /// each direction, exactly what `routes::system::background_traffic`
+    /// Whether this server is using the connection while nothing is playing.
+    /// It is what a client's "working in the background" indicator shows, in
+    /// each direction, and exactly what `routes::system::background_traffic`
     /// answers.
     ///
-    /// Two halves and their disjunction, not two signals: `downloading` and
-    /// `uploading` are each "that direction's peer counters grew over the
-    /// last window and nothing was playing over it", `active` is either.
-    /// The conjunction with playback is taken in `routes::system` over the
-    /// engine fields on purpose -- an embedder reading traffic and playback
-    /// separately would sample them a moment apart and get a light that
-    /// flickers whenever they disagree.
+    /// There are two halves and their disjunction, not two signals.
+    /// `downloading` and `uploading` each mean "that direction's peer
+    /// counters grew over the last window and nothing was playing over it",
+    /// and `active` is either. The conjunction with playback is taken in
+    /// `routes::system` over the engine fields on purpose. An embedder
+    /// reading traffic and playback separately would sample them a moment
+    /// apart, and get a light that flickers whenever they disagree.
     ///
-    /// Library-only: there is no control route for it, because the consumer
-    /// is the embedding client rather than anything speaking HTTP, and
+    /// It is library-only. There is no control route for it, because the
+    /// consumer is the embedding client rather than anything speaking HTTP.
     /// `enginefs::traffic::BackgroundTraffic` is `serde`-serializable like
-    /// every other type crossing this boundary. Cheap enough to poll every
-    /// second or two -- per torrent that exists, one read of librqbit's live
-    /// stats snapshot (a handful of counters) and the three live playback
-    /// fields, nothing built, no idle clock touched -- and it creates
-    /// nothing: no engine, no magnet add. The verdict changes when
+    /// every other type crossing this boundary. It is cheap enough to poll
+    /// every second or two. Per torrent that exists, it is one read of
+    /// librqbit's live stats snapshot (a handful of counters) and the three
+    /// live playback fields. Nothing is built and no idle clock is touched.
+    /// It creates nothing: no engine, no magnet add. The verdict changes when
     /// a window closes (`enginefs::traffic::TRAFFIC_WINDOW`) or the moment
-    /// playback is seen, whichever comes first; asking faster than the
-    /// window is otherwise answered from the standing reading.
+    /// playback is seen, whichever comes first. Asking faster than the window
+    /// is otherwise answered from the standing reading.
     pub fn background_traffic(&self) -> anyhow::Result<enginefs::traffic::BackgroundTraffic> {
         let state = self.state.clone();
         self.block_on_server(async move { routes::system::background_traffic(&state).await })
@@ -826,19 +827,19 @@ impl ServerHandle {
     /// torrent the set committed for sharing and what the session has
     /// moved.
     ///
-    /// `url` is the URL handed to the player, and its shape is what decides
-    /// which store answers -- a torrent stream, a proxied one, or neither,
-    /// which is `None` and means a stream this server is not holding rather
-    /// than an error. Every number is measured when it is asked for and
-    /// nothing is kept: the transfer totals are **this session's**, and the
-    /// ratio taken from them must be labelled as one.
+    /// `url` is the URL handed to the player, and its shape decides which
+    /// store answers: a torrent stream, a proxied one, or neither. Neither is
+    /// `None`, and means a stream this server is not holding rather than an
+    /// error. Every number is measured when it is asked for, and nothing is
+    /// kept. The transfer totals are **this session's**, and the ratio taken
+    /// from them must be labelled as one.
     ///
     /// It creates nothing and does not count as a poll, so it cannot hold a
-    /// torrent out of the idle sweep; it is not free, though: a torrent's
-    /// answer copies its store's held bits, and a proxied entity's first
-    /// ask lists its chunk directories on the blocking pool to seed the
-    /// owner's held set. Ask it while a panel is open, not for the life of
-    /// the process.
+    /// torrent out of the idle sweep. It is not free, though. A torrent's
+    /// answer copies its store's held bits, and a proxied entity's first ask
+    /// lists its chunk directories on the blocking pool to seed the owner's
+    /// held set. Ask it while a panel is open, not for the life of the
+    /// process.
     pub fn stream_numbers(
         &self,
         url: &str,
@@ -848,14 +849,14 @@ impl ServerHandle {
         self.block_on_server(async move { stream_numbers::stream_numbers(&state, &url).await })
     }
 
-    /// Torrent-level stats (see `routes::system::engine_stats`): `trackers`
-    /// are a stream's tracker sources -- normalised exactly as the stream and
+    /// Torrent-level stats (see `routes::system::engine_stats`). `trackers`
+    /// are a stream's tracker sources, normalised exactly as the stream and
     /// stats routes normalise their `tr=` values (`tracker:` prefixes
-    /// stripped, `dht:` entries dropped, trimmed), so a stream's `sources`
-    /// list can be passed as is -- and are only used when
-    /// this call is the one that creates the engine; a magnet still resolving
-    /// reports `phase: resolvingMetadata` immediately, a failed add
-    /// `phase: error`.
+    /// stripped, `dht:` entries dropped, trimmed). So a stream's `sources`
+    /// list can be passed as is. They are only used when this call is the one
+    /// that creates the engine. A magnet still resolving reports `phase:
+    /// resolvingMetadata` immediately, and a failed add reports `phase:
+    /// error`.
     pub fn engine_stats(
         &self,
         info_hash: &str,
@@ -869,11 +870,11 @@ impl ServerHandle {
         })
     }
 
-    /// Per-file stats, exactly what `GET /{infoHash}/{fileIdx}/stats.json?tr=...`
-    /// answers for an explicit index (see `routes::system::file_stats`;
-    /// `trackers` as in [`Self::engine_stats`]). Fails
-    /// with [`FileNotFound`] (the route's 404) for an index the torrent does
-    /// not have once its metadata is known.
+    /// Per-file stats, exactly what `GET
+    /// /{infoHash}/{fileIdx}/stats.json?tr=...` answers for an explicit index
+    /// (see `routes::system::file_stats`, with `trackers` as in
+    /// [`Self::engine_stats`]). Fails with [`FileNotFound`] (the route's 404)
+    /// for an index the torrent does not have once its metadata is known.
     pub fn file_stats(
         &self,
         info_hash: &str,
@@ -891,11 +892,11 @@ impl ServerHandle {
     }
 
     /// Pin `file_idx` of `info_hash` as an offline download (see
-    /// `routes::downloads::pin_download`): created through the magnet registry with `trackers` (as in
-    /// [`Self::engine_stats`]) when new, kept wanted and exempt from
-    /// eviction, persisted across restarts. The torrent does not move --
-    /// pinning is retention, not a location. Fails with
-    /// [`PinDownloadError`] -- `InsufficientSpace` below
+    /// `routes::downloads::pin_download`). When new, it is created through
+    /// the magnet registry with `trackers` (as in [`Self::engine_stats`]). It
+    /// is kept wanted, exempt from eviction, and persisted across restarts.
+    /// The torrent does not move: pinning is retention, not a location. Fails
+    /// with [`PinDownloadError`]: `InsufficientSpace` below
     /// [`PIN_FREE_SPACE_MARGIN`], `FileNotFound` for a bad index.
     pub fn pin_download(
         &self,
@@ -913,19 +914,17 @@ impl ServerHandle {
     }
 
     /// Drop the pin on `file_idx` of `info_hash` (see
-    /// `routes::downloads::unpin_download`, which
-    /// is the whole of it).
-    /// [`UnpinOutcome::unpinned`] says whether a pin was cleared -- false
-    /// for an unknown torrent or an unpinned file -- and
-    /// [`UnpinOutcome::deleted_files`] whether data actually went, which is
-    /// not simply `delete_files` echoed back. With `delete_files` the data
-    /// goes too: the whole torrent when this was its last pin, only that
-    /// file while other pins hold, the piece-store directory for a pin whose
-    /// torrent the backend does not have, and a `file_idx`
-    /// the torrent does not have is refused with
-    /// [`PinDownloadError::FileNotFound`] rather than taken for the whole
-    /// torrent. Without it only the pin goes and the engine becomes an
-    /// ordinary, evictable one again.
+    /// `routes::downloads::unpin_download`, which is the whole of it).
+    /// [`UnpinOutcome::unpinned`] says whether a pin was cleared (false for
+    /// an unknown torrent or an unpinned file).
+    /// [`UnpinOutcome::deleted_files`] says whether data actually went, which
+    /// is not simply `delete_files` echoed back. With `delete_files` the data
+    /// goes too. That is the whole torrent when this was its last pin, only
+    /// that file while other pins hold, and the piece-store directory for a
+    /// pin whose torrent the backend does not have. A `file_idx` the torrent
+    /// does not have is refused with [`PinDownloadError::FileNotFound`]
+    /// rather than taken for the whole torrent. Without `delete_files` only
+    /// the pin goes, and the engine becomes an ordinary, evictable one again.
     pub fn unpin_download(
         &self,
         info_hash: &str,
@@ -941,10 +940,11 @@ impl ServerHandle {
     }
 
     /// Pins an addon URL or a Drive file as an offline download (see
-    /// `routes::downloads::pin_proxy_download` and `crate::proxy_downloads`). The row's `info_hash` is the key to
-    /// drop it by ([`Self::unpin_proxy_download`]). A Drive file already
-    /// whole on the disk needs no `refresh_token`; one that is not, with
-    /// none (or an empty one), is [`ProxyPinError::NoGrant`].
+    /// `routes::downloads::pin_proxy_download` and `crate::proxy_downloads`).
+    /// The row's `info_hash` is the key to drop it by
+    /// ([`Self::unpin_proxy_download`]). A Drive file already whole on the
+    /// disk needs no `refresh_token`. One that is not, with none (or an empty
+    /// one), is [`ProxyPinError::NoGrant`].
     pub fn pin_proxy_download(
         &self,
         request: routes::downloads::ProxyDownloadRequest,
@@ -977,14 +977,15 @@ impl ServerHandle {
     }
 
     /// **Pin what an id names as an offline download**, whatever it is
-    /// (`docs/design/media-pipeline.md` §2.6): a torrent file through
-    /// [`Self::pin_download`] (with the URL's `tr=` trackers, and `-1`
-    /// chosen as the stream route chooses it), a link through
-    /// [`Self::pin_proxy_download`] keyed with its `h=` headers, a Drive file
-    /// under a grant asked of the id's [`GrantSupplier`] (none is needed
-    /// for a file already whole on the disk). A member of a container pins
-    /// the container -- every volume of a set -- since a member is ranges of
-    /// those files. A file on this device is [`PinError::NothingToDownload`].
+    /// (`docs/design/media-pipeline.md` §2.6). A torrent file goes through
+    /// [`Self::pin_download`] (with the URL's `tr=` trackers, and `-1` chosen
+    /// as the stream route chooses it). A link goes through
+    /// [`Self::pin_proxy_download`], keyed with its `h=` headers. A Drive
+    /// file goes under a grant asked of the id's [`GrantSupplier`] (none is
+    /// needed for a file already whole on the disk). A member of a container
+    /// pins the container (every volume of a set), since a member is ranges
+    /// of those files. A file on this device is
+    /// [`PinError::NothingToDownload`].
     ///
     /// Answers the rows [`Self::downloads`] lists for it: one, or one per
     /// volume. The info-hash and key methods stay; this is the same pin.
@@ -996,11 +997,12 @@ impl ServerHandle {
     }
 
     /// **Drop the pin on what an id names**, with `delete_files` its bytes
-    /// too: [`Self::unpin_download`] or [`Self::unpin_proxy_download`] for
-    /// each file [`Self::pin`] pinned for it, the outcomes joined
-    /// (`unpinned` if any pin went, `deleted_files` if any bytes did). A
-    /// torrent URL with an explicit file index is unpinned without
-    /// resolving, so a dormant pin's torrent is not added to learn it.
+    /// too. It calls [`Self::unpin_download`] or
+    /// [`Self::unpin_proxy_download`] for each file [`Self::pin`] pinned for
+    /// it, and joins the outcomes (`unpinned` if any pin went,
+    /// `deleted_files` if any bytes did). A torrent URL with an explicit file
+    /// index is unpinned without resolving, so a dormant pin's torrent is not
+    /// added to learn it.
     pub fn unpin(&self, id: &MediaId, delete_files: bool) -> Result<UnpinOutcome, PinError> {
         let state = self.state.clone();
         let id = id.clone();
@@ -1016,14 +1018,14 @@ impl ServerHandle {
 
     /// What the torrent backend calls `file_idx` of `info_hash` (the `path`
     /// of its [`Self::downloads`] entry). `None` when the torrent is not
-    /// managed right now or the backend does not know the path yet; never
+    /// managed right now or the backend does not know the path yet. It never
     /// creates an engine.
     ///
-    /// A name, not a file: torrent data is stored one file per piece
-    /// (`enginefs::piece_store`), so nothing is written at this path and
-    /// handing it to a local player would hand it a path that does not
-    /// exist. A finished download plays through the media routes like any
-    /// other. Nothing above the backend chooses the folder in it either.
+    /// A name, not a file. Torrent data is stored one file per piece
+    /// (`enginefs::piece_store`), so nothing is written at this path. Handing
+    /// it to a local player would hand it a path that does not exist. A
+    /// finished download plays through the media routes like any other.
+    /// Nothing above the backend chooses the folder in it either.
     pub fn download_path(
         &self,
         info_hash: &str,
@@ -1040,17 +1042,16 @@ impl ServerHandle {
     /// can fetch (see `routes::drive::open_file`), with the stream path made
     /// absolute on this server.
     ///
-    /// **This is how an embedder asks, and why the credential never
-    /// becomes a request.** The refresh token is an argument to a function
-    /// call inside this process: it is not a query string, not a path
-    /// segment, not a header, and not a line anything logs. What comes
-    /// back is a URL carrying a random key, which is the whole of what the
-    /// player is told.
+    /// **This is how an embedder asks, and why the credential never becomes a
+    /// request.** The refresh token is an argument to a function call inside
+    /// this process. It is not a query string, not a path segment, not a
+    /// header, and not a line anything logs. What comes back is a URL
+    /// carrying a random key, which is the whole of what the player is told.
     ///
-    /// A dead pairing is [`routes::drive::DriveOpenError::is_pair_again`]
-    /// -- terminal, and the one thing a caller must be able to tell
-    /// without reading English, because the answer to it is a new QR and
-    /// the answer to everything else is to try again.
+    /// A dead pairing is [`routes::drive::DriveOpenError::is_pair_again`]. It
+    /// is terminal, and it is the one thing a caller must be able to tell
+    /// without reading English. The answer to it is a new QR, and the answer
+    /// to everything else is to try again.
     pub fn open_drive_file(
         &self,
         file_id: &str,
@@ -1071,63 +1072,64 @@ impl ServerHandle {
         })
     }
 
-    /// What the cache currently occupies against its configured limit, in
-    /// the one occupancy accounting this repository has
-    /// (`enginefs::chunk_store::occupied_bytes` -- allocated blocks, not
-    /// apparent length); see `cache_cleaner::usage`.
-    /// [`CacheUsage::protected_bytes`] and
-    /// `protected_files` are what a pin or the stream being played is
-    /// holding right now, so a caller can tell "over the limit but nothing
-    /// is disposable" apart from "a clean would help" without running one.
+    /// What the cache currently occupies against its configured limit, in the
+    /// one occupancy accounting this repository has
+    /// (`enginefs::chunk_store::occupied_bytes`: allocated blocks, not
+    /// apparent length). See `cache_cleaner::usage`.
+    /// [`CacheUsage::protected_bytes`] and `protected_files` are what a pin
+    /// or the stream being played is holding right now. So a caller can tell
+    /// "over the limit but nothing is disposable" apart from "a clean would
+    /// help" without running one.
     ///
-    /// Walks nothing: the owners of the cache count what they hold as they
-    /// write it, and the only filesystem work is one `read_dir` of the
-    /// store root for what no live store speaks for and a `stat` of each
-    /// staged copy a live store is writing. Cheap enough for a
-    /// "Storage" screen open or a manual refresh; it is not cached here, so
-    /// do not poll it on a sub-second timer.
+    /// It walks nothing. The owners of the cache count what they hold as they
+    /// write it. The only filesystem work is one `read_dir` of the store root
+    /// for what no live store speaks for, and a `stat` of each staged copy a
+    /// live store is writing. It is cheap enough for a "Storage" screen open
+    /// or a manual refresh. It is not cached here, so do not poll it on a
+    /// sub-second timer.
     pub fn cache_usage(&self) -> anyhow::Result<CacheUsage> {
         let state = self.state.clone();
         self.block_on_server(async move { cache_cleaner::usage(&state).await })
     }
 
-    /// Give back everything nobody is playing and nobody is reading, now,
-    /// and report what is left (see `cache_cleaner::drop_slack`, which the
-    /// reconciler's tick and a viewer's switch run too). A pinned download's files
-    /// and the window of the stream being played are never touched, however
-    /// far over the limit the cache is; [`EvictionReport::shortfall_message`]
-    /// is the line to show the user when that leaves it still over: nothing
-    /// can reclaim what a pin or a live window keeps, and the fix is to stop
-    /// the stream or unpin the download, not to run the clean again.
+    /// Give back everything nobody is playing and nobody is reading, now, and
+    /// report what is left (see `cache_cleaner::drop_slack`, which the
+    /// reconciler's tick and a viewer's switch run too). A pinned download's
+    /// files and the window of the stream being played are never touched,
+    /// however far over the limit the cache is.
+    /// [`EvictionReport::shortfall_message`] is the line to show the user
+    /// when that leaves it still over. Nothing can reclaim what a pin or a
+    /// live window keeps. The fix is to stop the stream or unpin the
+    /// download, not to run the clean again.
     pub fn clean_cache_now(&self) -> anyhow::Result<EvictionReport> {
         let state = self.state.clone();
         self.block_on_server(async move { cache_cleaner::drop_slack(&state).await })
     }
 
-    /// **Clear the cache, now**: stop every torrent that streams and take
-    /// every byte no download keeps off the disk, and say what that freed
-    /// and how many torrents it stopped. What [`Self::clean_cache_now`]
-    /// will not do, on purpose -- it gives back only what nobody plays --
-    /// and what a user asks for when they want the space back whatever is
-    /// playing (an app's "Clear the cache", or its update making room).
+    /// **Clear the cache, now**: stop every torrent that streams, take every
+    /// byte no download keeps off the disk, and say what that freed and how
+    /// many torrents it stopped. [`Self::clean_cache_now`] will not do this,
+    /// on purpose: it gives back only what nobody plays. This is what a user
+    /// asks for when they want the space back whatever is playing (an app's
+    /// "Clear the cache", or its update making room).
     ///
     /// In order (`cache_cleaner::clear`): every hold on every torrent is
-    /// overridden -- a player screen's, a cast's, an idle share -- and every
-    /// read open on a torrent fails at once, so the player that was reading
-    /// gets a read error (`ConnectionAborted`, "the cache was cleared");
-    /// every torrent stops but one a kept download is on, which goes on
-    /// downloading; every piece no download keeps is taken through the
+    /// overridden (a player screen's, a cast's, an idle share). Every read
+    /// open on a torrent fails at once, so the player that was reading gets a
+    /// read error (`ConnectionAborted`, "the cache was cleared"). Every
+    /// torrent stops but one a kept download is on, which goes on
+    /// downloading. Every piece no download keeps is taken through the
     /// retention layer's own deletes, the last-played title's window
-    /// included; then every proxy-cache entry no download pins and no body
-    /// is reading now. Untouched: kept downloads, the settings, where each
-    /// file was last played (`read-positions.json`), and anything that is
-    /// not this server's (an app's image cache).
+    /// included. Then every proxy-cache entry goes that no download pins and
+    /// no body is reading now. Untouched: kept downloads, the settings, where
+    /// each file was last played (`read-positions.json`), and anything that
+    /// is not this server's (an app's image cache).
     ///
-    /// After it, whoever asks is served as a first ask is: a player
-    /// opening a stream holds its torrent again and it starts, a cast
-    /// published holds. A reader or cast opened before the clear stays
-    /// stopped -- a seek in it fails too -- so a player shows the error
-    /// it shows for any failed read rather than quietly fetching again.
+    /// After it, whoever asks is served as a first ask is. A player opening a
+    /// stream holds its torrent again and it starts, and a cast published
+    /// holds. A reader or cast opened before the clear stays stopped, and a
+    /// seek in it fails too. So a player shows the error it shows for any
+    /// failed read rather than quietly fetching again.
     pub fn clear_cache(&self) -> anyhow::Result<CacheClearReport> {
         let state = self.state.clone();
         self.block_on_server(async move { cache_cleaner::clear(&state).await })
@@ -1137,14 +1139,14 @@ impl ServerHandle {
     /// read it (`cache_budget::publish_now`), or `None` while nothing caps
     /// it at all.
     ///
-    /// **The one place the published cap is observable from outside.** It
-    /// is not [`Self::cache_usage`]'s `limit_bytes`: that is the same
-    /// arithmetic run again for the answer a client reads, while this is
-    /// the number the retention policies of both owners are sized from --
-    /// so a publisher that stopped reading what the cache holds would size
-    /// every window on a volume's free space alone and nothing a client
-    /// asked would say so. Here for the tests that pin it, and cheap: a
-    /// read of one cell. Doc-hidden: an embedder reads `cache_usage`.
+    /// **The one place the published cap is observable from outside.** It is
+    /// not [`Self::cache_usage`]'s `limit_bytes`. That is the same arithmetic
+    /// run again for the answer a client reads. This is the number the
+    /// retention policies of both owners are sized from. A publisher that
+    /// stopped reading what the cache holds would size every window on a
+    /// volume's free space alone, and nothing a client asked would say so. It
+    /// is here for the tests that pin it, and cheap: a read of one cell.
+    /// Doc-hidden: an embedder reads `cache_usage`.
     #[doc(hidden)]
     pub fn published_cache_budget(&self) -> Option<u64> {
         match self.state.engine.cache_budget().get() {
@@ -1155,16 +1157,16 @@ impl ServerHandle {
     }
 
     /// How many open bodies the proxy cache is answering right now
-    /// (`proxy_retention::ProxyRetention::reads`) -- an entity one of them
-    /// is inside is live, so nothing takes its bytes while it stands.
+    /// (`proxy_retention::ProxyRetention::reads`). An entity one of them is
+    /// inside is live, so nothing takes its bytes while it stands.
     ///
     /// Not [`Self::proxy_streams_live`], which counts the reads a client can
-    /// close by token: that registration goes the moment a body ends, while
-    /// the read itself lives on until hyper drops the response -- so a pass
-    /// in between is still answered "somebody is inside all of this". That
-    /// gap is nanoseconds on an idle machine and milliseconds on a loaded
-    /// one, which makes it exactly the kind of thing a test has to be able
-    /// to wait for rather than hope past.
+    /// close by token. That registration goes the moment a body ends, while
+    /// the read itself lives on until hyper drops the response. A pass in
+    /// between is still answered "somebody is inside all of this". That gap
+    /// is nanoseconds on an idle machine and milliseconds on a loaded one. So
+    /// it is exactly the kind of thing a test has to be able to wait for
+    /// rather than hope past.
     #[doc(hidden)]
     pub fn proxy_cache_reads(&self) -> usize {
         self.state.proxy_cache.retention().reads()
@@ -1177,11 +1179,11 @@ impl ServerHandle {
     /// **Not [`Self::cache_usage`]'s `limit_bytes`.** That one is the same
     /// arithmetic (`cache_budget::CacheLimit::effective`) run again over a
     /// fresh reading of the volume, so it says what a publication *would*
-    /// state; this is the number a pass will actually measure against,
-    /// read out of the cell every publication writes. A test whose whole
-    /// premise is that a stream ran past its budget has to assert the
-    /// second one: the first is true on a roomy volume whether or not
-    /// anything ever reached the owner.
+    /// state. This is the number a pass will actually measure against, read
+    /// out of the cell every publication writes. A test whose whole premise
+    /// is that a stream ran past its budget has to assert the second one. The
+    /// first is true on a roomy volume whether or not anything ever reached
+    /// the owner.
     #[doc(hidden)]
     pub fn proxy_cache_cap(&self) -> Option<u64> {
         self.state.proxy_cache.retention().cap()
@@ -1192,16 +1194,16 @@ impl ServerHandle {
     /// it (`proxy_cache::DiskWork`).
     ///
     /// **This is here for what watches the cache from outside**, which is to
-    /// say the tests, and it is the answer to a question they could not
-    /// otherwise ask. A chunk is written from a task nobody joins, so the
-    /// last chunks of a body land after the player has read the last byte of
-    /// it and in whatever order the pool ran them in; the pass that reclaims
-    /// round the final playhead lands after that again. A test that counts
-    /// the files in the cache root without this is counting a directory that
-    /// is still moving, and it will read the same policy as two different
-    /// answers depending on how loaded the machine is.
+    /// say the tests. It answers a question they could not otherwise ask. A
+    /// chunk is written from a task nobody joins. So the last chunks of a
+    /// body land after the player has read the last byte of it, in whatever
+    /// order the pool ran them. The pass that reclaims round the final
+    /// playhead lands after that again. A test that counts the files in the
+    /// cache root without this is counting a directory that is still moving.
+    /// It will read the same policy as two different answers, depending on
+    /// how loaded the machine is.
     ///
-    /// It is a wait on a condition and not on a clock: once a body has been
+    /// It is a wait on a condition and not on a clock. Once a body has been
     /// read to its end, nothing can start work this count has not already
     /// seen, so a count of nothing is a disk that has stopped. `within`
     /// bounds it so a regression fails instead of hanging.
@@ -1220,33 +1222,32 @@ impl ServerHandle {
     /// The token is the client's own: it mints one per player and puts it in
     /// the `/proxy` URL that player is given (`p=`). Closing it here makes
     /// that player's read fail at once instead of waiting out
-    /// `network-timeout`, which is generous on purpose, **and retires the
+    /// `network-timeout`, which is generous on purpose. It also **retires the
     /// token**: a later `/proxy` request carrying it is refused with `410
-    /// Gone` rather than given a fresh stream. Both halves are needed --
-    /// ffmpeg reconnects through the URL it already has, so the broken read
-    /// alone would only be a stutter.
+    /// Gone` rather than given a fresh stream. Both halves are needed. ffmpeg
+    /// reconnects through the URL it already has, so the broken read alone
+    /// would only be a stutter.
     ///
-    /// Ask the player to quit before calling this, not after: a cancelled
+    /// Ask the player to quit before calling this, not after. A cancelled
     /// demuxer has already ended its own read, so the close finds nothing
     /// live and answers 0, which is the outcome to want. Zero is an ordinary
-    /// answer anyway -- the player may already have finished -- and closing
-    /// twice is harmless. See [`crate::proxy_streams`] for what this does
-    /// not end: a demuxer wedged on something other than the read.
+    /// answer anyway, since the player may already have finished. Closing
+    /// twice is harmless. See [`crate::proxy_streams`] for what this does not
+    /// end: a demuxer wedged on something other than the read.
     pub fn close_proxy_streams(&self, token: &str) -> usize {
         self.state.proxy_streams.close(token)
     }
 
     /// **The player screen `token` is gone**: what the app says when the
     /// viewer leaves a player. The torrent the screen held is let go
-    /// (`enginefs::retention::holds`) -- from its first request until this,
-    /// the screen's torrent ran whether it was playing, paused, stalled or
-    /// had no read open at all -- and the screen is retired: a later
-    /// request carrying its token (a cast it published reads with it)
-    /// holds nothing. What runs the torrent afterwards is whatever else
-    /// holds it -- a cast still published, a pin -- or the idle-sharing
-    /// policy. A newer screen of the viewer keeps its own hold. Whether a
-    /// hold was released. Its proxied streams are
-    /// [`Self::close_proxy_streams`]'s.
+    /// (`enginefs::retention::holds`). From its first request until this, the
+    /// screen's torrent ran whether it was playing, paused, stalled or had no
+    /// read open at all. The screen is retired: a later request carrying its
+    /// token (a cast it published reads with it) holds nothing. What runs the
+    /// torrent afterwards is whatever else holds it (a cast still published,
+    /// a pin) or the idle-sharing policy. A newer screen of the viewer keeps
+    /// its own hold. Returns whether a hold was released. Its proxied streams
+    /// are [`Self::close_proxy_streams`]'s.
     pub fn release_player(&self, token: &str) -> bool {
         self.state.engine.release_player(token)
     }
@@ -1261,36 +1262,36 @@ impl ServerHandle {
     /// Tell the server whether the app it lives in is in the background.
     ///
     /// `true` puts the torrent session on a lean footprint
-    /// ([`enginefs::backend::Footprint::Lean`]): every torrent keeps
-    /// running -- it goes on seeding, and a pinned download goes on
-    /// downloading -- but with [`enginefs::backend::LEAN_PEER_LIMIT`] peers
-    /// instead of the configured limit, the surplus hung up least useful
-    /// first, and its peer table pruned of every `Dead` and `NotNeeded`
-    /// entry. That is the share of a backgrounded server's memory that was
-    /// measured to be both the largest and the one still growing (per-peer
-    /// buffers, tasks and table entries), and the OS's low-memory killer
-    /// takes the fattest background process first. Nothing is paused and
-    /// nothing on disk is touched, so a stream request that arrives while
-    /// lean is served like any other, from fewer peers.
+    /// ([`enginefs::backend::Footprint::Lean`]). Every torrent keeps running:
+    /// it goes on seeding, and a pinned download goes on downloading. But it
+    /// runs with [`enginefs::backend::LEAN_PEER_LIMIT`] peers instead of the
+    /// configured limit, the surplus hung up least useful first, and its peer
+    /// table pruned of every `Dead` and `NotNeeded` entry. That is the share
+    /// of a backgrounded server's memory that was measured to be both the
+    /// largest and the one still growing (per-peer buffers, tasks and table
+    /// entries). The OS's low-memory killer takes the fattest background
+    /// process first. Nothing is paused and nothing on disk is touched, so a
+    /// stream request that arrives while lean is served like any other, from
+    /// fewer peers.
     ///
-    /// The pruning is not free, and only its `NotNeeded` half is cheap:
-    /// those peers were hung up on and the table kept them to remember not
-    /// to dial them again, while a `Dead` entry is a peer waiting out a
-    /// backoff *to be re-dialled*, and forgetting one cancels that
-    /// reconnect -- it returns when a source names it again or it dials us.
-    /// See [`enginefs::backend::Footprint`] for why both go.
+    /// The pruning is not free, and only its `NotNeeded` half is cheap. Those
+    /// peers were hung up on, and the table kept them to remember not to dial
+    /// them again. A `Dead` entry is a peer waiting out a backoff *to be
+    /// re-dialled*, and forgetting one cancels that reconnect. It returns
+    /// when a source names it again or it dials us. See
+    /// [`enginefs::backend::Footprint`] for why both go.
     ///
-    /// `false` restores the configured limit and re-queues the parked
-    /// peers, onto the tail of the same queue every discovered address
-    /// joins: they come back, but behind whatever backlog is already
-    /// waiting, not first.
+    /// `false` restores the configured limit and re-queues the parked peers
+    /// onto the tail of the same queue every discovered address joins. They
+    /// come back, but behind whatever backlog is already waiting, not first.
     ///
     /// Call it from the app's lifecycle hooks (hidden/paused → `true`,
-    /// resumed → `false`). Idempotent, cheap, synchronous (no runtime
-    /// hop: atomics, a read lock per torrent and one message per surplus
-    /// peer), and safe before any torrent exists -- a torrent added while
-    /// lean starts lean. The app's own side of going to the background
-    /// (pausing the player, dropping image caches) is the app's business.
+    /// resumed → `false`). It is idempotent, cheap and synchronous (no
+    /// runtime hop: atomics, a read lock per torrent and one message per
+    /// surplus peer). It is safe before any torrent exists, and a torrent
+    /// added while lean starts lean. The app's own side of going to the
+    /// background (pausing the player, dropping image caches) is the app's
+    /// business.
     pub fn set_background(&self, background: bool) {
         let footprint = if background {
             enginefs::backend::Footprint::Lean
@@ -1312,14 +1313,14 @@ impl ServerHandle {
     /// somebody who put the device away does not expect it to go on
     /// spending their data, and never on a television or a desktop.
     ///
-    /// Held, nothing uploads **while nothing plays and no torrent download
-    /// is on its way**: a player reading and a download still fetching
-    /// share whatever this says, since that is activity, not idling. See
-    /// `enginefs::EngineFS::set_idle_sharing_held` for the whole rule.
+    /// When it is held, nothing uploads **while nothing plays and no torrent
+    /// download is on its way**. A player reading and a download still
+    /// fetching share whatever this says, since that is activity, not idling.
+    /// See `enginefs::EngineFS::set_idle_sharing_held` for the whole rule.
     ///
-    /// Not a setting and not persisted -- it is a fact about this run of
-    /// the app, so the app says it on every change of its lifecycle and a
-    /// server that starts again starts unheld. Applied before this
+    /// It is not a setting and not persisted. It is a fact about this run of
+    /// the app, so the app says it on every change of its lifecycle, and a
+    /// server that starts again starts unheld. It is applied before this
     /// returns.
     pub fn set_idle_sharing_held(&self, held: bool) -> anyhow::Result<()> {
         let state = self.state.clone();
@@ -1331,15 +1332,15 @@ impl ServerHandle {
         self.state.engine.idle_sharing_held()
     }
 
-    /// The live-peer cap librqbit is enforcing on `info_hash` right now --
-    /// the one lever [`Self::set_background`] moves -- or `None` when this
-    /// server holds no such torrent.
+    /// The live-peer cap librqbit is enforcing on `info_hash` right now, or
+    /// `None` when this server holds no such torrent. It is the one lever
+    /// [`Self::set_background`] moves.
     ///
-    /// Doc-hidden, not part of the embedder API: it exists so a test can
+    /// Doc-hidden, not part of the embedder API. It exists so a test can
     /// watch the footprint arrive on a torrent the server actually holds
-    /// without a swarm to count peers in, reading the same
-    /// `ManagedTorrentShared::peer_limit` the enginefs tests read. Nothing
-    /// is created or started by asking.
+    /// without a swarm to count peers in. It reads the same
+    /// `ManagedTorrentShared::peer_limit` the enginefs tests read. Nothing is
+    /// created or started by asking.
     #[doc(hidden)]
     pub fn torrent_peer_limit(&self, info_hash: &str) -> Option<usize> {
         let state = self.state.clone();
@@ -1353,33 +1354,33 @@ impl ServerHandle {
     }
 
     /// Ask the reconciler what it wants of `info_hash` *as the timer would
-    /// ask it*, now, and answer the ladder's verdict --
+    /// ask it*, now, and answer the ladder's verdict. This is
     /// `EngineFS::reconcile_hash` with `Trigger::Timer`. `None` when this
     /// server holds no such torrent.
     ///
     /// Doc-hidden, not part of the embedder API. It is here because the
-    /// reconciler's decision is otherwise unobservable from outside, and a
-    /// test that wants to assert one had to *sleep past a tick and look at
-    /// the torrent afterwards* -- which is a weak oracle for a `Run` and no
-    /// oracle at all for a `Stop`. A negative read off the swarm flag
-    /// cannot tell "the ladder said stop" from "the ladder said run and
-    /// the actuator's `RECONCILE_MIN_DWELL` swallowed the start", and the
-    /// dwell is fifteen seconds -- longer than any sleep a test should be
-    /// spending. The verdict returned here is taken before the actuator
-    /// runs, so it is the policy under test rather than its shadow.
+    /// reconciler's decision is otherwise unobservable from outside. A test
+    /// that wanted to assert one had to *sleep past a tick and look at the
+    /// torrent afterwards*. That is a weak oracle for a `Run` and no oracle
+    /// at all for a `Stop`. A negative read off the swarm flag cannot tell
+    /// "the ladder said stop" from "the ladder said run and the actuator's
+    /// `RECONCILE_MIN_DWELL` swallowed the start". The dwell is fifteen
+    /// seconds, longer than any sleep a test should be spending. The verdict
+    /// returned here is taken before the actuator runs, so it is the policy
+    /// under test rather than its shadow.
     ///
-    /// It is the timer's question and not a playback's on purpose: the two
-    /// are measured against different free-space lines
-    /// (`reconcile::line`), and the hysteresis only exists on the timer's
-    /// side. Asking costs one volume probe (`probed` starts false, so the
-    /// declaration a test made with `pretend_volume_space` is read fresh)
-    /// and takes that torrent's reconcile lock, so a driven pass and the
-    /// background loop cannot interleave.
+    /// It is the timer's question and not a playback's on purpose. The two
+    /// are measured against different free-space lines (`reconcile::line`),
+    /// and the hysteresis only exists on the timer's side. Asking costs one
+    /// volume probe (`probed` starts false, so the declaration a test made
+    /// with `pretend_volume_space` is read fresh). It takes that torrent's
+    /// reconcile lock, so a driven pass and the background loop cannot
+    /// interleave.
     ///
-    /// **It acts, like any other pass.** This is not a dry run: the
-    /// decision is applied through the same actuator the tick uses. On a
-    /// torrent already in the state the verdict asks for -- which is what
-    /// these assertions are about -- that is no call at all.
+    /// **It acts, like any other pass.** This is not a dry run: the decision
+    /// is applied through the same actuator the tick uses. On a torrent
+    /// already in the state the verdict asks for, that is no call at all, and
+    /// that is the case these assertions are about.
     #[doc(hidden)]
     pub fn reconcile_as_timer(
         &self,
@@ -1394,10 +1395,10 @@ impl ServerHandle {
         })
     }
 
-    /// The address librqbit accepts peer connections on, or `None` when
-    /// the session is not listening. With [`TorrentListenPort::Ephemeral`]
-    /// this is the port the OS assigned; a fixed range reports the port
-    /// that was free.
+    /// The address librqbit accepts peer connections on, or `None` when the
+    /// session is not listening. With [`TorrentListenPort::Ephemeral`] this
+    /// is the port the OS assigned. A fixed range reports the port that was
+    /// free.
     pub fn torrent_listen_addr(&self) -> Option<SocketAddr> {
         self.state.engine.backend.session.listen_addr()
     }
@@ -1411,9 +1412,9 @@ impl ServerHandle {
         self.state.proxy_streams.live()
     }
 
-    /// What the player `token`'s play session is on, or `None` for a token
-    /// no request has carried: a probe for the tests of which requests move
-    /// a play session (`enginefs::retention::sessions`), and nothing a
+    /// What the player `token`'s play session is on, or `None` for a token no
+    /// request has carried. It is a probe for the tests of which requests
+    /// move a play session (`enginefs::retention::sessions`), and nothing a
     /// client decides anything from.
     #[doc(hidden)]
     pub fn play_session_of(&self, token: &str) -> Option<enginefs::retention::sessions::Played> {
@@ -1422,8 +1423,8 @@ impl ServerHandle {
 
     /// The pieces the torrent `info_hash` has told librqbit to advertise
     /// (`TorrentHandle::advertised_pieces`), ascending, or `None` for a
-    /// torrent this engine does not hold: a probe for the tests of what a
-    /// play session announces, and nothing a client decides anything from.
+    /// torrent this engine does not hold. It is a probe for the tests of what
+    /// a play session announces, and nothing a client decides anything from.
     #[doc(hidden)]
     pub fn advertised_pieces(&self, info_hash: &str) -> anyhow::Result<Option<Vec<u32>>> {
         let engine = self.state.engine.clone();
@@ -1434,11 +1435,12 @@ impl ServerHandle {
         })
     }
 
-    /// Start or stop the LAN media listener (see [`crate::lan_media`]): a
-    /// second HTTP listener on [`ServerConfig::lan_media_addr`] serving
+    /// Start or stop the LAN media listener (see [`crate::lan_media`]). It is
+    /// a second HTTP listener on [`ServerConfig::lan_media_addr`] serving
     /// `/cast/{token}` (and a rendition's `/cast/{token}/stream.mp4`) and
-    /// nothing else -- what was published with [`Self::publish`] -- for handing the bytes of what this device casts
-    /// to a Chromecast or other receiver on the local network. Returns the address it is bound to afterwards --
+    /// nothing else: what was published with [`Self::publish`]. It hands the
+    /// bytes of what this device casts to a Chromecast or other receiver on
+    /// the local network. Returns the address it is bound to afterwards:
     /// `Some` after a successful start, `None` after a stop.
     ///
     /// Meant to be called around a cast session, so the LAN surface exists
@@ -1450,12 +1452,11 @@ impl ServerHandle {
     /// when [`ServerConfig::lan_media_addr`] is unset, or when the bind
     /// fails.
     ///
-    /// `set_lan_media(false)` **unpublishes every cast token and aborts**
-    /// the listener rather than draining it: when it returns, every body
-    /// being served under a token has been cut (it ends with an error at
-    /// its next poll), the listener socket is closed and the port is free.
-    /// The loopback listener and every request in flight on it are
-    /// untouched.
+    /// `set_lan_media(false)` **unpublishes every cast token and aborts** the
+    /// listener rather than draining it. When it returns, every body being
+    /// served under a token has been cut (it ends with an error at its next
+    /// poll), the listener socket is closed, and the port is free. The
+    /// loopback listener and every request in flight on it are untouched.
     pub fn set_lan_media(&self, enabled: bool) -> anyhow::Result<Option<SocketAddr>> {
         let state = self.state.clone();
         self.block_on_server(async move {
@@ -1485,20 +1486,19 @@ impl ServerHandle {
     }
 
     /// How many requests have reached the LAN media listener since the
-    /// current cast session began -- per session, not per process. Every
-    /// [`ServerHandle::set_lan_media`] start resets it, including one that
-    /// finds the listener already running (casting to a second receiver
-    /// mid-session does exactly that, and the count it wants is its own),
-    /// and a stop resets it too, so this reads zero while nothing is
-    /// listening.
+    /// current cast session began. It counts per session, not per process.
+    /// Every [`ServerHandle::set_lan_media`] start resets it, including one
+    /// that finds the listener already running. Casting to a second receiver
+    /// mid-session does exactly that, and the count it wants is its own. A
+    /// stop resets it too, so this reads zero while nothing is listening.
     ///
     /// It answers one question nothing else can: whether the receiver ever
     /// came back for the stream. A receiver told an address it cannot route
-    /// to never reports an error -- the connect hangs -- so from the outside
+    /// to never reports an error, because the connect hangs. From the outside
     /// it is indistinguishable from one that is buffering, and this is the
     /// only signal that separates them. Zero, well after a load, means the
-    /// address was wrong and the cast cannot recover; non-zero means the
-    /// receiver reached this device and whatever went wrong afterwards is
+    /// address was wrong and the cast cannot recover. Non-zero means the
+    /// receiver reached this device, and whatever went wrong afterwards is
     /// about the media, not the network.
     ///
     /// Cheap: one relaxed atomic load, no runtime hop, safe to poll.
@@ -1507,15 +1507,15 @@ impl ServerHandle {
     }
 
     /// How many `/cast` responses have begun a body since the current cast
-    /// session began: reset where [`Self::lan_media_requests_served`] is,
-    /// and counted when a `GET` under a published token starts sending
-    /// bytes -- never for a `HEAD`, an unknown token's `404` or a refusal.
+    /// session began. It is reset where [`Self::lan_media_requests_served`]
+    /// is. It counts when a `GET` under a published token starts sending
+    /// bytes, never for a `HEAD`, an unknown token's `404` or a refusal.
     ///
     /// Beside the requests count it gives three readings where there were
-    /// two: no requests (the receiver cannot reach the address), requests
-    /// but no body (it reached this device and was served nothing -- a
-    /// token it was not given, an id that would not open), bodies (the
-    /// network and the server did their part; the rest is the media).
+    /// two. No requests: the receiver cannot reach the address. Requests but
+    /// no body: it reached this device and was served nothing (a token it was
+    /// not given, an id that would not open). Bodies: the network and the
+    /// server did their part, and the rest is the media.
     ///
     /// Cheap: one relaxed atomic load, no runtime hop, safe to poll.
     pub fn lan_media_bodies_served(&self) -> u64 {
@@ -1523,19 +1523,19 @@ impl ServerHandle {
     }
 
     /// **Publish an id for a cast**: the token the receiver's URL ends in,
-    /// `<lan_media_base_url>/cast/<token>`, which serves what `id`
-    /// resolves to with ranges and `HEAD`. 128 random bits, never derived
-    /// from the id; in memory only.
+    /// `<lan_media_base_url>/cast/<token>`, which serves what `id` resolves
+    /// to with ranges and `HEAD`. The token is 128 random bits, never derived
+    /// from the id, and kept in memory only.
     ///
     /// With `play`, the receiver's reads are the viewer's playback, as a
     /// reader opened with it would be ([`Self::open_reader`]): the play
     /// session moves to the file and it shares by the same rules. Without
     /// one they are an aside.
     ///
-    /// The publication holds the id, so it is not evicted while cast.
-    /// Refused while the LAN listener is not running
+    /// The publication holds the id, so it is not evicted while cast. It is
+    /// refused while the LAN listener is not running
     /// ([`Self::set_lan_media`]), and for an id this server does not hold.
-    /// [`Self::unpublish`] ends it; so does stopping the listener, for every
+    /// [`Self::unpublish`] ends it. So does stopping the listener, for every
     /// token at once.
     pub fn publish(&self, id: &MediaId, play: Option<PlayToken>) -> anyhow::Result<CastToken> {
         let lease = self.state.media.lease(id)?;
@@ -1551,22 +1551,21 @@ impl ServerHandle {
     }
 
     /// **Install the rendition producer**: the embedder's demuxer, decoders
-    /// and encoders, which [`Self::publish_rendition`] needs. Once, by the
-    /// embedder, after the server starts; a second call replaces the first
-    /// for renditions published from then on.
+    /// and encoders, which [`Self::publish_rendition`] needs. The embedder
+    /// calls it once, after the server starts. A second call replaces the
+    /// first for renditions published from then on.
     pub fn install_producer(&self, producer: Arc<dyn Producer>) {
         self.state.lan_media.casts().install_producer(producer);
     }
 
-    /// **Publish a rendition of an id for a cast**: the token the
-    /// receiver's URL is built on,
-    /// `<lan_media_base_url>/cast/<token>/stream.mp4` -- one progressive
-    /// fragmented MP4 with a length and ranges, which the receiver seeks in
-    /// by bytes. What is made is what the receiver asks for (or a
-    /// [`Self::prepare_rendition`] asks for in its place), never where it was
-    /// told to start. As [`Self::publish`] -- refused while the LAN
-    /// listener is down, holds the id's lease, unpublished by
-    /// [`Self::unpublish`] or the listener's stop -- and refused
+    /// **Publish a rendition of an id for a cast**: the token the receiver's
+    /// URL is built on, `<lan_media_base_url>/cast/<token>/stream.mp4`. It is
+    /// one progressive fragmented MP4 with a length and ranges, which the
+    /// receiver seeks in by bytes. What is made is what the receiver asks for
+    /// (or a [`Self::prepare_rendition`] asks for in its place), never where
+    /// it was told to start. It behaves as [`Self::publish`] does: refused
+    /// while the LAN listener is down, holding the id's lease, unpublished by
+    /// [`Self::unpublish`] or the listener's stop. It is also refused
     /// (`noProducer`) when no producer is installed
     /// ([`Self::install_producer`]). No run starts until the receiver asks.
     pub fn publish_rendition(
@@ -1595,25 +1594,25 @@ impl ServerHandle {
     }
 
     /// **Ask for what a receiver will ask for first, before it does**: a
-    /// simulated receiver through the same request path -- the header
-    /// (which waits for the layout: the source's formats and index, for a
-    /// Matroska file its Cues, usually at the end), slot 0 (Chrome's
-    /// demuxer probes the first fragment before it seeks), and the slot a
-    /// receiver told to start at the spec's `startMs` jumps to, with the
-    /// slots of the 6 s after it ([`rendition::PREPARED_AFTER`]) -- and
-    /// nothing before it: a receiver asks for the file's start and then
-    /// that slot (`docs/design/renditions.md`, *Prepared before the
-    /// load*). Returns at once; the work runs on the server and
-    /// [`Self::rendition_readiness`] says how far it has got, so the app
-    /// tells the receiver to load only once its first requests will be
-    /// answered at once -- a receiver gives up on a load that stays silent
-    /// (measured: a minute for a thin swarm's first piece and Cues). The
-    /// receiver's requests then find them in the ring, and the run that
-    /// made them reads on for it.
+    /// simulated receiver through the same request path. It asks for the
+    /// header, which waits for the layout (the source's formats and index,
+    /// for a Matroska file its Cues, usually at the end). It asks for slot 0,
+    /// because Chrome's demuxer probes the first fragment before it seeks. It
+    /// asks for the slot a receiver told to start at the spec's `startMs`
+    /// jumps to, with the slots of the 6 s after it
+    /// ([`rendition::PREPARED_AFTER`]). It asks for nothing before that slot,
+    /// because a receiver asks for the file's start and then that slot
+    /// (`docs/design/renditions.md`, *Prepared before the load*). Returns at
+    /// once. The work runs on the server, and [`Self::rendition_readiness`]
+    /// says how far it has got. So the app tells the receiver to load only
+    /// once its first requests will be answered at once. A receiver gives up
+    /// on a load that stays silent (measured: a minute for a thin swarm's
+    /// first piece and Cues). The receiver's requests then find them in the
+    /// ring, and the run that made them reads on for it.
     ///
     /// No give-up timer: a stalled source is waited for as long as it takes,
     /// and [`Self::unpublish`] ends the wait. A second call is a no-op.
-    /// Whether `token` is a published rendition.
+    /// Returns whether `token` is a published rendition.
     pub fn prepare_rendition(&self, token: &CastToken) -> bool {
         let casts = self.state.lan_media.casts();
         let Some(rendition) = casts.rendition(token) else {
@@ -1645,24 +1644,24 @@ impl ServerHandle {
     }
 
     /// **How far a rendition's preparation has got**
-    /// ([`Self::prepare_rendition`]): `{"phase": "index"}` while the source's
-    /// index is read, `"start"` while the receiver's first slot is made,
-    /// `"ready"`, `"failed"` with the `sentence` to show, or `"ended"` for a
-    /// token not published (any more) or not a rendition. Cheap: no runtime
-    /// hop, safe to poll.
+    /// ([`Self::prepare_rendition`]). It is `{"phase": "index"}` while the
+    /// source's index is read, `"start"` while the receiver's first slot is
+    /// made, `"ready"`, `"failed"` with the `sentence` to show, or `"ended"`
+    /// for a token not published (any more) or not a rendition. Cheap: no
+    /// runtime hop, safe to poll.
     pub fn rendition_readiness(&self, token: &CastToken) -> RenditionReadiness {
         self.state.lan_media.casts().rendition_readiness(token)
     }
 
-    /// **What a publication has served so far, and how** -- requests,
-    /// bodies, bytes, where the receiver last asked, what was read from the
-    /// source, and for a rendition its layout, its runs and how far ahead of
-    /// the receiver it has made the film ([`CastNumbers`]): what the app's
-    /// cast panel shows. Counts that only grow and positions as they are
-    /// now, no rate and no clock -- two answers and the time between them
+    /// **What a publication has served so far, and how**: requests, bodies,
+    /// bytes, where the receiver last asked, what was read from the source,
+    /// and for a rendition its layout, its runs and how far ahead of the
+    /// receiver it has made the film ([`CastNumbers`]). It is what the app's
+    /// cast panel shows. Counts only grow, and positions are as they are now.
+    /// There is no rate and no clock: two answers and the time between them
     /// make the rates. `None` for a token not published (any more). Cheap:
-    /// atomics and one look under the rendition's lock, no runtime hop,
-    /// safe to poll.
+    /// atomics and one look under the rendition's lock, no runtime hop, safe
+    /// to poll.
     pub fn cast_numbers(&self, token: &CastToken) -> Option<CastNumbers> {
         self.state.lan_media.casts().numbers(token)
     }
@@ -1708,8 +1707,8 @@ impl ServerHandle {
             .unwrap_or(Err(rendition::NotServed::Cut))
     }
 
-    /// The fragment in slot `segment` of a rendition (without its
-    /// padding), as a range that begins in it asks for it: from the ring,
+    /// The fragment in slot `segment` of a rendition (without its padding),
+    /// as a range that begins in it asks for it. It comes from the ring,
     /// after the production it joins, or from a new run. For the tests, as
     /// [`Self::rendition_init`].
     #[doc(hidden)]
@@ -1732,8 +1731,8 @@ impl ServerHandle {
     }
 
     /// **Unpublish a cast token**: nothing more is served under it, and a
-    /// body being served under it ends now, with an error the receiver
-    /// reads as a broken source. Its id is let go. Whether the token was
+    /// body being served under it ends now, with an error the receiver reads
+    /// as a broken source. Its id is let go. Returns whether the token was
     /// published.
     pub fn unpublish(&self, token: &CastToken) -> bool {
         self.state.lan_media.casts().unpublish(token)
@@ -1741,13 +1740,13 @@ impl ServerHandle {
 
     /// The base URL to hand a receiver at `for_peer` (e.g.
     /// `http://192.168.1.20:11471/`), so a media URL built on it is one that
-    /// receiver can actually reach: the host is the local interface sharing
-    /// `for_peer`'s subnet, taken from the same interface enumeration
+    /// receiver can actually reach. The host is the local interface sharing
+    /// `for_peer`'s subnet. It is taken from the same interface enumeration
     /// `GET /network-info` answers from, since the first interface on a host
     /// with a VPN or a container bridge is regularly the wrong one. A
     /// listener bound to one specific address reports that address as is.
     ///
-    /// `None` when the LAN media listener is not running -- which is also the
+    /// `None` when the LAN media listener is not running. That is also the
     /// answer that says a cast URL cannot be built yet.
     pub fn lan_media_base_url(&self, for_peer: IpAddr) -> Option<Url> {
         let state = self.state.clone();
@@ -1758,8 +1757,8 @@ impl ServerHandle {
 
     /// Run `fut` on the server's runtime and wait for it. The engines spawn
     /// tasks and expect the server's multi-threaded runtime, so library calls
-    /// never execute on the caller's thread. This blocks the calling thread;
-    /// do not call it from an async task on a runtime with no spare threads.
+    /// never execute on the caller's thread. This blocks the calling thread.
+    /// Do not call it from an async task on a runtime with no spare threads.
     fn block_on_server<F>(&self, fut: F) -> anyhow::Result<F::Output>
     where
         F: std::future::Future + Send + 'static,
@@ -1830,12 +1829,12 @@ pub fn start(cfg: ServerConfig) -> anyhow::Result<ServerHandle> {
     })
 }
 
-/// Resolve the config and cache directories from `cfg` alone whenever it names
-/// a `config_dir`: an unset `cache_dir` then lands *inside* the config dir
-/// instead of consulting the OS user directories. Embedders (Android in
+/// Resolve the config and cache directories from `cfg` alone whenever it
+/// names a `config_dir`. An unset `cache_dir` then lands *inside* the config
+/// dir instead of consulting the OS user directories. Embedders (Android in
 /// particular) run without `HOME`/`XDG_*` and no passwd fallback, so nothing
-/// on the startup path may depend on an environment-derived location. Only
-/// when neither directory is given do we fall back to the platform defaults.
+/// on the startup path may depend on an environment-derived location. We fall
+/// back to the platform defaults only when neither directory is given.
 fn resolve_dirs(cfg: &ServerConfig) -> anyhow::Result<(PathBuf, PathBuf)> {
     let config_dir = match cfg.config_dir.clone() {
         Some(path) => path,
@@ -1891,9 +1890,9 @@ pub async fn run(
         let guards = log_writers.guards;
 
         // `RUST_LOG` or the default, with the retention trace off until the
-        // settings say otherwise (`diagnosticsTrace`, applied below once
-        // they are loaded); the handle is what lets the setting change a
-        // filter that is already installed.
+        // settings say otherwise (`diagnosticsTrace`, applied below once they
+        // are loaded). The handle is what lets the setting change a filter
+        // that is already installed.
         let log_directives = std::env::var("RUST_LOG")
             .ok()
             .filter(|directives| !directives.trim().is_empty())
@@ -1947,29 +1946,29 @@ pub async fn run(
 
     let default_settings = routes::system::ServerSettings {
         cache_root: cache_dir.to_string_lossy().to_string(),
-        // The *default*, not an override: a viewer who has asked for local
-        // discovery keeps it, and what the settings report says is what
-        // the session does. An embedder that must not announce -- a test --
-        // starts on a config directory of its own, so the default is the
-        // whole story there.
+        // The *default*, not an override. A viewer who has asked for local
+        // discovery keeps it, and what the settings report says is what the
+        // session does. An embedder that must not announce (a test) starts on
+        // a config directory of its own, so the default is the whole story
+        // there.
         bt_enable_lsd: cfg.enable_local_service_discovery,
         bt_enable_dht: cfg.enable_dht,
         ..routes::system::ServerSettings::default()
     };
 
-    // One `SettingsFile` for the process: the tracker refresher writes
+    // One `SettingsFile` for the process. The tracker refresher writes
     // through it from here on, and `AppState` takes the same one below, so
     // the two never race for the file (see `state::SettingsFile`).
     let settings_file = Arc::new(state::SettingsFile::new(config_dir.join("settings.json")));
     let mut settings = settings_file.load(&default_settings);
 
-    // The one torrent-data root, prepared before anything is opened on it:
-    // the piece store, the session's own records and the proxy cache all
-    // live under it, and it is the whole of what a usage figure counts. A
+    // The one torrent-data root, prepared before anything is opened on it.
+    // The piece store, the session's own records and the proxy cache all live
+    // under it, and it is the whole of what a usage figure counts. A
     // persisted `cacheRoot` that cannot be used any more (unmounted drive,
-    // permissions) falls back to the configured default rather than
-    // stopping the server, and the fallback is what gets persisted below --
-    // so the setting never claims a root the data is not in.
+    // permissions) falls back to the configured default rather than stopping
+    // the server. The fallback is what gets persisted below, so the setting
+    // never claims a root the data is not in.
     let torrent_data_root =
         match routes::system::prepare_torrent_data_root(&settings.cache_root).await {
             Ok(root) => root,
@@ -2014,7 +2013,7 @@ pub async fn run(
         },
     };
 
-    // One engine, opened on the one torrent-data root; librqbit sessions
+    // One engine, opened on the one torrent-data root. librqbit sessions
     // always persist to disk, so there is no second, memory-only engine and
     // no fallback to one. A failure here is a failure.
     // The previous build's cache directory, out of the way before the
@@ -2044,27 +2043,27 @@ pub async fn run(
     state.read_memory = Arc::new(media::memory::ReadMemory::load(
         config_dir.join(media::memory::MEMORY_FILE),
     ));
-    // Where a Drive file's two services are, fixed at the server rather
-    // than named per request -- see `routes::drive::DriveEndpoints`. A
-    // build whose embedder named no pairing service keeps `None` and
-    // refuses a create; nothing else about it changes.
+    // Where a Drive file's two services are, fixed at the server rather than
+    // named per request (see `routes::drive::DriveEndpoints`). A build whose
+    // embedder named no pairing service keeps `None` and refuses a create.
+    // Nothing else about it changes.
     state.drive = cfg.drive_refresh_endpoint.clone().map(|refresh| {
         Arc::new(match cfg.drive_api_base.clone() {
             Some(api_base) => routes::drive::DriveEndpoints::against(refresh, api_base),
             None => routes::drive::DriveEndpoints::at(refresh),
         })
     });
-    // The token is a secret and must never reach `tracing` or stdout: the
-    // log files would keep it, and the kept launches' archives with them.
-    // An embedder reads `ServerHandle::auth_token` instead.
+    // The token is a secret and must never reach `tracing` or stdout. The log
+    // files would keep it, and the kept launches' archives with them. An
+    // embedder reads `ServerHandle::auth_token` instead.
     tracing::info!("control API requires `Authorization: Bearer <token>`");
 
     let (seeding_enabled, diagnostics_trace) = {
         let settings = settings_arc.read().await;
         (settings.seeding_enabled, settings.diagnostics_trace)
     };
-    // The filter was installed with the trace off, which is also what a
-    // fresh process means by `false`; only `true` has anything to apply.
+    // The filter was installed with the trace off, which is also what a fresh
+    // process means by `false`. Only `true` has anything to apply.
     if diagnostics_trace {
         diagnostics::logging::set_diagnostics_trace(true);
     }
@@ -2074,10 +2073,10 @@ pub async fn run(
     // else: no torrent is reconciled here. The settings guard is gone by
     // then, taken only for the read above.
     state.engine.set_seeding_enabled(seeding_enabled).await;
-    // The root the session was actually opened on, persisted, so
-    // `GET /settings`, the settings file and the next boot all name the
-    // directory the data is in. Only a value that was already something else
-    // is written -- an unusable one that was replaced by the default, or a
+    // The root the session was actually opened on, persisted, so `GET
+    // /settings`, the settings file and the next boot all name the directory
+    // the data is in. Only a value that was already something else is
+    // written: an unusable one that was replaced by the default, or a
     // spelling that resolved to another (a symlinked prefix, a Windows 8.3
     // name).
     if corrected_cache_root && let Err(error) = state.save_settings().await {
@@ -2088,21 +2087,21 @@ pub async fn run(
     }
 
     // The proxy cache's own launch-time sweep, before the router can serve a
-    // request that writes into it. It empties the root: a proxied entity is
-    // kept while something is playing it and disposable the moment anything
-    // else opens, and a process that has served nothing is playing nothing --
-    // so every chunk a previous run left is a byte no owner here would ever
-    // count or reclaim. See `proxy_cache::sweep`.
+    // request that writes into it. It empties the root. A proxied entity is
+    // kept while something is playing it and is disposable the moment
+    // anything else opens, and a process that has served nothing is playing
+    // nothing. So every chunk a previous run left is a byte no owner here
+    // would ever count or reclaim. See `proxy_cache::sweep`.
     //
-    // Not part of the engine's boot ordering, and it does not need to be:
-    // the piece store's sweep has to precede the session because opening it
-    // seeds each store's held set off the disk, and a piece deleted after
-    // that stays counted as held for the life of the process. This root is
-    // the other cache, the session knows nothing of it, and the only thing
-    // in this process that ever writes here is a `/proxy` response -- so
-    // "before the router serves" is the whole of the requirement, and it is
-    // also what makes `ProxyRetention::occupancy` -- what *this* process
-    // wrote -- equal to what is on the disk from the first byte.
+    // It is not part of the engine's boot ordering, and it does not need to
+    // be. The piece store's sweep has to precede the session, because opening
+    // the session seeds each store's held set off the disk, and a piece
+    // deleted after that stays counted as held for the life of the process.
+    // This root is the other cache, and the session knows nothing of it. The
+    // only thing in this process that ever writes here is a `/proxy`
+    // response. So "before the router serves" is the whole of the
+    // requirement. It is also what makes `ProxyRetention::occupancy` (what
+    // *this* process wrote) equal to what is on the disk from the first byte.
     {
         // The pinned proxy downloads first, so the sweep keeps them and the
         // owner counts them: see `crate::proxy_downloads`.
@@ -2116,16 +2115,16 @@ pub async fn run(
     }
 
     // And what an **older build** left under `<cacheRoot>/.archives`: the
-    // extraction cache the archive layer kept, which this server does not
-    // write (see `crate::translators` -- a member is ranges of the
-    // container, and nothing is extracted). On an install
-    // upgraded into this build the directory can be gigabytes, about twice
-    // the size of every archive played since that build's last clean exit
-    // -- the download and the extraction -- and **nothing else will ever
-    // take it**: no retention owner speaks for those bytes, no cache
-    // figure counts them, and the piece store's own legacy sweep walks
-    // `<cacheRoot>/media-cache`, one level below this. So it goes
-    // here, once, on the first launch of a build that has no use for it.
+    // extraction cache the archive layer kept. This server does not write it
+    // (see `crate::translators`: a member is ranges of the container, and
+    // nothing is extracted). On an install upgraded into this build the
+    // directory can be gigabytes. That is about twice the size of every
+    // archive played since that build's last clean exit: the download and the
+    // extraction. **Nothing else will ever take it.** No retention owner
+    // speaks for those bytes, no cache figure counts them, and the piece
+    // store's own legacy sweep walks `<cacheRoot>/media-cache`, one level
+    // below this. So it goes here, once, on the first launch of a build that
+    // has no use for it.
     {
         let stale = torrent_data_root.join(LEGACY_ARCHIVE_SCRATCH_DIR);
         if let Err(error) =
@@ -2142,12 +2141,12 @@ pub async fn run(
     let mut background_tasks = Vec::new();
     // The engines' tracker refresher is a forever loop like the rest, so it
     // belongs in the list this function aborts. Detached, it is still parked
-    // on its hourly `interval.tick()` when the runtime goes down, and a task
-    // parked on a timer is what panics there: the time driver fires every
+    // on its hourly `interval.tick()` when the runtime goes down. A task
+    // parked on a timer is what panics there. The time driver fires every
     // pending timer as it shuts down, and a worker that polls the task it
     // just woke asserts on the shut-down driver ("A Tokio 1.x context was
-    // found, but it is being shutdown") -- caught by tokio, so only noise,
-    // but noise a real panic can hide in. See
+    // found, but it is being shutdown"). tokio catches it, so it is only
+    // noise, but noise a real panic can hide in. See
     // `TrackerManager::take_refresh_task`. The task has one owner, so it is
     // taken, not read.
     background_tasks.extend(state.engine.take_tracker_refresh_task());
@@ -2156,15 +2155,15 @@ pub async fn run(
     // than an hourly one, so of the two it is the likelier to be holding a
     // timer when the driver goes down.
     background_tasks.extend(state.engine.take_sweep_task());
-    // And the reconciler, which recomputes what every torrent should be
-    // doing and makes it so -- stopping one before it runs the volume out,
-    // starting it again when there is room. One, for the one engine (a
-    // second would only race the first for the same torrents).
+    // And the reconciler, which recomputes what every torrent should be doing
+    // and makes it so. It stops one before it runs the volume out, and starts
+    // it again when there is room. There is one, for the one engine. A second
+    // would only race the first for the same torrents.
     background_tasks.push(state.engine.start_reconciler());
-    // And the switch task: the moment a viewer opens something else, what
-    // they left is disposable, and this is what takes it off the disk
-    // without waiting for the next tick. See `drop_slack_on_switch_and_bell`
-    // for what it listens to and why each owner answers which signal.
+    // And the switch task. The moment a viewer opens something else, what
+    // they left is disposable, and this is what takes it off the disk without
+    // waiting for the next tick. See `drop_slack_on_switch_and_bell` for what
+    // it listens to and why each owner answers which signal.
     background_tasks.push({
         let engine = state.engine.clone();
         let proxy_cache = state.proxy_cache.clone();
@@ -2185,14 +2184,14 @@ pub async fn run(
                 proxy_cache.retention().drop_slack().await;
             }) as BoxFuture<'static, ()>
         };
-        // And the translated containers, which is where this server's
-        // sessions get the rule the map itself does not hold: a session
-        // stays while its own container is what is playing, and a lease
-        // out on one outranks that (`translators::session`).
+        // And the translated containers. This is where this server's sessions
+        // get the rule the map itself does not hold. A session stays while
+        // its own container is what is playing, and a lease out on one
+        // outranks that (`translators::session`).
         // And the Drive files, which are the same kind of session over one
-        // file instead of a container and take the same rule: the file
-        // that is playing stays, a body reading one outranks the rule, and
-        // a session that goes takes its credential with it.
+        // file instead of a container, and take the same rule. The file that
+        // is playing stays, a body reading one outranks the rule, and a
+        // session that goes takes its credential with it.
         let sessions = {
             let translated = state.translated_archives.clone();
             let drive = state.drive_files.clone();
@@ -2205,16 +2204,16 @@ pub async fn run(
             changed, bell, torrents, proxied, sessions,
         ))
     });
-    // And the cache budget (see `cache_budget`). Unconditional like the DHT
-    // health check: a process that has published no budget holds no
+    // And the cache budget (see `cache_budget`). It is unconditional, like
+    // the DHT health check: a process that has published no budget holds no
     // retention policy over a relayed stream at all.
-    // Awaited, not merely spawned: `start` states the budget before it
-    // returns, so it exists before the router below can serve a request
-    // into the proxy cache rather than a moment after.
+    // It is awaited, not merely spawned. `start` states the budget before it
+    // returns, so it exists before the router below can serve a request into
+    // the proxy cache, not a moment after.
     background_tasks.push(cache_budget::start(Arc::new(state.clone())).await);
-    // Unconditional and unconfigurable: two routing-table length reads on a
-    // timer, and the only thing that ever states whether the DHT works here.
-    // See `diagnostics::dht_health`.
+    // It is unconditional and unconfigurable: two routing-table length reads
+    // on a timer. It is the only thing that ever states whether the DHT works
+    // here. See `diagnostics::dht_health`.
     background_tasks.push(diagnostics::dht_health::start(state.engine.clone()));
 
     // Held for the shutdown below, which ends every play session.
@@ -2222,14 +2221,14 @@ pub async fn run(
     let app = build_router(state.clone());
 
     // The LAN media listener is deliberately not started here. It exists for
-    // the length of a cast session (see `lan_media`), and
-    // `ServerHandle::set_lan_media` is the one path that binds it -- which is
-    // also the only path that consults the `lanMediaEnabled` veto. Binding a
+    // the length of a cast session (see `lan_media`).
+    // `ServerHandle::set_lan_media` is the one path that binds it, and also
+    // the only path that consults the `lanMediaEnabled` veto. Binding a
     // configured address at boot put the LAN surface up before any cast had
-    // asked, with the persisted veto loaded a few lines above and ignored,
-    // and made a port already in use fatal to the loopback server the
-    // embedder actually needed. A bind failure is now the cast caller's
-    // error and nobody else's; the handle below is for the stop at shutdown.
+    // asked. It ignored the persisted veto loaded a few lines above. It also
+    // made a port already in use fatal to the loopback server the embedder
+    // actually needed. A bind failure is now the cast caller's error and
+    // nobody else's. The handle below is for the stop at shutdown.
     let lan_media = state.lan_media.clone();
 
     tracing::info!("listening on {}", bound_http_addr);
@@ -2273,10 +2272,10 @@ pub async fn run(
                     result?;
                 }
                 Err(_) => {
-                    // Never `std::process::exit` here: this server is one
+                    // Never `std::process::exit` here. This server is one
                     // thread of a host process with its own work and its own
-                    // exit, and a slow shutdown must cost that process a
-                    // dropped future, not its life.
+                    // exit. A slow shutdown must cost that process a dropped
+                    // future, not its life.
                     tracing::warn!(
                         ?source,
                         timeout_secs = cfg.graceful_shutdown_timeout.as_secs(),
@@ -2292,10 +2291,9 @@ pub async fn run(
         task.abort();
     }
     lan_media.stop().await;
-    // Best effort, and bounded: every torrent leaves the swarm and then
-    // every play session's bytes go. What does not finish -- a slow disk, a
-    // host that kills the process first -- the next start's launch sweep
-    // takes.
+    // Best effort, and bounded: every torrent leaves the swarm, and then
+    // every play session's bytes go. The next start's launch sweep takes what
+    // does not finish (a slow disk, a host that kills the process first).
     if tokio::time::timeout(
         cfg.graceful_shutdown_timeout,
         engine_at_shutdown.end_every_session(),
@@ -2316,41 +2314,41 @@ pub async fn run(
 /// slack drops that do not wait for the reconciler's tick, and the
 /// translated sessions of containers nobody is in any more.
 ///
-/// **Both owners answer a switch**, because the liveness cell is one cell:
-/// a proxied body opening makes a torrent's file slack and a torrent stream
-/// opening makes the proxied body slack, and the proxy has no tick of its
-/// own -- this is the only thing that ever ends one of its entities.
+/// **Both owners answer a switch**, because the liveness cell is one cell. A
+/// proxied body opening makes a torrent's file slack, and a torrent stream
+/// opening makes the proxied body slack. The proxy has no tick of its own, so
+/// this is the only thing that ever ends one of its entities.
 ///
-/// **Only the proxy answers the bell.** The torrent side's slack passes
-/// ride the same tick that takes the volume reading the bell is rung from
-/// (`enginefs::retention::SlackBell`), so running them here as well would
-/// be the same pass twice in the same instant; the proxy has no such tick,
-/// and a volume filling under a paused player is exactly the case where
-/// nothing opens and so nothing switches.
+/// **Only the proxy answers the bell.** The torrent side's slack passes ride
+/// the same tick that takes the volume reading the bell is rung from
+/// (`enginefs::retention::SlackBell`). Running them here as well would be the
+/// same pass twice in the same instant. The proxy has no such tick, and a
+/// volume filling under a paused player is exactly the case where nothing
+/// opens and so nothing switches.
 ///
-/// One task and one `select!`, so the two never run at once: the passes
-/// take each entity's turn and would be safe concurrently, but a bell that
-/// rings while a switch is mid-pass has nothing to add -- the switch's own
+/// One task and one `select!`, so the two never run at once. The passes take
+/// each entity's turn and would be safe concurrently. But a bell that rings
+/// while a switch is mid-pass has nothing to add, because the switch's own
 /// pass covers every slack entity there is.
 ///
 /// **The sessions go on a switch and on nothing else.** A translated
 /// container's session is the index of bytes the two owners above have just
-/// been told are slack, and it has the same life for the same reason
-/// (`enginefs::retention::live`, and `translators::session` for the map's
-/// own rule). It is handed
-/// the reading the switch landed on rather than asking the cell again:
-/// every consumer of one switch answers the same reading, as everywhere
-/// else. It is not called on the bell -- a volume running low is a reason
-/// to give bytes back, and an index in memory is not bytes on the volume.
+/// been told are slack. It has the same life for the same reason
+/// (`enginefs::retention::live`, and `translators::session` for the map's own
+/// rule). It is handed the reading the switch landed on rather than asking
+/// the cell again: every consumer of one switch answers the same reading, as
+/// everywhere else. It is not called on the bell. A volume running low is a
+/// reason to give bytes back, and an index in memory is not bytes on the
+/// volume.
 ///
 /// The three are taken as closures rather than as the owners themselves so
 /// that this shape can be tested for what it does with each signal, which
 /// is the whole of what it is.
 ///
 /// The receiver is made by the caller, and `watch::Sender::subscribe` marks
-/// the value it was made on as seen: the first wake-up is the first real
+/// the value it was made on as seen. So the first wake-up is the first real
 /// switch after that, including one that lands before this task is first
-/// polled -- which a `mark_unchanged()` in here would swallow.
+/// polled. A `mark_unchanged()` in here would swallow that one.
 async fn drop_slack_on_switch_and_bell(
     mut switched: tokio::sync::watch::Receiver<Option<enginefs::retention::live::LiveEntity>>,
     bell: Arc<enginefs::retention::SlackBell>,
@@ -2361,14 +2359,14 @@ async fn drop_slack_on_switch_and_bell(
     loop {
         tokio::select! {
             moved = switched.changed() => {
-                // The cell is gone, which means the engine is: there is
+                // The cell is gone, which means the engine is. There is
                 // nothing left to drop the slack of.
                 if moved.is_err() {
                     return;
                 }
-                // The reading is taken and the borrow dropped before
-                // anything is awaited: it holds the cell's own lock, and
-                // the writer of the next switch would wait on it.
+                // The reading is taken and the borrow dropped before anything
+                // is awaited. The borrow holds the cell's own lock, and the
+                // writer of the next switch would wait on it.
                 let reading = {
                     let value = switched.borrow_and_update();
                     value
@@ -2435,8 +2433,8 @@ async fn method_not_allowed_handler(
     StatusCode::METHOD_NOT_ALLOWED
 }
 
-/// The proxy cache's chunk size, exported doc-hidden so the tests that pin
-/// what it stores can speak in whole chunks instead of repeating a number
+/// The proxy cache's chunk size, exported doc-hidden. The tests that pin what
+/// it stores can then speak in whole chunks instead of repeating a number
 /// that is the store's to choose (see `proxy_cache::CHUNK_BYTES`).
 #[doc(hidden)]
 pub use proxy_cache::CHUNK_BYTES as PROXY_CACHE_CHUNK_BYTES;
@@ -2457,29 +2455,28 @@ pub fn build_router(state: AppState) -> Router {
                 tracing::info_span!(
                     "request",
                     method = %request.method(),
-                    // Not the path as it stands: `/proxy` and `/ftp` carry
-                    // the caller's target URL -- and its `h=` headers --
-                    // *in the path*, and this span decorates every line
-                    // those routes write. See `routes::util::log_path`.
+                    // Not the path as it stands. `/proxy` and `/ftp` carry
+                    // the caller's target URL, and its `h=` headers, *in the
+                    // path*, and this span decorates every line those routes
+                    // write. See `routes::util::log_path`.
                     path = routes::util::log_path(request.uri().path()),
                 )
             }),
         )
         // **No CORS layer on loopback.** Nothing that reads this listener is
-        // a browser: the embedder's player (mpv), its HTTP client and
-        // stremio-core all ignore CORS, and the Cast receiver -- the one
-        // browser media element in the picture -- is on another device and
-        // reads the LAN listener, which keeps its layer. What a wildcard
-        // `Access-Control-Allow-Origin` did buy here was for everybody
-        // else on the device: loopback is not "only this app" -- any page
-        // a browser on the device has open, and on Android any app, reaches
-        // it -- and the open routes fetch what the caller names. Under `*`
-        // a web page could read LAN and intranet URLs through `/proxy`
+        // a browser. The embedder's player (mpv), its HTTP client and
+        // stremio-core all ignore CORS. The Cast receiver, the one browser
+        // media element in the picture, is on another device and reads the
+        // LAN listener, which keeps its layer. What a wildcard
+        // `Access-Control-Allow-Origin` did buy here was for everybody else
+        // on the device. Loopback is not "only this app": any page a browser
+        // on the device has open reaches it, and on Android any app does. And
+        // the open routes fetch what the caller names. Under `*` a web page
+        // could read LAN and intranet URLs through `/proxy`
         // (`?d=http://192.168.1.1/admin`, with headers of its choosing in
         // `h=`), `/ftp`, an archive create and a torrent-creating stream
-        // `GET`. Without it the browser still sends the request -- this is
-        // not a request barrier -- but the page cannot read what comes
-        // back.
+        // `GET`. Without it the browser still sends the request, since this
+        // is not a request barrier. But the page cannot read what comes back.
         .with_state(state)
 }
 
@@ -2492,16 +2489,16 @@ pub fn build_router(state: AppState) -> Router {
 ///   request is a CORS request even for a plain MP4 as soon as tracks are
 ///   involved, and Google's receiver CORS requirements name
 ///   `Content-Type`, `Accept-Encoding` and `Range` as the request headers the
-///   server has to allow. Naming them is the guarantee; a wildcard only works
-///   for as long as the receiver's fetch implementation expands it.
+///   server has to allow. Naming them is the guarantee. A wildcard only
+///   works for as long as the receiver's fetch implementation expands it.
 /// * A player that seeks needs `Content-Range`, `Content-Length` and
 ///   `Accept-Ranges` readable from script, so they are exposed by name too.
 ///
-/// Nothing on that listener takes a bearer header or relays a `Location`,
-/// so neither is named: the loopback listener answers no CORS at all (see
+/// Nothing on that listener takes a bearer header or relays a `Location`, so
+/// neither is named. The loopback listener answers no CORS at all (see
 /// [`build_router`]).
 ///
-/// Methods stay a wildcard: every method this server answers is one of the
+/// Methods stay a wildcard. Every method this server answers is one of the
 /// safelisted ones or is preflighted, and `*` is honoured for methods
 /// everywhere.
 fn lan_cors_layer() -> CorsLayer {
@@ -2527,14 +2524,14 @@ fn lan_cors_layer() -> CorsLayer {
 
 /// The router the LAN media listener serves (see [`crate::lan_media`]):
 /// `/cast/{token}` ([`cast::router`]) and the two unhandled-request
-/// fallbacks, with the tracing layer the loopback router carries and the
-/// CORS layer it does not ([`lan_cors_layer`]: a Cast receiver is a browser
-/// media element).
+/// fallbacks. It carries the tracing layer the loopback router carries, and
+/// the CORS layer it does not ([`lan_cors_layer`]: a Cast receiver is a
+/// browser media element).
 ///
 /// **The LAN listener serves published tokens and nothing else.** Not
 /// [`media_router`], not a subset of it, and not [`control_router`] at any
-/// level: every other path on this listener is a `404` (a control path
-/// included, never the `401` that would say a token would help), so the
+/// level. Every other path on this listener is a `404` (a control path
+/// included, never the `401` that would say a token would help). So the
 /// network can reach exactly what the app published, for as long as it is
 /// published, and cannot make this device fetch, add or open anything.
 fn build_lan_media_router(state: AppState) -> Router {
@@ -2552,13 +2549,13 @@ fn build_lan_media_router(state: AppState) -> Router {
                         path = routes::util::log_path(request.uri().path()),
                     )
                 })
-                // A span alone is not an event: it decorates the lines a
-                // handler writes and emits none of its own, so a receiver
+                // A span alone is not an event. It decorates the lines a
+                // handler writes and emits none of its own. So a receiver
                 // that fetches and a receiver that never connects looked
-                // exactly alike in the log -- a listener that starts, runs
-                // and stops with nothing in between. This is the line that
-                // tells the two apart, and the peer is the one field that
-                // says whether the address we handed out was reachable.
+                // exactly alike in the log: a listener that starts, runs and
+                // stops with nothing in between. This is the line that tells
+                // the two apart, and the peer is the one field that says
+                // whether the address we handed out was reachable.
                 .on_request(move |request: &axum::extract::Request, _: &tracing::Span| {
                     lan_media.record_request();
                     tracing::info!(
@@ -2597,7 +2594,7 @@ fn stream_routes() -> Router<AppState> {
 }
 
 /// The archive formats' prefixes, each mounting `router` for the format it
-/// names -- which is what picks the translator (`routes::archive::Format`).
+/// names. That is what picks the translator (`routes::archive::Format`).
 fn archive_prefixes(
     router: impl Fn(routes::archive::Format) -> Router<AppState>,
 ) -> Router<AppState> {
@@ -2618,10 +2615,10 @@ fn archive_routes() -> Router<AppState> {
     archive_prefixes(routes::archive::router)
 }
 
-/// The `/local-addon` stub (see `routes::local_addon`): not media bytes, but
-/// harmless and open for the same reason it lives in [`media_router`] at all
-/// -- default profiles, legacy clients included, call it as an addon, and it
-/// exposes nothing.
+/// The `/local-addon` stub (see `routes::local_addon`). It is not media
+/// bytes, but it is harmless and open for the same reason it lives in
+/// [`media_router`] at all: default profiles, legacy clients included, call
+/// it as an addon, and it exposes nothing.
 fn local_addon_routes() -> Router<AppState> {
     Router::new().nest("/local-addon", routes::local_addon::router())
 }
@@ -2629,30 +2626,30 @@ fn local_addon_routes() -> Router<AppState> {
 /// Routes that hand media bytes to a player. They are OPEN (no bearer token):
 /// players fetch the URLs stremio-core builds for them
 /// (types/resource/stream.rs) and cannot attach headers. The one non-media
-/// exception is the `/local-addon` stub: default profiles -- legacy clients
-/// included -- call it as an addon, and it exposes nothing.
+/// exception is the `/local-addon` stub. Default profiles, legacy clients
+/// included, call it as an addon, and it exposes nothing.
 ///
 /// `/proxy` and `/ftp` are also here, and are also open for the same
-/// header-less-caller reason -- but neither serves media bytes *from this
-/// server*: both fetch an arbitrary caller-supplied remote URL (`/proxy` over
-/// HTTP(S), `/ftp` over FTP/FTPS and nothing else) and
-/// stream back whatever answers. That makes each an open proxy, which is
-/// fine on the loopback listener -- only this host's own stremio-core can
-/// reach it -- but not on the LAN one. The archive `/create` routes and the
-/// torrent-creating first request of [`stream_routes`] are the same
-/// kind of thing in a smaller way. None of them is on the LAN: that
-/// listener serves `/cast/{token}` alone ([`build_lan_media_router`]).
+/// header-less-caller reason. But neither serves media bytes *from this
+/// server*. Both fetch an arbitrary caller-supplied remote URL (`/proxy` over
+/// HTTP(S), `/ftp` over FTP/FTPS and nothing else) and stream back whatever
+/// answers. That makes each an open proxy. That is fine on the loopback
+/// listener, where only this host's own stremio-core can reach it, but not on
+/// the LAN one. The archive `/create` routes and the torrent-creating first
+/// request of [`stream_routes`] are the same kind of thing in a smaller way.
+/// None of them is on the LAN: that listener serves `/cast/{token}` alone
+/// ([`build_lan_media_router`]).
 fn media_router() -> Router<AppState> {
     Router::new()
         .merge(stream_routes())
         .merge(archive_routes())
         .merge(routes::proxy::router())
         .nest("/ftp", routes::ftp::router())
-        // The byte-serving half of the Drive API, and the only half that is
-        // a route: the open is `ServerHandle::open_drive_file`, because its
-        // argument is the account's grant (`routes::drive`). This URL
-        // carries a random key and no credential, which is what lets a
-        // player fetch it.
+        // The byte-serving half of the Drive API, and the only half that is a
+        // route. The open is `ServerHandle::open_drive_file`, because its
+        // argument is the account's grant (`routes::drive`). This URL carries
+        // a random key and no credential, which is what lets a player fetch
+        // it.
         .merge(routes::drive::stream_routes())
         .merge(local_addon_routes())
 }
@@ -2670,9 +2667,9 @@ const MAX_CREATE_BODY: usize = 32 * 1024 * 1024;
 /// 2. **stremio-core's `StreamingServer` model**, which speaks Stremio's
 ///    streaming-server protocol over HTTP through the app's `Env::fetch`
 ///    (which attaches the bearer). Our fork of stremio-core is changed as
-///    little as possible -- by policy, so that it keeps following upstream
-///    -- and so the routes it calls stay exactly as it calls them. That is
-///    this router, and it is **all** of this router: `/settings`,
+///    little as possible, by policy, so that it keeps following upstream.
+///    So the routes it calls stay exactly as it calls them. That is this
+///    router, and it is **all** of this router: `/settings`,
 ///    `/create`, `/{infoHash}/create`, `/{infoHash}/{fileIdx}/stats.json`,
 ///    `/network-info`, `/device-info`, `/get-https`, `/casting` and
 ///    `/casting/{devID}/player` (`src/models/streaming_server.rs`,
@@ -2681,21 +2678,19 @@ const MAX_CREATE_BODY: usize = 32 * 1024 * 1024;
 ///    plus the archive `/create`s under [`media_router`] that
 ///    `types/resource/stream.rs` builds.
 ///
-/// **The app itself speaks no HTTP to this server.** It links the crate
-/// and calls [`ServerHandle`] over FFI -- downloads, cache usage and
-/// cleaning, stream numbers, closing a proxied stream, opening a Drive
-/// file, DHT status, background traffic, the LAN listener: every one is a
-/// method, and none has a route (`docs/api.md#removed-routes` lists the
-/// control routes that once mirrored them). There is no other client and
-/// none is planned.
+/// **The app itself speaks no HTTP to this server.** It links the crate and
+/// calls [`ServerHandle`] over FFI. Downloads, cache usage and cleaning,
+/// stream numbers, closing a proxied stream, opening a Drive file, DHT
+/// status, background traffic, the LAN listener: every one is a method, and
+/// none has a route (`docs/api.md#removed-routes` lists the control routes
+/// that once mirrored them). There is no other client and none is planned.
 ///
-/// So: **do not add a control route.** A new capability is a
-/// `ServerHandle` method; a new byte-serving URL for a player is a media
-/// route. A route appears here only if the core fork starts calling a
-/// path it did not call before, which is a change to the core fork first.
-/// Every route here requires `Authorization: Bearer <token>` (see `auth`),
-/// header only, and none is mounted on the LAN listener
-/// ([`build_lan_media_router`]).
+/// So: **do not add a control route.** A new capability is a `ServerHandle`
+/// method. A new byte-serving URL for a player is a media route. A route
+/// appears here only if the core fork starts calling a path it did not call
+/// before, and that is a change to the core fork first. Every route here
+/// requires `Authorization: Bearer <token>` (see `auth`), header only, and
+/// none is mounted on the LAN listener ([`build_lan_media_router`]).
 fn control_router() -> Router<AppState> {
     Router::new()
         .route("/network-info", get(routes::system::network_info))
@@ -2707,15 +2702,15 @@ fn control_router() -> Router<AppState> {
         .route(
             "/create",
             post(routes::engine::create_engine)
-                // A `.torrent` arrives here hex-encoded inside a JSON
-                // object, so the body is twice the file plus the envelope,
-                // and axum's default limit of 2 MB refused every torrent
-                // over about a megabyte with a `413` the client could only
-                // read as "the server would not take this file". A torrent
-                // that large is a very large one -- 1 MB of piece hashes is
-                // a 20,000-piece torrent -- and this is a token-protected
-                // route, so the limit is the one that stops a runaway body
-                // rather than one that judges the file.
+                // A `.torrent` arrives here hex-encoded inside a JSON object,
+                // so the body is twice the file plus the envelope. axum's
+                // default limit of 2 MB refused every torrent over about a
+                // megabyte, with a `413` the client could only read as "the
+                // server would not take this file". A torrent that large is a
+                // very large one: 1 MB of piece hashes is a 20,000-piece
+                // torrent. This is a token-protected route, so the limit is
+                // the one that stops a runaway body rather than one that
+                // judges the file.
                 .layer(axum::extract::DefaultBodyLimit::max(MAX_CREATE_BODY)),
         )
         .route("/{infoHash}/create", post(routes::engine::create_magnet))
@@ -2739,18 +2734,18 @@ mod slack_task_tests {
     /// Which signal makes which owner give its slack back, and which one
     /// takes the sessions.
     ///
-    /// A **switch** is all three: the cell is one cell, so a proxied body
-    /// opening makes a torrent's file disposable and a torrent stream
-    /// opening makes a proxied body disposable, and either way a container
+    /// A **switch** is all three. The cell is one cell, so a proxied body
+    /// opening makes a torrent's file disposable, and a torrent stream
+    /// opening makes a proxied body disposable. Either way, a container
     /// indexed from what was playing is a container nobody is in. The
-    /// **bell** is the proxy's alone -- the torrent's slack passes ride the
+    /// **bell** is the proxy's alone. The torrent's slack passes ride the
     /// same tick that takes the volume reading the bell was rung from, and
-    /// running them here as well would be that pass twice in one instant,
-    /// while the proxy has no tick at all; and an index in memory is not
-    /// bytes on the volume the bell was rung for.
+    /// running them here as well would be that pass twice in one instant. The
+    /// proxy has no tick at all. And an index in memory is not bytes on the
+    /// volume the bell was rung for.
     ///
-    /// Asserted on the passes rather than on the owners, because that is
-    /// the whole of what this task is: two signals and which call each of
+    /// It is asserted on the passes rather than on the owners, because that
+    /// is the whole of what this task is: two signals and which call each of
     /// them makes.
     #[tokio::test]
     async fn a_switch_drops_both_owners_slack_and_the_bell_drops_the_proxys() {
@@ -2767,10 +2762,9 @@ mod slack_task_tests {
                 }) as BoxFuture<'static, ()>
             }
         };
-        // What the sessions side was handed, switch by switch: the
-        // reading, so that a task passing a stale or re-read one shows up
-        // here rather than as a session taken while its own container was
-        // playing.
+        // What the sessions side was handed, switch by switch: the reading. A
+        // task passing a stale or re-read one shows up here, rather than as a
+        // session taken while its own container was playing.
         let readings: Arc<std::sync::Mutex<Vec<enginefs::retention::live::Reading>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let record = |readings: &Arc<std::sync::Mutex<Vec<enginefs::retention::live::Reading>>>| {
@@ -2827,9 +2821,9 @@ mod slack_task_tests {
             "a volume running low is not a viewer opening something else"
         );
 
-        // And the value as it stands when the task starts is not a change:
-        // a task that treated it as one would drop the slack of whatever
-        // was playing when the server came up.
+        // And the value as it stands when the task starts is not a change. A
+        // task that treated it as one would drop the slack of whatever was
+        // playing when the server came up.
         let quiet = tokio::spawn(drop_slack_on_switch_and_bell(
             live.changed(),
             Arc::new(SlackBell::default()),
@@ -2849,11 +2843,11 @@ mod slack_task_tests {
 mod default_log_filter_tests {
     use super::DEFAULT_LOG_FILTER;
 
-    /// Every crate whose diagnostics a field report depends on must be in
-    /// the default directives: an unlisted crate is filtered out entirely,
-    /// with nothing to say it happened. `librqbit` is the one that reports
-    /// a failed piece write, which is how a full or unwritable cache
-    /// volume becomes visible at all.
+    /// Every crate whose diagnostics a field report depends on must be in the
+    /// default directives. An unlisted crate is filtered out entirely, with
+    /// nothing to say it happened. `librqbit` is the one that reports a
+    /// failed piece write, which is how a full or unwritable cache volume
+    /// becomes visible at all.
     #[test]
     fn the_default_directives_cover_every_crate_that_reports_trouble() {
         for crate_name in ["stream_server", "enginefs", "librqbit"] {
@@ -2869,13 +2863,13 @@ mod default_log_filter_tests {
     }
 
     /// The two chronically-noisy librqbit targets are silenced at WARN while
-    /// the rest of `librqbit` keeps it -- the piece-write failure that makes
-    /// a full cache volume visible is a `librqbit::` WARN and must survive.
+    /// the rest of `librqbit` keeps it. The piece-write failure that makes a
+    /// full cache volume visible is a `librqbit::` WARN and must survive.
     ///
-    /// Asserted through a real subscriber rather than by reading the string,
-    /// because it depends on `EnvFilter` preferring the more specific
+    /// It is asserted through a real subscriber rather than by reading the
+    /// string. It depends on `EnvFilter` preferring the more specific
     /// directive (`librqbit_dht::dht=error`) over the prefix one
-    /// (`librqbit=warn`) for the same event -- which is the whole mechanism.
+    /// (`librqbit=warn`) for the same event, and that is the whole mechanism.
     #[test]
     fn the_repeating_dht_and_upnp_warnings_are_filtered_out_but_librqbit_warn_is_not() {
         use std::sync::{Arc, Mutex};
