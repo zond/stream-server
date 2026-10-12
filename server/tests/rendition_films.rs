@@ -1,8 +1,9 @@
 //! Renditions of **real films** (`docs/design/renditions.md` §2.8): H.264
-//! and HEVC with B-frames, AAC at 48 and 44.1 kHz, encoded by the system
-//! `ffmpeg` and repackaged by the server through a producer over the file
-//! (`support/film_producer.rs`) -- then read back by the system `ffmpeg`
-//! and `ffprobe` over HTTP, as a receiver's FFmpeg reads them.
+//! and HEVC with B-frames, AAC at 48 and 44.1 kHz. The system `ffmpeg`
+//! encodes them, and the server repackages them through a producer over
+//! the file (`support/film_producer.rs`). The system `ffmpeg` and
+//! `ffprobe` then read them back over HTTP, as a receiver's FFmpeg reads
+//! them.
 //!
 //! Every test skips, loudly, when the tools are not installed.
 
@@ -149,8 +150,8 @@ fn slots(file: &[u8]) -> Vec<(u64, u64, i64)> {
         .collect()
 }
 
-/// The packets `ffprobe` reads from `input` -- with `-read_intervals
-/// intervals` when given -- in the order it reads them: `(track,
+/// The packets `ffprobe` reads from `input` (with `-read_intervals
+/// intervals` when given), in the order it reads them: `(track,
 /// presentation time in microseconds, key)`.
 fn read_packets(
     input: &str,
@@ -184,7 +185,7 @@ fn read_packets(
         };
         let pts_us = (pts.parse::<f64>()? * 1_000_000.0).round() as i64;
         // A packet FFmpeg marks to be discarded (`D`) is one it has
-        // indexed twice -- a fragment read again -- and a player drops.
+        // indexed twice (a fragment read again), and a player drops it.
         if flags.contains('D') {
             continue;
         }
@@ -193,11 +194,11 @@ fn read_packets(
     Ok(out)
 }
 
-/// The film's packets of `track` in decode order -- the order a demuxer
-/// hands them out -- with their key flags: the source a rendition's
-/// packets must be, time for time. The sound from the film's start on: a
-/// frame before it (an AAC encoder's priming) has no time a fragment can
-/// say, and is not carried.
+/// The film's packets of `track` in decode order (the order a demuxer
+/// hands them out), with their key flags. They are the source a
+/// rendition's packets must be, time for time. The sound counts from the
+/// film's start on. A frame before it (an AAC encoder's priming) has no
+/// time a fragment can say, and is not carried.
 fn in_decode_order(film: &Film, track: TrackKind) -> Vec<(i64, bool)> {
     film.packets
         .iter()
@@ -207,11 +208,11 @@ fn in_decode_order(film: &Film, track: TrackKind) -> Vec<(i64, bool)> {
         .collect()
 }
 
-/// **`got` is a run of `film`, time for time**: from where its first
-/// packet is in the film, every packet the next one's, at the same
+/// **`got` is a run of `film`, time for time.** From where its first
+/// packet is in the film, every packet is the next one's, at the same
 /// presentation time (within the 90 kHz clock's tick) and with the same
-/// key flag -- not merely a time the film has somewhere, which a picture
-/// late by whole frames would still be.
+/// key flag. That is not merely a time the film has somewhere, which a
+/// picture late by whole frames would still be.
 fn assert_run(got: &[(i64, bool)], film: &[(i64, bool)], what: &str) {
     let Some(&(first, _)) = got.first() else {
         panic!("{what}: no packets");
@@ -243,8 +244,8 @@ fn of_track(packets: &[(TrackKind, i64, bool)], track: TrackKind) -> Vec<(i64, b
 
 /// **A relay that counts requests**: a TCP listener in front of `target`
 /// that passes everything through and keeps the `Range` of each request
-/// it sees going in -- how many requests a reader of the file makes, and
-/// where.
+/// it sees going in. It shows how many requests a reader of the file
+/// makes, and where.
 struct Relay {
     addr: SocketAddr,
     ranges: Arc<Mutex<Vec<String>>>,
@@ -313,9 +314,9 @@ impl Relay {
     }
 }
 
-/// Read `url` with the system `ffmpeg` as a player does -- every packet
-/// demuxed, nothing decoded -- with `before` ahead of the input; fails on
-/// anything it says at `error`.
+/// Read `url` with the system `ffmpeg` as a player does (every packet
+/// demuxed, nothing decoded), with `before` ahead of the input. It fails
+/// on anything it says at `error`.
 fn ffmpeg_reads(url: &str, before: &[&str], after: &[&str]) -> anyhow::Result<()> {
     let output = Command::new("ffmpeg")
         .args(["-hide_banner", "-v", "error"])
@@ -333,10 +334,10 @@ fn ffmpeg_reads(url: &str, before: &[&str], after: &[&str]) -> anyhow::Result<()
 }
 
 /// A film as the field's: 11 Mbit/s with a sync sample every 8 s, so a
-/// slot is some 11 MB -- past the 8 MiB at which FFmpeg stops growing its
-/// read buffer to cover a picture and its sound that far apart
-/// (`ff_configure_buffers_for_index`: twice the distance, under 16 MiB),
-/// which is what made a picture-first slot cost a request per hop.
+/// slot is some 11 MB. That is past the 8 MiB at which FFmpeg stops growing
+/// its read buffer to cover a picture and its sound that far apart
+/// (`ff_configure_buffers_for_index`: twice the distance, under 16 MiB).
+/// It is what made a picture-first slot cost a request per hop.
 fn fat_film(picture: Picture) -> Recipe {
     Recipe {
         picture,
@@ -349,14 +350,14 @@ fn fat_film(picture: Picture) -> Recipe {
 }
 
 /// **A straight read of a film whose slots are 11 MB reads it front to
-/// back**: one request -- a slot's padding is boxes a reader steps over
+/// back** in one request. A slot's padding is boxes a reader steps over
 /// without a seek (`layout::PAD_BOX`), not a skip it may make a request
-/// of -- and not one per hop between a slot's picture and its sound, the
-/// field bug: on zond's TV an 8 Mbit/s film
-/// with 7.5 s GOPs made a request every 0.3 to 1 s, alternately creeping
+/// of. It is not one request per hop between a slot's picture and its
+/// sound. That was the field bug: on zond's TV an 8 Mbit/s film with 7.5 s
+/// GOPs made a request every 0.3 to 1 s. It was alternately creeping
 /// through a slot's picture and parked at its sound, and the cast stopped
 /// after a second. Laid picture-first, this film made `ffmpeg` (6.1) ask
-/// 317 times, back and forth; chunked, once.
+/// 317 times, back and forth. Chunked, it asked once.
 #[test]
 fn a_straight_read_of_a_fat_film_reads_it_front_to_back() -> anyhow::Result<()> {
     if !film_producer::tools_for(
@@ -390,10 +391,10 @@ fn starts_of(ranges: &[String]) -> Vec<u64> {
         .collect()
 }
 
-/// **A seek reads on from where it lands**: `ffmpeg -ss` into a fat film's
+/// **A seek reads on from where it lands.** `ffmpeg -ss` into a fat film's
 /// third slot asks for the file's start, then the slot, and reads on
-/// across the next slot's boundary without asking again. Picture-first, the same
-/// seek asked 47 times, back and forth.
+/// across the next slot's boundary without asking again. Picture-first,
+/// the same seek asked 47 times, back and forth.
 #[test]
 fn a_seek_into_a_fat_film_reads_on_from_where_it_lands() -> anyhow::Result<()> {
     if !film_producer::tools_for(
@@ -407,7 +408,8 @@ fn a_seek_into_a_fat_film_reads_on_from_where_it_lands() -> anyhow::Result<()> {
     let file_slots = slots(&fixture.get(&token, Some((0, 64 * 1024 - 1)))?);
     let relay = Relay::start(fixture.lan.parse()?)?;
     ffmpeg_reads(&relay.url(&token), &["-ss", "20"], &["-t", "3"])?;
-    // 20 s is in slot 2 (16 to 24 s); three seconds on read into slot 3.
+    // 20 s is in slot 2 (16 to 24 s). Three seconds on, it reads into
+    // slot 3.
     let starts = starts_of(&relay.take());
     assert!(
         starts.len() >= 2 && starts[1] == file_slots[2].0,
@@ -418,17 +420,17 @@ fn a_seek_into_a_fat_film_reads_on_from_where_it_lands() -> anyhow::Result<()> {
 }
 
 /// **A film's rendition decodes whole and shows every sample at its own
-/// time**: H.264 with 48 kHz sound and HEVC (open GOPs) with 44.1 kHz,
-/// each decoded by `ffmpeg` without a complaint, and every packet `ffprobe`
-/// reads back, in the order it reads them, the film's packet at the same
-/// presentation time with the same key flag -- the picture and the sound
-/// alike, so neither is ever late against the other. FFmpeg shows a
-/// picture at its decode time, its composition offset and its
-/// `dts_shift` (the largest negative offset it has read so far): no
-/// offset is negative, so there is no shift and the picture is at its own
-/// time (`mux::DECODE_AHEAD_US`).
+/// time**: H.264 with 48 kHz sound and HEVC (open GOPs) with 44.1 kHz.
+/// `ffmpeg` decodes each without a complaint. Every packet `ffprobe` reads
+/// back, in the order it reads them, is the film's packet at the same
+/// presentation time with the same key flag. That holds for the picture
+/// and the sound alike, so neither is ever late against the other. FFmpeg
+/// shows a picture at its decode time, its composition offset and its
+/// `dts_shift` (the largest negative offset it has read so far). No offset
+/// is negative, so there is no shift, and the picture is at its own time
+/// (`mux::DECODE_AHEAD_US`).
 ///
-/// The sound's packets are the film's from its start: a frame before it
+/// The sound's packets are the film's from its start. A frame before it
 /// (the AAC encoder's priming at -21 ms, behind the MP4's edit list) has no
 /// time a fragment can say, and is not carried.
 #[test]
@@ -475,11 +477,12 @@ fn a_film_decodes_whole_with_its_times() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// **Every slot is the same bytes whichever run makes it**: a film read
-/// whole by one run from its start, then published again and read slot by
-/// slot from the last to the first -- each slot made by a run started at
-/// it, from two seconds before its cut -- is the same file, byte for byte.
-/// The chunks a slot is cut into are a function of its samples alone.
+/// **Every slot is the same bytes whichever run makes it.** A film is read
+/// whole by one run from its start. It is then published again and read
+/// slot by slot from the last to the first, each slot made by a run
+/// started at it, from two seconds before its cut. Both are the same file,
+/// byte for byte. The chunks a slot is cut into are a function of its
+/// samples alone.
 #[test]
 fn every_slot_is_the_same_bytes_whichever_run_makes_it() -> anyhow::Result<()> {
     for (picture, sample_rate) in [(Picture::H264, 48_000), (Picture::Hevc, 44_100)] {
@@ -499,7 +502,7 @@ fn every_slot_is_the_same_bytes_whichever_run_makes_it() -> anyhow::Result<()> {
                 sample_rate,
             },
             RenditionTuning {
-                // Nothing kept but what a run is making: every slot asked
+                // Nothing kept but what a run is making. Every slot asked
                 // again is made again.
                 ring_cap: 1,
                 ..RenditionTuning::default()
@@ -535,8 +538,8 @@ fn every_slot_is_the_same_bytes_whichever_run_makes_it() -> anyhow::Result<()> {
 }
 
 /// The first video packet's time after each of `seeks` (seconds), in one
-/// `ffprobe` of `url` that reads `before` seconds first -- the TV's remote
-/// seeks, forward then back.
+/// `ffprobe` of `url` that reads `before` seconds first. These are the TV's
+/// remote seeks, forward then back.
 fn ffprobe_lands(url: &str, before: Option<u32>, seeks: &[u32]) -> anyhow::Result<Vec<f64>> {
     let intervals: Vec<String> = before
         .map(|first| format!("%+{first}"))
@@ -557,25 +560,25 @@ fn ffprobe_lands(url: &str, before: Option<u32>, seeks: &[u32]) -> anyhow::Resul
     Ok(times[times.len() - seeks.len()..].to_vec())
 }
 
-/// **A seek lands on the sync sample of the slot its time falls in** --
-/// the app's long test film exactly (xtremio `rust/tests/support/film.rs`:
-/// 6 minutes of `testsrc`, a key every 2.8 s, HEVC Main 10 HDR10 with
-/// open GOPs, and H.264), published with the app's 6 s segments:
-/// `ffprobe` seeking to 5:00 lands on the key at 299.6 s in a few
-/// requests, a seek list read after the first 16 s lands each on its
-/// slot's key, and `ffmpeg -ss 60` asks for the start and the target and
-/// nothing else; and after a seek -- fresh, and back after reading --
-/// every packet of the picture and of the sound is the film's, at its
-/// time.
+/// **A seek lands on the sync sample of the slot its time falls in.** The
+/// film is the app's long test film exactly (xtremio
+/// `rust/tests/support/film.rs`: 6 minutes of `testsrc`, a key every
+/// 2.8 s, HEVC Main 10 HDR10 with open GOPs, and H.264), published with
+/// the app's 6 s segments. `ffprobe` seeking to 5:00 lands on the key at
+/// 299.6 s in a few requests. A seek list read after the first 16 s lands
+/// each on its slot's key. `ffmpeg -ss 60` asks for the start and the
+/// target and nothing else. And after a seek (fresh, and back after
+/// reading), every packet of the picture and of the sound is the film's,
+/// at its time.
 ///
 /// **A slot begins half a second before its key is shown**
 /// (`mux::DECODE_AHEAD_US`: what keeps every offset from being negative,
-/// and the picture at its own time in every reader), so the key a seek
+/// and the picture at its own time in every reader). So the key a seek
 /// lands on is the last one at or before the time *plus that half second*:
 /// 330 s lands on the key at 330.4 s, not on the one at 327.6 s.
 ///
-/// Cut on the 6 s grid, a slot held two or three GOPs and a seek landed
-/// at the slot's start -- the demuxer knows only the sync samples of the
+/// Cut on the 6 s grid, a slot held two or three GOPs, and a seek landed
+/// at the slot's start. The demuxer knows only the sync samples of the
 /// chunks it has read, and it reads the slot's first: 294.0 s for 5:00
 /// (H.264). With HEVC's open GOPs FFmpeg 6.1 then also sought the sound to
 /// the slot before, and the picture followed it: 288.4 s.
@@ -604,7 +607,7 @@ fn a_seek_lands_on_its_slots_sync_sample() -> anyhow::Result<()> {
             .filter(|packet| packet.track == TrackKind::Video && packet.key)
             .map(|packet| packet.pts_us as f64 / 1e6)
             .collect();
-        // The key of the slot `at` falls in: slots begin `D` before their
+        // The key of the slot `at` falls in. Slots begin `D` before their
         // keys are shown.
         let key_of = |at: f64| {
             *keys
@@ -643,10 +646,10 @@ fn a_seek_lands_on_its_slots_sync_sample() -> anyhow::Result<()> {
         let asked = relay.take();
         assert_eq!(asked.len(), 2, "{picture:?}: ffmpeg -ss 60 asked {asked:?}");
 
-        // **After a seek, picture and sound are each at their own times**:
-        // into a slot first, and back to one after reading the first 16 s
-        // -- each packet the film's at its time, the sound from at or
-        // before the picture it plays with.
+        // **After a seek, picture and sound are each at their own times.**
+        // That holds into a slot first, and back to one after reading the
+        // first 16 s. Each packet is the film's at its time, the sound from
+        // at or before the picture it plays with.
         let picture_film = in_decode_order(&fixture.film, TrackKind::Video);
         let sound_film = in_decode_order(&fixture.film, TrackKind::Audio);
         for (at, before) in [(300, false), (100, false), (43, true), (30, true)] {
@@ -691,10 +694,10 @@ fn a_seek_lands_on_its_slots_sync_sample() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// **An estimated layout shows every sample at its own time too**: the
-/// app's long HEVC film laid out with no index (a transport stream's, a
-/// Matroska file's without cues), read whole and after seeks -- every
-/// packet of the picture and of the sound the film's at its time; each
+/// **An estimated layout shows every sample at its own time too.** The
+/// app's long HEVC film is laid out with no index (a transport stream's, a
+/// Matroska file's without cues), and read whole and after seeks. Every
+/// packet of the picture and of the sound is the film's at its time. Each
 /// seek lands on a key at or before its target, within a segment and the
 /// assumed GOP (its slots are labelled 10 s late).
 #[test]
@@ -788,16 +791,17 @@ fn video_decode_times(path: &str) -> anyhow::Result<Vec<(i64, i64)>> {
     Ok(out)
 }
 
-/// **Decode times only ever increase, across every slot and every chunk**
-/// -- the foreman's open-GOP clip (`testsrc2` 1280x720, x265 with open
-/// GOPs every 2 s, whose leading pictures vary: 0, 3, 1, 0, 0, 1, 1, 4,
-/// ...), in 6 s segments, read whole by `ffprobe`: every packet's decode
-/// time after the one before's, every duration above nought, and every
-/// packet of picture and sound the film's at its time. A slot whose GOP
-/// has more leading pictures than the next has more samples than frames
-/// between its first decode time and the next slot's; stepped by the
-/// frames' durations from its own first decode time its times ran past the
-/// next slot's -- back 7200 ticks at the boundaries of that clip.
+/// **Decode times only ever increase, across every slot and every
+/// chunk.** The clip is the foreman's open-GOP clip (`testsrc2` 1280x720,
+/// x265 with open GOPs every 2 s, whose leading pictures vary: 0, 3, 1, 0,
+/// 0, 1, 1, 4, ...), in 6 s segments, read whole by `ffprobe`. Every
+/// packet's decode time comes after the one before's, every duration is
+/// above nought, and every packet of picture and sound is the film's at
+/// its time. A slot whose GOP has more leading pictures than the next has
+/// more samples than frames between its first decode time and the next
+/// slot's. Stepped by the frames' durations from its own first decode
+/// time, its times ran past the next slot's: back 7200 ticks at the
+/// boundaries of that clip.
 #[test]
 fn decode_times_only_ever_increase() -> anyhow::Result<()> {
     if !film_producer::tools_for(Picture::Hevc, "decode_times_only_ever_increase") {

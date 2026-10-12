@@ -1,8 +1,8 @@
 //! Media ids and the blocking reader over them (`stream_server::media`,
 //! `docs/design/media-pipeline.md` §2.3, §2.4): `register`, `resolve`,
-//! `open_reader`, `set_buffer` and the reader's `read`/`seek`/`cancel`/drop,
-//! over each kind of source the registry resolves -- a torrent file, a link
-//! through `/proxy`'s cache, a Google Drive file.
+//! `open_reader`, `set_buffer` and the reader's `read`/`seek`/`cancel`/drop.
+//! They run over each kind of source the registry resolves: a torrent file,
+//! a link through `/proxy`'s cache, a Google Drive file.
 //!
 //! Every server here is offline and on ephemeral ports, and every origin is
 //! a loopback fake of this file's own ([`Origin`]). A [`MediaReader`] blocks
@@ -35,8 +35,8 @@ mod rar_fixtures;
 mod torrent_fixtures;
 use torrent_fixtures::{bearer_client, offline_config, piece_store, real_torrent};
 
-/// A bound on a mistake, never a wait a correct run spends: a hash check,
-/// a read that should answer, a cancel that should wake one.
+/// A bound on a mistake, never a wait a correct run spends. It bounds a
+/// hash check, a read that should answer, a cancel that should wake one.
 const BOUND: Duration = Duration::from_secs(120);
 
 /// The fixtures' piece length (`real_torrent`'s).
@@ -56,9 +56,9 @@ fn payload(len: usize) -> Vec<u8> {
 /// Seed the pieces of `torrent` whose index `keep` accepts, in the piece
 /// store where the server reads them, from the files under `content` in
 /// the order the metainfo lists them (never the fixture's write order: see
-/// AGENTS.md on torrent file order). Whole pieces only: a fixture's files
-/// are whole numbers of pieces. **After the server has started**: the
-/// launch sweep deletes a piece directory seeded before it.
+/// AGENTS.md on torrent file order). Whole pieces only, since a fixture's
+/// files are whole numbers of pieces. **Call it after the server has
+/// started.** The launch sweep deletes a piece directory seeded before it.
 fn seed(cache_root: &Path, torrent: &[u8], content: &Path, keep: impl Fn(usize) -> bool) {
     let meta = librqbit::torrent_from_bytes(torrent).expect("parse the torrent back");
     let info_hash = meta.info_hash.as_string();
@@ -93,9 +93,9 @@ fn seed(cache_root: &Path, torrent: &[u8], content: &Path, keep: impl Fn(usize) 
 }
 
 /// A server with one torrent of the named films (each `film_len` bytes of
-/// [`payload`]) added and checked, the pieces `keep` accepts seeded: the
-/// server, its base URL, the info hash and each film's file index, looked
-/// up by name.
+/// [`payload`]) added and checked, and the pieces `keep` accepts seeded. It
+/// answers the server, its base URL, the info hash and each film's file
+/// index, looked up by name.
 struct TorrentFixture {
     handle: stream_server::ServerHandle,
     base: String,
@@ -276,19 +276,19 @@ const FILE_ID: &str = "1MediaIdFixtureFile";
 const ORIGIN_LEN: usize = 300 * 1024;
 
 /// One loopback listener standing in for a CDN, Google Drive and the
-/// pairing service at once: `/film.bin` serves ranges, `/whole.bin`
+/// pairing service at once. `/film.bin` serves ranges. `/whole.bin`
 /// answers every request with the whole file (an origin that will not
-/// range), `/refresh` mints Drive tokens and `/drive/v3/files/...` serves
+/// range). `/refresh` mints Drive tokens, and `/drive/v3/files/...` serves
 /// ranges to whoever holds one.
 struct Origin {
     addr: SocketAddr,
     /// Requests for a byte of `/film.bin` or the Drive file.
     ranged: Arc<AtomicUsize>,
-    /// Set by [`Origin::kill`]: every connection after it is dropped
+    /// Set by [`Origin::kill`]. Every connection after it is dropped
     /// unanswered, and counted in [`Origin::after_death`].
     dead: Arc<AtomicBool>,
     after_death: Arc<AtomicUsize>,
-    /// Set to revoke [`DYING_GRANT`]: its refreshes answer `pairAgain` from
+    /// Set to revoke [`DYING_GRANT`]. Its refreshes answer `pairAgain` from
     /// then on.
     revoked: Arc<AtomicBool>,
 }
@@ -328,7 +328,7 @@ impl Origin {
         })
     }
 
-    /// From now on nothing is served: the network is gone, as far as this
+    /// From now on nothing is served. The network is gone, as far as this
     /// server can tell.
     fn kill(&self) {
         self.dead.store(true, Ordering::SeqCst);
@@ -375,7 +375,7 @@ fn serve(mut stream: TcpStream, ranged: &AtomicUsize, revoked: &AtomicBool) {
         let body = String::from_utf8_lossy(&body);
         if body.contains(DYING_GRANT) && !revoked.load(Ordering::SeqCst) {
             // Sixty seconds is the credential's renew margin, so a token
-            // this short is renewed at every request: the revocation is met
+            // this short is renewed at every request. The revocation is met
             // at the next read, not an hour later.
             respond(
                 &mut stream,
@@ -490,12 +490,12 @@ fn proxy_url(handle: &stream_server::ServerHandle, target: &str) -> url::Url {
 // --- The tests --------------------------------------------------------------
 
 /// **A torrent id reads from the top, reads from where a seek put it, and
-/// ends.** Registered by the URL stremio-core builds with `-1` (the
-/// largest video, as the stream route picks it), resolved to the one film,
-/// read whole, then read again from an offset inside a piece -- a seek is
-/// a reopen at the offset, and a reader that only moved its position
-/// would answer the top of the file again -- and at the end `Ok(0)`, again
-/// and again.
+/// ends.** It is registered by the URL stremio-core builds with `-1` (the
+/// largest video, as the stream route picks it) and resolved to the one
+/// film. It is read whole, then read again from an offset inside a piece.
+/// A seek is a reopen at the offset, and a reader that only moved its
+/// position would answer the top of the file again. At the end it answers
+/// `Ok(0)`, again and again.
 #[test]
 fn a_torrent_id_reads_seeks_and_ends() -> anyhow::Result<()> {
     const FILM_LEN: usize = 4 * PIECE;
@@ -538,11 +538,11 @@ fn a_torrent_id_reads_seeks_and_ends() -> anyhow::Result<()> {
     fixture.stop()
 }
 
-/// **A `/proxy` id reads through the proxy cache, seeks and ends**, and a
-/// link whose host will not range is not a refusal: it resolves
+/// **A `/proxy` id reads through the proxy cache, seeks and ends.** A link
+/// whose host will not range is not a refusal. It resolves
 /// `in_process: false` with the `/proxy` URL a player can read it forward
-/// through -- and only a reader is refused for it, since nothing in this
-/// process could seek it.
+/// through. Only a reader is refused for it, since nothing in this process
+/// could seek it.
 #[test]
 fn a_proxy_id_reads_seeks_and_ends_and_a_non_ranging_one_is_out_of_process() -> anyhow::Result<()> {
     const SEEK_TO: u64 = 200 * 1024 + 3;
@@ -574,8 +574,8 @@ fn a_proxy_id_reads_seeks_and_ends_and_a_non_ranging_one_is_out_of_process() -> 
     assert_eq!(end?, 0);
     drop(reader);
 
-    // With a play, the reader is the viewer's player on a proxied stream:
-    // its session is off every torrent file, as a `p=` request through
+    // With a play, the reader is the viewer's player on a proxied stream.
+    // Its session is off every torrent file, as a `p=` request through
     // `/proxy` puts it.
     let played = handle.open_reader(
         &id,
@@ -609,8 +609,8 @@ fn a_proxy_id_reads_seeks_and_ends_and_a_non_ranging_one_is_out_of_process() -> 
 }
 
 /// **A Drive id reads by range under a grant the supplier hands over at
-/// resolve**, against the fake Drive and pairing service; and a supplier
-/// with no grant is `noGrant`, not a request with nothing behind it.
+/// resolve**, against the fake Drive and pairing service. A supplier with
+/// no grant is `noGrant`, not a request with nothing behind it.
 #[test]
 fn a_drive_id_reads_under_the_grant_its_supplier_gives() -> anyhow::Result<()> {
     const SEEK_TO: u64 = 123_457;
@@ -680,10 +680,10 @@ fn a_drive_id_reads_under_the_grant_its_supplier_gives() -> anyhow::Result<()> {
 }
 
 /// The fixture for a read that parks: one film whose last piece nobody
-/// has -- it is not seeded, and nothing on this offline server could
-/// fetch it -- and a reader seeked into that piece. Seeded and kept
-/// (`fixture_pins`): the claim is about a piece that is missing, not one
-/// taken.
+/// has, and a reader seeked into that piece. The piece is not seeded, and
+/// nothing on this offline server could fetch it. The rest is seeded and
+/// kept (`fixture_pins`), because the claim is about a piece that is
+/// missing, not one taken.
 fn parked_reader() -> anyhow::Result<(TorrentFixture, MediaReader)> {
     const FILM_LEN: usize = 4 * PIECE;
     let fixture = TorrentFixture::start(
@@ -701,7 +701,7 @@ fn parked_reader() -> anyhow::Result<(TorrentFixture, MediaReader)> {
 }
 
 /// **A read parked on a piece nobody has is woken by `cancel`**, with
-/// `Interrupted`, and every later call answers the same at once: the
+/// `Interrupted`, and every later call answers the same at once. The
 /// cancel is not a command queued behind the read it interrupts, and it
 /// is sticky, as mpv's `cancel_fn` says.
 #[test]
@@ -714,8 +714,8 @@ fn a_cancel_wakes_a_read_parked_on_a_missing_piece_and_sticks() -> anyhow::Resul
         let parked = reader.read(&mut [0u8; 64]);
         let _ = tx.send((parked, reader));
     });
-    // The read has reached the task and is being awaited: what the cancel
-    // is about to overtake.
+    // The read has reached the task and is being awaited. That is what the
+    // cancel is about to overtake.
     until("the read is in flight", || Ok(canceller.is_waiting()))?;
     canceller.cancel();
     let (parked, mut reader) = rx
@@ -768,8 +768,8 @@ fn a_server_stopped_under_a_blocked_read_answers_it_with_an_error() -> anyhow::R
 }
 
 /// **Dropping a reader on a thread with no runtime panics nothing, and
-/// ends its stream**: the drop is a channel closing, and the task drops
-/// the source -- whose end spawns -- on the runtime. `playing` is the
+/// ends its stream.** The drop is a channel closing, and the task drops
+/// the source (whose end spawns) on the runtime. `playing` is the
 /// registration, read as the activity light reads it.
 #[test]
 fn a_reader_dropped_off_the_runtime_ends_its_stream() -> anyhow::Result<()> {
@@ -796,10 +796,10 @@ fn a_reader_dropped_off_the_runtime_ends_its_stream() -> anyhow::Result<()> {
 }
 
 /// **A torrent reader opened with a play is the viewer's playback, from the
-/// open**: the session moves to its film before a byte is read, and the
+/// open.** The session moves to its film before a byte is read, and the
 /// film draws (under the default budget, which covers it, the draw is the
 /// whole film). A reader of the other film opened without a play is an
-/// aside: the session stays where it was and that film draws nothing.
+/// aside. The session stays where it was, and that film draws nothing.
 #[test]
 fn a_reader_with_a_play_moves_the_session_and_draws_and_one_without_does_neither()
 -> anyhow::Result<()> {
@@ -872,11 +872,11 @@ fn a_reader_with_a_play_moves_the_session_and_draws_and_one_without_does_neither
     fixture.stop()
 }
 
-/// **`set_buffer` is taken at the reader's next reopen, and not before**:
-/// the lookahead is worked out when a torrent file is opened, so the
+/// **`set_buffer` is taken at the reader's next reopen, and not before.**
+/// The lookahead is worked out when a torrent file is opened. So the
 /// handle already reading keeps the choice it was opened with, and a seek
-/// -- a new handle -- opens with the new one. What the profile changes (how
-/// far ahead the engine fetches) is no number this crate is shown, so what
+/// (a new handle) opens with the new one. What the profile changes (how
+/// far ahead the engine fetches) is no number this crate is shown. So what
 /// is read is the choice the stream's last open was made with.
 #[test]
 fn set_buffer_is_taken_at_the_next_reopen() -> anyhow::Result<()> {
@@ -898,7 +898,7 @@ fn set_buffer_is_taken_at_the_next_reopen() -> anyhow::Result<()> {
     assert_eq!(reader.opened_with_buffer(), Some(BufferProfile::Normal));
 
     // Set before an open, it outranks the token's buffer, which is only
-    // the initial value: a second id, told `Maximum` first, opens with it.
+    // the initial value. A second id, told `Maximum` first, opens with it.
     let told_first = fixture.register("film.mkv")?;
     fixture
         .handle
@@ -918,8 +918,8 @@ fn set_buffer_is_taken_at_the_next_reopen() -> anyhow::Result<()> {
     drop(second);
 
     fixture.handle.set_buffer(&id, BufferProfile::Large)?;
-    // A seek to where the reader already is -- what mpv makes right after
-    // every open -- is no reopen, so it takes nothing either.
+    // A seek to where the reader already is (what mpv makes right after
+    // every open) is no reopen, so it takes nothing either.
     let (reader, read) = within("a read after set_buffer", move || {
         let mut reader = reader;
         let read = reader
@@ -950,7 +950,7 @@ fn set_buffer_is_taken_at_the_next_reopen() -> anyhow::Result<()> {
 
 /// **An id nobody holds is evicted at the cap, and one being read is
 /// not.** Registering is no I/O, so the cap is reached with URLs this
-/// server serves nothing at; `set_buffer` is the cheapest question that
+/// server serves nothing at. `set_buffer` is the cheapest question that
 /// says whether an id is still held.
 #[test]
 fn an_id_nobody_holds_is_evicted_at_the_cap_and_one_being_read_is_not() -> anyhow::Result<()> {
@@ -992,10 +992,10 @@ fn an_id_nobody_holds_is_evicted_at_the_cap_and_one_being_read_is_not() -> anyho
     Ok(())
 }
 
-/// **A torrent the backend refuses is `torrentRefused`, not a wait.** With
-/// no DHT, no tracker and no local discovery, librqbit refuses a magnet at
-/// once ("no known way to resolve peers"): asking again gets the same
-/// answer, so the kind is the one a player stops on, never the
+/// **A torrent the backend refuses is `torrentRefused`, not a wait.**
+/// librqbit with no DHT, no tracker and no local discovery refuses a magnet
+/// at once ("no known way to resolve peers"). Asking again gets the same
+/// answer. So the kind is the one a player stops on, never the
 /// `torrentUnavailable` of a swarm that has not answered yet. The reader
 /// is refused the same way, and the sentence leaks nothing of the cause.
 #[test]
@@ -1048,9 +1048,9 @@ fn wait_complete(handle: &stream_server::ServerHandle, key: &str) -> anyhow::Res
 
 /// **A finished download of a link resolves and reads with the origin
 /// gone.** A `/proxy` id whose link is pinned and whole on the disk is
-/// answered off the disk, and never probes the origin: the network being
-/// gone is the case a download is for. What `open_drive_file` does for a
-/// Drive file with `complete_drive_download`, a media id does for both.
+/// answered off the disk, and never probes the origin. The network being
+/// gone is the case a download is for. A media id does for both what
+/// `open_drive_file` does for a Drive file with `complete_drive_download`.
 #[test]
 fn a_finished_link_download_resolves_and_reads_with_the_origin_gone() -> anyhow::Result<()> {
     const SEEK_TO: u64 = 170_001;
@@ -1139,8 +1139,8 @@ fn a_finished_drive_download_resolves_and_reads_with_drive_gone() -> anyhow::Res
 }
 
 /// **A played `/proxy` reader turns read-ahead on, and an aside does
-/// not**: without the registration playback still works and nothing is
-/// ever fetched ahead of the player, which no read would notice.
+/// not.** Without the registration, playback still works and nothing is
+/// ever fetched ahead of the player. No read would notice that.
 #[test]
 fn a_played_proxy_reader_registers_read_ahead_and_an_aside_does_not() -> anyhow::Result<()> {
     let origin = Origin::start()?;
@@ -1175,8 +1175,8 @@ fn a_played_proxy_reader_registers_read_ahead_and_an_aside_does_not() -> anyhow:
 
 /// **A Drive id whose grant has died is resolved again**, with whatever the
 /// supplier holds now, rather than answering with a source that can only
-/// fail. The first grant is revoked after the first resolve; a read meets
-/// the revocation; the next resolve asks the supplier again and gets the
+/// fail. The first grant is revoked after the first resolve. A read meets
+/// the revocation. The next resolve asks the supplier again and gets the
 /// good grant.
 #[test]
 fn a_drive_id_whose_grant_died_is_resolved_again_with_a_new_grant() -> anyhow::Result<()> {
@@ -1257,9 +1257,9 @@ fn lists_proxy(
         .any(|row| row.source.as_ref() == Some(key)))
 }
 
-/// **A torrent id pins and unpins its file in the piece store**: the `-1`
+/// **A torrent id pins and unpins its file in the piece store.** The `-1`
 /// URL stremio-core builds is resolved to the film as the stream route
-/// picks it, the pin is the info hash's (the row `pin_download` answers),
+/// picks it. The pin is the info hash's (the row `pin_download` answers),
 /// `downloads()` lists it, and `unpin` by the same id takes it off.
 #[test]
 fn a_torrent_id_pins_and_unpins_its_file() -> anyhow::Result<()> {
@@ -1303,10 +1303,10 @@ fn a_torrent_id_pins_and_unpins_its_file() -> anyhow::Result<()> {
     fixture.stop()
 }
 
-/// **A link id pins into the proxy cache, keyed with its `h=` headers**:
-/// the row's source is the link and the headers, its key is the one the
-/// cache files the stream with those headers under (not the bare link's),
-/// and `unpin` by the id takes it off.
+/// **A link id pins into the proxy cache, keyed with its `h=` headers.**
+/// The row's source is the link and the headers. Its key is the one the
+/// cache files the stream with those headers under (not the bare link's).
+/// `unpin` by the id takes it off.
 #[test]
 fn a_link_id_pins_into_the_proxy_cache_keyed_with_its_headers() -> anyhow::Result<()> {
     let origin = Origin::start()?;
@@ -1347,9 +1347,9 @@ fn a_link_id_pins_into_the_proxy_cache_keyed_with_its_headers() -> anyhow::Resul
     Ok(())
 }
 
-/// **A Drive id pins under the grant its supplier gives**, and without one
-/// a file not on the disk is refused with `NoGrant` rather than fetched
-/// with nothing; `unpin` by the id takes the pin off.
+/// **A Drive id pins under the grant its supplier gives.** Without one, a
+/// file not on the disk is refused with `NoGrant` rather than fetched with
+/// nothing. `unpin` by the id takes the pin off.
 #[test]
 fn a_drive_id_pins_under_its_grant() -> anyhow::Result<()> {
     let origin = Origin::start()?;
@@ -1391,7 +1391,7 @@ fn a_drive_id_pins_under_its_grant() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// **A file on this device has nothing to download**: pinning or unpinning
+/// **A file on this device has nothing to download.** Pinning or unpinning
 /// its id is refused, and nothing is listed.
 #[test]
 fn a_local_id_refuses_a_pin() -> anyhow::Result<()> {
@@ -1419,7 +1419,7 @@ fn a_local_id_refuses_a_pin() -> anyhow::Result<()> {
 
 /// **A member's id pins its container**: the ZIP's file in the torrent,
 /// which is where the member's bytes are, and not the torrent's other
-/// file; `unpin` by the id takes it off.
+/// file. `unpin` by the id takes it off.
 #[test]
 fn a_member_id_pins_its_container() -> anyhow::Result<()> {
     let film = payload(6 * PIECE + 77);
@@ -1561,13 +1561,13 @@ fn stored_zip(members: &[(&str, &[u8])]) -> Vec<u8> {
 
 /// **A member of a single-file RAR played through an id shares its own
 /// extent, and only it.** The RAR holds the film and, after it, an extra
-/// five times its size -- so a draw sized from the container, or made
+/// five times its size. So a draw sized from the container, or made
 /// anywhere in it, is a different number and different pieces. The budget
 /// covers the file, so a film's draw is the whole of what it is drawn
-/// over: here the pieces the member lies in, which is what is committed
-/// and what librqbit is told to announce. The play session is on the
-/// container file, sharing, with the member's extent; and a panel asking by
-/// id is told the container file's numbers.
+/// over. Here that is the pieces the member lies in, which is what is
+/// committed and what librqbit is told to announce. The play session is on
+/// the container file, sharing, with the member's extent. A panel asking
+/// by id is told the container file's numbers.
 #[cfg(feature = "rar")]
 #[test]
 fn a_member_of_a_single_file_rar_played_by_id_shares_its_own_extent() -> anyhow::Result<()> {
@@ -1658,11 +1658,11 @@ fn a_member_of_a_single_file_rar_played_by_id_shares_its_own_extent() -> anyhow:
     fixture.stop()
 }
 
-/// **A member read through an id without a play is an aside**: it reads
-/// the member's bytes through the `torrent:` form, resolves to the member,
-/// and moves no play session and draws nothing -- here with a session
-/// already on another film of the torrent, which it must not take. ZIP, so
-/// the build without RAR runs it too.
+/// **A member read through an id without a play is an aside.** It reads
+/// the member's bytes through the `torrent:` form and resolves to the
+/// member. It moves no play session and draws nothing. Here a session is
+/// already on another film of the torrent, which it must not take. The
+/// archive is a ZIP, so the build without RAR runs it too.
 #[test]
 fn a_member_read_by_id_without_a_play_moves_nothing_and_draws_nothing() -> anyhow::Result<()> {
     let film = payload(6 * PIECE + 77);
@@ -1720,11 +1720,11 @@ fn a_member_read_by_id_without_a_play_moves_nothing_and_draws_nothing() -> anyho
 }
 
 /// **A member of a multi-volume RAR set played through an id shares like a
-/// film** (the design's §2.8, step A2): every volume is opened as the
-/// viewer's playback, sharing, so the play session is on the set -- each
-/// volume with the member's bytes in it -- and the set draws once, over
+/// film** (the design's §2.8, step A2). Every volume is opened as the
+/// viewer's playback, sharing. So the play session is on the set (each
+/// volume with the member's bytes in it), and the set draws once, over
 /// those bytes in all of its volumes. The set holds the film across three
-/// volumes and an extra after it across two more; the budget covers it, so
+/// volumes and an extra after it across two more. The budget covers it. So
 /// what is announced is exactly the pieces the film's bytes lie in, in
 /// every volume it crosses, and nothing of the extra's volumes beyond the
 /// piece the two share. Each volume the film crosses commits its own
@@ -1774,7 +1774,7 @@ fn a_member_of_a_rar_set_played_by_id_shares_its_bytes_in_every_volume() -> anyh
     assert_eq!(info_hash, fixture.info_hash);
 
     // The volumes named are the film's, in its order, and their bytes are
-    // the film: nothing of a header, nothing of the extra.
+    // the film. There is nothing of a header and nothing of the extra.
     let data = |file_idx: usize| -> &[u8] {
         let at = names
             .iter()
@@ -1863,8 +1863,8 @@ fn viewer() -> Option<PlayToken> {
     })
 }
 
-/// The pre-want's numbers, shrunk to the fixtures' sixteen-kilobyte pieces
-/// so a window is a few pieces of a film of thirty-two, asked for a piece
+/// The pre-want's numbers, shrunk to the fixtures' sixteen-kilobyte pieces.
+/// So a window is a few pieces of a film of thirty-two, asked for a piece
 /// at a time.
 fn piece_rules() -> stream_server::media::prewant::Rules {
     let piece = PIECE as u64;
@@ -1881,7 +1881,8 @@ fn piece_rules() -> stream_server::media::prewant::Rules {
 }
 
 /// Seek `reader` to `at` and read until `len` bytes have come back, on a
-/// thread with no runtime; answers the reader and where the reads ended.
+/// thread with no runtime. It answers the reader and where the reads
+/// ended.
 fn read_at(reader: MediaReader, at: u64, len: usize) -> anyhow::Result<(MediaReader, u64)> {
     within("a read", move || {
         let mut reader = reader;
@@ -1901,11 +1902,11 @@ fn read_at(reader: MediaReader, at: u64, len: usize) -> anyhow::Result<(MediaRea
 
 /// **A play session ended at an offset is where the next playback resuming
 /// near it asks first.** The first session reads at twenty pieces in and
-/// leaves at 1000 s, which is remembered beside the settings with the byte
-/// it was last served to; the next, resuming at 1010 s with no length
-/// known, asks for the region around that byte **at its open, before a
-/// byte is read** -- the piece behind the remembered byte first, then
-/// outward a piece at a time -- and lets it go when the player reads
+/// leaves at 1000 s. That is remembered beside the settings with the byte
+/// it was last served to. The next session resumes at 1010 s with no length
+/// known. It asks for the region around that byte **at its open, before a
+/// byte is read**: the piece behind the remembered byte first, then
+/// outward a piece at a time. It lets the region go when the player reads
 /// inside it.
 #[test]
 fn a_session_ended_at_an_offset_is_asked_for_first_by_the_next_playback_near_it()
@@ -1970,14 +1971,14 @@ fn a_session_ended_at_an_offset_is_asked_for_first_by_the_next_playback_near_it(
     fixture.stop()
 }
 
-/// How long a "nothing is asked for" claim is watched for: the window the
-/// claim is measured over, never a wait for something to finish.
+/// How long a "nothing is asked for" claim is watched for. It is the window
+/// the claim is measured over, never a wait for something to finish.
 const QUIET: Duration = Duration::from_millis(500);
 
 /// **Without a memory, the resume time's share of the file, from there
-/// outward**, and a player that plays elsewhere -- a run of reads the
-/// length of the threshold, outside the window -- lets it go: a wrong
-/// estimate keeps nothing. An aside asks for nothing, resume or not.
+/// outward.** A player that plays elsewhere (a run of reads the length of
+/// the threshold, outside the window) lets it go, so a wrong estimate
+/// keeps nothing. An aside asks for nothing, resume or not.
 #[test]
 fn an_estimate_is_asked_for_and_let_go_when_the_player_plays_elsewhere() -> anyhow::Result<()> {
     let piece = PIECE as u64;
@@ -2034,11 +2035,11 @@ fn an_estimate_is_asked_for_and_let_go_when_the_player_plays_elsewhere() -> anyh
     fixture.stop()
 }
 
-/// **The resume point is asked for while the head is still coming**: the
-/// start and the resume point are both needed before the first frame, so
+/// **The resume point is asked for while the head is still coming.** The
+/// start and the resume point are both needed before the first frame. So
 /// with the player's read of the file's head parked on a piece nobody has,
-/// the window is being asked for all the same -- and the head read is
-/// still the one the player waits on.
+/// the window is being asked for all the same. The head read is still the
+/// one the player waits on.
 #[test]
 fn the_resume_point_is_asked_for_while_the_head_read_is_parked() -> anyhow::Result<()> {
     let piece = PIECE as u64;
@@ -2090,10 +2091,11 @@ fn the_resume_point_is_asked_for_while_the_head_read_is_parked() -> anyhow::Resu
 }
 
 /// **The read-wait readout says the player is waiting while a read is
-/// parked, and nothing once it is not**: a read served off the disk leaves
-/// nothing waiting, a read parked on a piece nobody has is shown waiting at
-/// its offset, and the cancel that wakes it takes the wait away. What the
-/// player's "buffering" card is shown from when mpv itself says nothing.
+/// parked, and nothing once it is not.** A read served off the disk leaves
+/// nothing waiting. A read parked on a piece nobody has is shown waiting at
+/// its offset, and the cancel that wakes it takes the wait away. The
+/// player's "buffering" card is shown from this when mpv itself says
+/// nothing.
 #[test]
 fn the_read_wait_readout_follows_a_parked_read() -> anyhow::Result<()> {
     const FILM_LEN: usize = 4 * PIECE;

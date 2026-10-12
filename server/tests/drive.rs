@@ -5,7 +5,7 @@
 //
 // Both Google and the pairing service are one loopback fake here (see
 // `Fake`), which is why the server is configured with a `drive_api_base`
-// at all -- a shipped build has Google's own, fixed, because an origin a
+// at all. A shipped build has Google's own, fixed, because an origin a
 // caller could name is a credentialed relay with a cache behind it.
 
 use std::io::{BufRead, BufReader, Write};
@@ -17,19 +17,19 @@ use std::sync::{Arc, Mutex};
 /// exists nowhere else, so "it did not leak" is a substring search.
 const REFRESH_TOKEN: &str = "refresh-tok-8b21-never-log-me";
 
-/// Drive's id for the film. Not a secret -- it is the cache key.
+/// Drive's id for the film. It is not a secret: it is the cache key.
 const FILE_ID: &str = "1AbCdEfGhIjKlMnOpQrStUvWxYz";
 
 const FILE_LENGTH: usize = 2 * 1024 * 1024;
 
-/// The film's bytes: a pattern, so a range can be checked to have come
-/// from the offset it claims rather than merely to be the right length.
+/// The film's bytes. They are a pattern, so a range can be checked to have
+/// come from the offset it claims rather than merely to be the right length.
 fn byte_at(offset: usize) -> u8 {
     byte_of(0, offset)
 }
 
-/// The same, for a generation of the film: what Drive serves after the
-/// file was replaced by one of the same length (see [`Fake::replace`]).
+/// The same, for a generation of the film. That is what Drive serves after
+/// the file was replaced by one of the same length (see [`Fake::replace`]).
 fn byte_of(generation: usize, offset: usize) -> u8 {
     ((offset.wrapping_mul(11) % 251) as u8).wrapping_add(generation as u8)
 }
@@ -44,21 +44,22 @@ fn md5_of(generation: usize) -> String {
 enum Refreshes {
     /// A fresh access token every time.
     Yes,
-    /// `401` with `pairAgain` -- and, so that the wording cannot have come
-    /// from here, the refresh token in the body, which is what a naive
-    /// service would do.
+    /// `401` with `pairAgain`, and the refresh token in the body, which is
+    /// what a naive service would do. The token is there so that the
+    /// wording cannot have come from here.
     PairAgain,
     /// One token with barely more life than the source's renew margin,
-    /// and then the grant is gone: a pairing revoked from the phone while
-    /// the film was playing, which is what the stream route's own check
-    /// exists for. The first token outlives the create by about a second
-    /// and nothing more, so the next read renews and finds nothing there.
+    /// and then the grant is gone. This is a pairing revoked from the phone
+    /// while the film was playing, which is what the stream route's own
+    /// check exists for. The first token outlives the create by about a
+    /// second and nothing more, so the next read renews and finds nothing
+    /// there.
     ShortThenGone,
 }
 
 /// One loopback listener standing in for both Google and the pairing
-/// service, the same way `sources::drive`'s own tests do it: `/refresh`
-/// mints tokens, `/drive/v3/files/{id}?alt=media` serves ranges to whoever
+/// service, the same way `sources::drive`'s own tests do it. `/refresh`
+/// mints tokens. `/drive/v3/files/{id}?alt=media` serves ranges to whoever
 /// holds one, and `/drive/v3/files/{id}` without it answers the file's
 /// metadata.
 ///
@@ -99,8 +100,8 @@ impl Fake {
                     ranges.clone(),
                     generation.clone(),
                 );
-                // A thread per connection: a player's opening is several
-                // reads at once and a serial fake would turn the test's
+                // A thread per connection. A player's opening is several
+                // reads at once, and a serial fake would turn the test's
                 // question into a queue.
                 std::thread::spawn(move || {
                     serve(stream, mode, &refreshes, &issued, &ranges, &generation)
@@ -128,7 +129,7 @@ impl Fake {
     }
 
     /// The reads of the film's bytes so far, less the one-byte probes an
-    /// open makes: what a read the disk answered does not add to.
+    /// open makes. A read the disk answered does not add to it.
     fn reads(&self) -> usize {
         self.ranges()
             .iter()
@@ -136,8 +137,8 @@ impl Fake {
             .count()
     }
 
-    /// The file is replaced in Drive by another of the same length: other
-    /// bytes, another checksum, the same id.
+    /// The file is replaced in Drive by another of the same length. It has
+    /// other bytes, another checksum, and the same id.
     fn replace(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
     }
@@ -201,8 +202,8 @@ fn serve(
                     .as_bytes(),
             ),
             // 61 seconds is one second more than the source's renew
-            // margin, so the create's own reads go out under it and the
-            // read after that renews -- into a grant that is gone.
+            // margin. So the create's own reads go out under it, and the
+            // read after that renews into a grant that is gone.
             Refreshes::ShortThenGone if count == 1 => {
                 let minted = format!("access-tok-{count:04}");
                 issued.lock().expect("the tokens").push(minted.clone());
@@ -316,9 +317,9 @@ fn fixture(fake: &Fake) -> anyhow::Result<Fixture> {
 }
 
 /// A server over the given directories, against the given pairing service
-/// and Drive origin, told `proxy_pins` -- which is how a second launch
-/// over a first one's cache is made, and how one is pointed at a Drive
-/// that is not there.
+/// and Drive origin, told `proxy_pins`. That is how a second launch over a
+/// first one's cache is made, and how one is pointed at a Drive that is
+/// not there.
 fn fixture_on(
     cache: tempfile::TempDir,
     config: tempfile::TempDir,
@@ -348,15 +349,15 @@ fn fixture_on(
 }
 
 /// A pairing service at an address nothing listens on: a port the OS just
-/// handed out and gave back. What a device with no network sees, near
-/// enough -- the connection is refused rather than timing out, which keeps
-/// the test quick and the claim the same. It is the *refresh* endpoint
-/// that is dead and not the Drive origin, because the origin's address is
+/// handed out and gave back. It is what a device with no network sees,
+/// near enough. The connection is refused rather than timing out, which
+/// keeps the test quick and the claim the same. It is the *refresh*
+/// endpoint that is dead and not the Drive origin. The origin's address is
 /// half of the cache key (`ProxyPinKey::Drive` keys the file's media URL,
-/// which in a shipped build is Google's fixed one) and a second launch
-/// against a different origin would be asking about a different file.
-/// Every Drive read renews its token before its first byte, so a dead
-/// pairing service is enough to make the origin unreachable.
+/// which in a shipped build is Google's fixed one). A second launch against
+/// a different origin would be asking about a different file. Every Drive
+/// read renews its token before its first byte, so a dead pairing service
+/// is enough to make the origin unreachable.
 fn dead_refresh_endpoint() -> anyhow::Result<url::Url> {
     let taken = TcpListener::bind(("127.0.0.1", 0))?;
     let addr = taken.local_addr()?;
@@ -381,7 +382,7 @@ impl Fixture {
     }
 
     /// A Drive pin of `file_id` with whatever grant is given, `None`
-    /// included; a refusal is the error, a `ProxyPinError` inside.
+    /// included. A refusal is the error, a `ProxyPinError` inside.
     fn pin_drive(
         &self,
         file_id: &str,
@@ -413,7 +414,7 @@ impl Fixture {
         }
     }
 
-    /// The open, as the app asks for it: the grant is an argument to a call
+    /// The open, as the app asks for it. The grant is an argument to a call
     /// in this process, which is the whole of the module's rule.
     fn open(
         &self,
@@ -462,8 +463,8 @@ fn a_create_answers_a_stream_path_the_player_can_fetch() -> anyhow::Result<()> {
     assert_eq!(body["length"], FILE_LENGTH as u64);
     assert_eq!(body["contentType"], "video/x-matroska");
     assert_eq!(body["name"], "A Film.mkv");
-    // The pairing is built already expired -- the app keeps no access
-    // token -- so opening it is what mints the first one.
+    // The pairing is built already expired (the app keeps no access
+    // token), so opening it is what mints the first one.
     assert_eq!(fake.refreshes(), 1, "the open renewed once");
 
     // And the path it named really serves the file.
@@ -480,7 +481,7 @@ fn a_create_answers_a_stream_path_the_player_can_fetch() -> anyhow::Result<()> {
 }
 
 /// The stream path serves the bytes that were asked for, from the offset
-/// that was asked for -- the framing a player seeks with.
+/// that was asked for. That is the framing a player seeks with.
 #[test]
 fn a_stream_path_serves_exact_ranges() -> anyhow::Result<()> {
     let fake = Fake::start(Refreshes::Yes)?;
@@ -519,9 +520,9 @@ fn a_stream_path_serves_exact_ranges() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A dead pairing arrives as itself: a kind the app switches on without
-/// reading English, and **not** the plain failure that "Google is down"
-/// would be.
+/// A dead pairing arrives as itself. It is a kind the app switches on
+/// without reading English, and **not** the plain failure that "Google is
+/// down" would be.
 #[test]
 fn a_dead_pairing_answers_as_itself_and_not_as_a_gateway_failure() -> anyhow::Result<()> {
     let fake = Fake::start(Refreshes::PairAgain)?;
@@ -543,11 +544,12 @@ fn a_dead_pairing_answers_as_itself_and_not_as_a_gateway_failure() -> anyhow::Re
 /// A pairing that dies **while the film is playing** reaches the player's
 /// next request as itself.
 ///
-/// The real flow, and the reason the stream route asks at all: a viewer
-/// revokes the pairing from their phone, the renewal the next read needs
-/// fails, that body stops -- and mpv does what mpv does, which is to open
-/// the same URL again with a `Range`. What it opens into has to be the
-/// reason, or the app shows a spinner for a film that will never resume.
+/// This is the real flow, and the reason the stream route asks at all. A
+/// viewer revokes the pairing from their phone. The renewal the next read
+/// needs fails, and that body stops. Then mpv does what mpv does, which is
+/// to open the same URL again with a `Range`. What it opens into has to be
+/// the reason, or the app shows a spinner for a film that will never
+/// resume.
 #[test]
 fn a_pairing_that_dies_mid_film_answers_the_next_request_as_itself() -> anyhow::Result<()> {
     let fake = Fake::start(Refreshes::ShortThenGone)?;
@@ -559,7 +561,7 @@ fn a_pairing_that_dies_mid_film_answers_the_next_request_as_itself() -> anyhow::
     // second. Waiting it out is what a film does.
     std::thread::sleep(std::time::Duration::from_millis(1_500));
 
-    // The read that needs a new token: whatever this answers, it is the
+    // The read that needs a new token. Whatever this answers, it is the
     // renewal behind it that kills the pairing.
     let dying = fixture.get(&path, Some("bytes=300000-"))?;
     let _ = dying.bytes();
@@ -604,8 +606,8 @@ fn a_build_with_no_pairing_service_refuses_by_name() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The stream is open and the key is the whole of what it takes -- which
-/// is the arrangement: the half that carries a credential is a call inside
+/// The stream is open, and the key is the whole of what it takes. That is
+/// the arrangement. The half that carries a credential is a call inside
 /// the process, and the half a player fetches is open and carries a key.
 #[test]
 fn the_stream_is_open_and_a_key_nobody_was_given_is_a_404() -> anyhow::Result<()> {
@@ -624,7 +626,7 @@ fn the_stream_is_open_and_a_key_nobody_was_given_is_a_404() -> anyhow::Result<()
 }
 
 /// **No token in any URL, and none in anything a caller is handed.** The
-/// open's answer and the stream URL are searched for the grant; the log
+/// open's answer and the stream URL are searched for the grant. The log
 /// files are the other half of this and live in `drive_secrecy.rs`, which
 /// needs a logging subscriber of its own.
 #[test]
@@ -665,12 +667,12 @@ fn no_url_or_answer_carries_the_refresh_token() -> anyhow::Result<()> {
 ///
 /// The download is the proxy cache's pin and filler (`proxy_downloads`),
 /// fed by the same `DriveSource` a stream is read through. What this pins
-/// down is the other half: a finished download is what the app plays when
+/// down is the other half. A finished download is what the app plays when
 /// there is no network, so opening the file must then cost **no request
-/// at all** -- not the probe `DriveSource::open` makes, and not the token
-/// renewal before it. The open answers the download's own media route,
-/// and a second launch that is told the pin -- against a pairing service
-/// and a Drive that are not there -- lists it and plays it the same way.
+/// at all**: not the probe `DriveSource::open` makes, and not the token
+/// renewal before it. The open answers the download's own media route. A
+/// second launch that is told the pin lists it and plays it the same way,
+/// against a pairing service and a Drive that are not there.
 #[test]
 fn a_drive_download_plays_from_the_disk_with_no_network() -> anyhow::Result<()> {
     let fake = Fake::start(Refreshes::Yes)?;
@@ -710,8 +712,8 @@ fn a_drive_download_plays_from_the_disk_with_no_network() -> anyhow::Result<()> 
         "a finished download opens without the grant"
     );
 
-    // And pinning it again -- what the app does at every launch for what
-    // it kept -- opens nothing either.
+    // And pinning it again (what the app does at every launch for what it
+    // kept) opens nothing either.
     let again = fixture.download(REFRESH_TOKEN)?;
     assert_eq!(again.info_hash, key);
     assert!(again.complete);
@@ -727,7 +729,7 @@ fn a_drive_download_plays_from_the_disk_with_no_network() -> anyhow::Result<()> 
     assert_eq!(response.bytes()?.as_ref(), expected.as_slice());
 
     // A second launch over the same cache, told the pin, with the pairing
-    // service unreachable: the device is offline (see
+    // service unreachable. The device is offline (see
     // [`dead_refresh_endpoint`] for why the origin's address stays).
     let (cache, config) = fixture.stop()?;
     let offline = fixture_on(
@@ -769,9 +771,9 @@ fn a_drive_download_plays_from_the_disk_with_no_network() -> anyhow::Result<()> 
         before,
         "nothing offline reached for the grant"
     );
-    // A whole download needs no grant at all: a re-pin with none, or an
-    // empty one, is the same row -- and a file that is not whole, with no
-    // grant to fetch it, is refused as exactly that.
+    // A whole download needs no grant at all. A re-pin with none, or an
+    // empty one, is the same row. A file that is not whole, with no grant
+    // to fetch it, is refused as exactly that.
     for no_grant in [None, Some("")] {
         let again = offline.pin_drive(FILE_ID, no_grant)?;
         assert!(again.complete, "{again:?}");
@@ -788,8 +790,8 @@ fn a_drive_download_plays_from_the_disk_with_no_network() -> anyhow::Result<()> 
     }
 
     // And a file that is *not* downloaded is refused as unreachable, not
-    // answered from somewhere -- offline means offline for what is not
-    // on the disk.
+    // answered from somewhere. Offline means offline for what is not on
+    // the disk.
     let other = offline
         .handle
         .open_drive_file("not-downloaded", REFRESH_TOKEN, None)?
@@ -800,21 +802,21 @@ fn a_drive_download_plays_from_the_disk_with_no_network() -> anyhow::Result<()> 
 }
 
 /// **A Drive file is read ahead of while it plays**, through the same
-/// source the open made, renewing the same grant: the passes' want-window
-/// is fetched by the proxy backing (`proxy_retention::Prefetcher`), so a
-/// reader consuming the film finds later chunks already on the disk --
-/// the buffer a torrent stream has always had.
+/// source the open made, renewing the same grant. The proxy backing
+/// fetches the passes' want-window (`proxy_retention::Prefetcher`). So a
+/// reader consuming the film finds later chunks already on the disk: the
+/// buffer a torrent stream has always had.
 ///
-/// The reader takes the film's first three chunks one after another --
-/// a pass runs once a reader has moved a chunk, and a rate takes two
-/// timed reads -- and never asks past them; what follows is then fetched
-/// from Drive by something that is not the reader.
+/// The reader takes the film's first three chunks one after another, and
+/// never asks past them. (A pass runs once a reader has moved a chunk, and
+/// a rate takes two timed reads.) What follows is then fetched from Drive
+/// by something that is not the reader.
 #[test]
 fn a_playing_drive_file_is_read_ahead_of() -> anyhow::Result<()> {
     const CHUNK: usize = stream_server::PROXY_CACHE_CHUNK_BYTES as usize;
     let fake = Fake::start(Refreshes::Yes)?;
     let fixture = fixture(&fake)?;
-    // A stated cache size publishes the budget now; the passes that size
+    // A stated cache size publishes the budget now. The passes that size
     // and fill the window run against a published budget, which a fresh
     // server otherwise states on its own timer.
     fixture
@@ -839,7 +841,7 @@ fn a_playing_drive_file_is_read_ahead_of() -> anyhow::Result<()> {
     }
 
     // What Drive was asked for reaches past everything the reader asked
-    // for: the read-ahead took the rest of the file from the head, so the
+    // for. The read-ahead took the rest of the file from the head, so the
     // reader's own later chunks were answered off the disk.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     let ahead = loop {
@@ -873,8 +875,8 @@ fn a_playing_drive_file_is_read_ahead_of() -> anyhow::Result<()> {
 }
 
 /// **A Drive file is kept, though Drive names no validator for it**, under
-/// the checksum its metadata states -- the bug a phone found on
-/// 2026-10-01: Drive's media responses carry no `ETag`, nothing was kept,
+/// the checksum its metadata states. This is the bug a phone found on
+/// 2026-10-01. Drive's media responses carry no `ETag`, nothing was kept,
 /// and a download sat at "0 B of 0 B" with its filler at the end.
 ///
 /// Three claims, each against the fake that answers as Drive does:
@@ -882,9 +884,9 @@ fn a_playing_drive_file_is_read_ahead_of() -> anyhow::Result<()> {
 /// 1. a download fills to complete;
 /// 2. a stream of a file that is not downloaded is read once from Drive,
 ///    and a second open of it reads the disk;
-/// 3. the file replaced in Drive by another **of the same length** -- which
-///    the length alone could never tell -- is a new checksum at the next
-///    open: what was kept of the old one is not served, and goes.
+/// 3. the file replaced in Drive by another **of the same length** (which
+///    the length alone could never tell) is a new checksum at the next
+///    open. What was kept of the old one is not served, and goes.
 #[test]
 fn a_drive_file_naming_no_validator_is_kept_under_its_checksum() -> anyhow::Result<()> {
     let fake = Fake::start(Refreshes::Yes)?;
@@ -895,7 +897,7 @@ fn a_drive_file_naming_no_validator_is_kept_under_its_checksum() -> anyhow::Resu
     let done = fixture.wait_complete(&row.info_hash)?;
     assert_eq!(done.downloaded, FILE_LENGTH as u64);
 
-    // Let it go, keeping its bytes, so the next open is a stream's and goes
+    // Let it go, keeping its bytes. So the next open is a stream's, and goes
     // through Drive rather than off the finished download.
     let key = row.info_hash.clone();
     let unpinned = fixture.handle.unpin_proxy_download(&key, false)?;
@@ -909,8 +911,8 @@ fn a_drive_file_naming_no_validator_is_kept_under_its_checksum() -> anyhow::Resu
             .join(".proxy")
             .join(&key);
         let mut names = Vec::new();
-        // No key directory is no generation: what a retire leaves until
-        // the next chunk is written.
+        // No key directory is no generation. That is what a retire leaves
+        // until the next chunk is written.
         let Ok(listing) = std::fs::read_dir(&dir) else {
             return Ok(names);
         };
@@ -936,7 +938,7 @@ fn a_drive_file_naming_no_validator_is_kept_under_its_checksum() -> anyhow::Resu
     assert_eq!(response.bytes()?.as_ref(), expected.as_slice());
     assert_eq!(fake.reads(), reads, "a kept file was read from Drive again");
 
-    // 3. Replaced in Drive, the same length: the next open names a new
+    // 3. Replaced in Drive, the same length. The next open names a new
     // checksum, and what is served is the new file.
     fake.replace();
     let opened = fixture.create(REFRESH_TOKEN)?;
