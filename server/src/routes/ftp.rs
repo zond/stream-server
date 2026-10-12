@@ -31,9 +31,9 @@ pub fn router() -> Router<AppState> {
     Router::new().route("/{filename}", get(stream_ftp))
 }
 
-/// What an FTP URL with no user in it logs in as, which is what an FTP URL
-/// in a stream almost always is. `curl` used `anonymous` with an email
-/// address for the password; servers that ask for one accept anything.
+/// What an FTP URL with no user in it logs in as. An FTP URL in a stream
+/// almost always has no user. `curl` used `anonymous` with an email address
+/// for the password. Servers that ask for one accept anything.
 const ANONYMOUS_USER: &str = "anonymous";
 const ANONYMOUS_PASSWORD: &str = "anonymous";
 
@@ -70,9 +70,9 @@ async fn stream_ftp(Path(filename): Path<String>, Query(params): Query<FtpQuery>
     };
 
     // Only what the route is named for. This route is open to any loopback
-    // caller -- on Android, every app on the device -- so the URL decides
-    // what this server will fetch on a stranger's behalf. The fetch speaks
-    // FTP and nothing else, and the scheme check enforces that: a URL of
+    // caller (on Android, every app on the device), so the URL decides what
+    // this server will fetch on a stranger's behalf. The fetch speaks FTP
+    // and nothing else, and the scheme check enforces that. A URL of
     // another scheme reaching an FTP client is a request nobody meant.
     let target = match ftp_target(&body.ftp_url) {
         Ok(target) => target,
@@ -81,10 +81,10 @@ async fn stream_ftp(Path(filename): Path<String>, Query(params): Query<FtpQuery>
 
     let data = match open_transfer(&target).await {
         Ok(data) => data,
-        // The origin's failure, which the caller hears as one: the transfer
-        // is opened here before a single header is written, so a dead host,
-        // a refused login and a missing file are a status rather than a
-        // `200` with nothing in it.
+        // The caller hears the origin's failure as one. The transfer is
+        // opened here before a single header is written. So a dead host, a
+        // refused login and a missing file are a status rather than a `200`
+        // with nothing in it.
         Err(e) => {
             // The origin only: an FTP URL carries its login as `user:password@`.
             tracing::debug!(
@@ -134,18 +134,18 @@ struct FtpTarget {
 
 /// The FTP fetch `url` describes, or why there is not one.
 ///
-/// **The scheme is matched by allow-list**: it keeps the route to what it
-/// is named for, and it refuses HTTP(S) too -- a caller with an HTTP URL
-/// has `/proxy`, which is built to be handed one. The `://` is required
-/// rather than taken from the parser, so
-/// `ftp:host`, which has no host part, is refused here and not later.
+/// **The scheme is matched by allow-list.** It keeps the route to what it
+/// is named for, and it refuses HTTP(S) too. A caller with an HTTP URL has
+/// `/proxy`, which is built to be handed one. The `://` is required rather
+/// than taken from the parser, so `ftp:host`, which has no host part, is
+/// refused here and not later.
 ///
-/// Everything after the scheme is `url`'s parse and not a split of our own:
-/// the host (an IPv6 literal keeps its brackets, which is what a socket
-/// address wants), the port or the scheme's default, the credentials or
-/// anonymous, and the path percent-decoded, because a file called
-/// `The Film.mkv` is `The%20Film.mkv` in a URL and `The Film.mkv` to the
-/// server.
+/// Everything after the scheme is `url`'s parse, not a split of our own.
+/// That covers the host (an IPv6 literal keeps its brackets, which is what
+/// a socket address wants), the port or the scheme's default, and the
+/// credentials or anonymous. It also covers the path, percent-decoded,
+/// because a file called `The Film.mkv` is `The%20Film.mkv` in a URL and
+/// `The Film.mkv` to the server.
 fn ftp_target(url: &str) -> Result<FtpTarget, &'static str> {
     const REFUSAL: &str = "ftpUrl must be an ftp:// or ftps:// URL";
 
@@ -162,9 +162,9 @@ fn ftp_target(url: &str) -> Result<FtpTarget, &'static str> {
 
     let parsed = url::Url::parse(url).map_err(|_| "ftpUrl is not a URL")?;
     let host = parsed.host_str().ok_or("ftpUrl names no host")?;
-    // `Url::host_str` unwraps an IPv6 literal's brackets and a socket address
-    // needs them back, so they are put back here rather than at the one call
-    // site that formats the address.
+    // `Url::host_str` unwraps an IPv6 literal's brackets, and a socket
+    // address needs them back. They are put back here rather than at the one
+    // call site that formats the address.
     let host = match parsed.host() {
         Some(url::Host::Ipv6(addr)) => format!("[{addr}]"),
         _ => host.to_string(),
@@ -194,7 +194,7 @@ fn ftp_target(url: &str) -> Result<FtpTarget, &'static str> {
 }
 
 /// A percent-decoded URL component, or the component as it stands when it
-/// decodes to no valid UTF-8 -- there is nothing better to send, and an
+/// decodes to no valid UTF-8. There is nothing better to send, and an
 /// error here would refuse a URL the server may well understand.
 fn decoded(component: &str) -> String {
     urlencoding::decode(component)
@@ -204,18 +204,18 @@ fn decoded(component: &str) -> String {
 
 /// Open the data connection for `target` and hand back the bytes.
 ///
-/// The control connection is not returned: the transfer stream holds a share
-/// of it, so it lives exactly as long as the body being read from it, and
-/// dropping the client here sends no `QUIT`. A body the player abandons
+/// The control connection is not returned. The transfer stream holds a share
+/// of it, so it lives exactly as long as the body being read from it.
+/// Dropping the client here sends no `QUIT`. A body the player abandons
 /// mid-film therefore closes both sockets when the response is dropped.
 async fn open_transfer(target: &FtpTarget) -> Result<Pin<Box<dyn AsyncRead + Send>>, FtpError> {
     open_transfer_with(target, tls_config()).await
 }
 
 /// [`open_transfer`], with the anchors `ftps://` verifies against named
-/// rather than compiled in -- which is what lets a test stand up an FTPS
-/// server of its own and be believed by this client. Production has one
-/// caller and it passes [`tls_config`].
+/// rather than compiled in. That lets a test stand up an FTPS server of its
+/// own and be believed by this client. Production has one caller, and it
+/// passes [`tls_config`].
 async fn open_transfer_with(
     target: &FtpTarget,
     tls: Arc<rustls::ClientConfig>,
@@ -224,8 +224,8 @@ async fn open_transfer_with(
     if target.secure {
         let connector = AsyncRustlsConnector::from(tokio_rustls::TlsConnector::from(tls));
         // Implicit TLS from the first byte, on 990 unless the URL says
-        // otherwise -- what `ftps://` means to every client that has the
-        // scheme.
+        // otherwise. That is what `ftps://` means to every client that has
+        // the scheme.
         let mut ftp =
             AsyncRustlsFtpStream::connect_secure_implicit(&addr, connector, &target.host).await?;
         ftp.login(&target.user, &target.password).await?;
@@ -234,7 +234,7 @@ async fn open_transfer_with(
     } else {
         let mut ftp = AsyncFtpStream::connect(&addr).await?;
         ftp.login(&target.user, &target.password).await?;
-        // Binary, always: the default is ASCII, which rewrites line endings
+        // Binary, always. The default is ASCII, which rewrites line endings
         // and would corrupt every byte of a film.
         ftp.transfer_type(FileType::Binary).await?;
         Ok(Box::pin(ftp.retr_as_stream(&target.path).await?))
@@ -244,16 +244,18 @@ async fn open_transfer_with(
 /// What the `ftps://` path verifies a certificate against: Mozilla's root
 /// program as compiled into this binary, and nothing else.
 ///
-/// The same anchors `enginefs::http_client_builder` gives every HTTPS client
-/// in this workspace, from the same crate, so `/ftp` trusts what `/proxy`
-/// trusts. It is not *quite* the same set: that builder adds the platform's
-/// own store, and this does not, because those anchors are held there as
-/// opaque `reqwest::Certificate`s that a `rustls::RootCertStore` cannot be
-/// given. A device-installed CA is therefore trusted for HTTPS and not for
-/// FTPS -- narrower than the rest of the workspace, and deliberate.
+/// These are the same anchors `enginefs::http_client_builder` gives every
+/// HTTPS client in this workspace, from the same crate, so `/ftp` trusts
+/// what `/proxy` trusts. It is not *quite* the same set. That builder adds
+/// the platform's own store, and this does not. Those anchors are held
+/// there as opaque `reqwest::Certificate`s that a `rustls::RootCertStore`
+/// cannot be given. A device-installed CA is therefore trusted for HTTPS
+/// and not for FTPS. That is narrower than the rest of the workspace, and
+/// deliberate.
 ///
-/// Built once for the life of the process: parsing ~150 roots per request
-/// is what the laziness is for, and the config is immutable and shared.
+/// It is built once for the life of the process. The laziness exists to
+/// avoid parsing ~150 roots per request, and the config is immutable and
+/// shared.
 fn tls_config() -> Arc<rustls::ClientConfig> {
     static CONFIG: LazyLock<Arc<rustls::ClientConfig>> = LazyLock::new(|| {
         let mut roots = rustls::RootCertStore::empty();
@@ -279,10 +281,10 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
 
-    /// What the route is named for goes through; nothing else does -- a URL
-    /// of another scheme reaching the FTP client is a request nobody meant,
-    /// and `file://` would read the settings file, and the proxy password
-    /// in it, to any app on the device.
+    /// What the route is named for goes through, and nothing else does. A
+    /// URL of another scheme reaching the FTP client is a request nobody
+    /// meant. `file://` would read the settings file, and the proxy
+    /// password in it, to any app on the device.
     #[test]
     fn only_ftp_and_ftps_are_fetched() {
         assert_eq!(
@@ -315,7 +317,7 @@ mod tests {
         );
     }
 
-    /// A URL that begins with `-` is refused by the scheme check: nothing is
+    /// The scheme check refuses a URL that begins with `-`. Nothing is
     /// spawned, so there is no argument vector for a URL to be read as a
     /// flag in.
     #[test]
@@ -362,7 +364,7 @@ mod tests {
         Some(lz_str::compress_to_encoded_uri_component(&json))
     }
 
-    /// The refusal reaches the wire as a 400 before anything is opened: the
+    /// The refusal reaches the wire as a 400 before anything is opened. The
     /// handler has no state, so it is called as the router would.
     #[tokio::test]
     async fn a_non_ftp_url_is_refused_at_the_route() {
@@ -384,8 +386,8 @@ mod tests {
     ///
     /// It exists so the transfer path has a real server to test against
     /// in-process, without depending on one already on the machine running
-    /// it: the server is forty lines of `TcpStream`, and what this route
-    /// does with a login it is refused, or a file that is not there,
+    /// it. The server is forty lines of `TcpStream`. With it, what this
+    /// route does with a refused login, or a file that is not there,
     /// becomes something a test can state.
     #[derive(Clone, Copy)]
     enum Behaviour {
@@ -394,7 +396,7 @@ mod tests {
         NoSuchFile,
     }
 
-    /// A plain FTP server on loopback. Answers the address to point an
+    /// A plain FTP server on loopback. It answers the address to point an
     /// [`FtpTarget`] at.
     async fn ftp_server(behaviour: Behaviour) -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -406,9 +408,9 @@ mod tests {
         addr
     }
 
-    /// The same server inside implicit TLS, as `ftps://` means it: the
-    /// control channel is encrypted from the first byte and so is the data
-    /// connection. Answers the address and the anchor that verifies it.
+    /// The same server inside implicit TLS, as `ftps://` means it. The
+    /// control channel is encrypted from the first byte, and so is the data
+    /// connection. It answers the address and the anchor that verifies it.
     async fn ftps_server(
         behaviour: Behaviour,
     ) -> (
@@ -431,11 +433,11 @@ mod tests {
     /// The FTP conversation itself, over whatever the control channel turned
     /// out to be: a `TcpStream` for `ftp://`, a TLS stream for `ftps://`.
     ///
-    /// `TYPE I` is not merely answered but **required**: a `RETR` that
-    /// arrives without it is refused, because the default transfer mode is
-    /// ASCII and a film fetched in ASCII is a film with every `\r\n` rewritten
-    /// in it. A client that forgot to ask for binary should fail a test here
-    /// rather than deliver a corrupt file in the field.
+    /// `TYPE I` is not merely answered but **required**. A `RETR` that
+    /// arrives without it is refused. The default transfer mode is ASCII,
+    /// and a film fetched in ASCII has every `\r\n` in it rewritten. A
+    /// client that forgot to ask for binary should fail a test here rather
+    /// than deliver a corrupt file in the field.
     async fn dialogue<S>(control: S, behaviour: Behaviour, tls: Option<tokio_rustls::TlsAcceptor>)
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
@@ -508,9 +510,9 @@ mod tests {
     }
 
     /// A chain the FTPS test can present and a client can verify: a CA that
-    /// is a CA, and a leaf it issued for the loopback names. A self-signed
-    /// certificate used as its own anchor is refused by rustls whatever it
-    /// is trusted as, which is why this is two certificates and not one.
+    /// is a CA, and a leaf it issued for the loopback names. rustls refuses
+    /// a self-signed certificate used as its own anchor, whatever it is
+    /// trusted as. That is why this is two certificates and not one.
     fn tls_fixture() -> (
         rustls::ServerConfig,
         rustls::pki_types::CertificateDer<'static>,
@@ -540,9 +542,9 @@ mod tests {
         (config, ca.der().clone())
     }
 
-    /// A client config that trusts one extra anchor and nothing else, which
-    /// is what makes the FTPS test's own server verifiable without giving
-    /// the shipped [`tls_config`] a way to trust anything more.
+    /// A client config that trusts one extra anchor and nothing else. That
+    /// makes the FTPS test's own server verifiable without giving the
+    /// shipped [`tls_config`] a way to trust anything more.
     fn trusting(anchor: rustls::pki_types::CertificateDer<'static>) -> Arc<rustls::ClientConfig> {
         let mut roots = rustls::RootCertStore::empty();
         roots.add(anchor).unwrap();
@@ -571,7 +573,7 @@ mod tests {
     }
 
     /// The bytes the server sends are the bytes the reader gets, in order
-    /// and whole -- the one thing this route exists to do.
+    /// and whole. That is the one thing this route exists to do.
     #[tokio::test]
     async fn a_transfer_delivers_the_file() {
         let addr = ftp_server(Behaviour::Serve(b"a film, in bytes")).await;
@@ -584,12 +586,12 @@ mod tests {
     /// How long a test waits for a transfer before calling it a failure.
     ///
     /// **A bound and not a hedge.** Both ends of every transfer here are in
-    /// this process and the payload is a handful of bytes, so any wait at
-    /// all is a client and a server that disagree -- a plain client against
-    /// a TLS server waits for a greeting that is never sent in cleartext,
-    /// which is what this looks like when the secure branch is broken. A
-    /// test that hangs is one CI cancels an hour later with nothing to read;
-    /// this one says which transfer stopped.
+    /// this process, and the payload is a handful of bytes. So any wait at
+    /// all is a client and a server that disagree. A plain client against a
+    /// TLS server waits for a greeting that is never sent in cleartext. That
+    /// is what this looks like when the secure branch is broken. A test that
+    /// hangs is one CI cancels an hour later with nothing to read. This one
+    /// says which transfer stopped.
     const TEST_TRANSFER_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
 
     /// The whole body of one transfer, within [`TEST_TRANSFER_BOUND`].
@@ -609,14 +611,14 @@ mod tests {
     /// The `ftps://` half, end to end: implicit TLS on the control channel
     /// from the first byte, the data connection wrapped in TLS as well, and
     /// the same bytes out the other side. The client verifies the server's
-    /// chain -- `trusting` gives it that server's anchor and nothing else,
-    /// so a handshake that skipped verification would fail this too.
+    /// chain. `trusting` gives it that server's anchor and nothing else, so
+    /// a handshake that skipped verification would fail this too.
     #[tokio::test]
     async fn a_secure_transfer_delivers_the_file() {
         let (addr, anchor) = ftps_server(Behaviour::Serve(b"a film, encrypted")).await;
         let mut target = target(addr, "/dir/film.mkv");
         target.secure = true;
-        // The name on the certificate, not the address: an FTPS client that
+        // The name on the certificate, not the address. An FTPS client that
         // checked neither would pass with either.
         target.host = "localhost".into();
         assert_eq!(
@@ -626,7 +628,7 @@ mod tests {
     }
 
     /// Both ways an origin refuses are an error before the response head is
-    /// built, which is what lets the route answer with a status at all.
+    /// built. That is what lets the route answer with a status at all.
     #[tokio::test]
     async fn a_refused_login_and_a_missing_file_are_both_errors() {
         let refused = ftp_server(Behaviour::RefuseLogin).await;
@@ -638,9 +640,9 @@ mod tests {
         // `an_origin_that_refuses_is_a_bad_gateway` states for the second.
     }
 
-    /// What the response head carries, which is what a player reads before
-    /// it reads a byte: the type guessed from the name in the path, the
-    /// inline disposition, and the two DLNA headers a renderer wants.
+    /// What the response head carries. A player reads it before it reads a
+    /// byte: the type guessed from the name in the path, the inline
+    /// disposition, and the two DLNA headers a renderer wants.
     #[tokio::test]
     async fn the_response_carries_the_headers_a_player_expects() {
         let addr = ftp_server(Behaviour::Serve(b"bytes")).await;
@@ -669,7 +671,7 @@ mod tests {
     }
 
     /// An origin that refuses reaches the caller as a `502`, not a `200`
-    /// with an empty body: the transfer opens, and can fail, before any
+    /// with an empty body. The transfer opens, and can fail, before any
     /// header is written.
     #[tokio::test]
     async fn an_origin_that_refuses_is_a_bad_gateway() {

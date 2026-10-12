@@ -39,14 +39,14 @@ struct CreateQuery {
 
 /// How much a member body asks its reader for per chunk.
 ///
-/// `ReaderStream::new` reads 4 KiB at a time, and for an archive member
-/// that is 4 KiB per read of whatever holds the container's bytes -- a
-/// seek of the piece store, a ranged read through the proxy cache -- per
-/// boxed future, per socket write; measured at some fourteen times the CPU
-/// per byte of a 256 KiB read on a desktop core, on what is the streaming
-/// hot path of the weakest devices this runs on. Every media body reads
-/// with it -- the torrent stream route, the archive members and `/ftp` --
-/// at 256 KiB per active stream.
+/// `ReaderStream::new` reads 4 KiB at a time. For an archive member that is
+/// 4 KiB per read of whatever holds the container's bytes (a seek of the
+/// piece store, a ranged read through the proxy cache), per boxed future,
+/// per socket write. That was measured at some fourteen times the CPU per
+/// byte of a 256 KiB read on a desktop core. This is the streaming hot path
+/// of the weakest devices this runs on. Every media body reads with it (the
+/// torrent stream route, the archive members and `/ftp`), at 256 KiB per
+/// active stream.
 pub(crate) const MEDIA_BODY_CHUNK_BYTES: usize = 256 * 1024;
 
 /// The response body for a media reader: [`MEDIA_BODY_CHUNK_BYTES`] per read.
@@ -54,7 +54,7 @@ pub(crate) fn media_body<R: tokio::io::AsyncRead>(reader: R) -> ReaderStream<R> 
     ReaderStream::with_capacity(reader, MEDIA_BODY_CHUNK_BYTES)
 }
 
-/// Which container format a URL prefix names -- the prefix is what says
+/// Which container format a URL prefix names. The prefix is what says
 /// *which translator reads this* (`crate::translators`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
@@ -84,9 +84,9 @@ impl Format {
         }
     }
 
-    /// The translator for this format -- `None` only for RAR in a build
-    /// without the `rar` feature, which has no reader for it at all and
-    /// answers `rar_disabled_response` instead.
+    /// The translator for this format. It is `None` only for RAR in a build
+    /// without the `rar` feature. That build has no reader for it at all
+    /// and answers `rar_disabled_response` instead.
     fn translator(self) -> Option<Box<dyn Translator>> {
         match self {
             Self::Zip => Some(Box::new(crate::translators::zip::Zip)),
@@ -102,10 +102,10 @@ impl Format {
     }
 }
 
-/// What a refused member is answered with, in **one** place: `415` for a
-/// member this server will not serve by range (§3 of the design), `422`
-/// for a container that contradicts itself. The body carries the kind the
-/// client switches on and the sentence it shows -- xtremio's
+/// What a refused member is answered with, in **one** place. It is `415`
+/// for a member this server will not serve by range (§3 of the design), and
+/// `422` for a container that contradicts itself. The body carries the kind
+/// the client switches on and the sentence it shows. xtremio's
 /// `archive_sniff` already has the place for it.
 fn refusal_response(refusal: &Refusal) -> Response {
     let status = match refusal {
@@ -128,20 +128,20 @@ fn refusal_response(refusal: &Refusal) -> Response {
 
 /// What a URL that cannot be a source is answered with. **An origin that
 /// will not serve ranges is `501`**, because it is this server that
-/// declines to do the work: serving a member out of it would mean
+/// declines to do the work. Serving a member out of it would mean
 /// downloading the whole archive first, which is the thing the design
 /// exists to stop.
 ///
-/// Shared with `routes::drive`, which opens a `ProxySource` of its own and
-/// owes a client the same four answers about one.
+/// It is shared with `routes::drive`, which opens a `ProxySource` of its own
+/// and owes a client the same four answers about one.
 pub(crate) fn source_error_response(error: &ProxySourceError) -> Response {
     // `noRanges` is a *refusal*, in the same shape as a translator's, and
-    // not an `error`: it is a thing about this source that the viewer can
+    // not an `error`. It is a thing about this source that the viewer can
     // be told in the viewer's own words ("this link will not serve the
-    // film in pieces"), and a client that has to tell it from the other
-    // `501` -- a build with no reader for the format, which is a sentence
-    // for whoever built the app and never for a television -- would
-    // otherwise have to match English. See [`no_reader_response`].
+    // film in pieces"). A client has to tell it from the other `501`: a
+    // build with no reader for the format, which is a sentence for whoever
+    // built the app and never for a television. Without the kind, that
+    // client would have to match English. See [`no_reader_response`].
     match error {
         ProxySourceError::WillNotRange => (
             StatusCode::NOT_IMPLEMENTED,
@@ -156,17 +156,17 @@ pub(crate) fn source_error_response(error: &ProxySourceError) -> Response {
             Json(serde_json::json!({ "error": error.to_string() })),
         )
             .into_response(),
-        // `Credentials` cannot arise on the archive routes -- a
+        // `Credentials` cannot arise on the archive routes. A
         // `/{fmt}/create` relays the caller's own `h=`, which is a value
-        // and not a grant to renew -- and it is answered rather than
-        // `unreachable!()`d, because the arm that says "this cannot
-        // happen" is how a later source that mints its own header gets a
-        // panic instead of a status -- and `/drive` is exactly that
-        // source: it shares this function, and its one terminal case --
-        // a grant that is gone -- never reaches here, because
-        // `DriveError` lifts `pairAgain` out of a `Credentials` before
-        // answering (`sources::drive`). A `502` is right for what is left
-        // either way: the far end would not authorise us.
+        // and not a grant to renew. It is still answered rather than
+        // `unreachable!()`d. An arm that says "this cannot happen" is how a
+        // later source that mints its own header gets a panic instead of a
+        // status. `/drive` is exactly that source, and it shares this
+        // function. Its one terminal case, a grant that is gone, never
+        // reaches here, because `DriveError` lifts `pairAgain` out of a
+        // `Credentials` before answering (`sources::drive`). A `502` is
+        // right for what is left either way: the far end would not
+        // authorise us.
         ProxySourceError::Origin(_)
         | ProxySourceError::Fetch(_)
         | ProxySourceError::Credentials(_) => (
@@ -186,17 +186,17 @@ pub(crate) struct ArchiveCreateRequest {
 }
 
 /// The whole archive API under one format prefix: [`session_router`] and
-/// [`stream_router`] together, which is what the loopback listener mounts.
+/// [`stream_router`] together. This is what the loopback listener mounts.
 pub fn router(format: Format) -> Router<AppState> {
     stream_router(format).merge(session_router(format))
 }
 
-/// The session-creating half: `/create` takes a container by URL -- the
-/// volume list, from wherever the caller names -- reads its index off it
-/// and remembers that, with the member chosen, under a key. Loopback only:
-/// it reaches out to a caller-named address, which is why the LAN listener
-/// never mounts any of this: it serves published cast tokens alone
-/// (`crate::cast`).
+/// The session-creating half. `/create` takes a container by URL (the
+/// volume list, from wherever the caller names), reads its index off it,
+/// and remembers that, with the member chosen, under a key. It is loopback
+/// only, because it reaches out to a caller-named address. That is why the
+/// LAN listener never mounts any of this. The LAN listener serves published
+/// cast tokens alone (`crate::cast`).
 pub fn session_router(format: Format) -> Router<AppState> {
     Router::new()
         .route(
@@ -208,12 +208,12 @@ pub fn session_router(format: Format) -> Router<AppState> {
             get(create_session_with_key).post(create_session_with_key),
         )
         // The prefix these routes are mounted under, as the handlers read
-        // it: `crate::archive_prefixes` mounts one of these per format.
+        // it. `crate::archive_prefixes` mounts one of these per format.
         .layer(Extension(format))
 }
 
 /// The byte-serving half: a member read out of a session [`session_router`]
-/// already created. Nothing here fetches, opens or names anything -- an
+/// already created. Nothing here fetches, opens or names anything. An
 /// unknown key is a `404`.
 pub fn stream_router(format: Format) -> Router<AppState> {
     Router::new()
@@ -225,8 +225,8 @@ pub fn stream_router(format: Format) -> Router<AppState> {
 
 /// What a build without the `rar` cargo feature says about a RAR. The
 /// feature is off in the MIT build, because `unrar-rs` is GPL-3.0 (see
-/// `server/Cargo.toml` and AGENTS.md) -- so such a build has no RAR
-/// reader at all, and says so rather than failing as some other error.
+/// `server/Cargo.toml` and AGENTS.md). So such a build has no RAR reader at
+/// all, and says so rather than failing as some other error.
 #[cfg(not(feature = "rar"))]
 const RAR_DISABLED_ERROR: &str =
     "RAR support is not compiled into this build (rebuild with the \"rar\" cargo feature)";
@@ -239,11 +239,12 @@ fn rar_disabled_response() -> Response {
     no_reader_response(RAR_DISABLED_ERROR)
 }
 
-/// **This build has no reader for the format**, which is a fact about the
-/// build and not about the source: `noReader`, so a client shows its own
-/// sentence ("this build cannot read RAR archives") rather than the one
-/// here, which names a cargo feature and is for whoever builds the app.
-/// The `message` travels all the same, for a log and for a developer.
+/// **This build has no reader for the format.** That is a fact about the
+/// build, not about the source. The kind is `noReader`, so a client shows
+/// its own sentence ("this build cannot read RAR archives") rather than the
+/// one here. The one here names a cargo feature and is for whoever builds
+/// the app. The `message` travels all the same, for a log and for a
+/// developer.
 fn no_reader_response(message: &str) -> Response {
     (
         StatusCode::NOT_IMPLEMENTED,
@@ -406,14 +407,14 @@ async fn create_session_internal(
     Json(CreateResponse { key }).into_response()
 }
 
-/// Why a container's session could not be had -- made by a `/create`, found
+/// Why a container's session could not be had: made by a `/create`, found
 /// under a key, or indexed off a torrent's file for the `torrent:` form.
 ///
 /// **One set of reasons, two framings.** The archive routes answer each with
-/// the status and body they always have ([`Self::response`]); a media id
+/// the status and body they always have ([`Self::response`]). A media id
 /// naming a member is refused with the same reason, typed
 /// (`crate::media::Refusal::of_session`). Neither framing lives in the
-/// other: the work is the same function for both.
+/// other. The work is the same function for both.
 #[derive(Debug)]
 pub(crate) enum SessionError {
     /// The create's payload, or a URL in it, cannot be taken (`400`, with
@@ -481,11 +482,11 @@ pub(crate) fn no_reader_message(format: Format) -> &'static str {
 
 /// What a format this build has no reader for answers.
 ///
-/// There is exactly one: RAR in a build without the `rar` cargo feature,
-/// which leaves `unrar-rs` out for its licence (`server/Cargo.toml`) and
-/// so has no RAR reader at all. Every other format the router mounts is
-/// compiled in, so the arm after it is unreachable -- answered rather than
-/// panicked, because a route that answers beats a process that goes down.
+/// There is exactly one: RAR in a build without the `rar` cargo feature.
+/// That build leaves `unrar-rs` out for its licence (`server/Cargo.toml`),
+/// so it has no RAR reader at all. Every other format the router mounts is
+/// compiled in, so the arm after it is unreachable. It answers rather than
+/// panics, because a route that answers beats a process that goes down.
 fn no_translator_response(format: Format) -> Response {
     #[cfg(not(feature = "rar"))]
     if format == Format::Rar {
@@ -497,27 +498,28 @@ fn no_translator_response(format: Format) -> Response {
 
 /// How a set of volumes is named as one session.
 ///
-/// **Every** URL, and not the first: `rarUrls` is a list of volumes, two
-/// sets can share a `.part1.rar` and differ after it, and a session found
-/// by the first URL alone would answer one set's index over the other's
-/// bytes. A newline cannot occur inside a URL, so the join is unambiguous.
-/// A single-volume archive's origin is its URL, exactly as before.
+/// **Every** URL names it, not just the first. `rarUrls` is a list of
+/// volumes, and two sets can share a `.part1.rar` and differ after it. A
+/// session found by the first URL alone would answer one set's index over
+/// the other's bytes. A newline cannot occur inside a URL, so the join is
+/// unambiguous. A single-volume archive's origin is its URL, exactly as
+/// before.
 fn set_origin(urls: &[String]) -> String {
     urls.join("\n")
 }
 
-/// `/{zip|tar|rar}/create`: every URL becomes a [`ProxySource`], the
-/// translator indexes them **in the order they were given**, and what is
-/// remembered under the key is the index -- no file, nothing on disk,
-/// nothing to sweep but memory. Answers the session, leased, and the
-/// member the request picked.
+/// `/{zip|tar|rar}/create`. Every URL becomes a [`ProxySource`], and the
+/// translator indexes them **in the order they were given**. What is
+/// remembered under the key is the index: no file, nothing on disk, nothing
+/// to sweep but memory. It answers the session, leased, and the member the
+/// request picked.
 ///
-/// The list is the volume list. For RAR that is the ordinary case: from an
+/// The list is the volume list. For RAR that is the ordinary case. From an
 /// addon, `rarUrls` *is* `.part1.rar`, `.part2.rar`, ... in order, and the
 /// extents a member is made of name the volume each part is in
 /// (`docs/design/translated-sources.md` §2.2). A format that does not come in
-/// sets reads `sources[0]` and says so about the rest, which is what every
-/// translator but RAR does.
+/// sets reads `sources[0]` and says so about the rest. Every translator but
+/// RAR does that.
 ///
 /// The route's `/create` and a media id naming the same URL
 /// (`crate::media`) both make their session here.
@@ -533,11 +535,11 @@ pub(crate) async fn create_session(
         ));
     };
     // Only what the route is named for: archives at web addresses. This
-    // route is open to any loopback caller -- on Android, every app on the
-    // device, and any page in a browser on it -- so a URL that was taken
-    // as a local path served the members of any archive this process could
+    // route is open to any loopback caller (on Android, every app on the
+    // device, and any page in a browser on it). A URL that was taken as a
+    // local path served the members of any archive this process could
     // read, its own private storage included. Every volume is checked, not
-    // just the first: a set is read whole, so a local path anywhere in the
+    // just the first. A set is read whole, so a local path anywhere in the
     // list would be read.
     if !payload
         .urls
@@ -550,10 +552,10 @@ pub(crate) async fn create_session(
     }
     let origin = set_origin(&payload.urls);
     // A key the caller chose (`/{fmt}/create/{key}`) may name a session
-    // that already exists, and replacing it points every later
-    // `/{fmt}/stream/{key}/...` at a different archive: the player that
-    // was reading one file seeks and reads another's bytes. A repeat of
-    // the same create is the ordinary case (a re-play sends it again).
+    // that already exists. Replacing it points every later
+    // `/{fmt}/stream/{key}/...` at a different archive. The player that
+    // was reading one file then seeks and reads another's bytes. A repeat
+    // of the same create is the ordinary case (a re-play sends it again).
     if let Some(existing) = state.translated_archives.get(&key)
         && existing.origin() != origin
     {
@@ -565,7 +567,7 @@ pub(crate) async fn create_session(
     }
 
     // A session that already holds this URL has already probed the origin
-    // and read the index off it; a re-play sends the same create again and
+    // and read the index off it. A re-play sends the same create again and
     // should cost neither.
     let indexed = match state
         .translated_archives
@@ -584,7 +586,7 @@ pub(crate) async fn create_session(
             (sources.clone(), existing.index().clone())
         }
         None => {
-            // One source per volume, in the order they were given: an
+            // One source per volume, in the order they were given. An
             // `Extent`'s `source` is an index into this list, so a set
             // probed out of order would serve every part of the film from
             // the wrong volume.
@@ -607,8 +609,8 @@ pub(crate) async fn create_session(
                     state.proxy_cache.clone(),
                     state.http_addr,
                     parsed,
-                    // No `h=` of any kind on this route yet; the caller's
-                    // headers are what would go here, which is what makes
+                    // No `h=` of any kind on this route yet. The caller's
+                    // headers are what would go here. They are what makes
                     // these reads the relay the cache refuses to key on.
                     std::collections::BTreeMap::new(),
                 )
@@ -644,8 +646,8 @@ pub(crate) async fn create_session(
 
     let selected = select_member(&index, payload.file_idx, &payload.file_must_include)?;
     // A create that named a member this server will not serve says so now
-    // rather than at the first byte: the player has a sentence to show and
-    // no session to clean up.
+    // rather than at the first byte. The player then has a sentence to show
+    // and no session to clean up.
     if let Some(member) = selected.and_then(|at| index.members.get(at))
         && let MemberBody::Opaque(refusal) = &member.body
     {
@@ -740,9 +742,9 @@ async fn stream_redirection(
     };
     // **The session first, which for a `torrent:` key is what indexes it.**
     // A container inside a torrent has no `/create` to be made at, and its
-    // member names are known only to its index -- so indexing it here is
-    // what lets a client ask for a member of a torrent's archive without
-    // being told its name first.
+    // member names are known only to its index. Indexing it here is what
+    // lets a client ask for a member of a torrent's archive without being
+    // told its name first.
     let session = match session_for(&state, translator.as_ref(), &key).await {
         Ok(session) => session,
         Err(error) => return error.response(),
@@ -763,10 +765,10 @@ async fn stream_redirection(
     }
 }
 
-/// The member `session` plays when no member is named: the one its create
-/// selected, or -- for a `torrent:` session, which was made by no create
-/// and carries none -- the one the same rule `/create` uses picks, `-1`
-/// and no filters unless the caller states them, which is the contract
+/// The member `session` plays when no member is named. That is the one its
+/// create selected. A `torrent:` session was made by no create and carries
+/// none. For it, the same rule `/create` uses picks the member, with `-1`
+/// and no filters unless the caller states them. That is the contract
 /// `/create` has.
 pub(crate) fn chosen_member(
     session: &TranslatedSession,
@@ -788,10 +790,10 @@ pub(crate) fn chosen_member(
 }
 
 /// Which member a redirect should pick, for a session that has not chosen
-/// one -- the same two things `/create`'s request carries, as query
+/// one. These are the same two things `/create`'s request carries, as query
 /// parameters, so a `torrent:` container can be pointed at a file the way a
 /// link-borne one can. `f` is the spelling the stream route already uses for
-/// its filters; `fileIdx` is `/create`'s.
+/// its filters, and `fileIdx` is `/create`'s.
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MemberSelection {
@@ -830,9 +832,9 @@ async fn stream_member(
 /// A member of a translated container, served as byte ranges of whatever
 /// holds the container's own bytes.
 ///
-/// **Nothing about a member's HTTP behaviour differs from a plain file's**:
-/// the framing is `util::MediaRange`, which is the torrent stream route's
-/// own, so `Content-Length`, `Content-Range`, `206`/`416` and `HEAD` are
+/// **Nothing about a member's HTTP behaviour differs from a plain file's.**
+/// The framing is `util::MediaRange`, which is the torrent stream route's
+/// own. So `Content-Length`, `Content-Range`, `206`/`416` and `HEAD` are
 /// the same answers here as there.
 async fn stream_translated(
     state: &AppState,
@@ -886,13 +888,13 @@ async fn stream_translated(
     framing.write_headers(size, &mut res_headers);
     compat::add_dlna_headers(&mut res_headers);
 
-    // The reader starts where the range does and stops where it ends; the
+    // The reader starts where the range does and stops where it ends. The
     // session's lease rides inside the body, so the session is in use for
-    // as long as the player reads and cannot be taken under it -- not by
-    // the cap and not by the viewer opening something else, which is what
-    // ends an unleased one (`translators::session`). For a torrent-backed
-    // member the source inside the view holds the stream registration, and
-    // it goes the same way.
+    // as long as the player reads, and cannot be taken under it. Neither
+    // the cap nor the viewer opening something else can take it. The
+    // latter is what ends an unleased one (`translators::session`). For a
+    // torrent-backed member, the source inside the view holds the stream
+    // registration, and it goes the same way.
     let reader = view
         .reader_at(framing.start)
         .take(framing.content_length(size));
@@ -906,11 +908,11 @@ async fn stream_translated(
 /// `key` in the one spelling the session registry files it under.
 ///
 /// A `torrent:<info hash>/<path>` key names its torrent by a hash, and a
-/// hash is hex whatever its case: the engine folds it before it looks a
-/// torrent up (`TorrentSource`), so `torrent:ABC…/film.rar` and
-/// `torrent:abc…/film.rar` name one archive -- filed as written, they would
+/// hash is hex whatever its case. The engine folds it before it looks a
+/// torrent up (`TorrentSource`). So `torrent:ABC…/film.rar` and
+/// `torrent:abc…/film.rar` name one archive. Filed as written, they would
 /// be two sessions over it, each indexing it and each holding a lease. Only
-/// the hash is folded; the path is the torrent's own and its case means
+/// the hash is folded. The path is the torrent's own, and its case means
 /// something. Any other key is the registry's own name for a `/create`d
 /// session and is returned as it came.
 fn canonical_key(key: &str) -> Cow<'_, str> {
@@ -925,9 +927,10 @@ fn canonical_key(key: &str) -> Cow<'_, str> {
     }
 }
 
-/// The session under `key`, leased -- creating it for the `torrent:` form,
-/// which has no `/create` of its own. What the archive routes and a media
-/// id naming a member (`crate::media`) both find a session with.
+/// The session under `key`, leased. It creates the session for the
+/// `torrent:` form, which has no `/create` of its own. The archive routes
+/// and a media id naming a member (`crate::media`) both find a session with
+/// this.
 pub(crate) async fn session_for(
     state: &AppState,
     translator: &dyn Translator,
@@ -938,7 +941,7 @@ pub(crate) async fn session_for(
     if let Some(session) = state.translated_archives.get(key) {
         return Ok(session);
     }
-    // `torrent:<info hash>/<path in the torrent>`: the archive is a file
+    // `torrent:<info hash>/<path in the torrent>`. The archive is a file
     // of a torrent this server already has, and the first request for a
     // member of it is what indexes it.
     let Some(rest) = key.strip_prefix("torrent:") else {
@@ -948,8 +951,8 @@ pub(crate) async fn session_for(
         return Err(SessionError::BadKey);
     };
     // The named file may be one volume of a set, and for RAR it usually
-    // is: the rest of the set is the files beside it in the torrent, and
-    // the translator's own naming rules say which and in what order
+    // is. The rest of the set is the files beside it in the torrent. The
+    // translator's own naming rules say which, and in what order
     // (`translators::rar::volume_set`). A format that does not come in
     // sets answers with the one file, which is the trait's default.
     let siblings = TorrentSource::file_names(&state.engine, info_hash)
@@ -960,14 +963,14 @@ pub(crate) async fn session_for(
         })?;
     let paths = translator.volumes(path, &siblings).map_err(|refusal| {
         // A set with a hole in it is `Malformed`, naming the volume it
-        // wanted -- `422`, and said at the index rather than as a short
+        // wanted. That is `422`, said at the index rather than as a short
         // read in the middle of a film.
         tracing::warn!(%info_hash, archive = path, %refusal, "the set is not all there");
         SessionError::Refused(refusal)
     })?;
-    // Held before the first volume opens: the opens below are what would
-    // move the live entity, and the hold is what makes an open of the
-    // second volume beside the first rather than a move off it.
+    // This is held before the first volume opens. The opens below are what
+    // would move the live entity. The hold makes an open of the second
+    // volume sit beside the first rather than move off it.
     let hold = (paths.len() > 1).then(|| {
         let files = paths
             .iter()
@@ -991,12 +994,12 @@ pub(crate) async fn session_for(
     })?;
     // The sources are **not** kept: see `SessionSources::Torrent`. The
     // insert leases what it made, so the read that follows cannot find it
-    // gone: indexing the container is itself what moved the live entity,
-    // and a look-up after the insert would be a second chance for the cell
-    // to move again in between. Insert-if-absent, because a player opens a
-    // member with several requests at once: two that both missed above
+    // gone. Indexing the container is itself what moved the live entity. A
+    // look-up after the insert would be a second chance for the cell to
+    // move again in between. It is insert-if-absent, because a player opens
+    // a member with several requests at once. Two that both missed above
     // both indexed, and the first one in is the session every later request
-    // gets -- the other index is dropped rather than replacing a session
+    // gets. The other index is dropped rather than replacing a session
     // somebody already holds a lease on.
     Ok(state.translated_archives.get_or_insert_with(key, || {
         TranslatedSession::new(
@@ -1012,7 +1015,7 @@ pub(crate) async fn session_for(
     }))
 }
 
-/// The sources a body of this session reads through -- the ones it holds,
+/// The sources a body of this session reads through: the ones it holds,
 /// or a torrent file opened for this read alone.
 async fn sources_for(
     state: &AppState,
@@ -1024,7 +1027,7 @@ async fn sources_for(
         SessionSources::Torrent {
             info_hash, paths, ..
         } => {
-            // Every volume, in the order the index was read in: an
+            // Every volume, in the order the index was read in. An
             // `Extent`'s `source` indexes this list.
             let mut sources: Vec<Arc<dyn ByteSource>> = Vec::with_capacity(paths.len());
             for path in paths {
@@ -1064,7 +1067,7 @@ mod tests {
         assert_eq!(canonical_key(UPPER), LOWER, "the path keeps its case");
         assert!(matches!(canonical_key(LOWER), Cow::Borrowed(_)));
         // A `/create`d session's key is the registry's own, and a key
-        // with no path is refused later; neither is rewritten.
+        // with no path is refused later. Neither is rewritten.
         for key in ["0123ABCD", "torrent:ABCDEF"] {
             assert_eq!(canonical_key(key), key);
         }

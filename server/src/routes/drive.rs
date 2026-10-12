@@ -1,41 +1,42 @@
 //! **A paired Google Drive file, as something a player can open.**
 //!
 //! [`crate::sources::drive::DriveSource`] already reads one by range and
-//! renews its own access token; this is what lets anything ask for one.
-//! It is the archive layer's shape ([`crate::routes::archive`]) with a
-//! single file where a container would be: [`open_file`] opens the file
-//! and remembers it under a key, and a `GET /drive/stream/{key}` serves
-//! that file's bytes.
+//! renews its own access token. This module is what lets anything ask for
+//! one. It is the archive layer's shape ([`crate::routes::archive`]) with a
+//! single file where a container would be. [`open_file`] opens the file and
+//! remembers it under a key, and a `GET /drive/stream/{key}` serves that
+//! file's bytes.
 //!
 //! # Where the credential travels, and where it does not
 //!
-//! The refresh token is the longest-lived secret this device holds: it
-//! does not expire on its own and it reaches every file the account has
+//! The refresh token is the longest-lived secret this device holds. It
+//! does not expire on its own, and it reaches every file the account has
 //! picked through this OAuth client. So the two halves are split along
 //! exactly that line.
 //!
 //! * **The open is a function call**, [`crate::ServerHandle::open_drive_file`],
 //!   and the refresh token is one of its arguments. It is not a request at
 //!   all: not a query parameter, not a path segment, not a header and not
-//!   a body -- the request line is the half of a request that gets logged
-//!   (by the tracing layer here, `routes::util::log_path`, by whatever an
+//!   a body. The request line is the half of a request that gets logged:
+//!   by the tracing layer here (`routes::util::log_path`), by whatever an
 //!   embedder puts in front, and by the diagnostics report the app lets a
-//!   viewer copy), and a body is one copy more of the secret in flight.
-//!   There is no `POST /drive/create` route to take it in a JSON body:
-//!   a control route the app never calls is not kept (`control_router` in
+//!   viewer copy. A body is one copy more of the secret in flight.
+//!   There is no `POST /drive/create` route to take it in a JSON body.
+//!   A control route the app never calls is not kept (`control_router` in
 //!   `lib.rs` says which remain and why). `/proxy`'s `h=Authorization:...`
-//!   overrides are the existing way to put a credential on a relayed fetch
-//!   and they are **not** reused here: they ride in the path, and an `h=`
-//!   is a header value relayed verbatim, while what a Drive file needs is
-//!   a *grant* that is spent for a new header every hour, which is
-//!   `DriveCredential`'s whole job and cannot be a value copied into a URL.
+//!   overrides are the existing way to put a credential on a relayed fetch,
+//!   and they are **not** reused here. They ride in the path, and an `h=`
+//!   is a header value relayed verbatim. What a Drive file needs is a
+//!   *grant* that is spent for a new header every hour. That is
+//!   `DriveCredential`'s whole job, and it cannot be a value copied into a
+//!   URL.
 //!
 //! * **`GET /drive/stream/{key}` is an open media route** and carries a
 //!   random key and nothing else. A player cannot send headers, so the URL
-//!   handed to mpv has to be usable as it stands -- and this one is
-//!   usable, meaningless to anyone who has not been given it, and
-//!   unchanged by the token rotating under it. The token never reaches the
-//!   player, the diagnostics log, the cast receiver or an `open` line.
+//!   handed to mpv has to be usable as it stands. This one is usable,
+//!   meaningless to anyone who has not been given it, and unchanged by the
+//!   token rotating under it. The token never reaches the player, the
+//!   diagnostics log, the cast receiver or an `open` line.
 //!
 //! Nothing in this module writes either token anywhere. The only thing it
 //! logs about a file is the file id, which is not a secret (it is the
@@ -45,24 +46,23 @@
 //!
 //! # A dead pairing arrives as itself
 //!
-//! [`DriveError::PairAgain`] is terminal: the grant is gone and only a new
+//! [`DriveError::PairAgain`] is terminal. The grant is gone, and only a new
 //! QR scan brings it back. An app that cannot tell it from "Google is
-//! having a moment" shows a spinner for something that will never finish,
-//! so the open answers it as a kind of its own
-//! ([`DriveOpenError::is_pair_again`], `refused() == Some("pairAgain")`)
-//! while everything else that could pass is a sentence. That is the
-//! archive layer's own convention (`refused` is a kind the client switches
-//! on, `error` is a sentence), and the switch is on the kind, never on the
-//! English.
+//! having a moment" shows a spinner for something that will never finish.
+//! So the open answers it as a kind of its own
+//! ([`DriveOpenError::is_pair_again`], `refused() == Some("pairAgain")`),
+//! and everything else that could pass is a sentence. That is the archive
+//! layer's own convention (`refused` is a kind the client switches on,
+//! `error` is a sentence). The switch is on the kind, never on the English.
 //!
-//! The stream route answers the same way, over HTTP because a player is
-//! what asks: a session whose pairing has since died is **`401` with
-//! `{"refused":"pairAgain"}`** rather than a body that stops, because the
-//! player re-opens and the app has to learn why.
+//! The stream route answers the same way, over HTTP, because a player is
+//! what asks. A session whose pairing has since died is **`401` with
+//! `{"refused":"pairAgain"}`** rather than a body that stops. The player
+//! re-opens, and the app has to learn why.
 //!
 //! # Not on the LAN listener
 //!
-//! [`stream_routes`] is loopback only, like every route: the LAN listener
+//! [`stream_routes`] is loopback only, like every route. The LAN listener
 //! serves published cast tokens and nothing else (`crate::cast`). A Drive
 //! file is cast by publishing its media id, so the receiver sees one file
 //! under a random token, never a Drive route it could walk.
@@ -91,14 +91,14 @@ use uuid::Uuid;
 /// Where the two services a Drive file needs live, for this server.
 ///
 /// **Neither is a caller's URL, and that is the point.** `DriveSource`'s
-/// own note says why the API base is a constant rather than a parameter:
-/// a caller who could name the origin would have this server fetch an
-/// arbitrary host under a credential it renews and *cache* the answer
-/// under the vouch `DriveSource` makes -- which is the open-relay shape
+/// own note says why the API base is a constant rather than a parameter.
+/// A caller who could name the origin would have this server fetch an
+/// arbitrary host under a credential it renews. It would then *cache* the
+/// answer under the vouch `DriveSource` makes. That is the open-relay shape
 /// `/proxy` has and `DriveSource` deliberately does not. So the origin is
 /// fixed here, at the server, and a create carries a file id.
 ///
-/// The refresh endpoint is the embedder's rather than a constant: the
+/// The refresh endpoint is the embedder's rather than a constant. The
 /// client secret lives in whatever pairing service the embedder runs, and
 /// this repository ships none. A server configured with none answers
 /// [`DriveOpenError::NoPairingService`] and creates nothing.
@@ -106,8 +106,8 @@ pub struct DriveEndpoints {
     /// `POST {"refreshToken":...}` -> `{"accessToken","expiresIn"}`, the
     /// service that holds the OAuth client secret.
     refresh: Url,
-    /// Where Drive itself is: [`GOOGLE_DRIVE_API`] in a shipped build, a
-    /// loopback origin in the tests.
+    /// Where Drive itself is: [`GOOGLE_DRIVE_API`] in a shipped build, and
+    /// a loopback origin in the tests.
     api_base: Url,
 }
 
@@ -121,10 +121,10 @@ impl DriveEndpoints {
         }
     }
 
-    /// The same, against another origin entirely -- what a test points at
-    /// its fake Drive. `#[doc(hidden)]`: an embedder has no use for it,
-    /// and a build that let one through would be handing the vouch above
-    /// to whoever set the configuration.
+    /// The same, against another origin entirely. A test points this at
+    /// its fake Drive. It is `#[doc(hidden)]` because an embedder has no
+    /// use for it. A build that let one through would be handing the vouch
+    /// above to whoever set the configuration.
     #[doc(hidden)]
     pub fn against(refresh_endpoint: Url, api_base: Url) -> Self {
         Self {
@@ -135,11 +135,11 @@ impl DriveEndpoints {
 
     /// The pairing for one file under this device's grant.
     ///
-    /// **Built already expired**, with no access token at all: the app
+    /// **Built already expired**, with no access token at all. The app
     /// keeps only the refresh token (that is what the secure store holds),
     /// so there is none to hand over. The open's first `bearer()` therefore
-    /// renews before its first request, which is not a special case -- it
-    /// is the ordinary path `DriveCredential` takes a minute before every
+    /// renews before its first request. That is not a special case. It is
+    /// the ordinary path `DriveCredential` takes a minute before every
     /// expiry, taken once at the start.
     pub(crate) fn pairing(&self, file_id: &str, refresh_token: &str) -> DrivePairing {
         DrivePairing {
@@ -155,17 +155,17 @@ impl DriveEndpoints {
 
 /// One opened Drive file, for as long as anything is reading it.
 ///
-/// It holds the source and nothing else: the credential is inside the
+/// It holds the source and nothing else. The credential is inside the
 /// source, where the only thing that can reach it is the header supplier.
 pub struct DriveSession {
     source: Arc<DriveSource>,
 }
 
 impl DriveSession {
-    /// Whether the entity the viewer is playing is this file -- the rule
-    /// `Sessions::retain` is given at the switch, exactly as a translated
-    /// container's is (`crate::run`). A source is the only thing that
-    /// knows which retained entity its bytes are.
+    /// Whether the entity the viewer is playing is this file. This is the
+    /// rule `Sessions::retain` is given at the switch, exactly as a
+    /// translated container's is (`crate::run`). A source is the only thing
+    /// that knows which retained entity its bytes are.
     pub fn is_live(&self, reading: &enginefs::retention::live::Reading) -> bool {
         self.source.is_live(reading)
     }
@@ -176,7 +176,8 @@ impl DriveSession {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DriveFileOpened {
-    /// The session key. Random, so it is not guessable from the file id.
+    /// The session key. It is random, so it is not guessable from the file
+    /// id.
     pub key: String,
     /// Where the bytes are: `/drive/stream/{key}` as a route answers, and
     /// an absolute URL on this server as
@@ -195,9 +196,9 @@ pub struct DriveFileOpened {
 #[derive(Debug)]
 pub enum DriveOpenError {
     /// This server was configured with no pairing service, so there is
-    /// nothing to renew a token against. A fact about the build and its
-    /// embedder, like the archive layer's `noReader`, and never about the
-    /// viewer's account.
+    /// nothing to renew a token against. It is a fact about the build and
+    /// its embedder, like the archive layer's `noReader`, and never about
+    /// the viewer's account.
     NoPairingService,
     /// Everything the source layer can say, `PairAgain` above all.
     Drive(DriveError),
@@ -224,7 +225,7 @@ impl From<DriveError> for DriveOpenError {
 }
 
 impl DriveOpenError {
-    /// Whether this is the terminal one: the grant is gone and only a new
+    /// Whether this is the terminal one: the grant is gone, and only a new
     /// pairing brings it back. **The one question a caller asks without
     /// matching English.**
     pub fn is_pair_again(&self) -> bool {
@@ -245,8 +246,8 @@ impl DriveOpenError {
 /// Open the file `file_id` under `refresh_token` and remember it, or say
 /// why it could not be opened.
 ///
-/// The one place an open happens, behind
-/// [`crate::ServerHandle::open_drive_file`] -- which is how the app asks,
+/// This is the one place an open happens, behind
+/// [`crate::ServerHandle::open_drive_file`]. That is how the app asks,
 /// since the app never speaks HTTP to this server.
 pub(crate) async fn open_file(
     state: &AppState,
@@ -258,7 +259,7 @@ pub(crate) async fn open_file(
         .drive
         .as_ref()
         .ok_or(DriveOpenError::NoPairingService)?;
-    // A finished download first, and off the disk: it is opened without
+    // A finished download comes first, off the disk. It is opened without
     // the origin and without spending the grant, which is what lets it
     // play on a device that is offline (`crate::proxy_downloads`). The
     // ordinary open below probes Drive, and would refuse exactly then.
@@ -272,15 +273,15 @@ pub(crate) async fn open_file(
     Ok(open_pairing(state, pairing, name).await?)
 }
 
-/// [`open_file`] from a pairing already built -- the seam the tests reach,
-/// since a shipped build's endpoints are not a caller's to name.
+/// [`open_file`] from a pairing already built. This is the seam the tests
+/// reach, since a shipped build's endpoints are not a caller's to name.
 pub(crate) async fn open_pairing(
     state: &AppState,
     pairing: DrivePairing,
     name: Option<String>,
 ) -> Result<DriveFileOpened, DriveError> {
-    // The id, and never the token: the id names content and is the cache
-    // key already, while the token is the account itself.
+    // Log the id, and never the token. The id names content and is the
+    // cache key already, while the token is the account itself.
     let file_id = pairing.file_id.clone();
     let source = DriveSource::open(state, pairing).await?;
     let source = match &name {
@@ -317,18 +318,18 @@ pub(crate) fn stream_path(key: &str) -> String {
     format!("/drive/stream/{}", urlencoding::encode(key))
 }
 
-/// The one route: the byte-serving half, **open**, because a player cannot
-/// send a bearer header, and safe to be open because the URL carries a
-/// random key and no credential at all. (The open itself is
+/// The one route: the byte-serving half. It is **open** because a player
+/// cannot send a bearer header. It is safe to be open because the URL
+/// carries a random key and no credential at all. (The open itself is
 /// [`open_file`], reached through the embed API and no route.)
 pub fn stream_routes() -> Router<AppState> {
     Router::new().route("/drive/stream/{key}", get(stream_drive_file))
 }
 
-/// The one shape a dead pairing has, wherever it is found. `401` because
-/// the credential is what is no good, and a kind beside the sentence
-/// because the app's answer is a new QR and it must not have to read
-/// English to know that.
+/// The one shape a dead pairing has, wherever it is found. It is `401`
+/// because the credential is what is no good. It has a kind beside the
+/// sentence because the app's answer is a new QR, and it must not have to
+/// read English to know that.
 fn pair_again_response() -> Response {
     (
         StatusCode::UNAUTHORIZED,
@@ -342,9 +343,9 @@ fn pair_again_response() -> Response {
 
 /// One Drive file, as a range of bytes.
 ///
-/// **Nothing about it differs from a plain file over HTTP**: the framing
+/// **Nothing about it differs from a plain file over HTTP.** The framing
 /// is `util::MediaRange`, the same one the torrent stream route and the
-/// archive member route use, so `Content-Length`, `Content-Range`,
+/// archive member route use. So `Content-Length`, `Content-Range`,
 /// `206`/`416` and `HEAD` are the same answers here as there.
 async fn stream_drive_file(
     State(state): State<AppState>,
@@ -354,16 +355,16 @@ async fn stream_drive_file(
     let Some(session) = state.drive_files.get(&key) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    // Asked before a byte is framed. The grant can die between the create
-    // and a seek an hour later, and a player's answer to a body that stops
-    // is to open again -- so what it opens into has to be the reason.
+    // This is asked before a byte is framed. The grant can die between the
+    // create and a seek an hour later. A player's answer to a body that
+    // stops is to open again, so what it opens into has to be the reason.
     if session.source.needs_pairing_again() {
         return pair_again_response();
     }
     // The passes read ahead of the player through the same source, quiet
-    // (`proxy_retention::Prefetcher`); it renews the grant for itself.
-    // Registered by every request, as `/proxy` registers on every origin
-    // answer: a slack pass that took the entity whole forgets its source
+    // (`proxy_retention::Prefetcher`). It renews the grant for itself.
+    // Every request registers it, as `/proxy` registers on every origin
+    // answer. A slack pass that took the entity whole forgets its source
     // with it, and the viewer coming back is read ahead of again.
     if let Some(key_dir) = session.source.key_dir() {
         state
@@ -401,8 +402,8 @@ async fn stream_drive_file(
     crate::routes::compat::add_dlna_headers(&mut res_headers);
 
     // The lease rides inside the body, so the session cannot be evicted or
-    // dropped at a switch while a player is still reading it -- the same
-    // way an archive member's body holds its session.
+    // dropped at a switch while a player is still reading it. An archive
+    // member's body holds its session the same way.
     let body = Body::from_stream(media_body(reader.take(wanted)).map(move |chunk| {
         let _in_use = &session;
         chunk
@@ -411,7 +412,7 @@ async fn stream_drive_file(
 }
 
 /// What a read that failed before the body began answers. A dead pairing
-/// is itself here too; anything else is a gateway that would not serve us.
+/// is itself here too. Anything else is a gateway that would not serve us.
 fn read_error_response(error: &std::io::Error) -> Response {
     if let Some(DriveError::PairAgain) = DriveError::in_read(error) {
         return pair_again_response();

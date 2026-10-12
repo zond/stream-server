@@ -30,24 +30,24 @@ static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
 /// How often an open stream reports what the torrent is doing.
 ///
-/// Only while a body is open, so a dead swarm can be told from a slow one,
-/// and either from a window waiting on a piece bigger than itself.
+/// It reports only while a body is open, so a dead swarm can be told from a
+/// slow one, and either from a window waiting on a piece bigger than itself.
 ///
-/// Five seconds: this is the loudest emitter in the process and it is per
-/// open response, so on a film with two tracks being read it alone is two
-/// lines a second, and the diagnostics report a tester sends back is a
-/// 400-line ring -- which at that rate holds between eighty seconds and two
-/// minutes. A stall is not a second-by-second phenomenon, and this keeps
-/// its start-up context from being evicted before anyone reads it.
+/// It is five seconds. This is the loudest emitter in the process, and it is
+/// per open response. On a film with two tracks being read, it alone is two
+/// lines a second. The diagnostics report a tester sends back is a 400-line
+/// ring, which at that rate holds between eighty seconds and two minutes. A
+/// stall is not a second-by-second phenomenon, and this keeps its start-up
+/// context from being evicted before anyone reads it.
 const STREAM_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Log what the torrent behind an open stream is doing, once every
 /// [`STREAM_PROGRESS_LOG_INTERVAL`], until the task is aborted (the body
 /// ended) or the engine is gone.
 ///
-/// `peek_engine`, not `get_engine`: watching a stream must not be what
-/// keeps its torrent out of the idle sweep -- the open reader already does
-/// that, honestly.
+/// It uses `peek_engine`, not `get_engine`. Watching a stream must not be
+/// what keeps its torrent out of the idle sweep. The open reader already
+/// does that, honestly.
 fn spawn_stream_progress_log(
     engine: Arc<enginefs::EngineFS>,
     info_hash: String,
@@ -57,7 +57,7 @@ fn spawn_stream_progress_log(
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(STREAM_PROGRESS_LOG_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // The first tick is immediate; skip it so a short request does not
+        // The first tick is immediate. Skip it so a short request does not
         // log a line saying nothing has happened yet.
         ticker.tick().await;
         loop {
@@ -75,7 +75,7 @@ fn spawn_stream_progress_log(
                 download_speed = stats.download_speed,
                 peers = stats.peers,
                 // Addresses queued, being dialled, seen and known against
-                // the peers connected: a slow start with few peers is
+                // the peers connected. A slow start with few peers is
                 // either nothing found or nothing answering, and these say
                 // which.
                 queued = stats.queued,
@@ -98,14 +98,14 @@ fn spawn_stream_progress_log(
 /// honestly say.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Consumer {
-    /// An HTTP response body: the line reports what the body delivered
+    /// An HTTP response body. The line reports what the body delivered
     /// against the range the response promised (`http_stream_end`).
     Http,
-    /// A blocking reader over FFI (`crate::media::MediaReader`): there is
-    /// no response, no promised length and no body to count, so the line
+    /// A blocking reader over FFI (`crate::media::MediaReader`). There is
+    /// no response, no promised length and no body to count. So the line
     /// says the reader closed and how long it was open
-    /// (`reader_stream_end`), and the reader's own close line says what
-    /// it delivered.
+    /// (`reader_stream_end`). The reader's own close line says what it
+    /// delivered.
     Reader,
 }
 
@@ -127,26 +127,26 @@ struct StreamLifecycleGuard {
 
 impl StreamLifecycleGuard {
     /// Register the stream and take ownership of ending it, with no await
-    /// in between: a cancel can only land at an await, so a gap here -- the
-    /// handler's future dropped after the stream is registered but before
-    /// anything owns ending it, which is how every one of these handlers
-    /// ends when a player closes the connection -- would leave
+    /// in between. A cancel can only land at an await. A gap here would be
+    /// the handler's future dropped after the stream is registered but
+    /// before anything owns ending it. That is how every one of these
+    /// handlers ends when a player closes the connection. It would leave
     /// `active_streams` and `active_file_streams` up for the life of the
     /// process, `playback_is_live` reading a player for ever, the session
     /// uploading with sharing off, and the sweep never removing the engine.
     ///
-    /// A registered stream is ended by exactly one thing -- this guard's
-    /// `on_stream_end` -- and until the guard exists there is nothing to end
-    /// it. The handover is what this function is: `on_stream_start_unreconciled`
-    /// undoes its own registration if it is dropped before it returns (see
-    /// `BackendEngineFS::on_stream_start`), and from the instant it does
-    /// return the guard owns it. Putting the two in one function with no
-    /// `.await` between them is what leaves no third state: a registration
-    /// neither side is holding.
+    /// Exactly one thing ends a registered stream: this guard's
+    /// `on_stream_end`. Until the guard exists, there is nothing to end it.
+    /// This function is the handover. `on_stream_start_unreconciled` undoes
+    /// its own registration if it is dropped before it returns (see
+    /// `BackendEngineFS::on_stream_start`). From the instant it does return,
+    /// the guard owns it. Putting the two in one function with no `.await`
+    /// between them leaves no third state: a registration neither side is
+    /// holding.
     ///
     /// `stale` is a request of an older screen of its viewer
-    /// ([`enginefs::retention::sessions::Heard::Stale`]): registered and
-    /// served the same, and the liveness cell stays where it is.
+    /// ([`enginefs::retention::sessions::Heard::Stale`]). It is registered
+    /// and served the same, and the liveness cell stays where it is.
     async fn start(
         engine: Arc<enginefs::EngineFS>,
         info_hash: String,
@@ -155,7 +155,7 @@ impl StreamLifecycleGuard {
         stale: bool,
         consumer: Consumer,
     ) -> Self {
-        // Unreconciled: the route asks the reconciler once, after its disk
+        // Unreconciled. The route asks the reconciler once, after its disk
         // gate ([`EngineFS::focus_torrent`]), because that is the reading
         // that can restart a torrent the gate has just made room for.
         match stale {
@@ -210,14 +210,14 @@ impl StreamLifecycleGuard {
         let file_idx = self.file_idx;
         let stream_id = self.stream_id;
 
-        // INFO, not DEBUG: this is the only record that a playback session
-        // ended and the only one that says how much of what was asked for
+        // INFO, not DEBUG. This is the only record that a playback session
+        // ended, and the only one that says how much of what was asked for
         // actually left the server.
         //
         // The reason is read against what the response promised, never off
-        // the body alone: hyper stops polling a body of declared length the
+        // the body alone. hyper stops polling a body of declared length the
         // moment that length is met, so a range delivered whole records no
-        // end at all and every completed playback was filed here as a
+        // end at all. Every completed playback was then filed here as a
         // `client-disconnect` (see [`util::BodyProgress::outcome_of`]).
         match self.consumer {
             Consumer::Http => tracing::info!(
@@ -233,7 +233,7 @@ impl StreamLifecycleGuard {
                 "stream ended"
             ),
             // No body, so no bytes sent, no promised length and no reason
-            // read off them: a reader's line with HTTP's numbers in it said
+            // read off them. A reader's line with HTTP's numbers in it said
             // `requested_len=0` and a disconnect for every playback.
             Consumer::Reader => tracing::info!(
                 stream_id,
@@ -297,43 +297,43 @@ where
 /// selection are being resolved. A normal `FileHandle` takes over this count
 /// once streaming begins.
 ///
-/// What reads the count is everything that asks whether a request is on an
-/// engine, and none of it is the reconciler's ladder: the housekeeping
-/// sweep, which would otherwise remove the engine of a magnet that is still
-/// resolving for somebody; `EngineFS::playback_is_live`, which is the
-/// activity light and what turns uploads on with sharing off; the cleanup
-/// of a torrent a refused pin added; and the diagnostics snapshot.
+/// Everything that asks whether a request is on an engine reads the count,
+/// and none of it is the reconciler's ladder. The readers are the
+/// housekeeping sweep, which would otherwise remove the engine of a magnet
+/// that is still resolving for somebody, and `EngineFS::playback_is_live`,
+/// which is the activity light and what turns uploads on with sharing off.
+/// The cleanup of a torrent a refused pin added reads it too, and so does
+/// the diagnostics snapshot.
 struct MetadataResolutionGuard {
     active_readers: Arc<AtomicUsize>,
 }
 
 impl MetadataResolutionGuard {
-    /// Count the request as active, and -- for a torrent that has no
-    /// metadata yet -- ask the engine's reconciler whether it should now
-    /// be running.
+    /// Count the request as active. For a torrent that has no metadata yet,
+    /// also ask the engine's reconciler whether it should now be running.
     ///
-    /// **Only without metadata.** The ladder reads `held` -- the holds,
-    /// and the streams being delivered -- and this runs before the stream
-    /// open registers its stream, so for a torrent that has
-    /// its metadata the question is about one nobody has claimed yet. A
-    /// torrent the viewer is coming back to -- still running from before
-    /// the last switch, not yet stopped by the timer -- is neither playing
-    /// nor pinned, so the ladder's last arm answers `Stop`, and a
-    /// `PlaybackStart` is not held back by the dwell: this stopped it,
-    /// dropping its peers, only for the GET's `focus_torrent` to start it
-    /// again after the disk gate. A HEAD opens no stream at all, so its
-    /// reconcile had no reason to be asked. The stream's own reconcile is
-    /// `focus_torrent`'s, once the cell is written.
+    /// **Only without metadata.** The ladder reads `held` (the holds, and
+    /// the streams being delivered), and this runs before the stream open
+    /// registers its stream. So for a torrent that has its metadata, the
+    /// question is about one nobody has claimed yet. Take a torrent the
+    /// viewer is coming back to, still running from before the last switch
+    /// and not yet stopped by the timer. It is neither playing nor pinned,
+    /// so the ladder's last arm answers `Stop`, and a `PlaybackStart` is not
+    /// held back by the dwell. This call stopped it, dropping its peers,
+    /// only for the GET's `focus_torrent` to start it again after the disk
+    /// gate. A HEAD opens no stream at all, so its reconcile had no reason
+    /// to be asked. The stream's own reconcile is `focus_torrent`'s, once
+    /// the cell is written.
     ///
     /// A torrent without metadata is the one case where the answer does
-    /// not depend on the cell: the ladder answers `Run` for it, because a
+    /// not depend on the cell. The ladder answers `Run` for it, because a
     /// magnet has to stay connected to resolve. Asked here and awaited, a
     /// stopped magnet starts resolving now rather than at the next tick.
     ///
     /// The reading goes stale if the metadata lands between it and the
-    /// ladder's own, which is then the old question about an unclaimed
-    /// torrent -- once, at the moment a magnet resolves, and put right by
-    /// `focus_torrent` on a GET.
+    /// ladder's own. That is then the old question about an unclaimed
+    /// torrent. It happens once, at the moment a magnet resolves, and
+    /// `focus_torrent` puts it right on a GET.
     async fn acquire<B: enginefs::backend::TorrentBackend + 'static>(
         engine_fs: &enginefs::BackendEngineFS<B>,
         engine: &Arc<enginefs::engine::Engine<B::Handle>>,
@@ -369,17 +369,18 @@ struct PlaybackQuery {
     filters: Vec<String>,
     /// `buffer=normal|large|maximum`: this playback's read-ahead choice,
     /// overriding the `bufferProfile` setting for this request only. `None`
-    /// when the parameter is absent -- and also when it carries a value this
-    /// build does not know, because a player that guessed wrong should get
-    /// the server's default rather than a failed stream.
+    /// when the parameter is absent. It is also `None` when it carries a
+    /// value this build does not know. A player that guessed wrong should
+    /// get the server's default rather than a failed stream.
     buffer: Option<BufferProfile>,
-    /// `p=`: the player token of the app's player this request is for --
-    /// the one statement that a request is the viewer's playback. Only such
-    /// a request has a play session: it moves the token's session to the
-    /// file it names, and only its open may share a drawn set of that file
-    /// ([`enginefs::retention::sessions`]). `None` for anything else -- a
-    /// subtitle or side file, another client, the server's own reads --
-    /// which is served and fetched ahead of as a stream and shares nothing.
+    /// `p=`: the player token of the app's player this request is for. It
+    /// is the one statement that a request is the viewer's playback. Only
+    /// such a request has a play session. It moves the token's session to
+    /// the file it names, and only its open may share a drawn set of that
+    /// file ([`enginefs::retention::sessions`]). `None` for anything else (a
+    /// subtitle or side file, another client, the server's own reads). Such
+    /// a request is served and fetched ahead of as a stream, and shares
+    /// nothing.
     player_token: Option<String>,
 }
 
@@ -395,7 +396,7 @@ impl PlaybackQuery {
             match key {
                 "download" => parsed.download = compat::query_value_is_true(raw_value),
                 "buffer" => {
-                    // Percent-decoded like `f=`: the values are bare words,
+                    // Percent-decoded like `f=`. The values are bare words,
                     // but a client that escapes them is not wrong.
                     let decoded = url::form_urlencoded::parse(field.as_bytes())
                         .next()
@@ -425,13 +426,13 @@ impl PlaybackQuery {
 }
 
 /// Whether a file of a torrent is one the app plays through a translated
-/// source rather than as the film itself -- an archive or a disc image,
-/// whose member is served out of it by the archive routes. By name, the one
-/// thing the stream route knows of it before a byte is read: the player
-/// opens such a file, fails to recognise it, and the app routes its member,
-/// so the file itself is never what plays.
+/// source rather than as the film itself. That is an archive or a disc
+/// image, whose member the archive routes serve out of it. It is decided by
+/// name, the one thing the stream route knows of it before a byte is read.
+/// The player opens such a file and fails to recognise it, and the app
+/// routes its member. So the file itself is never what plays.
 ///
-/// **A container played by its URL shares nothing**: a play session on one
+/// **A container played by its URL shares nothing.** A play session on one
 /// of these draws nothing ([`enginefs::retention::sessions::Played::Torrent`]'s
 /// `shares`). A member played through a media id is told by the member path
 /// instead, which knows the member's extent (`crate::media`).
@@ -450,7 +451,7 @@ pub(crate) fn played_through_a_translator(name: &str) -> bool {
 /// it is a download.
 ///
 /// **The range is not read at all.** What a read is for is answered by
-/// watching what the reads do, not by classifying the request; this is down
+/// watching what the reads do, not by classifying the request. This is down
 /// to the one bit a read cannot be watched into telling us: whether anybody
 /// is waiting for these bytes at a rate.
 fn playback_intent_for_request(is_download: bool) -> Fetching {
@@ -463,8 +464,8 @@ fn playback_intent_for_request(is_download: bool) -> Fetching {
 
 /// The `Content-Type` a torrent file is served with, by its extension and
 /// whatever case it is written in (`MOVIE.MKV` is a Matroska file too).
-/// A table of its own rather than `mime_guess`, which the archive and FTP
-/// routes use, because the two disagree where a player cares: `mime_guess`
+/// It is a table of its own rather than `mime_guess`, which the archive and
+/// FTP routes use. The two disagree where a player cares: `mime_guess`
 /// calls `.ts` `video/vnd.dlna.mpeg-tts` and `.opus` `audio/ogg`, and knows
 /// no `.eac3`.
 pub(crate) fn content_type_for_name(name: &str) -> &'static str {
@@ -493,16 +494,16 @@ pub(crate) fn content_type_for_name(name: &str) -> &'static str {
     }
 }
 
-/// The body of every `507` the stream route answers: a fixed sentence,
-/// because the conditions behind it (`ensure_download_disk_ready`'s own
-/// message, the engine's reason for a stop) name the cache root, and no
+/// The body of every `507` the stream route answers. It is a fixed
+/// sentence, because the conditions behind it (`ensure_download_disk_ready`'s
+/// own message, the engine's reason for a stop) name the cache root. No
 /// response may carry a path.
 pub(crate) const INSUFFICIENT_DISK_SPACE_BODY: &str =
     "Insufficient disk space for this stream; free some space and retry";
 
 /// Free space a test has declared for a root and everything under it,
-/// standing in for the volume probe. The readings are used in order and
-/// the last one stands for ever after -- see [`pretend_available_space`].
+/// standing in for the volume probe. The readings are used in order, and
+/// the last one stands for ever after (see [`pretend_available_space`]).
 type DiskSpaceOverrides =
     std::sync::Mutex<Vec<(std::path::PathBuf, std::collections::VecDeque<u64>)>>;
 static DISK_SPACE_OVERRIDES: std::sync::OnceLock<DiskSpaceOverrides> = std::sync::OnceLock::new();
@@ -510,27 +511,27 @@ static DISK_SPACE_OVERRIDES: std::sync::OnceLock<DiskSpaceOverrides> = std::sync
 /// Declare how much free space the volume under `root` has, for every
 /// readiness check on a path below it from now on.
 ///
-/// A test seam and nothing else: a volume cannot be filled on demand, so
-/// without this the low-disk refusal and the slack drop in front of it
-/// (`ensure_disk_ready_or_refuse`) could not be exercised end to end. Keyed
-/// by root so parallel tests, each with its own temp cache root, never see
-/// each other's declaration.
+/// A test seam and nothing else. A volume cannot be filled on demand.
+/// Without this, the low-disk refusal and the slack drop in front of it
+/// (`ensure_disk_ready_or_refuse`) could not be exercised end to end. It is
+/// keyed by root, so parallel tests, each with its own temp cache root,
+/// never see each other's declaration.
 #[doc(hidden)]
 pub fn pretend_available_space(root: impl Into<std::path::PathBuf>, bytes: u64) {
     pretend_available_space_readings(root, vec![bytes]);
 }
 
-/// [`pretend_available_space`] with a **volume that changes**: `readings`
+/// [`pretend_available_space`] with a **volume that changes**. `readings`
 /// are answered one per check, in order, and the last one answers every
 /// check after them.
 ///
-/// The disk gate asks twice -- once before it drops the cache owners' slack
-/// and once after -- and the whole of what the second ask is for is that
-/// the volume may have changed in between. A single declared number cannot
-/// express that, and a test that flipped it from another thread would be
-/// pinning a race: what this says instead is "the volume read short, and by
-/// the time it was read again the bytes had come back", which is exactly
-/// the situation the gate exists to handle.
+/// The disk gate asks twice: once before it drops the cache owners' slack
+/// and once after. The second ask exists only because the volume may have
+/// changed in between. A single declared number cannot express that. A
+/// test that flipped it from another thread would be pinning a race. What
+/// this says instead is "the volume read short, and by the time it was
+/// read again the bytes had come back". That is exactly the situation the
+/// gate exists to handle.
 #[doc(hidden)]
 pub fn pretend_available_space_readings(root: impl Into<std::path::PathBuf>, readings: Vec<u64>) {
     let root = root.into();
@@ -553,7 +554,7 @@ fn available_space_for_path(path: &FsPath) -> Option<u64> {
             .iter_mut()
             .find(|(root, _)| path.starts_with(root))
     {
-        // The last reading is never taken: a declaration of one number is a
+        // The last reading is never taken. A declaration of one number is a
         // volume that stays that size, which is what nearly every caller of
         // the seam means.
         let bytes = if readings.len() > 1 {
@@ -571,24 +572,25 @@ fn available_space_for_path(path: &FsPath) -> Option<u64> {
 ///
 /// **One line, and it is the reconciler's.** `available <
 /// CACHE_FREE_SPACE_FLOOR` is the free-space arm of
-/// `enginefs::reconcile::desired` written out, so the route refuses exactly
-/// the request whose torrent the reconciler would stop -- and, just as
+/// `enginefs::reconcile::desired` written out. So the route refuses exactly
+/// the request whose torrent the reconciler would stop, and, just as
 /// importantly, refuses nothing else. A `?download=1` of a film larger than
-/// the volume is not refused up front: it starts, fills to the floor, and is
-/// stopped there like anything else, the one policy's answer rather than a
-/// second one only this route knew about. (The offline-download path keeps a
-/// whole-file check of its own, where it can refuse *before* anything is
-/// downloaded -- `enginefs::free_space_allows` in `pin_download`.)
+/// the volume is not refused up front. It starts, fills to the floor, and is
+/// stopped there like anything else. That is the one policy's answer rather
+/// than a second one only this route knew about. (The offline-download path
+/// keeps a whole-file check of its own, where it can refuse *before*
+/// anything is downloaded: `enginefs::free_space_allows` in
+/// `pin_download`.)
 ///
 /// A volume that cannot be probed is an error here rather than a pass,
-/// unlike in the reconciler: this runs before a byte is written, and the
+/// unlike in the reconciler. This runs before a byte is written, and the
 /// caller retries once the volume has been probed again. The published cap
-/// reads the same failure the other way on purpose -- as unknown, leaving
-/// `cacheSize` alone (`cache_budget::available_space`) -- because there
-/// "no room" would evict a healthy cache, while here it only declines to
-/// start writing; each reader takes the answer whose mistake costs nothing.
+/// reads the same failure the other way on purpose: as unknown, leaving
+/// `cacheSize` alone (`cache_budget::available_space`). There, "no room"
+/// would evict a healthy cache, while here it only declines to start
+/// writing. Each reader takes the answer whose mistake costs nothing.
 ///
-/// It writes nothing: librqbit's own first write is what tests whether the
+/// It writes nothing. librqbit's own first write is what tests whether the
 /// root is writable, which is not what the floor is for.
 fn ensure_download_disk_ready(root: &FsPath) -> Result<(), String> {
     std::fs::create_dir_all(root).map_err(|e| {
@@ -602,8 +604,8 @@ fn ensure_download_disk_ready(root: &FsPath) -> Result<(), String> {
     // The same floor the published cap keeps free
     // (`CacheLimit::effective`) and the same one the engine's reconciler
     // stops a torrent at.
-    // Sized to the volume, because 512 MB is a thousandth of a phone and an
-    // eighth of a 4 GB television; see `enginefs::free_space_floor`.
+    // It is sized to the volume, because 512 MB is a thousandth of a phone
+    // and an eighth of a 4 GB television. See `enginefs::free_space_floor`.
     let required = enginefs::free_space_floor(enginefs::volume_total(root));
     let available = available_space_for_path(root).ok_or_else(|| {
         format!(
@@ -625,27 +627,28 @@ fn ensure_download_disk_ready(root: &FsPath) -> Result<(), String> {
 }
 
 /// The disk gate the stream route runs before it streams to disk, and what
-/// happens when the disk is not ready: both cache owners give back their
-/// slack, the volume is read again, and a `507` if it is still short
-/// ([`TorrentOpenError::InsufficientDiskSpace`], which the route answers).
+/// happens when the disk is not ready. Both cache owners give back their
+/// slack, and the volume is read again. If it is still short, the answer is
+/// a `507` ([`TorrentOpenError::InsufficientDiskSpace`], which the route
+/// answers).
 ///
 /// **There is no memory-only fallback.** librqbit sessions always persist to
-/// disk and this server has no memory-only storage anywhere, so a disk that
+/// disk, and this server has no memory-only storage anywhere. So a disk that
 /// is not ready must be refused, never relabelled and streamed to anyway.
 ///
 /// Refusing at once is not right either, on the device the floor is about.
-/// **This request has just made its predecessor disposable** -- the stream
+/// **This request has just made its predecessor disposable.** The stream
 /// is registered before this gate, so the film the viewer left is slack by
-/// now -- and those bytes are ours to take back. So a failed check drops
+/// now, and those bytes are ours to take back. So a failed check drops
 /// every owner's slack ([`EngineFS::drop_slack`] and the proxy cache's,
-/// the same passes `ServerHandle::clean_cache_now` runs), re-reads the volume and asks
-/// both questions again; only a disk still short after that is answered
-/// `507 Insufficient Storage` -- the status the pin route already uses for
-/// a full disk -- with a fixed body, because the check's own message names
-/// the cache root and no response may carry a path.
+/// the same passes `ServerHandle::clean_cache_now` runs). It then re-reads
+/// the volume and asks both questions again. Only a disk still short after
+/// that is answered `507 Insufficient Storage`, the status the pin route
+/// already uses for a full disk. The body is fixed, because the check's own
+/// message names the cache root, and no response may carry a path.
 ///
 /// **Nothing but slack is ever taken, so the refusal is real.** There is no
-/// tier below it that starts choosing between a pin and a window: when what
+/// tier below it that starts choosing between a pin and a window. When what
 /// is left is pins plus the one live window and it does not fit, the answer
 /// is `507`, and a viewer who wants that stream unpins something. That is
 /// the whole of the storage policy in one sentence, and it is why this gate
@@ -660,21 +663,22 @@ async fn ensure_disk_ready_or_refuse(
     wants_to_write: bool,
 ) -> Result<(), TorrentOpenError> {
     // A torrent that has everything it wants writes nothing, so a volume
-    // with no room on it is not about this request: refusing to serve bytes
+    // with no room on it is not about this request. Refusing to serve bytes
     // that are already on the disk because the disk is full would take a
-    // finished film off a device at exactly the moment its owner most wants
-    // to watch something without downloading anything. The other half of
-    // the reconciler's free-space arm, and the reason this is one gate
-    // rather than two: the arm's `wants_to_write &&
+    // finished film off a device. It would do so at exactly the moment its
+    // owner most wants to watch something without downloading anything.
+    // This is the other half of the reconciler's free-space arm, and the
+    // reason this is one gate rather than two. The arm's `wants_to_write &&
     // available < floor` is answered here in the same order.
     if !wants_to_write {
         return Ok(());
     }
     // The check performs blocking std::fs syscalls (create_dir_all and a
-    // statvfs) that are re-run on every request and every seek. Run them on the blocking pool so they never stall an async worker
-    // thread inline -- which would also block any other stream/API task
-    // scheduled on that same worker -- e.g. when the cache lives on a
-    // spun-down HDD or a slow network/SMB mount.
+    // statvfs) that are re-run on every request and every seek. Run them on
+    // the blocking pool so they never stall an async worker thread inline,
+    // for example when the cache lives on a spun-down HDD or a slow
+    // network/SMB mount. Stalling the worker would also block any other
+    // stream/API task scheduled on it.
     let check = || {
         let download_dir = engine_fs.download_dir.clone();
         async move {
@@ -714,8 +718,8 @@ async fn ensure_disk_ready_or_refuse(
         "dropped the slack of both cache owners on behalf of a stream request"
     );
     // The engine's reading of the volume is the reconciler's, up to one
-    // tick old, and a pass that just freed space must not be judged by it.
-    // This route's own probe is taken afresh by the check below.
+    // tick old. A pass that just freed space must not be judged by it.
+    // The check below takes this route's own probe afresh.
     engine_fs.reread_volume().await;
     if first_complaint(engine.is_stopped_for_space().await, &check)
         .await
@@ -733,15 +737,15 @@ async fn ensure_disk_ready_or_refuse(
 }
 
 /// The gate's two questions, in the order they cost, and the first
-/// complaint either of them makes -- `None` when the disk is ready.
+/// complaint either of them makes. `None` when the disk is ready.
 ///
 /// `probe` is a closure and not an answer, and that is the whole of this
-/// function: the floor probe is a `create_dir_all` and a `statvfs` on the
-/// blocking pool, and it must not be taken at all for a request the
-/// cheap question has already refused. A torrent the reconciler is holding
-/// stopped for want of space is answered from the reading it took, and a
-/// player retrying that stream four times a second is what the order is
-/// worth. Not a `match` over a tuple: that evaluates both arms and undoes
+/// function. The floor probe is a `create_dir_all` and a `statvfs` on the
+/// blocking pool. It must not be taken at all for a request the cheap
+/// question has already refused. A torrent the reconciler is holding
+/// stopped for want of space is answered from the reading it took. The
+/// order is worth a player retrying that stream four times a second. It is
+/// not a `match` over a tuple, because that evaluates both arms and undoes
 /// the ordering.
 async fn first_complaint<P, F>(stopped_for_space: bool, probe: P) -> Option<String>
 where
@@ -757,23 +761,23 @@ where
 /// How long the disk gate waits for the two owners to give their slack
 /// back before it answers the request anyway.
 ///
-/// A bound and not a deadline for the passes themselves: what is behind
-/// them is a run of `unlink`s on the blocking pool, and a device that has
-/// stopped answering is exactly the device this gate is about. Ten seconds
-/// is far longer than a pass over a full cache takes and far shorter than a
-/// player waits before it gives up, so the only request it ever ends is one
-/// that would otherwise have hung. The passes are not cancelled by it --
-/// they hold their entities' turns and finish in their own time; what the
-/// bound ends is this request's waiting for them.
+/// A bound, and not a deadline for the passes themselves. Behind them is a
+/// run of `unlink`s on the blocking pool, and a device that has stopped
+/// answering is exactly the device this gate is about. Ten seconds is far
+/// longer than a pass over a full cache takes, and far shorter than a
+/// player waits before it gives up. So the only request it ever ends is one
+/// that would otherwise have hung. It does not cancel the passes. They hold
+/// their entities' turns and finish in their own time. What the bound ends
+/// is this request's waiting for them.
 const SLACK_DROP_BOUND: Duration = Duration::from_secs(10);
 
 /// Run both owners' slack passes together, and give up waiting after
-/// `bound`. The number of files they took off the disk, or 0 if the bound
-/// ran out first.
+/// `bound`. It answers the number of files they took off the disk, or 0 if
+/// the bound ran out first.
 ///
-/// Together rather than one after the other: they are two different
-/// devices' worth of work in the general case and neither waits on the
-/// other, and a request holding a `507` is waiting for the sum. The bound
+/// They run together rather than one after the other. In the general case
+/// they are two different devices' worth of work, and neither waits on the
+/// other. A request holding a `507` is waiting for the sum. The bound
 /// covers the pair, because what it protects against is the disk itself
 /// stalling, and a stalled disk stalls both.
 async fn free_the_slack_within(
@@ -782,12 +786,13 @@ async fn free_the_slack_within(
     proxied: impl std::future::Future<Output = usize> + Send + 'static,
 ) -> usize {
     // Spawned, and that is what makes the bound a bound on the *waiting*
-    // rather than on the passes. A timeout drops what it is waiting on, and
-    // a pass dropped between an unlink and the booking of it is bytes off
-    // the disk that the owner still counts as held -- the count the cap is
-    // stated from, wrong in the direction that says there is room. A
-    // request that gives up, or a client that hangs up, leaves them
-    // running: they are the same passes the next tick would have run.
+    // rather than on the passes. A timeout drops what it is waiting on. A
+    // pass dropped between an unlink and the booking of it is bytes off
+    // the disk that the owner still counts as held. The cap is stated from
+    // that count, which would then be wrong in the direction that says
+    // there is room. A request that gives up, or a client that hangs up,
+    // leaves them running. They are the same passes the next tick would
+    // have run.
     let passes = futures_util::future::join(tokio::spawn(torrents), tokio::spawn(proxied));
     match tokio::time::timeout(bound, passes).await {
         Ok((torrents, proxied)) => torrents.unwrap_or(0) + proxied.unwrap_or(0),
@@ -803,12 +808,12 @@ async fn free_the_slack_within(
 }
 
 /// The engine a stream request is about: an existing one, or one created
-/// from the info hash with the request's `tr=` trackers -- a stream URL is
+/// from the info hash with the request's `tr=` trackers. A stream URL is
 /// how stremio-core starts a torrent at all. The error is the status and
 /// body to answer instead.
 ///
-/// Loopback only: the LAN listener serves published cast tokens and no
-/// stream route (`crate::cast`), so nothing on the network can make this
+/// It is loopback only. The LAN listener serves published cast tokens and
+/// no stream route (`crate::cast`), so nothing on the network can make this
 /// device start a torrent.
 async fn engine_for_request(
     engine_fs: &EngineFS,
@@ -824,7 +829,7 @@ async fn engine_for_request(
         })
 }
 
-/// A number for a stream's log lines, unique in this process: what ties a
+/// A number for a stream's log lines, unique in this process. It ties a
 /// stream's request, progress and end lines together.
 pub(crate) fn next_stream_id() -> u64 {
     NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed)
@@ -832,7 +837,7 @@ pub(crate) fn next_stream_id() -> u64 {
 
 /// A player's read, at the ordinary priority. The server's own reads (the
 /// probes that pass 255 to skip the playback preparation) never come
-/// through a player's open, and no request header may ask for that; 0 is a
+/// through a player's open, and no request header may ask for that. 0 is a
 /// background fetch, which this is not either.
 pub(crate) const PLAYER_PRIORITY: u8 = 1;
 
@@ -842,11 +847,11 @@ pub(crate) const PLAYER_PRIORITY: u8 = 1;
 pub(crate) struct Player<'a> {
     /// The player token, `<viewer>.<screen>`, as `p=` carries it.
     pub(crate) token: &'a str,
-    /// Whether this file may share at all: false for a container file the
-    /// HTTP route plays by name (`played_through_a_translator`).
+    /// Whether this file may share at all. It is false for a container file
+    /// the HTTP route plays by name (`played_through_a_translator`).
     pub(crate) shares: bool,
-    /// Where the member a media id plays lies: its byte extent in this
-    /// file, a single-file container
+    /// Where the member a media id plays lies. That is its byte extent in
+    /// this file, a single-file container
     /// (`enginefs::retention::sessions::Played::Torrent`'s `member`), or
     /// its bytes in every volume of a set this file is one of
     /// (`enginefs::retention::sessions::Played::Set`). What the session
@@ -867,25 +872,26 @@ pub(crate) struct TorrentOpen<'a> {
     pub(crate) file_idx: usize,
     /// For the log lines ([`next_stream_id`]).
     pub(crate) stream_id: u64,
-    /// Where the read is about to be: the engine prioritises the swarm
-    /// around it. The handle still starts at the top of the file; the
+    /// Where the read is about to be. The engine prioritises the swarm
+    /// around it. The handle still starts at the top of the file, and the
     /// caller seeks it.
     pub(crate) offset: u64,
     pub(crate) intent: Fetching,
     pub(crate) buffer: BufferProfile,
-    /// `None` for an open nobody's player asked for -- a subtitle, a side
-    /// file, another client -- which moves no session and shares nothing.
+    /// `None` for an open nobody's player asked for (a subtitle, a side
+    /// file, another client). Such an open moves no session and shares
+    /// nothing.
     pub(crate) player: Option<Player<'a>>,
-    /// What reads the stream: what its end line says.
+    /// What reads the stream. It decides what its end line says.
     pub(crate) consumer: Consumer,
 }
 
 /// Why [`open_torrent_stream`] opened nothing. The route answers each with
-/// its own HTTP status; a source answers them as `io::Error`s.
+/// its own HTTP status. A source answers them as `io::Error`s.
 #[derive(Debug)]
 pub(crate) enum TorrentOpenError {
-    /// The disk gate refused: the volume is short of the floor even with
-    /// both cache owners' slack given back. The route's `507`.
+    /// The disk gate refused. The volume is short of the floor even with
+    /// both cache owners' slack given back. This is the route's `507`.
     InsufficientDiskSpace,
     /// The engine could not open a reader on the file
     /// (`stream_open_failure_status` says which status each case is).
@@ -915,9 +921,9 @@ impl From<TorrentOpenError> for std::io::Error {
 }
 
 /// A stream [`open_torrent_stream`] registered, and how to open its file
-/// again: the registration and the play session belong to this, not to a
-/// file handle, so a seek -- a new handle at a new offset, [`Self::open_at`]
-/// -- neither moves the session nor ends the stream. Dropped, it ends the
+/// again. The registration and the play session belong to this, not to a
+/// file handle. So a seek (a new handle at a new offset, [`Self::open_at`])
+/// neither moves the session nor ends the stream. Dropping it ends the
 /// stream (`StreamLifecycleGuard`).
 pub(crate) struct TorrentStream {
     lifecycle: StreamLifecycleGuard,
@@ -926,7 +932,7 @@ pub(crate) struct TorrentStream {
     intent: Fetching,
     buffer: BufferProfile,
     /// Whether this open's reads are the viewer's playback of a file its
-    /// session shares: the one open whose play session may draw.
+    /// session shares. That is the one open whose play session may draw.
     shared: bool,
 }
 
@@ -935,8 +941,8 @@ impl TorrentStream {
     /// be at `offset`.
     ///
     /// The current screen of the viewer's player, on a file its session
-    /// shares, is the one open whose play session may draw; every other
-    /// open -- no token, an older screen's reconnect, an archive -- draws
+    /// shares, is the one open whose play session may draw. Every other
+    /// open (no token, an older screen's reconnect, an archive) draws
     /// nothing.
     pub(crate) async fn open_at(
         &self,
@@ -970,10 +976,10 @@ impl TorrentStream {
         self.buffer
     }
 
-    /// Make the next [`Self::open_at`] with `buffer`: the viewer changed
-    /// their read-ahead choice mid-playback, and the lookahead is worked
-    /// out at an open, so it takes effect at the next one (a seek) and not
-    /// in the handle already reading.
+    /// Make the next [`Self::open_at`] with `buffer`. The viewer changed
+    /// their read-ahead choice mid-playback. The lookahead is worked out at
+    /// an open, so it takes effect at the next one (a seek), not in the
+    /// handle already reading.
     pub(crate) fn set_buffer(&mut self, buffer: BufferProfile) {
         self.buffer = buffer;
     }
@@ -985,16 +991,16 @@ impl TorrentStream {
     }
 }
 
-/// **The one open of a torrent file for reading**: what the stream route
-/// does between resolving the file and building the body, and what a
-/// [`crate::sources::torrent::TorrentSource`] with a play does at its first
-/// read. In order, each for the reason written beside it: the player's
-/// session moved, the stream registered, the disk gate, the focus, the
-/// reader.
+/// **The one open of a torrent file for reading.** The stream route does
+/// this between resolving the file and building the body. A
+/// [`crate::sources::torrent::TorrentSource`] with a play does it at its
+/// first read. The steps, in order, each for the reason written beside it:
+/// the player's session moved, the stream registered, the disk gate, the
+/// focus, the reader.
 ///
-/// The stream is registered before the gate and ended by the returned
-/// [`TorrentStream`]'s drop -- including when this returns an error, which
-/// drops it here.
+/// The stream is registered before the gate. The returned
+/// [`TorrentStream`]'s drop ends it, including when this returns an error,
+/// which drops it here.
 pub(crate) async fn open_torrent_stream(
     open: TorrentOpen<'_>,
 ) -> Result<(TorrentStream, enginefs::files::FileHandle<LibrqbitHandle>), TorrentOpenError> {
@@ -1019,23 +1025,23 @@ pub(crate) async fn open_torrent_stream(
     // **Before the gate, and that is the point.** Registering the stream
     // is what makes the file the viewer just left slack, and a slack entity
     // is bytes this server is about to give back. Asking "is there room?"
-    // first would ask it of a volume still holding the previous film, so a
-    // switch on a full disk would answer `507` for space that is already
-    // ours -- and refusing before registering would leave nothing
+    // first would ask it of a volume still holding the previous film. A
+    // switch on a full disk would then answer `507` for space that is
+    // already ours. Refusing before registering would also leave nothing
     // registered, so the next attempt would ask the same stale question. A
     // refused request still moves the live entity, which is right: the
     // viewer really has left the old one.
     // **The player's own request moves its play session**, and nothing else
-    // does. Before the stream registers, so the reconcile this request
-    // makes sees the move: the next episode of the same torrent ends what
-    // the last one shared at once (stop, the advertised set made again,
-    // start), before this reader waits on a byte.
+    // does. It happens before the stream registers, so the reconcile this
+    // request makes sees the move. The next episode of the same torrent
+    // then ends what the last one shared at once (stop, the advertised set
+    // made again, start), before this reader waits on a byte.
     //
     // An older screen's request is served and moves nothing: not the
     // session, and not the liveness cell either.
     //
     // A volume of a set names the set, the same value whichever volume
-    // this is: the reader crossing into the next volume moves nothing.
+    // this is. The reader crossing into the next volume moves nothing.
     let shares = player.as_ref().is_some_and(|player| player.shares);
     let heard = player.map(|player| {
         let played = match player.member {
@@ -1092,11 +1098,11 @@ pub(crate) async fn open_torrent_stream(
     )
     .await?;
 
-    // No selection here: `on_stream_start` made it, and a second one per
-    // request was a second librqbit update -- a recompute over every piece
-    // and a persistence write -- for the same set. Planned from this
-    // request alone it would also drop the film an aside open (a subtitle)
-    // is fetched beside, which `on_stream_start` keeps selected.
+    // No selection here. `on_stream_start` made it. A second one per
+    // request was a second librqbit update (a recompute over every piece
+    // and a persistence write) for the same set. Planned from this request
+    // alone, it would also drop the film an aside open (a subtitle) is
+    // fetched beside, which `on_stream_start` keeps selected.
     engine_fs.focus_torrent(info_hash).await;
 
     // Await the async get_file
@@ -1165,9 +1171,9 @@ pub async fn head_stream_video(
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    // The one framing, shared with the archive routes: a member of an
-    // archive has to behave exactly like a plain file over HTTP, and that
-    // is only true if neither route writes its own (`util::MediaRange`).
+    // The one framing, shared with the archive routes. A member of an
+    // archive has to behave exactly like a plain file over HTTP. That is
+    // only true if neither route writes its own (`util::MediaRange`).
     let Some(framing) = util::MediaRange::of(range_header.as_deref(), size) else {
         return util::range_not_satisfiable(size);
     };
@@ -1218,7 +1224,7 @@ pub async fn stream_video(
         "stream_video request"
     );
 
-    // Existing engine, or -- on loopback -- one created from the info hash
+    // An existing engine, or, on loopback, one created from the info hash
     // with the request's trackers.
     let engine = match engine_for_request(
         &engine_fs,
@@ -1280,17 +1286,17 @@ pub async fn stream_video(
     let (start, end, is_partial) = (framing.start, framing.end, framing.partial);
     let requested_content_length = framing.content_length(size);
     let playback_intent = playback_intent_for_request(is_download);
-    // **Always on, unlike the retention trace.** What the player actually
-    // asked for, before anything here interprets it: two lines per range
-    // request, which is the frame every field log is read against -- the
-    // seeks, the tail crawl, the stall boundaries -- and the frame the
-    // retention trace's lines are placed into when that is on.
+    // **Always on, unlike the retention trace.** This is what the player
+    // actually asked for, before anything here interprets it. It is two
+    // lines per range request. Every field log is read against that frame
+    // (the seeks, the tail crawl, the stall boundaries). The retention
+    // trace's lines are placed into it when that trace is on.
     //
-    // `intent` is *our* label -- `playback_intent_for_request` derives it
-    // from the download flag. A player says nothing of the kind;
-    // it sends a byte range. So the range itself is logged beside the label,
-    // because a question about what a player is doing cannot be answered by
-    // reading back our own guess about it.
+    // `intent` is *our* label: `playback_intent_for_request` derives it
+    // from the download flag. A player says nothing of the kind; it sends
+    // a byte range. So the range itself is logged beside the label. A
+    // question about what a player is doing cannot be answered by reading
+    // back our own guess about it.
     tracing::info!(
         stream_id,
         info_hash = %info_hash,
@@ -1305,8 +1311,8 @@ pub async fn stream_video(
         stage = "stream_request",
         "a player asked for a range"
     );
-    // The request's own `buffer=` wins; anything else (absent, or a value this
-    // build does not know) falls back to the server-wide default.
+    // The request's own `buffer=` wins. Anything else (absent, or a value
+    // this build does not know) falls back to the server-wide default.
     let buffer_profile = match query.buffer {
         Some(profile) => profile,
         None => state.settings.read().await.buffer_profile,
@@ -1320,9 +1326,9 @@ pub async fn stream_video(
             "playback request without Range; treating as direct initial, not full download"
         );
     }
-    // The open itself -- play session, registration, disk gate, focus and
-    // the reader -- is the one every torrent reader shares
-    // (`open_torrent_stream`); what is left here is the HTTP around it.
+    // The open itself (play session, registration, disk gate, focus and
+    // the reader) is the one every torrent reader shares
+    // (`open_torrent_stream`). What is left here is the HTTP around it.
     let opened = open_torrent_stream(TorrentOpen {
         engine_fs: &engine_fs,
         proxy_cache: &state.proxy_cache,
@@ -1336,7 +1342,7 @@ pub async fn stream_video(
         player: query.player_token.as_deref().map(|token| Player {
             token,
             shares: !played_through_a_translator(&name),
-            // The route plays a file as itself: a container named here is
+            // The route plays a file as itself. A container named here is
             // a container, and shares nothing.
             member: None,
         }),
@@ -1381,9 +1387,9 @@ pub async fn stream_video(
         size
     );
 
-    // `size == 0` is not a range that cannot be satisfied: it is a file
+    // `size == 0` is not a range that cannot be satisfied. It is a file
     // with no bytes, and a request without a `Range` for it is a `200` with
-    // an empty body. A request *with* one is already a `416` above --
+    // an empty body. A request *with* one is already a `416` above, because
     // `parse_range` refuses every range on an empty resource.
     if size > 0 && start >= size {
         tracing::warn!(
@@ -1492,8 +1498,8 @@ pub async fn stream_video(
 
 /// Map a failed `try_get_file_with_intent` to the HTTP response for a stream
 /// request. The backend already blocked (bounded) for the torrent to become
-/// streamable, so reaching this means either a bad file index, a torrent that
-/// never left its initializing state, or a genuine reader failure.
+/// streamable. Reaching this means a bad file index, a torrent that never
+/// left its initializing state, or a genuine reader failure.
 fn stream_open_failure_response(
     stream_id: u64,
     info_hash: &str,
@@ -1513,9 +1519,9 @@ fn stream_open_failure_response(
 }
 
 /// Pure status/message mapping for `stream_open_failure_response`. The 502
-/// and 500 bodies are fixed, non-leaky strings on purpose: `reason` (from
+/// and 500 bodies are fixed, non-leaky strings on purpose. `reason` (from
 /// librqbit) and `{err:#}` can carry absolute download-dir paths, which must
-/// not be echoed to an HTTP client. The full detail still reaches the logs --
+/// not be echoed to an HTTP client. The full detail still reaches the logs:
 /// `stream_open_failure_response` logs `err` at `warn` for every branch.
 fn stream_open_failure_status(err: &GetFileError) -> (StatusCode, String) {
     match err {
@@ -1553,16 +1559,16 @@ mod tests {
         assert_eq!(content_type_for_name("mkv"), "application/octet-stream");
     }
 
-    /// The bound is on the *request*, not on the passes: a reclaim parked
+    /// The bound is on the *request*, not on the passes. A reclaim parked
     /// on a disk that has stopped answering must not hold a player's
     /// request with it.
     ///
-    /// One owner finishing and the other never doing is the case the bound
-    /// exists for -- a proxy chunk mid-unlink on a stalled mount -- and
-    /// what the request gets then is the volume as it stands, which is the
-    /// same answer it would have got had there been no slack at all. The
-    /// passes are not cancelled; they hold their entities' turns and finish
-    /// in their own time.
+    /// The bound exists for one owner finishing and the other never doing
+    /// so, such as a proxy chunk mid-unlink on a stalled mount. The request
+    /// then gets the volume as it stands. That is the same answer it would
+    /// have got had there been no slack at all. The passes are not
+    /// cancelled. They hold their entities' turns and finish in their own
+    /// time.
     #[tokio::test(start_paused = true)]
     async fn a_parked_pass_does_not_hold_the_request_past_the_bound() {
         let bound = Duration::from_secs(10);
@@ -1579,10 +1585,11 @@ mod tests {
         );
 
         // And the pass the request stopped waiting for runs to its end. A
-        // timeout drops what it is waiting on, and a pass dropped between
-        // an unlink and the booking of it leaves bytes off the disk that
-        // the owner still counts as held -- the figure the published cap
-        // is stated from, wrong in the direction that says there is room.
+        // timeout drops what it is waiting on. A pass dropped between an
+        // unlink and the booking of it leaves bytes off the disk that the
+        // owner still counts as held. The published cap is stated from that
+        // figure, which would be wrong in the direction that says there is
+        // room.
         let finished = Arc::new(AtomicBool::new(false));
         let slow = {
             let finished = finished.clone();
@@ -1607,10 +1614,10 @@ mod tests {
     /// The gate's two questions, in the order they cost.
     ///
     /// The floor probe is a `create_dir_all` and a `statvfs` on the
-    /// blocking pool, and a player retrying a torrent this process is
-    /// already holding stopped for want of space asks four times a second.
-    /// Every one of those is answered from the reading the reconciler
-    /// already took, and the probe is not taken at all.
+    /// blocking pool. A player retrying a torrent this process is already
+    /// holding stopped for want of space asks four times a second. Every one
+    /// of those is answered from the reading the reconciler already took,
+    /// and the probe is not taken at all.
     #[tokio::test]
     async fn a_torrent_stopped_for_space_is_answered_without_the_floor_probe() {
         let probes = AtomicUsize::new(0);
@@ -1704,8 +1711,8 @@ mod tests {
 
     /// **The gate writes nothing.** It asks the volume for its free space and
     /// nothing else, so a root this process cannot create a file in still
-    /// passes on its room. A process that can write anywhere -- root --
-    /// proves nothing here, and the test says so.
+    /// passes on its room. A process that can write anywhere (root) proves
+    /// nothing here, and the test says so.
     #[cfg(unix)]
     #[test]
     fn the_floor_check_writes_nothing_to_the_root() {
@@ -1735,7 +1742,7 @@ mod tests {
     async fn readiness_check_runs_off_the_async_worker_via_spawn_blocking() {
         // stream_video dispatches the blocking fs probes onto the blocking
         // pool rather than running them inline on a runtime worker. Exercise
-        // that exact path: the closure must be Send + 'static and produce the
+        // that exact path. The closure must be Send + 'static and produce the
         // same result it would when called directly.
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().to_path_buf();
@@ -1749,10 +1756,9 @@ mod tests {
     /// player's read is a player's read wherever in the file it lands.**
     ///
     /// mpv's index crawler and a viewer seeking into the last minutes of a
-    /// film both arrive as `Range: bytes=X-` over the same bytes, and
-    /// geometry alone cannot tell them apart reliably. The detector prices
-    /// them apart by what they consume instead -- measured at 91 B/s against
-    /// 1.2 MB/s.
+    /// film both arrive as `Range: bytes=X-` over the same bytes. Geometry
+    /// alone cannot tell them apart reliably. The detector prices them apart
+    /// by what they consume instead, measured at 91 B/s against 1.2 MB/s.
     #[test]
     fn what_a_read_is_for_is_who_asked_and_not_what_it_asked_for() {
         let file_size: u64 = 10 * 1024 * 1024 * 1024;
@@ -1782,7 +1788,7 @@ mod tests {
     }
 
     /// **`p=` is the player's token, read like `f=`**, and an empty one is
-    /// no token: only the app's player sends it.
+    /// no token. Only the app's player sends it.
     #[test]
     fn the_player_token_is_read_off_the_query() {
         assert_eq!(
@@ -1799,8 +1805,8 @@ mod tests {
     }
 
     /// **Which files the app plays through a translated source**: archives
-    /// and disc images, by name -- a split RAR's numbered volumes among them
-    /// -- and nothing that merely looks like one.
+    /// and disc images, by name (a split RAR's numbered volumes among them),
+    /// and nothing that merely looks like one.
     #[test]
     fn an_archive_is_told_by_its_name() {
         for name in [
@@ -1848,7 +1854,7 @@ mod tests {
     #[test]
     fn an_unknown_buffer_value_falls_back_to_the_default() {
         // `None` is what the handler turns into "use the server's
-        // bufferProfile setting"; none of these may fail the request.
+        // bufferProfile setting". None of these may fail the request.
         for raw in ["buffer=huge", "buffer=", "buffer", "buffer=2", "download=1"] {
             assert_eq!(PlaybackQuery::parse(Some(raw)).buffer, None, "query {raw}");
         }

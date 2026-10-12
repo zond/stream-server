@@ -16,8 +16,8 @@ pub struct FileCandidate {
 }
 
 /// A torrent's files as [`resolve_file_idx`] chooses among them, in the
-/// torrent's own order: the one mapping the stream route, the stats and the
-/// panel numbers share, so the three cannot pick different files.
+/// torrent's own order. The stream route, the stats and the panel numbers
+/// share this one mapping, so the three cannot pick different files.
 pub fn candidates(files: &[enginefs::backend::BackendFileInfo]) -> Vec<FileCandidate> {
     files
         .iter()
@@ -46,8 +46,8 @@ pub fn query_values(query: Option<&str>, name: &str) -> Vec<String> {
 }
 
 /// Normalise server.js-style peer sources (`tracker:` prefix stripped, `dht:`
-/// dropped, blanks removed). Takes the values as they are: `tr=` query values
-/// arrive already percent-decoded from `query_values`, and JSON
+/// dropped, blanks removed). It takes the values as they are. `tr=` query
+/// values arrive already percent-decoded from `query_values`, and JSON
 /// `peerSearch.sources` are never percent-encoded.
 pub fn normalize_tracker_sources(sources: Vec<String>) -> Vec<String> {
     sources
@@ -82,20 +82,20 @@ pub fn query_value_is_true(value: &str) -> bool {
 /// the request's `tr=` trackers merged in, waiting for metadata. Every route
 /// that may be the first to touch a torrent (stream, HEAD, both `stats.json`
 /// variants) must create the engine through this or
-/// `EngineFS::get_or_begin_add_magnet`: the librqbit backend cannot add
-/// trackers to a torrent after the fact (see `magnet_with_trackers`),
-/// so whichever request arrives first fixes the tracker set for the whole
+/// `EngineFS::get_or_begin_add_magnet`. The librqbit backend cannot add
+/// trackers to a torrent after the fact (see `magnet_with_trackers`), so
+/// whichever request arrives first fixes the tracker set for the whole
 /// session. A stats poll racing the first stream request must therefore not
 /// create a tracker-less engine that the stream request then silently reuses.
 ///
-/// Waits at most `enginefs::METADATA_RESOLVE_TIMEOUT` for metadata; map the
-/// error with [`engine_creation_failure`].
+/// It waits at most `enginefs::METADATA_RESOLVE_TIMEOUT` for metadata. Map
+/// the error with [`engine_creation_failure`].
 ///
-/// No want-set, unlike the create routes (`routes::engine::placement_for`).
-/// Its callers are the ones that either name no file at all -- a `stats.json`
-/// poll -- or name it and then narrow to it inside the same request, through
-/// `prepare_file_for_streaming`: there is no stretch of time here for an
-/// add-time want-set to shorten.
+/// There is no want-set, unlike the create routes
+/// (`routes::engine::placement_for`). Its callers either name no file at
+/// all (a `stats.json` poll), or name it and then narrow to it inside the
+/// same request, through `prepare_file_for_streaming`. There is no stretch
+/// of time here for an add-time want-set to shorten.
 pub async fn get_or_create_engine(
     engine_fs: &EngineFS,
     info_hash: &str,
@@ -106,13 +106,13 @@ pub async fn get_or_create_engine(
         .await
 }
 
-/// Status and body for a failed [`get_or_create_engine`]: a metadata timeout
+/// Status and body for a failed [`get_or_create_engine`]. A metadata timeout
 /// is 504 (the swarm did not answer in time; retrying may well succeed), a
-/// backend refusal 502, anything else 500. The body is
-/// [`MagnetAddError::client_message`] -- the same non-leaking text the stats
-/// route reports -- because a librqbit error can carry absolute download-dir
-/// paths, which must not be echoed to an HTTP client (log the error at the
-/// call site instead).
+/// backend refusal is 502, and anything else is 500. The body is
+/// [`MagnetAddError::client_message`], the same non-leaking text the stats
+/// route reports. A librqbit error can carry absolute download-dir paths,
+/// which must not be echoed to an HTTP client. Log the error at the call
+/// site instead.
 pub fn engine_creation_failure(error: &MagnetAddError) -> (StatusCode, String) {
     let status = match error {
         MagnetAddError::MetadataTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
@@ -237,7 +237,7 @@ pub fn resolve_file_idx(
 }
 
 /// Both live in `enginefs::engine`, next to `guess_file_index_in` and
-/// [`enginefs::engine::FileChoice`]: an add resolves which file a create
+/// [`enginefs::engine::FileChoice`]. An add resolves which file a create
 /// request means, and it cannot call back up into the server to ask.
 pub use enginefs::engine::{file_matches_filter, is_video_name};
 
@@ -295,9 +295,9 @@ mod tests {
         assert!(!body.contains("/home/user"), "{body}");
     }
 
-    /// `query_values` already percent-decodes `tr=`; decoding a second time
-    /// would corrupt trackers whose URL legitimately contains `%25` (and JSON
-    /// `peerSearch.sources` are never percent-encoded to begin with).
+    /// `query_values` already percent-decodes `tr=`. Decoding a second time
+    /// would corrupt trackers whose URL legitimately contains `%25`. JSON
+    /// `peerSearch.sources` are never percent-encoded to begin with.
     #[test]
     fn parse_trackers_decodes_exactly_once() {
         let trackers = parse_trackers(Some(

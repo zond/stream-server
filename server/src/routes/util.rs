@@ -5,14 +5,14 @@
 /// ranges `bytes=N-`) against a resource of `size` bytes.
 ///
 /// Returns `Some((start, end))` (inclusive, `end` clamped to `size - 1`)
-/// when the header describes a satisfiable byte range, `None` otherwise
-/// (including malformed headers, non-`bytes` units, and any range that
-/// cannot be satisfied — callers should fall back to a full-body 200 or
-/// respond 416 as appropriate).
+/// when the header describes a satisfiable byte range, and `None` otherwise.
+/// `None` includes malformed headers, non-`bytes` units, and any range that
+/// cannot be satisfied. Callers should then fall back to a full-body 200 or
+/// respond 416 as appropriate.
 ///
-/// `size == 0` always yields `None`: there is no valid inclusive byte
-/// range on an empty resource, and computing `size - 1` for a suffix or
-/// open range would otherwise underflow `u64`.
+/// `size == 0` always yields `None`. There is no valid inclusive byte range
+/// on an empty resource, and computing `size - 1` for a suffix or open
+/// range would otherwise underflow `u64`.
 pub(crate) fn parse_range(header: &str, size: u64) -> Option<(u64, u64)> {
     let prefix = "bytes=";
     if !header.starts_with(prefix) || size == 0 {
@@ -71,9 +71,9 @@ pub(crate) struct MediaRange {
 
 impl MediaRange {
     /// The framing for `range_header` over a resource of `size` bytes, or
-    /// `None` for a range nothing can satisfy -- which is
-    /// [`range_not_satisfiable`] and not a `200` over the whole file. A
-    /// request with no `Range` at all is the whole resource.
+    /// `None` for a range nothing can satisfy. That case is
+    /// [`range_not_satisfiable`], not a `200` over the whole file. A request
+    /// with no `Range` at all is the whole resource.
     pub(crate) fn of(range_header: Option<&str>, size: u64) -> Option<Self> {
         match range_header {
             Some(header) => parse_range(header, size).map(|(start, end)| Self {
@@ -91,8 +91,8 @@ impl MediaRange {
 
     /// How many bytes the body carries.
     ///
-    /// An empty resource is `(0, 0)` with no range: an inclusive end of 0
-    /// would otherwise read as a length of one, promising a `HEAD` a byte
+    /// An empty resource is `(0, 0)` with no range. Otherwise an inclusive
+    /// end of 0 would read as a length of one. That promises a `HEAD` a byte
     /// the `GET` doesn't have, which a client reads as a truncated
     /// response.
     pub(crate) fn content_length(&self, size: u64) -> u64 {
@@ -129,9 +129,9 @@ impl MediaRange {
     }
 }
 
-/// What a `Range` nothing can satisfy is answered with: a `416` that names
-/// the resource's length, as RFC 9110 asks, so the player can ask again
-/// for something that is there instead of guessing.
+/// The answer to a `Range` nothing can satisfy: a `416` that names the
+/// resource's length, as RFC 9110 asks. The player can then ask again for
+/// something that is there instead of guessing.
 pub(crate) fn range_not_satisfiable(size: u64) -> axum::response::Response {
     use axum::http::{StatusCode, header};
     use axum::response::IntoResponse;
@@ -147,13 +147,13 @@ pub(crate) fn range_not_satisfiable(size: u64) -> axum::response::Response {
 /// `scheme://host:port`, and never its path or query.
 ///
 /// `/proxy`'s `d=`, `/ftp`'s and an archive `/create`'s URL are the
-/// caller's, and a signed CDN link or a debrid URL carries the viewer's
-/// credentials in the query -- the log files this process keeps for the
-/// last ten launches are the one place those must not turn up. The origin
-/// is what a field report is read for anyway: which host answered, and
-/// how. A URL that does not parse is `"<unparsed>"` rather than itself:
-/// the reason it did not parse may be exactly the interesting part of it,
-/// and that is no reason to write it down.
+/// caller's. A signed CDN link or a debrid URL carries the viewer's
+/// credentials in the query. The log files this process keeps for the last
+/// ten launches are the one place those must not turn up. The origin is
+/// what a field report is read for anyway: which host answered, and how. A
+/// URL that does not parse is `"<unparsed>"` rather than itself. The reason
+/// it did not parse may be exactly the interesting part of it, and that is
+/// no reason to write it down.
 pub(crate) fn log_origin(url: &str) -> String {
     url::Url::parse(url)
         .map(|parsed| parsed.origin().ascii_serialization())
@@ -164,12 +164,12 @@ pub(crate) fn log_origin(url: &str) -> String {
 /// `/ftp` and `/cast` is elided to the route itself.
 ///
 /// `/proxy` takes its target in the *path* as well as the query (the Core
-/// format is `/proxy/d=<url>&h=<header>/<name>`), so a request span built
+/// format is `/proxy/d=<url>&h=<header>/<name>`). So a request span built
 /// from `uri.path()` carried the proxied URL and the caller's `h=` headers
-/// -- `Authorization` among them -- into every line written under that
-/// span. `/ftp` spells its target the same way. A `/cast/<token>` path is
-/// a URL into this device for as long as the token is published
-/// (`crate::cast`), and anyone on the LAN who read it could fetch the film.
+/// (`Authorization` among them) into every line written under that span.
+/// `/ftp` spells its target the same way. A `/cast/<token>` path is a URL
+/// into this device for as long as the token is published (`crate::cast`).
+/// Anyone on the LAN who read it could fetch the film.
 pub(crate) fn log_path(path: &str) -> &str {
     for route in ["/proxy", "/ftp", "/cast"] {
         if path == route || path.starts_with(&format!("{route}/")) {
@@ -183,14 +183,14 @@ pub(crate) fn log_path(path: &str) -> &str {
 /// ends.
 ///
 /// A body that stops early with no error recorded is the player
-/// disconnecting, not the server failing -- the distinction a field report
-/// needs, since a body can deliver a few MiB of a multi-gigabyte range and
-/// simply stop.
+/// disconnecting, not the server failing. A field report needs that
+/// distinction, since a body can deliver a few MiB of a multi-gigabyte
+/// range and simply stop.
 ///
 /// **One vocabulary, because two routes are asked the same question.** A
-/// torrent file and a proxied URL fail a player in the same ways, and a
-/// field report that had to be read with a glossary per route would answer
-/// neither: see `routes::stream`'s `http_stream_end` line and
+/// torrent file and a proxied URL fail a player in the same ways. A field
+/// report that had to be read with a glossary per route would answer
+/// neither. See `routes::stream`'s `http_stream_end` line and
 /// `routes::proxy`'s `http_proxy_body_end` one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BodyOutcome {
@@ -217,7 +217,7 @@ impl BodyOutcome {
 #[derive(Debug, Default)]
 pub(crate) struct BodyProgress {
     pub(crate) bytes_sent: u64,
-    /// `None` until the body ends by itself; a body dropped before that is
+    /// `None` until the body ends by itself. A body dropped before that is
     /// a player that hung up.
     pub(crate) outcome: Option<BodyOutcome>,
     pub(crate) error: Option<String>,
@@ -228,12 +228,12 @@ impl BodyProgress {
         self.bytes_sent = self.bytes_sent.saturating_add(len as u64);
     }
 
-    /// The reader failed. First error wins: what broke the stream is more
-    /// use than whatever the stream said on its way out.
+    /// The reader failed. The first error wins: what broke the stream is
+    /// more use than whatever the stream said on its way out.
     ///
-    /// Anything that can be shown, because the two routes fail with
-    /// different errors -- a reader's `io::Error`, an `axum::Error` off a
-    /// relayed body -- and what a report needs is the text either way.
+    /// It takes anything that can be shown. The two routes fail with
+    /// different errors (a reader's `io::Error`, an `axum::Error` off a
+    /// relayed body), and what a report needs is the text either way.
     pub(crate) fn record_error(&mut self, error: &dyn std::fmt::Display) {
         if self.outcome.is_none() {
             self.outcome = Some(BodyOutcome::ReaderError);
@@ -253,19 +253,18 @@ impl BodyProgress {
     ///
     /// **A body that delivered every byte it promised was not hung up on,
     /// whatever it recorded.** hyper stops polling a body of declared
-    /// length the moment that length is met -- the message is finished
-    /// without a further poll -- so [`Self::record_end`] never runs, and a
-    /// body read to its end by a happy client is indistinguishable from
-    /// one dropped part-way. Measured on `/proxy`: 65,536 bytes sent of
-    /// 65,536 promised, to a client that read all of them, filed as a
-    /// disconnect.
+    /// length the moment that length is met. The message is finished
+    /// without a further poll, so [`Self::record_end`] never runs. A body
+    /// read to its end by a happy client is then indistinguishable from one
+    /// dropped part-way. Measured on `/proxy`: 65,536 bytes sent of 65,536
+    /// promised, to a client that read all of them, filed as a disconnect.
     ///
-    /// A `promised` of nought is a response that declared no length -- a
-    /// rewritten playlist is framed as it is written -- and such a body is
-    /// polled to its end, so what it recorded is what happened. It is the
-    /// only way to ask what a body recorded and nothing else, and there is
-    /// no second accessor for it: reading an outcome without the promise
-    /// beside it is the defect above.
+    /// A `promised` of nought is a response that declared no length (a
+    /// rewritten playlist is framed as it is written). Such a body is
+    /// polled to its end, so what it recorded is what happened. This is the
+    /// only way to ask what a body recorded and nothing else. There is no
+    /// second accessor for it, because reading an outcome without the
+    /// promise beside it is the defect above.
     pub(crate) fn outcome_of(&self, promised: u64) -> BodyOutcome {
         match self.outcome {
             Some(outcome) => outcome,
@@ -303,7 +302,7 @@ mod tests {
         );
         assert_eq!(headers[axum::http::header::ACCEPT_RANGES], "bytes");
 
-        // An empty resource: a body of no bytes under a `200`, never a
+        // An empty resource is a body of no bytes under a `200`, never a
         // `Content-Length: 1` over a body that ends at once.
         let empty = MediaRange::of(None, 0).expect("an empty resource is not a bad range");
         assert_eq!(empty.content_length(0), 0);
@@ -435,7 +434,7 @@ mod body_progress_tests {
         let mut failed = BodyProgress::default();
         failed.record_chunk(7);
         failed.record_error(&std::io::Error::other("piece read failed"));
-        // A stream may still report end-of-stream after erroring; the error
+        // A stream may still report end-of-stream after erroring. The error
         // is what ended it.
         failed.record_end();
         assert_eq!(failed.outcome_of(0), BodyOutcome::ReaderError);
@@ -445,8 +444,8 @@ mod body_progress_tests {
 
     /// hyper never polls a body of declared length again once that length
     /// is met, so a body read to its end by a happy client records no end
-    /// at all -- and read without the promise beside it, every delivered
-    /// response is a disconnect.
+    /// at all. Read without the promise beside it, every delivered response
+    /// is a disconnect.
     #[test]
     fn a_body_that_delivered_what_it_promised_was_not_hung_up_on() {
         let mut delivered = BodyProgress::default();
@@ -461,8 +460,8 @@ mod body_progress_tests {
         // A response that promised no length says only what it recorded.
         assert_eq!(delivered.outcome_of(0), BodyOutcome::ClientDisconnect);
 
-        // And what a body did report is never overruled by the arithmetic:
-        // a reader that failed after delivering the promised bytes failed.
+        // And the arithmetic never overrules what a body did report. A
+        // reader that failed after delivering the promised bytes failed.
         let mut failed = BodyProgress::default();
         failed.record_chunk(64 * 1024);
         failed.record_error(&std::io::Error::other("piece read failed"));

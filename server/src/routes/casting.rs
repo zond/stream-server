@@ -31,13 +31,13 @@ pub fn router() -> Router<AppState> {
 /// The devices this server can cast to, which is none: `[]`, always.
 ///
 /// There is no discovery loop behind it (see `crate::devices`), so there is
-/// no state and the answer is a constant. That is the honest answer rather than
-/// a regression: nothing could be cast to a discovered device in any case --
-/// [`player_control`] below answers `501` on purpose -- and on Android
-/// M-SEARCH is multicast the app sandbox cannot send. The route stays
-/// because stremio-core's `StreamingServer` model requests it on every boot
-/// and a `404` would be a server it does not recognise; an embedder that
-/// casts discovers receivers itself and never reads this.
+/// no state and the answer is a constant. That is the honest answer, not a
+/// regression. Nothing could be cast to a discovered device in any case:
+/// [`player_control`] below answers `501` on purpose. On Android, M-SEARCH
+/// is also multicast the app sandbox cannot send. The route stays because
+/// stremio-core's `StreamingServer` model requests it on every boot, and a
+/// `404` would be a server it does not recognise. An embedder that casts
+/// discovers receivers itself and never reads this.
 pub async fn list_devices() -> Json<[crate::devices::Device; 0]> {
     Json([])
 }
@@ -49,7 +49,7 @@ pub async fn player_control(
     let params = body.map(|Json(b)| b).unwrap_or_default();
 
     // stremio-core's play_on_device (models/streaming_server.rs:716-744) POSTs
-    // here and treats a successful (2xx) response as `PlayingOnDevice` — a
+    // here and treats a successful (2xx) response as `PlayingOnDevice`. A
     // 200 here would make official UIs report success while nothing plays.
     // Casting isn't implemented, so fail visibly instead.
     tracing::warn!(

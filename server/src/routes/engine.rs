@@ -35,19 +35,19 @@ pub struct PeerSearchBody {
 /// What a `POST /create` names, sorted into what has to happen to it.
 ///
 /// stremio-core sends `/create` with a torrent-file `blob` and routes
-/// magnets to `/{infoHash}/create`; nothing shipped sends a magnet in
-/// `from`. But `from` accepts one -- a `magnet:` link or a bare 40-hex
-/// hash, both of which librqbit's `Session::add_torrent` treats as a magnet
-/// -- and a magnet may never go through `EngineFS::add_torrent` from a
-/// route: librqbit resolves metadata inside that call, with no timeout of
-/// its own, and the add is invisible to the registry that bounds every
-/// other magnet add at `METADATA_RESOLVE_TIMEOUT` and lets a stats poll for
+/// magnets to `/{infoHash}/create`. Nothing shipped sends a magnet in
+/// `from`. But `from` accepts one: a `magnet:` link or a bare 40-hex hash,
+/// both of which librqbit's `Session::add_torrent` treats as a magnet. A
+/// magnet may never go through `EngineFS::add_torrent` from a route.
+/// librqbit resolves metadata inside that call, with no timeout of its own.
+/// The add is also invisible to the registry. The registry bounds every
+/// other magnet add at `METADATA_RESOLVE_TIMEOUT`, and lets a stats poll for
 /// the same hash join it instead of starting a second resolve. (Measured:
 /// `{"from": <hash>}` for a hash with no swarm did not answer in two
 /// minutes while `/{infoHash}/stats.json` at the same time reported its own,
 /// separate `resolvingMetadata` add.) So a magnet is recognised here and
-/// sent down the registry path with the link's own `tr=` trackers merged
-/// in; a torrent file, by blob or by `http(s)` URL, keeps `add_torrent`.
+/// sent down the registry path, with the link's own `tr=` trackers merged
+/// in. A torrent file, by blob or by `http(s)` URL, keeps `add_torrent`.
 enum CreateSource {
     /// A `magnet:` link or bare info hash: the registry path.
     Magnet {
@@ -59,11 +59,11 @@ enum CreateSource {
 }
 
 impl CreateSource {
-    /// Sort `from` the way librqbit's own `Magnet::parse` would: a bare
+    /// Sort `from` the way librqbit's own `Magnet::parse` would. A bare
     /// 40-hex hash is a magnet (the same check `magnet_with_trackers` makes
-    /// before it upgrades one), and so is a `magnet:` URL naming a v1 hash
-    /// in `xt=urn:btih:`, whose `tr=` values are the link's trackers.
-    /// Anything else -- an `http(s)` URL, a v2-only magnet -- is left to
+    /// before it upgrades one). So is a `magnet:` URL naming a v1 hash in
+    /// `xt=urn:btih:`, whose `tr=` values are the link's trackers. Anything
+    /// else -- an `http(s)` URL, a v2-only magnet -- is left to
     /// `add_torrent` as before.
     fn from_link(from: String) -> Self {
         if is_info_hash(&from) {
@@ -162,15 +162,15 @@ pub async fn create_engine(
             {
                 Ok(engine) => engine,
                 // stremio-video's createTorrent.js checks resp.ok before
-                // reading the body (createTorrent.js:62); a 200 here on
+                // reading the body (createTorrent.js:62). A 200 here on
                 // failure leaves guessedFileIdx undefined and produces a
                 // broken /{infoHash}/undefined stream URL, so fail with a
                 // non-2xx status instead. The body is a fixed string like
-                // every other torrent-creation failure's: the error is
+                // every other torrent-creation failure's. The error is
                 // logged here in full and never echoed, since a backend
                 // error can carry the cache root's path.
                 // A typed failure goes through the same mapping as the
-                // magnet path's (`compat::engine_creation_failure`), so a
+                // magnet path's (`compat::engine_creation_failure`). So a
                 // client that re-creates the torrent from its `.torrent`
                 // file reads the same status and the same words as one that
                 // posted the magnet.
@@ -195,11 +195,10 @@ pub async fn create_engine(
 
 /// Stremio-core /{infoHash}/create endpoint for magnet links.
 ///
-/// It goes through `EngineFS::get_or_add_magnet`, never
-/// `add_torrent`: the hash may already be resolving for a stats poll or a
-/// stream request (and vice versa), and only one add per hash may exist or
-/// the second one's trackers are silently lost (see
-/// `routes::compat::get_or_create_engine`).
+/// It goes through `EngineFS::get_or_add_magnet`, never `add_torrent`. The
+/// hash may already be resolving for a stats poll or a stream request (and
+/// vice versa). Only one add per hash may exist, or the second one's
+/// trackers are silently lost (see `routes::compat::get_or_create_engine`).
 #[derive(Deserialize)]
 pub struct CreateMagnetRequest {
     pub stream: Option<CreateMagnetStream>,
@@ -245,7 +244,7 @@ pub async fn create_magnet(
             let stats = stats_with_guess(&engine, &choice).await;
             (StatusCode::OK, Json(stats))
         }
-        // See the matching comment in create_engine: stremio-video's
+        // See the matching comment in create_engine. stremio-video's
         // createTorrent.js requires a non-2xx status to detect failure.
         Err(e) => magnet_create_failure(ih, &e),
     }
@@ -274,10 +273,10 @@ fn merged_trackers(
 }
 
 /// Parse the request's `guessFileIdx` field, mirroring stremio-core's
-/// `CreatedTorrent.guess_file_idx: Option<SeriesInfo>`: `false`/`null`/absent
-/// means no guessing; `{}` means guess with no episode hints (movies);
+/// `CreatedTorrent.guess_file_idx: Option<SeriesInfo>`. `false`/`null`/absent
+/// means no guessing. `{}` means guess with no episode hints (movies).
 /// `{season, episode}` (stremio-video createTorrent.js:41-53) carries the
-/// hints; any other truthy value degrades to a hint-less guess.
+/// hints. Any other truthy value degrades to a hint-less guess.
 fn parse_guess_file_idx(value: Option<&serde_json::Value>) -> Option<SeriesInfo> {
     match value {
         None | Some(serde_json::Value::Bool(false)) | Some(serde_json::Value::Null) => None,
@@ -300,11 +299,11 @@ fn parse_guess_file_idx(value: Option<&serde_json::Value>) -> Option<SeriesInfo>
 ///
 /// A request that names nothing carries no choice, and the torrent wants
 /// everything as it always did. The choice is *not* turned into indices
-/// here -- for a magnet there is no file list yet to index into, and
+/// here. For a magnet there is no file list yet to index into, and
 /// resolving it here would mean a second metadata resolve. The add resolves
-/// it once, against the files it has just learned, and the route asks the
-/// same [`FileChoice`] for the `guessedFileIdx` it reports, so the two
-/// answers are one answer.
+/// it once, against the files it has just learned. The route asks the same
+/// [`FileChoice`] for the `guessedFileIdx` it reports, so the two answers
+/// are one answer.
 fn placement_for(choice: &FileChoice) -> TorrentPlacement {
     TorrentPlacement {
         only_files: None,
@@ -341,8 +340,8 @@ mod tests {
     use super::*;
 
     /// A `from` that librqbit would treat as a magnet -- a link, or a bare
-    /// info hash -- takes the registry path, with the link's trackers;
-    /// anything else is a torrent file to fetch.
+    /// info hash -- takes the registry path, with the link's trackers.
+    /// Anything else is a torrent file to fetch.
     #[test]
     fn create_source_sorts_magnets_from_torrent_files() {
         let hash = "0123456789abcdef0123456789abcdef01234567";
@@ -426,10 +425,10 @@ mod tests {
         );
     }
 
-    /// A create that names its file carries that file as the add's want-set;
-    /// one that names nothing carries no want-set at all, which is what
-    /// leaves the torrent wanting everything. Never `only_files`: the
-    /// indices are indices into a file list the add is what produces.
+    /// A create that names its file carries that file as the add's want-set.
+    /// One that names nothing carries no want-set at all, which is what
+    /// leaves the torrent wanting everything. It is never `only_files`: the
+    /// indices are indices into a file list that only the add produces.
     #[test]
     fn a_create_that_names_a_file_carries_it_as_the_adds_want_set() {
         let named = FileChoice {

@@ -1,7 +1,7 @@
 //! Offline downloads, behind the `ServerHandle` methods `pin_download`,
 //! `unpin_download`, `pin_proxy_download`, `unpin_proxy_download`,
-//! `downloads` and `download_path`. No HTTP route pins or lists anything:
-//! the app reaches this over FFI and nothing else speaks to it (see
+//! `downloads` and `download_path`. No HTTP route pins or lists anything.
+//! The app reaches this over FFI, and nothing else speaks to it (see
 //! `control_router` in `lib.rs`). The one route in this module is the
 //! media route `GET /downloads/{key}/stream`, which a player fetches.
 
@@ -23,33 +23,33 @@ use std::time::Duration;
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadInfo {
-    /// The download's coordinates. For a torrent, its info hash; for a
-    /// proxy download (see [`Self::source`]), the cache key directory's
-    /// name -- 64 hex characters, which no info hash is.
+    /// The download's coordinates. For a torrent, it is the info hash. For
+    /// a proxy download (see [`Self::source`]), it is the cache key
+    /// directory's name: 64 hex characters, which no info hash is.
     pub info_hash: String,
-    /// The file within the torrent; `0` for a proxy download, which is one
-    /// file by construction.
+    /// The file within the torrent. It is `0` for a proxy download, which is
+    /// one file by construction.
     pub file_idx: usize,
     /// What this is a download of when it is not a torrent: the addon URL
     /// or the Drive file the pin names (`crate::proxy_downloads`). `None`
     /// is a torrent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<crate::proxy_downloads::ProxyPinKey>,
-    /// Where a proxy download plays from: `/downloads/{key}/stream`, which
-    /// serves the pinned entry by range off the disk, for a link and a
-    /// Drive file alike. A torrent's is its media route, which the client
-    /// already knows, so it is `None` here.
+    /// Where a proxy download plays from: `/downloads/{key}/stream`. That
+    /// route serves the pinned entry by range off the disk, for a link and a
+    /// Drive file alike. A torrent plays from its media route, which the
+    /// client already knows, so it is `None` here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub play_url: Option<String>,
     /// What the torrent backend calls this file, when it knows.
     ///
     /// **A name, not a file.** Torrent data is stored one file per piece
     /// (`enginefs::piece_store`), so no whole file is ever produced at this
-    /// path and nothing should try to open it; the bytes come out of the
-    /// media routes. The folder in it is librqbit's own -- nothing above the
+    /// path, and nothing should try to open it. The bytes come out of the
+    /// media routes. The folder in it is librqbit's own. Nothing above the
     /// backend chooses one, for a pinned download no more than for a
-    /// streamed torrent -- and it is what `download_path` and the listing
-    /// agree on.
+    /// streamed torrent. It is what `download_path` and the listing agree
+    /// on.
     pub path: Option<String>,
     pub name: String,
     pub length: u64,
@@ -58,35 +58,37 @@ pub struct DownloadInfo {
     /// The torrent's startup phase (`checking` while librqbit verifies what
     /// is already on disk).
     pub phase: StartupPhase,
-    /// Why the download is not progressing, when anything knows: the
-    /// engine's error for a failed magnet add or a torrent the backend put
-    /// in an error state (a client-safe message either way -- the
-    /// backend's own text names server paths and stays in the log),
-    /// [`DORMANT_DOWNLOAD_ERROR`] for a pin whose torrent the backend does
-    /// not have and whose piece directory is on the disk. `null` for a
-    /// healthy download, and for a dormant pin with no piece directory,
-    /// which holds nothing and says so (`complete: false`).
+    /// Why the download is not progressing, when anything knows. For a
+    /// failed magnet add, or a torrent the backend put in an error state,
+    /// it is the engine's error. That is a client-safe message either way:
+    /// the backend's own text names server paths and stays in the log. For
+    /// a pin whose torrent the backend does not have and whose piece
+    /// directory is on the disk, it is [`DORMANT_DOWNLOAD_ERROR`]. It is
+    /// `null` for a healthy download. It is also `null` for a dormant pin
+    /// with no piece directory, which holds nothing and says so
+    /// (`complete: false`).
     pub error: Option<String>,
 }
 
 /// One download the embedder keeps, as it names it at boot
 /// ([`crate::ServerConfig::pins`]): a torrent's file, an addon link, a
-/// Google Drive file. **One pin set for both stores**: the torrent keys
-/// are the piece store's ([`Self::torrent_pins`]), the link and Drive keys
-/// the proxy cache's ([`Self::proxy_pins`]), and each store applies its
+/// Google Drive file. **One pin set for both stores.** The torrent keys
+/// are the piece store's ([`Self::torrent_pins`]). The link and Drive keys
+/// are the proxy cache's ([`Self::proxy_pins`]). Each store applies its
 /// half exactly as before.
 ///
-/// Serialized as `{"kind": "torrent", "infoHash", "fileIdx"}`,
-/// `{"kind": "url", "target", "headers"}` or `{"kind": "drive", "fileId"}`
-/// -- the last two are [`crate::ProxyPinKey`]'s own shapes.
+/// It is serialized as `{"kind": "torrent", "infoHash", "fileIdx"}`,
+/// `{"kind": "url", "target", "headers"}` or `{"kind": "drive", "fileId"}`.
+/// The last two are [`crate::ProxyPinKey`]'s own shapes.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum PinKey {
-    /// A file of a torrent. The info hash in any case; it is lowercased.
+    /// A file of a torrent. The info hash may be in any case; it is
+    /// lowercased.
     #[serde(rename_all = "camelCase")]
     Torrent { info_hash: String, file_idx: usize },
     /// An addon link: the URL stremio-core puts in `d=` plus the path, and
-    /// the `h=` request headers -- the `/proxy` cache key, as
+    /// the `h=` request headers. That is the `/proxy` cache key, as
     /// [`crate::ProxyPinKey::Url`] names it.
     #[serde(rename_all = "camelCase")]
     Url {
@@ -102,7 +104,7 @@ pub enum PinKey {
 impl PinKey {
     /// The piece store's half: the torrent keys, as info hash (lowercase)
     /// to its file indices, sorted and without repeats. An empty result
-    /// is an empty set, not an unknown one -- the caller keeps `None` for
+    /// is an empty set, not an unknown one. The caller keeps `None` for
     /// that.
     pub fn torrent_pins(keys: &[PinKey]) -> enginefs::piece_store::PinSet {
         let mut pins = enginefs::piece_store::PinSet::new();
@@ -156,22 +158,21 @@ impl From<crate::proxy_downloads::ProxyPinKey> for PinKey {
 }
 
 /// What a pin whose torrent the backend did not restore reports as its
-/// `error` (`enginefs::BackendEngineFS::dormant_pinned_downloads`): the pin
+/// `error` (`enginefs::BackendEngineFS::dormant_pinned_downloads`). The pin
 /// is kept, nothing is downloading, and there is nothing for the client to
-/// do about it. A dormant pin is a torrent the session did not bring back,
-/// and where its bytes are is not the question, so the message names no
+/// do about it. A dormant pin is a torrent the session did not bring back.
+/// Where its bytes are is not the question, so the message names no
 /// folder.
 pub const DORMANT_DOWNLOAD_ERROR: &str = "the torrent is not managed right now; \
      the pin is kept and applies when it comes back";
 
 /// Pin `file_idx` of `info_hash` as an offline download, behind
-/// `ServerHandle::pin_download`: the engine is created
-/// through the magnet registry with `trackers` (normalised like the stats
-/// routes' `tr=` values) when the hash is new, and the file is kept wanted
-/// and exempt from eviction (see
-/// `enginefs::BackendEngineFS::pin_download`). **Nothing moves**: a pin is
-/// a retention property, and a torrent that was streamed first is pinned
-/// where it already is. Refused with
+/// `ServerHandle::pin_download`. When the hash is new, the engine is
+/// created through the magnet registry with `trackers` (normalised like the
+/// stats routes' `tr=` values). The file is kept wanted and exempt from
+/// eviction (see `enginefs::BackendEngineFS::pin_download`). **Nothing
+/// moves.** A pin is a retention property, and a torrent that was streamed
+/// first is pinned where it already is. It is refused with
 /// [`PinDownloadError::InsufficientSpace`] below the free-space margin.
 pub async fn pin_download(
     state: &AppState,
@@ -219,13 +220,13 @@ pub async fn pin_download(
 /// so a download that has stopped moving is visible without diagnosing it
 /// from the peer connections by hand.
 ///
-/// Ten seconds, not the stream route's five: nothing is waiting on this
-/// line, and a download runs for the length of a film.
+/// It is ten seconds, not the stream route's five. Nothing is waiting on
+/// this line, and a download runs for the length of a film.
 const DOWNLOAD_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
-/// The files with a progress logger running, so that a second pin of the
-/// same file -- a retry, the boot's re-pin of an unfinished download -- adds
-/// no second line every ten seconds. A slot is taken before the task is
+/// The files with a progress logger running. A second pin of the same file
+/// (a retry, the boot's re-pin of an unfinished download) then adds no
+/// second line every ten seconds. A slot is taken before the task is
 /// spawned and given back when the task ends ([`LoggerSlot`]).
 fn progress_loggers() -> &'static Mutex<HashSet<(String, usize)>> {
     static LOGGERS: OnceLock<Mutex<HashSet<(String, usize)>>> = OnceLock::new();
@@ -235,10 +236,10 @@ fn progress_loggers() -> &'static Mutex<HashSet<(String, usize)>> {
 /// Takes `key`'s slot in [`progress_loggers`], or answers `None` when a
 /// logger already holds it. The slot is released when the value drops.
 fn claim_progress_logger(key: (String, usize)) -> Option<LoggerSlot> {
-    // The guard is dropped before any `LoggerSlot` exists: a slot's drop
-    // takes the same lock, and an eager `then_some` here built one for a
-    // refused claim too -- dropped under the guard (a deadlock) and
-    // removing the holder's key with it.
+    // The guard is dropped before any `LoggerSlot` exists. A slot's drop
+    // takes the same lock. An eager `then_some` here built one for a
+    // refused claim too. It was dropped under the guard (a deadlock), and
+    // it removed the holder's key with it.
     let claimed = progress_loggers()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -258,8 +259,8 @@ impl Drop for LoggerSlot {
 }
 
 /// Bytes moved since the previous reading, and how many readings in a row
-/// moved nothing: the two numbers that tell a download that is slow from
-/// one that has stopped.
+/// moved nothing. These two numbers tell a download that is slow from one
+/// that has stopped.
 #[derive(Debug, Default)]
 struct ProgressTrack {
     last: Option<u64>,
@@ -267,10 +268,11 @@ struct ProgressTrack {
 }
 
 impl ProgressTrack {
-    /// Answers `(moved, still)`: bytes since the previous reading -- 0 on
-    /// the first, which measures nothing -- and the consecutive readings,
-    /// this one included, that moved nothing. A count that went *down* (a
-    /// piece dropped, a re-check) is not movement either.
+    /// Answers `(moved, still)`. `moved` is the bytes since the previous
+    /// reading (0 on the first, which measures nothing). `still` is the
+    /// consecutive readings, this one included, that moved nothing. A count
+    /// that went *down* (a piece dropped, a re-check) is not movement
+    /// either.
     fn observe(&mut self, downloaded: u64) -> (u64, u32) {
         let moved = self.last.map_or(0, |last| downloaded.saturating_sub(last));
         self.still = match self.last {
@@ -283,13 +285,13 @@ impl ProgressTrack {
 }
 
 /// One `download progress` line every [`DOWNLOAD_PROGRESS_LOG_INTERVAL`]
-/// for `file_idx` of `info_hash`, until the file is complete, the pin is
-/// gone or the torrent has left the session -- each of which is said in a
-/// last line. Every field the stream line carries and the ones a stall is
-/// argued from: bytes moved since the last line, how long nothing has
-/// moved, the peers connected against the addresses queued, dialling and
-/// known, and the torrent's run state, so "stopped" and "nobody answers"
-/// read differently.
+/// for `file_idx` of `info_hash`. It runs until the file is complete, the
+/// pin is gone or the torrent has left the session, and says which in a
+/// last line. It carries every field the stream line carries, and the ones
+/// a stall is argued from. Those are the bytes moved since the last line,
+/// how long nothing has moved, and the peers connected against the
+/// addresses queued, dialling and known. They also include the torrent's
+/// run state, so "stopped" and "nobody answers" read differently.
 fn spawn_download_progress_log(
     engine: Arc<enginefs::EngineFS>,
     info_hash: String,
@@ -328,9 +330,9 @@ fn spawn_download_progress_log(
             }
             let stats = engine.get_statistics().await;
             let Some(file) = stats.files.get(file_idx) else {
-                // No file list right now (a hash check in progress, a
-                // torrent the session has not brought back): nothing to
-                // measure, and the next tick asks again.
+                // There is no file list right now (a hash check in
+                // progress, a torrent the session has not brought back).
+                // There is nothing to measure, and the next tick asks again.
                 tracing::debug!(
                     info_hash = %info_hash,
                     file_idx,
@@ -387,15 +389,16 @@ fn spawn_download_progress_log(
 /// Drop the pin on `file_idx` of `info_hash`, behind
 /// `ServerHandle::unpin_download`. [`UnpinOutcome`] says whether a pin was
 /// actually cleared (false for an unknown torrent or an unpinned file) and
-/// whether data actually went -- which is what the caller is told, not its
+/// whether data actually went. That is what the caller is told, not its
 /// own flag echoed back.
-/// `delete_files` also deletes the data -- the whole torrent when this was
-/// its last pin, only that file while other pins hold, and, for a pin whose
-/// torrent the backend does not have, its directory in the piece store
-/// (see `enginefs::BackendEngineFS::unpin_download`); a `file_idx` the
-/// torrent does not have is refused with [`PinDownloadError::FileNotFound`]
-/// (404), like [`pin_download`]. Without it the bytes stay where they are
-/// and the engine becomes an ordinary, evictable one again.
+/// `delete_files` also deletes the data. That is the whole torrent when this
+/// was its last pin, and only that file while other pins hold. For a pin
+/// whose torrent the backend does not have, it is the pin's directory in
+/// the piece store (see `enginefs::BackendEngineFS::unpin_download`). A
+/// `file_idx` the torrent does not have is refused with
+/// [`PinDownloadError::FileNotFound`] (404), like [`pin_download`]. Without
+/// `delete_files`, the bytes stay where they are, and the engine becomes an
+/// ordinary, evictable one again.
 pub async fn unpin_download(
     state: &AppState,
     info_hash: &str,
@@ -408,30 +411,30 @@ pub async fn unpin_download(
         .await
 }
 
-/// Every pinned download, behind `ServerHandle::downloads`:
-/// ordered by info hash then file index, the live ones first and the
-/// dormant ones (torrent not restored: held-nothing, or
-/// [`DORMANT_DOWNLOAD_ERROR`] -- see `dormant_downloads`) after them. One
-/// stats call per torrent, not per file.
+/// Every pinned download, behind `ServerHandle::downloads`, ordered by info
+/// hash then file index. The live ones come first. The dormant ones
+/// (torrent not restored: held-nothing, or [`DORMANT_DOWNLOAD_ERROR`] --
+/// see `dormant_downloads`) come after them. It makes one stats call per
+/// torrent, not per file.
 ///
 /// When the embedder named no pin set
-/// ([`enginefs::piece_store::PinsUnknown`]) the list is every file of every
-/// torrent the session restored, because that is what is being kept, and
-/// reporting the empty in-memory pin set instead would tell the caller the
+/// ([`enginefs::piece_store::PinsUnknown`]), the list is every file of every
+/// torrent the session restored, because that is what is being kept.
+/// Reporting the empty in-memory pin set instead would tell the caller the
 /// downloads are gone while the bytes are still on the disk.
 ///
 /// **One read of the condition, for the whole listing.** Asking again
 /// mid-listing is how a response comes back with a file listed twice: once
 /// because the set was unknown, once because a pin taken meanwhile names it.
-/// A value read once and trusted for the rest of the answer is the shape
-/// `PinsUnknown` is documented against; reading it repeatedly inside one
-/// answer is that shape, not its cure.
+/// `PinsUnknown` is documented against a value read once and trusted for
+/// the rest of the answer. Reading it repeatedly inside one answer is that
+/// shape, not its cure.
 pub async fn downloads(state: &AppState) -> Vec<DownloadInfo> {
     let engine_fs = state.engine.clone();
     let unknown = engine_fs.pins_unknown();
-    // A set, not a list: both sources can name the same file, and a
-    // listing that names one download twice is one no client can
-    // reconcile against its own list.
+    // A set, not a list. Both sources can name the same file, and no
+    // client can reconcile a listing that names one download twice against
+    // its own list.
     let mut by_hash: BTreeMap<String, std::collections::BTreeSet<usize>> = BTreeMap::new();
     if unknown {
         for info_hash in engine_fs.list_engines().await {
@@ -450,7 +453,7 @@ pub async fn downloads(state: &AppState) -> Vec<DownloadInfo> {
     }
     let mut downloads = Vec::new();
     for (info_hash, file_indices) in by_hash {
-        // The pin came from the registry a moment ago; a torrent that left
+        // The pin came from the registry a moment ago. A torrent that left
         // it since (an unpin racing this listing) simply is not listed.
         let Some(engine) = engine_fs.get_engine(&info_hash).await else {
             continue;
@@ -471,18 +474,18 @@ pub async fn downloads(state: &AppState) -> Vec<DownloadInfo> {
 /// what the disk says (`docs/design/media-pipeline.md` §2.6):
 ///
 /// * **no `.pieces/<hash>` directory**: this server holds nothing of it,
-///   and knows so for certain -- the session never restored the torrent
-///   and no store is on the disk. Reported as held-nothing: `complete:
-///   false`, `downloaded: 0`, phase `buffering` and **no error**, which is
-///   the row a client reads as "not whole" (xtremio marks a finished row
-///   gone). The boot that deleted the previous build's cache directory
-///   leaves every pin the app hands in like this.
+///   and knows so for certain. The session never restored the torrent,
+///   and no store is on the disk. It is reported as held-nothing:
+///   `complete: false`, `downloaded: 0`, phase `buffering` and **no
+///   error**. A client reads that row as "not whole" (xtremio marks a
+///   finished row gone). The boot that deleted the previous build's cache
+///   directory leaves every pin the app hands in like this.
 /// * **a directory there**: bytes may be held under a torrent the session
-///   could not restore, and what they amount to is unknown until it comes
-///   back. The dormant answer: phase `error` and
+///   could not restore. What they amount to is unknown until it comes
+///   back. This is the dormant answer: phase `error` and
 ///   [`DORMANT_DOWNLOAD_ERROR`], which a client reads as "cannot say yet".
 ///
-/// One hop to the blocking pool for every pin's `stat`.
+/// It takes one hop to the blocking pool for every pin's `stat`.
 async fn dormant_downloads(engine_fs: &enginefs::EngineFS) -> Vec<DownloadInfo> {
     let pins = engine_fs.dormant_pinned_downloads();
     if pins.is_empty() {
@@ -493,8 +496,8 @@ async fn dormant_downloads(engine_fs: &enginefs::EngineFS) -> Vec<DownloadInfo> 
         .iter()
         .map(|pin| store.torrent_dir(&pin.info_hash))
         .collect();
-    // A stat that could not be made is not "absent": the dormant answer,
-    // which claims nothing, is what such a pin keeps.
+    // A stat that could not be made is not "absent". Such a pin keeps the
+    // dormant answer, which claims nothing.
     let held = tokio::task::spawn_blocking(move || {
         dirs.iter()
             .map(|dir| match std::fs::symlink_metadata(dir) {
@@ -529,8 +532,8 @@ async fn dormant_downloads(engine_fs: &enginefs::EngineFS) -> Vec<DownloadInfo> 
 
 /// Every pinned proxy download (`crate::proxy_downloads`), read off the
 /// disk: what is held of the entity under the key, whether it is whole,
-/// and where it plays from. The disk is the truth for progress here as it
-/// is for a torrent -- nothing about a fill is remembered.
+/// and where it plays from. The disk is the truth for progress here, as it
+/// is for a torrent. Nothing about a fill is remembered.
 async fn proxy_downloads(state: &AppState) -> Vec<DownloadInfo> {
     let pinned = state.proxy_downloads.snapshot();
     let mut rows = Vec::with_capacity(pinned.len());
@@ -581,10 +584,10 @@ async fn proxy_downloads(state: &AppState) -> Vec<DownloadInfo> {
             } else if filling {
                 StartupPhase::Buffering
             } else {
-                // Pinned, nothing fetching: a Drive pin the app has not
-                // re-pinned with a pairing since boot, or a URL pin whose
-                // filler stopped (then `error` may say why). The bytes are
-                // kept.
+                // Pinned, with nothing fetching. This is a Drive pin the
+                // app has not re-pinned with a pairing since boot, or a URL
+                // pin whose filler stopped (then `error` may say why). The
+                // bytes are kept.
                 StartupPhase::Checking
             },
             error: failure,
@@ -595,10 +598,10 @@ async fn proxy_downloads(state: &AppState) -> Vec<DownloadInfo> {
 
 /// Where a proxy download plays from: its own media route,
 /// `GET /downloads/{key}/stream`, which serves the pinned entry by range
-/// off the disk. Not the `/proxy` URL of the stream: that route keys the
-/// cache on the player's own negotiation headers, so a player's request
-/// lands on a different key than the filler's and goes to the origin --
-/// the wrong answer for a download, and no answer at all offline.
+/// off the disk. It is not the `/proxy` URL of the stream. That route keys
+/// the cache on the player's own negotiation headers, so a player's request
+/// lands on a different key than the filler's and goes to the origin. That
+/// is the wrong answer for a download, and no answer at all offline.
 fn proxy_play_url(state: &AppState, key_name: &str) -> String {
     format!(
         "{}{}",
@@ -607,16 +610,16 @@ fn proxy_play_url(state: &AppState, key_name: &str) -> String {
     )
 }
 
-/// The media route a proxy download plays from, as this server's own path:
-/// what [`proxy_play_url`] makes absolute for a `DownloadInfo`, and what a
-/// complete Drive download is opened at
+/// The media route a proxy download plays from, as this server's own path.
+/// [`proxy_play_url`] makes it absolute for a `DownloadInfo`, and a complete
+/// Drive download is opened at it
 /// (`proxy_downloads::complete_drive_download`).
 pub(crate) fn proxy_stream_path(key_name: &str) -> String {
     format!("/downloads/{}/stream", urlencoding::encode(key_name))
 }
 
 /// One pinned file of a live torrent. A torrent still resolving its
-/// metadata has no file list yet: the entry then carries the pin and the
+/// metadata has no file list yet. The entry then carries the pin and the
 /// phase, with the file's own numbers still unknown.
 fn live_download(
     info_hash: &str,
@@ -640,11 +643,11 @@ fn live_download(
     }
 }
 
-/// What the backend calls `file_idx` of `info_hash` -- [`DownloadInfo::path`]
-/// on its own, a name and not a file that exists. `None` when the torrent is
-/// not managed right now or the backend does not know the path yet (no
-/// metadata). Never creates an engine -- unlike [`pin_download`], this only
-/// reports.
+/// What the backend calls `file_idx` of `info_hash`. This is
+/// [`DownloadInfo::path`] on its own: a name, not a file that exists. `None`
+/// when the torrent is not managed right now, or the backend does not know
+/// the path yet (no metadata). It never creates an engine. Unlike
+/// [`pin_download`], this only reports.
 pub async fn download_path(state: &AppState, info_hash: &str, file_idx: usize) -> Option<String> {
     let engine = state.engine.get_engine(&info_hash.to_lowercase()).await?;
     engine.handle.get_file_path(file_idx).await
@@ -664,8 +667,8 @@ pub struct ProxyDownloadRequest {
     pub drive_file_id: Option<String>,
     #[serde(default)]
     pub refresh_token: Option<String>,
-    /// What to call it in a list; the target's last path segment or the
-    /// Drive file's name when absent.
+    /// What to call it in a list. When absent, the target's last path
+    /// segment or the Drive file's name is used.
     #[serde(default)]
     pub name: Option<String>,
 }
@@ -689,7 +692,7 @@ pub async fn pin_proxy_download(
         (None, Some(file_id)) => {
             // An empty grant is no grant. `pin_drive` asks for one only
             // when the file is not whole on the disk yet, and refuses with
-            // `NoGrant` then -- a finished download re-pins without one.
+            // `NoGrant` then. A finished download re-pins without one.
             let token = request
                 .refresh_token
                 .as_deref()
@@ -723,13 +726,13 @@ pub(crate) async fn proxy_row(
     )
 }
 
-/// The key a proxy download of `pin` would have -- the row's `infoHash`
-/// -- derived without pinning anything or touching the network: the cache
-/// key directory's name for that source. `None` when the source cannot be
-/// keyed (a URL that does not parse or names this server; a Drive pin with
-/// no Drive endpoint). What lets an embedder write a download's row under
-/// its final coordinates before it asks for the pin, as it does for a
-/// torrent with the info hash.
+/// The key a proxy download of `pin` would have (the row's `infoHash`),
+/// derived without pinning anything or touching the network. It is the
+/// cache key directory's name for that source. `None` when the source
+/// cannot be keyed: a URL that does not parse or names this server, or a
+/// Drive pin with no Drive endpoint. This lets an embedder write a
+/// download's row under its final coordinates before it asks for the pin,
+/// as it does for a torrent with the info hash.
 pub fn proxy_download_key(
     state: &AppState,
     pin: &crate::proxy_downloads::ProxyPinKey,
@@ -763,12 +766,12 @@ pub async fn unpin_proxy_download(state: &AppState, key: &str, delete_files: boo
 }
 
 /// `GET /downloads/{key}/stream`: a proxy download by range, served off the
-/// pinned entry. A range the disk holds is answered from the disk with the
-/// origin asked for nothing -- which is the whole download once it is
-/// complete, and is what plays it offline. A range it does not hold yet
-/// (a play mid-download) is read through the same source the filler
-/// fills from, so the bytes land in the cache on their way to the player.
-/// A media route: no bearer, like every URL a player fetches.
+/// pinned entry. A range the disk holds is answered from the disk, and the
+/// origin is asked for nothing. Once the download is complete, that is the
+/// whole of it, and that is what plays it offline. A range it does not
+/// hold yet (a play mid-download) is read through the same source the
+/// filler fills from. The bytes then land in the cache on their way to the
+/// player. It is a media route: no bearer, like every URL a player fetches.
 pub async fn stream_proxy_download(
     State(state): State<AppState>,
     Path(key): Path<String>,
@@ -786,7 +789,7 @@ pub async fn stream_proxy_download(
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    // A viewer's entry: its readers claim the live entity and note the
+    // A viewer's entry. Its readers claim the live entity and note the
     // playhead, as any player's do.
     let Some(entry) = state
         .proxy_cache
@@ -805,7 +808,8 @@ pub async fn stream_proxy_download(
         .ok()
         .flatten();
     if let Some(cached) = cached.filter(|cached| cached.complete()) {
-        // Served whole from the disk: the framing the lookup already made.
+        // Served whole from the disk, with the framing the lookup already
+        // made.
         let total = cached.total();
         let Some(framing) = crate::routes::util::MediaRange::of(range.as_deref(), total) else {
             return crate::routes::util::range_not_satisfiable(total);
@@ -822,7 +826,7 @@ pub async fn stream_proxy_download(
         let body = axum::body::Body::from_stream(cached.body());
         return (framing.status(), res_headers, body).into_response();
     }
-    // Not all on the disk: read through the source, filling as it goes.
+    // Not all on the disk. Read through the source, filling as it goes.
     let source: Arc<dyn crate::sources::ByteSource> = match &pin {
         crate::proxy_downloads::ProxyPinKey::Url { target, headers } => {
             let Ok(url) = url::Url::parse(target) else {
@@ -842,7 +846,7 @@ pub async fn stream_proxy_download(
         }
         crate::proxy_downloads::ProxyPinKey::Drive { .. } => {
             // A Drive download mid-fill is played through the Drive route
-            // the client already opens with its pairing; this route holds no
+            // the client already opens with its pairing. This route holds no
             // credential to read the rest with.
             return (
                 StatusCode::CONFLICT,
@@ -883,7 +887,7 @@ pub async fn stream_proxy_download(
 mod tests {
     use super::{ProgressTrack, claim_progress_logger};
 
-    /// The line's two stall fields: a first reading measures nothing,
+    /// The line's two stall fields. A first reading measures nothing,
     /// movement resets the count, and a count that fell is not movement.
     #[test]
     fn progress_track_tells_slow_from_stopped() {
@@ -905,7 +909,7 @@ mod tests {
     }
 
     /// A retry or the boot's re-pin of a file already being logged adds no
-    /// second logger; once the first ends the slot is free again.
+    /// second logger. Once the first ends, the slot is free again.
     #[test]
     fn one_progress_logger_per_file() {
         let key = ("one_progress_logger_per_file".to_owned(), 3);
