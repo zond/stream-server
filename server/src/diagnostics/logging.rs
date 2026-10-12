@@ -16,30 +16,31 @@ static LOG_GUARDS: OnceLock<Vec<WorkerGuard>> = OnceLock::new();
 static LOG_FILTER: OnceLock<LogFilter> = OnceLock::new();
 
 /// The `tracing` target of the retention trace
-/// (`enginefs::retention::trace`): one line per entity per ten seconds
-/// saying what a pass decided and why, plus the per-file `streams_seen`
-/// line. Off unless the `diagnosticsTrace` setting turns it on.
+/// (`enginefs::retention::trace`). It writes one line per entity per ten
+/// seconds saying what a pass decided and why, plus the per-file
+/// `streams_seen` line. It is off unless the `diagnosticsTrace` setting
+/// turns it on.
 pub const RETENTION_TRACE_TARGET: &str = "enginefs::retention::trace";
 
 /// What `/proxy` reports about each answer it relays, under the same
 /// switch as the retention trace.
 ///
 /// A stream that plays from a torrent and fails from a debrid link leaves
-/// nothing behind to tell them apart: the player says only that it could
+/// nothing behind to tell them apart. The player says only that it could
 /// not recognise the format, and the URL is redacted on its way to the log
 /// because it carries the viewer's credentials. This target is the other
-/// half of that sentence -- what the origin actually answered -- and it is
-/// written with origins rather than URLs for the same reason the player's
-/// line is redacted.
+/// half of that story: what the origin actually answered. It is written
+/// with origins rather than URLs, for the same reason the player's line is
+/// redacted.
 pub const PROXY_TRACE_TARGET: &str = "stream_server::routes::proxy::trace";
 
 /// The process's log filter, kept so a setting can change it while the
-/// process runs. `tracing` allows one global subscriber per process and
-/// its filter is set when it is installed; `reload` is the one way to
-/// change a directive afterwards, and this is the handle it gives back,
-/// with the directives it was built over.
+/// process runs. `tracing` allows one global subscriber per process, and
+/// its filter is set when it is installed. `reload` is the one way to
+/// change a directive afterwards. This is the handle it gives back, with
+/// the directives it was built over.
 struct LogFilter {
-    /// `RUST_LOG`, or `DEFAULT_LOG_FILTER`: everything but the one
+    /// `RUST_LOG`, or `DEFAULT_LOG_FILTER`. It holds everything but the one
     /// directive the setting decides.
     base: String,
     handle: reload::Handle<EnvFilter, Registry>,
@@ -47,9 +48,9 @@ struct LogFilter {
 
 /// The filter for `base`'s directives with the retention trace on or off.
 ///
-/// The trace target is appended last: `EnvFilter` prefers the more
+/// The trace target is appended last. `EnvFilter` prefers the more
 /// specific directive, so `enginefs=info` in the base still carries every
-/// other `enginefs` line while this one decides the trace alone.
+/// other `enginefs` line, and this one decides the trace alone.
 pub fn log_filter(base: &str, diagnostics_trace: bool) -> EnvFilter {
     let level = if diagnostics_trace { "info" } else { "off" };
     EnvFilter::new(format!(
@@ -63,9 +64,9 @@ pub fn store_log_filter(base: String, handle: reload::Handle<EnvFilter, Registry
 }
 
 /// Turn the retention trace on or off in the running process's log.
-/// `false` when this process installed no log filter to change (an
-/// embedder that logs on its own, or a test), in which case the setting is
-/// persisted and applies at the next start that does.
+/// Returns `false` when this process installed no log filter to change (an
+/// embedder that logs on its own, or a test). The setting is then
+/// persisted and applies at the next start that installs one.
 pub fn set_diagnostics_trace(on: bool) -> bool {
     let Some(filter) = LOG_FILTER.get() else {
         return false;
@@ -107,8 +108,8 @@ pub fn uptime_secs() -> u64 {
 
 /// Render every request header as `name=value` pairs for diagnostic logging.
 /// Credential headers are redacted to their byte length so logs can be shared
-/// without leaking secrets; non-UTF8 values are shown as `<binary:N bytes>` so
-/// the line always stays printable.
+/// without leaking secrets. Non-UTF8 values are shown as `<binary:N bytes>`
+/// so the line always stays printable.
 fn format_headers(headers: &axum::http::HeaderMap) -> String {
     fn is_sensitive(name: &axum::http::HeaderName) -> bool {
         matches!(
@@ -139,13 +140,13 @@ fn format_headers(headers: &axum::http::HeaderMap) -> String {
 /// The names of a query string's parameters, without their values:
 /// `d, h, p`.
 ///
-/// What is being diagnosed here is a request nothing served, and the shape
-/// of it -- which parameters were sent -- is what says whether the client
-/// called something that no longer exists or spelled a live route wrongly.
-/// The *values* are where a caller's URLs and credentials live (`/proxy`'s
-/// `d=` and `h=`, an archive `/create`'s `lz=`), and this line is written
-/// at ERROR, which is always on. See `routes::util::log_origin` for the
-/// same rule on the routes that do serve those requests.
+/// This line diagnoses a request nothing served. Its shape (which
+/// parameters were sent) says whether the client called something that no
+/// longer exists or spelled a live route wrongly. The *values* are where a
+/// caller's URLs and credentials live (`/proxy`'s `d=` and `h=`, an archive
+/// `/create`'s `lz=`), and this line is written at ERROR, which is always
+/// on. See `routes::util::log_origin` for the same rule on the routes that
+/// do serve those requests.
 fn query_keys(query: Option<&str>) -> String {
     query
         .unwrap_or_default()
@@ -158,12 +159,13 @@ fn query_keys(query: Option<&str>) -> String {
 
 /// Emit an ERROR log describing an unhandled route or request (a 404 fallback,
 /// a 405 method mismatch, or a catch-all route that matched but could not be
-/// served) with as much request context as is available: peer address, method,
-/// the path (with `/proxy`'s and `/ftp`'s caller-supplied targets elided --
-/// see [`crate::routes::util::log_path`]), the query's parameter names
-/// without their values, HTTP version, the common diagnostic headers broken
-/// out as their own fields, and a dump of every header. Centralised so that
-/// every "we did not serve this" code path logs identically and greppably.
+/// served). It carries as much request context as is available: peer
+/// address, method, the path (with `/proxy`'s and `/ftp`'s caller-supplied
+/// targets elided, see [`crate::routes::util::log_path`]), the query's
+/// parameter names without their values, HTTP version, the common diagnostic
+/// headers broken out as their own fields, and a dump of every header. It is
+/// centralised so that every "we did not serve this" code path logs
+/// identically and greppably.
 pub fn log_unhandled(
     reason: &str,
     status: u16,
@@ -225,9 +227,9 @@ pub fn direct_stream_ended() {
 /// Open this launch's two log files: `server_current.log` for people and
 /// `server_<launch>.jsonl` for tools.
 ///
-/// Nothing else ever deletes a log, so this start does: the previous
-/// launch's `server_current.log` becomes its archive by rename (so a text
-/// line is written once, not again into a per-launch copy), and all but the
+/// Nothing else ever deletes a log, so this start does. The previous
+/// launch's `server_current.log` becomes its archive by rename, so a text
+/// line is written once, not again into a per-launch copy. All but the
 /// newest [`KEPT_LAUNCHES`] launches of either kind are removed. What one
 /// launch writes is not bounded.
 pub fn open_log_writers(log_dir: &Path) -> std::io::Result<LogWriters> {
@@ -250,9 +252,9 @@ pub fn open_log_writers(log_dir: &Path) -> std::io::Result<LogWriters> {
         .append(true)
         .open(&json_path)?;
 
-    // After the opens, so this launch's own `.jsonl` is one of the kept,
-    // and the text archives are the kept less the one `server_current.log`
-    // now is.
+    // This runs after the opens, so this launch's own `.jsonl` is one of
+    // the kept. The text archives are the kept less the one
+    // `server_current.log` now is.
     prune_launches(log_dir, ".jsonl", KEPT_LAUNCHES);
     prune_launches(log_dir, ".log", KEPT_LAUNCHES - 1);
 
@@ -270,9 +272,9 @@ pub fn open_log_writers(log_dir: &Path) -> std::io::Result<LogWriters> {
 
 /// Rename the previous launch's `server_current.log` to
 /// `server_<its last write>.log`. Answers whether the new launch has to
-/// append to it instead: when the rename failed (on Windows, another
-/// process still has the file open), truncating would destroy that
-/// launch's log rather than archive it.
+/// append to it instead. That is the case when the rename failed (on
+/// Windows, another process still has the file open): truncating would
+/// then destroy that launch's log rather than archive it.
 fn rotate_current_log(log_dir: &Path, current: &Path) -> bool {
     let Ok(metadata) = std::fs::metadata(current) else {
         return false;
@@ -294,7 +296,7 @@ fn rotate_current_log(log_dir: &Path, current: &Path) -> bool {
 }
 
 /// Delete all but the newest `keep` files named `server_*<suffix>` in
-/// `log_dir`, newest by name: every such name carries a time as
+/// `log_dir`, newest by name. Every such name carries a time as
 /// `%Y-%m-%d_%H-%M-%S`, which sorts as the time does.
 /// `server_current.log` is never one of them.
 fn prune_launches(log_dir: &Path, suffix: &str, keep: usize) {
@@ -319,13 +321,13 @@ pub fn store_log_guards(guards: Vec<WorkerGuard>) {
 }
 
 /// Whether this process has already installed its log files. Once it has,
-/// they are the process's for good: the global subscriber cannot be
+/// they are the process's for good. The global subscriber cannot be
 /// replaced, and it goes on appending to the file it opened. So a second
 /// start in one process (an embedder that stops its server and starts
-/// another) must not open
-/// them again -- the rotation would rename `server_current.log` out from
-/// under that writer, leaving the fresh `server_current.log` empty and the
-/// live log under an archive's name for the prune to delete.
+/// another) must not open them again. The rotation would rename
+/// `server_current.log` out from under that writer. The fresh
+/// `server_current.log` would stay empty, and the live log would sit under
+/// an archive's name for the prune to delete.
 pub fn log_files_installed() -> bool {
     LOG_GUARDS.get().is_some()
 }
@@ -415,11 +417,11 @@ pub fn log_startup_context(
 /// process's own, so a test can see what the line would carry.
 ///
 /// The command line goes through [`redacted_args`] first. This is the host
-/// process's own argv, read from the OS, and nothing here has scrubbed it;
-/// a `--token` value is a bearer token that grants the whole control API,
-/// and the diagnostics log is what a user pastes to a stranger when asking
-/// for help. Everything else on the line is a path or a version, all of
-/// which the log names elsewhere already.
+/// process's own argv, read from the OS, and nothing here has scrubbed it.
+/// A `--token` value is a bearer token that grants the whole control API.
+/// The diagnostics log is what a user pastes to a stranger when asking for
+/// help. Everything else on the line is a path or a version, and the log
+/// names all of them elsewhere already.
 fn log_startup_context_with_args(
     config_dir: &Path,
     cache_dir: &Path,
@@ -454,7 +456,7 @@ const REDACTED: &str = "<redacted>";
 /// The host process's command line as the log may show it: the value of
 /// `--token`, in either spelling (`--token <t>`, `--token=<t>`), replaced
 /// by [`REDACTED`]. Redaction is by flag name, never by what the value
-/// looks like -- a token an operator chose can be short, or a word.
+/// looks like. A token an operator chose can be short, or a word.
 fn redacted_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut redacted = Vec::new();
     let mut value_is_secret = false;
@@ -577,12 +579,12 @@ unsafe extern "system" fn windows_exception_filter(
 #[cfg(test)]
 mod tests {
     /// **The setting reaches the lines.** The retention trace is off by
-    /// default and on under the setting, with the rest of `enginefs` at
-    /// INFO either way; and the change lands on a subscriber that is
-    /// already installed, which is the only kind a running process has.
+    /// default and on under the setting. The rest of `enginefs` stays at
+    /// INFO either way. The change lands on a subscriber that is already
+    /// installed, which is the only kind a running process has.
     ///
     /// This installs the process's global subscriber, which the rest of
-    /// this test binary never does; nothing else in it reads the filter.
+    /// this test binary never does. Nothing else in it reads the filter.
     #[test]
     fn the_retention_trace_follows_the_setting_on_an_installed_subscriber() {
         use tracing_subscriber::layer::SubscriberExt;
@@ -747,8 +749,8 @@ mod tests {
     }
 
     /// The startup line, rendered by a real subscriber the way the log
-    /// files render it, carries the flag and not the secret -- the check
-    /// the README's "the token never passes through `tracing`" rests on.
+    /// files render it, carries the flag and not the secret. The README's
+    /// "the token never passes through `tracing`" rests on this check.
     #[test]
     fn the_startup_line_does_not_carry_the_token() {
         let captured = Captured::default();

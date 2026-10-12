@@ -10,7 +10,7 @@ pub struct ProcessMemorySnapshot {
     pub virtual_memory_bytes: u64,
 }
 
-/// This process's memory, and nothing else's. Read by the panic hook, so it
+/// This process's memory, and nothing else's. The panic hook reads it, so it
 /// runs while something is already going wrong.
 ///
 /// `System::new_all()` + `refresh_all()` would enumerate every process on
@@ -38,15 +38,15 @@ mod tests {
     use super::*;
 
     /// The single-process refresh reads what the panic line needs: this
-    /// process's memory. A refresh kind without memory in it would leave
-    /// both figures at zero, quietly -- and a panic report that says a
-    /// process used no memory is worse than one that says nothing.
+    /// process's memory. A refresh kind without memory in it would quietly
+    /// leave both figures at zero. A panic report that says a process used
+    /// no memory is worse than one that says nothing.
     ///
-    /// Both figures are asserted non-zero and nothing more. On Unix the
-    /// virtual size is at least the resident set, but on Windows sysinfo's
-    /// `virtual_memory()` is the pagefile commit, which a process whose pages
-    /// are mostly file-backed keeps *below* its working set -- so the two
-    /// are never compared against each other here, only against zero.
+    /// The test asserts only that both figures are non-zero. On Unix the
+    /// virtual size is at least the resident set. On Windows, sysinfo's
+    /// `virtual_memory()` is the pagefile commit, and a process whose pages
+    /// are mostly file-backed keeps that *below* its working set. So the two
+    /// are compared only against zero, never against each other.
     #[test]
     fn the_process_snapshot_reads_this_process_s_memory() {
         let snapshot = process_memory_snapshot();

@@ -2,7 +2,7 @@
 //!
 //! ## Why this exists
 //!
-//! A DHT-hostile network makes every bootstrap host fail for the whole of a
+//! On a DHT-hostile network every bootstrap host fails for the whole of a
 //! session, and librqbit says so on every retry:
 //!
 //! ```text
@@ -10,30 +10,30 @@
 //! ```
 //!
 //! That line comes from `bootstrap_hostname_with_backoff`
-//! (`crates/dht/src/dht.rs`), whose `backon` retry notifier logs at WARN on
-//! *every* attempt, with a delay that grows to ~120 s and a total budget of
-//! 24 hours -- so a 28-minute session on such a network produces hundreds
-//! of identical warnings and no conclusion (measured on a real device on
-//! mobile data). Worse, the message is misleading:
-//! `bootstrap_hostname` runs the v4 and v6 lookups and returns `v4.or(v6)`,
-//! and `Result::or` *discards* the v4 error whenever v4 failed. The bootstrap
-//! hosts have no `AAAA` records, so the v6 branch starts with an empty
-//! address set and returns `NoSuccessfulLookups { errors: 0 }` -- the "0
-//! errors" is that empty v6 set, not evidence that nothing was tried over v4.
+//! (`crates/dht/src/dht.rs`). Its `backon` retry notifier logs at WARN on
+//! *every* attempt. The delay grows to ~120 s and the total budget is 24
+//! hours. So a 28-minute session on such a network produces hundreds of
+//! identical warnings and no conclusion (measured on a real device on
+//! mobile data). Worse, the message is misleading. `bootstrap_hostname`
+//! runs the v4 and v6 lookups and returns `v4.or(v6)`, and `Result::or`
+//! *discards* the v4 error whenever v4 failed. The bootstrap hosts have no
+//! `AAAA` records, so the v6 branch starts with an empty address set and
+//! returns `NoSuccessfulLookups { errors: 0 }`. The "0 errors" is that
+//! empty v6 set, not evidence that nothing was tried over v4.
 //!
-//! None of it is caused by our configuration: the DHT binds its own
-//! dual-stack UDP socket on its own port (`DhtState::with_config`), entirely
-//! independent of the torrent listen port, so `TorrentListenPort::Ephemeral`
-//! cannot affect it. It is the network dropping the DHT's UDP.
+//! Our configuration causes none of it. The DHT binds its own dual-stack
+//! UDP socket on its own port (`DhtState::with_config`), independent of the
+//! torrent listen port, so `TorrentListenPort::Ephemeral` cannot affect it.
+//! It is the network dropping the DHT's UDP.
 //!
 //! ## What this module does instead
 //!
-//! Sample the routing table on a timer and report the *conclusion* once:
-//! INFO when the DHT comes up, WARN once when it has demonstrably not come up
-//! within [`BOOTSTRAP_GRACE`], INFO if it recovers after that. Every other
-//! sample is a debug line. The per-retry librqbit warnings are turned down to
-//! their own level in `DEFAULT_LOG_FILTER` (`crate::DEFAULT_LOG_FILTER`),
-//! since this is the thing that reports the state.
+//! It samples the routing table on a timer and reports the *conclusion*
+//! once. That is INFO when the DHT comes up, WARN once when it has
+//! demonstrably not come up within [`BOOTSTRAP_GRACE`], and INFO if it
+//! recovers after that. Every other sample is a debug line. This module
+//! reports the state, so the per-retry librqbit warnings are turned down to
+//! their own level in `DEFAULT_LOG_FILTER` (`crate::DEFAULT_LOG_FILTER`).
 //!
 //! The same state is served to clients as
 //! [`crate::ServerHandle::dht_status`], so a client can say "DHT unavailable,
@@ -45,13 +45,13 @@ use enginefs::EngineFS;
 use enginefs::backend::DhtStatus;
 
 /// How long a cold DHT is given before it is reported as unavailable.
-/// Generous on purpose: a bootstrap round-trip over a slow mobile link plus
-/// librqbit's own backoff can take tens of seconds, and a false "DHT
+/// It is generous on purpose. A bootstrap round-trip over a slow mobile link
+/// plus librqbit's own backoff can take tens of seconds, and a false "DHT
 /// unavailable" is worse than a late true one.
 pub const BOOTSTRAP_GRACE: Duration = Duration::from_secs(90);
 
-/// How often the routing table is sampled. Two routing-table length reads,
-/// so the interval is about report latency, not cost.
+/// How often the routing table is sampled. A sample is two routing-table
+/// length reads, so the interval is about report latency, not cost.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The one-off conclusions worth a log line above debug.
@@ -68,7 +68,7 @@ pub enum DhtReport {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
-    /// Nothing reported yet, still inside the grace window.
+    /// Nothing reported yet. Still inside the grace window.
     Waiting,
     /// [`DhtReport::Bootstrapped`] or [`DhtReport::Recovered`] was reported;
     /// nothing more to say for the rest of the session.
@@ -80,8 +80,9 @@ enum Phase {
 }
 
 /// Turns a stream of [`DhtStatus`] samples into at most a couple of log-worthy
-/// conclusions. Pure: `observe` takes the time since the first sample rather
-/// than reading a clock, so the transitions are testable without sleeping.
+/// conclusions. It is pure. `observe` takes the time since the first sample
+/// rather than reading a clock, so the transitions are testable without
+/// sleeping.
 #[derive(Debug)]
 pub struct DhtHealthReporter {
     phase: Phase,
@@ -101,7 +102,7 @@ impl DhtHealthReporter {
     pub fn observe(&mut self, since_start: Duration, status: DhtStatus) -> Option<DhtReport> {
         if !status.enabled {
             // A backend with no DHT is a deliberate configuration, not a
-            // network problem: latch it so a later sample cannot warn.
+            // network problem. Latch it so a later sample cannot warn.
             self.phase = Phase::Disabled;
             return None;
         }
