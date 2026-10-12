@@ -1,41 +1,41 @@
 //! **The scenario harness: a film, a disk, a script of timed reads, and a
 //! record of what the policy did to them.**
 //!
-//! It is how a claim about the retention policy
-//! (`docs/design/read-pattern-retention.md`) is proved against a film rather
-//! than against a function: a script of reads, played through the owner the
-//! way a player's reads are, and the disk and the backend's want-set read
+//! It proves a claim about the retention policy
+//! (`docs/design/read-pattern-retention.md`) against a film rather than
+//! against a function. A script of reads is played through the owner the
+//! way a player's reads are. The disk and the backend's want-set are read
 //! back afterwards.
 //!
 //! # Why here, and not under `owner`
 //!
-//! A sibling of `owner`, `pub(crate)` under `cfg(test)`, because a
+//! It is a sibling of `owner`, `pub(crate)` under `cfg(test)`, because a
 //! scenario is a statement about a *cache* and not about the module that
-//! implements it: it must survive a rewrite of `owner` unchanged. So the
+//! implements it. It must survive a rewrite of `owner` unchanged. So the
 //! harness reaches the owner through its **public** surface only
 //! ([`Retention::install`], [`Retention::reader_on`], [`Reader::note`],
-//! [`Retention::turn`], [`Retention::pass_at`]) and never through `State` or
-//! the policy. That is a constraint on the harness and not a courtesy: the
-//! seam it is allowed to use is the seam any policy has to be drivable
+//! [`Retention::turn`], [`Retention::pass_at`]), and never through `State`
+//! or the policy. That is a constraint on the harness and not a courtesy.
+//! The seam it is allowed to use is the seam any policy has to be drivable
 //! through.
 //!
 //! # The clock
 //!
-//! There is no sleep here and no runtime timer, and there cannot be: a
-//! scenario is a list of `(Duration, Step)` beats, the harness holds one
+//! There is no sleep here and no runtime timer, and there cannot be. A
+//! scenario is a list of `(Duration, Step)` beats. The harness holds one
 //! `t0` and adds to it, and every call that takes a `now` is handed the
-//! scenario's own. The house rule is the reason -- nothing takes
-//! `Instant::now()` internally -- and the replacement is the motive: its
+//! scenario's own. The house rule is the reason: nothing takes
+//! `Instant::now()` internally. The replacement is the motive. Its
 //! retention tier is an LRU keyed on `max(fetched_at, last_read_at)`, so a
 //! scenario that could not put two reads a measured distance apart could
 //! not test it at all. Times are built by adding to `t0` and never by
 //! `checked_sub`, which returns `None` on a freshly started process.
 //!
 //! Each pass is run to completion on a current-thread runtime the harness
-//! owns, inside [`tracing::subscriber::with_default`], so the pass's own
-//! trace lines are captured on the thread that produced them. That is what
-//! lets a scenario assert on the field's evidence in the form the field
-//! reported it -- a log line -- rather than on a reconstruction of it.
+//! owns, inside [`tracing::subscriber::with_default`]. So the pass's own
+//! trace lines are captured on the thread that produced them. That lets a
+//! scenario assert on the field's evidence in the form the field reported
+//! it (a log line), rather than on a reconstruction of it.
 //!
 //! # What a scenario can say
 //!
@@ -43,16 +43,16 @@
 //! response opens, a response is served some bytes, a response ends, the
 //! player says where it is, the swarm delivers what the backend still
 //! wants, a retention pass runs. Nothing in the list is a retention
-//! concept, on purpose. What comes back is a [`Log`] with, per pass, the
-//! windows kept, the windows wanted, the pieces the pass stopped wanting,
-//! the pieces that really left the disk and the trace lines the pass
-//! emitted -- and, per read, whether it was served, served short, or
-//! blocked, and for how long.
+//! concept, on purpose. What comes back is a [`Log`]. Per pass, it holds
+//! the windows kept, the windows wanted, the pieces the pass stopped
+//! wanting, the pieces that really left the disk and the trace lines the
+//! pass emitted. Per read, it holds whether the read was served, served
+//! short, or blocked, and for how long.
 //!
 //! That split is the point. **Kept, wanted and reclaimed are three
-//! different answers**, and the disagreement this harness was built to
-//! settle -- whether the field's starvation came from the keep set or the
-//! want set -- cannot be settled by a fixture that reports one number.
+//! different answers.** This harness was built to settle whether the
+//! field's starvation came from the keep set or the want set. A fixture
+//! that reports one number cannot settle that.
 
 use std::collections::{BTreeSet, HashMap};
 use std::marker::PhantomData;
@@ -102,19 +102,19 @@ impl Side for ProxySide {
 /// bytes they really hold.
 ///
 /// The piece length and the byte count were [`PIECE`] and `pieces * PIECE`
-/// until a scenario had to be about a real film. Both are fields now
-/// because the two numbers the field's failure turns on -- a 4 MiB piece
-/// and a last piece that is short -- cannot be spelled with either as a
-/// constant: [`RetentionPolicy::new`] checks that the four numbers
-/// describe the same file and refuses a byte count rounded up to a whole
-/// multiple of the piece length.
+/// until a scenario had to be about a real film. Both are fields now. The
+/// field's failure turns on two numbers, a 4 MiB piece and a last piece
+/// that is short, and neither can be spelled with either as a constant.
+/// [`RetentionPolicy::new`] checks that the four numbers describe the same
+/// file, and refuses a byte count rounded up to a whole multiple of the
+/// piece length.
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) struct FakeDomain {
     pub(crate) file: usize,
     pub(crate) pieces: Range<u32>,
-    /// Bytes per piece; every piece is full except possibly the last.
+    /// Bytes per piece. Every piece is full except possibly the last.
     pub(crate) piece: u64,
-    /// A domain no policy can be sized for: `policy` returns the error
+    /// A domain no policy can be sized for. `policy` returns the error
     /// the owner has to carry out from under L2.
     pub(crate) broken: bool,
 }
@@ -128,8 +128,8 @@ pub(crate) fn domain(file: usize, pieces: Range<u32>) -> FakeDomain {
     }
 }
 
-/// A file of a stated size at a stated piece length: the shape a scenario
-/// about a real film needs, where [`domain`] is the eight-piece toy the
+/// A file of a stated size at a stated piece length. A scenario about a
+/// real film needs this shape. [`domain`] is the eight-piece toy the
 /// owner's own tests are written against.
 pub(crate) fn film_domain(file: usize, piece: u64, bytes: u64) -> FakeDomain {
     let pieces = u32::try_from(bytes.div_ceil(piece)).expect("a film of fewer than 4G pieces");
@@ -163,37 +163,37 @@ pub(crate) type Hook<S> = Box<dyn Fn(&Door<FakeBacking<S>>) + Send + Sync>;
 pub(crate) struct FakeBacking<S: Side> {
     pub(crate) domains: parking_lot::Mutex<HashMap<usize, FakeDomain>>,
     pub(crate) held: parking_lot::Mutex<BTreeSet<u32>>,
-    /// **The detector, which is the policy.** The same one both real
-    /// backings run, fed by the scenario's own reads: what a consumer is,
-    /// what it is asking for and what may go is decided here, so a
+    /// **The detector, which is the policy.** It is the same one both real
+    /// backings run, fed by the scenario's own reads. What a consumer is,
+    /// what it is asking for and what may go are decided here. So a
     /// scenario measures the policy rather than a stand-in for it.
     pub(crate) detector: parking_lot::Mutex<crate::retention::streams::Streams>,
     /// Every range the owner advertised, in order. There is no other
-    /// direction: [`Backing::advertise`] only adds.
+    /// direction, since [`Backing::advertise`] only adds.
     pub(crate) advertised: parking_lot::Mutex<Vec<Range<u32>>>,
     pub(crate) fail_advertise: AtomicBool,
     pub(crate) fail_held: AtomicBool,
     /// How many listings were asked for.
     pub(crate) listings: AtomicU64,
     pub(crate) keeps_everything: AtomicBool,
-    /// What [`Backing::is_live`] answers: the entity the fake is
-    /// playing right now.
+    /// What [`Backing::is_live`] answers: the entity the fake is playing
+    /// right now.
     pub(crate) is_live: AtomicBool,
     /// The one entity the fake's liveness cell names, beside
-    /// [`Self::is_live`], which names them all: what a test of which file's
-    /// play session draws sets ([`play`]).
+    /// [`Self::is_live`], which names them all. A test of which file's play
+    /// session draws sets this ([`play`]).
     pub(crate) playing: parking_lot::Mutex<Option<usize>>,
-    /// **Whether the fake torrent is in the swarm** -- live, with peers
-    /// that may have been told of what it advertises. On by default for the
-    /// torrent side, off for the proxy's, which has no swarm. What
-    /// [`Backing::announced_in_swarm`] reads, and what the invariant in
-    /// [`Backing::reclaim`] holds every unlink to: **no piece this fake has
-    /// been told to advertise leaves the disk while it is in the swarm.** A
-    /// test of what a torrent does once it has left the swarm -- the
-    /// torrent's `EndShares` -- turns it off.
+    /// **Whether the fake torrent is in the swarm**: live, with peers that
+    /// may have been told of what it advertises. It is on by default for
+    /// the torrent side, and off for the proxy's, which has no swarm.
+    /// [`Backing::announced_in_swarm`] reads it. The invariant in
+    /// [`Backing::reclaim`] holds every unlink to it: **no piece this fake
+    /// has been told to advertise leaves the disk while it is in the
+    /// swarm.** A test of what a torrent does once it has left the swarm
+    /// (the torrent's `EndShares`) turns it off.
     pub(crate) in_swarm: AtomicBool,
-    /// **Every breach of that rule the fake saw**, recorded where it was
-    /// seen -- which may be a pass spawned on a task nobody awaits -- and
+    /// **Every breach of that rule the fake saw.** It is recorded where it
+    /// was seen, which may be a pass spawned on a task nobody awaits. It is
     /// asserted on the test's own task when its [`Checked`] hold drops, or
     /// at the end of a [`Scenario`]'s run.
     pub(crate) violations: parking_lot::Mutex<Vec<String>>,
@@ -201,31 +201,31 @@ pub(crate) struct FakeBacking<S: Side> {
     pub(crate) reclaims: parking_lot::Mutex<Vec<Vec<Range<u32>>>>,
     /// The extent of every `want_all` call, in order.
     pub(crate) wanted_all: parking_lot::Mutex<Vec<Range<u32>>>,
-    /// The windows every `want` call was handed, in order: what the
-    /// pass ordered the backend to fetch, as against what it kept.
+    /// The windows every `want` call was handed, in order: what the pass
+    /// ordered the backend to fetch, as against what it kept.
     pub(crate) wanted: parking_lot::Mutex<Vec<Vec<Range<u32>>>>,
     /// **What the backend has selected for download**, which is the half
     /// of librqbit a recorder cannot stand in for.
     ///
     /// `want` is the only order the owner gives the swarm, and a piece it
     /// drops is one no peer is ever asked for. A fake that only *records*
-    /// the windows can say what the pass decided and can never say what
-    /// the decision cost, so a scenario about a read that starved could
-    /// only ever assert on the plan. Here the set is real: seeded with
-    /// every piece of every file, as librqbit selects a file it is asked
-    /// for, narrowed by [`Backing::want`] and widened by
-    /// [`Backing::want_all`], and it is what
-    /// [`crate::retention::scenario::Step::Swarm`] delivers from.
+    /// the windows can say what the pass decided, and can never say what
+    /// the decision cost. So a scenario about a read that starved could
+    /// only ever assert on the plan. Here the set is real. It is seeded
+    /// with every piece of every file, as librqbit selects a file it is
+    /// asked for. It is narrowed by [`Backing::want`] and widened by
+    /// [`Backing::want_all`].
+    /// [`crate::retention::scenario::Step::Swarm`] delivers from it.
     pub(crate) selected: parking_lot::Mutex<BTreeSet<u32>>,
     /// The piece ranges live streams are reading over, as librqbit's
     /// `streams.wanted_ranges` holds them.
     ///
-    /// Not a recorder either: **the fork's `drop_pieces` refuses a piece
-    /// inside a live stream's lookahead** (see [`Buffering`]), so a piece
-    /// the pass drops is not dropped at all while a response is reading
-    /// ahead over it, and it is fetched whatever the want-set says. Left
-    /// out, this fake would answer "the want-set starved it" to every
-    /// question, which is exactly the answer the field disagreed about.
+    /// It is not a recorder either. **The fork's `drop_pieces` refuses a
+    /// piece inside a live stream's lookahead** (see [`Buffering`]). So a
+    /// piece the pass drops is not dropped at all while a response is
+    /// reading ahead over it, and it is fetched whatever the want-set says.
+    /// Left out, this fake would answer "the want-set starved it" to every
+    /// question. That is exactly the answer the field disagreed about.
     pub(crate) streams: parking_lot::Mutex<Vec<Range<u32>>>,
     /// What each `want` call really took out of [`Self::selected`]: the
     /// pieces that pass stopped the swarm from ever fetching.
@@ -248,7 +248,7 @@ pub(crate) struct FakeBacking<S: Side> {
     pub(crate) on_reading: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// Run between two runs of one reclaim.
     pub(crate) between_runs: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
-    /// Pieces another file shares, which [`Backing::alone`] leaves out: a
+    /// Pieces another file shares, which [`Backing::alone`] leaves out. A
     /// torrent's boundary piece belongs to both files it spans, and no
     /// pass over one of them may take it.
     pub(crate) shared: parking_lot::Mutex<BTreeSet<u32>>,
@@ -260,7 +260,7 @@ impl<S: Side> FakeBacking<S> {
         let domains: HashMap<usize, FakeDomain> =
             domains.into_iter().map(|d| (d.file, d)).collect();
         // A torrent whose files have been asked for is selected whole
-        // until a pass narrows it; that is the state every pass here
+        // until a pass narrows it. That is the state every pass here
         // starts from.
         let selected: BTreeSet<u32> = domains
             .values()
@@ -323,9 +323,9 @@ impl<S: Side> FakeBacking<S> {
             .collect()
     }
 
-    /// **The rule, as an assertion**: a piece leaving the disk while the
-    /// fake is in the swarm must not be one it was told to advertise --
-    /// there is no un-Have, and a peer that was told may still ask for it.
+    /// **The rule, as an assertion.** A piece leaving the disk while the
+    /// fake is in the swarm must not be one it was told to advertise. There
+    /// is no un-Have, and a peer that was told may still ask for it.
     ///
     /// Recorded before it panics, so a breach on a task whose panic nobody
     /// reads still fails the test ([`Self::assert_kept_the_rule`]).
@@ -339,8 +339,8 @@ impl<S: Side> FakeBacking<S> {
         }
     }
 
-    /// Fail unless every unlink this fake saw kept the sharing rule. What a
-    /// test's [`Checked`] hold asks when it drops.
+    /// Fail unless every unlink this fake saw kept the sharing rule. A
+    /// test's [`Checked`] hold asks this when it drops.
     pub(crate) fn assert_kept_the_rule(&self) {
         let violations = self.violations.lock();
         assert!(
@@ -353,8 +353,8 @@ impl<S: Side> FakeBacking<S> {
         self.held.lock().iter().copied().collect()
     }
 
-    /// Park the next call of the named kind: the returned receiver
-    /// fires when the pass is inside it, and the sender lets it go.
+    /// Park the next call of the named kind. The returned receiver fires
+    /// when the pass is inside it, and the sender lets it go.
     pub(crate) fn park(
         slot: &parking_lot::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
         entered: &parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -412,10 +412,10 @@ impl<S: Side> FakeBacking<S> {
 
 impl<S: Side> FakeBacking<S> {
     /// A viewer seeking to `at` and playing on from there: three
-    /// quarter-piece reads, which is what it takes for the smoothed
-    /// position ([`crate::retention::streams::Stream`]) to land inside the
-    /// piece the seek went to. One read of a byte is a marker the position
-    /// rightly ignores -- that is the crawler's read.
+    /// quarter-piece reads. That is what it takes for the smoothed position
+    /// ([`crate::retention::streams::Stream`]) to land inside the piece the
+    /// seek went to. One read of a byte is a marker the position rightly
+    /// ignores, since that is the crawler's read.
     pub(crate) fn seek_to(&self, at: u64) {
         let quarter = (PIECE / 4).max(1);
         for i in 0..3 {
@@ -426,12 +426,12 @@ impl<S: Side> FakeBacking<S> {
     /// **A consumer that has just read `bytes` of this file from `at`**, as
     /// the detector sees it.
     ///
-    /// What makes a reader a consumer rather than a position: a delivered
-    /// byte moves the head, and a *read* is what says there is somebody
-    /// moving through the file who must be fetched for and not deleted
-    /// from under. Both real read paths report every read they serve
-    /// (`Engine::note_read`, `proxy_retention::Reader::note_read`); a test
-    /// that wants a live consumer says so here.
+    /// This makes a reader a consumer rather than a position. A delivered
+    /// byte moves the head. A *read* says there is somebody moving through
+    /// the file who must be fetched for and not deleted from under. Both
+    /// real read paths report every read they serve (`Engine::note_read`,
+    /// `proxy_retention::Reader::note_read`). A test that wants a live
+    /// consumer says so here.
     pub(crate) fn read_from(&self, at: u64, bytes: u64) {
         self.note_read(1, at, at.saturating_add(bytes), std::time::Instant::now());
     }
@@ -471,11 +471,11 @@ impl<S: Side> Backing for FakeBacking<S> {
     }
 
     /// The extent in bytes, which is what the production backing answers
-    /// too: `Engine::bytes` is the file's PIECE SPAN and not its exact
-    /// length -- they differ by up to a piece, 0.03% on the field's film.
+    /// too. `Engine::bytes` is the file's PIECE SPAN and not its exact
+    /// length. They differ by up to a piece, 0.03% on the field's film.
     /// Carrying the exact length here would model something the owner never
-    /// sees, and a scenario that could tell the two apart would be asserting
-    /// a fiction.
+    /// sees. A scenario that could tell the two apart would be asserting a
+    /// fiction.
     fn bytes(domain: &FakeDomain) -> Option<u64> {
         Some(u64::from(domain.pieces.end - domain.pieces.start) * domain.piece)
     }
@@ -593,15 +593,15 @@ impl<S: Side> Backing for FakeBacking<S> {
         self.selected.lock().extend(domain.pieces.clone());
     }
 
-    /// Only what the pass ordered fetched, which is the half of the
-    /// window list a probe is left out of -- and then the selection it
-    /// costs, by `TorrentBacking::want`'s own rule: re-select the windows,
-    /// then stop wanting every piece of the file that is in no window and
-    /// not already on the disk.
+    /// Only what the pass ordered fetched, which is the half of the window
+    /// list a probe is left out of. Then the selection it costs, by
+    /// `TorrentBacking::want`'s own rule: re-select the windows, then stop
+    /// wanting every piece of the file that is in no window and not already
+    /// on the disk.
     ///
-    /// Two clauses of the real one are here because the answer depends on
-    /// them. A piece inside a live stream's lookahead is **not** dropped
-    /// -- the fork's `drop_pieces` refuses it -- so a response that is
+    /// Two clauses of the real one are here, because the answer depends on
+    /// them. A piece inside a live stream's lookahead is **not** dropped,
+    /// since the fork's `drop_pieces` refuses it. So a response that is
     /// reading ahead over a piece keeps it ordered whatever the pass
     /// decided. And what is dropped is recorded per pass, so a scenario
     /// can say which pieces stopped being fetchable and when.
@@ -633,13 +633,12 @@ impl<S: Side> Backing for FakeBacking<S> {
         self.dropped.lock().push(unwanted);
     }
 
-    /// For [`crate::retention::trace`]: answering it at
-    /// all is what makes the pass emit the field's own trace lines, which
-    /// is how a scenario reproduces a failure that was reported as a log
-    /// line rather than as a number. The counters are zero -- this fake
-    /// has no swarm to have paid for anything -- and only the piece
-    /// length is read, by the block that turns a reader's lookahead in
-    /// bytes into the piece range it covers.
+    /// For [`crate::retention::trace`]. Answering it at all makes the pass
+    /// emit the field's own trace lines. That is how a scenario reproduces
+    /// a failure that was reported as a log line rather than as a number.
+    /// The counters are zero, since this fake has no swarm to have paid for
+    /// anything. Only the piece length is read, by the block that turns a
+    /// reader's lookahead in bytes into the piece range it covers.
     fn trace(
         &self,
         _store: &Self::Store,
@@ -652,13 +651,13 @@ impl<S: Side> Backing for FakeBacking<S> {
             refused: 0,
             piece_length: domain.piece,
             // Nothing here writes a piece twice, so the fake has nothing to
-            // report: a scenario that wanted to assert on it would have to
+            // report. A scenario that wanted to assert on it would have to
             // model the storage, which this harness deliberately does not.
             staged_over_held: 0,
         })
     }
 
-    /// Both shapes at once: `shut` gates each run as the torrent does,
+    /// Both shapes at once. `shut` gates each run as the torrent does,
     /// `refuses` gates each index as both backings do, and the disk loses
     /// what neither refused.
     async fn reclaim(
@@ -669,8 +668,8 @@ impl<S: Side> Backing for FakeBacking<S> {
         door: Door<Self>,
     ) -> usize {
         if self.reclaim_panics.load(Ordering::SeqCst) {
-            // The proxy's shape of failure: the blocking closure dies,
-            // and the join error is the whole of what the pass hears.
+            // The proxy's shape of failure. The blocking closure dies, and
+            // the join error is the whole of what the pass hears.
             return tokio::task::spawn_blocking(|| -> usize { panic!("the unlink closure died") })
                 .await
                 .unwrap_or(0);
@@ -692,12 +691,12 @@ impl<S: Side> Backing for FakeBacking<S> {
                     // The invariant every scenario keeps: what a peer may
                     // have been told of stays until the swarm is left.
                     self.assert_not_announced(index);
-                    // As the torrent's `drop_pieces(.., LeaveDropped)`: a
+                    // As the torrent's `drop_pieces(.., LeaveDropped)`, a
                     // piece the pass takes is neither had nor wanted, so
                     // the swarm does not put it straight back. Left
                     // selected, the fake fetched every reclaimed piece
-                    // again on the next beat and every pass took it again
-                    // -- the field's loop, manufactured by the fake.
+                    // again on the next beat, and every pass took it again.
+                    // That was the field's loop, manufactured by the fake.
                     self.selected.lock().remove(&index);
                     freed += 1;
                 }
@@ -717,11 +716,11 @@ pub(crate) type Torrent = FakeBacking<TorrentSide>;
 /// **A test's own hold on a fake backing, which checks the sharing rule
 /// when the test ends** ([`FakeBacking::assert_kept_the_rule`]).
 ///
-/// Dropped with the test's other locals, on the test's own task, so a
-/// breach the fake recorded on a pass spawned elsewhere -- whose panic a
-/// `JoinHandle` nobody awaited would have swallowed -- fails the test
-/// anyway. Derefs to the `Arc`, so `backing.clone()` is the backing for a
-/// hook or an owner, and every knob reads as before.
+/// It is dropped with the test's other locals, on the test's own task. So
+/// a breach the fake recorded on a pass spawned elsewhere fails the test
+/// anyway, though a `JoinHandle` nobody awaited would have swallowed its
+/// panic. It derefs to the `Arc`, so `backing.clone()` is the backing for
+/// a hook or an owner, and every knob reads as before.
 pub(crate) struct Checked<S: Side>(pub(crate) Arc<FakeBacking<S>>);
 
 impl<S: Side> std::ops::Deref for Checked<S> {
@@ -739,9 +738,9 @@ impl<S: Side> Drop for Checked<S> {
     }
 }
 
-/// An eight-piece entity under a budget of four pieces: the proxy
-/// shape gives the whole budget to the window, so the window is four
-/// pieces and the stride is one.
+/// An eight-piece entity under a budget of four pieces. The proxy shape
+/// gives the whole budget to the window, so the window is four pieces and
+/// the stride is one.
 pub(crate) fn proxy() -> (
     Checked<ProxySide>,
     Arc<Retention<Proxy>>,
@@ -773,11 +772,11 @@ pub(crate) fn torrent() -> (
 /// The length of the film [`play`] states: a thousand seconds.
 pub(crate) const FILM_LENGTH: Duration = Duration::from_secs(1000);
 
-/// **The viewer plays `key`**: the fake's liveness cell names it, and the
-/// player opens it with the film's length already stated, so its play
-/// session's draw is decided at this very open ([`Opener::Player`]) -- the
-/// state every test of what a draw does starts from. What the open asks
-/// of the cache is nothing beyond its readers', as [`Retention::install`].
+/// **The viewer plays `key`.** The fake's liveness cell names it, and the
+/// player opens it with the film's length already stated. So its play
+/// session's draw is decided at this very open ([`Opener::Player`]). That
+/// is the state every test of what a draw does starts from. The open asks
+/// nothing of the cache beyond its readers', as [`Retention::install`].
 pub(crate) async fn play(
     owner: &Arc<Retention<Torrent>>,
     backing: &Torrent,
@@ -815,10 +814,10 @@ pub(crate) fn spawn_pass<S: Side>(
 /// The one file a scenario is about, as the numbers a player and a torrent
 /// really state: how many bytes, how big a piece, how long the film is.
 ///
-/// The length is here rather than on a step because it is a property of the
-/// film and not of a report ([`Retention::note_duration`]): it is what turns
-/// the file's size into a bitrate, and a bitrate is what a window measured
-/// in seconds needs.
+/// The length is here rather than on a step, because it is a property of
+/// the film and not of a report ([`Retention::note_duration`]). It turns
+/// the file's size into a bitrate, and a window measured in seconds needs
+/// a bitrate.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Film {
     pub(crate) bytes: u64,
@@ -827,7 +826,7 @@ pub(crate) struct Film {
 }
 
 impl Film {
-    /// How many pieces the film is; the last one is short.
+    /// How many pieces the film is. The last one is short.
     pub(crate) fn pieces(&self) -> u32 {
         u32::try_from(self.bytes.div_ceil(self.piece)).expect("a film of fewer than 4G pieces")
     }
@@ -841,14 +840,14 @@ impl Film {
 /// **The film the field failed on.**
 ///
 /// The size and the piece length are the reported ones: 23,346,250,742
-/// bytes at 4 MiB, which is 5,567 pieces with 754,678 bytes in the last,
-/// and which puts the first byte of piece 5560 at 23,320,330,240 -- the
-/// offset every one of the failing reads stopped at.
+/// bytes at 4 MiB. That is 5,567 pieces with 754,678 bytes in the last. It
+/// puts the first byte of piece 5560 at 23,320,330,240, the offset every
+/// one of the failing reads stopped at.
 ///
-/// The length is *not* reported, and it is needed, because it is what the
-/// window's time cap is sized from. Two hours twenty is what 23.3 GB comes
-/// to at 22 Mbps, which is what a 4K film this size is; what the scenario
-/// turns on is stated where it uses it.
+/// The length is *not* reported, and it is needed, because the window's
+/// time cap is sized from it. Two hours twenty is what 23.3 GB comes to at
+/// 22 Mbps, which is what a 4K film this size is. What the scenario turns
+/// on is stated where it uses it.
 pub(crate) const FIELD_FILM: Film = Film {
     bytes: 23_346_250_742,
     piece: 4 * 1024 * 1024,
@@ -858,13 +857,13 @@ pub(crate) const FIELD_FILM: Film = Film {
 /// The lookahead the field's second-track reads were granted, and the
 /// number that trace line carries: `lookahead_bytes=16777216`. A read like
 /// it gets its lookahead today from the film's bitrate times the viewer's
-/// seconds, like every other read; this constant is kept at the field's
+/// seconds, like every other read. This constant is kept at the field's
 /// number so the scenario stays the measurement it was taken from.
 pub(crate) const CONTAINER_METADATA_LOOKAHEAD: u64 = 16 * 1024 * 1024;
 
 /// The lookahead a playback read gets at the `Normal` buffer profile: the
-/// film's bitrate times the profile's seconds. Kept for the same reason as
-/// [`CONTAINER_METADATA_LOOKAHEAD`].
+/// film's bitrate times the profile's seconds. It is kept for the same
+/// reason as [`CONTAINER_METADATA_LOOKAHEAD`].
 pub(crate) const PLAYBACK_LOOKAHEAD: u64 = 128 * 1024 * 1024;
 
 /// The seconds of stream the `Normal` buffer profile asks to hold
@@ -876,17 +875,17 @@ pub(crate) const NORMAL_WINDOW_SECONDS: u64 = 90;
 pub(crate) const COMMITTED_SECONDS: u64 = 90;
 
 /// The one file, and the one entity key over it. A scenario is about one
-/// film; a second file would be a second entity with a turn of its own and
-/// nothing this harness is for.
+/// film. A second file would be a second entity with a turn of its own,
+/// and nothing this harness is for.
 const FILE: usize = 0;
 
 /// One beat of a scenario: something that really happens to a cache.
 ///
-/// **Nothing here is a retention concept.** A step says a response opened,
-/// was served, ended; that the player said where it is; that the swarm
-/// delivered; that a pass ran. What the policy makes of any of it is what
-/// the scenario is asking about, so a step that named a window or a
-/// want-set would be assuming the answer.
+/// **Nothing here is a retention concept.** A step says that a response
+/// opened, was served or ended, that the player said where it is, that the
+/// swarm delivered, or that a pass ran. The scenario is asking what the
+/// policy makes of any of it. So a step that named a window or a want-set
+/// would be assuming the answer.
 #[derive(Debug, Clone)]
 pub(crate) enum Step {
     /// A response opens at `offset` and is registered with the owner as
@@ -894,9 +893,9 @@ pub(crate) enum Step {
     /// carrying a buffer profile worth `window_seconds`.
     ///
     /// The lookahead is also a real range of pieces the backend is now
-    /// fetching for this response and will refuse to drop while it is open
-    /// ([`FakeBacking::streams`]), which is librqbit's behaviour and not a
-    /// bookkeeping detail: it is half of what decides whether a starved
+    /// fetching for this response, and will refuse to drop while it is open
+    /// ([`FakeBacking::streams`]). That is librqbit's behaviour and not a
+    /// bookkeeping detail. It is half of what decides whether a starved
     /// read was starved by the want-set.
     Opens {
         reader: &'static str,
@@ -907,19 +906,19 @@ pub(crate) enum Step {
     /// The response is polled for up to `bytes` more bytes.
     ///
     /// It is served what the disk actually holds, stopping at the first
-    /// piece that is missing -- one `poll_read` returns what is contiguous
-    /// and no more, which is why the field's failing reads each ended
-    /// exactly at a piece boundary. A read whose *first* byte is missing
-    /// parks instead: it delivers nothing and promises the piece under its
-    /// cursor, exactly as `files.rs::poll_read` does on `Poll::Pending`.
-    /// The difference between those two is load-bearing -- only the second
-    /// one tells the pass what the read is stuck on.
+    /// piece that is missing. One `poll_read` returns what is contiguous and
+    /// no more. That is why the field's failing reads each ended exactly at
+    /// a piece boundary. A read whose *first* byte is missing parks instead.
+    /// It delivers nothing and promises the piece under its cursor, exactly
+    /// as `files.rs::poll_read` does on `Poll::Pending`. The difference
+    /// between those two is load-bearing: only the second one tells the
+    /// pass what the read is stuck on.
     Reads { reader: &'static str, bytes: u64 },
-    /// The response ends: the player gave up, or got what it asked for.
+    /// The response ends. The player gave up, or got what it asked for.
     Closes { reader: &'static str },
     /// The swarm delivers up to `pieces` pieces the backend still wants and
-    /// the disk does not hold -- what a response's own lookahead is pulling
-    /// first, then whatever else is selected.
+    /// the disk does not hold. It delivers what a response's own lookahead
+    /// is pulling first, then whatever else is selected.
     Swarm { pieces: usize },
     /// A retention pass over the film, [`Mode::Live`].
     Pass,
@@ -972,7 +971,7 @@ pub(crate) struct PassLog {
 
 impl PassLog {
     /// The `planned to reclaim inside an open stream's lookahead` lines of
-    /// this pass -- the field's own evidence, in the field's own form.
+    /// this pass: the field's own evidence, in the field's own form.
     pub(crate) fn inside_a_lookahead(&self) -> Vec<&Line> {
         self.lines
             .iter()
@@ -993,8 +992,8 @@ pub(crate) struct ReadLog {
     pub(crate) asked: u64,
     pub(crate) delivered: u64,
     /// How long this reader has been unable to get the byte at `offset`,
-    /// across however many responses it has opened trying -- the field's
-    /// "reads blocked up to 20 s on those pieces".
+    /// across however many responses it has opened trying. This is the
+    /// field's "reads blocked up to 20 s on those pieces".
     pub(crate) waiting: Duration,
 }
 
@@ -1056,8 +1055,9 @@ pub(crate) struct Scenario {
     owner: Arc<Retention<Torrent>>,
     runtime: tokio::runtime::Runtime,
     film: Film,
-    /// The one instant this scenario's clock is built from, by adding.
-    /// Never `checked_sub`: on a freshly started process it answers `None`.
+    /// The one instant this scenario's clock is built from, by adding. It
+    /// never uses `checked_sub`, which on a freshly started process answers
+    /// `None`.
     t0: Instant,
     now: Duration,
     open: HashMap<&'static str, Open>,
@@ -1108,7 +1108,7 @@ impl Scenario {
     }
 
     /// Run the script and hand back what it recorded. Beats must be in
-    /// non-decreasing time order; the clock never moves backwards and
+    /// non-decreasing time order. The clock never moves backwards and
     /// nothing sleeps.
     pub(crate) fn run(mut self, script: &[(Duration, Step)]) -> Log {
         for (at, step) in script {
@@ -1206,9 +1206,9 @@ impl Scenario {
             .collect::<Vec<_>>();
     }
 
-    /// Which consumer a named response is, as the detector counts them: a
-    /// reopen under the same name is the same number, which is what a
-    /// player doing forty-six of them in seventy seconds looks like.
+    /// Which consumer a named response is, as the detector counts them. A
+    /// reopen under the same name is the same number. That is what a player
+    /// doing forty-six of them in seventy seconds looks like.
     fn reader_id(&self, reader: &'static str) -> u64 {
         let mut id = 0u64;
         for byte in reader.as_bytes() {
@@ -1222,8 +1222,8 @@ impl Scenario {
         let held = self.backing.held.lock().clone();
         let piece = self.piece_of(cursor);
         if !held.contains(&piece) {
-            // `poll_read` returned `Pending`: nothing delivered, and the
-            // piece under the cursor is promised, which is the only thing
+            // `poll_read` returned `Pending`. Nothing was delivered, and the
+            // piece under the cursor is promised. That is the only thing
             // that tells the pass what this read is stuck on.
             let since = *self.blocked_since.entry(reader).or_insert(self.now);
             self.open
@@ -1242,8 +1242,8 @@ impl Scenario {
             });
             return;
         }
-        // Served to the first piece we do not hold, and no further: one
-        // `poll_read` hands out what is contiguous.
+        // Served to the first piece we do not hold, and no further, since
+        // one `poll_read` hands out what is contiguous.
         let mut edge = piece;
         while edge < self.film.pieces() && held.contains(&edge) {
             edge += 1;
@@ -1263,8 +1263,8 @@ impl Scenario {
         {
             let now = self.instant();
             // What the detector sees, which is what decides everything: one
-            // served read, from where the cursor was to where it got to.
-            // Fed here because this is the one place a scenario serves
+            // served read, from where the cursor was to where it got to. It
+            // is fed here because this is the one place a scenario serves
             // bytes, as `FileReader::poll_read` is on the real path.
             self.backing
                 .note_read(self.reader_id(reader), cursor, moved, now);
@@ -1293,14 +1293,14 @@ impl Scenario {
     /// asking for and nothing else**.
     ///
     /// A response's own lookahead is what it fetches first, as librqbit's
-    /// deadline path does, and then whatever else is selected in index
-    /// order; but the only thing that decides whether a piece can arrive at
+    /// deadline path does, and then whatever else is selected, in index
+    /// order. But the only thing that decides whether a piece can arrive at
     /// all is whether it is in the selection. That is the whole point of
-    /// modelling the selection rather than recording it: a scenario says
-    /// how many pieces the swarm manages in a beat, and
-    /// [`Step::Swarm`]'s number can be made larger than the film, which
-    /// turns the question "why did this piece not arrive?" into one with
-    /// exactly one possible answer.
+    /// modelling the selection rather than recording it. A scenario says
+    /// how many pieces the swarm manages in a beat, and [`Step::Swarm`]'s
+    /// number can be made larger than the film. That turns the question
+    /// "why did this piece not arrive?" into one with exactly one possible
+    /// answer.
     fn swarm(&mut self, pieces: usize) {
         let held = self.backing.held.lock().clone();
         let selected = self.backing.selected.lock().clone();
@@ -1308,12 +1308,12 @@ impl Scenario {
         // An open response's lookahead first, and **not** filtered by what
         // the backend has selected. librqbit's priority loop reserves a
         // piece on a stream's list having checked only that it is not had,
-        // not releasing, not mid-hash-check, and that the peer has it --
-        // never that it is queued. Its own comment says so: "Only this loop
-        // can reserve such a piece -- `iter_queued_pieces` cannot, its bit
-        // is long gone." So a piece a pass dropped is still pulled back by
-        // a response reading over it, which is the difference between an
-        // eviction that is a loop and one that is a wall.
+        // not releasing, not mid-hash-check, and that the peer has it. It
+        // never checks that it is queued. Its own comment says so: "Only
+        // this loop can reserve such a piece -- `iter_queued_pieces`
+        // cannot, its bit is long gone." So a piece a pass dropped is still
+        // pulled back by a response reading over it. That is the difference
+        // between an eviction that is a loop and one that is a wall.
         let order = streams
             .iter()
             .flat_map(|range| range.clone())
@@ -1382,7 +1382,7 @@ impl Scenario {
 /// scenario can assert on the evidence the field reported rather than on a
 /// reconstruction of it.
 ///
-/// `register_callsite` deliberately answers `sometimes`: an `Interest` of
+/// `register_callsite` deliberately answers `sometimes`. An `Interest` of
 /// `never` is cached per callsite for the life of the process, and these
 /// tests run in parallel with every other test in the crate.
 struct Collector(Arc<parking_lot::Mutex<Vec<Line>>>);
