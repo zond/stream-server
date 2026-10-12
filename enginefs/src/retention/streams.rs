@@ -1,6 +1,6 @@
 //! **What is reading this file, worked out from the reads themselves.**
 //!
-//! Nothing here asks what a read means. It watches where reads go: a
+//! Nothing here asks what a read means. It watches where reads go. A
 //! player states no more than a byte range, and a classification derived
 //! from anything else guesses wrong.
 //!
@@ -22,9 +22,9 @@ use std::time::{Duration, Instant};
 /// One read that was served, as the detector sees it.
 ///
 /// `arrived` and `returned` are both here because the gap that matters runs
-/// from one read's return to the *next* read's arrival, and no other
-/// pairing works: our own fetch latency sits between a read's arrival and
-/// its return, so any measurement that spans it books a stall on a missing
+/// from one read's return to the *next* read's arrival. No other pairing
+/// works. Our own fetch latency sits between a read's arrival and its
+/// return, so any measurement that spans it books a stall on a missing
 /// piece as the consumer thinking. A stream blocked on a piece would then
 /// measure as slow, be given a smaller window, and stay blocked.
 #[derive(Debug, Clone, Copy)]
@@ -41,18 +41,21 @@ pub struct Read {
 
 /// One consumer of a file, read off its stream for the cache window.
 ///
-/// Three facts and a position, and the window wants exactly these to say
-/// whether this reader is the one about to stop the film: how much it
-/// eats a second when it is eating ([`Self::rate`], the sustained figure,
-/// `None` before a read has come back late enough to measure one), how
-/// long since it last asked for anything ([`Self::idle`]), and what one of
-/// its reads is worth ([`Self::last_read`]) -- the tolerance below which
-/// "bytes in front of it" means "waiting for more" and not "has some".
+/// It holds three facts and a position. The window wants exactly these to
+/// say whether this reader is the one about to stop the film:
+///
+/// * how much it eats a second when it is eating ([`Self::rate`], the
+///   sustained figure, `None` before a read has come back late enough to
+///   measure one);
+/// * how long since it last asked for anything ([`Self::idle`]);
+/// * what one of its reads is worth ([`Self::last_read`]). That is the
+///   tolerance below which "bytes in front of it" means "waiting for more"
+///   and not "has some".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reader {
-    /// The last byte it read. [`Stream::end`] is exclusive, and at a
-    /// boundary would name the unit this reader is waiting for rather than
-    /// the one it is reading out of.
+    /// The last byte it read. [`Stream::end`] is exclusive. At a boundary
+    /// it would name the unit this reader is waiting for rather than the
+    /// one it is reading out of.
     pub at: u64,
     pub rate: Option<u64>,
     pub idle: Duration,
@@ -67,9 +70,9 @@ impl Read {
 
 /// A consumer moving through one file.
 ///
-/// Not a connection. A player reopens its connection on every seek -- one
-/// field session did it twenty-two times in two minutes, alternating
-/// between the film and a second track twenty gigabytes away -- so a stream
+/// It is not a connection. A player reopens its connection on every seek.
+/// One field session did it twenty-two times in two minutes, alternating
+/// between the film and a second track twenty gigabytes away. So a stream
 /// keyed to a connection would be twenty-two streams where there are two.
 /// What makes it one stream is that the reads continue each other.
 #[derive(Debug)]
@@ -79,13 +82,13 @@ struct Stream {
     /// Where this consumer is, in bytes of the file.
     ///
     /// **A byte-weighted average of where its reads end**, not the last
-    /// read's end ([`Self::place`]): a read moves it by a share that grows
-    /// with the read's size, so a viewer's 256 KiB reads carry it and a
-    /// crawler's 91-byte read at the tail of the same held run does not.
-    /// A seek inside held bytes moves it over a handful of reads, which
-    /// costs nothing -- the bytes under the new position are held, which
-    /// is why the read joined this stream at all. A read about to run out
-    /// of held bytes places it outright, so the window lands where the
+    /// read's end ([`Self::place`]). A read moves it by a share that grows
+    /// with the read's size. So a viewer's 256 KiB reads carry it, and a
+    /// crawler's 91-byte read at the tail of the same held run does not. A
+    /// seek inside held bytes moves it over a handful of reads. That costs
+    /// nothing, since the bytes under the new position are held, which is
+    /// why the read joined this stream at all. A read about to run out of
+    /// held bytes places it outright, so the window lands where the
     /// fetching is needed.
     end: u64,
     /// The read before this one, which is what the next sample is measured
@@ -96,50 +99,50 @@ struct Stream {
     /// Every byte those reads asked for, summed over the stream's life.
     ///
     /// **What says which of a file's readers is the viewer.** A rate can
-    /// only be measured once a read comes back late, and a stream that has
-    /// not measured one is priced at the film's own arithmetic -- so by
-    /// rate a crawler that has just started outranks a viewer who has been
+    /// only be measured once a read comes back late. A stream that has not
+    /// measured one is priced at the film's own arithmetic. So by rate, a
+    /// crawler that has just started outranks a viewer who has been
     /// measured slower than the film's average. Bytes asked for need no
-    /// such admission rule and separate the two by orders of magnitude: one
-    /// measured session had the viewer's reads run to tens of megabytes a
-    /// body against the crawler's 39 kB.
+    /// such admission rule, and they separate the two by orders of
+    /// magnitude. In one measured session the viewer's reads ran to tens of
+    /// megabytes a body against the crawler's 39 kB.
     eaten: u64,
     /// When the last one did.
     seen: Instant,
-    /// When its first read arrived. What says a stream was started after
-    /// another's last read -- the viewer moving on from it; see
+    /// When its first read arrived. This says a stream was started after
+    /// another's last read: the viewer moving on from it. See
     /// [`FileStreams::current_viewer`].
     began: Instant,
-    /// How fast this consumer is eating the file, in bytes a second, or
+    /// How fast this consumer is eating the file, in bytes a second. It is
     /// `None` until a read has come back late enough to say anything. See
     /// [`Stream::sample`]: this is a *correction* to the file's own
     /// arithmetic and never the whole of the answer.
     rate: Option<u64>,
-    /// How much is currently fetched ahead of it, in bytes. Grows towards
-    /// what the rate asks for rather than jumping to it -- see
-    /// [`Stream::grant`].
+    /// How much is currently fetched ahead of it, in bytes. It grows
+    /// towards what the rate asks for rather than jumping to it (see
+    /// [`Stream::grant`]).
     window: u64,
-    /// When the read that last earned a grant came in, or `None` having
-    /// never been granted. A window grows for a consumer that is
-    /// consuming; see [`Stream::grant`].
+    /// When the read that last earned a grant came in, or `None` if it was
+    /// never granted. A window grows for a consumer that is consuming (see
+    /// [`Stream::grant`]).
     granted_for: Option<Instant>,
-    /// Whether the last grant was cut short by the doubling -- the window
-    /// is still on its way to what the rate asks for. What says a stall
-    /// reported now is the window filling and not the swarm falling short;
-    /// see [`Streams::viewer_filling`]. True until the first grant: a
-    /// stream nothing has granted has no window at all.
+    /// Whether the last grant was cut short by the doubling, so the window
+    /// is still on its way to what the rate asks for. This says a stall
+    /// reported now is the window filling and not the swarm falling short
+    /// (see [`Streams::viewer_filling`]). It is true until the first grant,
+    /// since a stream nothing has granted has no window at all.
     filling: bool,
     /// The last sample [`Self::sample`] admitted: what the consumer ate and
     /// the gap it took, from the previous read's return to this one's
-    /// arrival. Kept raw for the trace ([`Streams::last_sample`]), so a
-    /// reading of the field log can check the rate's arithmetic.
+    /// arrival. It is kept raw for the trace ([`Streams::last_sample`]), so
+    /// a reading of the field log can check the rate's arithmetic.
     sampled: Option<(u64, std::time::Duration)>,
 }
 
 impl Stream {
     /// Whether nothing has read from this stream for [`STREAM_DORMANT`] as
-    /// of `now`. A dormant stream is kept -- a resumed read rejoins it --
-    /// but it holds no window, takes no share and is nobody's head.
+    /// of `now`. A dormant stream is kept, so a resumed read rejoins it.
+    /// But it holds no window, takes no share and is nobody's head.
     fn dormant(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.seen) >= STREAM_DORMANT
     }
@@ -149,13 +152,13 @@ impl Stream {
     /// `missing_within` is how many bytes lie between the read's end and
     /// the first piece ahead of it the disk does not hold, or `u64::MAX`
     /// when the held run reaches the file's end. **A read within its
-    /// window -- a piece at least -- of missing data places the position
-    /// outright**: the fetch
-    /// is needed there now and a position that lagged behind would draw
-    /// the window short of the reads. Every other read moves the position
-    /// by its share of the way, `size / (size + piece / 8)`, so
-    /// the crawler's tail read inside a fully held film is a rounding
-    /// error and a viewer's seek converges in a handful of reads.
+    /// window (a piece at least) of missing data places the position
+    /// outright.** The fetch is needed there now, and a position that
+    /// lagged behind would draw the window short of the reads. Every other
+    /// read moves the position by its share of the way,
+    /// `size / (size + piece / 8)`. So the crawler's tail read inside a
+    /// fully held film is a rounding error, and a viewer's seek converges
+    /// in a handful of reads.
     fn place(&mut self, read: &Read, missing_within: u64, piece: u64) {
         let size = read.size();
         if missing_within <= self.window.max(piece) {
@@ -174,47 +177,49 @@ impl Stream {
     ///
     /// **A starving player asks again the instant we answer**, because the
     /// socket has room and it has nothing to play. So the gap between our
-    /// return and its next request measures *us* and not it: the field
+    /// return and its next request measures *us* and not it. The field
     /// measured 262,144 bytes across a gap of under a millisecond, over and
-    /// over, which read as five to eighteen gigabytes a second and asked
-    /// for the whole film as a window. Consumption is only observable once
-    /// we are already keeping up, which is exactly when we least need to
+    /// over. That read as five to eighteen gigabytes a second and asked for
+    /// the whole film as a window. Consumption is only observable once we
+    /// are already keeping up, which is exactly when we least need to
     /// discover it.
     ///
     /// So a sample counts only when the player came back *later than the
     /// picture it was carrying*. A read of `consumed` bytes is
-    /// `consumed / ceiling` seconds of film; a player that returns sooner
-    /// than that cannot have played what it was just given, so it is
-    /// catching up, and the read measures our delivery. One that returns
-    /// later has played it and waited, and that gap is the consumer's own.
+    /// `consumed / ceiling` seconds of film. A player that returns sooner
+    /// than that cannot have played what it was just given. It is catching
+    /// up, and the read measures our delivery. One that returns later has
+    /// played it and waited, and that gap is the consumer's own.
     ///
     /// **There is no tolerance in that and no constant.** The comparison is
-    /// against the film's own arithmetic, so it scales with the film: a
-    /// dense film gives a read more seconds of picture, a sparse one fewer.
+    /// against the film's own arithmetic, so it scales with the film. A
+    /// dense film gives a read more seconds of picture, and a sparse one
+    /// fewer.
     ///
     /// It biases the measurement, and the bias is the useful direction. A
     /// sample saying "faster than the film's average" is exactly the one
-    /// that cannot be told from starving, so it is discarded; what survives
+    /// that cannot be told from starving, so it is discarded. What survives
     /// says "slower", which is what a subtitle track at twenty kilobytes a
-    /// second is, and telling those apart is the whole of what the disk
-    /// allocation needs. By construction nothing here can exceed `ceiling`:
-    /// the gap that admits a sample is the gap that bounds it.
+    /// second is. Telling those apart is the whole of what the disk
+    /// allocation needs. By construction nothing here can exceed `ceiling`,
+    /// because the gap that admits a sample is the gap that bounds it.
     ///
-    /// Without a ceiling -- an entity whose length nobody has stated, which
-    /// is a proxied URL -- there is no picture to compare against and the
+    /// Without a ceiling there is no picture to compare against, and the
     /// delivery rate is all there is: no duration, no time caps, byte
-    /// arithmetic alone.
+    /// arithmetic alone. That is an entity whose length nobody has stated,
+    /// which is a proxied URL.
     ///
     /// **What it ate, not what we sent.** A player resumes where it stopped
-    /// consuming, which is behind where we stopped sending by whatever sat
-    /// unread in the socket -- 1.15 MB to 9.0 MB over the measured session.
-    /// Crediting the whole of the last read overstates it: on one real
-    /// reopen, 21,757,952 bytes served against 18,374,055 actually eaten.
+    /// consuming. That is behind where we stopped sending, by whatever sat
+    /// unread in the socket: 1.15 MB to 9.0 MB over the measured session.
+    /// Crediting the whole of the last read overstates it. On one real
+    /// reopen, 21,757,952 bytes were served against 18,374,055 actually
+    /// eaten.
     ///
     /// A read that consumed nothing is refused as well. It is a reopen
-    /// landing behind, or a re-read of ground already served; it says where
-    /// the consumer is, not how fast it is going, and folded in as a zero
-    /// it would drag the rate to the floor on every seek.
+    /// landing behind, or a re-read of ground already served. It says where
+    /// the consumer is, not how fast it is going. Folded in as a zero, it
+    /// would drag the rate to the floor on every seek.
     fn sample(&mut self, read: &Read, ceiling: Option<u64>) {
         let overlap = self
             .last
@@ -237,26 +242,26 @@ impl Stream {
         self.sampled = Some((consumed, gap));
         // **Seeded from the film's own arithmetic, not from the first
         // sample.** A stream nothing has measured is already fetched at the
-        // ceiling -- that is what `demand` does with a `None` rate -- so
-        // taking the first admitted sample whole would be a step out of it
-        // with no averaging behind it at all, and the first admitted sample
-        // is the one most likely to be wrong.
+        // ceiling: that is what `demand` does with a `None` rate. Taking
+        // the first admitted sample whole would be a step out of it with no
+        // averaging behind it at all. And the first admitted sample is the
+        // one most likely to be wrong.
         //
         // It is wrong in a particular direction, which is why this matters.
         // A starving player asks again the instant it is answered, so its
-        // reads are refused here; what survives admission is the moments
+        // reads are refused here. What survives admission is the moments
         // the player had some buffer and idled, and a long idle over a
         // small read is a *low* sample. On a link that alternates stalling
         // and bursting, the admitted samples are systematically the low
-        // ones -- so unseeded, one of them can collapse the window to a
-        // tenth of the film's rate, on exactly the link where a buffer is
-        // worth most: measured on a wifi-to-mobile switch at
-        // `rates=[Some(367710)]` against a 3,568,061 B/s film, a want set
+        // ones. So unseeded, one of them can collapse the window to a tenth
+        // of the film's rate, on exactly the link where a buffer is worth
+        // most. That was measured on a wifi-to-mobile switch at
+        // `rates=[Some(367710)]` against a 3,568,061 B/s film: a want set
         // of eight pieces where the arithmetic allows seventy-seven.
         //
-        // Seeded, the same sample moves the rate by an eighth -- one part
-        // in `RATE_SMOOTHING` -- and the transition out of "no measurement"
-        // is continuous rather than a step.
+        // Seeded, the same sample moves the rate by an eighth (one part in
+        // `RATE_SMOOTHING`). The transition out of "no measurement" is
+        // continuous rather than a step.
         self.rate = Some(match self.rate.or(ceiling) {
             None => sample,
             Some(rate) => (rate * (RATE_SMOOTHING - 1) + sample) / RATE_SMOOTHING,
@@ -266,12 +271,12 @@ impl Stream {
     /// What this stream should be fetched at, in bytes a second.
     ///
     /// **Arithmetic first, measurement as a correction.** `ceiling` is the
-    /// file's own size over its duration: exact at the first report,
-    /// nothing to converge, and no read pattern can distort it. A stream
-    /// nothing has measured is fetched at it from the start, which is what
-    /// a playhead that has never once been kept up with needs -- and costs
-    /// nothing, because the window still grows a doubling at a time
-    /// ([`Stream::grant`]), so a consumer that turns out to be a one-shot
+    /// file's own size over its duration. It is exact at the first report,
+    /// with nothing to converge, and no read pattern can distort it. A
+    /// stream nothing has measured is fetched at it from the start. That is
+    /// what a playhead that has never once been kept up with needs. It
+    /// costs nothing, because the window still grows a doubling at a time
+    /// ([`Stream::grant`]). So a consumer that turns out to be a one-shot
     /// probe has had the floor and stopped.
     ///
     /// A measurement can only lower it. See [`Stream::sample`] for why that
@@ -281,7 +286,7 @@ impl Stream {
             (Some(rate), Some(ceiling)) => rate.min(ceiling),
             (Some(rate), None) => rate,
             (None, Some(ceiling)) => ceiling,
-            // Neither arithmetic nor measurement: nothing is claimed, and
+            // Neither arithmetic nor measurement. Nothing is claimed, and
             // the demand floor is what the stream gets.
             (None, None) => 0,
         }
@@ -293,25 +298,25 @@ impl Stream {
     /// now.
     ///
     /// **At most twice what it was.** A window that jumped straight to what
-    /// one measurement asked for would hand a consumer that read once -- a
-    /// container index, a probe, anything that opens and closes -- a whole
-    /// film's worth of lookahead off a single sample. That is not
-    /// hypothetical: it is the build that fetched 1.6 GB to play 100 MB.
+    /// one measurement asked for would hand a whole film's worth of
+    /// lookahead, off a single sample, to a consumer that read once: a
+    /// container index, a probe, anything that opens and closes. That is
+    /// not hypothetical. It is the build that fetched 1.6 GB to play
+    /// 100 MB.
     ///
     /// Doubling costs the real consumer nothing. A grant is one step per
-    /// pass of this file, not per read: a film reaches a 315 MB window
-    /// from the 8 MB floor in six doublings, so six passes -- a dozen
-    /// seconds at the reconciler's two-second tick, six stride moves for
-    /// the proxy -- while a stream that turns out to be a one-shot probe
-    /// has cost eight megabytes and stopped.
+    /// pass of this file, not per read. A film reaches a 315 MB window from
+    /// the 8 MB floor in six doublings, so six passes: a dozen seconds at
+    /// the reconciler's two-second tick, or six stride moves for the proxy.
+    /// A stream that turns out to be a one-shot probe has meanwhile cost
+    /// eight megabytes and stopped.
     fn grant(&mut self, target: u64, floor: u64) -> u64 {
         // **And only for a consumer that is consuming.** A doubling a pass
-        // is what lets a real stream reach its window in a handful of
-        // passes; applied to a stream that has not read since the last
-        // grant it is a
-        // lookahead that goes on growing after the reading has stopped. A
+        // lets a real stream reach its window in a handful of passes.
+        // Applied to a stream that has not read since the last grant, it is
+        // a lookahead that goes on growing after the reading has stopped. A
         // read of a container's index closes the moment it has what it
-        // came for, and the field measured the tail of a paused film being
+        // came for. The field measured the tail of a paused film being
         // fetched for as long as the torrent was up.
         if self.granted_for == Some(self.seen) {
             return self.window.max(floor);
@@ -322,7 +327,7 @@ impl Stream {
         } else {
             self.window.saturating_mul(2)
         };
-        // Cut short by the doubling: the window has not reached what was
+        // Cut short by the doubling. The window has not reached what was
         // asked, and the next pass will grow it again.
         self.filling = ceiling < target;
         self.window = target.min(ceiling).max(floor);
@@ -332,50 +337,50 @@ impl Stream {
 
 /// Why a read had to start a stream of its own.
 ///
-/// One variant, and it stays an enum because the field log needs to say
-/// *that* a read started a stream and not only that the count went up: a
-/// join rule too tight reports two streams having opened ten, and the two
-/// readings are told apart by how often this appears.
+/// There is one variant. It stays an enum because the field log needs to
+/// say *that* a read started a stream, and not only that the count went
+/// up. A join rule too tight reports two streams having opened ten. The
+/// two readings are told apart by how often this appears.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rejected {
-    /// The read began in no run this file's streams are in -- a different
+    /// The read began in no run this file's streams are in: a different
     /// stretch of disk, or a piece the disk does not hold at all.
     Outside,
 }
 
 /// One over how much of a new sample the rate takes.
 ///
-/// A player's reads are bursty -- it drains as fast as the socket allows
-/// until its own buffer is full, then asks only as often as it plays -- so
-/// a rate that followed each sample would swing between the link's speed
-/// and the film's. A seventh of the old number and one of the new settles
-/// over roughly a dozen reads.
+/// A player's reads are bursty. It drains as fast as the socket allows
+/// until its own buffer is full, then asks only as often as it plays. So a
+/// rate that followed each sample would swing between the link's speed and
+/// the film's. A seventh of the old number and one of the new settles over
+/// roughly a dozen reads.
 ///
-/// **Not a sixteenth.** Widening is tempting -- only *admitted* samples
-/// move this ([`Stream::sample`]), and admission is biased low on a bad
-/// link, so a short memory tracks a stalling link down and leaves the
-/// stream too thin to ride the next stall out. But the seed a wider
-/// window would need to remove the cliff only exists where a duration
-/// does: a proxied stream states none, so its first admitted sample still
-/// sets the rate outright, and a longer memory only makes that one sample
-/// stickier -- on Windows, where the first read of a test is slower and so
-/// the first sample is lower, a longer memory leaves the cache holding
-/// three chunks of a played run where the assertion wants four.
+/// **Not a sixteenth.** Widening is tempting. Only *admitted* samples move
+/// this ([`Stream::sample`]), and admission is biased low on a bad link.
+/// So a short memory tracks a stalling link down and leaves the stream too
+/// thin to ride the next stall out. But the seed a wider window would need
+/// to remove the cliff only exists where a duration does. A proxied stream
+/// states none, so its first admitted sample still sets the rate outright,
+/// and a longer memory only makes that one sample stickier. On Windows the
+/// first read of a test is slower, and so the first sample is lower. There
+/// a longer memory leaves the cache holding three chunks of a played run
+/// where the assertion wants four.
 ///
 /// So the width may only be widened for streams that are seeded, and that
-/// is a second constant for one idea. The seed is what removes the cliff
-/// -- one sample can no longer collapse the window -- and the width is
-/// second order beside it: at either value the decay takes a dozen-odd
-/// admitted samples, which is not the difference between riding a bad
-/// patch out and not.
+/// is a second constant for one idea. The seed is what removes the cliff:
+/// one sample can no longer collapse the window. The width is second order
+/// beside it. At either value the decay takes a dozen-odd admitted
+/// samples, which is not the difference between riding a bad patch out
+/// and not.
 const RATE_SMOOTHING: u64 = 8;
 
 /// The smallest window a stream is ever granted, in pieces.
 ///
-/// Not a tunable: it is what a sequential reader needs to not block on the
-/// very next piece it asks for. A consumer given only the piece it is
-/// sitting in reads to the boundary and stops -- which is the field's
-/// second track exactly, forty kilobytes at a time, every read ending at
+/// It is not a tunable. It is what a sequential reader needs to not block
+/// on the very next piece it asks for. A consumer given only the piece it
+/// is sitting in reads to the boundary and stops. That is the field's
+/// second track exactly: forty kilobytes at a time, every read ending at
 /// 23,320,330,240. One piece past where it is, is the least that can be
 /// called a lookahead.
 const FLOOR_PIECES: u64 = 2;
@@ -390,11 +395,11 @@ pub const COLDEST_REPORTED: usize = 8;
 /// The unbroken stretches of a listing, ascending: what the disk holds,
 /// in the shape the detector asks about it.
 ///
-/// Built once per pass, because a read's run is looked up per read, and
-/// walking the held set outward from each read -- a lookup per piece, under
-/// the detector's lock the read path takes -- cost a fully cached film its
-/// whole length per read: five and a half thousand pieces, times every read
-/// a pass answers.
+/// It is built once per pass, because a read's run is looked up per read.
+/// Walking the held set outward from each read was a lookup per piece,
+/// under the detector's lock the read path takes. That cost a fully cached
+/// film its whole length per read: five and a half thousand pieces, times
+/// every read a pass answers.
 #[derive(Debug, Default)]
 struct HeldRuns(Vec<Range<u32>>);
 
@@ -406,10 +411,10 @@ impl HeldRuns {
     /// The maximal unbroken stretch of the listing containing `piece`,
     /// inside `bound`, or `None` for a piece the disk does not have.
     ///
-    /// The listing rather than the piece store's own bitfield, because the
-    /// proxy's held set is a set of chunk indices and the rule is the same
-    /// for both: what a consumer may reach back to is however much of the
-    /// disk was kept behind it.
+    /// It uses the listing rather than the piece store's own bitfield,
+    /// because the proxy's held set is a set of chunk indices and the rule
+    /// is the same for both. What a consumer may reach back to is however
+    /// much of the disk was kept behind it.
     fn containing(&self, piece: u32, bound: &Range<u32>) -> Option<Range<u32>> {
         if !bound.contains(&piece) {
             return None;
@@ -423,12 +428,13 @@ impl HeldRuns {
 /// Where one file lies in the torrent, which is what turns an offset
 /// inside it into the piece index the disk is listed by.
 ///
-/// A read carries an offset in its own file; `held` is a set of torrent
-/// pieces. For a file starting at torrent offset zero those are the same
-/// number -- every single-file torrent, and the first file of every other
-/// -- so dividing the offset by the piece length is right about the field's
-/// film and wrong about the second episode of a season pack, silently: the
-/// run it looked up would be tens of thousands of pieces from the read.
+/// A read carries an offset in its own file, and `held` is a set of
+/// torrent pieces. For a file starting at torrent offset zero those are the
+/// same number. That is every single-file torrent, and the first file of
+/// every other. So dividing the offset by the piece length is right about
+/// the field's film, and silently wrong about the second episode of a
+/// season pack. The run it looked up would be tens of thousands of pieces
+/// from the read.
 #[derive(Debug, Clone)]
 struct Geometry {
     /// The file's first byte within the torrent.
@@ -448,25 +454,25 @@ impl Geometry {
 /// Every stream detected on one file.
 #[derive(Debug)]
 pub struct FileStreams {
-    /// Where the file is, learned from the pass: the read path has a file
+    /// Where the file is, learned from the pass. The read path has a file
     /// offset and nothing else.
     geometry: Geometry,
-    /// The file's own bitrate -- its size over its duration -- or `None`
-    /// for a file whose length nobody has stated. The ceiling every stream
+    /// The file's own bitrate (its size over its duration), or `None` for a
+    /// file whose length nobody has stated. It is the ceiling every stream
     /// on it is fetched at, and the measure of what a read's gap has to
     /// beat to say anything. See [`Stream::sample`].
     ceiling: Option<u64>,
     streams: Vec<Stream>,
-    /// When each piece of this file was last any use. Kept because
-    /// `Backing::held` answers a set with no times on it; see
-    /// [`crate::retention::ledger`].
+    /// When each piece of this file was last any use. It is kept because
+    /// `Backing::held` answers a set with no times on it (see
+    /// [`crate::retention::ledger`]).
     ///
     /// **Per file, because a listing is.** A pass lists the pieces of the
-    /// entity it is for, and a ledger settled against another file's
-    /// listing would find none of its own pieces in it and forget the lot
-    /// -- so every pass of every other file would reset this one's arrival
-    /// times, and an LRU built on them would rank a file nobody has touched
-    /// for a minute as freshly fetched.
+    /// entity it is for. A ledger settled against another file's listing
+    /// would find none of its own pieces in it and forget the lot. So every
+    /// pass of every other file would reset this one's arrival times. An
+    /// LRU built on them would rank a file nobody has touched for a minute
+    /// as freshly fetched.
     ledger: super::ledger::Ledger,
     /// What these streams hold, published for the door to read without
     /// taking anything. See [`super::exempt`].
@@ -494,30 +500,30 @@ impl FileStreams {
     /// that is in the same unbroken stretch of disk it is.**
     ///
     /// The second is the general rule and the first is what it cannot see.
-    /// A consumer *is* the run of bytes it caused to be there, so two reads
+    /// A consumer *is* the run of bytes it caused to be there. So two reads
     /// belong to one consumer exactly when the disk between them is whole,
-    /// and a hole an eviction left is what ends one -- but that reads the
+    /// and a hole an eviction left is what ends one. But that reads the
     /// disk as the proof of who a consumer is, and one response can be
     /// ahead of the disk it is writing. So a read that begins exactly where
     /// this same reader's last read ended is that reader carrying on,
-    /// whatever the listing holds; see [`Self::observe_in`].
+    /// whatever the listing holds (see [`Self::observe_in`]).
     ///
-    /// Which makes the tolerance a measurement rather than a choice, and
-    /// scales it the right way: a cache with room holds a long run, so a
-    /// scrub back lands inside it and is the same viewer; a cache under
+    /// That makes the tolerance a measurement rather than a choice, and
+    /// scales it the right way. A cache with room holds a long run, so a
+    /// scrub back lands inside it and is the same viewer. A cache under
     /// pressure holds a short one, so the same scrub lands outside and is a
     /// new consumer that has to be fetched for. Bigger disks behave better,
     /// with no number anywhere.
     ///
     /// Three rules were tried and rejected before this one, each guessing
-    /// that distance in bytes; see `docs/design/read-pattern-retention.md`
+    /// that distance in bytes. See `docs/design/read-pattern-retention.md`
     /// for what each got wrong.
     ///
     /// The read's **begin** is what is looked up, not its end. A consumer
-    /// blocked on a missing piece serves up to the hole and stops, so its
-    /// end is the first byte it does *not* have -- in no run by definition,
-    /// and the reason the field showed twenty separate streams all ending
-    /// at 23,320,330,240. Where it started is where it was.
+    /// blocked on a missing piece serves up to the hole and stops. So its
+    /// end is the first byte it does *not* have, which is in no run by
+    /// definition. That is why the field showed twenty separate streams all
+    /// ending at 23,320,330,240. Where it started is where it was.
     #[cfg(test)]
     fn observe(
         &mut self,
@@ -540,14 +546,14 @@ impl FileStreams {
         let at = |offset: u64| self.geometry.at(piece, offset);
         let run = held.containing(at(read.begin), &self.geometry.bound);
         // **The reader's own stream first, then the one most recently
-        // read.** Several streams can sit in one run -- a hole between two
-        // of them fills, and what were two consumers are now two positions
-        // in one run -- and the first in vector order is whichever was
-        // created first, which after a scrub back is the stream the viewer
-        // left. Joining that one moves the history, the rate and the window
-        // onto a dormant stream while the live one keeps none. By the run
-        // rule they are the same consumer either way, so this only decides
-        // where the history is kept; it keeps it where the reading is.
+        // read.** Several streams can sit in one run: a hole between two of
+        // them fills, and what were two consumers are now two positions in
+        // one run. The first in vector order is whichever was created
+        // first, which after a scrub back is the stream the viewer left.
+        // Joining that one moves the history, the rate and the window onto
+        // a dormant stream while the live one keeps none. By the run rule
+        // they are the same consumer either way, so this only decides where
+        // the history is kept. It keeps it where the reading is.
         let nearest = run.as_ref().and_then(|run| {
             self.streams
                 .iter()
@@ -557,26 +563,26 @@ impl FileStreams {
                 .map(|(index, _)| index)
         });
         // **A continuation is never a new consumer, whatever the listing
-        // holds.** The run rule asks the disk who a reader is, and between
-        // two responses that is the right question; within one response it
-        // is a proxy that fails exactly where the delivery runs ahead of
-        // the writer. A proxied response reports each chunk as it goes past
-        // and a chunk enters the listing only once it is whole, so the read
-        // that delivered one begins in a piece no listing holds -- and one
-        // 16 MiB play-through of one URL was counted as thirty-two
-        // consumers, each granted its [`FLOOR_PIECES`] that no unlink may
-        // touch. Their floors together came to more than the whole
-        // allowance, so the pass computed an overhang it was then forbidden
-        // to take a piece of, and the cache settled over its cap for the
-        // life of the stream.
+        // holds.** The run rule asks the disk who a reader is. Between two
+        // responses that is the right question. Within one response it is a
+        // proxy that fails exactly where the delivery runs ahead of the
+        // writer. A proxied response reports each chunk as it goes past,
+        // and a chunk enters the listing only once it is whole. So the read
+        // that delivered one begins in a piece no listing holds. One 16 MiB
+        // play-through of one URL was counted as thirty-two consumers, each
+        // granted its [`FLOOR_PIECES`] that no unlink may touch. Their
+        // floors together came to more than the whole allowance. So the
+        // pass computed an overhang it was then forbidden to take a piece
+        // of, and the cache settled over its cap for the life of the
+        // stream.
         //
         // One response reads forward and never comes back to a byte it has
-        // left, so a read beginning exactly where this reader's own stream
-        // last ended is that stream going on. Exactly, and for the same
-        // reader only: anything looser is the guess-a-distance rule the run
-        // rule replaced. It leaves the torrent side as it was -- a read
-        // *past a hole* did not continue anything, so it is still a seek
-        // and still a consumer of its own.
+        // left. So a read beginning exactly where this reader's own stream
+        // last ended is that stream going on. It must be exactly there, and
+        // for the same reader only: anything looser is the
+        // guess-a-distance rule the run rule replaced. It leaves the
+        // torrent side as it was. A read *past a hole* did not continue
+        // anything, so it is still a seek and still a consumer of its own.
         let nearest = nearest.or_else(|| {
             self.streams
                 .iter()
@@ -593,10 +599,10 @@ impl FileStreams {
         if let Some(index) = nearest {
             // How far the read is from running out of held bytes: the
             // first missing piece of its run, or nothing when the run
-            // reaches the file's end -- the film's own end is not a hole.
-            // A read in no run at all has run out already: the piece it
-            // began in is not on the disk, so the fetch is needed where it
-            // is and the position is placed outright.
+            // reaches the file's end, since the film's own end is not a
+            // hole. A read in no run at all has run out already. The piece
+            // it began in is not on the disk, so the fetch is needed where
+            // it is and the position is placed outright.
             let missing_within = match &run {
                 None => 0,
                 Some(run) if run.end >= self.geometry.bound.end => u64::MAX,
@@ -612,13 +618,13 @@ impl FileStreams {
             if stream.reader != reader {
                 stream.reader = reader;
             }
-            // Backwards included: a scrub back is not ground already
-            // played, it is ground about to be played again, and a window
-            // belongs where the viewer is. What bounds how far a read and
-            // the position can differ is the held run: a read joins this
-            // stream only while the stream's position and the read's first
-            // byte are in one run of held pieces, and a read past a hole
-            // is a stream of its own. See [`Stream::place`].
+            // Backwards included. A scrub back is not ground already
+            // played. It is ground about to be played again, and a window
+            // belongs where the viewer is. The held run bounds how far a
+            // read and the position can differ. A read joins this stream
+            // only while the stream's position and the read's first byte
+            // are in one run of held pieces. A read past a hole is a stream
+            // of its own. See [`Stream::place`].
             stream.place(&read, missing_within, piece);
             stream.eaten = stream
                 .eaten
@@ -666,8 +672,8 @@ impl FileStreams {
             .map(|stream| self.geometry.at(piece, stream.end))
     }
 
-    /// The live stream that has asked for the most bytes -- the viewer
-    /// among a file's readers, by the argument at [`Stream::eaten`]; `None`
+    /// The live stream that has asked for the most bytes: the viewer among
+    /// a file's readers, by the argument at [`Stream::eaten`]. It is `None`
     /// for a file nothing live is reading.
     fn viewer(&self, now: Instant) -> Option<&Stream> {
         self.streams
@@ -680,15 +686,16 @@ impl FileStreams {
     /// from: one that another live stream began after it was last read.
     ///
     /// A seek within one file is exactly that. The stream the viewer left
-    /// stays live for [`STREAM_DORMANT`] and has asked for more bytes than
-    /// the one it is on now for most of that, so by bytes alone it would be
-    /// the viewer for half a minute after every seek -- and it is the new
-    /// stream's window that is ramping. The crawler beside a viewer is not
-    /// moved on from: it began before the viewer's latest read, and the
-    /// viewer is read after it began, so both stay and bytes decide.
+    /// stays live for [`STREAM_DORMANT`]. For most of that time it has
+    /// asked for more bytes than the one the viewer is on now. So by bytes
+    /// alone it would be the viewer for half a minute after every seek,
+    /// while it is the new stream's window that is ramping. The crawler
+    /// beside a viewer is not moved on from. It began before the viewer's
+    /// latest read, and the viewer is read after it began, so both stay and
+    /// bytes decide.
     ///
-    /// Never empty while anything is live: the live stream that began last
-    /// began after nothing else was last read.
+    /// It is never empty while anything is live, because the live stream
+    /// that began last began after nothing else was last read.
     fn current_viewer(&self, now: Instant) -> Option<&Stream> {
         let live = || self.streams.iter().filter(|stream| !stream.dormant(now));
         live()
@@ -702,14 +709,14 @@ impl FileStreams {
 /// The diagnostics report a tester sends back is a 400-line ring, and every
 /// line this costs is one of somebody else's. Ten seconds is 0.1 lines a
 /// second, against the five-second `stream_progress` line that is per open
-/// response; the streams being looked for form over tens of seconds and
+/// response. The streams being looked for form over tens of seconds and
 /// last for minutes, so nothing is missed by not saying it sooner.
 const REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How many reads of files no pass has described yet are kept.
 ///
 /// A read waits for its own file's geometry, which arrives with that file's
-/// first pass; this is the backstop for a file that somehow never gets one,
+/// first pass. This is the backstop for a file that somehow never gets one,
 /// so the detector's memory is bounded by something other than the length
 /// of the session. Two hundred and fifty-six is a few seconds of one
 /// consumer's reads at the rate the field measured.
@@ -717,46 +724,45 @@ const WAITING_READS: usize = 256;
 
 /// How long a stream nothing has read from stays live.
 ///
-/// A stream is never expired on a timer: it lives with its entity, like
+/// A stream is never expired on a timer. It lives with its entity, like
 /// the torrent does, and a resumed read rejoins it. What idleness changes
 /// is what it holds. A dormant stream's window is no longer exempt from
-/// reclaim, so its pieces are the LRU's like everything else -- a paused
+/// reclaim, so its pieces are the LRU's like everything else. A paused
 /// viewer's pieces stay for as long as nothing colder needs the room, and
-/// a seek's abandoned stream pins nothing -- and it takes no share of the
-/// allowance and is nobody's head. Thirty seconds is longer than any gap
-/// the field's slow second track left between its own reads.
+/// a seek's abandoned stream pins nothing. A dormant stream takes no share
+/// of the allowance and is nobody's head. Thirty seconds is longer than any
+/// gap the field's slow second track left between its own reads.
 const STREAM_DORMANT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How many streams one file keeps before a new one displaces the dormant
 /// stream read longest ago.
 ///
 /// "Never expired on a timer" ([`STREAM_DORMANT`]) is about a stream's
-/// life, not the list's length: every seek is a stream, and a file scrubbed
-/// through for an evening kept every one of them -- walked by every read
-/// and every pass, for the life of the entity. A dormant stream holds no
-/// window and is nobody's head, and the one read longest ago is the one a
-/// resumed read is least likely to rejoin. Live streams are never
-/// displaced, so a file read by more than this many consumers at once
-/// keeps them all; sixteen is several times any reading the field has
-/// shown (a viewer, a crawler beside it, and the streams its last seeks
-/// left).
+/// life, not the list's length. Every seek is a stream. A file scrubbed
+/// through for an evening kept every one of them, walked by every read and
+/// every pass, for the life of the entity. A dormant stream holds no window
+/// and is nobody's head. The one read longest ago is the one a resumed
+/// read is least likely to rejoin. Live streams are never displaced, so a
+/// file read by more than this many consumers at once keeps them all.
+/// Sixteen is several times any reading the field has shown (a viewer, a
+/// crawler beside it, and the streams its last seeks left).
 const STREAMS_PER_FILE: usize = 16;
 
 /// How many bytes of reading move a stream's position halfway to a read's
 /// end ([`Stream::place`]), as a share of the piece: an eighth. On the
-/// field's 4 MiB pieces that is half a mebibyte -- a viewer's 256 KiB
-/// read moves the position a third of the way, so a seek inside held
-/// bytes converges in a couple of dozen reads, under two seconds of
-/// playback, while the crawler's 91-byte read at the tail moves it by a
-/// fiftieth of a percent. In pieces rather than bytes because a piece is
-/// the unit everything else here is measured in, the fakes' included.
+/// field's 4 MiB pieces that is half a mebibyte. A viewer's 256 KiB read
+/// moves the position a third of the way, so a seek inside held bytes
+/// converges in a couple of dozen reads, under two seconds of playback.
+/// The crawler's 91-byte read at the tail moves it by a fiftieth of a
+/// percent. It is in pieces rather than bytes because a piece is the unit
+/// everything else here is measured in, the fakes' included.
 const PLAYHEAD_SMOOTHING_PIECE_SHARE: u64 = 8;
 
 impl FileStreams {
     /// What these streams would ask for over `seconds`, before anything is
-    /// shared out -- the demand this file puts on the entity's allowance.
+    /// shared out: the demand this file puts on the entity's allowance.
     fn asked(&self, seconds: u64, now: Instant) -> u64 {
-        // Saturating against a `seconds` nobody should hand in: the
+        // Saturating against a `seconds` nobody should hand in. The
         // `Maximum` profile is a finite day, precisely so this does not
         // saturate and hand every stream the whole allowance.
         self.streams
@@ -769,12 +775,12 @@ impl FileStreams {
     /// Grow every stream towards its share of the allowance and answer
     /// where the windows now reach.
     ///
-    /// `share` is the entity's, not this file's: it is one factor over
+    /// `share` is the entity's, not this file's. It is one factor over
     /// every stream of every file, which is what makes the shares equal in
     /// seconds across the whole of what is being read. A file that scaled
     /// its own demand against the whole allowance would be promised it
-    /// alone, and two files being read would together promise twice the
-    /// disk there is.
+    /// alone. Two files being read would together promise twice the disk
+    /// there is.
     fn grant(
         &mut self,
         seconds: u64,
@@ -793,21 +799,21 @@ impl FileStreams {
             stream.grant(target, floor);
         }
         // **Nothing is published here.** What may not be unlinked is the
-        // windows *and* the promises, the lookaheads and the committed set,
-        // and only the backing has all of those: it publishes them together
+        // windows *and* the promises, the lookaheads and the committed set.
+        // Only the backing has all of those, and it publishes them together
         // a call later. A publication of the windows alone, here, cleared
-        // every promise bit for the moment between the two -- a door asked
-        // in that moment let a parked read's piece go.
+        // every promise bit for the moment between the two. A door asked in
+        // that moment let a parked read's piece go.
         self.windows(piece, now)
     }
 
     /// Where the windows already granted reach, granting nothing.
     ///
-    /// What a pass of *another* file reports for this one. The grant is a
-    /// doubling, one step per pass ([`Stream::grant`]), and a file whose
-    /// window doubled on every pass of every other file would reach a full
-    /// lookahead at a rate set by how many files are being read rather than
-    /// by its own.
+    /// A pass of *another* file reports this for this one. The grant is a
+    /// doubling, one step per pass ([`Stream::grant`]). A file whose window
+    /// doubled on every pass of every other file would reach a full
+    /// lookahead at a rate set by how many files are being read, rather
+    /// than by its own.
     fn windows(&self, piece: u64, now: Instant) -> Vec<Range<u32>> {
         self.streams
             .iter()
@@ -830,14 +836,14 @@ impl FileStreams {
 pub struct Streams {
     by_file: HashMap<usize, FileStreams>,
     /// **How deep the backend is splitting the head of the lookahead**, and
-    /// this video's stalls that size it; see [`super::deadline`]. The
-    /// engine counts what the player reports here, the pass reads it.
+    /// this video's stalls that size it (see [`super::deadline`]). The
+    /// engine counts what the player reports here, and the pass reads it.
     pub deadline: super::deadline::DeadlineDepth,
     /// Reads served since the last pass, awaiting the listing of their own
     /// file to be answered against. A read carries its own timestamps, so
     /// waiting costs the answer nothing.
     pending: Vec<(usize, u64, Read)>,
-    /// When the last report went out, or `None` having said nothing yet.
+    /// When the last report went out, or `None` if nothing was said yet.
     reported: Option<Instant>,
 }
 
@@ -845,9 +851,9 @@ impl Streams {
     /// Whether a report is due, marking it sent when it is.
     ///
     /// The throttle is here, with the clock passed in, rather than in a
-    /// process-global map beside the trace call: `trace::pass`'s `SEEN` is
+    /// process-global map beside the trace call. `trace::pass`'s `SEEN` is
     /// keyed by the entity alone, so two event types sharing it silence
-    /// each other on alternate intervals, and being global wall-clock state
+    /// each other on alternate intervals. Being global wall-clock state also
     /// makes it order-dependent across the tests in one binary.
     pub fn report_due(&mut self, now: Instant) -> bool {
         let due = self
@@ -859,7 +865,7 @@ impl Streams {
         due
     }
     /// Keep a served read until a pass can say which consumer it belonged
-    /// to. The read path cannot answer that: membership is a question about
+    /// to. The read path cannot answer that. Membership is a question about
     /// the disk, and the disk's answer is a listing away.
     pub fn record(&mut self, file: usize, reader: u64, read: Read) {
         self.pending.push((file, reader, read));
@@ -867,12 +873,13 @@ impl Streams {
 
     /// Say where one file lies in the torrent.
     ///
-    /// From the pass, because the pass's domain is the one place that has
-    /// it: the read path knows an offset inside a file and no more, and
-    /// every question asked here -- which run a read is in, which pieces a
-    /// window covers -- is about torrent pieces.
+    /// It comes from the pass, because the pass's domain is the one place
+    /// that has it. The read path knows an offset inside a file and no
+    /// more. Every question asked here (which run a read is in, which
+    /// pieces a window covers) is about torrent pieces.
+    ///
     /// Only the geometry is written for a file already here, never the
-    /// whole entry: the exempt set is a handle a door may already be
+    /// whole entry. The exempt set is a handle a door may already be
     /// holding, and replacing it would leave that door reading a set
     /// nothing publishes into.
     pub fn domain(&mut self, file: usize, offset: u64, bound: Range<u32>, ceiling: Option<u64>) {
@@ -892,13 +899,14 @@ impl Streams {
 
     /// Answer every read kept since the last pass against `held`, and say
     /// what the most recent one had to do.
+    ///
     /// **A pass answers its own file's reads, against its own listing.**
     /// `held` is what the disk holds of `file`, so it is the only set the
-    /// reads of that file can be answered against: a read of another file
-    /// looked up here is looked up in a listing that does not cover it, so
-    /// it is in no run, so it is a consumer of its own -- every read of it,
-    /// for as long as both files are being read. Those wait for their own
-    /// pass, which every file being read gets.
+    /// reads of that file can be answered against. A read of another file
+    /// looked up here is looked up in a listing that does not cover it. So
+    /// it is in no run, and so it is a consumer of its own: every read of
+    /// it, for as long as both files are being read. Those wait for their
+    /// own pass, which every file being read gets.
     pub fn observe(
         &mut self,
         file: usize,
@@ -926,10 +934,10 @@ impl Streams {
                     streams.ledger.read(pieces, reader, read.returned);
                 }
             }
-            // A pass for a file nothing has described can answer nothing:
-            // every conversion here goes through a geometry, and the pass
+            // A pass for a file nothing has described can answer nothing.
+            // Every conversion here goes through a geometry, and the pass
             // states that before it asks. Everything waits, and the cap
-            // below is what keeps waiting bounded.
+            // below keeps waiting bounded.
             None => waiting = pending,
         }
         // Bounded, because a file whose pass never comes would otherwise
@@ -942,8 +950,8 @@ impl Streams {
     }
 
     /// Settle the torrent's split depth for `file`'s pass, beside what
-    /// every other file still being read last asked; see
-    /// [`super::deadline::DeadlineDepth::settle_for`].
+    /// every other file still being read last asked (see
+    /// [`super::deadline::DeadlineDepth::settle_for`]).
     pub fn settle_deadline(&mut self, file: usize, asked: usize, now: Instant) -> Option<usize> {
         let by_file = &self.by_file;
         self.deadline.settle_for(file, asked, |other| {
@@ -953,9 +961,9 @@ impl Streams {
         })
     }
 
-    /// What the LRU would give up first, and how many pieces it is watching
-    /// -- exempting everything in `kept`, which is what no unlink may
-    /// touch: the tiers above it.
+    /// What the LRU would give up first, and how many pieces it is
+    /// watching. Everything in `kept` is exempt: that is what no unlink may
+    /// touch, the tiers above it.
     pub fn coldest_of(
         &self,
         file: usize,
@@ -974,18 +982,18 @@ impl Streams {
     /// this lock.
     ///
     /// **The same handle for the life of the entity**, whether or not a
-    /// pass has described the file yet: a door is meant to keep this and
-    /// ask it per unlink without coming back here, and one handed a fresh
+    /// pass has described the file yet. A door is meant to keep this and
+    /// ask it per unlink without coming back here. A door handed a fresh
     /// empty set before the first pass would refuse nothing for as long as
     /// it held it. So a file asked about before its first pass is made
-    /// here, with the extent the caller knows and the trivial geometry;
-    /// the pass overwrites the geometry and keeps the set.
+    /// here, with the extent the caller knows and the trivial geometry. The
+    /// pass overwrites the geometry and keeps the set.
     ///
-    /// Empty until something is published into it, which is the right
-    /// answer for a file no stream is on.
+    /// It is empty until something is published into it, which is the
+    /// right answer for a file no stream is on.
     ///
-    /// Published under the owner's lock and read at the door with a load
-    /// and a bit test. See [`super::exempt::Exempt::holds`].
+    /// It is published under the owner's lock and read at the door with a
+    /// load and a bit test. See [`super::exempt::Exempt::holds`].
     pub fn exempt(&mut self, file: usize, pieces: u32) -> std::sync::Arc<super::exempt::Exempt> {
         self.by_file
             .entry(file)
@@ -1000,7 +1008,7 @@ impl Streams {
     }
 
     /// How many pieces of `file` its streams are holding, for the trace
-    /// line: the size of the answer the door would be getting.
+    /// line. That is the size of the answer the door would be getting.
     pub fn held_by_streams(&self, file: usize) -> u32 {
         self.by_file
             .get(&file)
@@ -1020,7 +1028,7 @@ impl Streams {
     }
 
     /// Where each stream on `file` has reached, and how many reads took it
-    /// there -- what a field log needs to say whether the two it found are
+    /// there. A field log needs this to say whether the two it found are
     /// the film and a second track, or two halves of the film.
     pub fn heads(&self, file: usize) -> Vec<(u64, u32)> {
         self.by_file
@@ -1039,23 +1047,23 @@ impl Streams {
     /// of it.
     ///
     /// **Shared as equal seconds, never as equal bytes.** Playback is gated
-    /// by the worst track: ninety seconds of subtitles buys nothing while
+    /// by the worst track. Ninety seconds of subtitles buys nothing while
     /// video has two, so the allocation that makes sense is the one that
-    /// maximises the minimum. Equal shares of the *bytes* does the opposite
-    /// -- ten megabytes split between a 3.5 MB/s film and a 20 kB/s second
+    /// maximises the minimum. Equal shares of the *bytes* do the opposite.
+    /// Ten megabytes split between a 3.5 MB/s film and a 20 kB/s second
     /// track gives the film 1.4 seconds and the track four minutes.
     ///
     /// So a single `t` is solved for, such that every stream's rate times
     /// `t` fits the budget, and each is granted `t` seconds. Scaling every
     /// stream's byte target by one factor is the same arithmetic, since
-    /// bytes are rate times time; what must not happen is dividing the
+    /// bytes are rate times time. What must not happen is dividing the
     /// budget into equal parts.
     ///
     /// Then each is floored at [`FLOOR_PIECES`] and grown towards its share
     /// rather than jumped to it ([`Stream::grant`]). The floor is applied
-    /// after the share and not subtracted before it: two pieces on two
+    /// after the share and not subtracted before it. Two pieces on two
     /// streams is sixteen megabytes, and a device with less free space than
-    /// that is not playing video, so it is not a case the allocation has to
+    /// that is not playing video. So it is not a case the allocation has to
     /// be shaped around.
     pub fn want(
         &mut self,
@@ -1066,8 +1074,9 @@ impl Streams {
         now: Instant,
     ) -> Vec<Range<u32>> {
         // The demand of everything being read, so the sharing is over the
-        // entity and not over one file of it. Live streams only: a dormant
-        // one holds no window and takes no share ([`STREAM_DORMANT`]).
+        // entity and not over one file of it. Live streams only, since a
+        // dormant one holds no window and takes no share
+        // ([`STREAM_DORMANT`]).
         let asked: u64 = self
             .by_file
             .values()
@@ -1085,9 +1094,9 @@ impl Streams {
         let mut windows = Vec::new();
         for (idx, streams) in self.by_file.iter_mut() {
             // Granted for the file whose pass this is, and only reported
-            // for the others: a grant is a doubling, one step per pass, and
-            // a window that doubled on every pass of every file would grow
-            // at a rate set by how many files are being read.
+            // for the others. A grant is a doubling, one step per pass. A
+            // window that doubled on every pass of every file would grow at
+            // a rate set by how many files are being read.
             windows.extend(if *idx == file {
                 streams.grant(seconds, piece, share, now)
             } else {
@@ -1100,39 +1109,39 @@ impl Streams {
     /// **The piece the file is being consumed at**: where its busiest
     /// stream has reached, or `None` for a file nothing is reading.
     ///
-    /// Busiest by the bytes its reads have asked for ([`Stream::eaten`]),
-    /// not by its measured rate: a rate is admitted only from a read that
-    /// came back late, so a stream that has measured none is priced at the
-    /// film's own arithmetic and would outrank a viewer measured slower
+    /// Busiest is by the bytes its reads have asked for ([`Stream::eaten`]),
+    /// not by its measured rate. A rate is admitted only from a read that
+    /// came back late. So a stream that has measured none is priced at the
+    /// film's own arithmetic, and would outrank a viewer measured slower
     /// than the film's average. `piece` is the torrent's piece length,
     /// because the answer is a torrent piece and a stream's head is an
     /// offset inside its file.
     ///
-    /// **What this is for is the pass's cadence and its trace line**, and
-    /// not what is kept: a file being read by a viewer and by mpv's index
-    /// crawler has two streams, both of them a player's, and which one is
-    /// the viewer is exactly what a rate says and a range header does not.
-    /// See [`crate::retention::owner::Consumers::at`].
+    /// **This is for the pass's cadence and its trace line**, and not for
+    /// what is kept. A file being read by a viewer and by mpv's index
+    /// crawler has two streams, both of them a player's. Which one is the
+    /// viewer is exactly what a rate says and a range header does not. See
+    /// [`crate::retention::owner::Consumers::at`].
     pub fn busiest(&self, file: usize, piece: u64, now: Instant) -> Option<u32> {
         self.by_file.get(&file)?.busiest(piece, now)
     }
 
-    /// **Whether the viewer's window is still filling** -- the live stream
-    /// that has asked for the most bytes, over every file of the entity,
-    /// had its last grant cut short by the doubling ([`Stream::grant`]).
-    /// `None` for an entity nothing live is reading. Of each file's
-    /// streams only the ones its reading has not moved on from count
-    /// ([`FileStreams::current_viewer`]): after a seek, the stream being
-    /// ramped is the new one, not the one with the longer history.
+    /// **Whether the viewer's window is still filling.** That is, whether
+    /// the live stream that has asked for the most bytes, over every file
+    /// of the entity, had its last grant cut short by the doubling
+    /// ([`Stream::grant`]). It is `None` for an entity nothing live is
+    /// reading. Of each file's streams, only the ones its reading has not
+    /// moved on from count ([`FileStreams::current_viewer`]). After a seek,
+    /// the stream being ramped is the new one, not the one with the longer
+    /// history.
     ///
-    /// What a stall reported by the player is read against: a window
+    /// A stall reported by the player is read against this. A window
     /// reaches what its rate asks for in a handful of passes after an open
-    /// or a seek, and a stall inside that ramp is the window filling, not
-    /// the swarm falling short of a full one. The player cannot tell the
-    /// two apart -- both are its buffering popup after a frame -- and this
-    /// side can, so the count that deepens the split
-    /// ([`super::deadline`]) skips the ramp here rather than by a guessed
-    /// grace period there.
+    /// or a seek. A stall inside that ramp is the window filling, not the
+    /// swarm falling short of a full one. The player cannot tell the two
+    /// apart, since both are its buffering popup after a frame. This side
+    /// can. So the count that deepens the split ([`super::deadline`]) skips
+    /// the ramp here rather than by a guessed grace period there.
     pub fn viewer_filling(&self, now: Instant) -> Option<bool> {
         self.by_file
             .values()
@@ -1145,16 +1154,16 @@ impl Streams {
     /// where it is, what it has been eating, and whether it is still at
     /// it. See [`Reader`].
     ///
-    /// **Less every stream the file's reading has moved on from** -- one
+    /// **Less every stream the file's reading has moved on from**: one
     /// that another stream began after it was last read, the rule
     /// [`FileStreams::current_viewer`] applies. A seek leaves exactly that
-    /// behind: the stream the viewer left keeps its place, the window moves
-    /// with the new one and takes what was ahead of the old, and the old
-    /// one then stands at the end of what is held with nothing in front of
-    /// it -- which is what a *stalled* reader looks like, so the window
-    /// reported the film as about to stop, for as long as the old stream
-    /// was remembered. A crawler beside a viewer is not moved on from: it
-    /// is read again after the viewer began.
+    /// behind. The stream the viewer left keeps its place. The window moves
+    /// with the new one and takes what was ahead of the old. The old one
+    /// then stands at the end of what is held with nothing in front of it,
+    /// which is what a *stalled* reader looks like. So the window reported
+    /// the film as about to stop, for as long as the old stream was
+    /// remembered. A crawler beside a viewer is not moved on from, because
+    /// it is read again after the viewer began.
     pub fn readers(&self, file: usize, now: Instant) -> Vec<Reader> {
         self.by_file
             .get(&file)
@@ -1177,13 +1186,13 @@ impl Streams {
     /// in bytes a second, or `None` for one that has not had two reads far
     /// enough apart to say.
     ///
-    /// Reported beside the raw `consumed`/`gap_ms` of the last sample, not
-    /// instead of them: at this seam a read is at most the 256 KiB the
-    /// response asks for, so a rate could be measuring the socket draining
-    /// while a player fills its buffer rather than the player consuming.
-    /// So nothing is ever sized from this alone: a window is sized from the
-    /// film's own arithmetic, which a measured rate may only lower
-    /// ([`Stream::demand`]).
+    /// It is reported beside the raw `consumed`/`gap_ms` of the last
+    /// sample, not instead of them. At this seam a read is at most the
+    /// 256 KiB the response asks for. So a rate could be measuring the
+    /// socket draining while a player fills its buffer, rather than the
+    /// player consuming. So nothing is ever sized from this alone. A window
+    /// is sized from the film's own arithmetic, which a measured rate may
+    /// only lower ([`Stream::demand`]).
     pub fn rates(&self, file: usize) -> Vec<Option<u64>> {
         self.by_file
             .get(&file)
@@ -1192,21 +1201,21 @@ impl Streams {
     }
 
     /// What the last read of `file`'s newest stream consumed, and over how
-    /// long -- the two halves of a rate sample, reported raw so a reading
-    /// of the field log can check the arithmetic before anything is sized
-    /// from it.
+    /// long. These are the two halves of a rate sample, reported raw so a
+    /// reading of the field log can check the arithmetic before anything is
+    /// sized from it.
     ///
-    /// Deliberately not an average. At this seam one read is at most the
-    /// 256 KiB `ReaderStream` asks for, and within a connection consecutive
-    /// reads are exactly contiguous, so `consumed` is the whole read and
-    /// the gap is however long the socket took -- which is a delivery rate
-    /// while the player is filling its buffer, and its true consumption
-    /// only once that buffer is full and TCP backpressure sets the pace.
-    /// Which of the two a number is, is what [`Stream::sample`] settles:
-    /// most of them are delivery, so a sample is refused unless the player
-    /// came back later than the picture it was carrying, and what survives
-    /// may only ever lower the film's own arithmetic. These two halves stay
-    /// raw so a field log can be read against the window a pass sized.
+    /// It is deliberately not an average. At this seam one read is at most
+    /// the 256 KiB `ReaderStream` asks for. Within a connection,
+    /// consecutive reads are exactly contiguous. So `consumed` is the whole
+    /// read and the gap is however long the socket took. That is a delivery
+    /// rate while the player is filling its buffer. It is its true
+    /// consumption only once that buffer is full and TCP backpressure sets
+    /// the pace. [`Stream::sample`] settles which of the two a number is.
+    /// Most of them are delivery, so a sample is refused unless the player
+    /// came back later than the picture it was carrying. What survives may
+    /// only ever lower the film's own arithmetic. These two halves stay raw
+    /// so a field log can be read against the window a pass sized.
     pub fn last_sample(&self, file: usize) -> Option<(u64, std::time::Duration)> {
         self.by_file.get(&file)?.streams.last()?.sampled
     }
@@ -1215,8 +1224,8 @@ impl Streams {
     /// since the last pass against `held`, the pass's reading of the disk,
     /// and say what `at`'s consumers are asking of it. The torrent, the
     /// proxy and the scenarios' fake all run this, each over its own unit
-    /// (a piece, a chunk) and its own lock; what differs between them --
-    /// the torrent's split depth, the fake's hooks -- stays in the backing.
+    /// (a piece, a chunk) and its own lock. What differs between them (the
+    /// torrent's split depth, the fake's hooks) stays in the backing.
     ///
     /// `trace_as` names the entity in the periodic `streams_seen` report,
     /// or `None` for a caller that reports nothing.
@@ -1233,35 +1242,36 @@ impl Streams {
         //
         // [`Asking::allowance`]: super::owner::Asking::allowance
         let available = asking.allowance(at.piece, held.len());
-        // Where this file lies, first: a read carries an offset inside its
+        // Where this file lies, first. A read carries an offset inside its
         // own file, and every question the detector answers is about
-        // pieces of the entity. Stated every pass, even for the proxy's
-        // trivial geometry, because every offset is converted through it.
+        // pieces of the entity. It is stated every pass, even for the
+        // proxy's trivial geometry, because every offset is converted
+        // through it.
         self.domain(at.file, at.offset, at.extent.clone(), asking.ceiling);
         let rejected = self.observe(at.file, held, at.piece, now);
         // **What the consumers are asking for, which is what this pass
-        // orders.** Every pass, and not only the ones that report: a
-        // window grows towards what its rate asks for by doubling, one step
-        // per grant, so grants that happened only when a log line was due
-        // would tie how fast a consumer is fetched for to how often this
-        // server talks about it.
+        // orders.** This runs every pass, and not only the ones that
+        // report. A window grows towards what its rate asks for by
+        // doubling, one step per grant. Grants that happened only when a
+        // log line was due would tie how fast a consumer is fetched for to
+        // how often this server talks about it.
         let want = self.want(at.file, asking.seconds, available, at.piece, now);
         let exempt = self.exempt(at.file, at.extent.end);
         // **What may not be unlinked is published here**, where the want
-        // set is decided: the pass's own holdings -- every promise and
-        // every open stream's lookahead -- with what the consumers are
+        // set is decided. It is the pass's own holdings (every promise and
+        // every open stream's lookahead), with what the consumers are
         // asking for, and the committed set, which is on the disk whatever
-        // is asked for. The same set is what the coldest are chosen
-        // against, because a reclaim chosen against a smaller one frees
-        // nothing: the door refuses what this publishes.
+        // is asked for. The coldest are chosen against the same set. A
+        // reclaim chosen against a smaller one frees nothing, because the
+        // door refuses what this publishes.
         let mut kept = want.clone();
         kept.extend(asking.holding.iter().cloned());
         kept.extend(asking.committed.iter().cloned());
         exempt.publish(&kept);
         // **What must go, and no more.** The disk that nothing else needs
-        // is scrub-back: giving it up before something asks for the room
+        // is scrub-back. Giving it up before something asks for the room
         // buys nothing and costs a re-fetch. So the reclaim is the overhang
-        // over what the disk may hold, taken coldest first -- over the
+        // over what the disk may hold, taken coldest first. It is over the
         // disk's line, not the windows' allowance, which has the committed
         // set taken off already ([`Asking::overhang`]).
         //
@@ -1269,8 +1279,8 @@ impl Streams {
         let over = asking.overhang(at.piece, held.len());
         let how_many = usize::try_from(over.div_ceil(at.piece.max(1))).unwrap_or(0);
         let (tracked, reclaim) = self.coldest_of(at.file, now, &kept, how_many);
-        // Who, among this file's readers, the viewer is; see
-        // [`super::owner::Consumers::at`].
+        // Who, among this file's readers, the viewer is (see
+        // [`super::owner::Consumers::at`]).
         let viewer = self.busiest(at.file, at.piece, now);
         if let Some(entity) = trace_as
             && self.report_due(now)
@@ -1370,8 +1380,8 @@ mod tests {
     /// The numbers are a real reopen from the field: a stream served to
     /// 6,149,382,662 and a connection resuming 3.1 MB behind it, whose
     /// first read ends well short of where the old one got to. Three
-    /// earlier rules each judged that distance and each was wrong about it;
-    /// this one does not judge it at all, it asks whether the bytes in
+    /// earlier rules each judged that distance and each was wrong about it.
+    /// This one does not judge it at all. It asks whether the bytes in
     /// between are there.
     #[test]
     fn a_reopen_behind_our_send_position_continues_the_stream() {
@@ -1392,7 +1402,7 @@ mod tests {
         assert_eq!(streams.streams.len(), 1);
     }
 
-    /// **A file keeps [`STREAMS_PER_FILE`] streams**: a new one displaces
+    /// **A file keeps [`STREAMS_PER_FILE`] streams.** A new one displaces
     /// the dormant stream read longest ago, and never a live one.
     #[test]
     fn a_new_stream_displaces_the_dormant_one_read_longest_ago() {
@@ -1430,12 +1440,12 @@ mod tests {
     /// consumer.**
     ///
     /// A proxied response reports every chunk as it goes past, and a chunk
-    /// enters the listing only once it is whole, so read after read begins
+    /// enters the listing only once it is whole. So read after read begins
     /// in a piece no listing holds. Under the run rule alone each of them
-    /// started a stream of its own: one 16 MiB play-through was counted as
+    /// started a stream of its own. One 16 MiB play-through was counted as
     /// thirty-two consumers, each granted its [`FLOOR_PIECES`] of window
     /// that no unlink may touch. Their floors together came to more than
-    /// the whole allowance, so the pass computed an overhang and was
+    /// the whole allowance. So the pass computed an overhang and was
     /// forbidden to take any of it, and the cache settled over its cap.
     #[test]
     fn a_response_reading_on_past_what_the_disk_holds_is_one_stream() {
@@ -1478,10 +1488,10 @@ mod tests {
     /// own**, and a read past a hole is still a seek.
     ///
     /// The continuation rule is one reader's alone. Two bodies reading the
-    /// same unheld stretch are what the run rule exists to tell apart, and
-    /// a rule that merged them on the offsets would be the guess-a-distance
+    /// same unheld stretch are what the run rule exists to tell apart. A
+    /// rule that merged them on the offsets would be the guess-a-distance
     /// rule the run rule replaced. The same holds within one body across a
-    /// hole: the read after a seek continues nothing, so it is a consumer
+    /// hole. The read after a seek continues nothing, so it is a consumer
     /// of its own and is fetched for as one.
     #[test]
     fn a_second_response_on_bytes_the_disk_lacks_is_a_stream_of_its_own() {
@@ -1512,11 +1522,11 @@ mod tests {
     /// player's.**
     ///
     /// mpv keeps a second reader crawling the container's index for as long
-    /// as a film is open, reopening about once a second; one measured
-    /// session had it take 39 kB an open against the viewer's tens of
-    /// megabytes, and both arrive as `Range: bytes=X-` over the same file.
-    /// The crawler is the *newest* reader most of the time and the
-    /// *longest-lived* stream some of the time, so neither recency nor age
+    /// as a film is open, reopening about once a second. In one measured
+    /// session it took 39 kB an open against the viewer's tens of
+    /// megabytes. Both arrive as `Range: bytes=X-` over the same file. The
+    /// crawler is the *newest* reader most of the time and the
+    /// *longest-lived* stream some of the time. So neither recency nor age
     /// can be asked. Bytes eaten can.
     #[test]
     fn the_busiest_stream_is_the_one_that_has_eaten_the_most() {
@@ -1541,7 +1551,7 @@ mod tests {
             "the newest reader is at the tail; the one eating the file is not"
         );
 
-        // And it follows the bytes rather than the order: let the crawler
+        // It follows the bytes rather than the order. Let the crawler
         // outgrow the viewer and it becomes the answer.
         for step in 0..200u64 {
             let from = tail + 39_316 + step * 262_144;
@@ -1560,14 +1570,15 @@ mod tests {
     /// thing that does.
     ///
     /// The same two reads, on a disk an eviction has broken between them.
-    /// Nothing about the consumer changed; what changed is what was kept,
+    /// Nothing about the consumer changed. What changed is what was kept,
     /// and that is the whole of the rule. It is also why a big cache
-    /// behaves better than a small one with no number anywhere: more room
-    /// means longer runs means a scrub back is still the same viewer.
+    /// behaves better than a small one with no number anywhere. More room
+    /// means longer runs, and longer runs mean a scrub back is still the
+    /// same viewer.
     #[test]
     fn a_hole_between_two_reads_makes_them_two_consumers() {
         let t0 = Instant::now();
-        // The reads are in pieces 1466 and 1465; the eviction took 1465
+        // The reads are in pieces 1466 and 1465. The eviction took 1465
         // itself, which is both the hole and where the reopen lands.
         let held = disk(&[1_460..1_465, 1_466..1_470]);
         let mut streams = file_at(0);
@@ -1584,12 +1595,12 @@ mod tests {
     /// **A consumer stuck on a missing piece is one stream, not one per
     /// retry.**
     ///
-    /// Every read ends at the same byte -- the boundary of the piece it is
-    /// blocked on -- while its start creeps forward a few dozen bytes an
+    /// Every read ends at the same byte (the boundary of the piece it is
+    /// blocked on), while its start creeps forward a few dozen bytes an
     /// attempt. The field showed twenty streams there, all ending at
-    /// 23,320,330,240. What the rule looks up is where a read *began*,
-    /// which is in the run; where it ended is the first byte it does not
-    /// have, which is in no run by definition.
+    /// 23,320,330,240. The rule looks up where a read *began*, which is in
+    /// the run. Where it ended is the first byte it does not have, which is
+    /// in no run by definition.
     #[test]
     fn a_consumer_retrying_a_blocked_piece_stays_one_stream() {
         let t0 = Instant::now();
@@ -1619,7 +1630,7 @@ mod tests {
         assert_eq!(streams.streams[0].reads, 4);
     }
 
-    /// **Two tracks are two streams**, and need no clause of their own: the
+    /// **Two tracks are two streams**, and need no clause of their own. The
     /// film's run and the second track's are different runs.
     #[test]
     fn a_second_track_in_another_run_is_its_own_stream() {
@@ -1636,7 +1647,7 @@ mod tests {
         assert_eq!(streams.streams.len(), 2, "two tracks, two streams");
     }
 
-    /// A read into territory the disk does not hold is a new consumer: it
+    /// A read into territory the disk does not hold is a new consumer. It
     /// is in no run, so it is in no stream, and something has to fetch for
     /// it.
     #[test]
@@ -1653,8 +1664,8 @@ mod tests {
         assert_eq!(streams.streams.len(), 2);
     }
 
-    /// Reads within one connection are exactly contiguous -- `ReadCursor`
-    /// advances by what each delivered -- and all inside one run.
+    /// Reads within one connection are exactly contiguous (`ReadCursor`
+    /// advances by what each delivered), and all inside one run.
     #[test]
     fn consecutive_reads_of_one_connection_are_one_stream() {
         let t0 = Instant::now();
@@ -1680,8 +1691,9 @@ mod tests {
     /// back for more.**
     ///
     /// The numbers are a real reopen from the field: 21,757,952 bytes
-    /// served, a resume 3,383,897 behind our send position, so 18,374,055
-    /// actually eaten. Crediting the whole read would overstate it by 18%.
+    /// served, and a resume 3,383,897 behind our send position, so
+    /// 18,374,055 actually eaten. Crediting the whole read would overstate
+    /// it by 18%.
     #[test]
     fn the_rate_credits_what_was_eaten_and_not_what_was_sent() {
         let t0 = Instant::now();
@@ -1724,13 +1736,13 @@ mod tests {
     /// **A player that comes back sooner than the picture it was given is
     /// catching up, and says nothing about how fast it plays.**
     ///
-    /// The numbers are the field's: 262,144 bytes -- one read -- of a film
-    /// at 3,568,061 bytes a second, which is 73 milliseconds of picture,
+    /// The numbers are the field's: 262,144 bytes (one read) of a film at
+    /// 3,568,061 bytes a second, which is 73 milliseconds of picture,
     /// returned after a gap the log printed as `gap_ms=0`. Taken as a
-    /// measurement that is 5.5 gigabytes a second, and the want set it
-    /// produced was the whole film: `want=[0..5567] exempt=5567`. A starving
-    /// player asks again the instant we answer, so the gap measures our
-    /// delivery; consumption is only observable once we are keeping up.
+    /// measurement that is 5.5 gigabytes a second. The want set it produced
+    /// was the whole film: `want=[0..5567] exempt=5567`. A starving player
+    /// asks again the instant we answer, so the gap measures our delivery.
+    /// Consumption is only observable once we are keeping up.
     #[test]
     fn a_read_returned_sooner_than_its_own_picture_is_not_a_measurement() {
         let t0 = Instant::now();
@@ -1762,8 +1774,8 @@ mod tests {
     /// waited, so the gap is the consumer's own.
     ///
     /// **Which is the only thing a measurement can honestly say: slower.**
-    /// By construction it cannot say faster -- the gap that admits a sample
-    /// is the gap that bounds it -- and that is the useful direction: a
+    /// By construction it cannot say faster, because the gap that admits a
+    /// sample is the gap that bounds it. That is the useful direction. A
     /// subtitle track at twenty kilobytes a second is what the disk
     /// allocation has to tell apart from the film.
     #[test]
@@ -1774,7 +1786,7 @@ mod tests {
         let mut streams = film_at(ceiling);
 
         streams.observe(1, read(0, 262_144, t0, 0), &held, PIECE);
-        // A second later: this consumer ate 262,144 bytes in that second,
+        // A second later. This consumer ate 262,144 bytes in that second,
         // which is a fourteenth of the film's rate.
         streams.observe(
             1,
@@ -1790,9 +1802,9 @@ mod tests {
 
         // **One sample moves the rate; it does not set it.** The rate is
         // seeded from the film's arithmetic, which is where `demand` has
-        // this stream anyway while `rate` is `None`, so an admitted sample
-        // is a correction to that and not a replacement of it -- an eighth
-        // of the way, one part in `RATE_SMOOTHING`, here.
+        // this stream anyway while `rate` is `None`. So an admitted sample
+        // is a correction to that and not a replacement of it: an eighth of
+        // the way, one part in `RATE_SMOOTHING`, here.
         let once = streams.streams[0]
             .rate
             .expect("a real gap is a measurement");
@@ -1802,7 +1814,7 @@ mod tests {
         );
         assert!(once < ceiling, "and a measurement can only say slower");
 
-        // And it keeps saying it: the same consumer, measured again and
+        // And it keeps saying it. The same consumer, measured again and
         // again, converges on what it is really eating.
         for second in 2..60u64 {
             streams.observe(
@@ -1826,7 +1838,7 @@ mod tests {
     }
 
     /// **A stream nothing has measured is fetched at the film's own
-    /// bitrate**, which is arithmetic and not a guess: size over duration
+    /// bitrate**, which is arithmetic and not a guess. Size over duration
     /// is exact at the first report and no read pattern can distort it.
     ///
     /// A playhead that has never once been kept up with is exactly the
@@ -1841,8 +1853,8 @@ mod tests {
         streams.streams[0].rate = None;
         streams.streams[0].window = 0;
 
-        // Five passes of doubling from the floor, with a read between each:
-        // a window grows for a consumer that is consuming.
+        // Five passes of doubling from the floor, with a read between each.
+        // A window grows for a consumer that is consuming.
         for step in 0..5u64 {
             streams.streams[0].seen = at(t0, step + 1);
             want(&mut streams, 90, u64::MAX, PIECE, t0);
@@ -1862,8 +1874,9 @@ mod tests {
         let t0 = Instant::now();
         let ceiling = 3_568_061;
         let mut streams = film_at(ceiling);
-        // A track at a fifth of a megabyte a second: above the demand
-        // floor, so what it is granted is its own rate and not the floor.
+        // A track at a fifth of a megabyte a second. That is above the
+        // demand floor, so what it is granted is its own rate and not the
+        // floor.
         stream_at(&mut streams, 100, 200_000, t0);
 
         want(&mut streams, 90, u64::MAX, PIECE, t0);
@@ -1878,9 +1891,9 @@ mod tests {
     /// **A rate measured before the film stated its length is still bound
     /// by it once it does.**
     ///
-    /// Not hypothetical: the duration arrives from the app after playback
-    /// starts, so the first reads of every session are measured with no
-    /// ceiling to refuse them -- and those are exactly the reads of a
+    /// This is not hypothetical. The duration arrives from the app after
+    /// playback starts, so the first reads of every session are measured
+    /// with no ceiling to refuse them. Those are exactly the reads of a
     /// player that has nothing buffered. The field measured 5.5 gigabytes a
     /// second that way.
     #[test]
@@ -1922,17 +1935,17 @@ mod tests {
     /// The trace prints `consumed` and `gap_ms` as the two halves of the
     /// last rate sample, so a reading of the field log can check the
     /// arithmetic. What it printed was the last read's size beside how long
-    /// *we* took to serve it -- `returned - arrived`, the one pairing the
-    /// `Read` doc rules out, since it books a stall on a missing piece as
-    /// the consumer thinking. The sample is the previous read's bytes over
-    /// the gap from its return to the next read's arrival.
+    /// *we* took to serve it: `returned - arrived`. That is the one pairing
+    /// the `Read` doc rules out, since it books a stall on a missing piece
+    /// as the consumer thinking. The sample is the previous read's bytes
+    /// over the gap from its return to the next read's arrival.
     #[test]
     fn the_last_sample_is_what_the_rate_was_made_from() {
         let t0 = Instant::now();
         let held = run(0..8);
         let mut streams = file_at(0);
         let ms = |n: u64| t0 + Duration::from_millis(n);
-        // Served in 300 ms; the consumer came back 700 ms after that.
+        // Served in 300 ms. The consumer came back 700 ms after that.
         streams.observe(
             1,
             Read {
@@ -1965,12 +1978,13 @@ mod tests {
 
     /// A sample that measures nothing is refused rather than folded in.
     ///
-    /// Two shapes of nothing. A gap of zero divides by it -- and `inf as
-    /// u64` saturates to `u64::MAX` in Rust, which would read as a real
-    /// measurement rather than an error. And a read that consumed nothing
-    /// is a reopen landing behind or a re-read of ground already served: it
-    /// says where the consumer is, not how fast it is going, and folded in
-    /// as a zero it would drag the rate to the floor on every seek.
+    /// There are two shapes of nothing. A gap of zero divides by it, and
+    /// `inf as u64` saturates to `u64::MAX` in Rust, which would read as a
+    /// real measurement rather than an error. And a read that consumed
+    /// nothing is a reopen landing behind, or a re-read of ground already
+    /// served. It says where the consumer is, not how fast it is going.
+    /// Folded in as a zero, it would drag the rate to the floor on every
+    /// seek.
     #[test]
     fn a_sample_that_measures_nothing_is_refused() {
         let t0 = Instant::now();
@@ -1978,12 +1992,12 @@ mod tests {
         let mut streams = file_at(0);
 
         streams.observe(1, read(0, 262_144, t0, 0), &held, PIECE);
-        // Same instant: no time passed.
+        // Same instant, so no time passed.
         streams.observe(1, read(262_144, 524_288, t0, 0), &held, PIECE);
         assert_eq!(streams.streams[0].rate, None, "a gap of zero says nothing");
 
         // A second later, but landing entirely behind what the last read
-        // served: nothing was consumed.
+        // served, so nothing was consumed.
         streams.observe(1, read(0, 262_144, t0, 1), &held, PIECE);
         assert_eq!(
             streams.streams[0].rate, None,
@@ -1991,9 +2005,9 @@ mod tests {
         );
     }
 
-    /// One file's share of its own demand: what [`Streams::want`] does when
-    /// the entity is one file, which is every test below that builds a
-    /// [`FileStreams`] directly.
+    /// One file's share of its own demand. This is what [`Streams::want`]
+    /// does when the entity is one file, which is every test below that
+    /// builds a [`FileStreams`] directly.
     fn want(
         streams: &mut FileStreams,
         seconds: u64,
@@ -2017,7 +2031,7 @@ mod tests {
     }
 
     /// Put a stream on `streams` at `piece` with a measured rate, without
-    /// driving reads through it -- the want set is being tested here, not
+    /// driving reads through it. The want set is being tested here, not
     /// the detector.
     fn stream_at(streams: &mut FileStreams, piece: u32, rate: u64, t0: Instant) {
         streams.streams.push(Stream {
@@ -2041,9 +2055,9 @@ mod tests {
     /// the file.
     ///
     /// The old arithmetic would place this window a hundred pieces in,
-    /// outside the file's own bound, where the clamp then drags it to the
-    /// file's first piece -- fetching the head of the episode over and over
-    /// while the viewer is an hour into it.
+    /// outside the file's own bound. The clamp then drags it to the file's
+    /// first piece, fetching the head of the episode over and over while
+    /// the viewer is an hour into it.
     #[test]
     fn a_window_covers_the_torrent_pieces_the_stream_is_actually_in() {
         let t0 = Instant::now();
@@ -2063,10 +2077,11 @@ mod tests {
     /// equal bytes.**
     ///
     /// Playback is gated by the worst track, so the allocation that makes
-    /// sense maximises the minimum. Equal shares of the bytes does the
-    /// opposite: the film and a second track at a hundred and seventy-five
-    /// times its rate, given half the disk each, leaves the film with a
-    /// fraction of a second and the track with minutes it will never use.
+    /// sense maximises the minimum. Equal shares of the bytes do the
+    /// opposite. Take the film and a second track at a hundred and
+    /// seventy-five times its rate, given half the disk each. That leaves
+    /// the film with a fraction of a second and the track with minutes it
+    /// will never use.
     #[test]
     fn a_short_disk_is_shared_as_seconds_and_not_as_bytes() {
         let t0 = Instant::now();
@@ -2083,8 +2098,9 @@ mod tests {
         let track = u64::from(windows[1].end - windows[1].start);
         // Equal seconds means the windows are in the ratio of the rates,
         // 3.5 to 1. Equal bytes would have made them the same size, which
-        // is 1 to 1 -- the shape that gives a film a second and a half of
-        // lookahead while a subtitle track sits on four minutes of it.
+        // is 1 to 1. That is the shape that gives a film a second and a
+        // half of lookahead while a subtitle track sits on four minutes of
+        // it.
         assert!(
             film > track * 3 && film < track * 4,
             "the windows are not in the ratio of the rates: {film} against {track}"
@@ -2107,11 +2123,11 @@ mod tests {
     /// each file.**
     ///
     /// A season pack plays one episode while a second track of it is read
-    /// from another file; a film plays while its subtitles are fetched from
+    /// from another file. A film plays while its subtitles are fetched from
     /// a sibling. If each file scaled its own demand against the whole
     /// allowance, two files being read would together be promised twice the
-    /// disk there is -- and the shares would not be equal seconds either,
-    /// which is the one thing the sharing exists to be.
+    /// disk there is. The shares would not be equal seconds either, which
+    /// is the one thing the sharing exists to be.
     #[test]
     fn the_allowance_is_shared_across_the_files_being_read() {
         let t0 = Instant::now();
@@ -2138,9 +2154,9 @@ mod tests {
     /// **Under the `Maximum` profile the shares are still equal seconds.**
     ///
     /// `Maximum` asks for the whole file, and for a while it was `u64::MAX`
-    /// seconds: every stream's demand saturated to `u64::MAX`, the scaling
+    /// seconds. Every stream's demand saturated to `u64::MAX`, the scaling
     /// factor came out as one, and each stream of the entity was granted
-    /// the whole allowance on its own -- two files being read together were
+    /// the whole allowance on its own. Two files being read together were
     /// promised twice the disk there is. A day is longer than any film and
     /// leaves the arithmetic intact.
     #[test]
@@ -2186,7 +2202,7 @@ mod tests {
         stream_on(&mut streams, 1, 2_783, 100, 3_500_000, t0);
         let held = run(0..PIECES);
 
-        // A minute on, a pass for file 1: nothing has read either file.
+        // A minute on, a pass for file 1. Nothing has read either file.
         let later = t0 + Duration::from_secs(60);
         streams.observe(1, &held, PIECE, later);
         let windows = streams.want(1, 90, u64::MAX, PIECE, later);
@@ -2200,9 +2216,9 @@ mod tests {
             "and it is kept, for the read that comes back to it"
         );
 
-        // File 1 is read again: its stream is live, file 0's is dormant,
-        // and the dormant one takes no share of an allowance that fits
-        // exactly one stream's sixty seconds.
+        // File 1 is read again. Its stream is live and file 0's is dormant.
+        // The dormant one takes no share of an allowance that fits exactly
+        // one stream's sixty seconds.
         streams.by_file.get_mut(&1).unwrap().streams[0].seen = later;
         let windows = streams.want(1, 60, 3_500_000 * 60, PIECE, later);
         let width: u64 = windows.iter().map(|w| u64::from(w.end - w.start)).sum();
@@ -2242,8 +2258,8 @@ mod tests {
     /// **A window doubles on its own file's pass, and on nobody else's.**
     ///
     /// The grant is one doubling per pass, and the passes of one entity are
-    /// per file: a window that grew on every pass of every file would reach
-    /// its full lookahead at a rate set by how many files are being read
+    /// per file. A window that grew on every pass of every file would reach
+    /// its full lookahead at a rate set by how many files are being read,
     /// rather than by how fast its own consumer is going.
     #[test]
     fn a_pass_of_one_file_does_not_grow_another_files_window() {
@@ -2272,10 +2288,10 @@ mod tests {
 
     /// **A stream is filling until a grant reaches what it asked for, and
     /// the viewer is the one whose filling the entity reports.** Nothing
-    /// granted is filling; a grant the doubling cut short is filling; a
-    /// grant that reached the target is not. Between two files the one
-    /// whose live stream has asked for the most bytes answers, and an
-    /// entity with no live stream answers nothing.
+    /// granted is filling. A grant the doubling cut short is filling. A
+    /// grant that reached the target is not. Between two files, the one
+    /// whose live stream has asked for the most bytes answers. An entity
+    /// with no live stream answers nothing.
     #[test]
     fn the_viewers_window_is_filling_until_a_grant_reaches_its_target() {
         let t0 = Instant::now();
@@ -2349,8 +2365,8 @@ mod tests {
     }
 
     /// **A listing's runs answer what walking the listing answered.** The
-    /// runs are cut once per pass so a read's run is a binary search, not
-    /// a walk the length of a fully cached film; the answer must be the
+    /// runs are cut once per pass, so a read's run is a binary search, not
+    /// a walk the length of a fully cached film. The answer must be the
     /// walk's, at every piece and every bound, gaps and edges included.
     #[test]
     fn a_listings_runs_answer_what_walking_it_answered() {
@@ -2386,10 +2402,10 @@ mod tests {
     }
 
     /// **Granting publishes nothing.** The backing publishes what may not
-    /// be unlinked -- windows, promises, lookaheads and the committed set
-    /// together -- once it has all of them. A grant that published its
-    /// windows alone first cleared the rest for the moment between, and a
-    /// door asked then let a parked read's piece go.
+    /// be unlinked (windows, promises, lookaheads and the committed set
+    /// together) once it has all of them. A grant that published its
+    /// windows alone first cleared the rest for the moment between. A door
+    /// asked then let a parked read's piece go.
     #[test]
     fn a_grant_leaves_what_the_backing_published_standing() {
         let t0 = Instant::now();
@@ -2408,8 +2424,8 @@ mod tests {
 
     /// **After a seek within one file, the window filling is the new
     /// stream's.** The stream the viewer left stays live for
-    /// [`STREAM_DORMANT`] and has eaten far more, so by bytes alone it was
-    /// the viewer for half a minute after every seek, its full window said
+    /// [`STREAM_DORMANT`] and has eaten far more. So by bytes alone it was
+    /// the viewer for half a minute after every seek. Its full window said
     /// "not filling", and a stall during the new stream's ramp was counted
     /// against the swarm. A crawler that began before the viewer's latest
     /// read does not take the viewer's place.
@@ -2425,7 +2441,7 @@ mod tests {
         file.streams[0].eaten = 500 * PIECE;
         file.streams[0].seen = t0 + Duration::from_secs(10);
         // The crawler at the tail, opened after the film and read now and
-        // then; nothing granted it a window worth having yet.
+        // then. Nothing granted it a window worth having yet.
         file.streams[2].began = t0 + Duration::from_secs(1);
         file.streams[2].eaten = PIECE / 100;
         file.streams[2].seen = t0 + Duration::from_secs(11);
@@ -2451,12 +2467,12 @@ mod tests {
     }
 
     /// **After a seek, the stream the viewer left is nobody's reader.**
-    /// It stays in the file's list for [`STREAM_DORMANT`]. Handed to the
-    /// cache window with the rest instead, it would stand at the end of
-    /// what is held with nothing in front of it once the window moves with
-    /// the new stream and takes what was ahead of the old one -- a stalled
-    /// reader, reported as the film about to stop. A crawler read again
-    /// after the seek is still a reader.
+    /// It stays in the file's list for [`STREAM_DORMANT`]. Suppose it were
+    /// handed to the cache window with the rest. Once the window moves with
+    /// the new stream and takes what was ahead of the old one, it would
+    /// stand at the end of what is held with nothing in front of it. That
+    /// is a stalled reader, reported as the film about to stop. A crawler
+    /// read again after the seek is still a reader.
     #[test]
     fn after_a_seek_the_readers_are_the_streams_still_being_read() {
         let t0 = Instant::now();
@@ -2464,7 +2480,8 @@ mod tests {
         stream_on(&mut streams, 0, 0, 100, 3_500_000, t0);
         stream_on(&mut streams, 0, 0, 4_000, 3_500_000, t0);
         let file = streams.by_file.get_mut(&0).unwrap();
-        // The film, last read before the seek; the new stream, begun after.
+        // The film, last read before the seek, and the new stream, begun
+        // after.
         file.streams[0].seen = t0 + Duration::from_secs(10);
         file.streams[1].began = t0 + Duration::from_secs(12);
         file.streams[1].seen = t0 + Duration::from_secs(13);
@@ -2478,7 +2495,7 @@ mod tests {
         );
 
         // What the window makes of them: the disk round the new stream is
-        // held, the old one's read-ahead went with the seek.
+        // held, and the old one's read-ahead went with the seek.
         let held = 3_999..4_010u32;
         let heads = readers.iter().map(|reader| {
             let piece = u32::try_from(reader.at / PIECE).unwrap();
@@ -2516,11 +2533,11 @@ mod tests {
     /// **A window grows towards what the rate asks for; it never jumps to
     /// it.**
     ///
-    /// A consumer that reads once and stops -- a container index, a probe,
-    /// anything that opens and closes -- would otherwise be handed a film's
+    /// A consumer that reads once and stops (a container index, a probe,
+    /// anything that opens and closes) would otherwise be handed a film's
     /// worth of lookahead off a single sample. That is the build that
     /// fetched 1.6 GB to play 100 MB. Doubling costs a real consumer
-    /// nothing: the grant is one doubling per pass of its file, and it
+    /// nothing. The grant is one doubling per pass of its file, and it
     /// reaches a full window in six of them.
     #[test]
     fn a_window_doubles_towards_its_target_rather_than_jumping_to_it() {
@@ -2555,12 +2572,12 @@ mod tests {
 
     /// **A stream nothing has read from goes dormant, and stays.**
     ///
-    /// It is not expired: a stream lives with its entity, like the torrent
+    /// It is not expired. A stream lives with its entity, like the torrent
     /// does, and a resumed read rejoins it. What idleness takes is its
-    /// standing -- no window, no share, not the head -- so its pieces are
-    /// the LRU's like everything else. A paused viewer's pieces stay for
-    /// as long as nothing colder needs the room, and a seek's abandoned
-    /// stream pins nothing.
+    /// standing (no window, no share, not the head), so its pieces are the
+    /// LRU's like everything else. A paused viewer's pieces stay for as
+    /// long as nothing colder needs the room, and a seek's abandoned stream
+    /// pins nothing.
     #[test]
     fn a_stream_nothing_has_read_from_goes_dormant_and_stays() {
         let t0 = Instant::now();
@@ -2605,7 +2622,8 @@ mod tests {
             "and is not where the file is being consumed"
         );
 
-        // Reading from it again wakes it: the same stream, not a new one.
+        // Reading from it again wakes it. It is the same stream, not a new
+        // one.
         assert_eq!(
             streams.observe(2, read(8_388_870_144, 8_389_132_288, t0, 60), &held, PIECE),
             None,
@@ -2618,11 +2636,11 @@ mod tests {
     /// position.**
     ///
     /// On a fully held film every piece is one run, so mpv's index crawl
-    /// at the tail joins the viewer's stream -- rightly, membership is the
-    /// held run. The position is a byte-weighted average of where reads
-    /// end ([`Stream::place`]): the viewer's 256 KiB reads carry it and
-    /// the crawler's 91 bytes do not, so the window and the head stay
-    /// with the viewer.
+    /// at the tail joins the viewer's stream. That is right, since
+    /// membership is the held run. The position is a byte-weighted average
+    /// of where reads end ([`Stream::place`]). The viewer's 256 KiB reads
+    /// carry it and the crawler's 91 bytes do not, so the window and the
+    /// head stay with the viewer.
     #[test]
     fn a_crawlers_read_at_the_tail_does_not_move_the_viewers_position() {
         let t0 = Instant::now();
@@ -2657,10 +2675,10 @@ mod tests {
 
     /// **A seek inside held bytes converges over a handful of reads.**
     ///
-    /// Gradual, because the bytes under the new position are held -- that
-    /// is why the read joined this stream -- so nothing is waiting on the
-    /// window getting there. Two dozen 256 KiB reads, under two seconds of
-    /// playback, bring a four-hundred-megabyte seek within a couple of
+    /// It is gradual, because the bytes under the new position are held.
+    /// That is why the read joined this stream. So nothing is waiting on
+    /// the window getting there. Two dozen 256 KiB reads, under two seconds
+    /// of playback, bring a four-hundred-megabyte seek within a couple of
     /// mebibytes.
     #[test]
     fn a_seek_inside_held_bytes_converges_over_a_few_reads() {
@@ -2691,9 +2709,9 @@ mod tests {
     /// **A read about to run out of held bytes places the position at
     /// once.**
     ///
-    /// The window is drawn from the position, and where the next pieces
-    /// are missing the window is what fetches them: a position lagging a
-    /// seek would draw it short of the reads and the viewer would wait on
+    /// The window is drawn from the position. Where the next pieces are
+    /// missing, the window is what fetches them. A position lagging a seek
+    /// would draw it short of the reads, and the viewer would wait on
     /// pieces nothing was asking for.
     #[test]
     fn a_read_about_to_run_out_of_held_bytes_places_the_position_at_once() {
@@ -2712,7 +2730,7 @@ mod tests {
     }
 
     /// The report is throttled on the detector's own clock, not a global
-    /// one: a test must drive it without sleeping, and two entities
+    /// one. A test must drive it without sleeping, and two entities
     /// reporting must not silence each other.
     #[test]
     fn a_report_waits_for_its_interval() {
@@ -2736,7 +2754,7 @@ mod tests {
     /// disk holds its first run and nothing else. A detector that divided
     /// the offset by the piece length would look up piece 0, find nothing
     /// held there, and report every read of the episode as a consumer of
-    /// its own -- which is the whole detector failing, silently, on every
+    /// its own. That is the whole detector failing, silently, on every
     /// torrent whose file does not start at zero.
     #[test]
     fn a_read_is_looked_up_at_the_piece_the_torrent_holds_it_in() {
@@ -2762,10 +2780,10 @@ mod tests {
     /// A read served before its file's first pass waits for it rather than
     /// being answered with whatever geometry is to hand.
     ///
-    /// Nothing but the pass knows where a file lies, and the read path runs
-    /// first: a read taken on another file's geometry asks about a stretch
-    /// of disk tens of thousands of pieces from the one it was in. Kept,
-    /// because the answer is a pass away and the read is still true.
+    /// Only the pass knows where a file lies, and the read path runs first.
+    /// A read taken on another file's geometry asks about a stretch of disk
+    /// tens of thousands of pieces from the one it was in. The read is
+    /// kept, because the answer is a pass away and the read is still true.
     #[test]
     fn a_read_of_a_file_no_pass_has_described_waits_for_one() {
         let t0 = Instant::now();
@@ -2820,10 +2838,10 @@ mod tests {
     }
 
     /// **What a pass grants is what the door is told**, and the telling
-    /// costs the door nothing: the set the pass published is read with a
-    /// load and a bit test, against a lock this file would otherwise have
-    /// to be asked for once per candidate piece, per unlink, from a
-    /// blocking thread.
+    /// costs the door nothing. The set the pass published is read with a
+    /// load and a bit test. Otherwise this file's lock would have to be
+    /// asked for once per candidate piece, per unlink, from a blocking
+    /// thread.
     #[test]
     fn the_door_reads_the_window_the_pass_granted() {
         let t0 = Instant::now();
@@ -2850,14 +2868,14 @@ mod tests {
     }
 
     /// A file no pass has described holds nothing, rather than holding
-    /// everything: a door asking about a file nothing is reading gets an
+    /// everything. A door asking about a file nothing is reading gets an
     /// answer, and the answer is that it may take what it likes.
     ///
     /// **And it is the same answer it will keep getting.** A door is meant
-    /// to hold this handle and ask it per unlink; handed a fresh empty set
+    /// to hold this handle and ask it per unlink. Handed a fresh empty set
     /// each time it asked early, it would refuse nothing for as long as it
-    /// held one -- which is the whole life of a stream that opened before
-    /// its first pass.
+    /// held one. That is the whole life of a stream that opened before its
+    /// first pass.
     #[test]
     fn a_file_no_pass_has_described_refuses_nothing_yet() {
         let t0 = Instant::now();
@@ -2886,9 +2904,9 @@ mod tests {
     /// A listing covers the pieces of the file it was taken for, so a
     /// ledger settled against another file's listing finds none of its own
     /// pieces in it and forgets the lot. Every pass of every other file
-    /// would then reset this one's arrival times, and the LRU built on them
+    /// would then reset this one's arrival times. The LRU built on them
     /// would rank a file nobody has touched for a minute as freshly
-    /// fetched -- and, being the newest thing there is, the last to be
+    /// fetched. Being the newest thing there is, it would be the last to be
     /// given up.
     #[test]
     fn a_pass_of_one_file_does_not_forget_another_files_pieces() {
@@ -2917,9 +2935,9 @@ mod tests {
     /// **A read in a run of several streams joins the one being read.**
     ///
     /// Two streams with a hole between them are two consumers. When the
-    /// hole fills they are two positions in one run, and a read that could
-    /// belong to either would join whichever was created first -- the one
-    /// the viewer left -- piling its history onto a dormant stream.
+    /// hole fills they are two positions in one run. A read that could
+    /// belong to either would join whichever was created first (the one the
+    /// viewer left), piling its history onto a dormant stream.
     #[test]
     fn a_read_joins_the_stream_it_is_being_read_on() {
         let t0 = Instant::now();
@@ -2940,8 +2958,8 @@ mod tests {
         streams.record(0, 2, read(60 * PIECE, 60 * PIECE + PIECE, at(t0, 2), 2));
         streams.observe(0, &whole_run, PIECE, at(t0, 2));
 
-        // Told apart by when each was created, because a stream takes the
-        // reader of whatever last read it.
+        // They are told apart by when each was created, because a stream
+        // takes the reader of whatever last read it.
         let file = &streams.by_file[&0];
         assert_eq!(file.streams.len(), 2, "and still two");
         let deep = file
@@ -2961,7 +2979,7 @@ mod tests {
         assert_eq!(head.reads, 1, "and left the other one where it was");
     }
 
-    /// Files do not share streams: the same offsets in two files are two
+    /// Files do not share streams. The same offsets in two files are two
     /// consumers, and a table keyed by file is what says so.
     #[test]
     fn two_files_do_not_share_a_stream() {
