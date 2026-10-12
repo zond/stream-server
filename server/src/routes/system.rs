@@ -16,32 +16,31 @@ use enginefs::{EngineLookup, FailedMagnetAdd, PendingMagnetAdd};
 use serde_json::{Value, json};
 
 /// Whether this server is using the connection while nothing is playing,
-/// in each direction -- what a client's "working in the background" light
-/// shows. Shared with [`crate::ServerHandle::background_traffic`]; there is
-/// no route, since the consumer is the embedding client.
+/// in each direction. This is what a client's "working in the background"
+/// light shows. It is shared with [`crate::ServerHandle::background_traffic`].
+/// There is no route, since the consumer is the embedding client.
 ///
 /// The conjunction is taken here, over the engine fields, and handed over
-/// as one value on purpose: an embedder reading traffic and playback
-/// separately would sample them a moment apart across FFI and get a light
-/// that flickers whenever they disagree. *Traffic* is the sum of every
-/// existing torrent's own peer counters
-/// ([`enginefs::backend::TransferTotals`]) plus what the downloads of what
-/// is not a torrent fetched from their origins
-/// ([`crate::proxy_downloads::ProxyDownloads::fetched_over_http`]),
-/// compared against the last reading; *nothing playing* is
+/// as one value on purpose. An embedder reading traffic and playback
+/// separately would sample them a moment apart across FFI. Its light would
+/// flicker whenever they disagree. *Traffic* is the sum of every existing
+/// torrent's own peer counters ([`enginefs::backend::TransferTotals`]),
+/// plus what the downloads of what is not a torrent fetched from their
+/// origins ([`crate::proxy_downloads::ProxyDownloads::fetched_over_http`]),
+/// compared against the last reading. *Nothing playing* is
 /// [`enginefs::EngineFS::playback_is_live`] and no stream started
 /// ([`enginefs::EngineFS::playback_starts`]), held over the window and not
 /// just now (see [`enginefs::traffic::TrafficWindow::sample`]).
 ///
-/// Cheap and a peek, so it can be polled every second or two for the life
-/// of the process: per torrent that exists, one read of librqbit's live
-/// stats snapshot under the torrent's state lock (a handful of counters,
-/// nothing built -- see `LibrqbitHandle::transfer_totals`), plus the three
-/// live playback fields; no `stats()`, no idle clock touched (a reading
-/// that counted as a poll would hold every torrent out of the idle sweep,
-/// and the light would be lit by the seeding it caused). It creates
-/// nothing -- no engine, no magnet add -- so it never goes near
-/// `stats_target`.
+/// It is cheap and a peek, so it can be polled every second or two for the
+/// life of the process. Per torrent that exists, it takes one read of
+/// librqbit's live stats snapshot under the torrent's state lock (a handful
+/// of counters, nothing built -- see `LibrqbitHandle::transfer_totals`). It
+/// also reads the three live playback fields. It calls no `stats()` and
+/// touches no idle clock. A reading that counted as a poll would hold every
+/// torrent out of the idle sweep, and the light would be lit by the seeding
+/// it caused. It creates nothing (no engine, no magnet add), so it never
+/// goes near `stats_target`.
 pub async fn background_traffic(state: &AppState) -> enginefs::traffic::BackgroundTraffic {
     let torrents = state
         .engine
@@ -49,8 +48,9 @@ pub async fn background_traffic(state: &AppState) -> enginefs::traffic::Backgrou
         .await
         .into_values()
         .fold(TransferTotals::default(), TransferTotals::plus);
-    // The start count before the live check: a stream that starts between
-    // the two is then seen by the check, or by the next reading's count.
+    // Read the start count before the live check. A stream that starts
+    // between the two is then seen by the check, or by the next reading's
+    // count.
     let playback_starts = state.engine.playback_starts();
     let playing = state.engine.playback_is_live().await;
     state.traffic_window.sample(enginefs::traffic::Reading {
@@ -63,14 +63,14 @@ pub async fn background_traffic(state: &AppState) -> enginefs::traffic::Backgrou
 
 /// Whether the mainline DHT works on this host -- see
 /// [`enginefs::backend::DhtStatus`] and `crate::diagnostics::dht_health`.
-/// Behind [`crate::ServerHandle::dht_status`]; no route reports it.
+/// It is behind [`crate::ServerHandle::dht_status`]. No route reports it.
 pub fn dht_status(state: &AppState) -> enginefs::backend::DhtStatus {
     state.engine.clone().dht_status()
 }
 
 // stremio-core probes this at startup (models/streaming_server.rs) expecting
 // `{"availableHardwareAccelerations": [...]}`. This fork does no transcoding
-// and has no hwaccel profiles, so an empty list is the honest answer — the
+// and has no hwaccel profiles, so an empty list is the honest answer. The
 // alternative, leaving the route absent, makes every client boot log an
 // ERROR-level 404 in diagnostics::logging for a request the core already
 // tolerates failing.
@@ -82,9 +82,9 @@ pub async fn device_info() -> impl IntoResponse {
 /// with it and the name of the interface carrying it.
 ///
 /// The name is kept because it is the only thing that distinguishes a
-/// Wi-Fi interface from a cellular or tunnel one when nothing else can:
+/// Wi-Fi interface from a cellular or tunnel one when nothing else can.
 /// `crate::lan_media`'s host pick ranks on it when it has no peer subnet to
-/// match, and picking a cellular address there is a cast that never starts.
+/// match. Picking a cellular address there is a cast that never starts.
 #[derive(Clone, Debug)]
 pub struct LocalIpv4Interface {
     pub name: String,
@@ -96,8 +96,8 @@ pub struct LocalIpv4Interface {
 ///
 /// This is the one interface enumeration in the server, so a second caller
 /// never grows a second copy of it. [`network_info`] applies its own
-/// loopback filter on top: `GET /network-info` advertises the addresses a
-/// *remote* client could use, while a caller matching an interface against a
+/// loopback filter on top. `GET /network-info` advertises the addresses a
+/// *remote* client could use. A caller matching an interface against a
 /// peer's subnet needs the loopback entries too. An enumeration failure is
 /// an empty list.
 pub fn local_ipv4_interfaces() -> Vec<LocalIpv4Interface> {
@@ -134,29 +134,29 @@ pub struct ServerSettings {
     /// (`<cacheRoot>/media-cache/.pieces/<infoHash>`, one file per
     /// piece, for the streaming cache and offline downloads alike), the
     /// session's own records beside it, and what `/proxy` cached. It is
-    /// the only root the cache is counted and capped over, and pinning is
-    /// a retention property rather than a location, so there is nowhere
-    /// else for a download to be.
+    /// the only root the cache is counted and capped over. Pinning is a
+    /// retention property rather than a location, so there is nowhere else
+    /// for a download to be.
     ///
-    /// Set through `POST /settings` with an absolute path
+    /// It is set through `POST /settings` with an absolute path
     /// ([`prepare_torrent_data_root`]: trimmed, created if missing, must be
-    /// writable). It is the one validated setting -- a path that cannot be
+    /// writable). It is the one validated setting. A path that cannot be
     /// used, or a value that is not a string, fails the whole update rather
     /// than being ignored. Unset in the settings file, it is
     /// `ServerConfig::cache_dir`, the root the embedder configured.
     ///
-    /// **At process start this is where the data actually is**: the value
-    /// is prepared before the session opens and the session is opened on
-    /// it, and one that cannot be prepared is replaced by the configured
+    /// **At process start this is where the data actually is.** The value
+    /// is prepared before the session opens, and the session is opened on
+    /// it. One that cannot be prepared is replaced by the configured
     /// default (and the correction persisted) before anything is built. It
-    /// is configuration all the same, not an observation: a change through
+    /// is configuration all the same, not an observation. A change through
     /// `POST /settings` names where torrent data will live from the next
-    /// start -- a running librqbit session cannot be moved -- so nothing
+    /// start, because a running librqbit session cannot be moved. So nothing
     /// asks this string where the bytes are. The usage figure, the
     /// free-space ladder and the diagnostics all read the live root from
     /// the engine (`state.engine.download_dir`).
     ///
-    /// There is no second location for pinned downloads: a pin does not
+    /// There is no second location for pinned downloads. A pin does not
     /// move a torrent, so a root that only pinned data went to would have
     /// nothing to hold.
     #[serde(rename = "cacheRoot")]
@@ -164,7 +164,7 @@ pub struct ServerSettings {
     // Option<f64> matches stremio-core's Settings.cache_size
     // (stremio-core/src/types/streaming_server/settings.rs:19): `null` means
     // UNLIMITED cache (see response.rs:90-123, where the "∞" option's `val`
-    // is `null`), while `Some(0.0)` is the distinct "no caching" selection.
+    // is `null`). `Some(0.0)` is the distinct "no caching" selection.
     #[serde(rename = "cacheSize")]
     pub cache_size: Option<f64>,
     #[serde(rename = "proxyStreamsEnabled")]
@@ -258,45 +258,44 @@ pub struct ServerSettings {
 
     /// When true (default), the server uploads to peers all the time.
     /// When false, it uploads only while a player is reading a torrent from
-    /// it or a torrent download is on its way; downloading is not affected
-    /// either way
-    /// (`BackendEngineFS::apply_upload_switch`).
+    /// it or a torrent download is on its way. Downloading is not affected
+    /// either way (`BackendEngineFS::apply_upload_switch`).
     #[serde(rename = "seedingEnabled", default = "default_seeding_enabled")]
     pub seeding_enabled: bool,
 
     /// DHT bootstrap nodes (`host:port`) used to seed librqbit's routing
     /// table when it starts cold. `None` or an empty list (the default)
-    /// uses `enginefs::backend::librqbit::DEFAULT_DHT_BOOTSTRAP_NODES`
-    /// (the two hosts that were measured to answer a DHT ping -- see that
-    /// constant's doc for the measurements, including the three names that
-    /// answer nothing and were removed); a non-empty list REPLACES the
+    /// uses `enginefs::backend::librqbit::DEFAULT_DHT_BOOTSTRAP_NODES`.
+    /// Those are the two hosts that were measured to answer a DHT ping (see
+    /// that constant's doc for the measurements, including the three names
+    /// that answer nothing and were removed). A non-empty list REPLACES the
     /// default entirely.
     /// Either way the entries go through
-    /// `enginefs::backend::librqbit::effective_dht_bootstrap_addrs`, which
+    /// `enginefs::backend::librqbit::effective_dht_bootstrap_addrs`. It
     /// turns names into address literals where DNS (system resolver, then
-    /// DNS over HTTPS, then the on-disk cache) can manage it and passes
-    /// literals through untouched. Entries
-    /// are validated on `POST /settings` (non-empty host, valid nonzero
-    /// port) -- an invalid entry is dropped with a `tracing::warn!` rather
-    /// than failing the request. DHT bootstrap addresses are read once when
-    /// librqbit's session opens (see
-    /// `enginefs::backend::BackendConfig::dht_bootstrap_nodes`), so unlike
-    /// the other `bt*` privacy settings this one only takes effect on the
-    /// next server start, not on the running session -- and even then, a
+    /// DNS over HTTPS, then the on-disk cache) can manage it, and passes
+    /// literals through untouched. Entries are validated on
+    /// `POST /settings` (non-empty host, valid nonzero port). An invalid
+    /// entry is dropped with a `tracing::warn!` rather than failing the
+    /// request. DHT bootstrap addresses are read once, when librqbit's
+    /// session opens (see
+    /// `enginefs::backend::BackendConfig::dht_bootstrap_nodes`). So unlike
+    /// the other `bt*` privacy settings, this one only takes effect on the
+    /// next server start, not on the running session. Even then, a
     /// persisted `dht.json` routing table makes bootstrap-host reachability
-    /// less consequential in practice, since librqbit still races the
-    /// bootstrap request but already has a warm table to work with (see the
-    /// same constant's doc for the underlying librqbit behaviour).
+    /// less consequential in practice. librqbit still races the bootstrap
+    /// request, but it already has a warm table to work with (see the same
+    /// constant's doc for the underlying librqbit behaviour).
     #[serde(rename = "dhtBootstrapNodes", default)]
     pub dht_bootstrap_nodes: Option<Vec<String>>,
 
     /// Whether the LAN media listener may run at all (see
-    /// `ServerHandle::set_lan_media`). `false` -- the default -- refuses
-    /// every request to start it, so an operator can forbid handing media
-    /// bytes to the local network outright; turning it back off through
+    /// `ServerHandle::set_lan_media`). `false`, the default, refuses every
+    /// request to start it, so an operator can forbid handing media bytes
+    /// to the local network outright. Turning it back off through
     /// `POST /settings` also stops a listener that is already running.
     ///
-    /// It only decides whether the listener is *allowed*: the address it
+    /// It only decides whether the listener is *allowed*. The address it
     /// would bind is `ServerConfig::lan_media_addr`, and with no address
     /// configured this setting does nothing at all.
     #[serde(rename = "lanMediaEnabled", default)]
@@ -304,46 +303,45 @@ pub struct ServerSettings {
 
     /// Whether the retention trace is in the log: one line per entity per
     /// ten seconds on what a pass decided and why, and the per-file
-    /// `streams_seen` line (`enginefs::retention::trace`). Off by default;
-    /// it is what a field report is read by when playback misbehaves, and
-    /// noise the rest of the time. Applied to the running process's log
-    /// filter at once (`diagnostics::logging::set_diagnostics_trace`) and
-    /// at every start.
+    /// `streams_seen` line (`enginefs::retention::trace`). It is off by
+    /// default. A field report is read by it when playback misbehaves, and
+    /// it is noise the rest of the time. It is applied to the running
+    /// process's log filter at once
+    /// (`diagnostics::logging::set_diagnostics_trace`) and at every start.
     #[serde(rename = "diagnosticsTrace", default)]
     pub diagnostics_trace: bool,
 
-    /// How far ahead playback reads: the default
-    /// [`BufferProfile`] for
+    /// How far ahead playback reads: the default [`BufferProfile`] for
     /// every stream request that does not carry a `buffer=` override.
-    /// The unit is seconds of film: `normal` (the default) holds and reads
-    /// ahead 90 s of it, `large` four minutes and `maximum` a day -- in
-    /// effect the whole file, as far as the cache budget reaches -- which
-    /// helps a spotty connection and costs more disk in the piece cache and
-    /// more bandwidth spent ahead of what is watched (`docs/settings.md`,
-    /// Buffer profiles). The startup
-    /// window is the same under every profile, so first-frame latency does
-    /// not change. A value that is not one of the three leaves the setting
-    /// as it was, like every other wrong-typed value.
+    /// The unit is seconds of film. `normal` (the default) holds and reads
+    /// ahead 90 s of it, `large` four minutes, and `maximum` a day. That is
+    /// in effect the whole file, as far as the cache budget reaches. A
+    /// larger profile helps a spotty connection. It costs more disk in the
+    /// piece cache and more bandwidth spent ahead of what is watched
+    /// (`docs/settings.md`, Buffer profiles). The startup window is the same
+    /// under every profile, so first-frame latency does not change. A value
+    /// that is not one of the three leaves the setting as it was, like
+    /// every other wrong-typed value.
     #[serde(rename = "bufferProfile", default)]
     pub buffer_profile: BufferProfile,
 }
 
 /// Validate and prepare a torrent-data root (`settings.cacheRoot`):
 /// trimmed, absolute, created if missing and writable (a probe file is
-/// created and removed). The returned path -- **resolved**, see below -- is
-/// what the setting stores.
+/// created and removed). The setting stores the returned path, which is
+/// **resolved** (see below).
 ///
-/// This is the only root there is: the piece store, the session's records
+/// This is the only root there is. The piece store, the session's records
 /// and the proxy cache all live under it, and it is the one volume the cap
-/// is a statement about. There is no second root: a free-space cap is a
+/// is a statement about. There is no second root. A free-space cap is a
 /// statement about *one* volume, and a second root above the first would
 /// put a tree the engine does not own inside the figure.
 ///
-/// Checked before it is created, so a refused setting leaves no directory
-/// behind; and resolved before it is returned, because the stored value is
-/// compared and joined onto as a plain path from then on. A spelling that
-/// reaches the same directory through a symlinked prefix would match none of
-/// that.
+/// It is checked before it is created, so a refused setting leaves no
+/// directory behind. It is resolved before it is returned, because the
+/// stored value is compared and joined onto as a plain path from then on.
+/// A spelling that reaches the same directory through a symlinked prefix
+/// would match none of that.
 pub async fn prepare_torrent_data_root(raw: &str) -> anyhow::Result<std::path::PathBuf> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -363,17 +361,17 @@ pub async fn prepare_torrent_data_root(raw: &str) -> anyhow::Result<std::path::P
     if let Err(error) = tokio::fs::remove_file(&probe).await {
         tracing::debug!(path = %probe.display(), %error, "could not remove the write probe");
     }
-    // **And that it can be listed**, which is not implied by being writable
-    // and is what the cache is built on. Every have-record this server keeps
-    // is seeded by reading a directory: the piece store's at startup, and
-    // the proxy cache's whenever an entity is first opened. A volume that
-    // will not list is one where a chunk we wrote is a chunk we cannot find
-    // again, so there is no degraded mode to offer -- a listing that fails
-    // and is read as "empty" is worse than one that does not run, because
-    // it says the cache holds nothing and has retention delete in the dark.
-    // That is not hypothetical: one transient directory error once withdrew
-    // every committed piece of a file from what this server announces,
-    // after peers had been told, and there is no un-Have.
+    // **And that it can be listed.** Being writable does not imply that,
+    // and the cache is built on it. Every have-record this server keeps is
+    // seeded by reading a directory: the piece store's at startup, and the
+    // proxy cache's whenever an entity is first opened. On a volume that
+    // will not list, a chunk we wrote is a chunk we cannot find again. So
+    // there is no degraded mode to offer. A listing that fails and is read
+    // as "empty" is worse than one that does not run. It says the cache
+    // holds nothing, and has retention delete in the dark. That is not
+    // hypothetical. One transient directory error once withdrew every
+    // committed piece of a file from what this server announces, after
+    // peers had been told, and there is no un-Have.
     let _listing = tokio::fs::read_dir(&path)
         .await
         .map_err(|e| anyhow::anyhow!("cacheRoot {raw:?} cannot be listed: {e}"))?;
@@ -383,13 +381,13 @@ pub async fn prepare_torrent_data_root(raw: &str) -> anyhow::Result<std::path::P
 /// The spelling [`prepare_torrent_data_root`] resolves `path` to, without
 /// creating or validating anything.
 ///
-/// Exported for tests only. A test that builds an expectation from a
+/// It is exported for tests only. A test that builds an expectation from a
 /// `TempDir` path and compares it against what the server reports must
-/// send it through exactly this, or it compares two spellings of the same
-/// directory: on Windows `TempDir` hands back the 8.3 short name
+/// send it through exactly this. Otherwise it compares two spellings of the
+/// same directory. On Windows, `TempDir` hands back the 8.3 short name
 /// (`C:\Users\RUNNER~1\...`) while the server answers with the long one
-/// (`C:\Users\runneradmin\...`), and on macOS `/var/...` is a symlink to
-/// `/private/var/...`. Never duplicate the normalisation in a test -- the
+/// (`C:\Users\runneradmin\...`). On macOS, `/var/...` is a symlink to
+/// `/private/var/...`. Never duplicate the normalisation in a test. The
 /// point is that both sides go through the same code.
 #[doc(hidden)]
 pub fn resolved_path(path: &std::path::Path) -> std::path::PathBuf {
@@ -397,9 +395,10 @@ pub fn resolved_path(path: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// A canonicalised path as the rest of the world should see it. On Windows
-/// `canonicalize` returns a `\\?\`-prefixed (verbatim) path, which reaches
-/// the same directory but is not what a settings file or a client expects;
-/// the plain drive spelling is restored for an ordinary local path.
+/// `canonicalize` returns a `\\?\`-prefixed (verbatim) path. It reaches
+/// the same directory, but it is not what a settings file or a client
+/// expects. The plain drive spelling is restored for an ordinary local
+/// path.
 #[cfg(windows)]
 fn plain_path(path: std::path::PathBuf) -> std::path::PathBuf {
     use std::path::{Component, Prefix};
@@ -424,7 +423,7 @@ fn plain_path(path: std::path::PathBuf) -> std::path::PathBuf {
 }
 
 /// `path` with its deepest existing ancestor canonicalised and the rest of
-/// the path appended unchanged -- so a directory that does not exist yet
+/// the path appended unchanged. A directory that does not exist yet then
 /// still compares against one reached through a symlink.
 fn canonical_prefix(path: &std::path::Path) -> std::path::PathBuf {
     let mut rest = Vec::new();
@@ -444,13 +443,13 @@ fn canonical_prefix(path: &std::path::Path) -> std::path::PathBuf {
 
 /// Resolve the `cacheSize` field of a `POST /settings` payload into the
 /// `ServerSettings.cache_size` value it should produce. Returns `None` when
-/// `v` is neither `null` nor a number (leaving the current setting
+/// `v` is neither `null` nor a number. That leaves the current setting
 /// unchanged, matching `update_settings`'s merge-on-present-and-valid
-/// semantics for every other field).
+/// semantics for every other field.
 ///
 /// stremio-core maps its "∞" cache-size option to JSON `null`
-/// (stremio-core/src/types/streaming_server/response.rs:90-123): `null`
-/// means UNLIMITED cache (`Some(None)` here), never "no caching" — that's
+/// (stremio-core/src/types/streaming_server/response.rs:90-123). `null`
+/// means UNLIMITED cache (`Some(None)` here), never "no caching". That is
 /// the distinct, explicit `0` selection (`Some(Some(0.0))`).
 fn resolve_cache_size(v: &Value) -> Option<Option<f64>> {
     if v.is_null() {
@@ -603,10 +602,10 @@ fn value_as_u16(value: &Value) -> Option<u16> {
 }
 
 /// A `dhtBootstrapNodes` entry is valid when it splits into a non-empty
-/// host and a nonzero port -- `host:port` with the port as the last colon
-/// segment, so an IPv6 literal with no bracket/port suffix (which has no
-/// unambiguous "last colon is the port" reading) is rejected too, same as
-/// a bare hostname with no port at all.
+/// host and a nonzero port: `host:port`, with the port as the last colon
+/// segment. So an IPv6 literal with no bracket/port suffix is rejected too,
+/// because it has no unambiguous "last colon is the port" reading. A bare
+/// hostname with no port at all is rejected the same way.
 fn is_valid_dht_bootstrap_node(entry: &str) -> bool {
     match entry.rsplit_once(':') {
         Some((host, port)) => !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p != 0),
@@ -616,10 +615,10 @@ fn is_valid_dht_bootstrap_node(entry: &str) -> bool {
 
 /// Parse a `dhtBootstrapNodes` payload value (expected: a JSON array of
 /// `host:port` strings) into the entries to store. Returns `None` when
-/// `value` is not an array at all, leaving the existing setting unchanged
-/// -- matching every other field's merge-on-present-and-valid semantics.
+/// `value` is not an array at all, leaving the existing setting unchanged.
+/// That matches every other field's merge-on-present-and-valid semantics.
 /// An array that mixes valid and invalid entries still returns `Some` with
-/// just the valid ones, each dropped invalid entry logged with
+/// just the valid ones. Each dropped invalid entry is logged with
 /// `tracing::warn!` rather than failing the whole `POST /settings` request.
 fn parse_dht_bootstrap_nodes(value: &Value) -> Option<Vec<String>> {
     let entries = value.as_array()?;
@@ -670,8 +669,8 @@ fn update_string_setting(
 }
 
 impl ServerSettings {
-    /// The `bt*` speed settings as the backend takes them: what the session
-    /// is built from at start and what `update_settings` pushes at it.
+    /// The `bt*` speed settings as the backend takes them. The session is
+    /// built from them at start, and `update_settings` pushes them at it.
     pub fn speed_profile(&self) -> enginefs::backend::TorrentSpeedProfile {
         enginefs::backend::TorrentSpeedProfile {
             bt_download_speed_hard_limit: self.bt_download_speed_hard_limit,
@@ -771,7 +770,8 @@ impl Default for ServerSettings {
     }
 }
 
-/// Returns server settings in the SettingsResponse format expected by stremio-core
+/// Returns server settings in the SettingsResponse format expected by
+/// stremio-core.
 /// Response format: { "baseUrl": "http://...", "values": { ...settings } }
 pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     let settings = state.settings.read().await;
@@ -782,36 +782,37 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
-/// Merge `payload` (the `POST /settings` body: any subset of the camelCase
-/// settings keys; wrong-typed values leave that setting unchanged, except
-/// `cacheRoot`, which is validated and fails the update) into the live
-/// settings, push the torrent-related values into the engine and
-/// persist. Returns the settings as they are afterwards, paired with the
-/// [`BtSettingsReport`] the torrent session gave for the `bt*` values --
-/// what applied to the running session now, what waits for the next start,
-/// and what the backend never honours -- so the caller can tell the client
-/// which of its settings took effect rather than echoing them back as if
-/// they all had. Shared by the HTTP handler and
+/// Merge `payload` into the live settings, push the torrent-related values
+/// into the engine, and persist. `payload` is the `POST /settings` body:
+/// any subset of the camelCase settings keys. Wrong-typed values leave that
+/// setting unchanged, except `cacheRoot`, which is validated and fails the
+/// update. Returns the settings as they are afterwards, paired with the
+/// [`BtSettingsReport`] the torrent session gave for the `bt*` values. The
+/// report says what applied to the running session now, what waits for the
+/// next start, and what the backend never honours. So the caller can tell
+/// the client which of its settings took effect, rather than echoing them
+/// back as if they all had. It is shared by the HTTP handler and
 /// `ServerHandle::update_settings`.
 pub async fn update_settings(
     state: &AppState,
     payload: &Value,
 ) -> anyhow::Result<(ServerSettings, BtSettingsReport)> {
-    // The keys and never the values: a patch can carry `btProxyPassword`.
+    // Log the keys and never the values. A patch can carry
+    // `btProxyPassword`.
     let keys: Vec<&str> = payload
         .as_object()
         .map(|patch| patch.keys().map(String::as_str).collect())
         .unwrap_or_default();
     tracing::debug!(?keys, "update_settings: received a patch");
 
-    // Held to the end, across the engine calls and the save: see
-    // `AppState::settings_update`. What is merged, applied and saved is
+    // Held to the end, across the engine calls and the save (see
+    // `AppState::settings_update`). What is merged, applied and saved is
     // then one update's, in the order the updates took the turn.
     let _one_update = state.settings_update.lock().await;
 
-    // `cacheRoot` is the one validated setting: an unusable directory -- or
-    // a value that is not a string -- fails the whole update (nothing is
-    // merged), before the lock is taken. There is no `null`: the server
+    // `cacheRoot` is the one validated setting. An unusable directory, or
+    // a value that is not a string, fails the whole update (nothing is
+    // merged) before the lock is taken. There is no `null`. The server
     // always has a root, and clearing it would mean nowhere to write.
     let cache_root_patch = match payload.get("cacheRoot") {
         None => None,
@@ -833,9 +834,9 @@ pub async fn update_settings(
             settings.cache_size = resolved;
         }
         if let Some(root) = cache_root_patch {
-            // The running session cannot be moved onto it: librqbit opened
-            // its storage at start. It is where torrent data lives from the
-            // next start, and until then the live root is the engine's.
+            // The running session cannot be moved onto it, because librqbit
+            // opened its storage at start. It is where torrent data lives
+            // from the next start. Until then the live root is the engine's.
             settings.cache_root = root.to_string_lossy().into_owned();
         }
         if let Some(v) = obj.get("proxyStreamsEnabled")
@@ -968,7 +969,7 @@ pub async fn update_settings(
         }
         update_bool_setting(obj, "lanMediaEnabled", &mut settings.lan_media_enabled);
         update_bool_setting(obj, "diagnosticsTrace", &mut settings.diagnostics_trace);
-        // Validated, not merged blindly: an unknown profile name leaves the
+        // Validated, not merged blindly. An unknown profile name leaves the
         // setting alone rather than failing the whole update.
         if let Some(profile) = obj
             .get("bufferProfile")
@@ -982,7 +983,7 @@ pub async fn update_settings(
                 settings.dht_bootstrap_nodes = None;
             } else if let Some(parsed) = parse_dht_bootstrap_nodes(v) {
                 // An empty (or now-all-invalid) list is stored the same as
-                // `null`: both mean "use the default set" (see
+                // `null`. Both mean "use the default set" (see
                 // `enginefs::backend::librqbit::resolve_dht_bootstrap_nodes`).
                 settings.dht_bootstrap_nodes = if parsed.is_empty() {
                     None
@@ -1019,29 +1020,29 @@ pub async fn update_settings(
     }
 
     state.engine.set_seeding_enabled(seeding_enabled).await;
-    // The log filter of the running process, so the trace starts or stops
-    // with the switch rather than at the next start. **Only when the switch
-    // moved:** the filter belongs to the process, not to this server, so an
-    // update about anything else must not restate it. Two servers in one
-    // process -- which every test binary of this crate is -- would otherwise
-    // each reset the other's trace on every settings write, and the one
-    // started second would lose its persisted `true` to the first one's next
-    // unrelated update.
+    // Set the log filter of the running process, so the trace starts or
+    // stops with the switch rather than at the next start. **Only when the
+    // switch moved.** The filter belongs to the process, not to this server,
+    // so an update about anything else must not restate it. Every test
+    // binary of this crate is two servers in one process. Without this rule
+    // each would reset the other's trace on every settings write. The one
+    // started second would lose its persisted `true` to the first one's
+    // next unrelated update.
     if diagnostics_trace != was_diagnostics_trace {
         crate::diagnostics::logging::set_diagnostics_trace(diagnostics_trace);
     }
     // `cacheSize` is half of what caps the cache, so a client that changed
-    // it has changed the cap -- and that cap is the budget the retention
-    // policy over the piece store and the proxy cache is sized from. Stated
-    // here rather than left to the next budget tick: that is a minute away
-    // at worst, and until it came, everything already playing stayed bounded
-    // by the number the client has just replaced.
-    // Ordered against every other reading of the volume, like all of them
-    // (`crate::cache_budget`).
+    // it has changed the cap. The retention policy over the piece store and
+    // the proxy cache is sized from that cap. It is stated here rather than
+    // left to the next budget tick. That tick is a minute away at worst, and
+    // until it came, everything already playing stayed bounded by the
+    // number the client has just replaced.
+    // It is ordered against every other reading of the volume, like all of
+    // them (`crate::cache_budget`).
     crate::cache_budget::publish_now(state).await;
-    // `cacheRoot` is not pushed to the engine: a librqbit session's storage
+    // `cacheRoot` is not pushed to the engine. A librqbit session's storage
     // root is fixed when the session opens, so a new one takes effect at the
-    // next start. Nothing reads this string for where the bytes are -- the
+    // next start. Nothing reads this string for where the bytes are. The
     // usage figure, the free-space ladder and the diagnostics all take the
     // live root from the engine.
 
@@ -1059,7 +1060,7 @@ pub async fn set_settings(
         // `btSettings` tells the client which of the `bt*` settings it just
         // sent actually took effect: `appliedLive` on the running session,
         // `pendingRestart` at the next start, `notHonoured` never (the
-        // backend has no knob -- see `bt_settings_support`). Without it a
+        // backend has no knob -- see `bt_settings_support`). Without it, a
         // 200 reads as "all applied", which for most of these is not true.
         Ok((_, report)) => Json(json!({ "success": true, "btSettings": report })),
         Err(e) => {
@@ -1072,12 +1073,12 @@ pub async fn set_settings(
 /// stremio-core's "access from other devices": `501 Not Implemented`, always.
 ///
 /// The route survives because stremio-core dispatches it. `GetHTTPSEndpoint`
-/// is in its `StreamingServer` vocabulary and a client can ask for it at any
-/// time, so a server that answered `404` would be a server core does not
-/// recognise; `501` is the honest "this server, no". Keeping it also keeps
-/// our fork of core rebasable -- nothing there has to be patched out.
+/// is in its `StreamingServer` vocabulary, and a client can ask for it at
+/// any time. A server that answered `404` would be a server core does not
+/// recognise. `501` is the honest "this server, no". Keeping it also keeps
+/// our fork of core rebasable: nothing there has to be patched out.
 ///
-/// An *embedded* server has no HTTPS endpoint to give: it binds loopback
+/// An *embedded* server has no HTTPS endpoint to give. It binds loopback
 /// inside a host process, and the remote address a certificate would be for
 /// belongs to the host, not this server.
 ///
@@ -1091,14 +1092,14 @@ pub async fn get_https() -> impl IntoResponse {
 }
 
 /// What a `stats.json` route reports on: the engine for the hash if there
-/// is one, else the in-flight magnet add for it -- started here, in the same
-/// engine, exactly as `routes::stream` would start it, honouring the request's
-/// `tr=` trackers. Clients commonly poll stats before their first stream
-/// request, so this path must not differ from the stream route's or the
-/// session's torrent ends up tracker-less. It never waits for metadata: while
-/// the add is in flight the routes report `resolvingMetadata` stats instead,
-/// and once an add has failed (metadata timeout, backend error) they report
-/// `phase: error` with the reason until a stream request retries it.
+/// is one, else the in-flight magnet add for it. The add is started here, in
+/// the same engine, exactly as `routes::stream` would start it, honouring the
+/// request's `tr=` trackers. Clients commonly poll stats before their first
+/// stream request. So this path must not differ from the stream route's, or
+/// the session's torrent ends up tracker-less. It never waits for metadata.
+/// While the add is in flight, the routes report `resolvingMetadata` stats
+/// instead. Once an add has failed (metadata timeout, backend error), they
+/// report `phase: error` with the reason until a stream request retries it.
 async fn stats_target(
     state: &AppState,
     info_hash: &str,
@@ -1137,26 +1138,27 @@ fn resolving_metadata_stats(
     EngineStats::resolving_metadata(info_hash, &pending.trackers)
 }
 
-/// `phase: error` and the reason (still a 200 over HTTP): the poller asked
+/// `phase: error` and the reason (still a 200 over HTTP). The poller asked
 /// about a torrent the engine gave up on, which is an answer, not a missing
 /// resource. The reason is [`enginefs::MagnetAddError::client_message`], not
-/// the raw error: a backend error chain may name absolute download-dir paths,
+/// the raw error. A backend error chain may name absolute download-dir paths,
 /// which stay in the server log (the supervisor warns with the full chain when
 /// the add fails).
 fn magnet_add_failed_stats(info_hash: &str, failed: &FailedMagnetAdd) -> EngineStats {
     EngineStats::magnet_add_failed(info_hash, &failed.trackers, &failed.error.client_message())
 }
 
-/// Torrent-level stats for `info_hash` (`ServerHandle::engine_stats`; the
+/// Torrent-level stats for `info_hash` (`ServerHandle::engine_stats`). The
 /// `GET /{infoHash}/stats.json` route that answered the same went with the
-/// other control routes nothing called): the statistics of an existing
-/// engine, else -- this being the first request for the hash -- the engine
-/// is created in the stream engine with `trackers` and `resolvingMetadata`
-/// stats come back at once; a failed add reports `phase: error`. `trackers`
-/// are raw tracker sources (a stream's `sources` as the caller has them) and
-/// are normalised here (`compat::normalize_tracker_sources`: `tracker:`
-/// prefixes stripped, `dht:` entries dropped, whitespace trimmed), the same
-/// way [`file_stats`] normalises the route's `tr=` values.
+/// other control routes nothing called. It answers the statistics of an
+/// existing engine. Otherwise this is the first request for the hash: the
+/// engine is created in the stream engine with `trackers`, and
+/// `resolvingMetadata` stats come back at once. A failed add reports
+/// `phase: error`. `trackers` are raw tracker sources (a stream's `sources`
+/// as the caller has them). They are normalised here
+/// (`compat::normalize_tracker_sources`: `tracker:` prefixes stripped,
+/// `dht:` entries dropped, whitespace trimmed), the same way [`file_stats`]
+/// normalises the route's `tr=` values.
 pub async fn engine_stats(state: &AppState, info_hash: &str, trackers: Vec<String>) -> EngineStats {
     let info_hash = info_hash.to_lowercase();
     let trackers = compat::normalize_tracker_sources(trackers);
@@ -1167,9 +1169,9 @@ pub async fn engine_stats(state: &AppState, info_hash: &str, trackers: Vec<Strin
     }
 }
 
-/// A per-file stats request named a file the torrent does not have: the index
-/// is out of range, or nothing matched `-1` with the given filters. Maps to a
-/// 404 with this message on the HTTP route.
+/// A per-file stats request named a file the torrent does not have. The
+/// index is out of range, or nothing matched `-1` with the given filters. It
+/// maps to a 404 with this message on the HTTP route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileNotFound(pub String);
 
@@ -1183,9 +1185,9 @@ impl std::error::Error for FileNotFound {}
 
 /// Per-file stats, exactly what `GET /{infoHash}/{fileIdx}/stats.json` answers.
 /// `requested_idx` is the route's `{fileIdx}` text (`-1` resolves to the best
-/// media file, narrowed by `filters`, the `f=` values); `trackers` are raw
-/// sources normalised here and used only if this request creates the engine,
-/// as in [`engine_stats`]. Shared by the HTTP handler and
+/// media file, narrowed by `filters`, the `f=` values). `trackers` are raw
+/// sources, normalised here and used only if this request creates the
+/// engine, as in [`engine_stats`]. It is shared by the HTTP handler and
 /// `ServerHandle::file_stats`.
 pub async fn file_stats(
     state: &AppState,
@@ -1197,10 +1199,10 @@ pub async fn file_stats(
     let info_hash = info_hash.to_lowercase();
     let trackers = compat::normalize_tracker_sources(trackers);
 
-    // While the magnet is still resolving there is no file list to index into:
-    // report the torrent-level resolvingMetadata stats so a per-file poller
-    // sees the phase instead of a misleading not-found. An invalid index once
-    // metadata is known is still an error below.
+    // While the magnet is still resolving, there is no file list to index
+    // into. Report the torrent-level resolvingMetadata stats, so a per-file
+    // poller sees the phase instead of a misleading not-found. An invalid
+    // index once metadata is known is still an error below.
     let engine = match stats_target(state, &info_hash, trackers, "file-stats").await {
         EngineLookup::Ready(engine) => engine,
         EngineLookup::Adding(pending) => return Ok(resolving_metadata_stats(&info_hash, &pending)),
@@ -1224,9 +1226,9 @@ pub async fn file_stats(
     }
     // Report progress for the exact file the client asked about. The guess
     // inside get_statistics can resolve to a different file in a multi-file
-    // torrent, and downloaded/length stays stable during cold start (unlike the
-    // torrent's total_wanted set, which briefly collapses to the metadata
-    // window and spikes the percentage just before playback).
+    // torrent. downloaded/length also stays stable during cold start. The
+    // torrent's total_wanted set does not: it briefly collapses to the
+    // metadata window and spikes the percentage just before playback.
     let file = &stats.files[idx];
     stats.stream_name = file.name.clone();
     stats.stream_len = file.length;
@@ -1256,10 +1258,10 @@ pub async fn get_file_stats(
 
 #[cfg(test)]
 mod tests {
-    /// The torrent-data root must be absolute and usable: relative, empty
+    /// The torrent-data root must be absolute and usable. Relative, empty
     /// and file-shadowed paths are refused, a missing directory is created,
-    /// the probe leaves nothing behind, and what comes back is the plain
-    /// spelling of the resolved path -- never the `\\?\` verbatim one
+    /// and the probe leaves nothing behind. What comes back is the plain
+    /// spelling of the resolved path, never the `\\?\` verbatim one
     /// `std::fs::canonicalize` answers with on Windows.
     #[tokio::test]
     async fn prepare_torrent_data_root_validates_and_creates() {
@@ -1286,12 +1288,12 @@ mod tests {
             .await
             .unwrap();
         // On Windows `canonicalize` answers with a `\\?\C:\...` verbatim
-        // path; `prepare_torrent_data_root` hands back the plain drive
+        // path. `prepare_torrent_data_root` hands back the plain drive
         // spelling, because the stored value reaches settings.json and
-        // every client, and because the engine is opened on it -- a
-        // verbatim path compares unequal to the plain one everything else
-        // is spelled with. Stripped here independently of the helper under
-        // test; a no-op on unix.
+        // every client, and because the engine is opened on it. A verbatim
+        // path compares unequal to the plain one everything else is spelled
+        // with. It is stripped here independently of the helper under test.
+        // This is a no-op on unix.
         let canonical = nested.canonicalize().unwrap();
         let expected = match canonical.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
             Some(plain) if plain.as_bytes().get(1) == Some(&b':') => {
@@ -1314,13 +1316,13 @@ mod tests {
     }
 
     /// A directory that exists but cannot be written is refused, and refused
-    /// *here* rather than by librqbit half a startup later: the write probe
-    /// is the only part of the check that a mere `create_dir_all` of an
-    /// existing directory says nothing about.
+    /// *here* rather than by librqbit half a startup later. A mere
+    /// `create_dir_all` of an existing directory says nothing about it. The
+    /// write probe is the only part of the check that does.
     ///
-    /// Unix only, and skipped when the process can write the directory
-    /// anyway -- running as root, a filesystem that does not enforce the
-    /// mode -- because then there is nothing to assert.
+    /// Unix only. It is skipped when the process can write the directory
+    /// anyway (running as root, a filesystem that does not enforce the
+    /// mode), because then there is nothing to assert.
     #[cfg(unix)]
     #[tokio::test]
     async fn prepare_torrent_data_root_refuses_a_directory_it_cannot_write() {
@@ -1344,17 +1346,17 @@ mod tests {
     /// only place it can be refused usefully.
     ///
     /// Everything this server knows about what it holds comes from reading a
-    /// directory -- the piece store's have-record at startup, the proxy
-    /// cache's whenever an entity is opened. There is no degraded mode: a
+    /// directory: the piece store's have-record at startup, and the proxy
+    /// cache's whenever an entity is opened. There is no degraded mode. A
     /// listing that fails and is read as "empty" says the cache holds
     /// nothing, and retention then deletes in the dark. One transient
     /// directory error once withdrew every committed piece of a file from
     /// what this server announces, after peers had been told, and there is
-    /// no un-Have. So the embedder is handed an error and stops, rather
-    /// than running on a volume where a chunk written is a chunk that
-    /// cannot be found again.
+    /// no un-Have. So the embedder is handed an error and stops. It does not
+    /// run on a volume where a chunk written is a chunk that cannot be found
+    /// again.
     ///
-    /// Write permission does not imply it: `0o333` is a directory that
+    /// Write permission does not imply it. `0o333` is a directory that
     /// takes a file and will not say what is in it.
     #[cfg(unix)]
     #[tokio::test]
@@ -1365,7 +1367,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o333)).unwrap();
         // Root ignores the mode, and so does any filesystem mounted without
-        // permission support; a test that cannot make the case cannot judge
+        // permission support. A test that cannot make the case cannot judge
         // it.
         if std::fs::read_dir(&root).is_ok() {
             return;
@@ -1378,10 +1380,10 @@ mod tests {
         );
     }
 
-    /// The stored root is the resolved path: the session is opened on it
-    /// and the volume is measured at it, and a spelling that reaches the
-    /// same directory through a symlinked prefix would compare unequal to
-    /// what the engine then reports its files at.
+    /// The stored root is the resolved path. The session is opened on it,
+    /// and the volume is measured at it. A spelling that reaches the same
+    /// directory through a symlinked prefix would compare unequal to what
+    /// the engine then reports its files at.
     #[cfg(unix)]
     #[tokio::test]
     async fn prepare_torrent_data_root_stores_the_resolved_path() {
@@ -1403,7 +1405,7 @@ mod tests {
     use enginefs::MagnetAddError;
     use std::sync::Arc;
 
-    /// Mirrors `compat::engine_creation_failure`'s non-leak test: the stats
+    /// Mirrors `compat::engine_creation_failure`'s non-leak test. The stats
     /// `error` field must not echo a backend error chain (which can name
     /// absolute download-dir paths) any more than the stream route's body does.
     #[tokio::test]
@@ -1431,8 +1433,8 @@ mod tests {
     }
 
     /// Ground truth: stremio-core's response.rs (lines 90-123) maps its
-    /// "∞" cacheSize option to a JSON `null` value, distinct from the
-    /// explicit `0` ("no caching") option. A client sending `cacheSize:
+    /// "∞" cacheSize option to a JSON `null` value. That is distinct from
+    /// the explicit `0` ("no caching") option. A client sending `cacheSize:
     /// null` wants UNLIMITED cache, so the server must not collapse that
     /// into the same value as "no caching".
     #[test]
@@ -1467,7 +1469,7 @@ mod tests {
     }
 
     /// `ServerSettings.cache_size` must serialize `None` to JSON `null` and
-    /// round-trip back to `None` — otherwise a client picking "unlimited"
+    /// round-trip back to `None`. Otherwise a client picking "unlimited"
     /// would get a `settings.json` that fails to deserialize on the next
     /// server start (see `AppState::load_settings`, which silently falls
     /// back to defaults on any parse error).
@@ -1742,7 +1744,7 @@ mod tests {
     }
 
     /// A payload with a mix of valid and invalid entries drops only the
-    /// invalid ones (logged, not fatal) -- the valid entries survive in
+    /// invalid ones (logged, not fatal). The valid entries survive in
     /// order.
     #[test]
     fn parse_dht_bootstrap_nodes_drops_invalid_entries_and_keeps_the_rest() {
@@ -1763,18 +1765,18 @@ mod tests {
         );
     }
 
-    /// Not a JSON array at all: `None`, so `update_settings` leaves the
-    /// existing setting untouched, the same as every other field's
-    /// merge-on-present-and-valid semantics.
+    /// A value that is not a JSON array at all parses to `None`. So
+    /// `update_settings` leaves the existing setting untouched, the same as
+    /// every other field's merge-on-present-and-valid semantics.
     #[test]
     fn parse_dht_bootstrap_nodes_rejects_a_non_array_payload() {
         assert!(parse_dht_bootstrap_nodes(&json!("router.bittorrent.com:6881")).is_none());
         assert!(parse_dht_bootstrap_nodes(&json!(42)).is_none());
     }
 
-    /// An explicitly configured *empty* list parses to `Some(vec![])`
-    /// (distinct from `None`/absent, which leaves the setting alone); the
-    /// caller (`update_settings`) stores that the same as `null`, and
+    /// An explicitly configured *empty* list parses to `Some(vec![])`. That
+    /// is distinct from `None`/absent, which leaves the setting alone. The
+    /// caller (`update_settings`) stores it the same as `null`.
     /// `enginefs::backend::librqbit::resolve_dht_bootstrap_nodes` (see its
     /// own tests) turns either back into the built-in default set at
     /// session start.

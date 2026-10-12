@@ -17,33 +17,33 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 use url::Url;
 
-/// Lazily-built, process-wide reqwest client for the proxy route: the one
-/// that **verifies** the origin's certificate, which is every request until
-/// one fails.
+/// Lazily-built, process-wide reqwest client for the proxy route. It is the
+/// one that **verifies** the origin's certificate, which is every request
+/// until one fails.
 ///
 /// `Client::builder().build()` can fail (e.g. if the TLS backend can't be
-/// initialized), so building it once at startup-on-first-use and reusing it
-/// avoids both a per-request `.unwrap()` panic and the cost of rebuilding a
-/// client for every proxied request.
+/// initialized). Building it once on first use and reusing it avoids both a
+/// per-request `.unwrap()` panic and the cost of rebuilding a client for
+/// every proxied request.
 static HTTP_CLIENT: OnceLock<Option<Client>> = OnceLock::new();
 
 /// How many redirects one proxied fetch follows before giving up.
 ///
-/// Ten -- reqwest's own default, kept so a chain that would play under an
-/// ordinary client keeps playing through this one. (The reference allows
-/// five.) The limit is also the loop detection -- a redirect ring is a
-/// chain that never ends, and counting hops ends it.
+/// It is ten, reqwest's own default, kept so a chain that would play under
+/// an ordinary client keeps playing through this one. (The reference allows
+/// five.) The limit is also the loop detection. A redirect ring is a chain
+/// that never ends, and counting hops ends it.
 const MAX_REDIRECTS: usize = 10;
 
-/// The statuses that mean "the resource is over there": the five reqwest's
-/// default policy follows, and the only ones this loop follows either.
+/// The statuses that mean "the resource is over there". These are the five
+/// reqwest's default policy follows, and the only ones this loop follows.
 ///
 /// The wider test `300<=status<400 && has("location")` also matches `300`,
-/// `304`, `305` and `306` -- turning a `304 Not Modified` into a fetch of
+/// `304`, `305` and `306`. It turns a `304 Not Modified` into a fetch of
 /// wherever `Location` pointed, the opposite of what the status says.
 ///
 /// `305 Use Proxy` is why the narrower list is a security boundary rather
-/// than a tidy-up: it does not name a new location for the resource, it
+/// than a tidy-up. It does not name a new location for the resource. It
 /// names a *proxy to send the request through*. Following it, with `h=`
 /// re-applied on every hop (see the loop in [`proxy`]), would let any origin
 /// that answers `305` choose the host our credentialed request goes to.
@@ -57,12 +57,12 @@ const FOLLOWED_REDIRECTS: [StatusCode; 5] = [
 ];
 
 /// Where a response says to go next, resolved against the URL it came
-/// *from* -- `None` when it is not a redirect this proxy follows.
+/// *from*. `None` when it is not a redirect this proxy follows.
 ///
-/// Against the current URL, not the origin. The reference resolves
-/// `Location` against `dest.href` with the path and fragment cut off, so a
-/// relative `Location: seg/2.m3u8` lands at `/seg/2.m3u8` on the host root
-/// instead of beside the resource that sent it.
+/// It resolves against the current URL, not the origin. The reference
+/// resolves `Location` against `dest.href` with the path and fragment cut
+/// off. A relative `Location: seg/2.m3u8` then lands at `/seg/2.m3u8` on
+/// the host root instead of beside the resource that sent it.
 ///
 /// A `Location` naming any scheme but `http`/`https` is not followed. This
 /// route fetches whatever a caller names, so the one thing it must not do
@@ -70,11 +70,11 @@ const FOLLOWED_REDIRECTS: [StatusCode; 5] = [
 /// for.
 ///
 /// The target's scheme is not compared with the one it came from, so an
-/// `https` hop may legitimately end at an `http` one -- what such a step
-/// down costs is decided where the request is built, not here: the caller's
-/// `h=` credentials stop travelling ([`CredentialChain`], which the loop in
-/// [`proxy`] asks about each hop and [`CarriedParams`] about each line of a
-/// playlist that continues the chain after it).
+/// `https` hop may legitimately end at an `http` one. What such a step down
+/// costs is decided where the request is built, not here. The caller's `h=`
+/// credentials stop travelling ([`CredentialChain`]). The loop in [`proxy`]
+/// asks it about each hop, and [`CarriedParams`] asks it about each line of
+/// a playlist that continues the chain after it.
 fn redirect_target(response: &reqwest::Response, from: &Url) -> Option<Url> {
     if !FOLLOWED_REDIRECTS.contains(&response.status()) {
         return None;
@@ -89,19 +89,20 @@ fn redirect_target(response: &reqwest::Response, from: &Url) -> Option<Url> {
 /// that wrote it.
 ///
 /// A relative `Location` is relative to the URL it came *from*, and the
-/// client reading our response never saw that URL -- it asked this server,
-/// so `Location: /elsewhere` resolves against `http://127.0.0.1:11470` and
-/// points the player back at us, at a path we do not serve. Resolving it
-/// here makes no request, so the reason not to rewrite it into a `/proxy/`
-/// link is untouched: naming where an origin pointed is not going there.
+/// client reading our response never saw that URL. The client asked this
+/// server, so `Location: /elsewhere` resolves against
+/// `http://127.0.0.1:11470` and points the player back at us, at a path we
+/// do not serve. Resolving it here makes no request. So the reason not to
+/// rewrite it into a `/proxy/` link is untouched: naming where an origin
+/// pointed is not going there.
 ///
 /// A value that is already absolute is relayed byte for byte rather than
 /// round-tripped through [`Url`], which would normalise a spelling that is
 /// the origin's to choose. That includes one naming a scheme this proxy
-/// will not fetch -- an `ftp://` `Location` is exactly the diagnostic the
-/// relay was added to preserve, and it needs nothing resolved. So does a
-/// value we cannot read as text or cannot resolve at all: whatever the
-/// origin wrote is better than nothing.
+/// will not fetch. An `ftp://` `Location` is exactly the diagnostic the
+/// relay was added to preserve, and it needs nothing resolved. The same
+/// goes for a value we cannot read as text or cannot resolve at all.
+/// Whatever the origin wrote is better than nothing.
 fn relayed_location(location: &HeaderValue, from: &Url) -> HeaderValue {
     let Ok(written) = location.to_str() else {
         return location.clone();
@@ -115,19 +116,19 @@ fn relayed_location(location: &HeaderValue, from: &Url) -> HeaderValue {
         .unwrap_or_else(|| location.clone())
 }
 
-/// The three numbers a `206`'s `Content-Range` states -- first byte, last
-/// byte and the entity's whole length -- or `None` when it states anything
+/// The three numbers a `206`'s `Content-Range` states (first byte, last
+/// byte and the entity's whole length), or `None` when it states anything
 /// else.
 ///
 /// Anything else includes the two spellings the standard allows that say
-/// less than three numbers: a `*` complete-length, which is an origin
-/// declining to say how long the entity is, and the unsatisfied-range form
-/// `bytes */<len>`. Neither is a range of bytes, and every caller here needs
-/// one.
+/// less than three numbers. One is a `*` complete-length, which is an
+/// origin declining to say how long the entity is. The other is the
+/// unsatisfied-range form `bytes */<len>`. Neither is a range of bytes, and
+/// every caller here needs one.
 ///
 /// A range whose last byte is before its first, or whose last byte is past
 /// the end of the entity it claims to be part of, is not read as a range
-/// either: an origin that says that has told us nothing usable, and the
+/// either. An origin that says that has told us nothing usable, and the
 /// arithmetic downstream would be the place we found out.
 pub(crate) fn parse_content_range(content_range: &str) -> Option<(u64, u64, u64)> {
     let (range, total) = content_range
@@ -142,15 +143,15 @@ pub(crate) fn parse_content_range(content_range: &str) -> Option<(u64, u64, u64)
 }
 
 /// Whether a `206`'s `Content-Range` says the part it carries is the whole
-/// entity -- `bytes 0-<len-1>/<len>`.
+/// entity: `bytes 0-<len-1>/<len>`.
 ///
-/// Which is not a corner: a player that opens a stream with
+/// That is not a corner case. A player that opens a stream with
 /// `Range: bytes=0-` to find out whether the origin is seekable gets a
-/// `206` back with the entire body in it, and for a playlist that body is
-/// one we must still rewrite. A `206` that carries a *part* is a fragment
-/// of a playlist, and there is nothing coherent to do with a rewritten
-/// fragment: its length is not the length the range promised, and the
-/// lines at its edges are cut.
+/// `206` back with the entire body in it. For a playlist, that body is one
+/// we must still rewrite. A `206` that carries a *part* is a fragment of a
+/// playlist, and there is nothing coherent to do with a rewritten fragment.
+/// Its length is not the length the range promised, and the lines at its
+/// edges are cut.
 fn covers_the_whole_entity(content_range: &str) -> bool {
     // `total - 1` rather than `last + 1`, so an origin claiming the last
     // byte is `u64::MAX` is a `false` and not an overflow panic.
@@ -160,34 +161,34 @@ fn covers_the_whole_entity(content_range: &str) -> bool {
 
 /// Whether a URL's path names a playlist by its extension.
 ///
-/// Case-insensitively, which the reference is not: `path.extname()` against
-/// a list of two lowercase literals does not see `/live/master.M3U8` at
-/// all, and only its content-type arm catches one. There is no reason to
-/// inherit that -- a filename's case is the origin's spelling, not a
-/// statement about the format.
+/// It matches case-insensitively, which the reference does not. There,
+/// `path.extname()` against a list of two lowercase literals does not see
+/// `/live/master.M3U8` at all, and only its content-type arm catches one.
+/// There is no reason to inherit that. A filename's case is the origin's
+/// spelling, not a statement about the format.
 fn names_a_playlist(url: &Url) -> bool {
     let path = url.path().to_ascii_lowercase();
     path.ends_with(".m3u8") || path.ends_with(".m3u")
 }
 
 /// The content type the caller *forced* with `r=Content-Type`, folded to
-/// lower case -- `None` when it sent none, which is every request but the
+/// lower case. `None` when it sent none, which is every request but the
 /// HLS one stremio-core builds.
 ///
-/// Kept apart from the origin's own value rather than merged over it,
-/// because the two are not interchangeable evidence about what this body
-/// is. `r=` is addon metadata describing the resource the caller meant;
-/// the origin's header describes the bytes that actually arrived. Merged,
-/// `r=` *shadowed* the origin, and the classification in [`proxy`] then
-/// read a forced `video/mp4` as proof that a genuine
-/// `application/x-mpegURL` playlist was not a playlist. Split, `r=` can
-/// only add to the verdict -- which is the property the reference has (its
-/// two arms are OR'd) and the one the merge lost.
+/// It is kept apart from the origin's own value rather than merged over it.
+/// The two are not interchangeable evidence about what this body is. `r=`
+/// is addon metadata describing the resource the caller meant. The origin's
+/// header describes the bytes that actually arrived. Merged, `r=`
+/// *shadowed* the origin. The classification in [`proxy`] then read a
+/// forced `video/mp4` as proof that a genuine `application/x-mpegURL`
+/// playlist was not a playlist. Split, `r=` can only add to the verdict.
+/// That is the property the reference has (its two arms are OR'd), and the
+/// one the merge lost.
 ///
-/// Folded because the spelling that matters most is not lower case: Apple
-/// writes `application/x-mpegURL`, that is what stremio-core sends and what
-/// this repo's `docs/proxy.md` uses, and a case-sensitive `contains("mpegurl")` sees
-/// none of it.
+/// It is folded because the spelling that matters most is not lower case.
+/// Apple writes `application/x-mpegURL`. That is what stremio-core sends
+/// and what this repo's `docs/proxy.md` uses. A case-sensitive
+/// `contains("mpegurl")` sees none of it.
 fn forced_content_type(response_header_overrides: &BTreeMap<String, String>) -> Option<String> {
     response_header_overrides
         .iter()
@@ -195,9 +196,9 @@ fn forced_content_type(response_header_overrides: &BTreeMap<String, String>) -> 
         .map(|(_, value)| value.to_ascii_lowercase())
 }
 
-/// What the *origin* labelled its own body with, folded the same way --
-/// the empty string when it said nothing, which neither forces the
-/// playlist path nor vetoes it.
+/// What the *origin* labelled its own body with, folded the same way. It is
+/// the empty string when it said nothing, which neither forces the playlist
+/// path nor vetoes it.
 fn origin_content_type(res_headers: &HeaderMap) -> String {
     res_headers
         .get(header::CONTENT_TYPE)
@@ -209,18 +210,18 @@ fn origin_content_type(res_headers: &HeaderMap) -> String {
 /// Whether a content type says plainly that this body is *not* a playlist,
 /// whatever the URL naming it was called.
 ///
-/// `video/*`, `image/*` and `audio/*` outside the mpegurl family: bodies
-/// that would be run through a line rewriter, stripped of their framing and
-/// handed to a player as text. `audio/x-mpegurl` and `audio/mpegurl` are
-/// the classic `.m3u` spellings, so the family is asked for first and
-/// vetoes nothing.
+/// That is `video/*`, `image/*` and `audio/*` outside the mpegurl family.
+/// Such bodies would otherwise be run through a line rewriter, stripped of
+/// their framing and handed to a player as text. `audio/x-mpegurl` and
+/// `audio/mpegurl` are the classic `.m3u` spellings, so the family is asked
+/// for first and vetoes nothing.
 ///
-/// A type this does not recognise vetoes nothing either, and that is the
-/// point of naming a set rather than a complement:
-/// `application/octet-stream` is what an indifferent origin labels
-/// everything, including the playlist an extension-less edge URL serves,
-/// and it says nothing at all. Only a type that positively describes some
-/// other medium is allowed to overrule the URL.
+/// A type this does not recognise vetoes nothing either. That is the point
+/// of naming a set rather than a complement. `application/octet-stream` is
+/// what an indifferent origin labels everything, including the playlist an
+/// extension-less edge URL serves, and it says nothing at all. Only a type
+/// that positively describes some other medium is allowed to overrule the
+/// URL.
 ///
 /// The parameters are cut off first: `video/mp4; charset=binary` is still
 /// `video/mp4`.
@@ -236,41 +237,41 @@ fn cannot_be_a_playlist(content_type: &str) -> bool {
 
 /// Whether the body a response carries is a playlist this route rewrites.
 ///
-/// **One function because there are two places the question is asked, and
-/// both must reach the same verdict**: a fetch asks it about what just
-/// arrived, a cache hit asks it about what is on disk -- **every hit, whole
-/// or partial**, before a byte of it is served and before a fetch is
-/// narrowed against it. A hit that skipped the question would serve the
-/// very body the rewrite exists to replace. This is also what keeps `r=`
-/// out of the cache key honestly, since `r=` is the input that can turn the
-/// verdict over: see [`crate::proxy_cache::ProxyCache::entry`].
+/// **One function, because the question is asked in two places, and both
+/// must reach the same verdict.** A fetch asks it about what just arrived.
+/// A cache hit asks it about what is on disk: **every hit, whole or
+/// partial**, before a byte of it is served and before a fetch is narrowed
+/// against it. A hit that skipped the question would serve the very body
+/// the rewrite exists to replace. This is also what keeps `r=` out of the
+/// cache key honestly, since `r=` is the input that can turn the verdict
+/// over (see [`crate::proxy_cache::ProxyCache::entry`]).
 ///
-/// Both URLs are asked, because either one alone has a blind spot: the URL
+/// Both URLs are asked, because either one alone has a blind spot. The URL
 /// the *caller* named is the only evidence left when a redirect lands on an
 /// extension-less URL an indifferent origin labels
-/// `application/octet-stream`; the URL the body *came from* catches the
-/// other direction, a caller naming an extension-less URL that redirects to
+/// `application/octet-stream`. The URL the body *came from* catches the
+/// other direction: a caller naming an extension-less URL that redirects to
 /// a `.m3u8`.
 ///
-/// A name is only evidence, and the body gets a veto: a URL that ends
-/// `.m3u8` but answers with, say, an MP4 body is an MP4, not a playlist --
-/// see [`cannot_be_a_playlist`] for what counts as a veto, and
+/// A name is only evidence, and the body gets a veto. A URL that ends
+/// `.m3u8` but answers with, say, an MP4 body is an MP4, not a playlist.
+/// See [`cannot_be_a_playlist`] for what counts as a veto, and
 /// `docs/proxy.md#playlists` for the shape of the rule.
 ///
 /// Only the *origin's* type vetoes, because only the origin has seen the
 /// bytes. What a caller forces with `r=Content-Type` may add the playlist
-/// verdict and may never take it away: an origin serving
+/// verdict and may never take it away. An origin serving
 /// `application/x-mpegURL` stays a playlist even under a caller's
-/// `r=Content-Type:video/mp4` -- an ordinary thing for an addon to say about
-/// the stream it describes -- because relaying it as a plain video would
+/// `r=Content-Type:video/mp4`, which is an ordinary thing for an addon to
+/// say about the stream it describes. Relaying it as a plain video would
 /// send every segment fetch straight to the origin, without the `h=` it
 /// needs or the `p=` a close is addressed by.
 ///
 /// `fetched_url` is `None` on a cache hit, since there is no fetch to have
-/// one. That cannot change the verdict for anything the store holds: a body
+/// one. That cannot change the verdict for anything the store holds. A body
 /// that ever got the playlist verdict was never stored (see
-/// [`cacheable_entity`]), and the caller's URL -- part of the cache key --
-/// is the same URL on both paths by construction.
+/// [`cacheable_entity`]). The caller's URL, part of the cache key, is the
+/// same URL on both paths by construction.
 fn is_a_playlist(
     url: &Url,
     fetched_url: Option<&Url>,
@@ -284,27 +285,27 @@ fn is_a_playlist(
 }
 
 /// How long [`http_client`] waits for an origin to accept a connection.
-/// Generous for a slow mobile network, and short of what a connect with no
-/// bound of ours waits out (see [`http_client`]).
+/// It is generous for a slow mobile network, and short of what a connect
+/// with no bound of ours waits out (see [`http_client`]).
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The process's one outbound HTTP client, on this workspace's own trust
 /// roots (`enginefs::http_client_builder`) and no platform verifier.
 ///
-/// `pub(crate)` for a second caller: `crate::sources::drive`, whose token
-/// refresh is an ordinary HTTPS `POST` and has no business standing up a
-/// client of its own -- a second one would be a second answer to what this
-/// process trusts, which is the thing `http_client_builder`'s docs are
-/// about. It inherits `Policy::none()`, which is right for a refresh: the
-/// endpoint is a constant this server was handed, and a redirect away from
-/// it is not somewhere a refresh token follows.
+/// It is `pub(crate)` for a second caller: `crate::sources::drive`. Its
+/// token refresh is an ordinary HTTPS `POST` and has no business standing
+/// up a client of its own. A second client would be a second answer to
+/// what this process trusts, which is the thing `http_client_builder`'s
+/// docs are about. It inherits `Policy::none()`, which is right for a
+/// refresh. The endpoint is a constant this server was handed, and a
+/// redirect away from it is not somewhere a refresh token follows.
 ///
-/// A connect is bounded ([`CONNECT_TIMEOUT`]) and nothing else is: a body
-/// is a film and streams for as long as it plays, but an origin that never
-/// answers the SYN -- a dead host, a blackholed address -- held the player's
-/// request open for as long as the platform took to give up: 30 s on Linux
-/// (reqwest's default `TCP_USER_TIMEOUT`), the kernel's own retry budget
-/// elsewhere, with nothing said.
+/// A connect is bounded ([`CONNECT_TIMEOUT`]), and nothing else is. A body
+/// is a film and streams for as long as it plays. But an origin that never
+/// answers the SYN (a dead host, a blackholed address) held the player's
+/// request open for as long as the platform took to give up, with nothing
+/// said. That is 30 s on Linux (reqwest's default `TCP_USER_TIMEOUT`), and
+/// the kernel's own retry budget elsewhere.
 pub(crate) fn http_client() -> Option<&'static Client> {
     HTTP_CLIENT
         .get_or_init(|| {
@@ -319,15 +320,15 @@ pub(crate) fn http_client() -> Option<&'static Client> {
 }
 
 /// The header names `r=` may not set, because they describe how *this*
-/// response is framed rather than what it contains -- and framing it is
-/// hyper's business, decided from the body actually being written.
+/// response is framed rather than what it contains. Framing it is hyper's
+/// business, decided from the body actually being written.
 ///
 /// They are the same three the origin's own values are never relayed
-/// under, for the same reason, and `r=` is if anything the more dangerous
-/// source: it is addon metadata, and an addon that says
+/// under, for the same reason. `r=` is if anything the more dangerous
+/// source, because it is addon metadata. An addon that says
 /// `r=Content-Length:1` in front of a two-gigabyte film panics the
 /// connection task in a debug build ("payload claims content-length of ...,
-/// custom content-length header claims 1") and, in a release build, leaves
+/// custom content-length header claims 1"). In a release build it leaves
 /// the player waiting for bytes that will never come.
 const UNFRAMEABLE_RESPONSE_HEADERS: [&str; 3] =
     ["content-length", "transfer-encoding", "connection"];
@@ -335,19 +336,19 @@ const UNFRAMEABLE_RESPONSE_HEADERS: [&str; 3] =
 /// Applies the `r=` custom response headers to a response builder,
 /// validating each name/value pair first so that a malicious or malformed
 /// header (e.g. containing a newline) can never poison the builder's
-/// internal error state. Invalid pairs -- and every name in
-/// [`UNFRAMEABLE_RESPONSE_HEADERS`], and every `access-control-*` name --
-/// are skipped and logged at debug level rather than propagated.
+/// internal error state. Invalid pairs are skipped and logged at debug
+/// level rather than propagated. So is every name in
+/// [`UNFRAMEABLE_RESPONSE_HEADERS`], and every `access-control-*` name.
 ///
 /// They **replace**, which is the whole of what `r=` is for. Appending
 /// them, as this did, left the origin's own header in place beside the
-/// override and a client reading the first of two `content-type`s got the
-/// origin's -- which is exactly the value stremio-core sends `r=` to
-/// correct. `Builder::header` appends; `HeaderMap::insert` takes the name
-/// over entirely, which is why the map is reached through `headers_mut`
-/// rather than the builder's own method. A builder already in an error
-/// state has no map to reach, and skipping is right there too: it is about
-/// to become a 502 (see [`finalize_response`]).
+/// override. A client reading the first of two `content-type`s got the
+/// origin's, which is exactly the value stremio-core sends `r=` to
+/// correct. `Builder::header` appends, and `HeaderMap::insert` takes the
+/// name over entirely. That is why the map is reached through
+/// `headers_mut` rather than the builder's own method. A builder already
+/// in an error state has no map to reach, and skipping is right there too.
+/// It is about to become a 502 (see [`finalize_response`]).
 fn apply_custom_response_headers(
     mut builder: Builder,
     custom_response_headers: &BTreeMap<String, String>,
@@ -359,11 +360,11 @@ fn apply_custom_response_headers(
         ) {
             (Ok(header_name), Ok(header_value)) => {
                 // Nor may it grant a browser the read this server withholds.
-                // The URL is the caller's, so `r=` is too: a web page on the
+                // The URL is the caller's, so `r=` is too. A web page on the
                 // device that could write `access-control-allow-origin:*`
                 // into it would have the relay hand it LAN and intranet
-                // responses, which is what answering no CORS on loopback is
-                // for (see `build_router`).
+                // responses. Answering no CORS on loopback exists to prevent
+                // that (see `build_router`).
                 if header_name.as_str().starts_with("access-control-") {
                     tracing::debug!(
                         name = %header_name,
@@ -401,8 +402,8 @@ fn apply_custom_response_headers(
 /// and for the same reason as the response ones.
 ///
 /// A map rather than a series of `RequestBuilder::header` calls, because
-/// those *append*: an addon's `h=User-Agent:...` would go out alongside the
-/// player's own, two `user-agent` headers on one request, leaving it to the
+/// those *append*. An addon's `h=User-Agent:...` would go out alongside the
+/// player's own: two `user-agent` headers on one request, leaving it to the
 /// origin which it honoured. `RequestBuilder::headers` replaces the name
 /// outright, which is what an override means.
 fn custom_request_headers(overrides: &BTreeMap<String, String>) -> HeaderMap {
@@ -416,7 +417,7 @@ fn custom_request_headers(overrides: &BTreeMap<String, String>) -> HeaderMap {
                 headers.insert(header_name, header_value);
             }
             _ => {
-                // The name only: an `h=` value is as likely as not a
+                // Log the name only. An `h=` value is as likely as not a
                 // credential, and an invalid one is still somebody's.
                 tracing::debug!(
                     name = %name,
@@ -428,9 +429,9 @@ fn custom_request_headers(overrides: &BTreeMap<String, String>) -> HeaderMap {
     headers
 }
 
-/// The `h=` names that are credentials rather than description: the three
-/// reqwest's own redirect policy calls sensitive and strips across hosts
-/// (`remove_sensitive_headers`).
+/// The `h=` names that are credentials rather than description. They are
+/// the three reqwest's own redirect policy calls sensitive and strips
+/// across hosts (`remove_sensitive_headers`).
 ///
 /// Nothing else this route sends can be one. The player's own headers are
 /// a fixed allow-list (see `build_request`) with no credential in it, so
@@ -438,21 +439,21 @@ fn custom_request_headers(overrides: &BTreeMap<String, String>) -> HeaderMap {
 pub(crate) const CREDENTIAL_REQUEST_HEADERS: [&str; 3] =
     ["authorization", "cookie", "proxy-authorization"];
 
-/// The player's own headers that reach the origin, and the whole of them:
-/// everything else a player sends is dropped, and `h=` is the only way
+/// The player's own headers that reach the origin, and the whole of them.
+/// Everything else a player sends is dropped, and `h=` is the only way
 /// anything not on this list gets there.
 ///
-/// `connection` and `transfer-encoding` are deliberately absent: both
-/// describe the framing of one hop, and a proxied fetch is a new hop --
+/// `connection` and `transfer-encoding` are deliberately absent. Both
+/// describe the framing of one hop, and a proxied fetch is a new hop.
 /// reqwest frames its own request, and a `transfer-encoding: chunked` copied
 /// from a bodyless player request describes a body that is not there. There
-/// is no credential on it either, which is what makes
+/// is no credential on the list either, which is what makes
 /// [`CREDENTIAL_REQUEST_HEADERS`] a statement about `h=` alone.
 ///
-/// A module-level constant because the proxy cache keys on it: what varies
-/// the origin's answer is this list minus the two headers that say *which
-/// bytes* of one answer are wanted. Two lists that had to agree about what
-/// the player sends would be a fifth place for a rule to drift (see
+/// It is a module-level constant because the proxy cache keys on it. What
+/// varies the origin's answer is this list minus the two headers that say
+/// *which bytes* of one answer are wanted. Two lists that had to agree about
+/// what the player sends would be a fifth place for a rule to drift (see
 /// [`CredentialChain`] for the four).
 pub(crate) const FORWARDED_REQUEST_HEADERS: [&str; 5] = [
     "accept",
@@ -463,12 +464,12 @@ pub(crate) const FORWARDED_REQUEST_HEADERS: [&str; 5] = [
 ];
 
 /// The same header map with every name in [`CREDENTIAL_REQUEST_HEADERS`]
-/// left out -- what a hop that no longer deserves the caller's secret is
-/// built with.
+/// left out. A hop that no longer deserves the caller's secret is built
+/// with it.
 ///
-/// The rest of `h=` still goes: a `User-Agent`, a `Referer` or an
-/// addon's own `X-` header describes the request and is not a secret to
-/// spend, and dropping those would break the stream for no gain.
+/// The rest of `h=` still goes. A `User-Agent`, a `Referer` or an addon's
+/// own `X-` header describes the request and is not a secret to spend.
+/// Dropping those would break the stream for no gain.
 ///
 /// [`ProxyParams::carried`] does the same filtering to the `h=` it writes
 /// into a rewritten playlist line, where the names are the caller's own
@@ -485,17 +486,17 @@ fn without_credentials(headers: &HeaderMap) -> HeaderMap {
 /// **one predicate** that decides whether the next request in it may carry
 /// [`CREDENTIAL_REQUEST_HEADERS`].
 ///
-/// There are two requests that decision has to be made for, and they are
-/// made in different places: the next hop of the redirect loop in
-/// [`proxy`], and the request a *player* makes for a line this route wrote
-/// into a rewritten playlist (see [`CarriedParams`], which asks this about
-/// every line). A rewritten line is as much a hop of this chain as a `302`
-/// is -- it is written by us, fetched automatically, and re-arms `h=` from
-/// whatever we wrote into it -- so the two must answer the same, and they
-/// answer the same by both calling [`CredentialChain::may_carry_to`].
+/// That decision has to be made for two requests, in different places. One
+/// is the next hop of the redirect loop in [`proxy`]. The other is the
+/// request a *player* makes for a line this route wrote into a rewritten
+/// playlist (see [`CarriedParams`], which asks this about every line). A
+/// rewritten line is as much a hop of this chain as a `302` is. We write
+/// it, it is fetched automatically, and it re-arms `h=` from whatever we
+/// wrote into it. So the two must answer the same, and they do so by both
+/// calling [`CredentialChain::may_carry_to`].
 ///
-/// **The rule it encodes**, which is the whole of the guarantee -- the
-/// credentials leave the origin the caller named only over `https`:
+/// **The rule it encodes** is the whole of the guarantee. The credentials
+/// leave the origin the caller named only over `https`:
 ///
 /// * an **`https` chain** -- one every URL of which, the caller's own
 ///   included, is `https` -- carries them to any `https` target, across
@@ -503,48 +504,47 @@ fn without_credentials(headers: &HeaderMap) -> HeaderMap {
 ///   `remove_sensitive_headers`, and it is what buys back the CDN-to-edge
 ///   `403` (see the loop in [`proxy`]);
 /// * **any other chain** carries them to the origin the caller named in
-///   `d=` when the caller named it in the clear, and to nowhere else --
+///   `d=` when the caller named it in the clear, and to nowhere else,
 ///   whatever the target's scheme, at any depth. Such a caller published
-///   the credential on that origin itself, by naming it, so a request
+///   the credential on that origin itself, by naming it. So a request
 ///   pointing back there publishes nothing that is not published already,
 ///   and an authenticated plain-`http` stream would lose every segment
 ///   without it. Anywhere else is a fresh disclosure somebody other than
-///   the caller chose: what named it was a `Location` or a playlist line
+///   the caller chose. What named it was a `Location` or a playlist line
 ///   that crossed a wire anyone on the path could read and rewrite.
 ///
 /// Two things follow from the second arm that the rule needs, and neither
-/// is a case of its own. A chain that began at an `https` URL and stepped
-/// down has published nothing and has nowhere to spend anything: it carries
-/// the credentials to no target at all, an `https` one included, because an
-/// `https` URL named over a wire that was read is not the caller's `https`
-/// origin talking. And a chain that began in the clear does not reach the
-/// same host's TLS port either -- `https://a.example` is not the origin
-/// `http://a.example`, which is the same answer the loop gives a `302` from
-/// cleartext to `https`.
+/// is a case of its own. First, a chain that began at an `https` URL and
+/// stepped down has published nothing and has nowhere to spend anything.
+/// It carries the credentials to no target at all, an `https` one
+/// included. An `https` URL named over a wire that was read is not the
+/// caller's `https` origin talking. Second, a chain that began in the clear
+/// does not reach the same host's TLS port either. `https://a.example` is
+/// not the origin `http://a.example`. That is the same answer the loop
+/// gives a `302` from cleartext to `https`.
 ///
 /// **Why this is one type and not two conditions that agree.** The redirect
 /// loop and the playlist rewriter both decide whether a hop may carry the
-/// caller's credentials, and two separate implementations of one policy
-/// drift apart under maintenance -- a fix to one side's cleartext exception
-/// leaves the other unchanged and now disagreeing. One predicate, asked from
-/// both places ([`CarriedParams`] for the rewriter, the loop in [`proxy`]
-/// for redirects), is what keeps a caller naming `http://A` from ever
-/// getting back a chain that hands `h=Authorization`/`h=Cookie` to hosts it
-/// never named.
+/// caller's credentials. Two separate implementations of one policy drift
+/// apart under maintenance. A fix to one side's cleartext exception leaves
+/// the other unchanged and now disagreeing. One predicate, asked from both
+/// places ([`CarriedParams`] for the rewriter, the loop in [`proxy`] for
+/// redirects), keeps a caller naming `http://A` from ever getting back a
+/// chain that hands `h=Authorization`/`h=Cookie` to hosts it never named.
 ///
-/// `Url::origin` is the comparison because it is the value a rewritten line
-/// is written with (`d=` is an origin), and because it says the things a
-/// host comparison here has to say: `a.example` and `cdn.a.example` are
-/// different hosts; two ports on one host are different listeners -- one on
-/// `:8080` is not the one the credential was handed to, and on a shared
-/// host it is often not even the same party's; and a default port spelled
-/// out is neither.
+/// `Url::origin` is the comparison for two reasons. It is the value a
+/// rewritten line is written with (`d=` is an origin). It also says the
+/// things a host comparison here has to say. `a.example` and
+/// `cdn.a.example` are different hosts. Two ports on one host are different
+/// listeners: one on `:8080` is not the one the credential was handed to,
+/// and on a shared host it is often not even the same party's. A default
+/// port spelled out is neither.
 #[derive(Clone)]
 pub(crate) struct CredentialChain {
     /// The origin the caller named in `d=`, when the caller named a
-    /// cleartext one: the single origin this chain has already published
-    /// the credentials to, and so the only one a chain that is not all
-    /// `https` may hand them to. `None` for a chain that began at an
+    /// cleartext one. It is the single origin this chain has already
+    /// published the credentials to. So it is the only one a chain that is
+    /// not all `https` may hand them to. `None` for a chain that began at an
     /// `https` URL, which has published nothing.
     spent_in_the_clear: Option<url::Origin>,
     /// Whether every URL this chain has visited, the caller's own included,
@@ -554,8 +554,8 @@ pub(crate) struct CredentialChain {
 
 impl CredentialChain {
     /// The chain as the caller named it, before a hop has been taken. The
-    /// caller's own URL is already part of it: naming an `http://` target
-    /// is the caller spending the credential on that origin, and naming an
+    /// caller's own URL is already part of it. Naming an `http://` target
+    /// is the caller spending the credential on that origin. Naming an
     /// `https` one is what an `https` chain is.
     fn named_by(caller: &Url) -> Self {
         let over_tls = caller.scheme() == "https";
@@ -565,10 +565,10 @@ impl CredentialChain {
         }
     }
 
-    /// Whether a request for `target` -- the next hop of the redirect loop,
-    /// or the fetch a player will make for a rewritten line -- may carry
-    /// [`CREDENTIAL_REQUEST_HEADERS`]. The rest of `h=` travels either way
-    /// (see [`without_credentials`]).
+    /// Whether a request for `target` may carry
+    /// [`CREDENTIAL_REQUEST_HEADERS`]. That request is the next hop of the
+    /// redirect loop, or the fetch a player will make for a rewritten line.
+    /// The rest of `h=` travels either way (see [`without_credentials`]).
     fn may_carry_to(&self, target: &Url) -> bool {
         if self.all_tls {
             target.scheme() == "https"
@@ -589,29 +589,30 @@ impl CredentialChain {
 /// One line for every proxied body this route serves, written when that
 /// body ends however it ends.
 ///
-/// What it answers, about a playback that failed at the player: how many
-/// bytes actually left this server, of how many the response promised; how
-/// long the body was open; and what ended it -- the player hanging up, the
-/// origin or the disk failing part-way, the client closing its own stream,
-/// or nothing at all because the whole of it was delivered. A proxied
-/// stream had none of that: `/proxy` said what the origin answered (see
-/// [`crate::diagnostics::logging::PROXY_TRACE_TARGET`]) and then went
-/// silent, so a body that stopped at 4 MiB of a 2 GiB range and a body that
-/// was delivered whole left the same trace -- and a range served entirely
-/// off disk left no trace at all.
+/// It answers three things about a playback that failed at the player.
+/// How many bytes actually left this server, of how many the response
+/// promised. How long the body was open. And what ended it: the player
+/// hanging up, the origin or the disk failing part-way, the client closing
+/// its own stream, or nothing at all because the whole of it was delivered.
+/// A proxied stream had none of that. `/proxy` said what the origin
+/// answered (see [`crate::diagnostics::logging::PROXY_TRACE_TARGET`]) and
+/// then went silent. A body that stopped at 4 MiB of a 2 GiB range and a
+/// body that was delivered whole left the same trace. A range served
+/// entirely off disk left no trace at all.
 ///
-/// Origins, never the URL: `d=` carries the caller's credentials in its
-/// query and the log is the one place those must not turn up, which is why
-/// the trace line beside this one names `target_origin` and `answered_by`
-/// and nothing else. What answered here is an origin, or `cache` when the
-/// disk held the whole of what was asked for and no origin was opened.
+/// It names origins, never the URL. `d=` carries the caller's credentials
+/// in its query, and the log is the one place those must not turn up. That
+/// is why the trace line beside this one names `target_origin` and
+/// `answered_by` and nothing else. What answered here is an origin, or
+/// `cache` when the disk held the whole of what was asked for and no origin
+/// was opened.
 ///
-/// INFO, and not under the trace switch, for the reason the torrent
-/// route's `http_stream_end` line is (`routes::stream`): it is the only
-/// record that a proxied playback ended, and a field report is read as it
-/// arrives, with whatever was on.
+/// It is INFO, and not under the trace switch, for the same reason as the
+/// torrent route's `http_stream_end` line (`routes::stream`). It is the
+/// only record that a proxied playback ended, and a field report is read as
+/// it arrives, with whatever was on.
 struct ProxyBodyLog {
-    /// When the request arrived, not when the body was framed: what a
+    /// When the request arrived, not when the body was framed. What a
     /// player experienced includes however long the origin took to answer.
     started: Instant,
     method: Method,
@@ -621,10 +622,10 @@ struct ProxyBodyLog {
     /// opened mid-file from one that could not read the container at all.
     range: String,
     /// The response's own framing, read off it in [`with_body_end_log`]:
-    /// the status it went out under, and the length it promised -- which is
-    /// what `bytes_sent` falls short of when a body fails. A rewritten
-    /// playlist promises no length (it is framed as it is written), so it
-    /// states nought and its `bytes_sent` stands alone.
+    /// the status it went out under, and the length it promised. That
+    /// length is what `bytes_sent` falls short of when a body fails. A
+    /// rewritten playlist promises no length (it is framed as it is
+    /// written), so it states nought and its `bytes_sent` stands alone.
     status: u16,
     requested_len: u64,
     progress: util::BodyProgress,
@@ -634,8 +635,8 @@ impl ProxyBodyLog {
     /// The line's subject: what was asked for, and what is answering.
     ///
     /// `None` for a method whose response carries no body. A `HEAD` is
-    /// answered with the framing of a body that is never sent and hyper
-    /// drops it unread, so a line about the bytes that left would be a line
+    /// answered with the framing of a body that is never sent, and hyper
+    /// drops it unread. A line about the bytes that left would be a line
     /// about a body there never was.
     fn for_method(
         started: Instant,
@@ -668,11 +669,11 @@ impl ProxyBodyLog {
 /// recorded however it comes, and the line written when the body is
 /// dropped.
 ///
-/// **The line is written here and nowhere else**, which is what makes it
-/// one line per body rather than one per decision: a refusal that never
-/// serves a body (a `410` for a retired token) drops its log unattached and
-/// says nothing, and a body that is dropped without ever ending -- which is
-/// every player that hangs up -- still says what it managed to deliver.
+/// **The line is written here and nowhere else.** That makes it one line
+/// per body rather than one per decision. A refusal that never serves a
+/// body (a `410` for a retired token) drops its log unattached and says
+/// nothing. A body that is dropped without ever ending, which is every
+/// player that hangs up, still says what it managed to deliver.
 struct LoggedBody<S> {
     inner: S,
     log: ProxyBodyLog,
@@ -723,11 +724,11 @@ impl<S> Drop for LoggedBody<S> {
 /// `response` with [`ProxyBodyLog`] over its body, and the framing the
 /// response itself states read off it.
 ///
-/// Every proxied body passes through here -- the cache hit, the rewritten
-/// playlist and the relayed origin alike -- because the question the line
-/// answers is asked of a failed playback without knowing which of the three
-/// it was. `None` is a response with no body to account for, and is handed
-/// back as it came.
+/// Every proxied body passes through here: the cache hit, the rewritten
+/// playlist and the relayed origin alike. The question the line answers is
+/// asked of a failed playback without knowing which of the three it was.
+/// `None` is a response with no body to account for, and is handed back as
+/// it came.
 fn with_body_end_log(response: Response, log: Option<ProxyBodyLog>) -> Response {
     let Some(mut log) = log else {
         return response;
@@ -762,23 +763,23 @@ fn finalize_response(builder: Builder, body: axum::body::Body) -> Response {
 
 /// Whether the origin's own `Cache-Control` forbids keeping this response.
 ///
-/// `no-store` and `private` say so outright: the first is "do not write this
-/// down", the second is "this is one client's copy", and `/proxy` takes no
+/// `no-store` and `private` say so outright. The first is "do not write this
+/// down", and the second is "this is one client's copy". `/proxy` takes no
 /// bearer token, so a private copy in a shared store is exactly the thing
 /// [`CREDENTIAL_REQUEST_HEADERS`] is refused over. `no-cache` and a
-/// `max-age` of zero say something weaker -- revalidate before you use it --
-/// but this cache never revalidates ([`crate::proxy_cache`] says so in one
+/// `max-age` of zero say something weaker: revalidate before you use it.
+/// But this cache never revalidates ([`crate::proxy_cache`] says so in one
 /// sentence), so for it they say the same thing.
 ///
 /// Nothing else in the header is read. There is no freshness lifetime here
-/// to compute: an entry is served until a retention pass takes it, and a
+/// to compute. An entry is served until a retention pass takes it, and a
 /// `max-age` of an hour would not make that true any earlier.
 ///
 /// **This header was read nowhere in this file before the cache existed.**
 /// The rule is being introduced, not inherited.
 ///
 /// A source that opened the entity itself (`checked_at_open`, see
-/// [`SourceIdentity`]) answers the last three: it holds the grant the copy
+/// [`SourceIdentity`]) answers the last three. It holds the grant the copy
 /// is private to, and it checks the entity again at every open. Only
 /// `no-store` is a refusal then.
 fn origin_forbids_caching(res_headers: &HeaderMap, checked_at_open: bool) -> bool {
@@ -808,14 +809,14 @@ fn origin_forbids_caching(res_headers: &HeaderMap, checked_at_open: bool) -> boo
 /// How a response identifies **which** entity it is a part of: its `ETag`,
 /// or its `Last-Modified` when it offers no usable one.
 ///
-/// Length and content type say what an entity is like; only this says which
+/// Length and content type say what an entity is like. Only this says which
 /// it is. A URL whose content is replaced by content of the same size and
-/// type is invisible to the other two, and it is the case that turns a
-/// narrowed range into a body spliced from two generations -- so the store
+/// type is invisible to the other two. That is the case that turns a
+/// narrowed range into a body spliced from two generations. So the store
 /// files an entity under this as well, and a cached head and a fresh `206`
 /// are joined only when both name it.
 ///
-/// The header is part of the value, not just its text: a date and a tag are
+/// The header is part of the value, not just its text. A date and a tag are
 /// different claims however they happen to be spelled, and comparing them
 /// across is comparing nothing. So one response yields one validator, chosen
 /// the same way every time, and two are equal only when they were chosen
@@ -823,9 +824,9 @@ fn origin_forbids_caching(res_headers: &HeaderMap, checked_at_open: bool) -> boo
 ///
 /// A **weak** `ETag` (`W/"..."`) is not one. It promises the two
 /// representations are semantically equivalent, not that they are the same
-/// bytes, and bytes are the whole of what is being joined here -- so it is
-/// passed over for the `Last-Modified` beside it, and a response offering
-/// only a weak tag offers nothing.
+/// bytes. Bytes are the whole of what is being joined here. So a weak tag
+/// is passed over for the `Last-Modified` beside it, and a response
+/// offering only a weak tag offers nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct EntityValidator {
     /// `etag` or `last-modified` -- the header it was read from.
@@ -854,16 +855,17 @@ impl EntityValidator {
             .or_else(|| read(header::LAST_MODIFIED))
     }
 
-    /// How the store files it and how two are compared -- the header's name
+    /// How the store files it and how two are compared: the header's name
     /// and the value, so a date can never be read as a tag.
     fn filed(&self) -> String {
         format!("{}:{}", self.header.as_str(), self.value)
     }
 
     /// The other direction, for the callers that have a filed validator and
-    /// no response to read it from: a hit labelling the bytes it is about to
-    /// serve, and the narrowed fetch asking `If-Range` under the validator
-    /// its head is filed by. `None` for anything this did not write.
+    /// no response to read it from. One is a hit labelling the bytes it is
+    /// about to serve. The other is the narrowed fetch asking `If-Range`
+    /// under the validator its head is filed by. `None` for anything this
+    /// did not write.
     fn from_filed(filed: &str) -> Option<Self> {
         let (name, value) = filed.split_once(':')?;
         let header = HeaderName::from_bytes(name.as_bytes()).ok()?;
@@ -875,7 +877,7 @@ impl EntityValidator {
 }
 
 /// **What an entity is filed and compared under**: the strongest identity
-/// there is for it, and never none -- every entity the other rules let
+/// there is for it, and never none. Every entity the other rules let
 /// through is kept.
 ///
 /// In order:
@@ -886,10 +888,10 @@ impl EntityValidator {
 /// 2. the origin's own [`EntityValidator`];
 /// 3. its length alone, filed `length:<bytes>`.
 ///
-/// The last is weak and is chosen knowingly: a resource replaced by one of
-/// the same length under a URL that names neither validator is served as it
-/// was. Refusing to keep it instead -- the old rule -- protected against
-/// that by never keeping a byte of an origin that names neither, which is
+/// The last is weak and is chosen knowingly. A resource replaced by one of
+/// the same length, under a URL that names neither validator, is served as
+/// it was. The old rule refused to keep it instead. It protected against
+/// that by never keeping a byte of an origin that names neither. That is
 /// most of the ones a viewer downloads from (Google Drive among them), and
 /// nobody downloading a film wants that trade. A length that differs is
 /// still a different entity: a new directory, the old one dropped by the
@@ -897,9 +899,9 @@ impl EntityValidator {
 ///
 /// An identity that will not make a directory name (an origin's tag past
 /// [`crate::proxy_cache::can_be_filed`]'s bound) gives way to the next one
-/// down, so an outlandish `ETag` costs its strength and not the keeping.
+/// down. So an outlandish `ETag` costs its strength and not the keeping.
 /// Only `etag:` and `last-modified:` read back through
-/// [`EntityValidator::from_filed`], so the other two are never sent as an
+/// [`EntityValidator::from_filed`]. So the other two are never sent as an
 /// `If-Range` the origin could not know, nor stated on a hit as a header
 /// the origin never wrote.
 fn entity_identity(
@@ -916,17 +918,18 @@ fn entity_identity(
         .unwrap_or_else(|| format!("length:{total}"))
 }
 
-/// What a source that opened an entity itself -- a [`crate::sources::ProxySource`]
-/// that vouched for its URL ([`crate::sources::proxy::Vouch`]) -- tells the
-/// cache about it, beyond what any one response says.
+/// What a source that opened an entity itself tells the cache about it,
+/// beyond what any one response says. Such a source is a
+/// [`crate::sources::ProxySource`] that vouched for its URL
+/// ([`crate::sources::proxy::Vouch`]).
 ///
 /// Its presence is the statement that the source **checks the entity again
-/// at every open** and retires a generation that no longer matches
-/// ([`crate::proxy_cache::Entry::retire_others`]), which is what lets a
-/// response's own `Cache-Control: private`, `no-cache` or `max-age=0` be
-/// answered by the source rather than refuse the keeping: "one client's
-/// copy" is what a grant's holder keeps, and "revalidate first" is what the
-/// open does. `no-store` is still a refusal.
+/// at every open**, and retires a generation that no longer matches
+/// ([`crate::proxy_cache::Entry::retire_others`]). That lets the source
+/// answer a response's own `Cache-Control: private`, `no-cache` or
+/// `max-age=0`, rather than have it refuse the keeping. "One client's copy"
+/// is what a grant's holder keeps, and "revalidate first" is what the open
+/// does. `no-store` is still a refusal.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SourceIdentity<'a> {
     /// The identity it supplies, if it has one (see [`entity_identity`]).
@@ -941,16 +944,16 @@ pub(crate) struct SourceIdentity<'a> {
 ///
 /// * **anything but a `200` or a `206`.** An error page, a `304` and a
 ///   redirect the loop declined to follow are not the resource;
-/// * **a playlist.** Live content, and the branch above replaces the body
-///   with one of ours anyway. The verdict is the one already computed for
-///   the rewrite, never a second opinion;
+/// * **a playlist.** It is live content, and the branch above replaces the
+///   body with one of ours anyway. The verdict is the one already computed
+///   for the rewrite, never a second opinion;
 /// * **a body under a content coding.** The bytes are not what the framing
 ///   headers a hit would be answered with describe;
 /// * **an origin that has not proved it answers ranges.** A `206` is the
-///   proof in itself; a `200` has to say `Accept-Ranges: bytes`. Storing
+///   proof in itself, and a `200` has to say `Accept-Ranges: bytes`. Storing
 ///   anything else would let a later hit answer a range the origin never
-///   said it supports, which is claiming seekability for a stream that has
-///   none the moment the cache misses;
+///   said it supports. That claims seekability for a stream that has none
+///   the moment the cache misses;
 /// * **an entity whose length the origin will not state, or states as
 ///   zero.** There is nothing to file the chunks under, no `Content-Range` a
 ///   hit could write, and no chunk in an entity of no bytes;
@@ -1022,9 +1025,9 @@ fn cacheable_entity(
 /// from it ([`crate::sources::ProxySource`]).
 ///
 /// `None` for anything but a `206` with a `Content-Range` naming an entity
-/// length -- which is, in the one place this is asked, an origin that will
-/// not serve a range, and so one this server refuses to read a member out
-/// of rather than download whole.
+/// length. In the one place this is asked, that is an origin that will not
+/// serve a range. This server refuses to read a member out of such an
+/// origin rather than download it whole.
 pub(crate) fn probed_entity(status: StatusCode, res_headers: &HeaderMap) -> Option<ProbedEntity> {
     if status != StatusCode::PARTIAL_CONTENT {
         return None;
@@ -1059,8 +1062,8 @@ pub(crate) struct ProbedEntity {
 /// What [`cacheable_entity`] found: the entity, and where in it this body
 /// begins.
 pub(crate) struct CacheableEntity {
-    /// The absolute offset of the body's first byte -- zero for a `200`, the
-    /// `Content-Range`'s first byte for a `206`.
+    /// The absolute offset of the body's first byte: zero for a `200`, and
+    /// the `Content-Range`'s first byte for a `206`.
     first: u64,
     total: u64,
     content_type: String,
@@ -1069,9 +1072,9 @@ pub(crate) struct CacheableEntity {
 }
 
 /// What the stitch reads of a cached head: the fields the entity is filed
-/// under and how far the head reaches. Borrowed off a
-/// [`crate::proxy_cache::Cached`] at the join, and stated outright by the
-/// tests of the join, which have no store to look one up in.
+/// under, and how far the head reaches. It is borrowed off a
+/// [`crate::proxy_cache::Cached`] at the join. The tests of the join state
+/// it outright, because they have no store to look one up in.
 struct StitchHead<'a> {
     total: u64,
     held_to: u64,
@@ -1091,10 +1094,10 @@ impl<'a> StitchHead<'a> {
 }
 
 /// Why a cached head may **not** go in front of the body the origin just
-/// sent, or `None` when it may. One reason per condition, in the words the
-/// log then reports: every one of them ends the same way -- the head is
-/// dropped and the origin's own answer relayed -- so what a reader has to
-/// be told apart is which of them happened.
+/// sent, or `None` when it may. There is one reason per condition, in the
+/// words the log then reports. Every one of them ends the same way: the
+/// head is dropped and the origin's own answer relayed. So what a reader
+/// has to be told apart is which of them happened.
 ///
 /// The conditions themselves are argued for where the join is made; this
 /// only names them.
@@ -1107,26 +1110,26 @@ fn stitch_refusal(
     supplied: Option<&str>,
 ) -> Option<&'static str> {
     if status != StatusCode::PARTIAL_CONTENT {
-        // Including the `200` an origin answers when it ignored the narrowed
-        // range, or when the `If-Range` it honoured found the head stale:
-        // what came back is the whole entity, and there is nothing to put in
-        // front of it.
+        // This includes the `200` an origin answers when it ignored the
+        // narrowed range, or when the `If-Range` it honoured found the head
+        // stale. What came back is the whole entity, and there is nothing to
+        // put in front of it.
         return Some("the origin did not answer a 206, so what it sent is not a tail");
     }
     if is_playlist {
-        // Reachable without any narrowing bug: the classification a hit is
-        // put through asks about the type the *store* filed, and this one
-        // asks about the type the origin just sent. An entity that became a
-        // playlist between the two is one whose head we hold and whose tail
+        // This is reachable without any narrowing bug. The classification a
+        // hit is put through asks about the type the *store* filed, and this
+        // one asks about the type the origin just sent. An entity that became
+        // a playlist between the two is one whose head we hold and whose tail
         // is rewritten whole.
         return Some("the origin answered with a playlist, which is rewritten whole");
     }
     if encoded_body {
         return Some("the origin answered under a content coding the cached head is not in");
     }
-    // The tail's identity by the same rule the head was filed by, so a
-    // head kept under its length alone joins a tail of the same length --
-    // and of a length that is not the head's, it does not.
+    // The tail's identity by the same rule the head was filed by. A head
+    // kept under its length alone joins a tail of the same length, and
+    // does not join a tail of another length.
     let tail_total = res_headers
         .get(header::CONTENT_RANGE)
         .and_then(|value| value.to_str().ok())
@@ -1142,12 +1145,12 @@ fn stitch_refusal(
         return Some("the origin named a different entity than the cached head is filed under");
     }
     // The entity is filed under length, type and validator, and a head is
-    // joined to a tail only if all three agree: an origin that answers the
-    // same tag under another type has changed what the bytes are -- a
-    // transcode behind one `ETag`, say -- and the tail it sent is filed
-    // under a different entity name than the head was read from. The
-    // validator and the length are checked either side of this; the type
-    // was the one field of the name the join did not ask about.
+    // joined to a tail only if all three agree. An origin that answers the
+    // same tag under another type has changed what the bytes are (a
+    // transcode behind one `ETag`, say). The tail it sent is filed under a
+    // different entity name than the head was read from. The validator and
+    // the length are checked either side of this. The type was the one
+    // field of the name the join did not ask about.
     if !origin_content_type(res_headers).eq_ignore_ascii_case(cached.content_type) {
         return Some(
             "the origin labelled the tail with a different content type than the cached head",
@@ -1175,17 +1178,17 @@ fn stitch_refusal(
 /// own claims remembered rather than anything invented here:
 ///
 /// * `Accept-Ranges: bytes`, because an entity only exists in the store at
-///   all if the origin proved it answers ranges -- a `206`, or a `200` that
+///   all if the origin proved it answers ranges: a `206`, or a `200` that
 ///   said so (see [`cacheable_entity`]);
 /// * the content type it labelled the entity with;
-/// * the validator it identified the entity by (see [`EntityValidator`]),
-///   which is the same one a stitched response carries and which is over the
-///   same entity's bytes either way. A hit that withheld it while a stitch of
+/// * the validator it identified the entity by (see [`EntityValidator`]).
+///   It is the same one a stitched response carries, over the same
+///   entity's bytes either way. A hit that withheld it while a stitch of
 ///   the very same entity stated it would have two cache answers disagreeing
 ///   about what they had served.
 ///
-/// What a hit does not carry is `Server` and `Date`: both describe a hop to
-/// an origin that is not being made, and there is nothing truthful to put in
+/// A hit does not carry `Server` and `Date`. Both describe a hop to an
+/// origin that is not being made, and there is nothing truthful to put in
 /// them.
 fn cache_hit_response(
     state: &AppState,
@@ -1217,9 +1220,9 @@ fn cache_hit_response(
     }
     builder = apply_custom_response_headers(builder, response_header_overrides);
 
-    // Read through the registry like any other proxied body: a client that
-    // closes its player must break this read too, and a token retired while
-    // the lookup ran is a `410` here exactly as it is after a fetch.
+    // Read through the registry like any other proxied body. A client that
+    // closes its player must break this read too. A token retired while the
+    // lookup ran is a `410` here, exactly as it is after a fetch.
     let Some(body) = state
         .proxy_streams
         .attach(player_token.clone(), cached.body())
@@ -1245,16 +1248,16 @@ fn cache_hit_response(
 /// headers to send back (`r=`), and the client's name for the player
 /// reading the stream (`p=`).
 ///
-/// One parser for both shapes: the Core format spells them in the path
-/// segment before the target's path, the query format in the request's own
-/// query. Both carry `h=`/`r=`, which is what lets the playlist rewrite (see
-/// [`ProxyParams::carried`]) put an authenticated playlist's headers onto
-/// the segments it names.
+/// There is one parser for both shapes. The Core format spells them in the
+/// path segment before the target's path, and the query format in the
+/// request's own query. Both carry `h=`/`r=`. That is what lets the
+/// playlist rewrite (see [`ProxyParams::carried`]) put an authenticated
+/// playlist's headers onto the segments it names.
 ///
-/// `BTreeMap` rather than `HashMap` because the order the headers come back
-/// out in is written into every line of every rewritten playlist, and a
-/// body that differs between two identical requests is not something to
-/// hand a caching player.
+/// `BTreeMap` rather than `HashMap`, because the order the headers come back
+/// out in is written into every line of every rewritten playlist. A body
+/// that differs between two identical requests is not something to hand a
+/// caching player.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct ProxyParams {
     /// The target URL, as `d=` spelled it. In the Core format this is the
@@ -1317,47 +1320,48 @@ impl ProxyParams {
     /// Everything a rewritten playlist line has to carry besides its own
     /// target, spelled as query parameters: `h=` and `p=`.
     ///
-    /// `h=` because a segment of an authenticated stream needs the same
-    /// authorization the playlist needed -- without it the playlist fetched
-    /// `200` and every segment `403`. `p=` because the segment read has to
-    /// belong to the same player as the playlist that named it: closing an
+    /// `h=`, because a segment of an authenticated stream needs the same
+    /// authorization the playlist needed. Without it, the playlist fetched
+    /// `200` and every segment `403`. `p=`, because the segment read has to
+    /// belong to the same player as the playlist that named it. Closing an
     /// HLS player has to break the read that is actually in flight, and
     /// that is a segment, never the playlist.
     ///
     /// **`r=` is deliberately not here.** It is a response-header override
     /// for *the resource the caller named*, and the caller named a
-    /// playlist: stremio-core sends `r=Content-Type:application/x-mpegurl`
-    /// for an HLS stream, so copying it onto every line labelled the
+    /// playlist. stremio-core sends `r=Content-Type:application/x-mpegurl`
+    /// for an HLS stream. So copying it onto every line labelled the
     /// segments and the AES keys as playlists too. mpv was handed MPEG-TS
-    /// under `application/x-mpegurl` and a 16-byte key under it as well.
+    /// under `application/x-mpegurl`, and a 16-byte key under it as well.
     ///
     /// The reference does copy it, on every same-origin line and every
     /// absolute path, because its virtual root is the caller's whole opts
-    /// string -- and there it compounds: it classifies a response by the
-    /// content type it has already merged `r=` into, so a segment fetched
-    /// through such a line is itself called a playlist and run through the
-    /// line rewriter. We ask the caller's forced type too, and for a good
-    /// reason (see [`forced_content_type`]); what keeps the same thing from
-    /// happening here is exactly this -- `r=` is not on the line, so a
-    /// segment inherits no label. Its own cross-origin branch drops `r=`
-    /// (`newOpts` has only `d` and `h`), which is the half worth keeping.
+    /// string. There it compounds. It classifies a response by the content
+    /// type it has already merged `r=` into. So a segment fetched through
+    /// such a line is itself called a playlist and run through the line
+    /// rewriter. We ask the caller's forced type too, and for a good reason
+    /// (see [`forced_content_type`]). What keeps the same thing from
+    /// happening here is exactly this: `r=` is not on the line, so a
+    /// segment inherits no label. The reference's own cross-origin branch
+    /// drops `r=` (`newOpts` has only `d` and `h`), which is the half worth
+    /// keeping.
     ///
     /// **Nor is all of `h=` on every line.** Which lines
     /// [`CREDENTIAL_REQUEST_HEADERS`] may be written into is not this
-    /// function's decision at all: `chain` is the chain the playlist
-    /// arrived over -- what the caller named, and what has happened to it
-    /// since -- and every line asks [`CredentialChain::may_carry_to`] about
-    /// its own target, which is the same call the redirect loop makes about
-    /// its next hop. Both spellings are built here because the target is
-    /// not known until [`proxied_uri`] has resolved the line.
+    /// function's decision at all. `chain` is the chain the playlist
+    /// arrived over: what the caller named, and what has happened to it
+    /// since. Every line asks [`CredentialChain::may_carry_to`] about its
+    /// own target, which is the same call the redirect loop makes about its
+    /// next hop. Both spellings are built here, because the target is not
+    /// known until [`proxied_uri`] has resolved the line.
     fn carried(&self, chain: &CredentialChain) -> CarriedParams {
         let mut all = String::new();
         let mut uncredentialed = String::new();
         for (name, value) in &self.request_headers {
             let parameter = format!("&h={}", urlencoding::encode(&format!("{name}:{value}")));
-            // `h=` names are the caller's spelling, not a `HeaderMap`'s, so
+            // `h=` names are the caller's spelling, not a `HeaderMap`'s. So
             // the comparison has to do the lowercasing the header map would
-            // have done: `h=AUTHORIZATION:...` is the same credential.
+            // have done. `h=AUTHORIZATION:...` is the same credential.
             if !CREDENTIAL_REQUEST_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
                 uncredentialed.push_str(&parameter);
             }
@@ -1377,42 +1381,41 @@ impl ProxyParams {
 }
 
 /// What a rewritten playlist line carries, in the two spellings a line may
-/// need. [`ProxyParams::carried`] builds both; the line's own target picks
-/// between them, by asking [`CredentialChain`] -- the same predicate, and
-/// the same call, the redirect loop makes about its next hop.
+/// need. [`ProxyParams::carried`] builds both. The line's own target picks
+/// between them by asking [`CredentialChain`]. That is the same predicate,
+/// and the same call, the redirect loop makes about its next hop.
 ///
-/// **A rewritten line is a hop of the same chain** -- the last one this
-/// route has any say over. What it writes into the line is what the player
-/// hands straight back to us as its own `h=`, and what we then spend on
-/// whatever that line named, without a caller ever having decided to. So
-/// the rule cannot live in the lines alone, or in the loop alone: judged
-/// apart, the two disagree the moment a chain crosses both and a scheme
-/// changes along the way. See [`CredentialChain`] for why it is one
-/// predicate asked from both places, and for the rule itself. What is left
-/// here is the two strings and where a line's target is asked about.
+/// **A rewritten line is a hop of the same chain**, the last one this
+/// route has any say over. What it writes into the line, the player hands
+/// straight back to us as its own `h=`. We then spend it on whatever that
+/// line named, without a caller ever having decided to. So the rule cannot
+/// live in the lines alone, or in the loop alone. Judged apart, the two
+/// disagree the moment a chain crosses both and a scheme changes along the
+/// way. See [`CredentialChain`] for why it is one predicate asked from both
+/// places, and for the rule itself. What is left here is the two strings,
+/// and where a line's target is asked about.
 ///
 /// **A chain that is not all `https` arms the origin the caller named in the
-/// clear and no other, at any depth, whatever a line's scheme** -- and a
-/// chain that began at `https` and stepped down arms nothing at all, having
-/// named nothing in the clear to spend on. A line to A is fetched as
-/// `d=http://A`, so the origin *it* may arm is A again, and nothing else in
-/// its playlist -- an `https` line included -- is written with a credential
-/// for anything further on to inherit. That bound is that chain's alone: an
-/// armed `https` line on an `https` chain is a fresh
-/// request whose own redirects and own playlist may carry the credential
-/// onward to further `https` hosts, and nothing counts those --
-/// `MAX_REDIRECTS` bounds the hops inside one request, and a rewritten line
-/// is not a hop of the request that wrote it but a new one the player
-/// makes. Every one of those hosts is reached over TLS, which is the whole
-/// of what the one rule promises.
+/// clear and no other, at any depth, whatever a line's scheme.** A chain
+/// that began at `https` and stepped down arms nothing at all, having named
+/// nothing in the clear to spend on. A line to A is fetched as
+/// `d=http://A`, so the origin *it* may arm is A again. Nothing else in its
+/// playlist, an `https` line included, is written with a credential for
+/// anything further on to inherit. That bound is that chain's alone. An
+/// armed `https` line on an `https` chain is a fresh request. Its own
+/// redirects and own playlist may carry the credential onward to further
+/// `https` hosts, and nothing counts those. `MAX_REDIRECTS` bounds the hops
+/// inside one request. A rewritten line is not a hop of the request that
+/// wrote it, but a new one the player makes. Every one of those hosts is
+/// reached over TLS, which is the whole of what the one rule promises.
 struct CarriedParams {
     /// What a line the credentials may travel on carries.
     credentialed: String,
     /// What every other line carries: the same, with
     /// [`CREDENTIAL_REQUEST_HEADERS`] left out.
     uncredentialed: String,
-    /// The chain the playlist arrived over, which is what every line is
-    /// judged against -- and the only thing here that decides.
+    /// The chain the playlist arrived over. Every line is judged against
+    /// it, and it is the only thing here that decides.
     chain: CredentialChain,
 }
 
@@ -1427,18 +1430,17 @@ impl CarriedParams {
         }
     }
 
-    /// The same parameters whatever a line names -- what the line tests
-    /// below are written against, since they are about the rewriting and
-    /// not about the credential rule. Both spellings are one string, so
-    /// the chain cannot change the answer; it is here because the type has
-    /// one.
+    /// The same parameters whatever a line names. The line tests below are
+    /// written against this, since they are about the rewriting and not
+    /// about the credential rule. Both spellings are one string, so the
+    /// chain cannot change the answer. It is here because the type has one.
     #[cfg(test)]
     fn everywhere(carried: &str) -> Self {
         Self {
             credentialed: carried.to_string(),
             uncredentialed: carried.to_string(),
-            // Any chain: with one string for both answers, what this
-            // says cannot be observed.
+            // Any chain. With one string for both answers, what this says
+            // cannot be observed.
             chain: CredentialChain::named_by(
                 &Url::parse("https://carried.invalid/").expect("a literal URL"),
             ),
@@ -1451,10 +1453,10 @@ impl CarriedParams {
 ///
 /// `nest("/proxy", ...)` cannot express all three. It registers the prefix
 /// itself plus a `{*tail}` wildcard beneath it, and a wildcard matches at
-/// least one character -- so `/proxy/` matches neither and is a router-level
-/// `404` before any handler runs, which is exactly the URL the query format
+/// least one character. So `/proxy/` matches neither and is a router-level
+/// `404` before any handler runs. That is exactly the URL the query format
 /// has with no target appended. Rewritten lines are in the path format (see
-/// [`proxied_uri`]); the query format is still read because callers write
+/// [`proxied_uri`]). The query format is still read because callers write
 /// it.
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -1468,9 +1470,9 @@ pub fn router() -> Router<AppState> {
 
 /// `/proxy/?d=<url>`: the whole target in the query, nothing in the path.
 ///
-/// The one format the wildcard above cannot express. Its query carries the
-/// same proxy parameters the Core format carries in its path segment
-/// (`d=`, `h=`, `r=`, `p=`), read by the same parser, because the whole
+/// This is the one format the wildcard above cannot express. Its query
+/// carries the same proxy parameters the Core format carries in its path
+/// segment (`d=`, `h=`, `r=`, `p=`), read by the same parser. The whole
 /// target in one parameter has to be able to say everything a target named
 /// by path can.
 pub async fn proxy_root_handler(
@@ -1485,17 +1487,18 @@ pub async fn proxy_root_handler(
 /// The Core path format, read from the URI rather than from the router's
 /// capture, because the capture is percent-*decoded*.
 ///
-/// Both [`Path`](axum::extract::Path) and `RawPathParams` decode what the wildcard matched, and
-/// the target's path is not ours to decode: `%2F` became a path separator,
-/// `%3F` began a query and everything from a `%23` on was read as a
-/// fragment and lost. Measured end to end, `https://host/a%2Fb/film.mkv`
-/// reached the origin as `GET /a/b/film.mkv` -- a signed link whose path
-/// segment carries a base64 signature gets a 403, and a file named with a
-/// `#` gets a 404. The URI's own path is the target as it came off the wire, so
-/// what the caller encoded is what the origin is asked for. It also means
-/// the `d=`/`h=`/`r=` segment is decoded exactly once, by
-/// `form_urlencoded`: decoding a header value carrying a `%` or a `&` a
-/// second time would lose its meaning.
+/// Both [`Path`](axum::extract::Path) and `RawPathParams` decode what the
+/// wildcard matched, and the target's path is not ours to decode. `%2F`
+/// became a path separator, `%3F` began a query, and everything from a
+/// `%23` on was read as a fragment and lost. Measured end to end,
+/// `https://host/a%2Fb/film.mkv` reached the origin as
+/// `GET /a/b/film.mkv`. A signed link whose path segment carries a base64
+/// signature gets a 403, and a file named with a `#` gets a 404. The URI's
+/// own path is the target as it came off the wire, so what the caller
+/// encoded is what the origin is asked for. It also means the
+/// `d=`/`h=`/`r=` segment is decoded exactly once, by `form_urlencoded`.
+/// Decoding a header value carrying a `%` or a `&` a second time would lose
+/// its meaning.
 pub async fn proxy_handler(
     State(state): State<AppState>,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
@@ -1504,7 +1507,7 @@ pub async fn proxy_handler(
     method: Method,
 ) -> impl IntoResponse {
     // The route this handler serves is `/proxy/{*rest}`, so the prefix is
-    // always there; an empty rest could only come of a router change, and it
+    // always there. An empty rest could only come of a router change, and it
     // answers 400 the way any unparseable target does.
     let rest = uri.path().strip_prefix("/proxy/").unwrap_or_default();
     proxy(state, Some(rest.to_string()), raw_query, headers, method).await
@@ -1514,23 +1517,23 @@ pub async fn proxy_handler(
 /// they name.
 ///
 /// **The one place the `/proxy` URL shape is read.** The handler below uses
-/// it to decide what to fetch, and `crate::stream_numbers` uses it to
-/// decide which stream a client's player URL is about; a second reading of
-/// the same shape is a second answer waiting to disagree with this one.
+/// it to decide what to fetch. `crate::stream_numbers` uses it to decide
+/// which stream a client's player URL is about. A second reading of the
+/// same shape is a second answer waiting to disagree with this one.
 ///
 /// `rest` is what the path held after `/proxy/`, and *that is what decides
-/// the format*: `None` -- nothing in the path -- is the query format
-/// (`/proxy/?d=<url>`), anything else is the Core path format
+/// the format*. `None` (nothing in the path) is the query format
+/// (`/proxy/?d=<url>`). Anything else is the Core path format
 /// (`/proxy/d=<origin>&h=.../<path>`), whose own query belongs to the
-/// target and is folded into it. `None` is a target that will not parse as
-/// a URL, which the handler answers `400`.
+/// target and is folded into it. A `None` result is a target that will not
+/// parse as a URL, which the handler answers `400`.
 pub(crate) fn requested(rest: Option<&str>, raw_query: Option<&str>) -> Option<(ProxyParams, Url)> {
     let params = match rest {
         None => ProxyParams::parse(raw_query.unwrap_or_default()),
         Some(rest) => {
             // The Core path format: /proxy/d=...&h=.../path/to/file. The
             // segment before the first slash is the proxy's own parameters,
-            // everything after it is the target's path.
+            // and everything after it is the target's path.
             let (query_seg, path_seg) = match rest.split_once('/') {
                 Some((q, p)) => (q, p),
                 None => (rest, ""),
@@ -1559,16 +1562,17 @@ pub(crate) fn requested(rest: Option<&str>, raw_query: Option<&str>) -> Option<(
 }
 
 /// `rest` is what the path held after `/proxy/`, and *that is what decides
-/// the format*: `None` -- nothing in the path -- is the query format
-/// (`/proxy/?d=<url>`), anything else is the Core path format
+/// the format*. `None` (nothing in the path) is the query format
+/// (`/proxy/?d=<url>`). Anything else is the Core path format
 /// (`/proxy/d=<origin>&h=.../<path>`).
 ///
-/// Not whether the request's own query has a `d` parameter: the target URL
-/// may own that name too, and a Core-format request for
+/// Whether the request's own query has a `d` parameter does not decide it.
+/// The target URL may own that name too. A Core-format request for
 /// `/proxy/d=<encoded>/film.mkv?d=1&t=2` read that way would take the
-/// target's own `d=1` as the whole target -- fetching it, if it happened to
-/// parse as a URL, *instead of* the target the caller named. The path shape
-/// cannot be spoofed by the target's own query, so the path shape decides.
+/// target's own `d=1` as the whole target. If that happened to parse as a
+/// URL, it would be fetched *instead of* the target the caller named. The
+/// target's own query cannot spoof the path shape, so the path shape
+/// decides.
 async fn proxy(
     state: AppState,
     rest: Option<String>,
@@ -1581,19 +1585,19 @@ async fn proxy(
     // (the Core format), where the parameters are a path segment of their
     // own and the target's path follows them.
 
-    // What the end-of-body line measures against: a player waits for the
+    // What the end-of-body line measures against. A player waits for the
     // origin's first byte as surely as for the last one. See
     // [`ProxyBodyLog`].
     let started = Instant::now();
 
     // Reads, and nothing else. The route is open, so answering under a
     // wildcard CORS would let any page read what it fetched (see
-    // `build_router`), and relaying whatever method it was called with --
-    // the caller's headers and body along with it -- would let any page a
-    // browser on this device had open, and on Android any app at all, make
-    // it `POST` or `DELETE` to whatever the device can reach, in its name.
-    // "Only stremio-core can reach loopback" is not true on a phone.
-    // Players fetch media with `GET` and probe with `HEAD`; `OPTIONS` is
+    // `build_router`). Relaying whatever method it was called with (the
+    // caller's headers and body along with it) would be worse. Any page a
+    // browser on this device had open, and on Android any app at all, could
+    // make it `POST` or `DELETE` to whatever the device can reach, in its
+    // name. "Only stremio-core can reach loopback" is not true on a phone.
+    // Players fetch media with `GET` and probe with `HEAD`. `OPTIONS` is
     // relayed for a player that asks.
     if !matches!(method, Method::GET | Method::HEAD | Method::OPTIONS) {
         return Response::builder()
@@ -1607,23 +1611,23 @@ async fn proxy(
         return (StatusCode::BAD_REQUEST, "Invalid target URL").into_response();
     };
     // The client's name for the player this stream is for, if it minted one
-    // (`p=`). It is ours, not the target's: it never travels to the origin,
+    // (`p=`). It is ours, not the target's. It never travels to the origin,
     // and it is what `ServerHandle::close_proxy_streams` addresses. See
     // [`crate::proxy_streams`].
     let player_token = params.player_token.clone();
 
     // A token that has been closed is not given another stream. ffmpeg
-    // reconnects through the URL it already has -- token and all -- so
-    // without this the close is a stutter rather than an end: measured,
-    // three closes on one live reader produced three fresh origin fetches
-    // at the offsets the closes interrupted. `410 Gone` because that is
-    // exactly what happened: this stream was here and was deliberately
-    // ended. A `404` would read as a target that never existed and send a
-    // client looking for a typo in its URL. The check comes before the
-    // fetch, so a refusal costs the origin nothing -- but it is only the
-    // cheap half of the refusal: the fetch below takes as long as the origin
-    // takes, and the token can be retired while it does. The registration
-    // asks again (see the `attach` below).
+    // reconnects through the URL it already has, token and all. Without
+    // this, the close is a stutter rather than an end. Measured: three
+    // closes on one live reader produced three fresh origin fetches at the
+    // offsets the closes interrupted. `410 Gone`, because that is exactly
+    // what happened: this stream was here and was deliberately ended. A
+    // `404` would read as a target that never existed, and send a client
+    // looking for a typo in its URL. The check comes before the fetch, so a
+    // refusal costs the origin nothing. But it is only the cheap half of the
+    // refusal. The fetch below takes as long as the origin takes, and the
+    // token can be retired while it does. The registration asks again (see
+    // the `attach` below).
     if let Some(token) = player_token.as_deref()
         && state.proxy_streams.is_closed(token)
     {
@@ -1637,8 +1641,8 @@ async fn proxy(
         )
             .into_response();
     }
-    // The player plays a proxied stream now: its play session is off any
-    // torrent file it was on, and what that shared ends as any left
+    // The player plays a proxied stream now. Its play session is off any
+    // torrent file it was on, and what that file shared ends as any left
     // session's does (`enginefs::retention::sessions`).
     if let Some(token) = player_token.as_deref() {
         state
@@ -1647,9 +1651,9 @@ async fn proxy(
     }
 
     let ranged = headers.contains_key(header::RANGE);
-    // Needed before the lookup, not after it: it is an input to the playlist
-    // verdict, and every hit has to reach that verdict before it answers or
-    // narrows anything.
+    // This is needed before the lookup, not after it. It is an input to the
+    // playlist verdict, and every hit has to reach that verdict before it
+    // answers or narrows anything.
     let forced_content_type = forced_content_type(&params.response_headers);
     let cache_entry = state.proxy_cache.entry(
         &method,
@@ -1658,12 +1662,12 @@ async fn proxy(
         &headers,
         state.http_addr,
     );
-    // The whole of what follows -- the lookup, the narrowed conditional
-    // fetch, the stitch guard and the fill's verdict -- is
-    // [`cache_assisted_range`], which `crate::sources::ProxySource` calls
-    // too: an archive member behind a URL is read by the same sequence,
-    // under the same key, so there is one answer to each of these questions
-    // and not two.
+    // The whole of what follows (the lookup, the narrowed conditional
+    // fetch, the stitch guard and the fill's verdict) is
+    // [`cache_assisted_range`]. `crate::sources::ProxySource` calls it too.
+    // An archive member behind a URL is read by the same sequence, under
+    // the same key, so there is one answer to each of these questions and
+    // not two.
     let answer = match cache_assisted_range(
         cache_entry,
         state.http_addr,
@@ -1693,8 +1697,8 @@ async fn proxy(
     } = match answer {
         // The whole of what was asked for is here, and it is ours to send.
         RangeAnswer::Hit(cached) => {
-            // `cache`, because no origin was opened: the one place the
-            // end-of-body line names something that is not a host.
+            // `cache`, because no origin was opened. This is the one place
+            // the end-of-body line names something that is not a host.
             let log = ProxyBodyLog::for_method(started, &method, &url, "cache", &headers);
             return cache_hit_response(
                 &state,
@@ -1707,23 +1711,23 @@ async fn proxy(
         }
         RangeAnswer::Origin(origin) => *origin,
     };
-    // Which host actually answered, which is not always the one the caller
-    // named: a redirect chain ends where it ends. The value
-    // [`cache_assisted_range`]'s trace line states as `answered_by`, said
-    // again by the end-of-body line below so the two read alike.
+    // Which host actually answered. It is not always the one the caller
+    // named, because a redirect chain ends where it ends.
+    // [`cache_assisted_range`]'s trace line states it as `answered_by`. The
+    // end-of-body line below says it again, so the two read alike.
     let answered_by = fetched_url.origin().ascii_serialization();
 
-    // An entity a *player* is reading is one the passes read ahead of, and
-    // this is the one moment that knows how: the URL, the caller's request
-    // headers, and what the origin just said the entity is. Registered on
-    // every relayed answer, so a link whose credentials rotate is fetched
-    // with the latest (`proxy_retention::Prefetcher`).
+    // The passes read ahead of an entity a *player* is reading. This is the
+    // one moment that knows how: the URL, the caller's request headers, and
+    // what the origin just said the entity is. It is registered on every
+    // relayed answer, so a link whose credentials rotate is fetched with
+    // the latest (`proxy_retention::Prefetcher`).
     //
-    // A player, and only a player: the request carries the client's own
+    // A player, and only a player. The request carries the client's own
     // player token (`p=`, which the app puts on every URL it hands mpv --
     // see `proxy_streams`). A request without one is a probe, an index
-    // read, a thumbnail or a test, and fetches exactly what it asked for:
-    // a single sizeable read is enough to give the detector a rate, so the
+    // read, a thumbnail or a test, and fetches exactly what it asked for.
+    // A single sizeable read is enough to give the detector a rate, so the
     // rate cannot be the thing that tells a player from a one-off fetch.
     if let (Some(entry), Some(cacheable), Some(_player)) = (
         cache_entry.as_ref(),
@@ -1731,7 +1735,7 @@ async fn proxy(
         player_token.as_ref(),
     ) {
         // The player's negotiation headers, which are half of the cache
-        // key: the source has to fetch into the entity the player reads.
+        // key. The source has to fetch into the entity the player reads.
         let mut negotiation = HeaderMap::new();
         for (name, value) in crate::proxy_cache::negotiation_headers(&headers) {
             negotiation.insert(name, value.clone());
@@ -1754,18 +1758,17 @@ async fn proxy(
         );
     }
 
-    // A rewritten playlist is the whole resource however it was asked for,
-    // so it is answered `200` even when the origin said `206` -- and a
-    // `HEAD` for it says the same, since what it describes is that same
-    // response.
+    // A rewritten playlist is the whole resource however it was asked for.
+    // So it is answered `200` even when the origin said `206`. A `HEAD` for
+    // it says the same, since what it describes is that same response.
     let mut res_builder = Response::builder().status(if rewritable_body {
         StatusCode::OK
     } else {
         status
     });
 
-    // What the origin said about the *resource*: true of whatever we send
-    // back, because none of it describes the bytes on this hop.
+    // What the origin said about the *resource*. It is true of whatever we
+    // send back, because none of it describes the bytes on this hop.
     let resource_res_headers = ["content-type", "server", "date"];
     for name in resource_res_headers {
         if let Some(value) = res_headers.get(name) {
@@ -1773,20 +1776,20 @@ async fn proxy(
         }
     }
 
-    // A `3xx` still here is one the loop above declined to follow -- a
+    // A `3xx` still here is one the loop above declined to follow: a
     // status outside [`FOLLOWED_REDIRECTS`], a `Location` naming a scheme
-    // this proxy will not fetch, or none at all -- and it is relayed with
-    // its status. Without its `Location` it is relayed with nothing else:
-    // measured, a player got `302 Found`, the CORS headers and
-    // `content-length: 0`, which makes an unfollowable redirect and a
+    // this proxy will not fetch, or none at all. It is relayed with its
+    // status. Without its `Location`, it is relayed with nothing else.
+    // Measured: a player got `302 Found`, the CORS headers and
+    // `content-length: 0`. That makes an unfollowable redirect and a
     // headerless one the same dead end, and neither one diagnosable.
     //
-    // Not rewritten into a proxy URL of our own: we are declining to follow
-    // it, and handing the player a `/proxy/` link to the same place would
-    // be making the request anyway with extra steps -- for a `305` that is
-    // the whole of what must not happen. Absolutised, though, because a
-    // relative `Location` relayed as written is resolved by the client
-    // against *this* server. See [`relayed_location`].
+    // It is not rewritten into a proxy URL of our own. We are declining to
+    // follow it. Handing the player a `/proxy/` link to the same place would
+    // be making the request anyway with extra steps, and for a `305` that is
+    // the whole of what must not happen. It is absolutised, though, because
+    // the client resolves a relative `Location` relayed as written against
+    // *this* server. See [`relayed_location`].
     if status.is_redirection()
         && let Some(location) = res_headers.get(header::LOCATION)
     {
@@ -1794,22 +1797,22 @@ async fn proxy(
             res_builder.header(header::LOCATION, relayed_location(location, &fetched_url));
     }
 
-    // What the origin said about *its own body*: only true of a body we hand
-    // on byte for byte. A rewritten playlist is a different body, so the
-    // origin's own framing must not be copied onto it -- a false
+    // What the origin said about *its own body*. It is only true of a body
+    // we hand on byte for byte. A rewritten playlist is a different body, so
+    // the origin's own framing must not be copied onto it. A false
     // `Content-Length` panics the connection task ("payload claims
-    // content-length of 180, custom content-length header claims 82"), a
-    // false `Transfer-Encoding: chunked` closes it having written nothing,
-    // and only a close-delimited origin survives the copy by accident.
+    // content-length of 180, custom content-length header claims 82"). A
+    // false `Transfer-Encoding: chunked` closes it having written nothing.
+    // Only a close-delimited origin survives the copy by accident.
     // `Accept-Ranges`, `Content-Range`, `ETag` and `Last-Modified` go with
-    // it: they all describe the entity at the origin, and a client that acts
-    // on them -- ranging into the rewritten playlist, or caching it under
-    // the origin's tag -- would be acting on the wrong bytes.
-    // `content-encoding` belongs to the same set and for the same reason: it
+    // it. They all describe the entity at the origin. A client that acts on
+    // them (ranging into the rewritten playlist, or caching it under the
+    // origin's tag) would be acting on the wrong bytes.
+    // `content-encoding` belongs to the same set, for the same reason. It
     // names the coding of *these* bytes, and dropping it would hand the
     // player gzip labelled as identity.
-    // `connection` and `transfer-encoding` are relayed in neither branch:
-    // framing this response is hyper's job, not the origin's.
+    // `connection` and `transfer-encoding` are relayed in neither branch.
+    // Framing this response is hyper's job, not the origin's.
     let relayed_body_res_headers = [
         "accept-ranges",
         "content-encoding",
@@ -1827,24 +1830,24 @@ async fn proxy(
         // not.
         //
         // A `HEAD` takes this branch as well, and so answers with no length
-        // and no claim to ranges: the only honest thing to say about a body
-        // whose length is not known until it has been written.
+        // and no claim to ranges. That is the only honest thing to say about
+        // a body whose length is not known until it has been written.
         res_builder = res_builder.header(header::ACCEPT_RANGES, "none");
     } else {
         for name in relayed_body_res_headers {
             // A body with a cached head in front of it is longer than the
             // one the origin just described, and starts earlier in the
-            // entity. Its own framing is written below instead; relaying the
+            // entity. Its own framing is written below instead. Relaying the
             // origin's here as well would be the two-content-lengths hyper
             // panics on.
             //
-            // Its validators are written below too, and for a reason that is
-            // not framing: relayed from here they are the *fetched*
+            // Its validators are written below too, for a reason that is
+            // not framing. Relayed from here, they are the *fetched*
             // response's, and half the body they would be labelling came off
             // disk. That is the same defect as the splice above, one step
-            // later. What makes any of them truthful is the guard: a stitch
+            // later. The guard is what makes any of them truthful. A stitch
             // that happened has proved the two halves share one validator.
-            // What it has not proved is anything about the origin's *other*
+            // It has not proved anything about the origin's *other*
             // validator, so only the one that was compared goes back out.
             if stitched.is_some()
                 && matches!(
@@ -1885,19 +1888,20 @@ async fn proxy(
 
     if rewriting_playlist {
         // The playlist is rewritten as it arrives, a line at a time, and
-        // handed to hyper as a stream. Nothing measures it: the whole of
-        // the framing trouble this route has had came of buffering the body
-        // so a `Content-Length` could be declared for it, and a body hyper
-        // frames from what is actually written cannot disagree with its own
+        // handed to hyper as a stream. Nothing measures it. All the framing
+        // trouble this route has had came of buffering the body so a
+        // `Content-Length` could be declared for it. A body hyper frames
+        // from what is actually written cannot disagree with its own
         // headers.
         //
         // It is read through the registry, exactly as a media body is, and
-        // that is the point: a live-HLS player refreshing its playlist
+        // that is the point. A live-HLS player refreshing its playlist
         // against an origin that has stopped answering is a read wedged
-        // here, and a close must be able to reach it -- the one read this
-        // feature exists for. Streaming it makes the close plainer still:
-        // the registry's stream *is* the body now, so a close breaks the
-        // player's read directly rather than a drain it is waiting behind.
+        // here. A close must be able to reach it, because that is the one
+        // read this feature exists for. Streaming it makes the close plainer
+        // still. The registry's stream *is* the body now, so a close breaks
+        // the player's read directly rather than a drain it is waiting
+        // behind.
         let Some(chunks) = state
             .proxy_streams
             .attach(player_token.clone(), response.bytes_stream())
@@ -1913,9 +1917,9 @@ async fn proxy(
                 .into_response();
         };
         // Lines resolve against `fetched_url`, where the playlist came
-        // from; which of them may be written with the credentials in `h=`
-        // is a question for `chain`, which knows what the *caller* named
-        // and what the hops since have cost. The two URLs part company at a
+        // from. Which of them may be written with the credentials in `h=`
+        // is a question for `chain`. It knows what the *caller* named and
+        // what the hops since have cost. The two URLs part company at a
         // redirect, and only the first of them says where a line resolves.
         let carried = params.carried(&chain);
         let log = ProxyBodyLog::for_method(started, &method, &url, &answered_by, &headers);
@@ -1927,10 +1931,10 @@ async fn proxy(
     }
 
     // Registered under the client's token, so the client can end this exact
-    // read rather than waiting out a timeout meant for a slow swarm -- or
-    // refused, if the close landed while the origin was still thinking. Same
-    // `410` and for the same reason as the check above: the stream was asked
-    // for, and its client ended it before a byte of it arrived.
+    // read rather than waiting out a timeout meant for a slow swarm. Or
+    // refused, if the close landed while the origin was still thinking. It
+    // is the same `410`, for the same reason as the check above. The stream
+    // was asked for, and its client ended it before a byte of it arrived.
     let Some(registration) = state.proxy_streams.register(player_token.clone()) else {
         tracing::debug!(
             token = player_token.as_deref().unwrap_or_default(),
@@ -1948,22 +1952,22 @@ async fn proxy(
     // around the whole of it.
     //
     // **The writer goes on after the registration is decided, never
-    // before.** `register` can refuse -- the token was retired while the
-    // origin was thinking -- and that refusal serves no bytes at all; a
+    // before.** `register` can refuse (the token was retired while the
+    // origin was thinking), and that refusal serves no bytes at all. A
     // writer started before it would have been committing chunks off a
-    // stream nobody ever read. It goes *under* the registry's stream and not
-    // over it for the other half of the same rule: what the writer sees is
-    // what the player is being served, so a close or a client that vanished
+    // stream nobody ever read. It goes *under* the registry's stream, not
+    // over it, for the other half of the same rule. What the writer sees is
+    // what the player is being served. So a close or a client that vanished
     // ends the fill at the same byte it ends the read (see
     // [`crate::proxy_cache::Filling`], and `proxy_streams::Registration`'s
     // `Drop` for how a vanished client gets here at all). And it goes over
-    // the origin's bytes only, never over the head: what is on disk is not
+    // the origin's bytes only, never over the head. What is on disk is not
     // written again.
     //
     // **The registry's stream goes around the whole body, head included.**
     // Wrapping the origin's stream alone, with the head chained in front,
-    // would leave a close unable to reach a read stuck in the head: `Chain`
-    // never polls its second stream until the first has ended, so a client
+    // would leave a close unable to reach a read stuck in the head. `Chain`
+    // never polls its second stream until the first has ended. A client
     // that vanished during the head would go on receiving the rest of it
     // from disk until the tail was first polled. Wrapped last, the close is
     // polled on every poll of the body, head reads included
@@ -1983,36 +1987,36 @@ async fn proxy(
 }
 
 /// One line of a rewritten playlist, or the line unchanged when there is
-/// nothing in it to rewrite. `carried` is [`ProxyParams::carried`] -- the
-/// `h=`/`p=` the playlist's own URL arrived with, which every line it names
-/// needs too: a segment of an authenticated stream needs the same
+/// nothing in it to rewrite. `carried` is [`ProxyParams::carried`]: the
+/// `h=`/`p=` the playlist's own URL arrived with. Every line it names needs
+/// them too. A segment of an authenticated stream needs the same
 /// authorization the playlist needed, and closing an HLS player has to
 /// break the read in flight, which is a segment. What a segment does *not*
-/// need is the caller's `r=`; see [`ProxyParams::carried`]. It is
-/// [`CarriedParams`] rather than a string because the credentials in `h=`
-/// depend on where the line points -- the choice is made in
-/// [`proxied_uri`], which is where the target is known.
+/// need is the caller's `r=` (see [`ProxyParams::carried`]). It is
+/// [`CarriedParams`] rather than a string, because the credentials in `h=`
+/// depend on where the line points. The choice is made in [`proxied_uri`],
+/// which is where the target is known.
 ///
 /// **Every line that names a resource is rewritten, relative ones
-/// included.** The reference leaves those alone, correctly for itself: a
-/// relative line is resolved by the player against the URL the player asked
-/// for, which under the path format already points back through the proxy.
-/// Two things stop us inheriting that. A redirect moves the directory the
-/// lines are relative to and the player cannot know -- the URL it asked for
-/// is the CDN's, the one the playlist came from is the edge's, and `base`
-/// here is the second (see
+/// included.** The reference leaves those alone, correctly for itself. The
+/// player resolves a relative line against the URL the player asked for,
+/// which under the path format already points back through the proxy.
+/// Two things stop us inheriting that. First, a redirect moves the
+/// directory the lines are relative to, and the player cannot know. The URL
+/// it asked for is the CDN's, the one the playlist came from is the edge's,
+/// and `base` here is the second (see
 /// `a_playlist_reached_through_a_redirect_is_rewritten_against_the_edge`).
-/// And the URL the player asked for carries the caller's `r=`, so a line
+/// Second, the URL the player asked for carries the caller's `r=`. A line
 /// left alone would re-acquire on the segment the very label this rewrite
 /// exists to keep off it. Resolving every line costs bytes in the playlist
 /// and buys both.
 ///
-/// A line is one of three things and the reference reads them the same way:
-/// a tag (`#…`), where only a `URI="…"` attribute names a resource; an
+/// A line is one of three things, and the reference reads them the same
+/// way: a tag (`#…`), where only a `URI="…"` attribute names a resource; an
 /// empty line; or a URI. Where we differ is in *finding* the URI inside a
 /// tag. The reference matches `URI="([^"]+)"` and splices the result back
-/// with `line.replace(uri[1], …)`, which replaces the first occurrence of
-/// that *substring* anywhere in the line -- so
+/// with `line.replace(uri[1], …)`. That replaces the first occurrence of
+/// that *substring* anywhere in the line. So
 /// `#EXT-X-KEY:METHOD=AES-128,IV=0xabc,URI="0xabc"` rewrites the IV and
 /// leaves the key URI alone. The value is spliced by index here, so it is
 /// the attribute that moves and nothing else.
@@ -2046,36 +2050,36 @@ fn rewrite_line<'a>(line: &'a str, base: &Url, carried: &CarriedParams) -> Cow<'
 
 /// The path one URI named by a playlist takes back through this proxy:
 /// `/proxy/d=<origin>&h=…&p=…/<path on that origin>[?<query>]`, with `uri`
-/// resolved against `base` -- the URL the playlist itself came from.
+/// resolved against `base`, the URL the playlist itself came from.
 ///
-/// **The path format, never the `/proxy/?d=<whole url>` query format**: a
+/// **The path format, never the `/proxy/?d=<whole url>` query format.** A
 /// query-format URL has no directory. A media playlist named by a master
 /// one is rewritten like everything else, so the player fetches it at
-/// `/proxy/?d=…media.m3u8` -- and if it then resolved *its* relative lines
-/// against that, `seg-0.ts` would become `/proxy/seg-0.ts` and 404 at our
-/// own router before it ever became a request to the origin. The path
-/// format mirrors the origin's path structure underneath the proxy's
+/// `/proxy/?d=…media.m3u8`. If it then resolved *its* relative lines
+/// against that, `seg-0.ts` would become `/proxy/seg-0.ts`. That would 404
+/// at our own router before it ever became a request to the origin. The
+/// path format mirrors the origin's path structure underneath the proxy's
 /// mount, so a nested playlist's own relative lines land back here at the
 /// right origin.
 ///
-/// All four line forms -- absolute URL, absolute path, protocol-relative
-/// and relative -- go through this one call, because [`Url::join`] already
-/// distinguishes them correctly; a `startsWith("http://")` test misses a
-/// line spelled `HTTP://host/…` or `//host/path`, and a `contains("://")`
-/// test misreads a relative line whose own query carries a scheme as
-/// absolute (see `a_query_that_looks_like_a_url_does_not_make_the_line_absolute`).
+/// All four line forms (absolute URL, absolute path, protocol-relative and
+/// relative) go through this one call, because [`Url::join`] already
+/// distinguishes them correctly. A `startsWith("http://")` test misses a
+/// line spelled `HTTP://host/…` or `//host/path`. A `contains("://")` test
+/// misreads a relative line whose own query carries a scheme as absolute
+/// (see `a_query_that_looks_like_a_url_does_not_make_the_line_absolute`).
 ///
-/// `None` when the line does not resolve to an `http(s)` URL at all -- a
+/// `None` when the line does not resolve to an `http(s)` URL at all: a
 /// `data:` URI, or something that is not a URL. Such a line is left exactly
 /// as the origin wrote it, since there is nothing this proxy could fetch
 /// for it.
 fn proxied_uri(uri: &str, base: &Url, carried: &CarriedParams) -> Option<String> {
-    // A blank URI names nothing. [`Url::join`] disagrees -- it strips the
-    // whitespace and hands back `base` itself -- so a line of spaces, or an
+    // A blank URI names nothing. [`Url::join`] disagrees: it strips the
+    // whitespace and hands back `base` itself. So a line of spaces, or an
     // `URI=""`, would otherwise be rewritten into a proxy URL for the
     // playlist that contains it. (The reference's `URI="([^"]+)"` cannot
     // match an empty one, and a blank line falls out of its URI branch
-    // untouched; this is the same answer for both.)
+    // untouched. This is the same answer for both.)
     if uri.trim().is_empty() {
         return None;
     }
@@ -2083,25 +2087,25 @@ fn proxied_uri(uri: &str, base: &Url, carried: &CarriedParams) -> Option<String>
     if !matches!(target.scheme(), "http" | "https") {
         return None;
     }
-    // This is where the line's target -- and so its scheme and its origin
-    // -- is finally known, which makes it where the caller's credentials
-    // are either written into the line or left out of it.
+    // This is where the line's target, and so its scheme and its origin,
+    // is finally known. So this is where the caller's credentials are
+    // either written into the line or left out of it.
     let carried = carried.for_target(&target);
-    // `d=` is the bare origin and the path rides in the URL's own path,
-    // which is the invariant the path format's handler depends on: it
+    // `d=` is the bare origin, and the path rides in the URL's own path.
+    // The path format's handler depends on that invariant, because it
     // *appends* the request path to `d=`. (The reference instead
-    // *replaces* `d=`'s pathname with the request path, which comes to the
+    // *replaces* `d=`'s pathname with the request path. That comes to the
     // same thing only because its `d=` is always a bare origin too.)
     let mut proxied = format!(
         "/proxy/d={}{carried}{}",
         urlencoding::encode(&target.origin().ascii_serialization()),
         target.path()
     );
-    // The target's own query travels in the rewritten URL's query, where
-    // this route reads it back off the wire and puts it on the origin
-    // request -- a signed CDN URL is a path plus a token, and it is the
-    // token that makes it fetchable. (The reference writes the query into
-    // the line too, and then drops it on the next hop: it assigns
+    // The target's own query travels in the rewritten URL's query. This
+    // route reads it back off the wire and puts it on the origin request. A
+    // signed CDN URL is a path plus a token, and it is the token that makes
+    // it fetchable. (The reference writes the query into the line too, and
+    // then drops it on the next hop. It assigns
     // `dest.search = req.search || ""`, and nothing in its server ever sets
     // `req.search`.)
     if let Some(query) = target.query() {
@@ -2115,11 +2119,11 @@ fn proxied_uri(uri: &str, base: &Url, carried: &CarriedParams) -> Option<String>
 /// reading is not line-oriented after all.
 ///
 /// A streaming rewrite has to keep the bytes since the last `\n` until a
-/// `\n` arrives to complete them, and nothing about a response guarantees
-/// one ever does: a `.m3u8` URL that answers with a megabyte of MPEG-TS is
+/// `\n` arrives to complete them. Nothing about a response guarantees one
+/// ever does. A `.m3u8` URL that answers with a megabyte of MPEG-TS is
 /// enough to make that buffer the whole body. A playlist line is a tag or a
-/// URI, so 64 KiB is orders of magnitude more than any real one; past it,
-/// the bytes are handed on as they came and the rest of that line with
+/// URI, so 64 KiB is orders of magnitude more than any real one. Past it,
+/// the bytes are handed on as they came, and the rest of that line with
 /// them.
 const LONGEST_REWRITABLE_LINE: usize = 64 * 1024;
 
@@ -2127,26 +2131,27 @@ const LONGEST_REWRITABLE_LINE: usize = 64 * 1024;
 ///
 /// The reference streams too, through a `stream.Transform` that keeps the
 /// tail after the last separator in a `partialLine` and prepends it to the
-/// next chunk; this is that, and the reason for it is the same. Buffering
-/// the whole body to measure it was where our framing bugs came from: the
-/// rewritten length had to be declared, so a `Content-Length` had to be
-/// written, and a `206` or a `HEAD` measured the wrong thing. A body handed
-/// to hyper as a stream is framed by hyper from what it actually writes.
+/// next chunk. This is that, for the same reason. Buffering the whole body
+/// to measure it was where our framing bugs came from. The rewritten length
+/// had to be declared, so a `Content-Length` had to be written, and a `206`
+/// or a `HEAD` measured the wrong thing. hyper frames a body handed to it
+/// as a stream from what it actually writes.
 ///
 /// **Line endings are preserved per line**, which is better than the
-/// reference and cheaper. It detects the ending once, from the first chunk
-/// that contains one, and re-emits that for the whole body -- and its
-/// detection has three faults worth naming so nobody ports them back: with
-/// both characters present and `\n` first it returns the literal `"\n\r"`,
-/// an ending that does not exist; it scans the whole buffered chunk, so a
-/// stray `\r` anywhere in a large first chunk mis-detects the body; and
-/// with no terminator in the first chunk at all it splits on `null`, which
-/// JavaScript coerces to the string `"null"`. Splitting on `\n` and putting
-/// back whatever `\r` the line already carried needs none of that, and a
-/// body with mixed endings comes out as it went in. A lone `\r` is not a
-/// line ending here; the HLS specification says lines end `\n` or `\r\n`.
+/// reference and cheaper. The reference detects the ending once, from the
+/// first chunk that contains one, and re-emits that for the whole body. Its
+/// detection has three faults, named here so nobody ports them back. With
+/// both characters present and `\n` first, it returns the literal
+/// `"\n\r"`, an ending that does not exist. It scans the whole buffered
+/// chunk, so a stray `\r` anywhere in a large first chunk mis-detects the
+/// body. With no terminator in the first chunk at all, it splits on `null`,
+/// which JavaScript coerces to the string `"null"`. Splitting on `\n` and
+/// putting back whatever `\r` the line already carried needs none of that,
+/// and a body with mixed endings comes out as it went in. A lone `\r` is
+/// not a line ending here. The HLS specification says lines end `\n` or
+/// `\r\n`.
 struct PlaylistRewriter {
-    /// The URL the playlist came from -- what its lines are relative to.
+    /// The URL the playlist came from, which its lines are relative to.
     base: Url,
     /// [`ProxyParams::carried`]: the `h=`/`p=` every line it writes
     /// carries, in the two spellings a line may have earned.
@@ -2155,7 +2160,7 @@ struct PlaylistRewriter {
     pending: Vec<u8>,
     /// Set when [`pending`](Self::pending) outgrew
     /// [`LONGEST_REWRITABLE_LINE`] and its head has already gone out
-    /// unrewritten: the rest of that one line follows it verbatim.
+    /// unrewritten. The rest of that one line follows it verbatim.
     passing_through: bool,
 }
 
@@ -2169,7 +2174,7 @@ impl PlaylistRewriter {
         }
     }
 
-    /// Every line `chunk` completes, rewritten; the rest is held for the
+    /// Every line `chunk` completes, rewritten. The rest is held for the
     /// chunk that completes it.
     fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
         self.pending.extend_from_slice(chunk);
@@ -2189,10 +2194,10 @@ impl PlaylistRewriter {
     /// What is left when the origin's body ends: the tail after the last
     /// `\n`, rewritten, with **no** terminator added.
     ///
-    /// Which is how the presence or absence of a final newline survives the
-    /// rewrite: unlike `body.lines()`, which cannot tell `"a\nb"` from
-    /// `"a\nb\n"` and invents one for both. The reference's `flush` does the
-    /// same thing for the same reason.
+    /// That is how the presence or absence of a final newline survives the
+    /// rewrite. `body.lines()` cannot tell `"a\nb"` from `"a\nb\n"`, and
+    /// invents one for both. The reference's `flush` does the same thing as
+    /// this, for the same reason.
     fn finish(&mut self) -> Vec<u8> {
         let pending = std::mem::take(&mut self.pending);
         let mut rewritten = Vec::new();
@@ -2215,7 +2220,7 @@ impl PlaylistRewriter {
                 .extend_from_slice(rewrite_line(text, &self.base, &self.carried).as_bytes()),
             // A playlist is UTF-8 by specification, so a line that is not
             // holds no URI to rewrite. It is passed on as it came rather
-            // than through `from_utf8_lossy`: replacing bytes we cannot read
+            // than through `from_utf8_lossy`. Replacing bytes we cannot read
             // with U+FFFD would corrupt them on their way to a player that
             // might have understood them.
             Err(_) => rewritten.extend_from_slice(line),
@@ -2228,11 +2233,11 @@ impl PlaylistRewriter {
 
 /// The origin's playlist as a stream of rewritten chunks.
 ///
-/// Nothing here measures anything, which is the point: the response is
-/// framed by hyper from the bytes actually written. The reference reaches
-/// the same place by hand, deleting `content-length` and forcing
-/// `transfer-encoding: chunked` -- a header we must not set ourselves, and
-/// do not need to.
+/// Nothing here measures anything, which is the point. hyper frames the
+/// response from the bytes actually written. The reference reaches the same
+/// place by hand, deleting `content-length` and forcing
+/// `transfer-encoding: chunked`. That is a header we must not set
+/// ourselves, and do not need to.
 fn rewritten_playlist_body<S, C, E>(
     chunks: S,
     base: Url,
@@ -2251,7 +2256,7 @@ where
                     Some(Ok(chunk)) => {
                         let rewritten = rewriter.push(chunk.as_ref());
                         // A chunk that completes no line has nothing to
-                        // send yet; an empty one on the wire would be a
+                        // send yet. An empty one on the wire would be a
                         // frame that says nothing.
                         if rewritten.is_empty() {
                             continue;
@@ -2289,40 +2294,41 @@ fn rewrite_playlist_carrying(body: &str, base: &Url, carried: CarriedParams) -> 
     String::from_utf8(rewritten).expect("text in, text out")
 }
 
-/// What a cache-assisted ranged read came back with: the disk answered the
-/// whole of it, or the origin was asked for the rest.
+/// What a cache-assisted ranged read came back with. Either the disk
+/// answered the whole of it, or the origin was asked for the rest.
 pub(crate) enum RangeAnswer {
-    /// Every byte the request asked for is on disk. Nothing was fetched and
+    /// Every byte the request asked for is on disk. Nothing was fetched, and
     /// the origin never learned the read happened.
     Hit(crate::proxy_cache::Cached),
-    /// The origin answered. Boxed because it carries a whole response and
-    /// the hit does not, which is the one case `clippy::large_enum_variant`
+    /// The origin answered. It is boxed because it carries a whole response
+    /// and the hit does not. That is the one case `clippy::large_enum_variant`
     /// is actually about.
     Origin(Box<OriginAnswer>),
 }
 
-/// The origin's answer and everything already decided about it: the
-/// verdicts a caller must not reach a second opinion on.
+/// The origin's answer, and everything already decided about it. A caller
+/// must not reach a second opinion on these verdicts.
 pub(crate) struct OriginAnswer {
     /// The origin's response, its body still unread.
     pub(crate) response: reqwest::Response,
-    /// Where the body actually came from, which is where a playlist's
-    /// relative lines resolve -- not where the caller pointed us.
+    /// Where the body actually came from. A playlist's relative lines
+    /// resolve there, not where the caller pointed us.
     pub(crate) fetched_url: Url,
-    /// What the chain has published and what it may still spend: asked
-    /// again of every line of a playlist this response turns out to be.
+    /// What the chain has published and what it may still spend. It is
+    /// asked again of every line of a playlist this response turns out to
+    /// be.
     pub(crate) chain: CredentialChain,
     pub(crate) status: StatusCode,
     pub(crate) res_headers: HeaderMap,
     /// Whether the body this response describes is one we would replace
-    /// with a rewritten playlist -- true of a `HEAD` for such a body too,
-    /// since what it describes is that same response.
+    /// with a rewritten playlist. It is true of a `HEAD` for such a body
+    /// too, since what it describes is that same response.
     pub(crate) rewritable_body: bool,
     /// And whether one is actually being written now, which a `HEAD` is
     /// not.
     pub(crate) rewriting_playlist: bool,
     /// The entity this response describes, when it is one the cache may
-    /// keep -- see [`cacheable_entity`].
+    /// keep (see [`cacheable_entity`]).
     pub(crate) cacheable: Option<CacheableEntity>,
     /// The entry the lookup was made against, still open for the fill.
     pub(crate) entry: Option<crate::proxy_cache::Entry>,
@@ -2332,18 +2338,18 @@ pub(crate) struct OriginAnswer {
 }
 
 /// Why a fetch never produced a response. Each one is a status the route
-/// answers with and an error a source fails its read with; the mapping is
+/// answers with, and an error a source fails its read with. The mapping is
 /// here so the two cannot drift.
 pub(crate) enum FetchFailure {
     /// The process-wide client would not build -- see [`http_client`].
     NoClient,
     /// The origin could not be reached, or dropped the connection.
     Transport(String),
-    /// The chain never stopped redirecting ([`MAX_REDIRECTS`]) -- or an
-    /// origin redirected it back into this server, which is a ring the hop
-    /// count cannot see (each turn through our own `/proxy` is a new
-    /// request with a count of its own) and so is answered as the ring it
-    /// is.
+    /// The chain never stopped redirecting ([`MAX_REDIRECTS`]). Or an
+    /// origin redirected it back into this server. That is a ring the hop
+    /// count cannot see, because each turn through our own `/proxy` is a
+    /// new request with a count of its own. So it is answered as the ring
+    /// it is.
     TooManyRedirects,
 }
 
@@ -2377,9 +2383,8 @@ impl FetchFailure {
     }
 }
 
-/// The stream a proxied body is built as, and the one shape its two halves
-/// -- what came off the disk and what came off the socket -- are chained
-/// in.
+/// The stream a proxied body is built as. Its two halves (what came off
+/// the disk and what came off the socket) are chained in this one shape.
 pub(crate) type ProxiedBody = std::pin::Pin<
     Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>,
 >;
@@ -2396,7 +2401,7 @@ pub(crate) fn origin_body(response: reqwest::Response) -> ProxiedBody {
 /// `body` with the cache writer over it, when the response is one the rules
 /// allow us to keep and there is an entry to keep it under.
 ///
-/// It goes **over the origin's bytes only, never over a cached head**: what
+/// It goes **over the origin's bytes only, never over a cached head.** What
 /// is on disk is not written again.
 pub(crate) fn cache_filling(
     body: ProxiedBody,
@@ -2428,39 +2433,38 @@ pub(crate) fn with_cached_head(
     }
 }
 
-/// **One ranged read of an entity, cache first.** The whole of the path
-/// `/proxy` answers a player's `Range` with once the target is settled: the
-/// lookup, the narrowed conditional fetch for what the disk does not hold,
-/// the guard on joining the two, and the verdict on whether what came back
-/// may be kept.
+/// **One ranged read of an entity, cache first.** This is the whole of the
+/// path `/proxy` answers a player's `Range` with, once the target is
+/// settled. It covers the lookup, the narrowed conditional fetch for what
+/// the disk does not hold, the guard on joining the two, and the verdict on
+/// whether what came back may be kept.
 ///
 /// It is a function rather than a stretch of [`proxy`] because it has a
-/// second caller: [`crate::sources::ProxySource`], which is how a
-/// translated archive member reads the bytes of an archive behind a URL.
-/// A member's read and a player's read are the same read -- same key, same
-/// narrowing, same `If-Range`, same fill -- and two copies of that sequence
-/// would risk drifting into two different answers to the same question.
-/// What the two callers do differ about is what they make of the answer:
-/// the route frames a response around it, the source reads it as a stream
-/// of bytes.
+/// second caller: [`crate::sources::ProxySource`]. That is how a translated
+/// archive member reads the bytes of an archive behind a URL. A member's
+/// read and a player's read are the same read: same key, same narrowing,
+/// same `If-Range`, same fill. Two copies of that sequence would risk
+/// drifting into two different answers to the same question. The two
+/// callers differ only in what they make of the answer. The route frames a
+/// response around it, and the source reads it as a stream of bytes.
 ///
-/// What the cache can do for this request, asked here and nowhere else:
-/// `url` is final by now and no origin socket has been opened, so a hit
-/// answers without one and a partial hit narrows the `Range` the loop
+/// What the cache can do for this request is asked here and nowhere else.
+/// `url` is final by now, and no origin socket has been opened. So a hit
+/// answers without one, and a partial hit narrows the `Range` the loop
 /// below is about to send. `entry` is `None` for a request the cache will
-/// not touch at all -- see [`crate::proxy_cache::ProxyCache::entry`] for
-/// the whole of that list.
+/// not touch at all. See [`crate::proxy_cache::ProxyCache::entry`] for the
+/// whole of that list.
 ///
-/// `self_addr` is this server's own HTTP listener: a redirect hop that
+/// `self_addr` is this server's own HTTP listener. A redirect hop that
 /// names it is refused ([`crate::proxy_cache::names_this_server`]), since
 /// following it would turn one request into an unbounded chain of our own.
 ///
-/// The lookup lists one directory per thousand chunks of the range -- a
-/// few `getdents` for a cached film, still filesystem reads -- so it goes
-/// to the blocking pool rather than onto the reactor.
+/// The lookup lists one directory per thousand chunks of the range. That is
+/// a few `getdents` for a cached film, but still filesystem reads, so it
+/// goes to the blocking pool rather than onto the reactor.
 ///
 /// `source` is what a source that opened the entity itself knows of it
-/// ([`SourceIdentity`]): `None` from the route, which is relaying a
+/// ([`SourceIdentity`]). It is `None` from the route, which is relaying a
 /// stranger's request and knows nothing past the response.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn cache_assisted_range(
@@ -2495,29 +2499,28 @@ pub(crate) async fn cache_assisted_range(
         None => (None, None),
     };
 
-    // **Is this a request whose body we would replace?** Asked of everything
-    // the cache found, before any of it is used for anything, because the
-    // answer decides both of the things a hit can do: answer outright, and
-    // narrow the fetch.
+    // **Is this a request whose body we would replace?** This is asked of
+    // everything the cache found, before any of it is used for anything.
+    // The answer decides both of the things a hit can do: answer outright,
+    // and narrow the fetch.
     //
-    // The store never holds a playlist ([`cacheable_entity`] refuses one),
-    // but whether a stored body *is* one is not decided by the stored bytes
-    // alone: `r=Content-Type:application/x-mpegURL` -- what stremio-core
-    // sends for an HLS stream -- forces the verdict over an origin that
-    // mislabels, and `r=` is deliberately not in the cache key (see
-    // [`is_a_playlist`]). Asking it here, with the same inputs the fetch
-    // would give it, is what makes the key's promise true: the store keeps
-    // origin bytes, and what is done with them is one question with one
-    // answer.
+    // The store never holds a playlist ([`cacheable_entity`] refuses one).
+    // But the stored bytes alone do not decide whether a stored body *is*
+    // one. `r=Content-Type:application/x-mpegURL`, which stremio-core sends
+    // for an HLS stream, forces the verdict over an origin that mislabels.
+    // `r=` is deliberately not in the cache key (see [`is_a_playlist`]).
+    // Asking it here, with the same inputs the fetch would give it, is what
+    // makes the key's promise true. The store keeps origin bytes, and what
+    // is done with them is one question with one answer.
     //
-    // A hit whose answer is "playlist" steps aside **whole**: the entry is
+    // A hit whose answer is "playlist" steps aside **whole**. The entry is
     // dropped, the player's own `Range` goes to the origin unnarrowed, and
     // the response is classified and rewritten the way any fetched one is.
-    // Stepping aside only for a *complete* hit is not enough: a partial hit
+    // Stepping aside only for a *complete* hit is not enough. A partial hit
     // that narrowed the fetch to the bytes it lacked would get back a tail
-    // that is itself a playlist, which the stitch guard below refuses to
-    // join to the head -- so the player would see the origin's raw `206`,
-    // under a `Content-Range` it never asked for, its segment lines pointing
+    // that is itself a playlist. The stitch guard below refuses to join that
+    // to the head. So the player would see the origin's raw `206`, under a
+    // `Content-Range` it never asked for, its segment lines pointing
     // straight at the origin.
     let cached = match cached {
         Some(cached)
@@ -2554,11 +2557,11 @@ pub(crate) async fn cache_assisted_range(
     //
     // And it is asked *conditionally*, under the validator the head is filed
     // by. A narrowed range is only worth asking for while the head it was
-    // narrowed against is still part of the entity; `If-Range` is the one
-    // question that says so, and an origin that honours it answers the whole
-    // of the new entity when the head has gone stale -- which is a correct
-    // answer to the player rather than a tail it did not ask for. It is not
-    // the guard -- an origin is free to ignore it; the guard is the
+    // narrowed against is still part of the entity. `If-Range` is the one
+    // question that says so. An origin that honours it answers the whole of
+    // the new entity when the head has gone stale. That is a correct answer
+    // to the player, rather than a tail it did not ask for. It is not the
+    // guard, because an origin is free to ignore it. The guard is the
     // comparison below, on what actually came back.
     let narrowed = cached.as_ref().map(|cached| {
         (
@@ -2572,15 +2575,15 @@ pub(crate) async fn cache_assisted_range(
     let build_request = |client: &Client, url: &Url, carry_credentials: bool| {
         let mut req_builder = client.request(method.clone(), url.clone());
 
-        // What the player asked for, forwarded as it asked for it -- see
+        // What the player asked for, forwarded as it asked for it. See
         // [`FORWARDED_REQUEST_HEADERS`] for what is on that list and what is
         // not.
         for name in FORWARDED_REQUEST_HEADERS {
             // What is left of the player's `Range` after the cache, in place
             // of the player's own. `RequestBuilder::header` *appends*, so
-            // this has to be a substitution and not an addition beside it:
-            // sending both left the origin to choose, and it chose the first
-            // -- the whole range, which is exactly the fetch the cache was
+            // this has to be a substitution and not an addition beside it.
+            // Sending both left the origin to choose, and it chose the first:
+            // the whole range, which is exactly the fetch the cache was
             // narrowing away.
             if name == "range"
                 && let Some((range, _)) = narrowed.as_ref()
@@ -2589,9 +2592,9 @@ pub(crate) async fn cache_assisted_range(
                 continue;
             }
             // The player's own `if-range` never reaches here with a narrowed
-            // range beside it: a request carrying one is not a request the
-            // cache touches at all ([`crate::proxy_cache::ProxyCache::entry`]
-            // refuses it), so there is nothing of the player's to displace.
+            // range beside it. The cache does not touch a request carrying
+            // one at all ([`crate::proxy_cache::ProxyCache::entry`] refuses
+            // it), so there is nothing of the player's to displace.
             if name == "if-range"
                 && let Some((_, Some(validator))) = narrowed.as_ref()
             {
@@ -2604,8 +2607,8 @@ pub(crate) async fn cache_assisted_range(
         }
 
         // `accept-encoding` is answered here rather than forwarded. This
-        // client has no gzip/brotli/deflate feature, so it decodes nothing,
-        // and a playlist arrives as bytes we cannot rewrite -- while the
+        // client has no gzip/brotli/deflate feature, so it decodes nothing.
+        // A compressed playlist arrives as bytes we cannot rewrite, and the
         // player's own `accept-encoding: gzip` invited exactly that. Asking
         // for `identity` says what we can actually take. An origin that
         // compresses anyway is still relayed honestly: `content-encoding`
@@ -2613,10 +2616,10 @@ pub(crate) async fn cache_assisted_range(
         // headers below).
         req_builder = req_builder.header(header::ACCEPT_ENCODING, "identity");
 
-        // The `h=` overrides last, and replacing rather than adding to what
-        // the player sent: an override that leaves the original in place
+        // The `h=` overrides go last, and replace rather than add to what
+        // the player sent. An override that leaves the original in place
         // is not one. Every hop of a redirect chain is built through here,
-        // so every hop gets them (see the loop below) -- minus the
+        // so every hop gets them (see the loop below), minus the
         // credentials once the chain has stepped down to cleartext.
         req_builder = req_builder.headers(if carry_credentials {
             custom_request_headers.clone()
@@ -2627,66 +2630,66 @@ pub(crate) async fn cache_assisted_range(
     };
 
     // The redirect chain is walked here, one hop at a time, rather than
-    // left to reqwest -- and the reason is `h=`. reqwest's default policy
+    // left to reqwest, and the reason is `h=`. reqwest's default policy
     // strips `Authorization`, `Cookie` and `Proxy-Authorization` on any
-    // cross-host *or cross-port* redirect, which is exactly the shape of an
-    // authenticated stream behind a CDN that hands off to an edge: the
+    // cross-host *or cross-port* redirect. That is exactly the shape of an
+    // authenticated stream behind a CDN that hands off to an edge. The
     // playlist fetched `200` and everything it named `403`, with the origin
-    // logging no credential at all. The reference's answer is structural --
+    // logging no credential at all. The reference's answer is structural:
     // `redirect: "manual"`, its own loop, and
-    // `opts.h.forEach(headers.set(...))` re-applied on every hop -- and this
-    // is that: each hop is built by `build_request`, so each hop carries the
+    // `opts.h.forEach(headers.set(...))` re-applied on every hop. This is
+    // that. Each hop is built by `build_request`, so each hop carries the
     // headers the caller asked for.
     //
     // Say plainly what that costs, because it was chosen and not
-    // overlooked: reqwest's policy calls those three headers sensitive and
-    // drops them across hosts (`remove_sensitive_headers`) precisely so a
-    // redirect cannot walk a credential to a host the caller never named,
-    // and re-applying `h=` per hop gives that protection up. What is left
-    // holding the line is the set of statuses we follow
-    // ([`FOLLOWED_REDIRECTS`]) and the hop bound ([`MAX_REDIRECTS`]): the
+    // overlooked. reqwest's policy calls those three headers sensitive and
+    // drops them across hosts (`remove_sensitive_headers`). It does so
+    // precisely so a redirect cannot walk a credential to a host the caller
+    // never named. Re-applying `h=` per hop gives that protection up. What
+    // is left holding the line is the set of statuses we follow
+    // ([`FOLLOWED_REDIRECTS`]) and the hop bound ([`MAX_REDIRECTS`]). The
     // credential travels only where the *resource* moved, only a bounded
     // number of times, and never to a host an origin nominated as a proxy
-    // to route us through. The header is the addon's and it goes where the
-    // origin sent the resource; that is the trade the caller made by naming
+    // to route us through. The header is the addon's, and it goes where the
+    // origin sent the resource. That is the trade the caller made by naming
     // a header for a stream, and the alternative is the `403`.
     //
     // **One thing that trade does not cover is the wire going cleartext.**
     // [`redirect_target`] takes any `http` or `https` target without
-    // comparing it to the scheme it came from, and a `Location` that
-    // arrived in the clear is not something the origin can be said to have
-    // written. A `302` from `https` to `http` would have the caller's
-    // `Authorization` -- or `Cookie` -- re-applied on a hop anyone on the
-    // path can read: not "the credential goes where the resource went" but
-    // the origin choosing to publish it, and no `403` is avoided by
-    // obliging. A `302` sent *over* cleartext named its target in the clear
-    // too, so whoever could read the credential could also have chosen who
-    // receives it next -- which is why even a target on the very host that
-    // redirected us is not one this hop can trust the answer about, and why
-    // an upgrade back to `https` brings nothing back.
+    // comparing it to the scheme it came from. A `Location` that arrived in
+    // the clear is not something the origin can be said to have written. A
+    // `302` from `https` to `http` would have the caller's `Authorization`
+    // (or `Cookie`) re-applied on a hop anyone on the path can read. That is
+    // not "the credential goes where the resource went". It is the origin
+    // choosing to publish it, and no `403` is avoided by obliging. A `302`
+    // sent *over* cleartext named its target in the clear too. So whoever
+    // could read the credential could also have chosen who receives it
+    // next. That is why even a target on the very host that redirected us
+    // is not one this hop can trust the answer about. It is also why an
+    // upgrade back to `https` brings nothing back.
     //
     // Which hops carry them is therefore not decided here. It is decided by
-    // [`CredentialChain::may_carry_to`], which this loop asks about every
-    // hop and which is asked again, unchanged, about every line of a
-    // playlist the chain comes back with. What it answers is one rule, and
-    // it is the whole of the guarantee: **the credentials leave the origin
-    // the caller named only over `https`.** An `https` chain carries them
-    // across `https` hosts, which is the trade that buys the `403` above
-    // back; any other chain spends them on `url` when the caller named
-    // `url` in the clear -- and by naming it chose to publish them there --
-    // and on nobody else, at any depth, an `https` target included. A chain
-    // that started `https` and stepped down has published nothing and so
-    // spends nothing anywhere. The rest of `h=` still travels either way
-    // (see [`without_credentials`]).
+    // [`CredentialChain::may_carry_to`]. This loop asks it about every hop,
+    // and it is asked again, unchanged, about every line of a playlist the
+    // chain comes back with. What it answers is one rule, and it is the
+    // whole of the guarantee: **the credentials leave the origin the caller
+    // named only over `https`.** An `https` chain carries them across
+    // `https` hosts, which is the trade that buys the `403` above back. Any
+    // other chain spends them on `url` when the caller named `url` in the
+    // clear (and by naming it chose to publish them there), and on nobody
+    // else, at any depth, an `https` target included. A chain that started
+    // `https` and stepped down has published nothing, and so spends nothing
+    // anywhere. The rest of `h=` still travels either way (see
+    // [`without_credentials`]).
     //
     // "Every hop" has to include the ones this route does not make itself.
     // A playlist is rewritten line by line into `/proxy/` URLs the player
-    // then fetches, and each of those lines is written with `h=` on it --
-    // so a chain that ended here is continued, credentials and all, by the
-    // very next request the player makes. The redirect loop and the
-    // rewriter ask the same call ([`CarriedParams::for_target`] is the
-    // other caller) rather than keep two conditions in step by hand -- see
-    // [`CredentialChain`] for why.
+    // then fetches, and each of those lines is written with `h=` on it. So
+    // the very next request the player makes continues a chain that ended
+    // here, credentials and all. The redirect loop and the rewriter ask the
+    // same call ([`CarriedParams::for_target`] is the other caller), rather
+    // than keep two conditions in step by hand. See [`CredentialChain`] for
+    // why.
     //
     // The method is kept across hops, as the reference keeps it. A `303`
     // asks for a `GET` and a browser would give it one, but this route is
@@ -2698,7 +2701,7 @@ pub(crate) async fn cache_assisted_range(
     // Nothing else in this loop decides what a request carries.
     let mut chain = CredentialChain::named_by(url);
     let response = loop {
-        // Asked per hop, and the one question there is to ask: the same
+        // Asked per hop, and the one question there is to ask. The same
         // call decides every line of a playlist this chain returns.
         let carry_credentials = chain.may_carry_to(&fetched_url);
         let Some(client) = http_client() else {
@@ -2712,12 +2715,12 @@ pub(crate) async fn cache_assisted_range(
             Ok(resp) => resp,
             Err(e) => {
                 // `without_url`, because reqwest's `Display` names the URL
-                // it was fetching -- the caller's, credentials and all --
-                // and this string travels: into `/proxy`'s response body,
-                // into the `io::Error` a `ByteSource` read fails with, and
-                // from there into whatever logs that (`routes::archive`
-                // does). The origin is what a field report is read for
-                // anyway; see `routes::util::log_origin`.
+                // it was fetching: the caller's, credentials and all. And
+                // this string travels: into `/proxy`'s response body, into
+                // the `io::Error` a `ByteSource` read fails with, and from
+                // there into whatever logs that (`routes::archive` does).
+                // The origin is what a field report is read for anyway (see
+                // `routes::util::log_origin`).
                 return Err(FetchFailure::Transport(e.without_url().to_string()));
             }
         };
@@ -2726,10 +2729,10 @@ pub(crate) async fn cache_assisted_range(
             break response;
         };
         if crate::proxy_cache::names_this_server(&location, self_addr) {
-            // Back into this server: every turn through our own `/proxy`
+            // Back into this server. Every turn through our own `/proxy`
             // starts a count of its own, so [`MAX_REDIRECTS`] never ends
             // it, and each turn holds a request open while it opens the
-            // next. Refused as the ring it is.
+            // next. It is refused as the ring it is.
             tracing::warn!(
                 target_origin = %url.origin().ascii_serialization(),
                 "a redirect points back into this server; giving up"
@@ -2746,11 +2749,11 @@ pub(crate) async fn cache_assisted_range(
         chain.stepped_to(&location);
         if carry_credentials && !chain.may_carry_to(&location) {
             // At WARN only when there was something to drop, and by header
-            // name rather than value: a stream that now `403`s has to be
+            // name rather than value. A stream that now `403`s has to be
             // diagnosable, and a chain with no credential in it is not an
-            // event. Once per hop that loses them rather than once per
-            // chain, since a chain that is not all `https` may step back
-            // onto the origin the caller named and be carrying them again.
+            // event. It is once per hop that loses them, rather than once
+            // per chain. A chain that is not all `https` may step back onto
+            // the origin the caller named and be carrying them again.
             let dropped: Vec<&str> = custom_request_headers
                 .keys()
                 .map(|name| name.as_str())
@@ -2775,21 +2778,21 @@ pub(crate) async fn cache_assisted_range(
         fetched_url = location;
     };
 
-    // `fetched_url` is where the body actually came from, `url` where the
-    // caller pointed us. A playlist's relative lines are relative to the URL
-    // it *arrived* at: rewriting against the URL we asked for sends every
-    // segment back to the host that redirected us, and to its directory,
-    // which for a CDN-to-edge `302` -- the ordinary HLS deployment -- is
-    // every segment of every stream served that way.
+    // `fetched_url` is where the body actually came from, and `url` is
+    // where the caller pointed us. A playlist's relative lines are relative
+    // to the URL it *arrived* at. Rewriting against the URL we asked for
+    // sends every segment back to the host that redirected us, and to its
+    // directory. For a CDN-to-edge `302`, the ordinary HLS deployment, that
+    // is every segment of every stream served that way.
     let status = response.status();
     let res_headers = response.headers().clone();
 
     // What the origin answered, for the switch that asks (see
-    // [`PROXY_TRACE_TARGET`]). Origins and never URLs: `d=` carries the
+    // [`PROXY_TRACE_TARGET`]). Origins, never URLs. `d=` carries the
     // caller's credentials in its query, and a log is the one place they
-    // must not turn up. The caller's `Range` is safe -- it is a byte
-    // count -- and is half of what tells a player that opened mid-file
-    // from one that could not read the container at all.
+    // must not turn up. The caller's `Range` is safe, because it is a byte
+    // count. It is half of what tells a player that opened mid-file from
+    // one that could not read the container at all.
     tracing::info!(
         target: crate::diagnostics::logging::PROXY_TRACE_TARGET,
         method = %method,
@@ -2816,9 +2819,9 @@ pub(crate) async fn cache_assisted_range(
         "what the origin answered",
     );
 
-    // The origin's own type, beside the caller's forced one from above:
-    // asked separately, see [`forced_content_type`] for why merging them was
-    // the bug.
+    // The origin's own type, beside the caller's forced one from above. It
+    // is asked separately. See [`forced_content_type`] for why merging them
+    // was the bug.
     let origin_content_type = origin_content_type(&res_headers);
     let is_playlist = is_a_playlist(
         url,
@@ -2828,10 +2831,10 @@ pub(crate) async fn cache_assisted_range(
     );
 
     // A body under a content coding we cannot decode is a body we must not
-    // rewrite: the lines are not text yet. We relay it whole instead --
-    // its segment URLs then point straight at the origin, which loses the
-    // `h=` request headers, so say so rather than serving the player a
-    // rewritten playlist made of compressed bytes.
+    // rewrite, because the lines are not text yet. We relay it whole
+    // instead. Its segment URLs then point straight at the origin, which
+    // loses the `h=` request headers. So say so, rather than serve the
+    // player a rewritten playlist made of compressed bytes.
     let content_encoding = res_headers
         .get(header::CONTENT_ENCODING)
         .and_then(|h| h.to_str().ok())
@@ -2839,20 +2842,20 @@ pub(crate) async fn cache_assisted_range(
     let encoded_body =
         !content_encoding.is_empty() && !content_encoding.eq_ignore_ascii_case("identity");
     // Only a body that is actually a playlist is rewritten as one, and a
-    // status code is half of what says so: without it, a 404's error page
-    // served at a `.m3u8` URL would be rewritten line by line and handed
-    // back as a playlist of fabricated proxy URLs -- an origin's "Not
+    // status code is half of what says so. Without it, a 404's error page
+    // served at a `.m3u8` URL would be rewritten line by line. It would be
+    // handed back as a playlist of fabricated proxy URLs: an origin's "Not
     // found" turned into a segment list. Such a status falls through to the
     // plain relay instead.
     // A rewritten body replaces the origin's, so the response has to be one
-    // that *is* the whole body. `status.is_success()` is not enough: a
+    // that *is* the whole body. `status.is_success()` is not enough. A
     // `206` passes it too, and a rewritten fragment of a playlist is a body
-    // whose length is not the length the range promised and whose edge
+    // whose length is not the length the range promised, and whose edge
     // lines are cut in half. A `206` that carries the whole entity is
-    // different, and it is not a corner -- it is what an origin answers the
-    // `Range: bytes=0-` a player opens a stream with -- so it is rewritten
+    // different, and it is not a corner case. It is what an origin answers
+    // the `Range: bytes=0-` a player opens a stream with. So it is rewritten
     // and answered as the `200` it has become. The reference guards none of
-    // this; it rewrites a `206` and relays its `Content-Range` beside a body
+    // this. It rewrites a `206` and relays its `Content-Range` beside a body
     // that no longer matches it.
     let whole_body = status == StatusCode::OK
         || (status == StatusCode::PARTIAL_CONTENT
@@ -2861,18 +2864,18 @@ pub(crate) async fn cache_assisted_range(
                 .and_then(|value| value.to_str().ok())
                 .is_some_and(covers_the_whole_entity));
     // Whether the body this response describes is one we would replace.
-    // Not the same question as whether we are writing one now: a `HEAD`
-    // has no body to rewrite, so it is not rewritten -- but it still
+    // That is not the same question as whether we are writing one now. A
+    // `HEAD` has no body to rewrite, so it is not rewritten. But it still
     // *describes* the resource a `GET` would be answered with, and that is
     // a rewritten playlist.
     //
     // Answering it from the relay branch instead had `HEAD` and `GET`
-    // disagree about the same URL: measured, the `HEAD` advertised the
-    // origin's `Content-Length: 67` and `Accept-Ranges: bytes` while the
-    // `GET` returned 199 chunked bytes and `Accept-Ranges: none`, so a
+    // disagree about the same URL. Measured: the `HEAD` advertised the
+    // origin's `Content-Length: 67` and `Accept-Ranges: bytes`, while the
+    // `GET` returned 199 chunked bytes and `Accept-Ranges: none`. So a
     // player that sized the resource and then sent `Range: bytes=0-66` got
     // a `200` carrying 199. Framing headers for a body we would not serve
-    // are worse than none: every field below is now decided by what the
+    // are worse than none. Every field below is now decided by what the
     // resource *is*, and only the body itself by the method.
     let rewritable_body = is_playlist && !encoded_body && whole_body;
     let rewriting_playlist = rewritable_body && *method != Method::HEAD;
@@ -2891,29 +2894,29 @@ pub(crate) async fn cache_assisted_range(
         );
     }
 
-    // The entity this response describes, when it is one the cache may keep
-    // -- and `None` for every response it may not. See [`cacheable_entity`]
-    // for the list and the reason behind each entry. `is_playlist` and
-    // `encoded_body` are the verdicts already reached above rather than a
-    // second opinion about the same body.
+    // The entity this response describes, when it is one the cache may
+    // keep, and `None` for every response it may not. See
+    // [`cacheable_entity`] for the list and the reason behind each entry.
+    // `is_playlist` and `encoded_body` are the verdicts already reached
+    // above, rather than a second opinion about the same body.
     let cacheable = cache_entry
         .as_ref()
         .and_then(|_| cacheable_entity(status, &res_headers, is_playlist, encoded_body, source));
 
     // Whether the cached head may go in front of what the origin just sent.
     // What has to hold is that the two are parts of **one entity**, adjacent
-    // and in the same coding, and "one entity" is the whole of the question:
+    // and in the same coding. "One entity" is the whole of the question:
     //
     // * the origin **names the same validator** the head is filed under
     //   ([`EntityValidator`]). Length and type cannot say this. A resource
-    //   replaced by one of the same size and type is invisible to both, and
-    //   splicing across that change produces a body half of one generation
-    //   and half of another with nothing anywhere able to notice -- not the
-    //   player, which was told a coherent `Content-Range`, and not this
-    //   store, which has no hash to check its own bytes against. Every other
-    //   way this join can go wrong ends in a read that visibly breaks; this
-    //   one ends in a file that plays and is wrong, which is why it is the
-    //   question the guard is built around;
+    //   replaced by one of the same size and type is invisible to both.
+    //   Splicing across that change produces a body half of one generation
+    //   and half of another, with nothing anywhere able to notice. The
+    //   player cannot, because it was told a coherent `Content-Range`. This
+    //   store cannot, because it has no hash to check its own bytes against.
+    //   Every other way this join can go wrong ends in a read that visibly
+    //   breaks. This one ends in a file that plays and is wrong, which is
+    //   why it is the question the guard is built around;
     // * its `Content-Range` begins exactly where the cache left off, in an
     //   entity of the same length;
     // * it is a `206`, under no content coding, and not a playlist.
@@ -2922,32 +2925,32 @@ pub(crate) async fn cache_assisted_range(
     // the refusal is then logged in.
     //
     // An origin that ignored the narrowed range and sent the whole file
-    // (`200`) is answered honestly: the head is dropped and the origin's own
+    // (`200`) is answered honestly. The head is dropped and the origin's own
     // response relayed, which costs a re-fetch of bytes we held and nothing
     // else. That is also what an origin that honours the `If-Range` above
-    // answers when the head has gone stale, and it is why the condition is
-    // worth sending -- the player gets the whole of the entity that exists
+    // answers when the head has gone stale. It is why the condition is
+    // worth sending: the player gets the whole of the entity that exists
     // now, which is a correct answer to a range request.
     //
     // **The one case that is not free** is an origin that ignored the
     // condition and answered the narrowed range out of a *different* entity.
-    // The head is dropped and its `206` is relayed as it stands, which is an
-    // answer to the narrowed range and not to the one the player asked for;
-    // the player reads the `Content-Range`, finds bytes it did not ask for
-    // and re-reads. That re-read is clean, because the fill below has by then
+    // The head is dropped and its `206` is relayed as it stands. That is an
+    // answer to the narrowed range, not to the one the player asked for. The
+    // player reads the `Content-Range`, finds bytes it did not ask for, and
+    // re-reads. That re-read is clean, because by then the fill below has
     // filed the entity the origin just described and dropped the one it
-    // replaced -- but it is a broken read, it is logged as one, and it is the
+    // replaced. But it is a broken read, and it is logged as one. It is the
     // price of narrowing a range against a store that never revalidates. A
-    // broken read is a price worth paying; a silent splice is not, because
+    // broken read is a price worth paying. A silent splice is not, because
     // nothing downstream could ever find out it had been paid.
     //
-    // A tail that turns out to be a **playlist** costs the same and is not a
-    // stale head either: the hit's classification asked about the type the
-    // store filed, and this one also asks about the URL the body came from,
-    // which only the fetch knows -- a redirect to a `.m3u8` is enough to
-    // turn the verdict over between them. What that answers with is a
-    // playlist fragment relayed unrewritten, which is what a `206` of a
-    // playlist always is here.
+    // A tail that turns out to be a **playlist** costs the same, and is not
+    // a stale head either. The hit's classification asked about the type
+    // the store filed. This one also asks about the URL the body came from,
+    // which only the fetch knows. A redirect to a `.m3u8` is enough to turn
+    // the verdict over between them. What that answers with is a playlist
+    // fragment relayed unrewritten, which is what a `206` of a playlist
+    // always is here.
     let stitched = match cached {
         Some(cached) => {
             match stitch_refusal(
@@ -2960,7 +2963,7 @@ pub(crate) async fn cache_assisted_range(
             ) {
                 None => Some(cached),
                 // Which of the conditions failed, said in the log rather than
-                // left for a reader to work out from the fields -- a refusal
+                // left for a reader to work out from the fields. A refusal
                 // reported as some other refusal is a wrong answer about a
                 // wrong answer.
                 Some(reason) => {
@@ -3020,9 +3023,9 @@ mod tests {
     }
 
     /// A head is joined to a tail only when every field the entity is
-    /// filed under agrees. The name has three -- length, type, validator
-    /// -- and the join asked about two: an origin that answered the same
-    /// tag and the same length under another content type had its tail
+    /// filed under agrees. The name has three (length, type, validator),
+    /// and the join asked about two. An origin that answered the same tag
+    /// and the same length under another content type had its tail
     /// stitched to a head of different bytes.
     #[test]
     fn a_tail_of_another_content_type_is_not_stitched_to_the_head() {
@@ -3115,9 +3118,9 @@ mod tests {
             Some(format!("last-modified:{date}"))
         );
         // A weak tag promises the two representations mean the same, not
-        // that they are the same bytes -- and bytes are the whole of what a
-        // stitch joins. So it is passed over for the date beside it, and on
-        // its own it is nothing.
+        // that they are the same bytes. Bytes are the whole of what a stitch
+        // joins. So it is passed over for the date beside it, and on its own
+        // it is nothing.
         assert_eq!(
             validated(&[("etag", "W/\"v1\""), ("last-modified", date)]),
             Some(format!("last-modified:{date}"))
@@ -3135,10 +3138,10 @@ mod tests {
         );
     }
 
-    /// **Every entity is kept, under the strongest identity there is**: what
-    /// the source supplied, else the origin's validator, else the length
-    /// alone. Only the origin's two read back as a header, so neither of
-    /// the others is ever sent as an `If-Range` or stated on a hit.
+    /// **Every entity is kept, under the strongest identity there is.** That
+    /// is what the source supplied, else the origin's validator, else the
+    /// length alone. Only the origin's two read back as a header, so neither
+    /// of the others is ever sent as an `If-Range` or stated on a hit.
     #[test]
     fn an_entity_with_no_validator_is_kept_by_its_length() {
         let tagged = headers(&[("etag", "\"v1\"")]);
@@ -3165,7 +3168,7 @@ mod tests {
             assert_eq!(EntityValidator::from_filed(filed), None);
         }
 
-        // A bare `206` is kept now: the old rule refused it outright.
+        // A bare `206` is kept now. The old rule refused it outright.
         let bare_range = headers(&[
             ("content-type", "video/mp4"),
             ("content-range", "bytes 0-499/1000"),
@@ -3201,9 +3204,9 @@ mod tests {
     }
 
     /// **A source that checks the entity at its open answers `private`,
-    /// `no-cache` and `max-age=0` itself**; `no-store` is still a refusal,
-    /// and a relayed response with none of that standing is refused as
-    /// before. What Drive's media responses carry is the first kind.
+    /// `no-cache` and `max-age=0` itself.** `no-store` is still a refusal.
+    /// A relayed response with none of that standing is refused as before.
+    /// What Drive's media responses carry is the first kind.
     #[test]
     fn a_checking_source_keeps_what_the_origin_called_private() {
         let drive_like = headers(&[
@@ -3393,11 +3396,10 @@ mod tests {
         );
     }
 
-    /// A protocol-relative line, which the reference's `startsWith("/")`
-    /// branch mangles into `/proxy/<opts>/host/path` -- a path on the
-    /// playlist's own origin, named after the host that was meant to serve
-    /// it. [`Url::join`] knows the form, so it costs us nothing to get
-    /// right.
+    /// A protocol-relative line. The reference's `startsWith("/")` branch
+    /// mangles it into `/proxy/<opts>/host/path`: a path on the playlist's
+    /// own origin, named after the host that was meant to serve it.
+    /// [`Url::join`] knows the form, so it costs us nothing to get right.
     #[test]
     fn a_protocol_relative_line_keeps_the_host_it_names() {
         let rewritten = rewrite_playlist("//cdn.example.org/other/seg-0.ts\n", &base(), "");
@@ -3423,7 +3425,7 @@ mod tests {
         );
     }
 
-    /// The signed URL's whole point: the token in the query is what makes
+    /// The signed URL's whole point. The token in the query is what makes
     /// the segment fetchable, so it has to survive into the line we write
     /// and be there again when the player comes back through it.
     #[test]
@@ -3441,7 +3443,7 @@ mod tests {
         );
     }
 
-    /// The whole reason the lines are written in the path format: a media
+    /// The whole reason the lines are written in the path format. A media
     /// playlist named by a master one keeps its directory under the proxy's
     /// mount, so the relative lines *it* contains resolve to a URL this
     /// route serves. Under the query format they resolved to
@@ -3477,7 +3479,7 @@ mod tests {
     }
 
     /// A blank line, and a tag attribute that names nothing, must not be
-    /// rewritten into a proxy URL for the playlist itself: `Url::join`
+    /// rewritten into a proxy URL for the playlist itself. `Url::join`
     /// strips whitespace and hands back the base, which would otherwise
     /// turn the playlist into one of its own segments.
     #[test]
@@ -3500,7 +3502,7 @@ mod tests {
 
     /// The player's token travels into every line the rewrite writes, so a
     /// segment fetch belongs to the same player as the playlist that named
-    /// it -- otherwise closing an HLS player would close its playlist read
+    /// it. Otherwise closing an HLS player would close its playlist read
     /// and leave the segment in flight, which is the read that matters.
     #[test]
     fn the_player_token_is_carried_into_every_rewritten_line() {
@@ -3521,7 +3523,7 @@ mod tests {
 
     /// The body arriving in chunks that fall wherever the network puts
     /// them, including inside a URI and between the `\r` and the `\n`. What
-    /// comes out is what the whole body would have produced -- that is the
+    /// comes out is what the whole body would have produced. That is the
     /// whole contract of a streaming rewrite.
     #[test]
     fn a_body_split_across_chunks_rewrites_to_the_same_bytes() {
@@ -3542,8 +3544,8 @@ mod tests {
     }
 
     /// Line endings survive per line, `\r\n` and `\n` alike, and a body that
-    /// ended without one still does -- unlike `body.lines()`, which turns a
-    /// CRLF playlist into an LF one and invents a final newline for a body
+    /// ended without one still does. `body.lines()` does not: it turns a
+    /// CRLF playlist into an LF one, and invents a final newline for a body
     /// that had none.
     #[test]
     fn line_endings_come_out_the_way_they_went_in() {
@@ -3566,9 +3568,9 @@ mod tests {
         );
     }
 
-    /// A line that is not UTF-8 holds no URI, and replacing the bytes we
-    /// cannot read with U+FFFD -- what `from_utf8_lossy` over the whole body
-    /// would do -- corrupts them on their way to a player that might have
+    /// A line that is not UTF-8 holds no URI. Replacing the bytes we cannot
+    /// read with U+FFFD (what `from_utf8_lossy` over the whole body would
+    /// do) corrupts them on their way to a player that might have
     /// understood them.
     #[test]
     fn a_line_that_is_not_text_is_passed_on_as_it_came() {
@@ -3582,11 +3584,10 @@ mod tests {
         assert_eq!(out, expected, "the bytes as the origin wrote them");
     }
 
-    /// A body that is not line-oriented at all -- a `.m3u8` URL answering
-    /// with megabytes of MPEG-TS -- must not be held in memory waiting for
-    /// a newline that never comes. Past
-    /// [`LONGEST_REWRITABLE_LINE`] the bytes are handed on as they came,
-    /// and the rest of that line with them.
+    /// A body that is not line-oriented at all (a `.m3u8` URL answering
+    /// with megabytes of MPEG-TS) must not be held in memory waiting for a
+    /// newline that never comes. Past [`LONGEST_REWRITABLE_LINE`], the bytes
+    /// are handed on as they came, and the rest of that line with them.
     #[test]
     fn a_line_too_long_to_be_one_is_handed_on_rather_than_held() {
         let mut rewriter = PlaylistRewriter::new(base(), CarriedParams::everywhere(""));
@@ -3609,8 +3610,8 @@ mod tests {
     }
 
     /// Both URL shapes carry the same four parameters, and one parser reads
-    /// them: the Core format spells them in its path segment, the query
-    /// format -- the one the rewrite writes -- in the query.
+    /// them. The Core format spells them in its path segment. The query
+    /// format, the one the rewrite writes, spells them in the query.
     #[test]
     fn both_url_shapes_are_read_by_the_same_parser() {
         let expected = ProxyParams {
@@ -3641,12 +3642,12 @@ mod tests {
         );
     }
 
-    /// The whole point of [`ProxyParams::carried`]: a segment fetched
+    /// The whole point of [`ProxyParams::carried`]. A segment fetched
     /// through a rewritten line is asked for with the headers the
-    /// playlist's own URL carried -- without it, an authenticated HLS
-    /// stream serves its playlist and 403s every segment.
+    /// playlist's own URL carried. Without it, an authenticated HLS stream
+    /// serves its playlist and 403s every segment.
     ///
-    /// And `r=` stays behind. The playlist is what the caller labelled; a
+    /// And `r=` stays behind. The playlist is what the caller labelled. A
     /// segment carrying that label is MPEG-TS announced as a playlist.
     #[test]
     fn the_headers_are_carried_into_every_rewritten_line_too() {
@@ -3670,15 +3671,15 @@ mod tests {
         );
     }
 
-    /// The one rule, one hop further on: the credentials leave the origin
-    /// the caller named only over `https`, so a line that steps down from
-    /// an `https` playlist to an `http` target is written without them and
+    /// The one rule, one hop further on. The credentials leave the origin
+    /// the caller named only over `https`. So a line that steps down from
+    /// an `https` playlist to an `http` target is written without them, and
     /// one that stays on `https` keeps them.
     ///
     /// A rewritten line is where the loop's guard could otherwise be
-    /// defeated: the player fetches what the playlist names, by itself, so
+    /// defeated. The player fetches what the playlist names, by itself. So
     /// an `Authorization` written into an `http` line is delivered in the
-    /// clear -- to an origin the caller never named, on a line the origin
+    /// clear, to an origin the caller never named, on a line the origin
     /// chose.
     #[test]
     fn a_line_that_steps_down_to_cleartext_is_written_without_the_credentials() {
@@ -3710,22 +3711,22 @@ mod tests {
         );
     }
 
-    /// And once the chain has stepped off `https`, no line gets them back
-    /// -- including one naming `https`. A playlist fetched over cleartext
-    /// is told what to name in the clear too, so an `https` line in it is
-    /// not the caller's `https` origin talking; and the cleartext host that
-    /// serves it is not the origin the caller spent the credential on, so
+    /// And once the chain has stepped off `https`, no line gets them back,
+    /// including one naming `https`. A playlist fetched over cleartext is
+    /// told what to name in the clear too. So an `https` line in it is not
+    /// the caller's `https` origin talking. The cleartext host that serves
+    /// it is not the origin the caller spent the credential on either, so
     /// its own segments are no more armed than anyone else's.
     #[test]
     fn a_playlist_reached_over_cleartext_arms_no_line_with_the_credentials() {
-        // What the caller named -- `https`, so no cleartext line is its
-        // origin -- and `base()`, the cleartext host a redirect landed on,
-        // is where the playlist actually came from.
+        // The caller named an `https` URL, so no cleartext line is its
+        // origin. `base()`, the cleartext host a redirect landed on, is
+        // where the playlist actually came from.
         let requested = Url::parse("https://secure.example.net/master.m3u8").expect("a caller URL");
         let params =
             ProxyParams::parse("d=whatever&h=Authorization%3ABearer+abc&h=User-Agent%3Aaddon%2F1");
-        // The chain: named over `https`, landed on cleartext, so nothing
-        // it names is the origin the credential was spent on.
+        // The chain was named over `https` and landed on cleartext. So
+        // nothing it names is the origin the credential was spent on.
         let mut chain = CredentialChain::named_by(&requested);
         chain.stepped_to(&base());
         let rewritten = rewrite_playlist_carrying(
@@ -3752,20 +3753,20 @@ mod tests {
     /// The exception a cleartext chain earns is one origin's, not the
     /// scheme's, and not the scheme's in the other direction either. A
     /// caller that names an `http://` target has spent the credential on
-    /// exactly that origin, and lines naming it are the only lines of such
-    /// a playlist that may carry it -- at whatever depth, since every line
-    /// is a fresh request and re-arms `h=` from what it was written with.
+    /// exactly that origin. Lines naming it are the only lines of such a
+    /// playlist that may carry it, at whatever depth. Every line is a fresh
+    /// request and re-arms `h=` from what it was written with.
     ///
-    /// The `https` row proves the rewriter and the redirect loop agree: a
-    /// cleartext chain must not arm an `https` line any more than the loop
-    /// would follow that chain onto an `https` hop -- see [`CredentialChain`]
+    /// The `https` row proves the rewriter and the redirect loop agree. A
+    /// cleartext chain must not arm an `https` line, any more than the loop
+    /// would follow that chain onto an `https` hop. See [`CredentialChain`]
     /// for the one predicate both ask.
     ///
     /// Two decisions are pinned here rather than only argued in
-    /// [`CarriedParams`]: a subdomain is a different host, and a different
+    /// [`CarriedParams`]. A subdomain is a different host, and a different
     /// port is a different listener. Both are what [`Url::origin`] already
-    /// says, which is also what `d=` is written with -- and the default
-    /// port spelled out is *not* a different listener.
+    /// says, which is also what `d=` is written with. The default port
+    /// spelled out is *not* a different listener.
     #[test]
     fn a_cleartext_line_carries_the_credentials_only_to_the_origin_the_caller_named() {
         let params =
@@ -3814,15 +3815,15 @@ mod tests {
         }
     }
 
-    /// Which origin is armed follows the caller's URL, not the body's: a
-    /// cleartext `302` makes those two different origins, and keying on the
-    /// body's would have it exactly backwards -- the line home to the host
-    /// the caller named and authenticated to would lose the credential, and
-    /// the redirect target the caller never named would gain it.
+    /// Which origin is armed follows the caller's URL, not the body's. A
+    /// cleartext `302` makes those two different origins. Keying on the
+    /// body's would have it exactly backwards. The line home to the host the
+    /// caller named and authenticated to would lose the credential, and the
+    /// redirect target the caller never named would gain it.
     #[test]
     fn a_cleartext_redirect_does_not_move_which_origin_a_line_may_be_armed_for() {
-        // The caller named A; a cleartext `302` took the fetch to B, so the
-        // playlist's own lines are B's and the credential is A's.
+        // The caller named A, and a cleartext `302` took the fetch to B. So
+        // the playlist's own lines are B's, and the credential is A's.
         let named = Url::parse("http://a.example/live/master.m3u8").expect("the caller's URL");
         let landed = Url::parse("http://b.example/edge/master.m3u8").expect("the redirect target");
         let params =
@@ -3857,15 +3858,15 @@ mod tests {
     }
 
     /// The two callers of the predicate, asked the same question and made
-    /// to give the same answer: for every shape of chain and every shape of
+    /// to give the same answer. For every shape of chain and every shape of
     /// target, what the redirect loop would put on its next hop
     /// ([`CredentialChain::may_carry_to`], which is the call the loop makes)
     /// is what the rewriter puts on a line naming the same target.
     ///
-    /// This is the test for the *defect*, not for the rule -- the rule is
-    /// pinned by the tests around this one. It guards `for_target` staying
-    /// exactly `may_carry_to` and nothing else: should the rewriter ever
-    /// grow a condition of its own again, this fails in whichever direction
+    /// This is the test for the *defect*, not for the rule. The tests around
+    /// this one pin the rule. It guards `for_target` staying exactly
+    /// `may_carry_to` and nothing else. Should the rewriter ever grow a
+    /// condition of its own again, this fails in whichever direction
     /// disagrees, rather than a mismatch surfacing in the field.
     #[test]
     fn the_loop_and_the_rewriter_answer_alike_for_every_chain_and_target() {
@@ -3947,7 +3948,7 @@ mod tests {
         );
     }
 
-    /// Several of them, and the order is the same every time: the rewritten
+    /// Several of them, and the order is the same every time. The rewritten
     /// playlist is a body a player may cache and re-fetch, and two spellings
     /// of the same playlist would be two.
     #[test]
@@ -3966,10 +3967,10 @@ mod tests {
         assert_eq!(rewritten, body);
     }
 
-    /// `r=` is an override: the origin's value for that name goes, rather
+    /// `r=` is an override. The origin's value for that name goes, rather
     /// than the two of them being sent together for the client to choose
-    /// between -- and a client reading the first of two `content-type`s
-    /// read the origin's, which is the value `r=` exists to correct.
+    /// between. A client reading the first of two `content-type`s read the
+    /// origin's, which is the value `r=` exists to correct.
     #[test]
     fn a_custom_response_header_replaces_the_origin_s_own() {
         let builder = Response::builder()
@@ -4005,7 +4006,7 @@ mod tests {
 
     /// `r=` names a header on the resource, not on the hop. The three that
     /// frame the hop are dropped from it exactly as they are dropped from
-    /// the origin's own headers -- an addon that says its film is one byte
+    /// the origin's own headers. An addon that says its film is one byte
     /// long panics hyper in debug and hangs the player in release.
     #[test]
     fn a_custom_response_header_cannot_reframe_the_response() {
@@ -4055,7 +4056,7 @@ mod tests {
     }
 
     /// `r=` is part of the caller's URL, so a web page on the device could
-    /// use it to grant itself the cross-origin read loopback withholds: no
+    /// use it to grant itself the cross-origin read loopback withholds. No
     /// `access-control-*` name gets through.
     #[test]
     fn r_cannot_grant_a_cross_origin_read() {
@@ -4080,8 +4081,8 @@ mod tests {
 
     #[test]
     fn malicious_r_header_value_does_not_panic_and_yields_a_response() {
-        // Simulates parsing r=X-Evil:bad%0d%0aInjected:1 from the proxy URL:
-        // once percent-decoded and split on ':', the value carries a raw
+        // Simulates parsing r=X-Evil:bad%0d%0aInjected:1 from the proxy URL.
+        // Once percent-decoded and split on ':', the value carries a raw
         // newline. Feeding this straight into a response builder via
         // `.header(name, value)` + `.unwrap()` would poison the builder and
         // panic at `.body()`. The validated path must not.
@@ -4132,7 +4133,7 @@ mod tests {
 
     /// The parser under it, which the proxy cache reads a stored entity's
     /// length out of. A range it cannot state all three numbers of is not a
-    /// range: everything downstream does arithmetic with them.
+    /// range, because everything downstream does arithmetic with them.
     #[test]
     fn a_content_range_is_three_numbers_or_nothing() {
         assert_eq!(parse_content_range("bytes 10-40/180"), Some((10, 40, 180)));
@@ -4157,7 +4158,7 @@ mod tests {
     }
 
     /// The four forms a `Location` we are not following can take. Only the
-    /// relative ones are resolved; the rest are the origin's own bytes,
+    /// relative ones are resolved. The rest are the origin's own bytes,
     /// including the `ftp://` this relay exists to preserve as a
     /// diagnostic.
     #[test]
