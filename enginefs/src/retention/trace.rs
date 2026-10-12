@@ -1,22 +1,22 @@
 //! **The retention trace: what a pass decided and why, in the log, under
 //! a setting.**
 //!
-//! Piece counts alone do not say what a pass was deciding or why; this
-//! line-per-entity trace does -- one line per entity per ten seconds, a
-//! line per file on what its reads look like, the budget in force when it
-//! is published, and an immediate line for the one event that should never
-//! happen. A phone opened a 4K film and fetched 1.6 GB to play about a
-//! hundred megabytes before these lines existed to explain why.
+//! Piece counts alone do not say what a pass was deciding or why. This
+//! line-per-entity trace does. It writes one line per entity per ten
+//! seconds, a line per file on what its reads look like, the budget in
+//! force when it is published, and an immediate line for the one event
+//! that should never happen. A phone opened a 4K film and fetched 1.6 GB to
+//! play about a hundred megabytes before these lines existed to explain
+//! why.
 //!
-//! Gated rather than removed, because the lines stay useful whenever
+//! It is gated rather than removed, because the lines stay useful whenever
 //! something else goes wrong. Everything here logs at INFO on the
-//! `enginefs::retention::trace`
-//! target, and the server's log filter carries that target at `off` unless
-//! the `diagnosticsTrace` setting turns it on
-//! (`stream_server::diagnostics::logging::set_diagnostics_trace`), at which
-//! point it reaches the app's Diagnostics log without a debug build or an
-//! environment variable. Nothing here checks the setting: a disabled target
-//! is refused at the call site by `tracing` itself, and the tests that read
+//! `enginefs::retention::trace` target. The server's log filter carries
+//! that target at `off` unless the `diagnosticsTrace` setting turns it on
+//! (`stream_server::diagnostics::logging::set_diagnostics_trace`). Then it
+//! reaches the app's Diagnostics log without a debug build or an
+//! environment variable. Nothing here checks the setting. `tracing` itself
+//! refuses a disabled target at the call site, and the tests that read
 //! these lines install their own subscriber.
 //!
 //! The two numbers that are always on are [`crate::retention::TorrentStreamNumbers`]'s
@@ -31,14 +31,14 @@ use std::time::{Duration, Instant};
 use crate::retention::CacheBudget;
 
 /// How often one entity may say anything. A pass runs every two seconds
-/// per file, and five of those per line is enough to see a trend without
+/// per file. Five of those per line is enough to see a trend without
 /// making the log the reason the phone is busy.
 const INTERVAL: Duration = Duration::from_secs(10);
 
 /// How long an entity nobody has passed over stays in [`SEEN`]. The map is
-/// keyed by entity and only ever grew: on the proxy that is one entry per
+/// keyed by entity and only ever grew. On the proxy that is one entry per
 /// URL ever proxied, for the life of the process. An entity quiet for this
-/// long is forgotten; if it is passed over again its first line is a
+/// long is forgotten. If it is passed over again, its first line is a
 /// fresh one with no deltas, which is what a new entity gets.
 const STALE: Duration = Duration::from_secs(60);
 
@@ -47,14 +47,14 @@ fn sweep(seen: &mut HashMap<String, Was>, now: Instant) {
     seen.retain(|_, was| now.duration_since(was.at) < STALE);
 }
 
-/// What the backing can say that the owner cannot; `None` for a backing
-/// that counts none of it (the proxy).
+/// What the backing can say that the owner cannot. It is `None` for a
+/// backing that counts none of it (the proxy).
 #[derive(Debug, Clone)]
 pub struct Backing {
     /// What the owner's key is a key *within*, for a key that does not name
-    /// its entity on its own: a torrent's key is a file index, and file 0
-    /// of every torrent is one key. The trace lines -- and [`pass`]'s
-    /// interval and deltas -- are keyed by this and the key together, so two
+    /// its entity on its own. A torrent's key is a file index, and file 0
+    /// of every torrent is one key. The trace lines (and [`pass`]'s
+    /// interval and deltas) are keyed by this and the key together, so two
     /// torrents' counters are never subtracted from each other.
     pub entity: Option<String>,
     /// Bytes this torrent has received from peers, ever.
@@ -67,11 +67,11 @@ pub struct Backing {
     /// Bytes per piece, for turning a lookahead into a piece range.
     pub piece_length: u64,
     /// How many times a staged copy has been opened over a piece the store
-    /// holds -- a backend writing into a piece it was told was finished.
+    /// holds: a backend writing into a piece it was told was finished.
     ///
-    /// Zero on a healthy run, and it stays in the pass line because the
-    /// failure it names has a silent half: a read past the end of the fresh
-    /// staged file shows up as `reading N bytes at X of piece P`, but a read
+    /// It is zero on a healthy run. It stays in the pass line because the
+    /// failure it names has a silent half. A read past the end of the fresh
+    /// staged file shows up as `reading N bytes at X of piece P`. A read
     /// inside a sparse hole in it returns zeros and looks like quiet media.
     /// This number is the only thing that distinguishes them.
     pub staged_over_held: u64,
@@ -81,10 +81,10 @@ pub struct Backing {
 pub struct Pass<'a> {
     /// **Where the entity is being consumed**, from the read-pattern
     /// detector: the head of the stream that has eaten the most of it. The
-    /// readers' own answer only where the detector has none.
+    /// readers' own answer is used only where the detector has none.
     pub playhead: u32,
     /// How many pieces this entity's consumers are asking for between
-    /// them -- what `streams_seen` prints as `want`, totalled.
+    /// them: what `streams_seen` prints as `want`, totalled.
     pub wanted: u32,
     pub held_behind: usize,
     pub held_ahead: usize,
@@ -92,8 +92,8 @@ pub struct Pass<'a> {
     pub budget: CacheBudget,
     /// The largest stream lookahead granted to a reader still open.
     pub lookahead_bytes: u64,
-    /// The bitrate the time caps are sized from -- the entity's size over
-    /// the duration a player stated -- or `None` until one is stated.
+    /// The bitrate the time caps are sized from (the entity's size over
+    /// the duration a player stated), or `None` until one is stated.
     pub bytes_per_second: Option<u64>,
     /// Pieces of the entity this pass stopped wanting.
     pub dropped: usize,
@@ -125,7 +125,8 @@ pub fn name<K: Debug>(key: &K, backing: Option<&Backing>) -> String {
 }
 
 /// One line for one pass over the entity called `name` ([`name`]), at most
-/// one per [`INTERVAL`] as of `now` -- the pass's own clock, never read here.
+/// one per [`INTERVAL`] as of `now`. `now` is the pass's own clock, never
+/// read here.
 pub fn pass(name: &str, now: Instant, sample: Pass<'_>) {
     let held = sample.held_behind + sample.held_ahead;
     let (fetched, verified) = sample
@@ -175,10 +176,10 @@ pub fn pass(name: &str, now: Instant, sample: Pass<'_>) {
         staged_over_held = sample.backing.map(|backing| backing.staged_over_held),
         fetched_since,
         verified_since,
-        // Fetched over this interval and not vouched for by a piece hash:
-        // chunks still in flight, the second copy of a chunk asked of a
-        // fast peer on purpose, and what was really thrown away, with
-        // nothing here telling the three apart. A level, not a verdict.
+        // Fetched over this interval and not vouched for by a piece hash.
+        // That is chunks still in flight, the second copy of a chunk asked
+        // of a fast peer on purpose, and what was really thrown away.
+        // Nothing here tells the three apart. A level, not a verdict.
         unverified_since = fetched_since.saturating_sub(verified_since),
         held_since,
         "retention pass"
@@ -190,16 +191,16 @@ pub fn pass(name: &str, now: Instant, sample: Pass<'_>) {
 ///
 /// **This is the plan and not the outcome**, and the difference has cost
 /// two wrong diagnoses. The decision is taken against the entity's own
-/// window; the door is asked again at every unlink ([`Door::refuses`]),
-/// against the set the pass published -- one bit per piece, covering
-/// everything this entity's consumers are being fetched for and every
-/// promise an open read has been made -- and a piece in it is cut out of
+/// window. The door is asked again at every unlink ([`Door::refuses`]),
+/// against the set the pass published. That set is one bit per piece,
+/// covering everything this entity's consumers are being fetched for and
+/// every promise an open read has been made. A piece in it is cut out of
 /// the run there. So a line here is a piece the pass would have taken had
-/// nothing been reading it, which is the ordinary case, and may well have
-/// deleted nothing.
+/// nothing been reading it. That is the ordinary case, and it may well
+/// have deleted nothing.
 ///
-/// What says whether anything went is `unlinked` on the pass line that
-/// follows. Read the two together or not at all.
+/// `unlinked` on the pass line that follows says whether anything went.
+/// Read the two together or not at all.
 ///
 /// [`Door::refuses`]: super::owner::Door::refuses
 pub fn planned_to_reclaim_inside_a_lookahead(
@@ -221,7 +222,7 @@ pub fn planned_to_reclaim_inside_a_lookahead(
 }
 
 /// Where the published budget came from, said once per publication. The
-/// pass reports the number in force; this is the only place that knows
+/// pass reports the number in force. This is the only place that knows
 /// whether it is the operator's `cacheSize` or what the volume had left.
 pub fn budget_published(bytes: Option<u64>, configured: Option<u64>, from_disk: Option<u64>) {
     let source = match (configured, from_disk) {
@@ -258,13 +259,13 @@ pub struct StreamsSeen<'a> {
     /// want-windows the pass keeps and fetches.
     pub want: &'a [std::ops::Range<u32>],
     /// What this entity was allowed to hold when that was sized: what it
-    /// holds now plus the volume's headroom. Without it a narrow want set
-    /// cannot be told apart -- a slow start, a share squeezed by another
-    /// stream, and a disk with nothing left all look the same.
+    /// holds now plus the volume's headroom. Without it the causes of a
+    /// narrow want set cannot be told apart. A slow start, a share squeezed
+    /// by another stream, and a disk with nothing left all look the same.
     pub allowed: u64,
-    /// How many pieces of this file its streams are holding -- the size of
-    /// the answer the door would get from the published set, beside the
-    /// windows it was computed from.
+    /// How many pieces of this file its streams are holding. That is the
+    /// size of the answer the door would get from the published set,
+    /// beside the windows it was computed from.
     pub exempt: u32,
     /// How many pieces the LRU is watching.
     pub tracked: usize,
@@ -296,9 +297,9 @@ pub fn streams_seen(seen: StreamsSeen<'_>) {
     );
 }
 
-/// The pass handed the backend a new split depth; see
-/// [`super::deadline`]. Logged on change only, so a stream that has settled
-/// says nothing.
+/// The pass handed the backend a new split depth (see
+/// [`super::deadline`]). It is logged on change only, so a stream that has
+/// settled says nothing.
 pub fn deadline_depth(
     info_hash: &str,
     depth: usize,
@@ -318,7 +319,7 @@ pub fn deadline_depth(
     );
 }
 
-/// The player reported buffering while playing; `counted` says whether it
+/// The player reported buffering while playing. `counted` says whether it
 /// went into the stalls that deepen the split, or was read as the viewer's
 /// window still filling after an open or a seek. See
 /// [`crate::engine::Engine::player_stalled`].
@@ -356,9 +357,9 @@ mod tests {
         assert!(seen.contains_key("fresh"));
     }
 
-    /// File 0 of one torrent and file 0 of another are two entities: the
+    /// File 0 of one torrent and file 0 of another are two entities. The
     /// name the lines, the interval and the deltas are keyed by carries the
-    /// torrent, and a backing that names none is keyed by its key alone.
+    /// torrent. A backing that names none is keyed by its key alone.
     #[test]
     fn a_key_is_named_within_the_entity_its_backing_names() {
         let backing = |entity: &str| Backing {

@@ -4,51 +4,52 @@
 //! The backend (`librqbit`, the fork's `CLAIMS.md`) splits the first few
 //! pieces ahead of a reader into claims any faster peer may join, and asks
 //! for them before anything deeper. A fixed depth of two holds only while a
-//! piece arrives in less than a piece of playback: on a slow swarm, 4 MiB
-//! pieces completing in two to twelve seconds against 1.2 s of playback
-//! each walk the reader into piece after piece still in flight, waiting
-//! each time on its slowest claim, with splitting only beginning about a
-//! second before the reader arrives, on pieces that needed six.
+//! piece arrives in less than a piece of playback. Take a slow swarm, with
+//! 4 MiB pieces completing in two to twelve seconds against 1.2 s of
+//! playback each. It walks the reader into piece after piece still in
+//! flight, waiting each time on its slowest claim. Splitting only begins
+//! about a second before the reader arrives, on pieces that needed six.
 //!
 //! The backend knows how long its pieces take (the median of the last
-//! sixty-four completed, whole and split alike) but not how fast the reader
-//! eats them or that the player has stopped; this crate knows both, so the
-//! depth is decided here, on every pass, and applied when it changes:
+//! sixty-four completed, whole and split alike). It does not know how fast
+//! the reader eats them or that the player has stopped. This crate knows
+//! both, so the depth is decided here, on every pass, and applied when it
+//! changes:
 //!
-//! * **Start at the median.** A piece takes the median to arrive; the
-//!   reader plays a piece in `piece_length / bitrate` seconds; so the split
+//! * **Start at the median.** A piece takes the median to arrive, and the
+//!   reader plays a piece in `piece_length / bitrate` seconds. So the split
 //!   has to begin `ceil(median / seconds_per_piece)` pieces ahead for the
-//!   piece to be whole when the reader gets there. Never fewer than
+//!   piece to be whole when the reader gets there. It is never fewer than
 //!   [`FLOOR`], which is what the constant was. The median is of every
-//!   piece on purpose: until the split reaches it a piece is one peer's
-//!   whole reservation, so what whole pieces take is the time to cover,
-//!   and a median of split pieces alone -- several peers filling each at
-//!   once -- measured the mode it was sizing and shrank the depth back to
-//!   a second before the reader.
+//!   piece on purpose. Until the split reaches it, a piece is one peer's
+//!   whole reservation, so what whole pieces take is the time to cover. A
+//!   median of split pieces alone (several peers filling each at once)
+//!   measured the mode it was sizing. It shrank the depth back to a second
+//!   before the reader.
 //! * **One more per stall.** The player says when it has shown its
-//!   buffering popup after having played -- the one signal that the
+//!   buffering popup after having played. That is the one signal that the
 //!   arithmetic above was not enough, whatever the reason. Each such stall
 //!   adds a piece for the rest of that video.
 //! * **Never past the lookahead.** The split pieces are asked for before
-//!   the rest of the window; a depth past the window is the whole window
-//!   split, which is every piece cut into sixteen and nobody fetching whole.
-//!   The ceiling is the stream's lookahead in pieces -- bitrate times the
-//!   seconds the viewer's profile buys, over the piece length.
-//! * **Reset per video.** The stalls are this video's: a new player on the
+//!   the rest of the window. A depth past the window is the whole window
+//!   split: every piece cut into sixteen and nobody fetching whole. The
+//!   ceiling is the stream's lookahead in pieces: bitrate times the seconds
+//!   the viewer's profile buys, over the piece length.
+//! * **Reset per video.** The stalls are this video's. A new player on the
 //!   torrent starts the count again, since the next episode's swarm is the
 //!   same but its bitrate is not necessarily.
-//! * **Up freely, down a piece a pass.** A rising median is the signal --
+//! * **Up freely, down a piece a pass.** A rising median is the signal:
 //!   pieces are taking longer and the split has to start earlier now. A
-//!   falling one can wait: the depth the backend holds shrinks by one per
-//!   pass towards what the arithmetic asks, so a median that dips for a
-//!   few passes (the fast split pieces of a seek's burst filling the ring)
-//!   does not pull the split zone out from under pieces already cut. On the
+//!   falling one can wait. The depth the backend holds shrinks by one per
+//!   pass towards what the arithmetic asks. So a median that dips for a few
+//!   passes (the fast split pieces of a seek's burst filling the ring) does
+//!   not pull the split zone out from under pieces already cut. On the
 //!   arithmetic alone the depth has been measured to flap
 //!   7-3-4-5-6-8-5-4-3 in forty seconds.
 //!
-//! Where no length has been stated there is no bitrate, so no median-derived
-//! depth and no ceiling: the floor plus the stalls stands, as the constant
-//! did before the player had said how long the film is.
+//! Where no length has been stated there is no bitrate, so there is no
+//! median-derived depth and no ceiling. The floor plus the stalls stands, as
+//! the constant did before the player had said how long the film is.
 
 use std::time::Duration;
 
@@ -60,10 +61,11 @@ pub const FLOOR: usize = 2;
 /// pass knows.
 ///
 /// `median` is the backend's median completion of a piece, `None` before
-/// it has finished any; `bitrate` the film's own, `None` before a
-/// player has stated a length; `lookahead_seconds` the seconds of film the
-/// viewer's buffer profile buys; `stalls` how many times this video's
-/// player has reported buffering after having played. Never zero.
+/// it has finished any. `bitrate` is the film's own, `None` before a
+/// player has stated a length. `lookahead_seconds` is the seconds of film
+/// the viewer's buffer profile buys. `stalls` is how many times this
+/// video's player has reported buffering after having played. The result
+/// is never zero.
 pub fn depth(
     median: Option<Duration>,
     piece_length: u64,
@@ -91,25 +93,25 @@ pub fn depth(
     ceiling.map_or(asked, |ceiling| asked.min(ceiling)).max(1)
 }
 
-/// **This video's stalls, and the depth last handed down** -- what the
-/// pass keeps between two readings so it applies a depth only when it
-/// changes, and lets it fall no faster than a piece a pass.
+/// **This video's stalls, and the depth last handed down.** The pass keeps
+/// these between two readings, so it applies a depth only when it changes
+/// and lets it fall no faster than a piece a pass.
 ///
-/// One per torrent, not per file: the split depth is the torrent's (it is
-/// the piece tracker's), and a torrent plays one video at a time -- which
-/// may be read from more than one of its files, a film and an external
-/// audio track, each pass sizing the depth from its own file's bitrate, so
-/// what each asked is kept and the most of them settles. Kept on
-/// the read-pattern detector because that is the one thing the engine, which
-/// hears from the player, and its backing, which runs the pass, already
-/// share.
+/// There is one per torrent, not per file. The split depth is the
+/// torrent's (it is the piece tracker's), and a torrent plays one video at
+/// a time. That video may be read from more than one of its files, such as
+/// a film and an external audio track. Each pass sizes the depth from its
+/// own file's bitrate, so what each asked is kept and the most of them
+/// settles. It is kept on the read-pattern detector because that is the
+/// one thing the engine (which hears from the player) and its backing
+/// (which runs the pass) already share.
 #[derive(Debug, Default)]
 pub struct DeadlineDepth {
     stalls: usize,
     applied: Option<usize>,
     /// What each file's last pass asked for, by file index. One depth
     /// serves every file of the torrent, and each file's pass sizes it from
-    /// its own bitrate: a film asking six and its external audio track
+    /// its own bitrate. A film asking six and its external audio track
     /// asking two, settled one pass after the other, flapped the depth
     /// 6/5/6/5. The depth is the most any file still being read asks.
     asked_by: std::collections::HashMap<usize, usize>,
@@ -131,15 +133,16 @@ impl DeadlineDepth {
         self.stalls
     }
 
-    /// The depth to hand the backend given that the arithmetic asks for
-    /// `asked`: `asked` itself when it is no lower than what the backend
-    /// holds, one less than the backend holds when it is -- and `None` when
-    /// that is what the backend holds already, so the caller applies only a
-    /// change. The first reading always applies as asked: the backend's own
-    /// default is not this crate's to assume.
+    /// The depth to hand the backend, given that the arithmetic asks for
+    /// `asked`. It is `asked` itself when that is no lower than what the
+    /// backend holds, and one less than the backend holds when it is lower.
+    /// It is `None` when that is what the backend holds already, so the
+    /// caller applies only a change. The first reading always applies as
+    /// asked, because the backend's own default is not this crate's to
+    /// assume.
     ///
     /// `file` is whose pass this is, and `reading` says which files are
-    /// still being read: what those asked stands beside this, and the most
+    /// still being read. What those asked stands beside this, and the most
     /// of them is what settles. A file nothing reads any more asks nothing.
     pub fn settle_for(
         &mut self,
@@ -187,9 +190,9 @@ mod tests {
         );
     }
 
-    /// A piece plays for 1.18 s; a six-second median needs the split to
-    /// start six pieces ahead -- 5.1, rounded up -- and a median under a
-    /// piece of playback stays at the floor.
+    /// A piece plays for 1.18 s. A six-second median needs the split to
+    /// start six pieces ahead (5.1, rounded up). A median under a piece of
+    /// playback stays at the floor.
     #[test]
     fn the_median_is_measured_in_pieces_of_playback_rounded_up() {
         assert_eq!(

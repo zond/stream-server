@@ -4,17 +4,18 @@
 //! candidate chunk on the proxy, from a blocking thread, at the instant of
 //! every unlink. Taking the entity's state lock and walking its readers for
 //! each ask is affordable only while the answer is one piece of arithmetic
-//! over one window, not as a walk of a stream table, and a lock taken per
-//! chunk on a blocking thread would be a contention point on the path that
-//! is already the slowest thing a pass does.
+//! over one window. It is not affordable as a walk of a stream table. A
+//! lock taken per chunk on a blocking thread would also be a contention
+//! point on the path that is already the slowest thing a pass does.
 //!
-//! So the answer is published instead: one bit per piece, written only by
-//! the owner and only under its own lock, read by the door with a load and
-//! a mask. For the field's film that is 5,566 bits -- 87 words, 696 bytes.
+//! So the answer is published instead: one bit per piece. Only the owner
+//! writes it, and only under its own lock. The door reads it with a load
+//! and a mask. For the field's film that is 5,566 bits: 87 words, 696
+//! bytes.
 //!
 //! **The door never writes it.** "A stream dies when its region is
 //! evicted" reads like a write from the reclaim, and the reclaim holds no
-//! turn; two unordered writers to one piece of state is exactly the defect
+//! turn. Two unordered writers to one piece of state is exactly the defect
 //! class this owner's design rules out everywhere else. The door refuses
 //! or does not refuse, and the owner alone decides what the bits say.
 
@@ -62,8 +63,8 @@ impl Exempt {
 
     /// Publish exactly `runs` as exempt, and nothing else.
     ///
-    /// Whole-cloth rather than incrementally, because an incremental update
-    /// is two readings of a set that changed in between -- which is the
+    /// It is whole-cloth rather than incremental, because an incremental
+    /// update is two readings of a set that changed in between. That is the
     /// shape of defect this owner keeps finding. The cost is writing 87
     /// words a pass on the field's film, which is nothing beside the
     /// listing the pass has just done.
@@ -71,9 +72,9 @@ impl Exempt {
     /// The whole set is computed before any of it is stored, and stored a
     /// word at a time. Clearing first and setting after would flicker every
     /// piece that is exempt before and after the call through a moment of
-    /// not-exempt, and a door asking in that moment would allow an unlink
-    /// it should have refused; this way a piece only ever reads as clear
-    /// when it is genuinely leaving.
+    /// not-exempt. A door asking in that moment would allow an unlink it
+    /// should have refused. This way a piece only ever reads as clear when
+    /// it is genuinely leaving.
     pub fn publish(&self, runs: &[Range<u32>]) {
         let mut next = vec![0u64; self.words.len()];
         for run in runs {
@@ -91,19 +92,19 @@ impl Exempt {
 
     /// Hold one more region, on top of whatever is published.
     ///
-    /// **For a promise**, which is made between passes: a parked read is
+    /// **For a promise**, which is made between passes. A parked read is
     /// told which pieces are coming, and those may not be unlinked whatever
-    /// the streams are doing. Never clears, because a caller that cleared
-    /// would be a second writer deciding something is over; the next
-    /// [`Self::publish`] is what takes it away, and the pass that publishes
+    /// the streams are doing. It never clears, because a caller that
+    /// cleared would be a second writer deciding something is over. The
+    /// next [`Self::publish`] takes it away, and the pass that publishes
     /// includes every promise live at that moment.
     ///
-    /// Written by the owner under the entity's lock. `publish` is not: the
-    /// backing publishes from inside its `reading`, with no owner lock
-    /// held, so a promise set while a publication was computing its words
-    /// *is* lost by the store that follows it. What makes the two writers
-    /// safe is the pass re-holding every live promise under the lock at
-    /// its step 5, after it has taken the published set over
+    /// The owner writes this under the entity's lock. `publish` is not
+    /// written that way. The backing publishes from inside its `reading`,
+    /// with no owner lock held. So a promise set while a publication was
+    /// computing its words *is* lost by the store that follows it. The two
+    /// writers are safe because the pass re-holds every live promise under
+    /// the lock at its step 5, after it has taken the published set over
     /// (`Retention::pass`). Every hold made between two passes lands in a
     /// set nothing is publishing into.
     pub fn hold(&self, run: Range<u32>) {
@@ -158,8 +159,8 @@ mod tests {
     }
 
     /// An index past the end of the entity is not exempt, and does not
-    /// panic: the door is asked about whatever the backing offers it, and a
-    /// run clipped to the entity is the owner's business rather than a
+    /// panic. The door is asked about whatever the backing offers it. A run
+    /// clipped to the entity is the owner's business rather than a
     /// precondition on this.
     #[test]
     fn a_piece_the_entity_does_not_have_is_not_held() {

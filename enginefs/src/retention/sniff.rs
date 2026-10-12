@@ -1,33 +1,34 @@
-//! **Whether a file is an archive, by its content**: what decides that a
+//! **Whether a file is an archive, by its content.** This decides that a
 //! play session on it shares nothing.
 //!
 //! The app plays an archive or a disc image in a torrent through a
-//! translated source -- the member is served out of it -- so the file
+//! translated source, which serves the member out of it. So the file
 //! itself is never what plays, and archive playback shares nothing. The
 //! stream route knows the file's name before a byte is read and answers
-//! from it early; a name is a guess (a split `.001`, a disc image named
-//! `.img` or `.bin`, a misnamed archive), so a play session's draw also
-//! waits until the file's first bytes are held and asks them. Nothing is
+//! from it early. A name is a guess (a split `.001`, a disc image named
+//! `.img` or `.bin`, a misnamed archive). So a play session's draw also
+//! waits until the file's first bytes are held, and asks them. Nothing is
 //! announced before the draw, so the wait costs nothing.
 //!
 //! The signatures are the app's own (`xtremio`'s `archive_sniff.dart`,
 //! which is what routes a member at all): RAR 1.5 to 5, ZIP, 7-Zip and
-//! ISO 9660 -- and beside them the two it cannot sniff but the server can
-//! translate, UDF (its volume recognition sequence where ISO 9660's would
-//! be) and TAR (a POSIX or GNU `ustar` header whose checksum adds up: the
-//! magic alone is six bytes a film could carry by chance, and the checksum
-//! is what a tar header always has and a film's bytes do not).
+//! ISO 9660. Beside them are the two the app cannot sniff but the server
+//! can translate. One is UDF: its volume recognition sequence, where ISO
+//! 9660's would be. The other is TAR: a POSIX or GNU `ustar` header whose
+//! checksum adds up. The magic alone is six bytes a film could carry by
+//! chance. The checksum is what a tar header always has and a film's bytes
+//! do not.
 //!
-//! And one the app never routed: a Windows executable (`MZ`), which is
-//! what a self-extracting ZIP starts with -- its end record is at the tail
+//! There is also one the app never routed: a Windows executable (`MZ`).
+//! A self-extracting ZIP starts with one. Its end record is at the tail
 //! like any ZIP's, and the stub in front of it is no film. The server's
 //! `resolve` sniffs with [`containers`] and asks each named translator in
-//! turn, which verifies its own format; a hit nothing indexes is a
-//! refusal there, never a film.
+//! turn, which verifies its own format. A hit nothing indexes is a refusal
+//! there, never a film.
 
-/// How many leading bytes [`is_archive`] needs to see all it can: an ISO
+/// How many leading bytes [`is_archive`] needs to see all it can. An ISO
 /// 9660 or UDF image carries its signature at the start of sector 16,
-/// 32769 bytes in; everything else is in the first few hundred.
+/// 32769 bytes in. Everything else is in the first few hundred.
 pub const HEAD_BYTES: u64 = DESCRIPTOR_AT as u64 + 5;
 
 const DESCRIPTOR_AT: usize = 0x8001;
@@ -35,8 +36,8 @@ const TAR_MAGIC_AT: usize = 257;
 const TAR_CHECKSUM: std::ops::Range<usize> = 148..156;
 const TAR_HEADER: usize = 512;
 
-/// Whether `head` -- a file's first bytes, all of them for a file shorter
-/// than [`HEAD_BYTES`] -- begins an archive or a disc image.
+/// Whether `head` begins an archive or a disc image. `head` is a file's
+/// first bytes, all of them for a file shorter than [`HEAD_BYTES`].
 pub fn is_archive(head: &[u8]) -> bool {
     !containers(head).is_empty()
 }
@@ -45,10 +46,10 @@ pub fn is_archive(head: &[u8]) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Container {
     SevenZ,
-    /// RAR 1.5 to 5; a later volume of a set carries the same signature.
+    /// RAR 1.5 to 5. A later volume of a set carries the same signature.
     Rar,
     /// A ZIP's local header (or its empty-archive or spanned marker), or
-    /// a Windows executable, which a self-extracting ZIP is: only its end
+    /// a Windows executable, which a self-extracting ZIP is. Only its end
     /// record, at the tail, says which.
     Zip,
     Tar,
@@ -83,10 +84,11 @@ pub fn containers(head: &[u8]) -> Vec<Container> {
     .collect()
 }
 
-/// Whether `head` begins with a tar header: the POSIX magic (`ustar\0`) or
-/// GNU's (`ustar  \0`) at 257, and the octal checksum at 148 equal to the
-/// sum of the header's 512 bytes with that field read as spaces -- the
-/// unsigned sum, or the signed one some old writers used.
+/// Whether `head` begins with a tar header. That needs the POSIX magic
+/// (`ustar\0`) or GNU's (`ustar  \0`) at 257. It also needs the octal
+/// checksum at 148 to equal the sum of the header's 512 bytes with that
+/// field read as spaces: the unsigned sum, or the signed one some old
+/// writers used.
 fn is_tar(head: &[u8]) -> bool {
     let Some(header) = head.get(..TAR_HEADER) else {
         return false;
@@ -145,9 +147,9 @@ mod tests {
         head
     }
 
-    /// **Every kind the app routes, and the two it cannot sniff**, found by
-    /// its signature wherever the file is named; a film, a short file and
-    /// a near miss are not.
+    /// **Every kind the app routes, and the two it cannot sniff**, is found
+    /// by its signature wherever the file is named. A film, a short file
+    /// and a near miss are not.
     #[test]
     fn an_archive_is_told_by_its_signature() {
         for head in [
@@ -194,7 +196,7 @@ mod tests {
     }
 
     /// **Each signature names its reader**, so `resolve` asks the one
-    /// translator that can say whether it is right; an executable is a
+    /// translator that can say whether it is right. An executable is a
     /// self-extracting ZIP until the ZIP reader says otherwise.
     #[test]
     fn a_signature_names_the_container_to_try() {

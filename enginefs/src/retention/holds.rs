@@ -1,77 +1,80 @@
-//! **Who keeps a torrent running, said by the holder**: explicit holds,
-//! each with an owner and a lifetime, which the reconciler combines with
-//! the pins and the bodies being delivered rather than guessing from what
-//! was opened last.
+//! **Who keeps a torrent running, said by the holder.** These are explicit
+//! holds, each with an owner and a lifetime. The reconciler combines them
+//! with the pins and the bodies being delivered, rather than guessing from
+//! what was opened last.
 //!
 //! The question "should this torrent run?" used to be answered from two
-//! inferences: the liveness cell ([`crate::retention::live`]) -- the last
-//! entity a stream opened on, which a stream of anything else moves -- and
-//! the reads open on the torrent at the instant of the tick. Neither is
-//! what the app knows. A phone that handed its film to a television had
-//! its own player paused and no read open between the receiver's
-//! requests; any other open (a link through `/proxy`, a subtitle on
-//! another torrent) moved the cell, and the next tick stopped the torrent
-//! the television was waiting on -- measured on a phone,
+//! inferences. One was the liveness cell ([`crate::retention::live`]): the
+//! last entity a stream opened on, which a stream of anything else moves.
+//! The other was the reads open on the torrent at the instant of the tick.
+//! Neither is what the app knows. A phone that handed its film to a
+//! television had its own player paused and no read open between the
+//! receiver's requests. Any other open (a link through `/proxy`, a subtitle
+//! on another torrent) moved the cell. The next tick then stopped the
+//! torrent the television was waiting on. This was measured on a phone:
 //! `torrent_stopped_by_reconciler playing=false` just after a cast began.
 //! The app *knows* the torrent is in use: a player screen is open on it,
 //! or a cast of it is published. So it says so, and the hold lasts exactly
 //! as long as that is true.
 //!
-//! Three kinds, and nothing else writes here but a file's deletion, which
-//! takes a screen's hold and an idle share off it ([`Holds::forget_file`]),
-//! and a cache clear, which overrides every one of them ([`Holds::clear`]):
+//! There are three kinds of hold. Only two other things write here: a
+//! file's deletion takes a screen's hold and an idle share off it
+//! ([`Holds::forget_file`]), and a cache clear overrides every hold
+//! ([`Holds::clear`]). The three kinds:
 //!
-//! * **A player screen** ([`Holds::hold_for_player`]): the torrent the
-//!   viewer's newest screen's own requests named -- the same told play
-//!   that moves the play session ([`crate::retention::sessions`]) -- held
-//!   from that request until the screen says it is gone
+//! * **A player screen** ([`Holds::hold_for_player`]). It holds the torrent
+//!   the viewer's newest screen's own requests named. That is the same told
+//!   play that moves the play session ([`crate::retention::sessions`]). It
+//!   holds from that request until the screen says it is gone
 //!   ([`Holds::release_player`]), however long it is paused or stalled and
-//!   whether or not a read is open. One per viewer: a newer screen of the
-//!   viewer replaces an older one's hold, so a screen that never said
-//!   goodbye (a crash in the app's teardown) holds nothing once the viewer
-//!   plays anything else, and a request of an older screen than the newest
-//!   moves nothing ([`crate::retention::sessions::Heard::Stale`]'s rule).
-//! * **A cast** ([`Holds::hold`] for a published token): from publish to
-//!   unpublish, whatever the receiver is doing. Taken while the screen's
-//!   hold is still there, so a hand-over from the phone to the television
-//!   has no instant in which nothing holds the torrent. A cast published
-//!   with the viewer's play token is that viewer's: publishing it means
-//!   the viewer is watching *it*, so it lets the viewer's idle share go.
-//! * **An idle share** ([`Holds::idle_shares`]): what a viewer watched
-//!   last, after they have left it -- the screen released
+//!   whether or not a read is open. There is one per viewer. A newer screen
+//!   of the viewer replaces an older one's hold. So a screen that never
+//!   said goodbye (a crash in the app's teardown) holds nothing once the
+//!   viewer plays anything else. A request of an older screen than the
+//!   newest moves nothing ([`crate::retention::sessions::Heard::Stale`]'s
+//!   rule).
+//! * **A cast** ([`Holds::hold`] for a published token). It holds from
+//!   publish to unpublish, whatever the receiver is doing. It is taken
+//!   while the screen's hold is still there, so a hand-over from the phone
+//!   to the television has no instant in which nothing holds the torrent. A
+//!   cast published with the viewer's play token is that viewer's.
+//!   Publishing it means the viewer is watching *it*, so it lets the
+//!   viewer's idle share go.
+//! * **An idle share** ([`Holds::idle_shares`]). It is what a viewer
+//!   watched last, after they have left it: the screen released
 //!   ([`Holds::release_player`]) or the cast unpublished (the
-//!   [`TorrentHold`] dropped). The play's hold is not dropped then but
+//!   [`TorrentHold`] dropped). The play's hold is not dropped then. It
 //!   becomes the viewer's idle share on the same torrent, in the same step,
 //!   so the torrent goes on giving back what the viewer took. It is
-//!   released, explicitly, when the viewer starts watching something
-//!   else: a request of a current screen of theirs that names another
-//!   torrent's file ([`Holds::hold_for_player`]) or something that is not
-//!   a torrent ([`Holds::moved_elsewhere`]), or a cast of theirs being
-//!   published. Starting the same film again turns it back into a
-//!   player's hold, under the same lock, with no instant between. One per
-//!   viewer, the last thing they watched: two viewers leave two. A play
-//!   with no viewer -- a cast published without a play token -- leaves
-//!   none. Whether an idle share runs its torrent is not this module's
-//!   question: the reconciler counts one only while idle sharing is
-//!   allowed (`seedingEnabled` on and not held back by the app), read at
+//!   released, explicitly, when the viewer starts watching something else.
+//!   That is a request of a current screen of theirs that names another
+//!   torrent's file ([`Holds::hold_for_player`]) or something that is not a
+//!   torrent ([`Holds::moved_elsewhere`]), or a cast of theirs being
+//!   published. Starting the same film again turns it back into a player's
+//!   hold, under the same lock, with no instant between. There is one per
+//!   viewer, the last thing they watched, so two viewers leave two. A play
+//!   with no viewer (a cast published without a play token) leaves none.
+//!   Whether an idle share runs its torrent is not this module's question.
+//!   The reconciler counts one only while idle sharing is allowed
+//!   (`seedingEnabled` on and not held back by the app). It reads that at
 //!   the moment it asks, so the share outlives the setting going off and
 //!   back on.
 //!
-//! **A cache clear overrides every hold, and says so** ([`Holds::clear`]):
-//! the user asked for everything that streams to stop. Each screen's hold
-//! goes -- the screen is not retired, so its next request holds again --
-//! every idle share goes, and every cast's hold is set aside: still owned
-//! by its publication, it holds nothing from then on, and its unpublish
-//! leaves no idle share. A new hold is never overridden by an old clear:
-//! whoever asks after it -- a screen's request, a cast published -- holds
-//! at once.
+//! **A cache clear overrides every hold, and says so** ([`Holds::clear`]).
+//! The user asked for everything that streams to stop. Each screen's hold
+//! goes, but the screen is not retired, so its next request holds again.
+//! Every idle share goes. Every cast's hold is set aside: still owned by
+//! its publication, it holds nothing from then on, and its unpublish
+//! leaves no idle share. A new hold is never overridden by an old clear.
+//! Whoever asks after it (a screen's request, a cast published) holds at
+//! once.
 //!
 //! **What releases a hold the holder forgot.** Holds live in this process's
-//! memory only, and the server lives inside the app's process: an app that
+//! memory only, and the server lives inside the app's process. An app that
 //! is killed takes every hold with it, and a restart starts with none. A
-//! screen's hold is bounded by the one-per-viewer rule above; a cast's is
-//! an RAII value ([`TorrentHold`]) owned by its publication, which the
-//! listener's stop unpublishes with every other.
+//! screen's hold is bounded by the one-per-viewer rule above. A cast's hold
+//! is an RAII value ([`TorrentHold`]) owned by its publication, and the
+//! listener's stop unpublishes it with every other.
 //!
 //! One lock, never held across an await or around another lock.
 
@@ -121,8 +124,8 @@ struct Inner {
     /// Each viewer's screen hold: the screen number it was taken by (or
     /// none, for a token without one) and what it is on.
     players: HashMap<String, (Option<u64>, On)>,
-    /// Each viewer's newest screen that said it was gone: a request still
-    /// carrying its token (or an older one's) holds nothing -- a cast the
+    /// Each viewer's newest screen that said it was gone. A request still
+    /// carrying its token (or an older one's) holds nothing. A cast the
     /// screen published reads with the screen's token, and must not bring
     /// the screen's hold back after the screen was left. One per viewer.
     closed: HashMap<String, u64>,
@@ -155,12 +158,12 @@ pub struct TorrentHold {
 
 impl Drop for TorrentHold {
     /// The cast is unpublished. A viewer's cast becomes the viewer's idle
-    /// share -- unless the viewer is watching something already: a screen
-    /// of theirs holds a torrent, or another cast of theirs is published.
+    /// share, unless the viewer is watching something already: a screen of
+    /// theirs holds a torrent, or another cast of theirs is published.
     fn drop(&mut self) {
         let mut inner = self.holds.0.lock();
         let held = inner.held.remove(&self.id);
-        // A cast a clear set aside was stopped already: what it leaves is
+        // A cast a clear set aside was stopped already, so it leaves
         // nothing.
         if inner.set_aside.remove(&self.id) {
             return;
@@ -183,10 +186,10 @@ impl Drop for TorrentHold {
 
 impl Holds {
     /// **Hold `info_hash` -- `files` of it, or all when `None` -- until the
-    /// answer is dropped**: what a published cast owns for as long as it is
+    /// answer is dropped.** A published cast owns this for as long as it is
     /// published. `player` is the play token the cast was published with,
-    /// if any: the cast is then that viewer's, which lets the viewer's idle
-    /// share go now (they are watching this) and leaves this torrent as
+    /// if any. The cast is then that viewer's. It lets the viewer's idle
+    /// share go now (they are watching this), and leaves this torrent as
     /// their idle share when it is dropped.
     pub fn hold(
         &self,
@@ -221,13 +224,13 @@ impl Holds {
         }
     }
 
-    /// **The player `token`'s screen is on `files` of `info_hash`**: its
-    /// viewer's hold is on them from now on, replacing whatever that viewer
-    /// held before, the viewer's idle share included -- the viewer is
-    /// watching this now; when it is the same torrent the share simply
-    /// becomes the screen's hold again, in one step -- unless `token` is an
-    /// older screen than the one holding, or a screen that was left, which
-    /// moves nothing. Answers whether the hold is now `token`'s.
+    /// **The player `token`'s screen is on `files` of `info_hash`.** Its
+    /// viewer's hold is on them from now on. It replaces whatever that
+    /// viewer held before, the viewer's idle share included, since the
+    /// viewer is watching this now. When it is the same torrent, the share
+    /// simply becomes the screen's hold again, in one step. An older screen
+    /// than the one holding, or a screen that was left, moves nothing.
+    /// Answers whether the hold is now `token`'s.
     pub fn hold_for_player(&self, token: &str, info_hash: &str, files: Vec<usize>) -> bool {
         let parsed = PlayerToken::parse(token);
         let info_hash = info_hash.to_lowercase();
@@ -266,21 +269,21 @@ impl Holds {
         true
     }
 
-    /// **The player screen `token` is gone**: its viewer's hold is
-    /// released -- if this screen (or an older one) took it; a newer
-    /// screen's hold stays -- and the screen is retired: a later request
-    /// with its token (the cast it published, its player reconnecting)
-    /// holds nothing. The torrent it held becomes the viewer's idle share,
-    /// unless a cast of the viewer's is published, which is what they are
-    /// watching. Answers whether a hold was released.
+    /// **The player screen `token` is gone.** Its viewer's hold is
+    /// released if this screen (or an older one) took it. A newer screen's
+    /// hold stays. The screen is retired, so a later request with its token
+    /// (the cast it published, its player reconnecting) holds nothing. The
+    /// torrent it held becomes the viewer's idle share, unless a cast of the
+    /// viewer's is published, which is what they are watching. Answers
+    /// whether a hold was released.
     pub fn release_player(&self, token: &str) -> bool {
         self.leave_screen(token, true)
     }
 
-    /// **The player `token`'s screen moved off every torrent** -- its
-    /// request named something that is not a torrent (a `/proxy` link, a
-    /// Drive file): the viewer is watching that now, so the screen's hold
-    /// goes, and so does the viewer's idle share. Retires the screen as
+    /// **The player `token`'s screen moved off every torrent.** Its request
+    /// named something that is not a torrent (a `/proxy` link, a Drive
+    /// file). The viewer is watching that now, so the screen's hold goes,
+    /// and so does the viewer's idle share. Retires the screen as
     /// [`Self::release_player`] does. The caller has already found `token`
     /// to be a current screen of the viewer's.
     pub fn moved_elsewhere(&self, token: &str) {
@@ -289,8 +292,8 @@ impl Holds {
     }
 
     /// **The viewer of `player` (a play token) is watching something that
-    /// is not a torrent** -- a cast of a link published with their token:
-    /// their idle share goes. No screen is touched.
+    /// is not a torrent**, such as a cast of a link published with their
+    /// token. Their idle share goes. No screen is touched.
     pub fn watching_elsewhere(&self, player: &str) {
         let left = self
             .0
@@ -340,10 +343,10 @@ impl Holds {
         released.is_some()
     }
 
-    /// **`file_idx` of `info_hash` was deleted**: a player screen's hold on
-    /// it goes -- the screen plays a file that no longer exists, and the
-    /// torrent must not run on its account -- and so does an idle share of
-    /// it. A cast's stays until its unpublish.
+    /// **`file_idx` of `info_hash` was deleted.** A player screen's hold on
+    /// it goes, and so does an idle share of it. The screen plays a file
+    /// that no longer exists, and the torrent must not run on its account.
+    /// A cast's hold stays until its unpublish.
     pub fn forget_file(&self, info_hash: &str, file_idx: usize) {
         let names = |on: &On| {
             on.info_hash == info_hash
@@ -358,12 +361,12 @@ impl Holds {
     }
 
     /// **A cache clear: every hold is overridden**, until whoever holds
-    /// asks again. Each viewer's screen hold goes -- without retiring the
-    /// screen, so a request of it after this holds again -- every idle
-    /// share goes, and every cast's hold is set aside: its publication
-    /// still owns it, it holds nothing, and its unpublish leaves no idle
-    /// share. A cast published after this holds as any does. Answers how
-    /// many holds were overridden, and logs each torrent it let go.
+    /// asks again. Each viewer's screen hold goes. The screen is not
+    /// retired, so a request of it after this holds again. Every idle share
+    /// goes. Every cast's hold is set aside: its publication still owns it,
+    /// it holds nothing, and its unpublish leaves no idle share. A cast
+    /// published after this holds as any does. Answers how many holds were
+    /// overridden, and logs each torrent it let go.
     pub fn clear(&self) -> usize {
         let mut inner = self.0.lock();
         let mut released: Vec<(String, &'static str)> = Vec::new();
@@ -402,8 +405,8 @@ impl Holds {
     }
 
     /// Whether something is using `info_hash` (lowercase) now: a player
-    /// screen on it or a cast of it. Not an idle share -- see
-    /// [`Self::idle_shares`].
+    /// screen on it or a cast of it. An idle share does not count here (see
+    /// [`Self::idle_shares`]).
     pub fn holds(&self, info_hash: &str) -> bool {
         let inner = self.0.lock();
         inner.casts().any(|(_, on)| on.info_hash == info_hash)
@@ -424,14 +427,15 @@ impl Holds {
     }
 
     /// Whether any hold of any kind is on `info_hash`: [`Self::holds`] or
-    /// [`Self::idle_shares`]. What keeps a torrent's engine, and its files,
+    /// [`Self::idle_shares`]. This keeps a torrent's engine, and its files,
     /// in the session for its holder, whether or not it runs now.
     pub fn holds_any(&self, info_hash: &str) -> bool {
         self.holds(info_hash) || self.idle_shares(info_hash)
     }
 
-    /// Whether any hold of any kind is on `file_idx` of `info_hash`: what
-    /// keeps that file's retention window whatever the liveness cell names.
+    /// Whether any hold of any kind is on `file_idx` of `info_hash`. Such a
+    /// hold keeps that file's retention window whatever the liveness cell
+    /// names.
     pub fn holds_file(&self, info_hash: &str, file_idx: usize) -> bool {
         let inner = self.0.lock();
         inner.casts().any(|(_, on)| on.file(info_hash, file_idx))
@@ -500,12 +504,12 @@ mod tests {
 
     /// **What a viewer watched last stays theirs to share until they watch
     /// something else.** A screen released, or a cast of theirs
-    /// unpublished, leaves the viewer's idle share on its torrent; a
+    /// unpublished, leaves the viewer's idle share on its torrent. A
     /// request of a current screen naming another torrent, a move to
     /// something that is not a torrent, or a cast of theirs published lets
-    /// it go; the same torrent again turns it back into the screen's hold.
-    /// One per viewer: two viewers leave two. A cast with no play token
-    /// leaves none.
+    /// it go. The same torrent again turns it back into the screen's hold.
+    /// There is one per viewer, so two viewers leave two. A cast with no
+    /// play token leaves none.
     #[test]
     fn a_viewers_last_play_becomes_their_idle_share_until_they_watch_something_else() {
         let holds = Holds::default();
@@ -556,11 +560,11 @@ mod tests {
         assert!(!holds.idle_shares("ff"), "the file it shares was deleted");
     }
 
-    /// **A cast of the viewer's is what they are watching**: published, it
-    /// lets their idle share go and keeps a screen released under it from
-    /// leaving one; unpublished, it leaves its torrent as their idle share,
-    /// unless they are watching something else by then. A cast with no
-    /// play token belongs to nobody and leaves nothing.
+    /// **A cast of the viewer's is what they are watching.** Once
+    /// published, it lets their idle share go and keeps a screen released
+    /// under it from leaving one. Once unpublished, it leaves its torrent as
+    /// their idle share, unless they are watching something else by then. A
+    /// cast with no play token belongs to nobody and leaves nothing.
     #[test]
     fn a_viewers_cast_ends_their_idle_share_and_leaves_its_own() {
         let holds = Holds::default();
@@ -585,8 +589,9 @@ mod tests {
         // A cast of another torrent lets the share go.
         let other = holds.hold("cc", None, Some("v.3"));
         assert!(!holds.holds_any("bb"));
-        // And unpublished while a screen of the viewer's plays something
-        // else, it leaves nothing: that is the last thing watched.
+        // Unpublished while a screen of the viewer's plays something else,
+        // it leaves nothing, since that screen's file is the last thing
+        // watched.
         assert!(holds.hold_for_player("v.4", "dd", vec![0]));
         drop(other);
         assert!(!holds.idle_shares("cc"));
@@ -596,9 +601,9 @@ mod tests {
         assert!(!holds.holds_any("ee"));
     }
 
-    /// **A screen holds until it says it is gone**, one hold per viewer: the
-    /// next screen replaces it, an older screen neither takes it back nor
-    /// releases it, and only that screen (or a newer) releases it.
+    /// **A screen holds until it says it is gone**, one hold per viewer. The
+    /// next screen replaces it. An older screen neither takes it back nor
+    /// releases it. Only that screen (or a newer one) releases it.
     #[test]
     fn a_screen_holds_one_torrent_per_viewer_until_it_is_released() {
         let holds = Holds::default();
@@ -647,10 +652,10 @@ mod tests {
         assert!(!holds.holds("bb"), "the file the screen plays was deleted");
     }
 
-    /// **A cache clear overrides every hold until it is asked for again**:
-    /// a screen's hold, an idle share and a cast's all stop holding; the
-    /// screen is not retired, so its next request holds again; the set-
-    /// aside cast leaves no idle share when it is unpublished; and a cast
+    /// **A cache clear overrides every hold until it is asked for again.**
+    /// A screen's hold, an idle share and a cast's hold all stop holding.
+    /// The screen is not retired, so its next request holds again. The
+    /// set-aside cast leaves no idle share when it is unpublished. A cast
     /// published after the clear holds as any does.
     #[test]
     fn a_clear_overrides_every_hold_until_it_is_asked_for_again() {

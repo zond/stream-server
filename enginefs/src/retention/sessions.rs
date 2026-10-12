@@ -1,41 +1,41 @@
-//! **Which files the viewer's players are playing**: one play session per
-//! viewer, and nothing but the viewer's own player starts or moves one.
+//! **Which files the viewer's players are playing.** There is one play
+//! session per viewer, and only the viewer's own player starts or moves
+//! one.
 //!
 //! A play session is what shares a torrent's pieces (the draw,
-//! `retention::owner`'s `State::draw`), so which file it is on must never
-//! be inferred -- not from the reads open on a file, which a seek closes for
+//! `retention::owner`'s `State::draw`). So which file it is on must never
+//! be inferred: not from the reads open on a file, which a seek closes for
 //! a moment, nor from the order in which a subtitle and a film happened to
-//! open, nor from a length a player states. It is **told**: a stream
+//! open, nor from a length a player states. It is **told**. A stream
 //! request carrying the player token (`p=`) is the viewer's player asking
-//! for the file it plays, and it is the only thing that writes here
-//! ([`PlaySessions::play`]). A request without one -- a subtitle, a side
-//! file, another client on the HTTP routes, the server's own reads for a
-//! translated source -- never starts a session, never moves one, and never
-//! draws.
+//! for the file it plays. It is the only thing that writes here
+//! ([`PlaySessions::play`]). A request without one never starts a session,
+//! never moves one, and never draws. That covers a subtitle, a side file,
+//! another client on the HTTP routes, and the server's own reads for a
+//! translated source.
 //!
 //! **One session per viewer.** The app's token is `<viewer>.<screen>`
 //! ([`PlayerToken`]): a viewer id per install and a number per player
-//! screen. Every screen of one viewer -- the next episode opens a new one
-//! -- carries on that viewer's session, and a request from an older screen
+//! screen. Every screen of one viewer carries on that viewer's session,
+//! and the next episode opens a new screen. A request from an older screen
 //! than the newest the viewer has used is ignored ([`Heard::Stale`]).
 //!
 //! **One viewer, in practice.** The server lives inside the app's process
-//! and dies with it; the app pins stremio-core's streaming server to that
+//! and dies with it. The app pins stremio-core's streaming server to that
 //! embedded server and reaches it over FFI, so no other device's player
 //! ever uses it. The one outside client, a cast receiver, carries the
-//! app's own token. Two viewers on one server cannot happen with xtremio,
-//! and the rules below for two are what keeps a second token -- a client
-//! on the HTTP routes -- from stopping the torrent under the first. A
-//! session moving to another file ends what it was sharing there -- which ends only
-//! with the torrent leaving the swarm -- and that is done at once **only
-//! when the player that moved is the only one on the torrent**: the stop
-//! interrupts exactly the viewer who moved (the next episode of the same
-//! torrent, a brief restart). While another player's session is on the
-//! torrent the end waits until no session is on it at all, so neither
-//! player ever stops the torrent under the other
-//! ([`PlaySessions::may_end_now`]).
+//! app's own token. Two viewers on one server cannot happen with xtremio.
+//! The rules below for two keep a second token (a client on the HTTP
+//! routes) from stopping the torrent under the first. A session moving to
+//! another file ends what it was sharing there, which ends only with the
+//! torrent leaving the swarm. That is done at once **only when the player
+//! that moved is the only one on the torrent**. The stop then interrupts
+//! exactly the viewer who moved (the next episode of the same torrent, a
+//! brief restart). While another player's session is on the torrent, the
+//! end waits until no session is on it at all. So neither player ever
+//! stops the torrent under the other ([`PlaySessions::may_end_now`]).
 //!
-//! It is not the liveness cell ([`crate::retention::live`]): that one
+//! It is not the liveness cell ([`crate::retention::live`]). That one
 //! follows every stream a request opens and decides only which file's
 //! window is kept. Whether a torrent runs is its holds'
 //! ([`crate::retention::holds`]). This decides only what is shared, and
@@ -56,9 +56,9 @@ pub enum Played {
         shares: bool,
         /// **The member's byte extent within the file**, when what plays
         /// is a member of a single-file container opened through a media
-        /// id: the member path knows what the file is and where the film
+        /// id. The member path knows what the file is and where the film
         /// lies in it. The draw is then sized from this extent's length and
-        /// made inside it, and the file's content is not sniffed -- it is a
+        /// made inside it. The file's content is not sniffed: it is a
         /// container, and the member path said so. `None` for a file played
         /// as itself.
         member: Option<Range<u64>>,
@@ -66,19 +66,19 @@ pub enum Played {
     /// **A member of a multi-volume set** (`film.part1.rar`,
     /// `film.part2.rar`, ...) played through a media id: every volume it
     /// lies in, in the member's order, each with the member's bytes in it.
-    /// It shares, like a film: the set is **one thing played**, so a
+    /// It shares, like a film. The set is **one thing played**, so a
     /// request for any of its volumes names this same value and moves
-    /// nothing -- the reader crossing from one volume into the next is no
-    /// player moving -- and leaving it leaves every volume at once. The
-    /// draw is made once over the member's bytes in all of them.
+    /// nothing. The reader crossing from one volume into the next is no
+    /// player moving. Leaving the set leaves every volume at once. The draw
+    /// is made once over the member's bytes in all of them.
     ///
-    /// Per-volume extents and not one range over the volumes' concatenation:
-    /// the member's bytes in each volume start after that volume's own
-    /// headers, so a range over the concatenation would need each volume's
-    /// boundaries and header lengths beside it to say which bytes of which
-    /// file are the film -- the per-volume ranges again, in a costlier form.
-    /// And per volume is what every reader of it asks: which files the
-    /// session is on, and which pieces of each the member lies in.
+    /// These are per-volume extents and not one range over the volumes'
+    /// concatenation. The member's bytes in each volume start after that
+    /// volume's own headers. A range over the concatenation would need each
+    /// volume's boundaries and header lengths beside it to say which bytes
+    /// of which file are the film. That is the per-volume ranges again, in a
+    /// costlier form. And per volume is what every reader of it asks: which
+    /// files the session is on, and which pieces of each the member lies in.
     Set {
         info_hash: String,
         volumes: Vec<Volume>,
@@ -134,10 +134,10 @@ impl Played {
         }
     }
 
-    /// **What a draw over `file_idx` is made for under this**: the member
-    /// of it played ([`Played::Torrent`]'s `member`, `None` for the file as
-    /// itself), or the set it is a volume of. Two plays of one file that
-    /// answer differently play different films in it, and a draw made for
+    /// **What a draw over `file_idx` is made for under this.** It is the
+    /// member of it played ([`Played::Torrent`]'s `member`, `None` for the
+    /// file as itself), or the set it is a volume of. Two plays of one file
+    /// that answer differently play different films in it. A draw made for
     /// one is nothing the other shares.
     fn made_for(&self, file_idx: usize) -> (Option<Range<u64>>, Option<&[Volume]>) {
         match self {
@@ -152,14 +152,14 @@ impl Played {
     }
 }
 
-/// A player token as the app mints it: `<viewer>.<screen>` -- a viewer id
-/// per install, and a number per player screen that only grows. The play
-/// session is the viewer's, so each new screen of one viewer (the next
+/// A player token as the app mints it: `<viewer>.<screen>`, a viewer id
+/// per install and a number per player screen that only grows. The play
+/// session is the viewer's. So each new screen of one viewer (the next
 /// episode opens one) continues or moves the same session rather than
-/// starting another; a screen's number says which of two of the viewer's
+/// starting another. A screen's number says which of two of the viewer's
 /// requests is newer. A token with no `.`, or whose screen part is not a
-/// number, is a viewer with no screen number -- a client from before the
-/// scheme -- and each of its requests is current.
+/// number, is a viewer with no screen number: a client from before the
+/// scheme. Each of its requests is current.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlayerToken {
     pub viewer: String,
@@ -204,35 +204,35 @@ impl Session {
 #[derive(Default, Debug)]
 struct Inner {
     by_viewer: HashMap<String, Session>,
-    /// Files a session left while no other session was on their
-    /// torrent: what they shared may end at once. Forgotten when a session
-    /// is on the file again, when its torrent's shares have been ended, and
-    /// when nothing is on its torrent to end anything under.
+    /// Files a session left while no other session was on their torrent.
+    /// What they shared may end at once. An entry is forgotten when a
+    /// session is on the file again, when its torrent's shares have been
+    /// ended, and when nothing is on its torrent to end anything under.
     left_alone: HashSet<(String, usize)>,
 }
 
 /// What [`PlaySessions::play`] made of a player's request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Heard {
-    /// The viewer's newest screen: its session is on what it asked for,
+    /// The viewer's newest screen. Its session is on what it asked for,
     /// and `moved` says whether that is a change.
     Current { moved: bool },
-    /// An older screen of the viewer than the newest it has heard from --
+    /// An older screen of the viewer than the newest it has heard from:
     /// the previous screen's player still reconnecting while the next one
     /// takes over. It moves nothing, starts nothing, and is no player's
     /// playback.
     Stale,
 }
 
-/// The play sessions, one per viewer. Behind one lock that is never held
-/// across an await or around another lock. Bounded by the number of
-/// viewers: one entry each, replaced, never accumulated.
+/// The play sessions, one per viewer. They sit behind one lock that is
+/// never held across an await or around another lock. They are bounded by
+/// the number of viewers: one entry each, replaced, never accumulated.
 #[derive(Default, Debug)]
 pub struct PlaySessions(parking_lot::Mutex<Inner>);
 
 impl PlaySessions {
     /// **The player `token` asked for `played`.** A request of the
-    /// viewer's newest screen (or a newer one) puts its session on it; an
+    /// viewer's newest screen (or a newer one) puts its session on it. An
     /// older screen's is [`Heard::Stale`] and changes nothing.
     pub fn play(&self, token: &str, played: Played) -> Heard {
         let token = PlayerToken::parse(token);
@@ -260,13 +260,13 @@ impl PlaySessions {
         if previous.played == played {
             return Heard::Current { moved: false };
         }
-        // What it left: every file it was on that it is not on now, and
-        // every file it shared and still shares for another film -- another
+        // What it left: every file it was on that it is not on now. Also
+        // every file it shared and still shares for another film: another
         // member of the same container, the file as itself after a member
-        // of it, a set after a member of one volume: a draw is made for a
+        // of it, a set after a member of one volume. A draw is made for a
         // member, and a new member on the same file is a move. The same
-        // file with only `shares` changed leaves nothing, and a set left
-        // leaves every volume of it.
+        // file with only `shares` changed leaves nothing. A set left leaves
+        // every volume of it.
         if let Some(hash) = previous.played.info_hash() {
             let left: Vec<usize> = previous
                 .played
@@ -293,8 +293,8 @@ impl PlaySessions {
         Heard::Current { moved: true }
     }
 
-    /// Nothing waits for a torrent no session is on: its shares end by the
-    /// torrent being nobody's, not by a mark.
+    /// Nothing waits for a torrent no session is on. Its shares end because
+    /// the torrent is nobody's, not by a mark.
     fn prune(inner: &mut Inner) {
         let Inner {
             by_viewer,
@@ -303,10 +303,10 @@ impl PlaySessions {
         left_alone.retain(|(hash, _)| by_viewer.values().any(|session| session.on_torrent(hash)));
     }
 
-    /// Whether a session is on `file_idx` of `info_hash` and shares it: the
-    /// one condition under which that file's play
-    /// session draws, and under which what it drew is still shared. Every
-    /// volume of a set a session plays a member across is covered.
+    /// Whether a session is on `file_idx` of `info_hash` and shares it.
+    /// This is the one condition under which that file's play session
+    /// draws, and under which what it drew is still shared. Every volume of
+    /// a set a session plays a member across is covered.
     pub fn covers(&self, info_hash: &str, file_idx: usize) -> bool {
         self.0
             .lock()
@@ -315,13 +315,14 @@ impl PlaySessions {
             .any(|session| session.played.shares_file(info_hash, file_idx))
     }
 
-    /// **Where in `file_idx` of `info_hash` the sessions sharing it play**:
-    /// the member extent every session covering the file names
-    /// ([`Played::Torrent`]'s `member`). `None` when no session covers the
-    /// file, when one plays the file as itself, or when two name different
-    /// members -- each of which is the file as a whole, sized and sniffed
-    /// as one. A session playing a set the file is a volume of names no
-    /// member of the file alone ([`Self::set_of`] is its question).
+    /// **Where in `file_idx` of `info_hash` the sessions sharing it play.**
+    /// This is the member extent every session covering the file names
+    /// ([`Played::Torrent`]'s `member`). It is `None` when no session
+    /// covers the file, when one plays the file as itself, or when two name
+    /// different members. Each of those is the file as a whole, sized and
+    /// sniffed as one. A session playing a set the file is a volume of
+    /// names no member of the file alone ([`Self::set_of`] is its
+    /// question).
     pub fn member_of(&self, info_hash: &str, file_idx: usize) -> Option<Range<u64>> {
         let inner = self.0.lock();
         let mut members = inner
@@ -340,11 +341,11 @@ impl PlaySessions {
 
     /// **The set the sessions sharing `file_idx` of `info_hash` play a
     /// member across** ([`Played::Set`]): its volumes, in the member's
-    /// order, each with the member's bytes in it. `None` when no session
-    /// covers the file, and when a session covering it plays anything else
-    /// -- the file as itself, a member of it alone, another set -- under
-    /// which the file is sized and sniffed as itself, as two members are
-    /// ([`Self::member_of`]).
+    /// order, each with the member's bytes in it. It is `None` when no
+    /// session covers the file. It is also `None` when a session covering
+    /// it plays anything else (the file as itself, a member of it alone,
+    /// another set). Under those the file is sized and sniffed as itself,
+    /// as under two members ([`Self::member_of`]).
     pub fn set_of(&self, info_hash: &str, file_idx: usize) -> Option<Vec<Volume>> {
         let inner = self.0.lock();
         let mut sets = inner
@@ -378,10 +379,10 @@ impl PlaySessions {
     }
 
     /// Whether what `file_idx` of `info_hash` shared may end now, with its
-    /// torrent still played: the session that left it was the only one on
-    /// the torrent, so stopping the torrent interrupts nobody but the
-    /// viewer that moved. Otherwise it waits for no session to be on the
-    /// torrent at all.
+    /// torrent still played. It may when the session that left it was the
+    /// only one on the torrent, so stopping the torrent interrupts nobody
+    /// but the viewer that moved. Otherwise it waits for no session to be
+    /// on the torrent at all.
     pub fn may_end_now(&self, info_hash: &str, file_idx: usize) -> bool {
         self.0
             .lock()
@@ -391,11 +392,11 @@ impl PlaySessions {
 
     /// **A cache clear: every viewer's session is on nothing now**, as
     /// though each had moved to something that is not a torrent
-    /// ([`Played::Elsewhere`]): no draw is shared any more, and the next
+    /// ([`Played::Elsewhere`]). No draw is shared any more. The next
     /// request of a screen puts its session where it asks, as a move. The
     /// newest screen each viewer was heard from is kept, so an older
-    /// screen's request is still [`Heard::Stale`]. Nothing waits to end:
-    /// the clear ends it all.
+    /// screen's request is still [`Heard::Stale`]. Nothing waits to end,
+    /// since the clear ends it all.
     pub fn clear(&self) {
         let mut inner = self.0.lock();
         for session in inner.by_viewer.values_mut() {
@@ -404,7 +405,7 @@ impl PlaySessions {
         inner.left_alone.clear();
     }
 
-    /// `info_hash`'s shares have been ended: nothing it left is waiting.
+    /// `info_hash`'s shares have been ended, so nothing it left is waiting.
     pub fn ended(&self, info_hash: &str) {
         self.0
             .lock()
@@ -424,7 +425,7 @@ impl PlaySessions {
     }
 
     /// How many entries the sessions keep: one per viewer, and one per
-    /// file waiting to end. For the tests of what is pruned.
+    /// file waiting to end. It is for the tests of what is pruned.
     #[cfg(test)]
     pub(crate) fn entries(&self) -> (usize, usize) {
         let inner = self.0.lock();
@@ -448,7 +449,7 @@ mod tests {
     const CURRENT: Heard = Heard::Current { moved: true };
     const SAME: Heard = Heard::Current { moved: false };
 
-    /// **A token is a viewer and a screen**; one without a screen number is
+    /// **A token is a viewer and a screen.** One without a screen number is
     /// a viewer whose every request is current.
     #[test]
     fn a_token_is_a_viewer_and_a_screen() {
@@ -471,8 +472,8 @@ mod tests {
         }
     }
 
-    /// **The viewer's session follows its newest screen**, and an older
-    /// screen's request -- the last screen's player still reconnecting --
+    /// **The viewer's session follows its newest screen.** An older
+    /// screen's request (the last screen's player still reconnecting)
     /// changes nothing.
     #[test]
     fn a_viewers_newest_screen_moves_its_session_and_an_older_one_is_stale() {
@@ -489,7 +490,7 @@ mod tests {
         assert_eq!(sessions.play("tv.3", file("t", 1)), SAME);
     }
 
-    /// **The legacy shape**: a client from before `<viewer>.<screen>` sends
+    /// **The legacy shape.** A client from before `<viewer>.<screen>` sends
     /// a bare token, and every one of its requests is current.
     #[test]
     fn a_token_with_no_screen_is_always_current() {
@@ -526,9 +527,9 @@ mod tests {
         );
     }
 
-    /// **A clear puts every session on nothing**: no file is covered or
-    /// played, nothing waits to end, the next request of the playing screen
-    /// is a move back, and an older screen's is still stale.
+    /// **A clear puts every session on nothing.** No file is covered or
+    /// played and nothing waits to end. The next request of the playing
+    /// screen is a move back, and an older screen's is still stale.
     #[test]
     fn a_clear_puts_every_session_on_nothing() {
         let sessions = PlaySessions::default();
@@ -548,7 +549,7 @@ mod tests {
         assert!(sessions.covers("t", 1));
     }
 
-    /// **Only `shares` changing is no move**: nothing is left behind.
+    /// **Only `shares` changing is no move.** Nothing is left behind.
     #[test]
     fn a_change_of_shares_alone_leaves_nothing() {
         let sessions = PlaySessions::default();
@@ -569,9 +570,9 @@ mod tests {
     }
 
     /// **A member's extent is the file's only while every session sharing
-    /// the file names that one member**: a session playing the file as
-    /// itself, or another member, makes it the whole file again, and a
-    /// session that shares nothing names nothing.
+    /// the file names that one member.** A session playing the file as
+    /// itself, or another member, makes it the whole file again. A session
+    /// that shares nothing names nothing.
     #[test]
     fn a_member_extent_is_the_one_every_sharing_session_names() {
         let member = |bytes: Range<u64>| Played::Torrent {
@@ -603,12 +604,12 @@ mod tests {
         assert_eq!(sessions.member_of("t", 0), None, "the file as itself");
     }
 
-    /// **A new member on the same file is a move**: a draw is made for a
-    /// member, so a session moving to another member of the file it is on
-    /// -- or from the file as itself to a member of it, or from a member to
-    /// a set the file is a volume of -- leaves the file as a move to another
-    /// file would, while the same member again moves nothing and `shares`
-    /// flipping alone leaves nothing.
+    /// **A new member on the same file is a move.** A draw is made for a
+    /// member. So a session leaves the file, as a move to another file
+    /// would, when it moves to another member of the file it is on. The
+    /// same holds from the file as itself to a member of it, and from a
+    /// member to a set the file is a volume of. The same member again moves
+    /// nothing, and `shares` flipping alone leaves nothing.
     #[test]
     fn a_new_member_on_the_same_file_leaves_the_file() {
         let member = |bytes: Range<u64>| Played::Torrent {
@@ -681,10 +682,10 @@ mod tests {
         }
     }
 
-    /// **A set is one thing played**: it covers every volume, the same set
-    /// asked for again -- the reader in its next volume -- moves nothing and
-    /// leaves nothing, and leaving it leaves every volume at once, as
-    /// leaving a film leaves the film.
+    /// **A set is one thing played.** It covers every volume. The same set
+    /// asked for again (the reader in its next volume) moves nothing and
+    /// leaves nothing. Leaving it leaves every volume at once, as leaving a
+    /// film leaves the film.
     #[test]
     fn a_set_is_one_thing_played_and_leaving_it_leaves_every_volume() {
         let sessions = PlaySessions::default();
@@ -711,10 +712,10 @@ mod tests {
         assert!(!sessions.covers("t", 0) && !sessions.covers("t", 1));
     }
 
-    /// **The set every session sharing a file names, or none**: a set's
-    /// volume names no member of its own ([`PlaySessions::member_of`]), and
-    /// a second session playing anything else of the file -- the file as
-    /// itself, or another set -- makes it the file as a whole.
+    /// **The set every session sharing a file names, or none.** A set's
+    /// volume names no member of its own ([`PlaySessions::member_of`]). A
+    /// second session playing anything else of the file (the file as
+    /// itself, or another set) makes it the file as a whole.
     #[test]
     fn a_set_is_the_one_every_sharing_session_names() {
         let sessions = PlaySessions::default();

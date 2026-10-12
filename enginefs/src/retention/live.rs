@@ -3,45 +3,47 @@
 //!
 //! Retention needs one fact that nothing else in this process could state:
 //! **which stream is the live one right now**. The window a player is
-//! inside is kept; everything else on the volume is slack and goes. That is
-//! one entity at a time -- one file of one torrent, or one proxied URL --
-//! because a television plays one thing, and because a rule that kept every
-//! entity anybody had ever opened is a rule that keeps the disk.
+//! inside is kept. Everything else on the volume is slack and goes. That
+//! is one entity at a time (one file of one torrent, or one proxied URL),
+//! because a television plays one thing. A rule that kept every entity
+//! anybody had ever opened would keep the disk.
 //!
 //! The cell is a [`tokio::sync::watch`] with exactly one writer:
 //! `BackendEngineFS::on_stream_start` for a torrent file, and the proxy's
-//! reader constructor for a proxied body. Both are "the server saw a stream
-//! opened", which is the event, and neither is undone: a request that dies
-//! after the server saw it opened still moved the live entity, because the
-//! predecessor's bytes really are the ones nobody is playing any more.
+//! reader constructor for a proxied body. Both mean "the server saw a
+//! stream opened", which is the event, and neither is undone. A request
+//! that dies after the server saw it opened still moved the live entity,
+//! because the predecessor's bytes really are the ones nobody is playing
+//! any more.
 //!
 //! One correction is made to what an open decided, and only through
-//! [`Live::hand_on`]: an open the aside rule kept off the cell because the
-//! live file was still being read, once that read has closed and the
-//! aside's has not. The player that opens the next episode before the
-//! server has seen the last one's connection close looks like a subtitle
-//! fetch at the moment it opens, and like a viewer moving on a moment later.
+//! [`Live::hand_on`]. It applies to an open the aside rule kept off the
+//! cell because the live file was still being read, once that read has
+//! closed and the aside's has not. A player may open the next episode
+//! before the server has seen the last one's connection close. At the
+//! moment it opens it looks like a subtitle fetch, and a moment later like
+//! a viewer moving on.
 //!
 //! **Nothing here remembers a time.** A stream that has stopped is not a
-//! stream that has been replaced: pausing for an hour changes nothing on
+//! stream that has been replaced. Pausing for an hour changes nothing on
 //! the disk, while opening something else changes it at once. So the value
 //! is a *what*, not a *when*, and it is written only where a new what
 //! begins.
 //!
 //! # Reading it
 //!
-//! A reader takes a [`Reading`] -- a copy -- and every consumer of one tick
-//! is handed the same copy, so the retention passes of one tick cannot
+//! A reader takes a [`Reading`], which is a copy. Every consumer of one
+//! tick is handed the same copy, so the retention passes of one tick cannot
 //! disagree about what is playing. (The reconciler's ladder does not read
-//! it at all: whether a torrent runs is what its holds, its pins and the
-//! bodies being delivered off it say -- [`crate::retention::holds`].) Between
-//! tasks the value can move, which is why every delete asks its door again
+//! it at all. Whether a torrent runs is what its holds, its pins and the
+//! bodies being delivered off it say: [`crate::retention::holds`].) Between
+//! tasks the value can move. That is why every delete asks its door again
 //! at the instant of the unlink ([`crate::retention::owner::Door`]) rather
 //! than trusting the reading it started from.
 //!
-//! The cheap questions -- "is this file the live one?" -- are asked of
-//! [`Live`] directly, off the watch's own lock and with nothing cloned:
-//! they are asked once per reclaim run, on a blocking thread, and a
+//! The cheap questions ("is this file the live one?") are asked of
+//! [`Live`] directly, off the watch's own lock and with nothing cloned.
+//! They are asked once per reclaim run, on a blocking thread, and a
 //! `String` per ask would be an allocation per unlink.
 
 use std::path::{Path, PathBuf};
@@ -52,7 +54,7 @@ use crate::retention::sessions::PlaySessions;
 
 /// The one entity being played.
 ///
-/// A torrent's liveness is per *file*, not per torrent: two files of one
+/// A torrent's liveness is per *file*, not per torrent. Two files of one
 /// torrent are two windows over two regions of one piece space, and a
 /// subtitle fetched during playback must not make the video slack. The
 /// proxy's is per entity directory, which is one origin URL.
@@ -66,10 +68,10 @@ pub enum LiveEntity {
 
 /// What one [`Live::open`] moved.
 ///
-/// Handed back so a caller can act on the predecessor at once -- dropping
-/// its slack without waiting for the next tick -- and `None` from an open
-/// that moved nothing (the same entity again, or an aside the caller asked
-/// to keep).
+/// It is handed back so a caller can act on the predecessor at once,
+/// dropping its slack without waiting for the next tick. It is `None` from
+/// an open that moved nothing (the same entity again, or an aside the
+/// caller asked to keep).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Switch {
     /// What was live before, and `None` when nothing was.
@@ -78,29 +80,29 @@ pub struct Switch {
     pub to: LiveEntity,
 }
 
-/// The cell. One per server; handed to every owner that has to answer
-/// "am I the one being played?".
+/// The cell. There is one per server, handed to every owner that has to
+/// answer "am I the one being played?".
 ///
-/// It starts empty and a restart empties it: nothing is playing in a
+/// It starts empty and a restart empties it. Nothing is playing in a
 /// process that has served nothing, which is the honest reading. (The
-/// first tick after a restart stops every unpinned torrent because a
-/// restart has no holds either -- [`crate::retention::holds`].)
+/// first tick after a restart stops every unpinned torrent, because a
+/// restart has no holds either: [`crate::retention::holds`].)
 #[derive(Debug)]
 pub struct Live {
     cell: tokio::sync::watch::Sender<Option<LiveEntity>>,
     /// **Which files the viewer's players are playing**, which is not this
-    /// cell: the cell follows every stream a request opens, and decides
-    /// windows; the sessions follow only the player's own `p=`
-    /// requests, and decide what is shared ([`PlaySessions`]). Here so that
+    /// cell. The cell follows every stream a request opens, and decides
+    /// windows. The sessions follow only the player's own `p=` requests,
+    /// and decide what is shared ([`PlaySessions`]). They are here so that
     /// everything that holds the cell holds them too.
     sessions: PlaySessions,
     /// **Files of one torrent that are one thing to watch**: the volumes of
     /// a RAR set, read by one archive session ([`Live::hold_set`]).
     sets: VolumeSets,
-    /// **Who said they are using a torrent** -- a player screen open on it,
-    /// a cast of it published -- which is not this cell either: the cell is
-    /// the last thing a stream opened, the holds are what the app declared
-    /// ([`Holds`]). Here for the same reason as the sessions.
+    /// **Who said they are using a torrent** (a player screen open on it, a
+    /// cast of it published), which is not this cell either. The cell is
+    /// the last thing a stream opened. The holds are what the app declared
+    /// ([`Holds`]). They are here for the same reason as the sessions.
     holds: Holds,
 }
 
@@ -155,18 +157,18 @@ impl Live {
     }
 
     /// Holds `files` of `info_hash` as **one thing to watch** until the
-    /// returned hold is dropped: the volumes of an archive read across
-    /// them, which a player sees as one film.
+    /// returned hold is dropped. These are the volumes of an archive read
+    /// across them, which a player sees as one film.
     ///
-    /// Without it each volume is an entity of its own, and an archive
-    /// session opens every one of them -- to read the index, and again for
-    /// each body -- so the cell moved on every open, and every move's slack
-    /// pass took the volumes it had just left and the ones about to be
-    /// read, index reads and all. With it, an open of one volume while
-    /// another of the set is live is no move ([`Self::together`], the
-    /// caller's aside rule), and every volume of the live set is live to
-    /// the retention passes: each keeps its window around wherever its
-    /// reads are, and none is slack while the set is being watched.
+    /// Without it each volume is an entity of its own. An archive session
+    /// opens every one of them, to read the index and again for each body.
+    /// So the cell moved on every open. Every move's slack pass took the
+    /// volumes it had just left and the ones about to be read, index reads
+    /// and all. With it, an open of one volume while another of the set is
+    /// live is no move ([`Self::together`], the caller's aside rule). Every
+    /// volume of the live set is live to the retention passes. Each keeps
+    /// its window around wherever its reads are, and none is slack while
+    /// the set is being watched.
     pub fn hold_set(self: &Arc<Self>, info_hash: &str, files: Vec<usize>) -> SetHold {
         let id = self
             .sets
@@ -181,9 +183,9 @@ impl Live {
         }
     }
 
-    /// Whether `a` and `b` of `info_hash` are in one held set: two volumes
-    /// of one archive being read as one film. A file is together with
-    /// itself.
+    /// Whether `a` and `b` of `info_hash` are in one held set, as two
+    /// volumes of one archive being read as one film. A file is together
+    /// with itself.
     pub fn together(&self, info_hash: &str, a: usize, b: usize) -> bool {
         if a == b {
             return true;
@@ -197,15 +199,15 @@ impl Live {
 
     /// The server saw a stream open on `to`.
     ///
-    /// **The one writer.** `keep_current` is the aside rule, and it is
-    /// computed by the caller *before* this call: an open on another file
-    /// of the live torrent while a reader of the live file is still open is
-    /// a subtitle or a side file, not a move of the playing file. Deciding
-    /// it here would mean reading a second lock under this one, and the
-    /// caller has the reading anyway.
+    /// **The one writer.** `keep_current` is the aside rule, and the caller
+    /// computes it *before* this call. An open on another file of the live
+    /// torrent, while a reader of the live file is still open, is a subtitle
+    /// or a side file, not a move of the playing file. Deciding it here
+    /// would mean reading a second lock under this one, and the caller has
+    /// the reading anyway.
     ///
-    /// Opening the entity that is already live moves nothing -- a seek is a
-    /// second response on one entity, not a switch -- so no watcher is
+    /// Opening the entity that is already live moves nothing, since a seek
+    /// is a second response on one entity, not a switch. So no watcher is
     /// woken for it.
     pub fn open(&self, to: LiveEntity, keep_current: bool) -> Option<Switch> {
         let mut switch = None;
@@ -223,10 +225,11 @@ impl Live {
         switch
     }
 
-    /// Move the cell from `from` to `to`, and only if it still names `from`:
-    /// the aside rule asked again once the live file's last read has closed
-    /// while `to` is still being read. An open that moved the cell since is
-    /// newer than the reading this was decided from, and it stands.
+    /// Move the cell from `from` to `to`, and only if it still names `from`.
+    /// This is the aside rule asked again, once the live file's last read
+    /// has closed while `to` is still being read. An open that moved the
+    /// cell since is newer than the reading this was decided from, and it
+    /// stands.
     pub fn hand_on(&self, from: &LiveEntity, to: LiveEntity) -> Option<Switch> {
         let mut switch = None;
         self.cell.send_if_modified(|current| {
@@ -243,8 +246,8 @@ impl Live {
         switch
     }
 
-    /// **`entity` is being deleted**: the cell stops naming it, if it does,
-    /// and names nothing. What an explicit delete of a download asks, once
+    /// **`entity` is being deleted.** The cell stops naming it, if it does,
+    /// and names nothing. An explicit delete of a download asks this once
     /// no read of the file is open, so the torrent is not kept running for
     /// a file that is gone.
     pub fn forget(&self, entity: &LiveEntity) -> bool {
@@ -259,14 +262,15 @@ impl Live {
 
     /// **A cache clear: nothing is being played**, whatever was. The cell
     /// names nothing until the next stream opens, so no window is kept for
-    /// what was live -- the last thing played included. Whether it moved.
+    /// what was live, the last thing played included. Answers whether it
+    /// moved.
     pub fn forget_all(&self) -> bool {
         self.cell
             .send_if_modified(|current| current.take().is_some())
     }
 
     /// A copy of the value, for a caller that will ask several questions of
-    /// one reading -- a reconciler tick hands the same copy to every
+    /// one reading. A reconciler tick hands the same copy to every
     /// retention pass it runs, so they cannot disagree.
     pub fn reading(&self) -> Reading {
         Reading(self.cell.borrow().clone())
@@ -292,10 +296,10 @@ impl Live {
     }
 
     /// Whether the proxied entity in `dir` is the one being played, off the
-    /// watch's own lock with nothing cloned. Asked once per candidate chunk
-    /// of a proxy slack pass -- that backing reclaims chunk by chunk, not
-    /// run by run -- from a blocking thread, so a `PathBuf` per ask would
-    /// be an allocation per unlink.
+    /// watch's own lock with nothing cloned. It is asked once per candidate
+    /// chunk of a proxy slack pass, from a blocking thread, since that
+    /// backing reclaims chunk by chunk, not run by run. So a `PathBuf` per
+    /// ask would be an allocation per unlink.
     pub fn is_proxy(&self, dir: &Path) -> bool {
         matches!(
             &*self.cell.borrow(),
@@ -303,8 +307,8 @@ impl Live {
         )
     }
 
-    /// A receiver that is woken every time the value really changes: what a
-    /// task drops the predecessor's slack from.
+    /// A receiver that is woken every time the value really changes. A task
+    /// drops the predecessor's slack from it.
     pub fn changed(&self) -> tokio::sync::watch::Receiver<Option<LiveEntity>> {
         self.cell.subscribe()
     }
@@ -313,8 +317,8 @@ impl Live {
 /// One reading of [`Live`], as a value.
 ///
 /// **It is a copy and it does not follow the cell.** Every consumer of one
-/// tick gets the same copy so that a write landing mid-tick is seen by all
-/// of them or by none; a consumer that has to be right at the instant of an
+/// tick gets the same copy, so a write landing mid-tick is seen by all of
+/// them or by none. A consumer that has to be right at the instant of an
 /// unlink asks [`Live`] again there.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Reading(Option<LiveEntity>);
@@ -353,17 +357,17 @@ impl Reading {
     }
 
     /// Whether the proxied body being played is filed **anywhere under**
-    /// `key_dir` -- one URL's key directory, which holds one directory per
+    /// `key_dir`: one URL's key directory, which holds one directory per
     /// generation of the entity behind it.
     ///
-    /// The question [`Self::is_proxy`] asks is about the bytes: the entity
+    /// The question [`Self::is_proxy`] asks is about the bytes. The entity
     /// directory is where the chunks are, and a chunk of a superseded
     /// generation is not the live one's. The question here is about the
-    /// *resource*, which is what something holding a URL knows: a
-    /// container indexed from a link is the same container after the
-    /// origin has revalidated it under a new tag, and asking by entity
-    /// would say the viewer had moved on when all that moved was the
-    /// `ETag` (`server::translators::session`).
+    /// *resource*, which is what something holding a URL knows. A container
+    /// indexed from a link is the same container after the origin has
+    /// revalidated it under a new tag. Asking by entity would say the
+    /// viewer had moved on when all that moved was the `ETag`
+    /// (`server::translators::session`).
     pub fn proxy_under(&self, key_dir: &Path) -> bool {
         matches!(&self.0, Some(LiveEntity::Proxy { dir: playing }) if playing.starts_with(key_dir))
     }
@@ -436,8 +440,8 @@ mod tests {
     }
 
     /// A key directory holds one directory per generation of the entity
-    /// behind one URL, and the cell names the generation: a holder of the
-    /// URL asks about the key, a holder of the bytes about the entity.
+    /// behind one URL, and the cell names the generation. A holder of the
+    /// URL asks about the key, and a holder of the bytes about the entity.
     #[test]
     fn a_proxied_body_is_under_its_key_directory_and_not_under_another() {
         let key = Path::new("/cache/proxy/aa");
@@ -457,8 +461,8 @@ mod tests {
             "the key directory is not where the chunks are"
         );
         assert!(!reading.proxy_under(Path::new("/cache/proxy/bb")));
-        // Not a prefix match on the *name*: `/cache/proxy/a` is another
-        // key, whatever its spelling shares with this one.
+        // This is not a prefix match on the *name*. `/cache/proxy/a` is
+        // another key, whatever its spelling shares with this one.
         assert!(!reading.proxy_under(Path::new("/cache/proxy/a")));
 
         live.open(torrent("aa", 0), false);
@@ -492,7 +496,7 @@ mod tests {
         assert_eq!(live.reading().file_of("aa"), Some(1));
     }
 
-    /// The aside rule, as the caller spells it: an open that says "keep
+    /// The aside rule, as the caller spells it. An open that says "keep
     /// what is current" moves nothing and wakes nobody.
     #[test]
     fn an_open_that_asks_to_keep_the_current_entity_moves_nothing() {

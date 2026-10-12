@@ -1,56 +1,57 @@
 //! Bounding the streaming cache, and telling the truth about what we hold.
 //!
-//! [`crate::piece_store::policy`] is the arithmetic -- a budget, a piece
-//! length, the pieces of one file, what the readers were granted -- and out
-//! of it a set to share and a set to give back; the windows to keep are the
-//! detector's ([`streams`]), from the runs of disk the reads caused. [`owner`]
-//! is the owner: it keeps one policy per file, resident and never taken
-//! out, and runs the pass over what the reads show. This
-//! module is the torrent's half of the wiring under both -- the budget cell
-//! the server publishes into, the bell that says the volume is running low,
-//! and the calls that make a policy's answers true --
+//! [`crate::piece_store::policy`] is the arithmetic. It takes a budget, a
+//! piece length, the pieces of one file and what the readers were granted,
+//! and gives back a set to share and a set to give back. The windows to
+//! keep come from the detector ([`streams`]), from the runs of disk the
+//! reads caused. [`owner`] is the owner: it keeps one policy per file,
+//! resident and never taken out, and runs the pass over what the reads
+//! show. This module is the torrent's half of the wiring under both: the
+//! budget cell the server publishes into, the bell that says the volume is
+//! running low, and the calls that make a policy's answers true.
 //!
-//! * **nothing is announced that nothing chose**: the session runs under the
-//!   fork's `explicit_piece_advertising`, so a torrent -- added, restored,
-//!   restarted out of an error -- advertises nothing until told;
-//! * a play session's **draw** is decided once, before its reader opens,
-//!   sized against the stream's real read-ahead (nothing, if the budget
-//!   cannot hold both), and advertised then
-//!   ([`crate::backend::TorrentHandle::set_pieces_advertised`]): the backend
+//! * **Nothing is announced that nothing chose.** The session runs under
+//!   the fork's `explicit_piece_advertising`, so a torrent advertises
+//!   nothing until told, whether it was added, restored or restarted out of
+//!   an error.
+//! * A play session's **draw** is decided once, before its reader opens. It
+//!   is sized against the stream's real read-ahead (nothing, if the budget
+//!   cannot hold both) and advertised then
+//!   ([`crate::backend::TorrentHandle::set_pieces_advertised`]). The backend
 //!   announces each piece of it as it completes, and nothing else of the
-//!   file; a pinned download is advertised whole;
-//! * everything else the torrent holds of that file is **reclaimed**, which
-//!   is the backend forgetting it and the store unlinking it, in that order
-//!   and under one claim ([`take_claimed`]).
+//!   file. A pinned download is advertised whole.
+//! * Everything else the torrent holds of that file is **reclaimed**. The
+//!   backend forgets it and the store unlinks it, in that order and under
+//!   one claim ([`take_claimed`]).
 //!
 //! **An announcement is never taken back.** There is no un-Have in
-//! BitTorrent. While a file is being played, the only pieces of it a peer
-//! is told about are its draw's, which nothing reclaims; once nobody plays
-//! it, its play session is over, and what it announced ends only with the
-//! torrent leaving the swarm: the reconciler stops the torrent first, then
-//! the session's bytes go and the advertised set is made again from what is
-//! still shared (`Engine::end_shares`), and the torrent starts again if it
-//! is still wanted -- the same torrent's next episode, a download.
+//! BitTorrent. While a file is being played, a peer is told only about the
+//! pieces of its draw, which nothing reclaims. Once nobody plays it, its
+//! play session is over, and what it announced ends only when the torrent
+//! leaves the swarm. The reconciler stops the torrent first. Then the
+//! session's bytes go and the advertised set is made again from what is
+//! still shared (`Engine::end_shares`). The torrent starts again if it is
+//! still wanted, for the same torrent's next episode or a download.
 //!
 //! # What decides the budget, and what a missing one means
 //!
-//! The budget is the server's -- `cache_budget::cap_to_publish`, the smaller
+//! The budget is the server's: `cache_budget::cap_to_publish`, the smaller
 //! of what the operator configured and what the volume can still give,
 //! against what the owners of the cache say they hold. It is pushed in
-//! ([`RetentionBudget::set`]) and never recomputed here: a second reading of
-//! "how much room is there" that disagreed with the published one would have
-//! the two halves of the cache sized against different numbers.
+//! ([`RetentionBudget::set`]) and never recomputed here. A second reading of
+//! "how much room is there" could disagree with the published one, and then
+//! the two halves of the cache would be sized against different numbers.
 //!
 //! **At process start it is [`CacheBudget::Unknown`], and that is true rather
-//! than a placeholder**: nothing has told this process a budget yet. It is
-//! not zero, which would say the cache may hold nothing, and it is not a
-//! number this process invented from a disk reading of its own, which would
-//! be a claim about a cap nobody set. Unknown means no policy is installed
-//! and nothing is shared: a stream that starts before the first publication
+//! than a placeholder.** Nothing has told this process a budget yet. It is
+//! not zero, which would say the cache may hold nothing. It is not a number
+//! this process invented from a disk reading of its own, which would be a
+//! claim about a cap nobody set. Unknown means no policy is installed and
+//! nothing is shared. A stream that starts before the first publication
 //! holds what it holds, and its play session shares nothing, since there is
 //! no budget to size a shared set against. `cache_budget::start` states the
-//! cap before the router serves its first request, so nothing but a test
-//! ever sees the gap.
+//! cap before the router serves its first request, so only a test ever sees
+//! the gap.
 
 use std::collections::BTreeSet;
 use std::ops::Range;
@@ -67,9 +68,9 @@ pub(crate) mod ledger;
 pub mod live;
 pub mod owner;
 /// The scenario harness and the fake backing every retention test is built
-/// over. **Test-only**, and a sibling of [`owner`] rather than a part of it
-/// on purpose: a scenario is a statement about a cache, and has to outlive
-/// any rewrite of the module it measures.
+/// over. It is **test-only**, and a sibling of [`owner`] rather than a part
+/// of it on purpose. A scenario is a statement about a cache, and has to
+/// outlive any rewrite of the module it measures.
 #[cfg(test)]
 pub(crate) mod scenario;
 /// What is asked of the harness: scenarios that are statements about a
@@ -85,15 +86,16 @@ pub mod trace;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CacheBudget {
     /// Nothing has told this process a budget. **An absence, not a
-    /// number**: nothing has published one yet, so there is nothing to be
+    /// number.** Nothing has published one yet, so there is nothing to be
     /// right or wrong about. Nothing is shared and nothing is reclaimed
     /// under it.
     #[default]
     Unknown,
     /// There is no cap: the operator set no `cacheSize` and the volume's
-    /// free space could not be read. Nothing to bound, so -- as under
-    /// [`Self::Unknown`] -- no policy is installed, and a play session
-    /// shares nothing: there is no budget to size a shared set against.
+    /// free space could not be read. There is nothing to bound, so no
+    /// policy is installed, as under [`Self::Unknown`]. A play session
+    /// shares nothing, since there is no budget to size a shared set
+    /// against.
     Unbounded,
     /// This many bytes for everything under the torrent-data root.
     Bytes(u64),
@@ -102,18 +104,18 @@ pub enum CacheBudget {
 /// The budget, shared between the `BackendEngineFS` the server publishes
 /// into and the engines that read it.
 ///
-/// A lock and not an atomic because the value is a three-way answer and
-/// "unknown" has to survive being read: an atomic would need a sentinel,
-/// and a sentinel is how a value a process invents at startup gets read
-/// back as an observation.
+/// It is a lock and not an atomic because the value is a three-way answer
+/// and "unknown" has to survive being read. An atomic would need a
+/// sentinel, and a sentinel is how a value a process invents at startup
+/// gets read back as an observation.
 ///
 /// **Two numbers, one publication.** The cap is what the whole cache may
-/// occupy; the headroom is what the volume will still give before the
-/// margin -- the `free_disk - margin` of `docs/design/read-pattern-retention.md`
-/// section 4. They are written together, under this lock, by the one
-/// publisher, because they are two readings of one `statvfs` and a pass
-/// that mixed a fresh cap with a stale headroom would be sizing a lookahead
-/// against a disk that never existed.
+/// occupy. The headroom is what the volume will still give before the
+/// margin: the `free_disk - margin` of `docs/design/read-pattern-retention.md`
+/// section 4. The one publisher writes them together, under this lock,
+/// because they are two readings of one `statvfs`. A pass that mixed a
+/// fresh cap with a stale headroom would size a lookahead against a disk
+/// that never existed.
 #[derive(Debug, Default)]
 pub struct RetentionBudget(parking_lot::RwLock<(CacheBudget, Option<u64>)>);
 
@@ -127,18 +129,18 @@ impl RetentionBudget {
     ///
     /// **What an entity may grow into, rather than what the cache may
     /// hold.** An entity's own allowance is this plus what it already
-    /// holds: computed from the free space alone it would shrink as the
-    /// cache filled and never converge, stopping well short of the disk
-    /// with nothing to explain why.
+    /// holds. An allowance computed from the free space alone would shrink
+    /// as the cache filled and never converge. It would stop well short of
+    /// the disk with nothing to explain why.
     pub fn headroom(&self) -> Option<u64> {
         self.0.read().1
     }
 
-    /// The publisher's reading. `None` is [`CacheBudget::Unbounded`] --
-    /// the shape `CacheLimit::effective` answers in -- and never
+    /// The publisher's reading. `None` is [`CacheBudget::Unbounded`] (the
+    /// shape `CacheLimit::effective` answers in), and never
     /// [`CacheBudget::Unknown`], which only the absence of a publication
-    /// can mean. `headroom` is `None` for a volume that could not be read,
-    /// which is not "no room": the cap then stands alone, as it did before
+    /// can mean. `headroom` is `None` for a volume that could not be read.
+    /// That is not "no room": the cap then stands alone, as it did before
     /// any of this existed.
     pub fn set(&self, limit: Option<u64>, headroom: Option<u64>) {
         *self.0.write() = (
@@ -153,26 +155,27 @@ impl RetentionBudget {
 
 /// The bell the volume rings when it is running low.
 ///
-/// One reading of one device, so one bell: the reconciler's tick takes the
-/// reading every owner acts on ([`crate::reconcile::Volumes`]) and rings
-/// this whenever what it read is under the line a stopped torrent has to
-/// see cleared. That reading is the tick's own and not any torrent's --
-/// the tick takes it before it looks at what there is to decide about, so
-/// a session holding nothing but proxied chunks still rings. Everybody who
-/// can give bytes back answers by dropping
-/// their slack -- everything nobody is playing and nobody is reading --
-/// and nobody chooses a victim: the answer to a volume running low is to
-/// stop holding what is already disposable, not to pick something to take.
+/// There is one reading of one device, so there is one bell. The
+/// reconciler's tick takes the reading every owner acts on
+/// ([`crate::reconcile::Volumes`]). It rings this whenever what it read is
+/// under the line a stopped torrent has to see cleared. That reading is the
+/// tick's own and not any torrent's. The tick takes it before it looks at
+/// what there is to decide about, so a session holding nothing but proxied
+/// chunks still rings. Everybody who can give bytes back answers by
+/// dropping their slack: everything nobody is playing and nobody is
+/// reading. Nobody chooses a victim. The answer to a volume running low is
+/// to stop holding what is already disposable, not to pick something to
+/// take.
 ///
-/// **The torrent side has no listener and needs none**: its slack passes
-/// ride the same tick that takes the reading. What this is for is the
-/// proxy cache, which has no tick of its own -- its entities are only ever
-/// ended by a viewer opening something else, and a volume filling under a
-/// paused player is the one case where nothing opens.
+/// **The torrent side has no listener and needs none.** Its slack passes
+/// ride the same tick that takes the reading. This is for the proxy cache,
+/// which has no tick of its own. Its entities are only ever ended by a
+/// viewer opening something else, and a volume filling under a paused
+/// player is the one case where nothing opens.
 ///
-/// One permit and not a counter, like every other signal here: a ring
-/// while nobody is waiting is remembered once, because the pass the waiter
-/// runs covers every slack entity there is and running it twice for two
+/// It is one permit and not a counter, like every other signal here. A
+/// ring while nobody is waiting is remembered once. The pass the waiter
+/// runs covers every slack entity there is, so running it twice for two
 /// rings would find nothing the second time.
 #[derive(Debug, Default)]
 pub struct SlackBell(tokio::sync::Notify);
@@ -195,12 +198,12 @@ impl SlackBell {
 pub(crate) fn playhead_piece(span: &FilePieceSpan, piece_length: u64, offset_in_file: u64) -> u32 {
     let absolute = span.offset.saturating_add(offset_in_file);
     let piece = absolute / piece_length;
-    // A file with no pieces at all -- a zero-length one, which a torrent
-    // may perfectly well carry -- has an empty range, and there is no last
-    // piece to clamp to: `clamp` would be handed a max below its min and
-    // panic, on a reader the route opens like any other (the empty body is
+    // A file with no pieces at all has an empty range. A torrent may well
+    // carry such a zero-length file. There is no last piece to clamp to:
+    // `clamp` would be handed a max below its min and panic. The route
+    // opens a reader on such a file like any other (the empty body is
     // `a_zero_length_torrent_file_is_an_empty_body_not_a_416`). Its first
-    // piece is the honest answer: nothing of it has to arrive.
+    // piece is the honest answer, since nothing of it has to arrive.
     let Some(last) = span
         .pieces
         .end
@@ -216,34 +219,35 @@ pub(crate) fn playhead_piece(span: &FilePieceSpan, piece_length: u64, offset_in_
 }
 
 /// One reading of one file's retention state: the file's pieces, every
-/// reader inside it, and -- where the play session shares a set -- how much
-/// of it is committed.
+/// reader inside it, and how much of it is committed where the play session
+/// shares a set.
 ///
-/// A value rather than a borrow of the owner's state, because the question
-/// it exists to answer -- [`Self::window`] -- is finished against the
-/// store's held set, read outside the lock that state lives behind.
+/// It is a value rather than a borrow of the owner's state. The question it
+/// exists to answer, [`Self::window`], is finished against the store's held
+/// set, which is read outside the lock that state lives behind.
 ///
 /// **Every number here is an observation and none of them survives the
-/// call.** The readers are where they were and what they were eating at
-/// the instant they were read, the committed count is what the policy has
-/// actually advertised, and nothing is stored: a second reading a moment
-/// later is a second measurement, not a memory of this one.
+/// call.** The readers are where they were, and eating what they were
+/// eating, at the instant they were read. The committed count is what the
+/// policy has actually advertised. Nothing is stored: a second reading a
+/// moment later is a second measurement, not a memory of this one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PolicyReading {
     /// The file's pieces, first to last: the bound a run is measured in.
     pieces: Range<u32>,
     piece_length: u64,
-    /// What a second of this film costs, when the arithmetic can say:
-    /// the fallback for a reader that has no measured rate, and the
-    /// ceiling for one whose measured rate is a cache-served burst.
+    /// What a second of this film costs, when the arithmetic can say. It is
+    /// the fallback for a reader that has no measured rate, and the ceiling
+    /// for one whose measured rate is a cache-served burst.
     film_rate: Option<u64>,
     readers: Vec<PieceReader>,
     /// Where playback is by the detector's own account, for the window
-    /// when no reader is live: bytes only, since nothing is eating them.
+    /// when no reader is live. It is bytes only, since nothing is eating
+    /// them.
     fallback: PiecePosition,
-    /// What the play session has committed, or `None` where it has promised
-    /// nothing: no draw decided yet, none published, or a pin (which shares
-    /// the file whole on its own account, not the session's).
+    /// What the play session has committed. It is `None` where the session
+    /// has promised nothing: no draw decided yet, none published, or a pin
+    /// (which shares the file whole on its own account, not the session's).
     committed: Option<Committed>,
 }
 
@@ -252,10 +256,10 @@ pub struct PolicyReading {
 pub enum Committed {
     /// A policy stands and has counted them: this many pieces.
     Counted(usize),
-    /// No policy stands -- the budget covers the file -- and the draw is
+    /// No policy stands, because the budget covers the file. The draw is
     /// every piece of it, all shared and all kept for the session, the
-    /// read-ahead's with the rest. Counted against the held set when the
-    /// reading is finished.
+    /// read-ahead's with the rest. They are counted against the held set
+    /// when the reading is finished.
     Drawn(BTreeSet<u32>),
 }
 
@@ -300,11 +304,12 @@ impl PolicyReading {
 
     /// Bytes the play session has committed: pieces of its draw we hold,
     /// which are announced and are not reclaimed while the torrent is in the
-    /// swarm. Under a budget that covers the file that is every piece of it
-    /// we hold, counted in `held`. `None` where nothing has been promised.
+    /// swarm. Under a budget that covers the file, that is every piece of it
+    /// we hold, counted in `held`. It is `None` where nothing has been
+    /// promised.
     ///
-    /// Piece count times piece length, so the last piece of a file counts
-    /// whole.
+    /// It is piece count times piece length, so the last piece of a file
+    /// counts whole.
     pub fn committed_bytes(&self, held: &HeldSnapshot) -> Option<u64> {
         let pieces = match self.committed.as_ref()? {
             Committed::Counted(count) => *count,
@@ -315,12 +320,12 @@ impl PolicyReading {
 
     /// What the store holds around the reader that will run out first, in
     /// a file of `file_bytes` bytes. See [`CacheWindow::worst_of`] for the
-    /// rule; this only measures each reader's run in bytes and hands them
+    /// rule. This only measures each reader's run in bytes and hands them
     /// over.
     ///
-    /// **Whatever the budget.** The run is what is on the disk, and a
-    /// budget that covers the file changes how long it can grow, not what
-    /// it is: nothing here asks whether a policy stands.
+    /// **Whatever the budget.** The run is what is on the disk. A budget
+    /// that covers the file changes how long the run can grow, not what it
+    /// is, so nothing here asks whether a policy stands.
     pub fn window(&self, held: &HeldSnapshot, file_bytes: u64) -> CacheWindow {
         CacheWindow::worst_of(
             self.readers.iter().map(|reader| {
@@ -339,16 +344,16 @@ impl PolicyReading {
     }
 
     /// The unbroken run of held pieces `at` stands in, as bytes behind and
-    /// bytes ahead of it -- **to the byte**, not the piece. A reader stalled
-    /// at the last byte of what is held has one byte ahead of it, not four
-    /// mebibytes, and the difference is the whole of whether it reads as
-    /// waiting. Nothing held under it is a run of nothing; a missing piece
+    /// bytes ahead of it, measured **to the byte**, not the piece. A reader
+    /// stalled at the last byte of what is held has one byte ahead of it,
+    /// not four mebibytes. That difference decides whether it reads as
+    /// waiting. Nothing held under it is a run of nothing. A missing piece
     /// ends the run on either side.
     ///
-    /// **Clipped to the file**, `file_bytes` long: a file's first and last
+    /// **Clipped to the file**, `file_bytes` long. A file's first and last
     /// piece carry its neighbours' bytes too (or, at the end of the
-    /// torrent, fewer bytes than a piece), and none of those are this
-    /// stream's to scrub into or play.
+    /// torrent, fewer bytes than a piece). None of those are this stream's
+    /// to scrub into or play.
     fn run_around(&self, at: PiecePosition, held: &HeldSnapshot, file_bytes: u64) -> (u64, u64) {
         let Some(run) = held.run_containing(at.piece, self.pieces.clone()) else {
             return (0, 0);
@@ -366,7 +371,7 @@ impl PolicyReading {
 
 /// One reader's run, in bytes, with what it needs to be judged: the input
 /// to [`CacheWindow::worst_of`]. Each store measures the bytes its own way
-/// -- pieces on the torrent side, chunks on the proxy's -- and the fold is
+/// (pieces on the torrent side, chunks on the proxy's), and the fold is
 /// the same.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeadRun {
@@ -384,25 +389,26 @@ pub struct HeadRun {
 /// **unbroken** run of the stream on the disk that the playhead stands in,
 /// split at the playhead.
 ///
-/// A live reading of a store and nothing else: what is on the disk for the
-/// stream being played, split at the byte a player has actually reached.
-/// Both stores answer in this shape -- the piece store counting pieces of
-/// the file, the proxy cache counting chunks of the entity -- because it is
-/// the same question about the same volume. Only complete, readable units
-/// count, and the first one missing on either side ends that half: bytes
-/// past a hole are not something playback or a scrub can reach without a
+/// It is a live reading of a store and nothing else: what is on the disk
+/// for the stream being played, split at the byte a player has actually
+/// reached. Both stores answer in this shape, because it is the same
+/// question about the same volume. The piece store counts pieces of the
+/// file, and the proxy cache counts chunks of the entity. Only complete,
+/// readable units count, and the first one missing on either side ends that
+/// half. Playback or a scrub cannot reach bytes past a hole without a
 /// fetch. Neither half reaches outside the stream.
 ///
 /// **Not the retention policy's window**, and not only where a policy
-/// stands. Under a budget that splits the file the run is usually what the
-/// policy kept; under one that covers the file, none published, or a pin,
-/// it is whatever has been fetched round the playhead -- the same quantity,
-/// and just as much what a viewer can scrub back into and has in hand.
+/// stands. Under a budget that splits the file, the run is usually what the
+/// policy kept. Under one that covers the file, none published, or a pin,
+/// it is whatever has been fetched round the playhead. That is the same
+/// quantity, and just as much what a viewer can scrub back into and has in
+/// hand.
 ///
 /// It is never anything's stored state. At process start there is no
 /// playhead in either store (`enginefs::engine::Engine`'s is `None`, the
-/// proxy's map is empty), so there is nothing to read one of these off,
-/// which is the honest answer for a process that has watched nothing yet.
+/// proxy's map is empty), so there is nothing to read one of these off.
+/// That is the honest answer for a process that has watched nothing yet.
 #[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheWindow {
@@ -413,11 +419,11 @@ pub struct CacheWindow {
     /// hand. The byte at the playhead counts here.
     pub ahead_bytes: u64,
     /// How long the run behind lasts the reader that owns it, in seconds
-    /// at its own demand; `None` when no reader is live and the bytes are
-    /// the fallback's. See [`CacheWindow::worst_of`].
+    /// at its own demand. It is `None` when no reader is live and the bytes
+    /// are the fallback's. See [`CacheWindow::worst_of`].
     pub behind_seconds: Option<f64>,
     /// The same for the run ahead: the seconds until the reader that is
-    /// worst off runs out, which is when the film next stops.
+    /// worst off runs out. That is when the film next stops.
     pub ahead_seconds: Option<f64>,
 }
 
@@ -426,40 +432,40 @@ impl CacheWindow {
     /// from the live reader with the fewest seconds of it.
     ///
     /// **Seconds, at the reader's demand.** A film stops for whichever of
-    /// mpv's streams starves, and a stream's runway is what it holds over
-    /// what it eats -- so the video's megabytes and a subtitle track's
-    /// kilobytes are compared in the one unit that means the same for
-    /// both. Demand is the sustained rate the detector sampled, capped at
-    /// what a second of the film costs, since no single consumer needs more
-    /// than the film's pace for long and a rate sampled off a cache-served
-    /// burst says gigabytes; a reader never sampled is priced at the film's
-    /// pace. Nothing to price it at, nothing to say: such a reader is
+    /// mpv's streams starves. A stream's runway is what it holds over what
+    /// it eats. So the video's megabytes and a subtitle track's kilobytes
+    /// are compared in the one unit that means the same for both. Demand is
+    /// the sustained rate the detector sampled, capped at what a second of
+    /// the film costs. No single consumer needs more than the film's pace
+    /// for long, and a rate sampled off a cache-served burst says
+    /// gigabytes. A reader never sampled is priced at the film's pace. With
+    /// nothing to price it at there is nothing to say, so such a reader is
     /// skipped.
     ///
     /// **Parked is derived, not declared.** A reader that has had time to
-    /// eat everything in front of it and has not done so is not going to:
-    /// mpv's read of a Matroska file's cues sits at the tail for the whole
-    /// film with a few mebibytes ahead of it, and after the second or so
-    /// those would take it has all the time in the world. Such a reader
-    /// cannot stall the film and is left out of both halves.
+    /// eat everything in front of it, and has not, is not going to. mpv's
+    /// read of a Matroska file's cues sits at the tail for the whole film
+    /// with a few mebibytes ahead of it. After the second or so those would
+    /// take, it has all the time in the world. Such a reader cannot stall
+    /// the film and is left out of both halves.
     ///
-    /// **A stalled reader is not parked**, and the two are told apart by
-    /// what is in front of them, measured to the byte. A viewer waiting on
-    /// the next piece stands at the end of what is held with less than one
-    /// of its own reads ahead of it; that is "waiting for more", however
-    /// long it has been waiting, and it is reported -- at whatever demand
-    /// it has -- as the near-zero it is. The tolerance is the reader's own
-    /// last read, so a subtitle track asking for kilobytes and a viewer
-    /// asking for a quarter of a megabyte are each judged by their own
-    /// appetite.
+    /// **A stalled reader is not parked.** The two are told apart by what is
+    /// in front of them, measured to the byte. A viewer waiting on the next
+    /// piece stands at the end of what is held, with less than one of its
+    /// own reads ahead of it. That is "waiting for more", however long it
+    /// has been waiting. It is reported, at whatever demand it has, as the
+    /// near-zero it is. The tolerance is the reader's own last read. So a
+    /// subtitle track asking for kilobytes and a viewer asking for a quarter
+    /// of a megabyte are each judged by their own appetite.
     ///
     /// **The halves are independent.** "What stops the film next" and "how
-    /// far back can this scrub" are different questions, and the reader
-    /// that answers one need not answer the other.
+    /// far back can this scrub" are different questions. The reader that
+    /// answers one need not answer the other.
     ///
-    /// **No live reader, no seconds.** A paused player, a file just opened:
-    /// the bytes around `fallback` -- where the detector says playback is
-    /// -- and no time, because nothing is eating them.
+    /// **No live reader, no seconds.** For a paused player or a file just
+    /// opened, the window is the bytes around `fallback` (where the
+    /// detector says playback is) and no time, because nothing is eating
+    /// them.
     pub fn worst_of(
         heads: impl IntoIterator<Item = HeadRun>,
         film_rate: Option<u64>,
@@ -520,31 +526,32 @@ fn demand_of(rate: Option<u64>, film_rate: Option<u64>) -> Option<f64> {
 /// has moved this session.
 ///
 /// Every field is measured when it is asked for and none of it is kept.
-/// The transfer totals in particular are **this session's** -- librqbit's
-/// own per-torrent counters, which start at zero when the torrent is added
-/// to this process and are not persisted. A ratio taken from them is a
-/// ratio for this run and must be labelled as one; the conventional
-/// per-torrent, across-restarts ratio would need counters stored on disk,
-/// and a stored counter is a claim about a past this process never saw.
+/// The transfer totals in particular are **this session's**. They are
+/// librqbit's own per-torrent counters, which start at zero when the
+/// torrent is added to this process and are not persisted. A ratio taken
+/// from them is a ratio for this run and must be labelled as one. The
+/// conventional per-torrent, across-restarts ratio would need counters
+/// stored on disk, and a stored counter is a claim about a past this
+/// process never saw.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TorrentStreamNumbers {
     /// The unbroken run of the file the piece store holds round the
-    /// playhead, split at it, under any budget; `None` where no reader has
-    /// been inside the file in this process, so there is no playhead to
-    /// split at.
+    /// playhead, split at it, under any budget. It is `None` where no
+    /// reader has been inside the file in this process, so there is no
+    /// playhead to split at.
     pub window: Option<CacheWindow>,
-    /// Bytes of the play session's draw we hold -- announced, and not
+    /// Bytes of the play session's draw we hold: announced, and not
     /// reclaimed while the torrent is in the swarm. Under a budget that
     /// covers the file the draw is the whole file, so this is every byte of
-    /// it we hold. `None` where the session has promised nothing: no draw
-    /// decided yet, or a pin, which shares the file whole on its own.
+    /// it we hold. It is `None` where the session has promised nothing: no
+    /// draw decided yet, or a pin, which shares the file whole on its own.
     pub committed_bytes: Option<u64>,
     /// What this torrent has fetched and sent since it was added, in this
-    /// process, or `None` where the backend has no counters to read: a
+    /// process. It is `None` where the backend has no counters to read: a
     /// torrent that is paused, still checking, stopped for space or in
-    /// error. **Not zero for those** -- a torrent that has moved gigabytes
-    /// and then paused has not moved nothing, and the row a client draws
-    /// from a zero says it has. See
+    /// error. **Not zero for those.** A torrent that has moved gigabytes
+    /// and then paused has not moved nothing, and a row a client draws
+    /// from a zero would say it has. See
     /// [`crate::backend::TorrentHandle::transfer_totals`].
     pub transfer: Option<crate::backend::TransferTotals>,
     /// How many pieces this engine's retention passes have asked the
@@ -552,10 +559,10 @@ pub struct TorrentStreamNumbers {
     ///
     /// **Zero is the only healthy value.** A refusal is librqbit keeping a
     /// piece inside an open stream's lookahead that this policy's window no
-    /// longer covers: the disk cannot come back under budget while that
+    /// longer covers. The disk cannot come back under budget while that
     /// stream lives, and every tick spends a `drop_pieces` to be refused
     /// again. It is not `Option`, because "no refusals" and "nothing to
-    /// read" are the same fact here -- the counter is the engine's own and
+    /// read" are the same fact here. The counter is the engine's own and
     /// exists from its construction.
     pub refused_reclaims: usize,
 }
@@ -576,18 +583,18 @@ pub struct RetentionPass {
 /// in.
 ///
 /// **A file's first and last piece are not only its own.** A piece is a
-/// fixed length across the whole torrent, so a file that does not begin and
-/// end on a piece boundary -- every file of a torrent without BEP-47
-/// padding -- shares those two with its neighbours. The policy governs one
-/// file and its reclaim set includes both of them, and nothing below here
-/// refuses: librqbit's `ChunkTracker::drop_piece` consults the want-set
-/// only for a piece we do *not* have, so a piece we have is dropped
-/// whoever else wants it, and [`take_claimed`] then unlinks the bytes.
-/// The neighbour, still selected, fetches the piece again; the next pass
-/// finds it held, inside the policy's range and outside the window, and
-/// reclaims it again -- a refetch loop at the boundary for as long as the
-/// neighbour is wanted. Nothing is advertised over a hole while that runs
-/// (the have-bit goes before the unlink), so what it costs is the
+/// fixed length across the whole torrent. So a file that does not begin and
+/// end on a piece boundary shares those two pieces with its neighbours.
+/// That is every file of a torrent without BEP-47 padding. The policy
+/// governs one file and its reclaim set includes both of them, and nothing
+/// below here refuses. librqbit's `ChunkTracker::drop_piece` consults the
+/// want-set only for a piece we do *not* have. So a piece we have is
+/// dropped whoever else wants it, and [`take_claimed`] then unlinks the
+/// bytes. The neighbour, still selected, fetches the piece again. The next
+/// pass finds it held, inside the policy's range and outside the window,
+/// and reclaims it again. That is a refetch loop at the boundary for as
+/// long as the neighbour is wanted. Nothing is advertised over a hole while
+/// that runs (the have-bit goes before the unlink). What it costs is the
 /// neighbour's bytes and the swarm's, over and over.
 ///
 /// So the reclaim is narrowed here, by the rule
@@ -595,10 +602,10 @@ pub struct RetentionPass {
 /// `TorrentStorage::remove_file` deletes a boundary piece by: a piece
 /// another wanted file owns bytes in stays.
 ///
-/// Every unlink of a policy's pieces comes through here: the pass asks it
-/// ([`owner::Backing::alone`] for the torrent, reclaiming under its own
-/// reader) whichever mode the pass is in, so the boundary rule is one rule
-/// and not one per caller.
+/// Every unlink of a policy's pieces comes through here. The pass asks it
+/// whichever mode the pass is in ([`owner::Backing::alone`] for the
+/// torrent, reclaiming under its own reader). So the boundary rule is one
+/// rule and not one per caller.
 pub(crate) async fn this_files_alone<H: TorrentHandle>(
     handle: &H,
     file_idx: usize,
@@ -629,11 +636,11 @@ pub(crate) async fn this_files_alone<H: TorrentHandle>(
 /// Give a run of pieces back: the backend forgets them, the store unlinks
 /// what it forgot, and only then is the claim released.
 ///
-/// Pieces librqbit refuses to drop -- a peer is mid-flight on them, or a
-/// live stream is about to read them -- are simply not in the claim, so
-/// they are not deleted either. That is the interlock doing its second job:
-/// it is also what keeps a reclaim from racing the read-ahead it would
-/// otherwise delete out from under.
+/// librqbit refuses to drop a piece a peer is mid-flight on, or one a live
+/// stream is about to read. Such pieces are simply not in the claim, so
+/// they are not deleted either. That is the interlock doing its second job.
+/// It also keeps a reclaim from racing the read-ahead it would otherwise
+/// delete out from under.
 pub(crate) async fn release<H: TorrentHandle>(
     handle: &H,
     store: &Arc<StoreRegistry>,
@@ -645,12 +652,12 @@ pub(crate) async fn release<H: TorrentHandle>(
         .await
     {
         Ok(Some(dropped)) => take_claimed(store, info_hash, dropped).await,
-        // No claim, so no list of pieces the backend forgot and no right to
-        // take any: every unlink goes under a claim, and a backend that
+        // No claim means no list of pieces the backend forgot, and no right
+        // to take any. Every unlink goes under a claim, so a backend that
         // hands none back (a test double) frees nothing here.
         Ok(None) => 0,
-        // It still believes it has them, so they are not ours to take:
-        // unlinking here is exactly the advertise-then-serve-a-hole this
+        // It still believes it has them, so they are not ours to take.
+        // Unlinking here is exactly the advertise-then-serve-a-hole this
         // whole path exists to prevent.
         Err(error) => {
             tracing::warn!(
@@ -669,26 +676,25 @@ pub(crate) async fn release<H: TorrentHandle>(
 /// believe the torrent has it.**
 ///
 /// The bytes are one record of a piece and the backend's have-set is the
-/// other. Unlink behind the backend's back and it goes on reporting the
+/// other. Unlink behind the backend's back, and it goes on reporting the
 /// piece complete, advertising it, and answering a peer's request with a
 /// read past the end of nothing. So the have-set is edited first
 /// ([`crate::backend::TorrentHandle::drop_pieces`], which hands back the
-/// claim), the bytes go while the claim stands -- nothing can download one
-/// of them back into the range being deleted -- and the claim is released
-/// last.
+/// claim). The bytes go while the claim stands, so nothing can download one
+/// of them back into the range being deleted. The claim is released last.
 ///
 /// Every reclaim in this server ends here: the retention policy's, through
 /// [`release`], and the per-file delete an unpin does, through
 /// `BackendEngineFS::delete_download_data`.
 ///
-/// Returns how many pieces really left the disk -- either copy of one
+/// Returns how many pieces really left the disk. Either copy of one
 /// counts, since either occupies blocks the volume gets back. A piece with
-/// no file was not there to leave it, and is not an error; nor is one the
-/// volume refuses to unlink, which is logged and stepped over rather than
-/// abandoning the rest of the run: every piece in it has had its have-bit
-/// cleared already. It keeps its bit in the held set, so the next pass
-/// offers it again, and librqbit hands a dropped piece to a new claim once
-/// this one is released: that is the retry.
+/// no file was not there to leave, and is not an error. Nor is one the
+/// volume refuses to unlink. That one is logged and stepped over rather
+/// than abandoning the rest of the run, since every piece in the run has
+/// had its have-bit cleared already. It keeps its bit in the held set, so
+/// the next pass offers it again. librqbit hands a dropped piece to a new
+/// claim once this one is released, and that is the retry.
 pub(crate) async fn take_claimed(
     store: &Arc<StoreRegistry>,
     info_hash: &str,
@@ -701,56 +707,56 @@ pub(crate) async fn take_claimed(
 /// The unlink itself, off the reactor, with the claim held across it and
 /// released on the far side.
 ///
-/// **Off the reactor** because this is one `unlink` per piece on the flash
-/// of a television, which is a syscall loop of no bounded length: run on
-/// the reactor thread it stalls every other task that thread is carrying,
-/// whichever door called. The retention pass compounds that -- it holds the
-/// file's turn across the wait, and the stream-open path takes the same
-/// turn, so a pass on the reactor stops request handling for as long as the
-/// volume takes to answer. The unpin's delete holds no such turn:
+/// **Off the reactor**, because this is one `unlink` per piece on the
+/// flash of a television: a syscall loop of no bounded length. Run on the
+/// reactor thread, it stalls every other task that thread is carrying,
+/// whichever door called. The retention pass makes that worse. It holds
+/// the file's turn across the wait, and the stream-open path takes the
+/// same turn. So a pass on the reactor stops request handling for as long
+/// as the volume takes to answer. The unpin's delete holds no such turn.
 /// `BackendEngineFS::delete_download_data` never touches the owner, and
-/// what orders *it* against a re-download is the claim below and nothing
-/// else. This is not a function under which a turn is always held.
+/// only the claim below orders *it* against a re-download. A turn is not
+/// always held under this function.
 ///
-/// **The claim travels with the work rather than staying behind.** It is
-/// what keeps the unlink ordered against the have-set, so it has to outlive
-/// the deletion and not merely the call that started it; moved here it is
-/// released on the blocking thread once the bytes are gone, which is the
+/// **The claim travels with the work rather than staying behind.** It keeps
+/// the unlink ordered against the have-set, so it has to outlive the
+/// deletion and not merely the call that started it. Moved here, it is
+/// released on the blocking thread once the bytes are gone. That is the
 /// order [`take_claimed`] exists to impose. A caller that stops awaiting
-/// does not disturb that: a blocking task already started is not cancelled,
+/// does not disturb it. A blocking task already started is not cancelled,
 /// so the deletion finishes and the claim goes with it.
 ///
 /// **There is one door and it takes a claim.** `pieces` must be a subset
-/// of what the claim dropped: the pass's late-arrival unlink narrows the
-/// claim's list to what the window no longer covers, [`take_claimed`] hands
-/// it whole. An unlink with no claim -- by path, or for a backend that
-/// keeps no have-set -- has no way in.
+/// of what the claim dropped. The pass's late-arrival unlink narrows the
+/// claim's list to what the window no longer covers, and [`take_claimed`]
+/// hands it whole. An unlink with no claim (by path, or for a backend that
+/// keeps no have-set) has no way in.
 ///
 /// **Through the registered store, and there is no other way in now.** The
 /// live store of a running torrent keeps the held set the pass reads and a
-/// cache of open handles, and an unlink by path behind its back left both
+/// cache of open handles. An unlink by path behind its back left both
 /// wrong: a bit over a file that has gone, and an unlinked inode kept alive
-/// by a cached descriptor until another piece took its slot. The path door
-/// that did that was the cache cleaner's, which held a `&StoreRoot` and
-/// deleted by name; with the cleaner gone, a hash no store is registered
-/// for frees nothing here and says so. Every caller holds a claim from a
-/// live torrent, so "no store" is a torrent whose storage went between the
-/// drop and this call, and its directory is the next launch's sweep.
+/// by a cached descriptor until another piece took its slot. That path
+/// door was the cache cleaner's, which held a `&StoreRoot` and deleted by
+/// name. With the cleaner gone, a hash no store is registered for frees
+/// nothing here and says so. Every caller holds a claim from a live
+/// torrent. So "no store" is a torrent whose storage went between the drop
+/// and this call, and its directory is the next launch's sweep.
 ///
 /// The registry refuses outright while a store is under its initial hash
-/// check -- asked here, at the unlink, and not from a state read earlier: a
-/// piece taken from under the check is a have-bit over nothing. Refused
-/// pieces stay on the disk and in the held set, and the next pass offers
-/// them again.
+/// check. That is asked here, at the unlink, and not from a state read
+/// earlier, because a piece taken from under the check is a have-bit over
+/// nothing. Refused pieces stay on the disk and in the held set, and the
+/// next pass offers them again.
 pub(crate) async fn unlink(
     store: &Arc<StoreRegistry>,
     info_hash: &str,
     pieces: Vec<u32>,
     #[cfg_attr(not(test), allow(unused_mut))] mut claim: crate::backend::DroppedFilePieces,
 ) -> usize {
-    // A test backend's witness: what is on the disk of these pieces now is
-    // what the unlink below takes, and it is told on this task, so what it
-    // asserts fails whoever awaited the unlink.
+    // A test backend's witness. What is on the disk of these pieces now is
+    // what the unlink below takes. The witness is told on this task, so
+    // what it asserts fails whoever awaited the unlink.
     #[cfg(test)]
     let witness = claim.take_witness().map(|witness| {
         let doomed: Vec<u32> = store
@@ -809,9 +815,9 @@ pub(crate) async fn unlink(
 /// before it and the pieces after it.
 ///
 /// A window that falls in the middle of a run makes it two calls on the
-/// torrent instead of one, which is the whole price of narrowing a run at
-/// the door; a window that does not touch it leaves the single call it
-/// was.
+/// torrent instead of one. That is the whole price of narrowing a run at
+/// the door. A window that does not touch the run leaves the single call
+/// it was.
 pub(crate) fn outside(run: Range<u32>, window: &Range<u32>) -> Vec<Range<u32>> {
     let mut kept = Vec::new();
     if run.start < window.start {
@@ -825,9 +831,9 @@ pub(crate) fn outside(run: Range<u32>, window: &Range<u32>) -> Vec<Range<u32>> {
 
 /// Scattered piece indices as the fewest contiguous ranges that cover them.
 ///
-/// The backend takes a range at a time -- both the advertised set and the
-/// want-set do -- and a reclaim of two hundred consecutive pieces should be
-/// one call and not two hundred locks on the torrent.
+/// The backend takes a range at a time, for both the advertised set and
+/// the want-set. A reclaim of two hundred consecutive pieces should be one
+/// call and not two hundred locks on the torrent.
 pub(crate) fn runs(pieces: &[u32]) -> Vec<Range<u32>> {
     let mut sorted: Vec<u32> = pieces.to_vec();
     sorted.sort_unstable();
@@ -835,10 +841,10 @@ pub(crate) fn runs(pieces: &[u32]) -> Vec<Range<u32>> {
     sorted_runs(sorted)
 }
 
-/// [`runs`] of indices that are already ascending and distinct -- a
-/// `BTreeSet`'s, a listing's -- so nothing is copied or sorted. The one
-/// run-builder both adapters use: the piece store's sets and the proxy's
-/// chunk listings alike.
+/// [`runs`] of indices that are already ascending and distinct (a
+/// `BTreeSet`'s, a listing's), so nothing is copied or sorted. It is the
+/// one run-builder both adapters use, for the piece store's sets and the
+/// proxy's chunk listings alike.
 pub fn sorted_runs(indices: impl IntoIterator<Item = u32>) -> Vec<Range<u32>> {
     let mut runs: Vec<Range<u32>> = Vec::new();
     for index in indices {
@@ -925,8 +931,8 @@ mod window_tests {
     /// mpv's read of the cues: a few mebibytes in front of it, a rate
     /// sampled off a cache-served burst, and silent for five minutes. It
     /// has had time to eat what is ahead of it many times over, so it is
-    /// not eating it, and it is not the reader about to stop the film --
-    /// whatever its rate says.
+    /// not eating it. Whatever its rate says, it is not the reader about to
+    /// stop the film.
     #[test]
     fn a_reader_that_has_had_time_to_eat_what_is_ahead_and_has_not_is_parked() {
         let viewer = head(60_000_000, 70_000_000, Some(3_200_000), 0.08);
@@ -943,7 +949,7 @@ mod window_tests {
 
     /// A viewer waiting on the next piece stands at the end of what is
     /// held with a byte in front of it. It has been waiting ten seconds and
-    /// is not eating -- and it is the opposite of parked: it is the reader
+    /// is not eating. Yet it is the opposite of parked: it is the reader
     /// that has stopped the film, and it reads as the nothing it has.
     #[test]
     fn a_stalled_reader_is_not_parked_and_reads_as_nothing_in_hand() {
@@ -1016,9 +1022,9 @@ mod window_tests {
         );
     }
 
-    /// Nobody live -- a paused player, or only parked readers -- is the
-    /// bytes round where the detector says playback is, and no seconds,
-    /// because nothing is eating them.
+    /// With nobody live (a paused player, or only parked readers), the
+    /// window is the bytes round where the detector says playback is. It
+    /// has no seconds, because nothing is eating them.
     #[test]
     fn with_no_live_reader_the_window_is_the_fallbacks_bytes_and_no_time() {
         let parked = head(0, 4_194_304, Some(3_000_000), 300.0);
