@@ -636,7 +636,7 @@ fn a_file_changed_into_one_that_will_not_range_stops_the_download_with_a_reason(
     assert!(
         stopped["error"]
             .as_str()
-            .is_some_and(|why| why.contains("byte ranges")),
+            .is_some_and(|why| why.contains("cannot send part of a file")),
         "{stopped}"
     );
     fixture.stop()?;

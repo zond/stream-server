@@ -134,8 +134,7 @@ impl fmt::Display for Refusal {
             ),
             Self::Unsupported { format, what } => write!(
                 f,
-                "this {format} uses {what}; that is not supported yet, so it cannot be read as \
-                 byte ranges"
+                "this {format} uses {what}, which is not supported yet, so it cannot be played"
             ),
         }
     }

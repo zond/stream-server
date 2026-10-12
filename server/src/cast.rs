@@ -580,7 +580,7 @@ fn not_served(reason: NotServed) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
                 "refused": "unpublished",
-                "message": "the cast was unpublished",
+                "message": "the cast was stopped",
             })),
         )
             .into_response(),

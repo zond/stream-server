@@ -209,7 +209,7 @@ impl std::fmt::Display for DriveOpenError {
         match self {
             Self::NoPairingService => write!(
                 f,
-                "this build has no pairing service to renew a Google Drive token against"
+                "this app was built without a Google Drive pairing service, so it cannot renew Drive access"
             ),
             Self::Drive(error) => write!(f, "{error}"),
         }

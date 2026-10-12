@@ -721,7 +721,7 @@ pub(crate) async fn proxy_row(
         .unwrap_or_default();
     rows.into_iter().find(|row| row.info_hash == name).ok_or(
         crate::proxy_downloads::ProxyPinError::Unkeyable(
-            "the pin was taken but the download is not listed",
+            "the download was started but does not appear in the list",
         ),
     )
 }

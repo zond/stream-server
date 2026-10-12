@@ -1697,7 +1697,7 @@ impl Registry {
             let Some(name) = crate::routes::downloads::proxy_download_key(state, &key) else {
                 return Err(PinError::Proxy(
                     crate::proxy_downloads::ProxyPinError::Unkeyable(
-                        "nothing this server can key, so nothing is pinned under it",
+                        "it is not something this server can keep, so nothing was saved under it",
                     ),
                 ));
             };

@@ -368,14 +368,16 @@ impl Refusal {
         use crate::routes::archive::SessionError;
         match error {
             SessionError::BadRequest(message) => Self::BadRequest(message),
-            SessionError::KeyInUse => {
-                Self::BadRequest("That session key is in use for another archive".to_string())
-            }
+            SessionError::KeyInUse => Self::BadRequest(
+                "that archive key is already in use for another archive".to_string(),
+            ),
             SessionError::Source(error) => Self::of_probe(error),
             SessionError::Refused(refusal) => Self::Translated(refusal),
-            SessionError::NoMember => Self::NoSuchFile("Failed to select archive file".to_string()),
+            SessionError::NoMember => {
+                Self::NoSuchFile("this archive holds no such file".to_string())
+            }
             SessionError::NoSession => {
-                Self::NoSuchFile("this server holds no archive session under that key".to_string())
+                Self::NoSuchFile("this server has no archive open under that key".to_string())
             }
             SessionError::BadKey => Self::UnrecognisedUrl,
             SessionError::NotInTorrent => {
@@ -400,12 +402,12 @@ impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownId => f.write_str(
-                "this server holds nothing under that id: it was never issued here, or was let go",
+                "this server does not know that stream: it was never registered here, or it was let go",
             ),
             Self::UnrecognisedUrl => {
                 f.write_str("this server serves nothing at that URL, so it cannot play it")
             }
-            Self::NotYet { what } => write!(f, "{what} cannot be played by id yet"),
+            Self::NotYet { what } => write!(f, "{what} cannot be played this way yet"),
             Self::Translated(refusal) => write!(f, "{refusal}"),
             Self::NoRanges => write!(f, "{}", ProxySourceError::WillNotRange),
             Self::NoReader(message)
@@ -482,7 +484,7 @@ impl std::fmt::Display for PinError {
         match self {
             Self::Refused(refusal) => write!(f, "{refusal}"),
             Self::NothingToDownload => {
-                f.write_str("a file on this device is here already; there is nothing to download")
+                f.write_str("this file is already on this device, so there is nothing to download")
             }
             Self::Torrent(error) => write!(f, "{error}"),
             Self::Proxy(error) => write!(f, "{error}"),
@@ -522,7 +524,7 @@ mod tests {
         };
         assert_eq!(
             Refusal::of_magnet_add(&cancelled),
-            Refusal::TorrentUnavailable("magnet add for abc was cancelled".into())
+            Refusal::TorrentUnavailable("opening torrent abc was cancelled".into())
         );
 
         let backend = |error: anyhow::Error| MagnetAddError::Backend {
@@ -543,7 +545,9 @@ mod tests {
         assert_eq!(refusal.kind(), "torrentRefused");
         assert_eq!(
             refusal,
-            Refusal::TorrentRefused("backend refused the torrent; see server logs".into())
+            Refusal::TorrentRefused(
+                "the torrent engine refused this torrent, and the reason is in the log".into()
+            )
         );
     }
 }

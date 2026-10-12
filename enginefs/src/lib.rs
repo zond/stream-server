@@ -226,13 +226,13 @@ type EngineRegistry<H> = Arc<RwLock<HashMap<String, Arc<Engine<H>>>>>;
 pub enum MagnetAddError {
     /// The backend did not return within [`METADATA_RESOLVE_TIMEOUT`]: no
     /// peer supplied the info dictionary in time. Routes map this to 504.
-    #[error("metadata for {info_hash} did not resolve within {}s", .timeout.as_secs())]
+    #[error("no peer sent the file list of torrent {info_hash} within {}s", .timeout.as_secs())]
     MetadataTimeout {
         info_hash: String,
         timeout: Duration,
     },
     /// The add task was aborted (its registry entry was swept as idle).
-    #[error("magnet add for {info_hash} was cancelled")]
+    #[error("opening torrent {info_hash} was cancelled")]
     Cancelled { info_hash: String },
     /// The add task ended abnormally before the backend answered: it
     /// panicked. This happens in debug builds only. The release profile's
@@ -261,7 +261,7 @@ impl MagnetAddError {
             // asks again, and "refused" there would say it had stopped.
             Self::MetadataTimeout { .. } | Self::Cancelled { .. } => self.to_string(),
             Self::Backend { .. } | Self::TaskFailed { .. } => {
-                "backend refused the torrent; see server logs".to_string()
+                "the torrent engine refused this torrent, and the reason is in the log".to_string()
             }
         }
     }
@@ -334,12 +334,12 @@ pub enum PinDownloadError {
     #[error(transparent)]
     MagnetAdd(#[from] MagnetAddError),
     /// The torrent has no such file.
-    #[error("file index {file_idx} out of range ({file_count} files)")]
+    #[error("the torrent has {file_count} files, so there is no file at index {file_idx}")]
     FileNotFound { file_idx: usize, file_count: usize },
     /// The volume the pieces land on has less than the file's missing bytes
     /// plus [`PIN_FREE_SPACE_MARGIN`] available.
     #[error(
-        "not enough free space for the download: {required} bytes needed (including a {margin} byte margin), {available} available"
+        "there is not enough free space for this download: it needs {required} bytes, including a margin of {margin}, and {available} are free"
     )]
     InsufficientSpace {
         required: u64,
@@ -362,7 +362,9 @@ impl PinDownloadError {
         match self {
             Self::MagnetAdd(error) => error.client_message(),
             Self::FileNotFound { .. } | Self::InsufficientSpace { .. } => self.to_string(),
-            Self::Backend(_) => "backend refused the download; see server logs".to_string(),
+            Self::Backend(_) => {
+                "the torrent engine refused this download, and the reason is in the log".to_string()
+            }
         }
     }
 }

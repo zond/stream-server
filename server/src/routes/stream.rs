@@ -499,7 +499,7 @@ pub(crate) fn content_type_for_name(name: &str) -> &'static str {
 /// own message, the engine's reason for a stop) name the cache root. No
 /// response may carry a path.
 pub(crate) const INSUFFICIENT_DISK_SPACE_BODY: &str =
-    "Insufficient disk space for this stream; free some space and retry";
+    "Not enough disk space for this stream: free some space and try again";
 
 /// Free space a test has declared for a root and everything under it,
 /// standing in for the volume probe. The readings are used in order, and

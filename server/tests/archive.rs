@@ -842,7 +842,7 @@ fn an_origin_that_will_not_range_is_refused() -> anyhow::Result<()> {
     assert!(
         body["message"]
             .as_str()
-            .is_some_and(|message| message.contains("byte ranges")),
+            .is_some_and(|message| message.contains("cannot send part of a file")),
         "{body}"
     );
     fixture.assert_nothing_kept();

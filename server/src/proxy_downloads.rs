@@ -124,7 +124,7 @@ impl std::fmt::Display for ProxyPinError {
         match self {
             Self::Source(error) => write!(f, "{error}"),
             Self::Drive(error) => write!(f, "{error}"),
-            Self::Unkeyable(why) => write!(f, "this link cannot be a download: {why}"),
+            Self::Unkeyable(why) => write!(f, "this link cannot be downloaded: {why}"),
             Self::NoGrant => {
                 f.write_str("this device is not linked to a Google account that can read that file")
             }
@@ -361,13 +361,15 @@ pub(crate) async fn pin_url(
     headers: BTreeMap<String, String>,
     name: Option<String>,
 ) -> Result<PathBuf, ProxyPinError> {
-    let url = Url::parse(target).map_err(|_| ProxyPinError::Unkeyable("the URL does not parse"))?;
+    let url =
+        Url::parse(target).map_err(|_| ProxyPinError::Unkeyable("it is not a valid address"))?;
     let key = ProxyPinKey::Url {
         target: url.as_str().to_string(),
         headers: headers.clone(),
     };
     let entry = key.entry(state).ok_or(ProxyPinError::Unkeyable(
-        "the URL names this server, or carries a credential the cache will not key",
+        "it points back at this device's own server, or it carries a login, which a download \
+         never keeps",
     ))?;
     if held_complete(state, &entry).await {
         return Ok(state.proxy_downloads.pin(state, key, name, entry, None));
@@ -497,7 +499,7 @@ pub(crate) async fn pin_drive(
         file_id: file_id.to_string(),
     };
     let entry = key.entry(state).ok_or(ProxyPinError::Unkeyable(
-        "the Drive file's media URL names this server",
+        "the Drive file's address points back at this device's own server",
     ))?;
     if held_complete(state, &entry).await {
         return Ok(state.proxy_downloads.pin(state, key, name, entry, None));

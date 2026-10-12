@@ -1013,7 +1013,7 @@ fn a_torrent_the_backend_refuses_is_refused_not_unavailable() -> anyhow::Result<
     assert_eq!(
         refusal,
         Some(Refusal::TorrentRefused(
-            "backend refused the torrent; see server logs".to_string()
+            "the torrent engine refused this torrent, and the reason is in the log".to_string()
         ))
     );
     let refusal = refusal.expect("refused");
@@ -1022,7 +1022,7 @@ fn a_torrent_the_backend_refuses_is_refused_not_unavailable() -> anyhow::Result<
         serde_json::to_value(&refusal)?,
         serde_json::json!({
             "refused": "torrentRefused",
-            "message": "backend refused the torrent; see server logs",
+            "message": "the torrent engine refused this torrent, and the reason is in the log",
         })
     );
     assert_eq!(

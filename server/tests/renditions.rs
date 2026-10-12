@@ -1951,6 +1951,7 @@ fn unpublish_wakes_a_waiting_range_and_stops_the_producer() -> anyhow::Result<()
     let (status, body) = waiting.join().expect("the request thread")?;
     assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
     assert!(body.contains("unpublished"), "{body}");
+    assert!(body.contains("the cast was stopped"), "{body}");
     let run = fixture.producer.runs()[0].clone();
     until("the producer is stopped", || run.stopped() && run.done());
     assert_eq!(

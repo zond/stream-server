@@ -1298,7 +1298,7 @@ impl Rendition {
                 if frozen != formats {
                     return Err(run::Frozen::Failed(
                         "The conversion came back from a seek in a different format, which the \
-                         television cannot follow; cast the film again."
+                         television cannot follow. Cast the film again."
                             .to_string(),
                     ));
                 }

@@ -63,7 +63,7 @@ impl std::fmt::Display for ProxySourceError {
         match self {
             Self::WillNotRange => write!(
                 f,
-                "this link's host does not serve byte ranges, so a file inside it could only be \
+                "this link's host cannot send part of a file, so a file inside it could only be \
                  played by downloading the whole thing"
             ),
             Self::Origin(status) => write!(f, "this link's host answered {status}"),
@@ -1352,7 +1352,7 @@ mod tests {
         assert!(
             ProxySourceError::WillNotRange
                 .to_string()
-                .contains("byte ranges"),
+                .contains("cannot send part of a file"),
             "the refusal has no sentence a player could show"
         );
     }

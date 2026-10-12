@@ -77,9 +77,9 @@ impl std::fmt::Display for LocalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotSeekable => f.write_str(
-                "this file can only be read once from start to end (its provider streams it \
-                 rather than handing over the file), and playing it needs to seek: save it \
-                 to this device first",
+                "this file can only be read once from start to end, because its provider streams \
+                 it rather than handing over the file. Playing it needs to seek, so save it to \
+                 this device first",
             ),
             Self::NotAFile => f.write_str("that is not a file this device can play"),
             Self::Open(error) => write!(f, "the file on this device could not be opened: {error}"),

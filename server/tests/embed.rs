@@ -2538,7 +2538,7 @@ fn a_pin_moves_nothing_and_survives_a_restart() -> anyhow::Result<()> {
     assert!(
         missing
             .as_ref()
-            .is_err_and(|e| e.to_string().contains("out of range")),
+            .is_err_and(|e| e.to_string().contains("so there is no file at index 9")),
         "{missing:?}"
     );
 
@@ -2943,7 +2943,12 @@ fn downloads_pin_in_place_and_delete_only_what_they_say() -> anyhow::Result<()> 
         ),
         "{missing:#}"
     );
-    assert!(not_found.client_message().contains("range"), "{missing:#}");
+    assert!(
+        not_found
+            .client_message()
+            .contains("so there is no file at index"),
+        "{missing:#}"
+    );
 
     // And a *destructive* unpin for an index the torrent does not have is
     // the same refusal, not a request to delete every file of it.
@@ -6016,7 +6021,7 @@ fn a_stream_below_the_free_space_floor_is_refused_not_degraded() -> anyhow::Resu
         );
         assert_eq!(
             response.text()?,
-            "Insufficient disk space for this stream; free some space and retry",
+            "Not enough disk space for this stream: free some space and try again",
             "range {range:?}"
         );
     }
@@ -6159,7 +6164,7 @@ fn a_stream_refused_for_space_frees_the_slack_and_asks_again() -> anyhow::Result
     assert_eq!(response.status(), reqwest::StatusCode::INSUFFICIENT_STORAGE);
     assert_eq!(
         response.text()?,
-        "Insufficient disk space for this stream; free some space and retry"
+        "Not enough disk space for this stream: free some space and try again"
     );
     assert!(
         started.elapsed() < std::time::Duration::from_secs(10),

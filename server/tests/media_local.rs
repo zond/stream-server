@@ -200,8 +200,9 @@ fn a_pipe_fd_is_refused_at_resolve() -> anyhow::Result<()> {
     assert_eq!(refusal.kind(), "notSeekable");
     assert_eq!(
         refusal.to_string(),
-        "this file can only be read once from start to end (its provider streams it rather \
-         than handing over the file), and playing it needs to seek: save it to this device first"
+        "this file can only be read once from start to end, because its provider streams it \
+         rather than handing over the file. Playing it needs to seek, so save it to this device \
+         first"
     );
     handle.shutdown()?;
     handle.join()?;
