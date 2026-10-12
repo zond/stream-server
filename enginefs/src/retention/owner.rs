@@ -1,37 +1,36 @@
 //! One owner for retention: the policy never leaves its cell, and one party
 //! at a time changes the world it describes.
 //!
-//! Both retention drivers -- `Engine::retain` over a torrent's piece store
-//! and `server::proxy_retention` over a proxied body's chunk store -- run the
-//! same arithmetic ([`RetentionPolicy`]) through this one owner, and the
+//! Both retention drivers run the same arithmetic ([`RetentionPolicy`])
+//! through this one owner: `Engine::retain` over a torrent's piece store,
+//! and `server::proxy_retention` over a proxied body's chunk store. The
 //! defect it is built against is **a value read at one moment, trusted at
-//! another**. The policy is the case that matters: a pass that took it out
-//! of its slot for its own length and died at an await -- the runtime
+//! another**. The policy is the case that matters. Suppose a pass took it
+//! out of its slot for its own length and died at an await: the runtime
 //! shutting down, the blocking pool refusing a task, a panic in the unlink
-//! closure -- would walk off with it, and the entity would be unbounded
-//! until the budget's *value* changed.
+//! closure. It would walk off with the policy, and the entity would be
+//! unbounded until the budget's *value* changed.
 //!
 //! **What an entity shares is decided once and only ever added to the
 //! backend.** The viewer's playback stream draws it once, as soon as its
 //! read-ahead is known ([`State::draw`], [`Retention::install_opening`],
-//! [`DRAW_FALLBACK`]), and advertises it through [`Backing::advertise`], the
-//! one direction there is: nothing here takes an announcement back, and a
+//! [`DRAW_FALLBACK`]). It advertises it through [`Backing::advertise`],
+//! the one direction there is. Nothing here takes an announcement back. A
 //! [`Mode::Slack`] pass deletes nothing a peer may have been told of while
 //! the backend is in the swarm ([`Backing::announced_in_swarm`]). Ending an
-//! announcement is the driver's -- the torrent's reconciler stops it first
-//! (`EndShares`).
+//! announcement is the driver's job: the torrent's reconciler stops it
+//! first (`EndShares`).
 //!
 //! Here the policy is resident in [`State::installed`], behind a lock that
-//! is never held across an await, and it is never taken out: a pass advances
+//! is never held across an await. It is never taken out: a pass advances
 //! it in place. What a pass holds instead is the entity's **turn**, a tokio
 //! mutex over a zero-sized [`Turn`] token, one per entity on both sides.
-//! Whoever holds the turn is the one
-//! party installing, clearing or passing on that entity, and the turn *is*
-//! held across that party's I/O, because that is what keeps "nothing of
-//! this entity becomes advertised between the decision and the unlink"
-//! true.
-//! The guard is the [`Claim`], and a dead pass drops it like any other
-//! local: the entity is passable again, and the policy is still in its cell.
+//! Whoever holds the turn is the one party installing, clearing or passing
+//! on that entity. The turn *is* held across that party's I/O, because that
+//! keeps "nothing of this entity becomes advertised between the decision
+//! and the unlink" true. The guard is the [`Claim`], and a dead pass drops
+//! it like any other local. The entity is then passable again, and the
+//! policy is still in its cell.
 //!
 //! # Lock order
 //!
@@ -42,173 +41,177 @@
 //! * **L2** [`Entity::state`] (`parking_lot::Mutex`) -- every datum,
 //!   including the resident [`RetentionPolicy`].
 //! * **T** [`Entity::turn`] (`tokio::sync::Mutex<Turn>`) -- the entity's turn.
-//!   Protects no memory; orders this process's changes to the world outside
-//!   it (what librqbit advertises, what the directory holds). The ONLY thing
-//!   ever held across an await.
+//!   It protects no memory. It orders this process's changes to the world
+//!   outside it (what librqbit advertises, what the directory holds). It is
+//!   the ONLY thing ever held across an await.
 //! * **X** -- locks outside the owner: `pinned_files`, [`RetentionBudget`],
 //!   the liveness cell, librqbit's own, the filesystem.
 //! * **S** [`Retention::set_draws`] (`parking_lot::Mutex`) -- one set's
-//!   draw decided at a time ([`Backing::played_set`]). Taken under T, with
-//!   no owner lock held, and held with no await: under it L1 to copy the
-//!   set's entities out, each sibling's L2 alone and released, then the
-//!   deciding entity's own L2. Outermost of the three; nothing takes it
-//!   under L1 or L2.
+//!   draw decided at a time ([`Backing::played_set`]). It is taken under T,
+//!   with no owner lock held, and held with no await. Under it come L1 to
+//!   copy the set's entities out, each sibling's L2 alone and released,
+//!   then the deciding entity's own L2. It is the outermost of the three,
+//!   and nothing takes it under L1 or L2.
 //!
 //! 1. L1 → L2 only, and only inside [`Retention::holdings`],
 //!    [`Retention::forget_empty`], `drawn_in`, [`Retention::draws`],
 //!    [`Retention::draws_for`], [`Retention::withdraw_from_draws_made_for`]
-//!    and [`Door::drawn`], which take L1 and read
-//!    each entity's L2 under it; never L2 → L1. An entity holds its own `Arc` and never
-//!    reaches the map. (Every other reader of the map --
-//!    [`Retention::readers`], `lookup`, `entity` -- copies the `Arc`s out
-//!    and releases L1 before touching any L2.)
+//!    and [`Door::drawn`]. These take L1 and read each entity's L2 under
+//!    it, never L2 → L1. An entity holds its own `Arc` and never reaches
+//!    the map. (Every other reader of the map -- [`Retention::readers`],
+//!    `lookup`, `entity` -- copies the `Arc`s out and releases L1 before
+//!    touching any L2.)
 //! 2. No L1 or L2 guard is ever live across an await, a tracing macro, a
 //!    `&self` method of [`Backing`] or any X. The pure associated functions
 //!    of [`Backing`] -- `governs`, `extent`, `policy`, `index_of` -- ARE
 //!    called under L2 (`policy` from [`Reader::note`]'s decide, `index_of`
-//!    from the [`Door`] and every head reading) and must take no lock and do
-//!    no I/O. [`Backing::policy`] returns its `Err` as a value and the
+//!    from the [`Door`] and every head reading). They must take no lock and
+//!    do no I/O. [`Backing::policy`] returns its `Err` as a value, and the
 //!    caller logs after unlock. [`Backing::keeps_everything`]
 //!    (`pinned_files.read()`) is asked before L2 is taken, in the [`Door`]
 //!    and in the pass.
-//! 3. T is awaited (`lock().await`) only with NO owner lock held:
+//! 3. T is awaited (`lock().await`) only with NO owner lock held.
 //!    [`Retention::pass`]'s callers, [`Retention::install`] and
-//!    `Retention::clear` (test builds only) take it first. T → L2 briefly is allowed.
-//!    `try_lock` on T IS allowed under L2 -- deliberately:
-//!    "is a pass running" and "is this byte due" must be one reading, and
-//!    **every exit of the pass** must decide `again` and either hand the
-//!    claim on or drop it INSIDE its L2 block. Releasing L2 before the
-//!    `try_lock`, or the claim after L2, reopens the swallowed-last-byte
-//!    hole: a byte delivered between the conclusion and the release finds a
-//!    pass "running", starts none, and nothing remembers that it wanted
-//!    one. The one `try_lock` under L2 is [`Reader::note`]'s, on an entity
-//!    it already holds; [`Retention::try_turn`] looks its entity up under
-//!    L1 and is for callers holding nothing.
-//! 4. T is per entity and never nested: every party takes one turn, does
-//!    its work and releases it before taking another, and nothing here
-//!    touches two entities in one act -- what makes a sibling slack is the
-//!    liveness value ([`crate::retention::live`]), not an install. The one
-//!    reading across entities is a set's draw (under S): a volume adopts
-//!    the draw a sibling already holds, read under the sibling's L2 and
-//!    copied out, and writes only its own state. The one write across a
-//!    set's entities is a delete's ([`Retention::withdraw_from_draws_made_for`]),
-//!    which takes each volume's turn in turn -- released before the next --
-//!    and S under it, as a draw does.
+//!    `Retention::clear` (test builds only) take it first. T → L2 briefly
+//!    is allowed. `try_lock` on T IS allowed under L2, deliberately. "Is a
+//!    pass running" and "is this byte due" must be one reading. **Every
+//!    exit of the pass** must decide `again`, and either hand the claim on
+//!    or drop it INSIDE its L2 block. Releasing L2 before the `try_lock`,
+//!    or the claim after L2, reopens the swallowed-last-byte hole. A byte
+//!    delivered between the conclusion and the release finds a pass
+//!    "running" and starts none, and nothing remembers that it wanted one.
+//!    The one `try_lock` under L2 is [`Reader::note`]'s, on an entity it
+//!    already holds. [`Retention::try_turn`] looks its entity up under L1
+//!    and is for callers holding nothing.
+//! 4. T is per entity and never nested. Every party takes one turn, does
+//!    its work and releases it before taking another. Nothing here touches
+//!    two entities in one act: what makes a sibling slack is the liveness
+//!    value ([`crate::retention::live`]), not an install. The one reading
+//!    across entities is a set's draw (under S). A volume adopts the draw a
+//!    sibling already holds, read under the sibling's L2 and copied out,
+//!    and writes only its own state. The one write across a set's entities
+//!    is a delete's ([`Retention::withdraw_from_draws_made_for`]). It takes
+//!    each volume's turn in turn, released before the next, and S under
+//!    it, as a draw does.
 //! 5. Writes to `installed`, `windows`, `stride` and the in-place advance of
 //!    the policy require `&mut Turn`, so "written only under the turn" is a
-//!    type -- with one documented exception: [`State::install_now`]
+//!    type. There is one documented exception. [`State::install_now`]
 //!    ([`Install::OnDeliveredByte`]) writes `installed`, `decided` and
-//!    `stride` and resets every reader's `passed_at` under L2 alone from
-//!    [`Reader::note`] while a pass may hold T. Legal only because [`Share::Nothing`] holds nothing back (no
-//!    foreign state to keep in step; const-asserted in [`Retention::new`]),
-//!    and it is why the pass re-checks budget and domain at the post-listing
-//!    re-read and before writing its windows. `decided` has no turn-writer:
-//!    it is written by `install_now` and cleared with the policy.
+//!    `stride`, and resets every reader's `passed_at`, under L2 alone from
+//!    [`Reader::note`] while a pass may hold T. That is legal only because
+//!    [`Share::Nothing`] holds nothing back (no foreign state to keep in
+//!    step; const-asserted in [`Retention::new`]). It is why the pass
+//!    re-checks budget and domain at the post-listing re-read and before
+//!    writing its windows. `decided` has no turn-writer: it is written by
+//!    `install_now` and cleared with the policy.
 //!
 //! **Why it is deadlock-free.** L1 and L2 form a strict two-level order with
 //! no awaits inside, so they wait only on each other and in one direction.
-//! T is acquired only by tasks holding no owner lock, never nested with
-//! another T; its holder takes only L2 (which never waits) and X (from
-//! [`Backing`] calls, with no owner lock held). The two writers
-//! that must never wait on T -- [`Reader::note`] /
-//! [`Retention::note_position`] on every delivered byte, and pin writes --
-//! touch only L1 to copy out, L2 and X, which is what the torrent's
-//! parked-pass tests exercise: a pass parked inside a backend call under T
-//! (`reselect_gate`, `advertise_gate`) while a note and a pin land.
+//! T is acquired only by tasks holding no owner lock, and never nested with
+//! another T. Its holder takes only L2 (which never waits) and X (from
+//! [`Backing`] calls, with no owner lock held). Two writers must never
+//! wait on T: [`Reader::note`] / [`Retention::note_position`] on every
+//! delivered byte, and pin writes. They touch only L1 to copy out, L2 and
+//! X. The torrent's parked-pass tests exercise that: a pass parked inside a
+//! backend call under T (`reselect_gate`, `advertise_gate`) while a note
+//! and a pin land.
 //!
 //! # The pass
 //!
-//! Two passes, and which one runs is the driver's, from one reading of what
-//! is being played ([`Mode`]). [`Mode::Slack`] is the short one, written
-//! out on [`Retention::slack_pass`]: re-establish that it really is slack
-//! under the turn, take nothing a peer may have been told of while the
-//! backend is in the swarm, drop the policy, the windows and the draw, take
-//! every byte off the disk, forget the entity if nothing is left. The re-establishing is the first step and not a formality -- the
-//! driver's reading is older than the turn by every unlink it has done
-//! since, and this is the pass that deletes an entity whole. What follows
-//! is [`Mode::Live`].
+//! There are two passes, and the driver picks which one runs, from one
+//! reading of what is being played ([`Mode`]). [`Mode::Slack`] is the short
+//! one, written out on [`Retention::slack_pass`]. It re-establishes that the
+//! entity really is slack under the turn. It takes nothing a peer may have
+//! been told of while the backend is in the swarm. It drops the policy, the
+//! windows and the draw, takes every byte off the disk, and forgets the
+//! entity if nothing is left. The re-establishing is the first step and not
+//! a formality. The driver's reading is older than the turn by every unlink
+//! it has done since, and this is the pass that deletes an entity whole.
+//! What follows is [`Mode::Live`].
 //!
-//! One body with two entries. [`Retention::turn`] queues on T for the
-//! torrent's tick and the proxy's slack sweep; [`Reader::note`] claims T
+//! It is one body with two entries. [`Retention::turn`] queues on T for the
+//! torrent's tick and the proxy's slack sweep. [`Reader::note`] claims T
 //! with a `try_lock` when a delivered byte moved a stride, which is the
-//! proxy's trigger. Both hand a [`Claim`] to [`Retention::pass`], whose steps are:
+//! proxy's trigger. Both hand a [`Claim`] to [`Retention::pass`], whose
+//! steps are:
 //!
 //! 1. [`Backing::keeps_everything`] → clear, conclude nothing.
 //! 2. Snapshot heads and promises under L2.
 //! 3. Test hook.
 //! 4. The listing ([`Backing::held`]), with no owner lock held.
 //! 5. RE-READ under L2, and REFUSE if the resident policy's budget or
-//!    domain differs from the snapshot -- a decide ran under us. Otherwise
-//!    advance the resident policy in place and build the windows.
-//! 6. Nothing to announce -- the draw was advertised when it was decided
-//!    (at an open, or at step 1a of a pass) and the backend announces each
-//!    piece of it as it completes -- and nothing to
-//!    withdraw; the draw is held in the published set so no unlink of the
-//!    pass may take it. Then, no L2 held,
-//!    [`Backing::want`], which trims what the backend fetches to the
-//!    *want*-windows and what is on the disk, asking the same [`Door`] the
-//!    reclaim asks before it unlinks anything that arrived under the pass.
-//!    Two window lists come out of step 5, not one: every reader is owed a
-//!    window that is not deleted under it, and what is fetched is what the
-//!    detector's consumers are asking for.
+//!    domain differs from the snapshot, since a decide ran under us.
+//!    Otherwise advance the resident policy in place and build the windows.
+//! 6. There is nothing to announce. The draw was advertised when it was
+//!    decided (at an open, or at step 1a of a pass), and the backend
+//!    announces each piece of it as it completes. There is nothing to
+//!    withdraw. The draw is held in the published set, so no unlink of the
+//!    pass may take it. Then, with no L2 held, [`Backing::want`]. It trims
+//!    what the backend fetches to the *want*-windows and what is on the
+//!    disk. It asks the same [`Door`] the reclaim asks before it unlinks
+//!    anything that arrived under the pass. Two window lists come out of
+//!    step 5, not one. Every reader is owed a window that is not deleted
+//!    under it, and what is fetched is what the detector's consumers are
+//!    asking for.
 //! 7. Test hook.
 //! 8. [`Backing::reclaim`] with a [`Door`] that answers [`Door::shut`] from
 //!    the backing and [`Door::refuses`] from the set this pass published.
-//! 9. Conclude under L2: `passed_at` and the windows only if the budget and
-//!    domain are still the ones measured, and `again` decided from the same
-//!    `head` the pass measured from, with the SAME claim handed back to the
-//!    driver.
+//! 9. Conclude under L2. Write `passed_at` and the windows only if the
+//!    budget and domain are still the ones measured. Decide `again` from
+//!    the same `head` the pass measured from, with the SAME claim handed
+//!    back to the driver.
 //!
-//! Every early return leaves the policy exactly where it is, and every one
-//! of them -- the pin, nothing installed, the failed listing, the refused
-//! re-read -- decides `again` under L2 the way step 9 does, with the claim
+//! Every early return leaves the policy exactly where it is. Every one of
+//! them (the pin, nothing installed, the failed listing, the refused
+//! re-read) decides `again` under L2 the way step 9 does. The claim is
 //! dropped or handed on inside that block ([`State::owes_a_pass`]). There
 //! is no `abandon` and no `put_back`, because nothing was taken out.
 //!
 //! # Rules the steps above do not spell out
 //!
 //! * [`Retention::try_turn`] never waits, but it looks its entity up under
-//!   L1, so it is NOT legal under L2 (L2 → L1 inverts rule 1); the
-//!   `try_lock` rule 3 allows under L2 is [`Reader::note`]'s on an entity it
-//!   already holds.
-//! * `again` is decided on every exit of the pass, not only at step 9, and a
-//!   pass refused at its re-read (or overtaken during its reclaim) hands the
-//!   claim on outright rather than asking the stride rule of a head it never
-//!   measured: step 9 alone would swallow a last byte delivered under a
-//!   budget change; see [`Retention::pass`].
+//!   L1. So it is NOT legal under L2 (L2 → L1 inverts rule 1). The
+//!   `try_lock` rule 3 allows under L2 is [`Reader::note`]'s, on an entity
+//!   it already holds.
+//! * `again` is decided on every exit of the pass, not only at step 9. A
+//!   pass refused at its re-read (or overtaken during its reclaim) hands
+//!   the claim on outright, rather than asking the stride rule of a head it
+//!   never measured. Step 9 alone would swallow a last byte delivered under
+//!   a budget change. See [`Retention::pass`].
 //! * `passed_at` is written only when the windows are (budget and domain
-//!   unchanged): writing it regardless would undo the "every reader is due
+//!   unchanged). Writing it regardless would undo the "every reader is due
 //!   again" a publication promises.
 //! * `clear` forgets `decided` with the policy. Without it a cleared
 //!   [`Install::OnDeliveredByte`] entity is never decided again until the
 //!   budget's value changes.
 //! * The windows are written only if budget AND domain are unchanged. The
-//!   domain check is dead as things stand, because only `install`, under the
-//!   turn, writes the domain; it is kept because it is the conservative
-//!   direction.
-//! * Step 2 snapshots `{domain, budget}` and the head's piece, and reads
-//!   heads and promises afresh at step 5 with no fallback to a step-2 copy:
-//!   an entity cannot vanish under a pass, because the pass holds its `Arc`.
+//!   domain check is dead as things stand, because only `install`, under
+//!   the turn, writes the domain. It is kept because it is the
+//!   conservative direction.
+//! * Step 2 snapshots `{domain, budget}` and the head's piece. Step 5 reads
+//!   heads and promises afresh, with no fallback to a step-2 copy. An
+//!   entity cannot vanish under a pass, because the pass holds its `Arc`.
 //! * [`Backing`] has a `Sized` bound (RPITIT with `Door<Self>` needs it).
-//! * `install` creates the entity for a fresh key before its checks, so an
+//! * `install` creates the entity for a fresh key before its checks. So an
 //!   install that answers `Unbounded` (a pin, a budget that covers the
-//!   file) leaves an entity with nothing installed in the map until a
-//!   slack pass finds it holding nothing ([`Retention::forget_empty`]) --
-//!   one small struct per file ever installed on.
+//!   file) leaves an entity with nothing installed in the map. It stays
+//!   until a slack pass finds it holding nothing
+//!   ([`Retention::forget_empty`]): one small struct per file ever
+//!   installed on.
 //! * An entity left unbounded wants its whole extent again
 //!   ([`Backing::want_all`]). Its passes trim the backend's want-set to the
 //!   window ([`Backing::want`] at step 6), and a dropped piece stays dropped
-//!   until something wants it; a pin on a single-file torrent changes no
-//!   selection, so without this the download the user asked to keep would
-//!   stop at the window's edge. It is asked by the pass under a pin and by
-//!   an install that ends with nothing installed -- not by every clear: an
-//!   install that replaces one policy with another has a window to trim to
-//!   at its next pass, and a file the reader left is [`Mode::Slack`], with
+//!   until something wants it. A pin on a single-file torrent changes no
+//!   selection. So without this, the download the user asked to keep would
+//!   stop at the window's edge. The pass asks it under a pin, and so does
+//!   an install that ends with nothing installed. Not every clear asks it.
+//!   An install that replaces one policy with another has a window to trim
+//!   to at its next pass. A file the reader left is [`Mode::Slack`], with
 //!   its pieces on their way off the disk rather than something to fetch
 //!   whole.
-//! * Two policies on one torrent are legal: each file is its own entity
-//!   with its own head, its own window and its own [`Mode`], and the one
-//!   that is neither played nor read is the one whose bytes go.
+//! * Two policies on one torrent are legal. Each file is its own entity,
+//!   with its own head, its own window and its own [`Mode`]. The one that
+//!   is neither played nor read is the one whose bytes go.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Debug;
@@ -225,15 +228,15 @@ use crate::retention::{CacheBudget, RetentionBudget, runs, trace};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
     /// A delivered byte that moved its reader a stride, where the stride is
-    /// the window over `passes_per_window`, at least one piece. The proxy:
-    /// a proxied entity grows only as its own body is relayed, so the byte
-    /// that grows it is the byte that should measure it, and twenty
+    /// the window over `passes_per_window`, at least one piece. This is the
+    /// proxy's. A proxied entity grows only as its own body is relayed, so
+    /// the byte that grows it is the byte that should measure it. Twenty
     /// listings per window of playback bound the overshoot to a twentieth
     /// of the budget.
     OnMove { passes_per_window: u64 },
-    /// Somebody takes the turn and calls the pass -- the reconciler's tick.
-    /// The torrent: the swarm fills its cache whether or not anyone reads,
-    /// so a delivered byte is not the event that grows it.
+    /// Somebody takes the turn and calls the pass: the reconciler's tick.
+    /// This is the torrent's. The swarm fills its cache whether or not
+    /// anyone reads, so a delivered byte is not the event that grows it.
     External,
 }
 
@@ -241,10 +244,10 @@ pub enum Trigger {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Install {
     /// Inside [`Reader::note`], the moment the published budget differs from
-    /// the one the entity was decided under. Legal only with
-    /// [`Share::Nothing`]: swapping a policy that shares nothing needs no
+    /// the one the entity was decided under. It is legal only with
+    /// [`Share::Nothing`]. Swapping a policy that shares nothing needs no
     /// backend call, so it can happen under L2 alone while a pass holds the
-    /// turn -- see rule 5 in the module docs.
+    /// turn (see rule 5 in the module docs).
     OnDeliveredByte,
     /// By [`Retention::install`], before the reader opens, so the play
     /// session's read-ahead is known to the policy before a piece of it
@@ -255,18 +258,18 @@ pub enum Install {
 /// Who opened an entity, as far as what it shares goes
 /// ([`Retention::install_opening`]).
 ///
-/// **Only the viewer's playback stream shares anything** -- a request
-/// carrying the player's token (`p=`). Everything else
-/// that reads a torrent's file -- a subtitle fetched beside the film, a
-/// volume of an archive a translated source is reading, a pin's adoption
-/// -- draws nothing and announces nothing: its bytes are reclaimed as any
+/// **Only the viewer's playback stream shares anything**: a request
+/// carrying the player's token (`p=`). Everything else that reads a
+/// torrent's file draws nothing and announces nothing. That covers a
+/// subtitle fetched beside the film, a volume of an archive a translated
+/// source is reading, and a pin's adoption. Its bytes are reclaimed as any
 /// unshared bytes are, and nothing it did can make the torrent leave the
 /// swarm under the film.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Opener {
     /// The viewer's player, by its token. Its play session draws a shared
-    /// set while a session is on the entity ([`Backing::plays`]) and once
-    /// its read-ahead is known ([`DRAW_FALLBACK`]).
+    /// set while a session is on the entity ([`Backing::plays`]), once its
+    /// read-ahead is known ([`DRAW_FALLBACK`]).
     Player,
     /// Anything else. Draws nothing.
     Unshared,
@@ -275,14 +278,14 @@ pub enum Opener {
 /// **What a play session's draw was made for**: the member of the entity
 /// the session played ([`Backing::played_member`], `None` for the entity as
 /// itself) and the set it played the entity as a volume of
-/// ([`Backing::played_set`]). Recorded with the draw
-/// ([`State::drawn_for`]), because a draw is made for a member: a session
-/// that moves to another member of the same container -- the next episode
-/// of a season in one ZIP -- plays a different film in the same entity, and
-/// the first member's draw is nothing it shares. The driver counts a draw
-/// as shared only while what it was made for is what is played now
-/// ([`Retention::draws_for`]), and a set's volume adopts a sibling's draw
-/// only when it was made for this set.
+/// ([`Backing::played_set`]). It is recorded with the draw
+/// ([`State::drawn_for`]), because a draw is made for a member. A session
+/// that moves to another member of the same container (the next episode
+/// of a season in one ZIP) plays a different film in the same entity. The
+/// first member's draw is nothing it shares. The driver counts a draw as
+/// shared only while what it was made for is what is played now
+/// ([`Retention::draws_for`]). A set's volume adopts a sibling's draw only
+/// when it was made for this set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrawnFor<K> {
     pub member: Option<Range<u64>>,
@@ -300,18 +303,18 @@ pub type DrawMade<K> = (K, BTreeSet<u32>, DrawnFor<K>);
 /// anyway**, counted from the first pass that finds playback under way (a
 /// delivered byte) and the draw still undecided.
 ///
-/// The draw has to be sized beside the stream's real read-ahead, which is
-/// the film's bitrate times the seconds the viewer asked for, and the
-/// bitrate is the film's size over the duration the player states
-/// ([`Retention::note_duration`]) -- which it does only once it has opened
-/// the media, after the first open. Drawn at that open, the set was sized
-/// beside the intent's placeholder (32 MiB) while every later open was
-/// granted the real read-ahead, hundreds of megabytes for a 4K film, and the
+/// The draw has to be sized beside the stream's real read-ahead: the
+/// film's bitrate times the seconds the viewer asked for. The bitrate is
+/// the film's size over the duration the player states
+/// ([`Retention::note_duration`]). The player states it only once it has
+/// opened the media, after the first open. Drawn at that open, the set was
+/// sized beside the intent's placeholder (32 MiB). Every later open was
+/// granted the real read-ahead, hundreds of megabytes for a 4K film. The
 /// disk sat over its budget by the difference for the whole session. So the
 /// draw waits for the rate, which costs nothing: under the announce-nothing
-/// default nothing of the file is announced before it. A player that never
+/// default, nothing of the file is announced before it. A player that never
 /// states a length (a client other than the app) would share nothing at
-/// all, so after this much playback the draw is made with what the opens
+/// all. So after this much playback the draw is made with what the opens
 /// stated.
 pub const DRAW_FALLBACK: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -320,7 +323,7 @@ pub const DRAW_FALLBACK: std::time::Duration = std::time::Duration::from_secs(10
 ///
 /// The driver decides it, from one reading of what is being played
 /// ([`crate::retention::live`]), and hands it to [`Retention::pass`]. It is
-/// not a property of the entity and nothing here remembers it: the same
+/// not a property of the entity, and nothing here remembers it. The same
 /// entity is live this tick and slack the next because a player opened
 /// something else, and the tick after that it is gone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -330,21 +333,21 @@ pub enum Mode {
     /// has released, trims the want-set to the window and reclaims the
     /// rest.
     Live,
-    /// Nothing is playing it and nothing is reading it: its play session is
-    /// over. Once nothing it holds is announced in the swarm, the pass takes
-    /// every byte of it off the disk. Nothing is kept: an entity that has
-    /// been left is not a small cache, it is disposable.
+    /// Nothing is playing it and nothing is reading it, so its play session
+    /// is over. Once nothing it holds is announced in the swarm, the pass
+    /// takes every byte of it off the disk. Nothing is kept. An entity that
+    /// has been left is not a small cache: it is disposable.
     ///
     /// `opens` is [`Retention::opens_of`] as the driver read it when it
-    /// decided this, and it travels with the mode so the pass can find out
+    /// decided this. It travels with the mode so the pass can find out
     /// whether the decision is still true. A stream opening on the entity
-    /// is [`Retention::install`], which takes the entity's turn -- so an
-    /// open that lands after this reading and before the pass takes that
-    /// turn is one the pass would otherwise delete under, and one that
-    /// arrives later cannot get in at all. The count is compared and not
-    /// re-read: asking "is it live now?" again answers about a moment that
-    /// has already passed, and comparing two readings answers about the gap
-    /// between them, which is the thing that can hurt.
+    /// is [`Retention::install`], which takes the entity's turn. So the pass
+    /// would otherwise delete under an open that lands after this reading
+    /// and before the pass takes that turn. An open that arrives later
+    /// cannot get in at all. The count is compared and not re-read. Asking
+    /// "is it live now?" again answers about a moment that has already
+    /// passed. Comparing two readings answers about the gap between them,
+    /// which is the thing that can hurt.
     Slack { opens: u64 },
 }
 
@@ -361,30 +364,31 @@ pub struct Asking {
     /// What the volume will still give before the margin, or `None` for a
     /// volume nothing could read.
     pub headroom: Option<u64>,
-    /// The file's own bitrate -- size over duration -- or `None` for a file
+    /// The file's own bitrate (size over duration), or `None` for a file
     /// whose length nobody has stated.
     pub ceiling: Option<u64>,
-    /// How many seconds of stream a window may buy. Never "no cap": the
-    /// `Maximum` profile, and an entity no reader has stated a profile for,
-    /// are [`crate::backend::priorities::MAXIMUM_WINDOW_SECONDS`], a
+    /// How many seconds of stream a window may buy. It is never "no cap".
+    /// The `Maximum` profile, and an entity no reader has stated a profile
+    /// for, are [`crate::backend::priorities::MAXIMUM_WINDOW_SECONDS`]: a
     /// finite number the sharing arithmetic can multiply without
     /// saturating.
     pub seconds: u64,
     /// **What the pass knows must be kept whatever the consumers want**:
     /// every promise a parked read is holding, and the lookahead each open
-    /// stream was granted -- the backend refuses to forget a piece inside
-    /// one, so asking is a reclaim that is refused and a disk that grows.
+    /// stream was granted. The backend refuses to forget a piece inside a
+    /// lookahead, so asking is a reclaim that is refused and a disk that
+    /// grows.
     ///
-    /// Handed *in* rather than added afterwards, because what may not be
-    /// unlinked and what is offered up have to be the same reading: a
+    /// It is handed *in* rather than added afterwards, because what may not
+    /// be unlinked and what is offered up have to be the same reading. A
     /// reclaim chosen against a smaller set than the door refuses frees
     /// nothing at all.
     pub holding: Vec<Range<u32>>,
     /// **The committed set**, as runs: the pieces the policy has offered a
     /// peer and will never reclaim (`RetentionPolicy::advance` vetoes
-    /// them). Inside the allowance and outside the reclaim, so the disk
-    /// settles at the cap and not at the cap plus the committed set; see
-    /// [`Self::allowance`].
+    /// them). It is inside the allowance and outside the reclaim, so the
+    /// disk settles at the cap and not at the cap plus the committed set.
+    /// See [`Self::allowance`].
     pub committed: Vec<Range<u32>>,
     /// **How many bytes the fill may put on the disk between two passes**,
     /// which is the room the allowance has to leave for it.
@@ -392,71 +396,71 @@ pub struct Asking {
     /// What is on the disk when a pass measures it is what the consumers
     /// asked for plus whatever arrived since the last pass, which is a
     /// stride. An allowance that spent the whole budget would therefore sit
-    /// a stride *over* it for as long as anything is downloading -- and the
+    /// a stride *over* it for as long as anything is downloading. The
     /// budget's own job is to keep the volume off the free-space floor, so
     /// being over it is the one thing it may not be. See
-    /// `docs/design/read-pattern-retention.md` section 4 on why the margin is
-    /// load-bearing: eviction has to trigger on approaching the line, not
+    /// `docs/design/read-pattern-retention.md` section 4 on why the margin
+    /// is load-bearing: eviction has to trigger on approaching the line, not
     /// on crossing it.
     pub margin: u64,
     /// **The one reading of the clock this pass makes**, taken on the far
-    /// side of the listing. Every backing's `reading` measures against
-    /// this -- idle streams, the report throttle, the LRU -- rather than
-    /// reading the clock inside the rule it then compares, which is the
-    /// shape of bug that never converges.
+    /// side of the listing. Every backing's `reading` measures against this
+    /// (idle streams, the report throttle, the LRU). It does not read the
+    /// clock inside the rule it then compares, which is the shape of bug
+    /// that never converges.
     pub now: std::time::Instant,
 }
 
 impl Asking {
-    /// **What this entity may hold**, given `held` bytes on its disk: what
-    /// it holds now plus what the volume will still give before the
-    /// margin, under the configured cap -- less the room the fill needs
+    /// **What this entity may hold**, given `held` bytes on its disk. It is
+    /// what it holds now plus what the volume will still give before the
+    /// margin, under the configured cap, less the room the fill needs
     /// between two passes.
     ///
-    /// `docs/design/read-pattern-retention.md` section 4. Its own usage has to be
-    /// in there or the allowance shrinks as the cache fills and never
-    /// converges -- a stream would stop well short of the disk with nothing
-    /// to explain why. The cap is over the whole cache and is what an
-    /// entity is bounded by when there is no reading of the volume at all;
-    /// where there is one, the smaller of the two, like every other reading
-    /// of this: the volume said 381 GB free on the field's phone against a
-    /// configured 10.7 GB, and an allowance that took the disk's word alone
-    /// let one entity's want set grow to the whole film. A budget nobody
-    /// has stated yet, over a volume nothing has read, is not a licence to
-    /// want everything: every stream falls to its floor, which is what a
-    /// stream with no measurement gets anyway.
+    /// See `docs/design/read-pattern-retention.md` section 4. Its own usage
+    /// has to be in there, or the allowance shrinks as the cache fills and
+    /// never converges. A stream would stop well short of the disk with
+    /// nothing to explain why. The cap is over the whole cache. It is what
+    /// an entity is bounded by when there is no reading of the volume at
+    /// all. Where there is one, the smaller of the two counts, like every
+    /// other reading of this. The volume said 381 GB free on the field's
+    /// phone against a configured 10.7 GB. An allowance that took the
+    /// disk's word alone let one entity's want set grow to the whole film.
+    /// A budget nobody has stated yet, over a volume nothing has read, is
+    /// not a licence to want everything. Every stream falls to its floor,
+    /// which is what a stream with no measurement gets anyway.
     ///
     /// **Less the committed set.** Those pieces are on the disk and stay
-    /// there whatever the consumers ask for -- a piece offered to a peer is
-    /// out of reach of every reclaim -- so windows sized to an allowance
+    /// there whatever the consumers ask for, since a piece offered to a
+    /// peer is out of reach of every reclaim. Windows sized to an allowance
     /// that did not count them let the disk settle at the cap *plus* the
-    /// committed set, by up to `COMMITTED_SECONDS` of film. Masked under
-    /// the Normal profile, whose margin happened to be as large; exposed
-    /// under Maximum.
+    /// committed set, by up to `COMMITTED_SECONDS` of film. That was masked
+    /// under the Normal profile, whose margin happened to be as large, and
+    /// exposed under Maximum.
     ///
     /// **This is what the windows may spend, not where the reclaim
-    /// starts.** The committed pieces are in `held` already, so measuring
-    /// the overhang against this took them off twice and the disk settled
-    /// at the cap less the committed set -- scrub-back given up early, for
+    /// starts.** The committed pieces are in `held` already. Measuring the
+    /// overhang against this took them off twice, and the disk settled at
+    /// the cap less the committed set: scrub-back given up early, for
     /// nothing. The reclaim reads [`Self::overhang`].
     ///
-    /// One computation for every backing, so the scenarios test the same
-    /// arithmetic the torrent and the proxy run. `piece` is the piece
+    /// It is one computation for every backing, so the scenarios test the
+    /// same arithmetic the torrent and the proxy run. `piece` is the piece
     /// length and `held` how many pieces the listing found.
     ///
-    /// Only `Bytes` reaches this in the shipped drivers: a policy is
+    /// Only `Bytes` reaches this in the shipped drivers. A policy is
     /// installed from a `Bytes` budget alone, and no policy means no pass.
     /// The other arms are the shapes the type admits, answered the safe way
-    /// round -- nothing stated over nothing read is not a licence.
+    /// round: nothing stated over nothing read is not a licence.
     pub fn allowance(&self, piece: u64, held: usize) -> u64 {
         self.disk(piece, held)
             .saturating_sub(self.committed_pieces().saturating_mul(piece))
     }
 
     /// **How many bytes of the `held` pieces must go**: what the disk
-    /// holds over what it may hold before the margin. Where the disk
-    /// settles is therefore the cap less the margin, committed pieces
-    /// included -- they are part of what is held, and part of what may be.
+    /// holds over what it may hold before the margin. So the disk settles
+    /// at the cap less the margin, committed pieces included. They are part
+    /// of what is held, and part of what may be.
     pub fn overhang(&self, piece: u64, held: usize) -> u64 {
         (held as u64)
             .saturating_mul(piece)
@@ -471,7 +475,7 @@ impl Asking {
 
     /// [`Self::disk`] with the margin stated: what the entity may hold
     /// while leaving `margin` bytes for what arrives before the next pass.
-    /// What the room an asker may fill is measured from, with the margin
+    /// The room an asker may fill is measured from this, with the margin
     /// that is not the asker's own ([`Retention::ask_ahead`]).
     pub fn within(&self, piece: u64, held: usize, margin: u64) -> u64 {
         let held = (held as u64).saturating_mul(piece);
@@ -501,25 +505,25 @@ impl Asking {
 pub struct Consumers {
     /// What the streams want fetched ahead of them, in pieces.
     pub want: Vec<Range<u32>>,
-    /// One bit per piece: what no unlink may touch. Read at the door
-    /// without taking any lock -- see [`crate::retention::exempt`].
+    /// One bit per piece: what no unlink may touch. It is read at the door
+    /// without taking any lock (see [`crate::retention::exempt`]).
     pub exempt: std::sync::Arc<crate::retention::exempt::Exempt>,
     /// What to give back first, coldest by effective age, and only as much
-    /// as the allowance asks for. Empty while what is held fits: the disk
-    /// that is not needed for anything else is scrub-back, and giving it up
-    /// early buys nothing and costs a re-fetch.
+    /// as the allowance asks for. It is empty while what is held fits. The
+    /// disk that is not needed for anything else is scrub-back, and giving
+    /// it up early buys nothing and costs a re-fetch.
     pub reclaim: Vec<u32>,
     /// **The piece the entity is being consumed at**: where the detector's
     /// busiest stream has reached, and `None` for a backing with no
     /// detector or an entity nothing has read lately.
     ///
     /// *Who* the viewer is, among several readers of one file, is a
-    /// question about behaviour and the detector is what answers it: mpv
-    /// keeps a second reader crawling the container's index for as long as
-    /// a film is open, reopening about once a second, so the newest read
-    /// and the longest-lived read are both regularly that crawler rather
-    /// than the viewer. Not told from the geometry of a range header: the
-    /// two reads look identical from the wire, measured at 91 B/s for the
+    /// question about behaviour, and the detector answers it. mpv keeps a
+    /// second reader crawling the container's index for as long as a film
+    /// is open, reopening about once a second. So the newest read and the
+    /// longest-lived read are both regularly that crawler rather than the
+    /// viewer. It is not told from the geometry of a range header. The two
+    /// reads look identical from the wire, measured at 91 B/s for the
     /// crawler against 1.2 MB/s for the viewer.
     ///
     /// **It is a cadence and a reporting number, not a retention one.**
@@ -531,64 +535,65 @@ pub struct Consumers {
 
 /// The world outside the owner, for one kind of entity.
 ///
-/// Small on purpose: describe the entity's index space, list what the disk
-/// holds, hold pieces back from what we advertise and put them back, and
-/// reclaim a set of runs through a [`Door`] the owner supplies. The owner
-/// does the arithmetic, the two re-readings, the door, the throttle, the
-/// grace and the budget comparison. **No `&self` method is ever called with
-/// an owner lock held**, so an implementation may take any lock it likes in
-/// them, including the entity's own state lock through a [`Reader`]. The
-/// pure associated functions -- [`Self::governs`], [`Self::extent`],
-/// [`Self::policy`], [`Self::index_of`] -- ARE called under L2 and must take
-/// no lock and do no I/O (rule 2).
+/// It is small on purpose. It describes the entity's index space, lists
+/// what the disk holds, holds pieces back from what we advertise and puts
+/// them back, and reclaims a set of runs through a [`Door`] the owner
+/// supplies. The owner does the arithmetic, the two re-readings, the door,
+/// the throttle, the grace and the budget comparison. **No `&self` method
+/// is ever called with an owner lock held.** So an implementation may take
+/// any lock it likes in them, including the entity's own state lock
+/// through a [`Reader`]. The pure associated functions --
+/// [`Self::governs`], [`Self::extent`], [`Self::policy`],
+/// [`Self::index_of`] -- ARE called under L2 and must take no lock and do
+/// no I/O (rule 2).
 ///
 /// The `async` methods return `Send` futures because the proxy's driver
-/// spawns the pass as a task; an implementation writes them as `async fn`
+/// spawns the pass as a task. An implementation writes them as `async fn`
 /// and the compiler checks the bound.
 pub trait Backing: Sized + Send + Sync + 'static {
-    /// Names one entity: the proxy's chunk directory path; a torrent file's
-    /// index.
+    /// Names one entity: the proxy's chunk directory path, or a torrent
+    /// file's index.
     type Key: Clone + Eq + Hash + Send + Sync + Debug;
     /// Where a reader is, in the backing's own coordinates: the proxy's
-    /// byte offset; the torrent's `(file_idx, offset_in_file)`.
+    /// byte offset, or the torrent's `(file_idx, offset_in_file)`.
     type Position: Copy + Send + Sync + Debug;
     /// What a policy is over, fixed for the entity's life: the proxy's
-    /// directory, total and target; the torrent's file, span and piece
-    /// length. Compared at the pass's re-read, so a domain that changed
-    /// under a listing refuses the decision.
+    /// directory, total and target, or the torrent's file, span and piece
+    /// length. It is compared at the pass's re-read, so a domain that
+    /// changed under a listing refuses the decision.
     type Domain: Clone + PartialEq + Send + Sync;
-    /// What [`Retention::install`] is asked for: the proxy's `()`; the
+    /// What [`Retention::install`] is asked for: the proxy's `()`, or the
     /// torrent's file index.
     type Want: Copy + Send + Sync;
-    /// What a pass needs handed to it and never owns: the proxy's `()`; the
-    /// torrent's store root, handed to the pass as `Engine::retain` is handed
-    /// one.
+    /// What a pass needs handed to it and never owns: the proxy's `()`, or
+    /// the torrent's store root, handed to the pass as `Engine::retain` is
+    /// handed one.
     type Store: Sync;
     /// How the budget is split. [`Share::Nothing`] says [`Self::advertise`]
-    /// is unreachable from the pass: the committed set has capacity zero, so
+    /// is unreachable from the pass. The committed set has capacity zero, so
     /// both lists it would be called for are empty by construction.
     const SHARE: Share;
     const TRIGGER: Trigger;
     const INSTALL: Install;
 
     /// Resolve what `want` names, or `None` when it names nothing that can
-    /// be bounded -- a torrent with no metadata. May do I/O; called with the
-    /// turn held and no owner lock.
+    /// be bounded (a torrent with no metadata). It may do I/O. It is called
+    /// with the turn held and no owner lock.
     fn resolve(&self, want: Self::Want) -> impl Future<Output = Option<Self::Domain>> + Send;
     /// Whether an installed `domain` is the one `want` asks about. Pure.
     fn governs(domain: &Self::Domain, want: Self::Want) -> bool;
     /// The piece index space of the entity. Pure.
     fn extent(domain: &Self::Domain) -> Range<u32>;
     /// How long one piece of this entity is, or `None` for a domain that
-    /// cannot say. What turns a lookahead in bytes into pieces.
+    /// cannot say. This turns a lookahead in bytes into pieces.
     fn piece_length(domain: &Self::Domain) -> Option<u64>;
     /// How many bytes the entity is, or `None` where the backing cannot say.
     ///
     /// Only [`State::buffering`] asks, and only to turn a player's stated
-    /// duration into the film's bitrate -- which is what a window measured
-    /// in seconds needs. Size over duration gives that number exactly, at
-    /// the first report, with nothing to converge and no read pattern to be
-    /// fooled by; a rate measured from reads instead has neither property.
+    /// duration into the film's bitrate, which a window measured in seconds
+    /// needs. Size over duration gives that number exactly, at the first
+    /// report, with nothing to converge and no read pattern to be fooled
+    /// by. A rate measured from reads instead has neither property.
     fn bytes(domain: &Self::Domain) -> Option<u64> {
         let _ = domain;
         None
@@ -596,19 +601,19 @@ pub trait Backing: Sized + Send + Sync + 'static {
     /// The position `offset` bytes into the entity, or `None` where the
     /// backing cannot make one.
     ///
-    /// The inverse of reading an offset out of a position, and it exists
-    /// for one caller: a player states where it is in the *picture*, and
-    /// with the film's length and the entity's size that is an offset into
+    /// It is the inverse of reading an offset out of a position, and it
+    /// exists for one caller. A player states where it is in the *picture*.
+    /// With the film's length and the entity's size, that is an offset into
     /// the file.
     fn position_at(domain: &Self::Domain, offset: u64) -> Option<Self::Position> {
         let _ = (domain, offset);
         None
     }
     /// The policy for `domain` under `budget` bytes, or why there is none.
-    /// Pure, and it returns its error rather than logging it: it is called
-    /// under L2 from [`Reader::note`], and the owner logs after unlock. The
-    /// owner installs only a [`Shape::Split`] -- a budget that covers the
-    /// entity bounds nothing and holds nothing back.
+    /// It is pure, and it returns its error rather than logging it. It is
+    /// called under L2 from [`Reader::note`], and the owner logs after
+    /// unlock. The owner installs only a [`Shape::Split`]. A budget that
+    /// covers the entity bounds nothing and holds nothing back.
     ///
     /// `buffering` is what the entity's open readers have already been
     /// promised ([`State::buffering`]), which the window may not be sized
@@ -620,42 +625,42 @@ pub trait Backing: Sized + Send + Sync + 'static {
     ) -> anyhow::Result<RetentionPolicy>;
     /// The index `at` lands on under `domain`, clamped to the last, or
     /// `None` when the position names nothing in this domain's index space.
-    /// An entity only ever hears its own bytes -- a [`Reader`] is opened on
-    /// one entity and a [`Retention::note_position`] names one key -- so a
+    /// An entity only ever hears its own bytes: a [`Reader`] is opened on
+    /// one entity, and a [`Retention::note_position`] names one key. So a
     /// backing whose positions always fall in the domain answers `Some`.
     /// Pure.
     fn index_of(domain: &Self::Domain, at: Self::Position) -> Option<u32>;
-    /// The backing refuses to give anything of `key` up right now -- a pin.
-    /// A copy-out read of a lock outside the owner, asked with no owner lock
-    /// held, before L2 wherever the two meet.
+    /// The backing refuses to give anything of `key` up right now: a pin.
+    /// It is a copy-out read of a lock outside the owner. It is asked with
+    /// no owner lock held, before L2 wherever the two meet.
     fn keeps_everything(&self, key: &Self::Key) -> bool;
     /// Whether `key` is the entity being played **at this instant**
     /// ([`crate::retention::live`]).
     ///
-    /// Asked on a [`Mode::Slack`] pass, and by nothing else. Once at the
-    /// top, under the turn, before the pass destroys anything: the mode was
-    /// decided from a reading taken before the driver's first entity, and a
-    /// viewer can have started this file since. Then again at the [`Door`],
-    /// as often as the backing's [`Self::reclaim`] asks it -- once per run
-    /// where that asks through [`Door::shut`], once per candidate index
-    /// where it asks through [`Door::refuses`] -- because a player can open
-    /// the file again while its bytes are going, and the run has to stop
-    /// where it is rather than empty the window the new stream is already
-    /// reading. A copy-out read like [`Self::keeps_everything`],
-    /// with no owner lock held, so it is on the path of every unlink the
-    /// per-index shape makes.
+    /// It is asked on a [`Mode::Slack`] pass, and by nothing else. It is
+    /// asked once at the top, under the turn, before the pass destroys
+    /// anything. The mode was decided from a reading taken before the
+    /// driver's first entity, and a viewer can have started this file
+    /// since. It is asked again at the [`Door`], as often as the backing's
+    /// [`Self::reclaim`] asks it: once per run where that asks through
+    /// [`Door::shut`], once per candidate index where it asks through
+    /// [`Door::refuses`]. A player can open the file again while its bytes
+    /// are going. The run then has to stop where it is, rather than empty
+    /// the window the new stream is already reading. It is a copy-out read
+    /// like [`Self::keeps_everything`], with no owner lock held, so it is
+    /// on the path of every unlink the per-index shape makes.
     ///
-    /// The default is `false`: a backing with no liveness of its own has
+    /// The default is `false`. A backing with no liveness of its own has
     /// nothing that could interrupt a slack run.
     fn is_live(&self, _key: &Self::Key) -> bool {
         false
     }
 
-    /// Whether a viewer's play session is on `key`, sharing it: the one
-    /// condition under which its play session draws
+    /// Whether a viewer's play session is on `key`, sharing it. This is the
+    /// one condition under which its play session draws
     /// ([`Retention::decide_draw_if_due`]). The torrent's answer is the
     /// player-token sessions ([`crate::retention::sessions`]), which only a
-    /// player's own request moves; the default is [`Self::is_live`], for a
+    /// player's own request moves. The default is [`Self::is_live`], for a
     /// backing whose liveness is its play session.
     fn plays(&self, key: &Self::Key) -> bool {
         self.is_live(key)
@@ -664,10 +669,10 @@ pub trait Backing: Sized + Send + Sync + 'static {
     /// **Where in `key` the play session plays**, when it plays a member of
     /// a container through the member path: the member's byte extent within
     /// the entity. The draw is then sized from that extent's length and
-    /// made inside it ([`Self::narrowed`]), and [`Self::content_shares`] is
-    /// not asked -- the member path knows the entity is a container and
-    /// which bytes of it are the film. `None` -- the default -- is the
-    /// entity played as itself.
+    /// made inside it ([`Self::narrowed`]). [`Self::content_shares`] is not
+    /// asked, since the member path knows the entity is a container and
+    /// which bytes of it are the film. `None`, the default, is the entity
+    /// played as itself.
     ///
     /// A copy-out read like [`Self::plays`], asked with no owner lock held.
     fn played_member(&self, _key: &Self::Key) -> Option<Range<u64>> {
@@ -675,23 +680,23 @@ pub trait Backing: Sized + Send + Sync + 'static {
     }
 
     /// `domain` narrowed to the pieces holding `bytes` of it (offsets into
-    /// the entity), with those bytes as its length: what a play session
-    /// on a member draws over. `None` when `bytes` is empty or reaches
-    /// past the entity, and for a backing with no members (the default).
-    /// Pure, like [`Self::policy`].
+    /// the entity), with those bytes as its length. A play session on a
+    /// member draws over this. It is `None` when `bytes` is empty or
+    /// reaches past the entity, and for a backing with no members (the
+    /// default). Pure, like [`Self::policy`].
     fn narrowed(_domain: &Self::Domain, _bytes: Range<u64>) -> Option<Self::Domain> {
         None
     }
 
     /// **The set `key` is a volume of, when the play session plays a member
-    /// across several entities** -- a film in a multi-volume RAR set inside
-    /// a torrent: every entity the member lies in, in the member's order,
-    /// each with the member's bytes in it. One thing played: the draw is
-    /// made once, over every volume's bytes of the member ([`Self::joined`]),
-    /// by whichever volume's play session is due first, and every other
-    /// volume adopts it rather than drawing again. [`Self::content_shares`]
-    /// is not asked, as for [`Self::played_member`]. `None` -- the default
-    /// -- is no set.
+    /// across several entities**, such as a film in a multi-volume RAR set
+    /// inside a torrent. It is every entity the member lies in, in the
+    /// member's order, each with the member's bytes in it. It is one thing
+    /// played. The draw is made once, over every volume's bytes of the
+    /// member ([`Self::joined`]), by whichever volume's play session is due
+    /// first. Every other volume adopts it rather than drawing again.
+    /// [`Self::content_shares`] is not asked, as for
+    /// [`Self::played_member`]. `None`, the default, is no set.
     ///
     /// A copy-out read like [`Self::plays`], asked with no owner lock held.
     fn played_set(&self, _key: &Self::Key) -> Option<Vec<(Self::Key, Range<u64>)>> {
@@ -699,45 +704,47 @@ pub trait Backing: Sized + Send + Sync + 'static {
     }
 
     /// What `key` is now, for a volume of a played set no stream has opened
-    /// yet: the draw is made over the whole set at once, and a volume the
-    /// reader has not reached has no entity to read a domain from. `None`
-    /// -- the default -- is a backing with no sets, or an entity that
-    /// cannot be named now.
+    /// yet. The draw is made over the whole set at once, and a volume the
+    /// reader has not reached has no entity to read a domain from. `None`,
+    /// the default, is a backing with no sets, or an entity that cannot be
+    /// named now.
     fn domain_of(&self, _key: &Self::Key) -> impl Future<Output = Option<Self::Domain>> + Send {
         async { None }
     }
 
     /// **One domain over the pieces of all of `parts`** (each one
     /// [`Self::narrowed`] to a volume's bytes of the member), for sizing a
-    /// set's draw: the union of their pieces, counted once each, as one run
-    /// `0..n` of the length they hold -- and that union in order, which is
-    /// what index `i` of the joined domain stands for. The parts' pieces
-    /// need not be one run in the entity's index space (another file may
-    /// lie between two volumes), so the draw is made over the joined index
-    /// space and mapped back through the list. `None` for no parts and for
-    /// a backing with no sets (the default). Pure, like [`Self::policy`].
+    /// set's draw. It is the union of their pieces, counted once each, as
+    /// one run `0..n` of the length they hold. It also returns that union
+    /// in order, which is what index `i` of the joined domain stands for.
+    /// The parts' pieces need not be one run in the entity's index space
+    /// (another file may lie between two volumes). So the draw is made over
+    /// the joined index space and mapped back through the list. `None` for
+    /// no parts and for a backing with no sets (the default). Pure, like
+    /// [`Self::policy`].
     fn joined(_parts: &[Self::Domain]) -> Option<(Self::Domain, Vec<u32>)> {
         None
     }
 
-    /// Whether `domain`'s content may be shared at all: `Some(false)` for an
-    /// archive or a disc image, which the app plays through a translated
-    /// source and which shares nothing; `None` while that cannot be told
-    /// yet -- the torrent's first bytes of the file are not held -- and the
-    /// play session's draw waits. The default has nothing to tell.
+    /// Whether `domain`'s content may be shared at all. It is `Some(false)`
+    /// for an archive or a disc image, which the app plays through a
+    /// translated source and which shares nothing. It is `None` while that
+    /// cannot be told yet (the torrent's first bytes of the file are not
+    /// held), and the play session's draw waits. The default has nothing to
+    /// tell.
     fn content_shares(&self, _domain: &Self::Domain) -> impl Future<Output = Option<bool>> + Send {
         async { Some(true) }
     }
-    /// The owner has just forgotten `key` ([`Retention::forget_empty`]):
-    /// whatever the backing keeps per entity beside the owner's map goes
-    /// with it, or it outlives the entity for the life of the process.
-    /// Called with no owner lock held. The default keeps nothing.
+    /// The owner has just forgotten `key` ([`Retention::forget_empty`]).
+    /// Whatever the backing keeps per entity beside the owner's map goes
+    /// with it, or it outlives the entity for the life of the process. It
+    /// is called with no owner lock held. The default keeps nothing.
     fn forgotten(&self, _key: &Self::Key) {}
     /// What the disk holds of the entity: the torrent's registered store's
-    /// held set, read in memory; the proxy's directory, listed off the
-    /// reactor. `None` is a set we do not have -- no store is registered
-    /// for the torrent, the pool would not answer, the directory would not
-    /// list -- and the pass concludes nothing rather than advance over an
+    /// held set, read in memory, or the proxy's directory, listed off the
+    /// reactor. `None` is a set we do not have: no store is registered for
+    /// the torrent, the pool would not answer, or the directory would not
+    /// list. The pass then concludes nothing, rather than advance over an
     /// empty reading of an entity that is not empty.
     fn held(
         &self,
@@ -745,24 +752,24 @@ pub trait Backing: Sized + Send + Sync + 'static {
         domain: &Self::Domain,
     ) -> impl Future<Output = Option<BTreeSet<u32>>> + Send;
     /// Advertise `pieces`: tell the swarm we will share them, each one the
-    /// moment we hold it. **The only direction there is**: nothing here
+    /// moment we hold it. **The only direction there is.** Nothing here
     /// ever takes an announcement back, because there is no un-Have, and
     /// the backend starts every entity with nothing advertised. Under
-    /// [`Share::Nothing`] never called; the proxy's implementation may
-    /// `debug_assert!` that.
+    /// [`Share::Nothing`] it is never called, and the proxy's
+    /// implementation may `debug_assert!` that.
     fn advertise(&self, pieces: Range<u32>) -> impl Future<Output = anyhow::Result<()>> + Send;
-    /// Whether the backend is in the swarm and advertises one of `pieces`
-    /// -- a piece a peer may have been told we have, or will be the moment
-    /// it completes. What a [`Mode::Slack`] pass asks of the pieces it is
-    /// about to delete: such pieces go only once the backend has left the
-    /// swarm, which is the driver's to arrange (the torrent's `EndShares`).
-    /// Read from the backend, never remembered. The default: a backing with
-    /// no swarm.
+    /// Whether the backend is in the swarm and advertises one of `pieces`:
+    /// a piece a peer may have been told we have, or will be told the
+    /// moment it completes. A [`Mode::Slack`] pass asks this of the pieces
+    /// it is about to delete. Such pieces go only once the backend has left
+    /// the swarm, which is the driver's to arrange (the torrent's
+    /// `EndShares`). It is read from the backend, never remembered. The
+    /// default is a backing with no swarm.
     fn announced_in_swarm(&self, _pieces: &[u32]) -> impl Future<Output = bool> + Send {
         async { false }
     }
     /// The subset of `pieces` this domain alone owns bytes in: the torrent's
-    /// boundary rule (`this_files_alone`); the proxy's identity.
+    /// boundary rule (`this_files_alone`), or the proxy's identity.
     fn alone(&self, domain: &Self::Domain, pieces: &[u32])
     -> impl Future<Output = Vec<u32>> + Send;
     /// Trim what the backend fetches to what the pass decided to fetch:
@@ -770,26 +777,27 @@ pub trait Backing: Sized + Send + Sync + 'static {
     /// the entity that is in no window and not `held`.
     ///
     /// `windows` here is the pass's *want*-windows and not the ones the
-    /// [`Door`] keeps: every open read's lookahead is kept and never
+    /// [`Door`] keeps. Every open read's lookahead is kept and never
     /// ordered, because what to fetch is the detector's answer and what may
-    /// not be deleted is every live read's. The committed set needs
-    /// no clause of its own: [`RetentionPolicy::advance`] keeps it inside
-    /// the held set it was handed, and `held` is that reading.
+    /// not be deleted is every live read's. The committed set needs no
+    /// clause of its own. [`RetentionPolicy::advance`] keeps it inside the
+    /// held set it was handed, and `held` is that reading.
     ///
     /// The torrent: librqbit's picker fetches every selected piece of a file
-    /// it is not told otherwise about, so without this the swarm fills the
-    /// file past the window and every pass reclaims what the last two
-    /// seconds fetched -- bytes the swarm paid for twice and the disk sat over
-    /// budget by. A piece the window has moved onto may have been dropped by
-    /// an earlier pass, so the windows are re-wanted first; held pieces
-    /// outside the window are the reclaim's (step 8) and are not touched
-    /// here. `held` is the pass's reading, and a piece that arrived since is
-    /// the backing's to notice: what it stops wanting it must not leave on
-    /// the disk, which is what `store` is for -- and an unlink there is an
-    /// unlink, asked of `door` at its instant like every other one this
-    /// owner makes. The proxy: a proxied body is fetched by its own response,
-    /// and there is no picker to trim, so the default does nothing. Called
-    /// at pass step 6 with the turn held and no owner lock.
+    /// it is not told otherwise about. Without this, the swarm fills the
+    /// file past the window, and every pass reclaims what the last two
+    /// seconds fetched. Those are bytes the swarm paid for twice, and the
+    /// disk sat over budget by them. A piece the window has moved onto may
+    /// have been dropped by an earlier pass, so the windows are re-wanted
+    /// first. Held pieces outside the window are the reclaim's (step 8) and
+    /// are not touched here. `held` is the pass's reading, and a piece that
+    /// arrived since is the backing's to notice. What it stops wanting it
+    /// must not leave on the disk, which is what `store` is for. An unlink
+    /// there is an unlink, asked of `door` at its instant like every other
+    /// one this owner makes. The proxy: a proxied body is fetched by its own
+    /// response, and there is no picker to trim, so the default does
+    /// nothing. It is called at pass step 6 with the turn held and no owner
+    /// lock.
     fn want(
         &self,
         _store: &Self::Store,
@@ -800,14 +808,14 @@ pub trait Backing: Sized + Send + Sync + 'static {
     ) -> impl Future<Output = ()> + Send {
         async {}
     }
-    /// Want every piece of the entity again: nothing bounds it now. The
-    /// counterpart of [`Self::want`] for an entity left with no policy --
-    /// a policy's passes stopped wanting pieces outside its window, and a
-    /// pin or a budget that covers the file wants all of it. Not asked when
-    /// one policy replaces another (the next pass trims to the new window)
-    /// nor for a sibling an install retires (the file the reader left).
-    /// Default: nothing, for the same reason as [`Self::want`]'s. Called
-    /// with the turn held and no owner lock.
+    /// Want every piece of the entity again, since nothing bounds it now.
+    /// It is the counterpart of [`Self::want`] for an entity left with no
+    /// policy. A policy's passes stopped wanting pieces outside its window,
+    /// and a pin or a budget that covers the file wants all of it. It is not
+    /// asked when one policy replaces another (the next pass trims to the
+    /// new window), nor for a sibling an install retires (the file the
+    /// reader left). The default does nothing, for the same reason as
+    /// [`Self::want`]'s. It is called with the turn held and no owner lock.
     fn want_all(&self, _domain: &Self::Domain) -> impl Future<Output = ()> + Send {
         async {}
     }
@@ -817,10 +825,10 @@ pub trait Backing: Sized + Send + Sync + 'static {
     ///
     /// The three replace what a playhead and a window once decided. A
     /// consumer is the unbroken run of bytes it caused, so membership is a
-    /// question about the disk and this is the first moment in a pass that
-    /// has one -- and the backing owns the detector because the reads reach
-    /// it, not the owner. A read carries its own timestamps, so nothing is
-    /// lost by answering it here rather than where it was served.
+    /// question about the disk. This is the first moment in a pass that has
+    /// one. The backing owns the detector because the reads reach it, not
+    /// the owner. A read carries its own timestamps, so nothing is lost by
+    /// answering it here rather than where it was served.
     fn reading(&self, domain: &Self::Domain, held: &BTreeSet<u32>, asking: Asking) -> Consumers;
 
     /// For [`crate::retention::trace`]: what the backing can say about the
@@ -836,10 +844,10 @@ pub trait Backing: Sized + Send + Sync + 'static {
     /// granularity **at the instant of each unlink**, and say how many
     /// pieces went. The torrent asks [`Door::shut`] before every part of
     /// every run and [`Door::refuses`] per piece, cutting the run where the
-    /// door refuses one; the proxy asks [`Door::refuses`] per chunk inside
+    /// door refuses one. The proxy asks [`Door::refuses`] per chunk inside
     /// one blocking closure, so the asking and the unlink cannot be
     /// separated by a suspension. A closure that dies reports what it can
-    /// vouch for, which is nothing: the policy is untouched either way,
+    /// vouch for, which is nothing. The policy is untouched either way,
     /// because it never left its cell.
     fn reclaim(
         &self,
@@ -851,30 +859,33 @@ pub trait Backing: Sized + Send + Sync + 'static {
 }
 
 /// The owner: every entity of one kind, with its readers, its resident
-/// policy and its turn. One per proxy cache; one per torrent engine.
+/// policy and its turn. There is one per proxy cache and one per torrent
+/// engine.
 pub struct Retention<B: Backing> {
     backing: Arc<B>,
     /// The published cache budget, the one cell both sides read. Read before
     /// L2 and never under it.
     budget: Arc<RetentionBudget>,
-    /// L1. The entities by key. Held for lookup, insert, prune and
+    /// L1. The entities by key. It is held for lookup, insert, prune and
     /// iterate-for-holdings only.
     ///
-    /// Shared with every [`Door`], which reads the draws recorded in it at
-    /// the unlink ([`Door::drawn`]).
+    /// It is shared with every [`Door`], which reads the draws recorded in
+    /// it at the unlink ([`Door::drawn`]).
     entities: Arc<Entities<B>>,
-    /// S. **One set's draw decided at a time** ([`Backing::played_set`]):
-    /// the volumes of a set read whether a sibling has drawn and record
-    /// their own draw as one step under it, so two volumes due together
-    /// cannot both find nothing drawn and draw twice. Protects no memory.
+    /// S. **One set's draw decided at a time** ([`Backing::played_set`]).
+    /// Under it, the volumes of a set read whether a sibling has drawn and
+    /// record their own draw as one step. So two volumes due together
+    /// cannot both find nothing drawn and draw twice. It protects no memory.
     set_draws: parking_lot::Mutex<()>,
-    /// Names the next reader; compared for equality only, so it may wrap.
+    /// Names the next reader. It is compared for equality only, so it may
+    /// wrap.
     next_reader: AtomicU64,
-    /// The one place a test can be *inside* a pass: run after the snapshot
-    /// and before the listing, and again after the decision and before the
-    /// unlinks, with the turn held and no owner lock. Each side keeps its
-    /// own cell where its tests write it and installs a runner here that
-    /// reads it. The shipped build has neither this nor the calls to it.
+    /// The one place a test can be *inside* a pass. It runs after the
+    /// snapshot and before the listing, and again after the decision and
+    /// before the unlinks, with the turn held and no owner lock. Each side
+    /// keeps its own cell where its tests write it, and installs a runner
+    /// here that reads it. The shipped build has neither this nor the calls
+    /// to it.
     #[cfg(any(test, feature = "test-hooks"))]
     hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
@@ -882,29 +893,30 @@ pub struct Retention<B: Backing> {
 /// One entity: its turn and its state, and nothing that reaches the map.
 pub struct Entity<B: Backing> {
     key: B::Key,
-    /// T. `Arc`, so a guard can be owned by the pass and outlive the
-    /// borrow that took it.
+    /// T. It is an `Arc`, so a guard can be owned by the pass and outlive
+    /// the borrow that took it.
     turn: Arc<tokio::sync::Mutex<Turn>>,
-    /// L2. `Arc`, so the [`Door`] can ask it from a blocking thread.
+    /// L2. It is an `Arc`, so the [`Door`] can ask it from a blocking
+    /// thread.
     state: Arc<parking_lot::Mutex<State<B>>>,
 }
 
-/// Proof of holding an entity's turn. Zero-sized: it protects no memory.
-/// `&mut Turn` is what every write to the policy, the windows and the
-/// stride requires, so "written only under the turn" is a type.
+/// Proof of holding an entity's turn. It is zero-sized and protects no
+/// memory. Every write to the policy, the windows and the stride requires
+/// `&mut Turn`, so "written only under the turn" is a type.
 pub struct Turn(());
 
-/// The entity's turn, owned. Dropping it on any path -- return, `?`, panic
-/// unwind, future cancellation -- hands the turn back and leaves the policy
-/// where it is. This is the proxy's `running` flag made into a guard, and
-/// the reason a dead pass no longer blocks every later one.
+/// The entity's turn, owned. Dropping it on any path (return, `?`, panic
+/// unwind, future cancellation) hands the turn back and leaves the policy
+/// where it is. This is the proxy's `running` flag made into a guard. It
+/// is why a dead pass no longer blocks every later one.
 pub struct Claim {
     guard: tokio::sync::OwnedMutexGuard<Turn>,
     /// The reader whose byte took this claim, so the pass knows which head
-    /// it is about: that reader's own playhead while its body is open, and
-    /// the entity's last delivered byte once it has ended. `None` from
-    /// [`Retention::turn`] and [`Retention::try_turn`], which are about the
-    /// entity.
+    /// it is about. That is the reader's own playhead while its body is
+    /// open, and the entity's last delivered byte once it has ended. It is
+    /// `None` from [`Retention::turn`] and [`Retention::try_turn`], which
+    /// are about the entity.
     about: Option<ReaderId>,
 }
 
@@ -914,157 +926,158 @@ impl Debug for Claim {
     }
 }
 
-/// Everything the owner knows about one entity. Behind L2, never across an
-/// await.
+/// Everything the owner knows about one entity. It is behind L2, never
+/// across an await.
 struct State<B: Backing> {
     domain: B::Domain,
     /// The policy and the budget it was built from. **Never `take()`n.**
     /// `None` is "nothing bounds this entity": no budget yet, no cap, a
     /// budget that covers it, or a pin.
     installed: Option<Installed>,
-    /// The budget the entity was last decided under, [`Install::OnDeliveredByte`]
-    /// only; `None` before any decision. Kept apart from `installed` because
-    /// "decided under X and nothing bounds it" is a different fact from
-    /// "not decided yet", and the note compares against it on every byte.
+    /// The budget the entity was last decided under, for
+    /// [`Install::OnDeliveredByte`] only. It is `None` before any decision.
+    /// It is kept apart from `installed`, because "decided under X and
+    /// nothing bounds it" is a different fact from "not decided yet". The
+    /// note compares against it on every byte.
     decided: Option<CacheBudget>,
     /// How far a playhead must move before another pass is worth its
     /// listing, in pieces. [`Trigger::OnMove`] only.
     stride: u32,
     /// What the last pass concluded: one range per playhead live then.
-    /// Kept across a decide, deliberately -- an empty windows beside a live
-    /// reader reads as "protect the whole entity" at the gate, which is the
-    /// honest answer when nothing has been measured and a wrong one the
+    /// It is kept across a decide, deliberately. An empty windows beside a
+    /// live reader reads as "protect the whole entity" at the gate. That is
+    /// the honest answer when nothing has been measured, and a wrong one the
     /// moment it means "measured against a budget one byte different".
     windows: Vec<Range<u32>>,
-    /// **What may not be unlinked, as one bit per piece**, shared with
+    /// **What may not be unlinked, as one bit per piece.** It is shared with
     /// every door this entity opens and with the reads that promise into
-    /// it. `None` until a pass has handed one over, which is every entity
-    /// no pass has run on. See [`crate::retention::exempt`].
+    /// it. It is `None` until a pass has handed one over, which is every
+    /// entity no pass has run on. See [`crate::retention::exempt`].
     exempt: Option<std::sync::Arc<crate::retention::exempt::Exempt>>,
     readers: HashMap<ReaderId, ReaderState<B>>,
     /// The entity's own last delivered byte: the proxy's `last_playhead`,
-    /// and a torrent file's head. Only its own bytes ever reach it -- a
-    /// [`Reader`] is on one entity, [`Retention::note_position`] names one
-    /// key -- so a file whose reader has gone on to another file keeps the
-    /// head it last had. What a pass measures from when the detector is
-    /// silent and the reader that asked has ended: one of the questions
-    /// [`Self::head`] asks, and the last resort under [`Consumers::at`].
+    /// and a torrent file's head. Only its own bytes ever reach it: a
+    /// [`Reader`] is on one entity, and [`Retention::note_position`] names
+    /// one key. So a file whose reader has gone on to another file keeps the
+    /// head it last had. A pass measures from this when the detector is
+    /// silent and the reader that asked has ended. It is one of the
+    /// questions [`Self::head`] asks, and the last resort under
+    /// [`Consumers::at`].
     last_position: Option<B::Position>,
     /// **Where the entity is being consumed, as the detector last said**:
     /// the piece the busiest stream had reached at the last pass
-    /// ([`Consumers::at`]), or `None` when the detector was silent -- no
-    /// pass yet, nothing reading it for `STREAM_DORMANT`, or the policy gone.
-    /// What [`Self::holding`] reports as the head ahead of every reading
-    /// off the readers: which of several readers is the viewer is a
-    /// question about behaviour, and mpv's index crawler is regularly the
-    /// newest reader with a head at the tail of the file.
+    /// ([`Consumers::at`]). It is `None` when the detector was silent: no
+    /// pass yet, nothing reading it for `STREAM_DORMANT`, or the policy
+    /// gone. [`Self::holding`] reports this as the head, ahead of every
+    /// reading off the readers. Which of several readers is the viewer is a
+    /// question about behaviour. mpv's index crawler is regularly the
+    /// newest reader, with a head at the tail of the file.
     consumed_at: Option<u32>,
     /// How long this entity's film is, where a player has said.
     ///
-    /// **A property of the film and not of a report**, which is why it sits
-    /// here rather than on a position report and never goes stale: with
-    /// the entity's own size ([`Backing::bytes`]) it is the bitrate, a film
-    /// does not change length, and a viewer who hands playback to a
-    /// receiver stops reporting a position without the film becoming any
-    /// shorter.
+    /// **A property of the film and not of a report.** That is why it sits
+    /// here rather than on a position report, and never goes stale. With
+    /// the entity's own size ([`Backing::bytes`]) it is the bitrate. A film
+    /// does not change length. A viewer who hands playback to a receiver
+    /// stops reporting a position without the film becoming any shorter.
     ///
     /// It is also the only thing a cast can state. The receiver does the
-    /// reading and reports where it is in *seconds*; converting that to a
-    /// byte offset needs a constant bitrate, and on the field's 23 GB film
-    /// a two-percent error is 460 MB -- wider than the whole window, so the
+    /// reading and reports where it is in *seconds*. Converting that to a
+    /// byte offset needs a constant bitrate. On the field's 23 GB film a
+    /// two-percent error is 460 MB, wider than the whole window, so the
     /// window would land off the film. So a cast says how long the film is,
-    /// which sizes the window exactly, and leaves where it is to the reads,
+    /// which sizes the window exactly. It leaves where it is to the reads,
     /// which for a receiver are plainly sequential.
     duration: Option<std::time::Duration>,
-    /// **How long the film of a member this entity holds is** -- a member
+    /// **How long the film of a member this entity holds is**: a member
     /// of this one container ([`Backing::played_member`]) or a member across
     /// a set it is a volume of ([`Backing::played_set`])
-    /// ([`Retention::note_set_duration`]): what the member's draw divides
-    /// the member's length by. Never this entity's own rate, as
-    /// [`Self::duration`] is: a volume's length over the film's duration is
-    /// the film's rate divided by the number of volumes, a container's
-    /// length over an episode's is the episode's times the episodes in it,
-    /// and a read-ahead sized from either would starve the player or fill
-    /// the budget. A property of the film, kept like [`Self::duration`].
+    /// ([`Retention::note_set_duration`]). The member's draw divides the
+    /// member's length by this. It is never this entity's own rate, as
+    /// [`Self::duration`] is. A volume's length over the film's duration is
+    /// the film's rate divided by the number of volumes. A container's
+    /// length over an episode's is the episode's times the episodes in it.
+    /// A read-ahead sized from either would starve the player or fill the
+    /// budget. It is a property of the film, kept like [`Self::duration`].
     set_duration: Option<std::time::Duration>,
-    /// **What this entity shares for the rest of its play session**: the
-    /// draw decided once the viewer's playback stream's read-ahead was known
-    /// ([`Retention::decide_draw_if_due`], [`RetentionPolicy::draw`]) -- the
-    /// whole extent under a budget that covers the file, nothing under a
-    /// budget too tight for the read-ahead and a shared set together, or
-    /// none published -- and advertised to the backend the moment it was
-    /// made. `None` until then, and for an entity nothing but asides and
-    /// translated sources opened.
+    /// **What this entity shares for the rest of its play session.** It is
+    /// the draw decided once the viewer's playback stream's read-ahead was
+    /// known ([`Retention::decide_draw_if_due`], [`RetentionPolicy::draw`]).
+    /// That is the whole extent under a budget that covers the file, and
+    /// nothing under a budget too tight for the read-ahead and a shared set
+    /// together, or with none published. It was advertised to the backend
+    /// the moment it was made. It is `None` until then, and for an entity
+    /// nothing but asides and translated sources opened.
     ///
     /// **Made once, never changed, never taken back.** Every later policy
-    /// adopts it ([`RetentionPolicy::adopt_draw`]); a seek, a budget that
-    /// moves, a bitrate stated later redraw nothing, because a redraw is a
-    /// withdrawal or a set nobody sized the read-ahead against. It ends with
-    /// the play session: a [`Mode::Slack`] pass that runs once the backend
-    /// has left the swarm forgets it with the bytes.
+    /// adopts it ([`RetentionPolicy::adopt_draw`]). A seek, a budget that
+    /// moves, or a bitrate stated later redraws nothing, because a redraw is
+    /// a withdrawal or a set nobody sized the read-ahead against. It ends
+    /// with the play session. A [`Mode::Slack`] pass that runs once the
+    /// backend has left the swarm forgets it with the bytes.
     draw: Option<BTreeSet<u32>>,
     /// **What [`Self::draw`] was made for** ([`DrawnFor`]): `Some` exactly
     /// when the draw is. A draw whose record no longer matches what the
-    /// session plays is shared no more, and is forgotten once the driver
-    /// has ended it ([`Retention::forget_draw_made_for`]) -- or at once
-    /// when it is empty, since nothing of it was ever advertised.
+    /// session plays is shared no more. It is forgotten once the driver has
+    /// ended it ([`Retention::forget_draw_made_for`]), or at once when it
+    /// is empty, since nothing of it was ever advertised.
     drawn_for: Option<DrawnFor<B::Key>>,
     /// **The viewer's player opened this entity in this play session**
-    /// ([`Opener::Player`]): the one kind of open whose session draws a
-    /// shared set, and only while a play session is on the entity
+    /// ([`Opener::Player`]). That is the one kind of open whose session
+    /// draws a shared set, and only while a play session is on the entity
     /// ([`Backing::plays`]). A translated source's read, a pin's adoption
-    /// and a subtitle fetched beside the film draw nothing. Cleared with the
-    /// draw, when the session ends.
+    /// and a subtitle fetched beside the film draw nothing. It is cleared
+    /// with the draw, when the session ends.
     player_opened: bool,
     /// The widest read-ahead any open of this play session stated
-    /// ([`Retention::install_opening`]'s `opening`): what a draw decided
-    /// after the opens -- the rate arrived later, or the fallback ran out
-    /// -- is still sized beside, whether or not that open's reader is still
-    /// in the map. Cleared with the draw.
+    /// ([`Retention::install_opening`]'s `opening`). A draw decided after
+    /// the opens (the rate arrived later, or the fallback ran out) is still
+    /// sized beside it, whether or not that open's reader is still in the
+    /// map. It is cleared with the draw.
     asked: Buffering,
     /// When a pass first found this play session's draw waiting for the
     /// film's rate with playback under way ([`DRAW_FALLBACK`]), or `None`.
-    /// On the pass's own clock, never read from the wall. Cleared with the
-    /// draw.
+    /// It is on the pass's own clock, never read from the wall. It is
+    /// cleared with the draw.
     draw_waiting_since: Option<std::time::Instant>,
     /// What [`Backing::content_shares`] said of this entity's content, once
     /// it could say: `Some(false)` for an archive, whose play session draws
-    /// nothing. Asked until it answers, then kept for the session.
+    /// nothing. It is asked until it answers, then kept for the session.
     content: Option<bool>,
     /// **A slack pass took this entity's policy and began taking its
     /// bytes**, so pieces it dropped are neither had nor wanted
     /// ([`Backing::reclaim`] leaves them dropped). Nothing else would want
-    /// them again: what a pin lands on after such a pass has no policy for
-    /// [`Retention::clear_under`] to forget, and a download the user asked
-    /// to keep would stand still at the pieces the pass took. So the pin
-    /// exit wants the entity whole when this is set, and clears it.
+    /// them again. What a pin lands on after such a pass has no policy for
+    /// [`Retention::clear_under`] to forget. A download the user asked to
+    /// keep would stand still at the pieces the pass took. So the pin exit
+    /// wants the entity whole when this is set, and clears it.
     slacked: bool,
     /// **How many pieces an asker may have asked for in all**, as the last
     /// pass measured it, with the budget it was measured under
-    /// ([`Reader::room`]): what the entity may hold less everything its
-    /// readers hold that no reclaim can give back.
+    /// ([`Reader::room`]). It is what the entity may hold, less everything
+    /// its readers hold that no reclaim can give back.
     room: Option<(CacheBudget, u64)>,
     /// The draw that decides which of this entity's pieces this process
     /// offers to the swarm ([`Buffering::seed`]).
     ///
     /// **Per entity and random, and that is the whole point of it.** A
-    /// peer cannot see the swarm, so it cannot coordinate; what it can do
-    /// is pick independently, and independent picks by many peers sum to
-    /// even coverage where one shared rule -- keep the first minute, keep
-    /// every k-th piece -- sums to a shared hole. Drawn once and kept: a
+    /// peer cannot see the swarm, so it cannot coordinate. What it can do
+    /// is pick independently. Independent picks by many peers sum to even
+    /// coverage, where one shared rule (keep the first minute, keep every
+    /// k-th piece) sums to a shared hole. It is drawn once and kept, since a
     /// redraw would orphan pieces already announced.
     seed: u64,
     /// How many streams have ever been opened on this entity: every
     /// [`Retention::install`] that reached the turn, whatever it decided
     /// there.
     ///
-    /// Counted rather than remembered as a flag because the question it
-    /// answers is about a *gap*: a [`Mode::Slack`] pass carries the reading
-    /// its driver took, and an open that landed between that reading and
-    /// the turn is the one that would have its policy and its bytes deleted
-    /// under it. Every open goes through `install` and `install` takes this
-    /// turn, so an open the pass does not see in this number is one that
-    /// cannot start until the pass has finished.
+    /// It is counted rather than remembered as a flag, because the question
+    /// it answers is about a *gap*. A [`Mode::Slack`] pass carries the
+    /// reading its driver took. An open that landed between that reading
+    /// and the turn would have its policy and its bytes deleted under it.
+    /// Every open goes through `install`, and `install` takes this turn. So
+    /// an open the pass does not see in this number cannot start until the
+    /// pass has finished.
     opens: u64,
 }
 
@@ -1077,17 +1090,17 @@ struct Installed {
 /// One open read of one entity.
 struct ReaderState<B: Backing> {
     /// The position of the last byte this read delivered, and `None` until
-    /// it has delivered one. Only ever written from a byte that really went
-    /// out, never from a `Range` header.
+    /// it has delivered one. It is only ever written from a byte that
+    /// really went out, never from a `Range` header.
     playhead: Option<B::Position>,
     /// Where this read was opened, for the window it is owed before it has
-    /// delivered anything, and `None` for a reader opened at no position
+    /// delivered anything. It is `None` for a reader opened at no position
     /// (the proxy's: nothing bounds a proxied entity until its first
     /// delivered byte, so there is no window for an offset to place).
     ///
     /// A read parked on its first piece is the one the entity is buffering
-    /// *for*, and a playhead written only from a delivered byte makes it
-    /// invisible: with no window the pass concluded nothing, the want-set
+    /// *for*. A playhead written only from a delivered byte makes it
+    /// invisible. With no window the pass concluded nothing, the want-set
     /// stayed the whole file, and a cold open fetched 180 MB in the seconds
     /// before the first frame.
     opened_at: Option<B::Position>,
@@ -1096,46 +1109,45 @@ struct ReaderState<B: Backing> {
     promised: Range<u32>,
     /// **The pieces a stream of this reader's is asking the backend for
     /// now, with no promise to read them** ([`Reader::asks`]): a pre-want's
-    /// reach. Nothing a pass keeps once the stream has moved on -- a piece
-    /// fetched this way is cached data like any other -- but while it is
-    /// being asked for it is a fact about the backend, as a reading
-    /// stream's lookahead is: the backend will not forget a piece a stream
-    /// is asking for, and what of it has not arrived is about to. Empty for
-    /// every reader that reads.
+    /// reach. A pass keeps none of it once the stream has moved on, since a
+    /// piece fetched this way is cached data like any other. But while it
+    /// is being asked for, it is a fact about the backend, as a reading
+    /// stream's lookahead is. The backend will not forget a piece a stream
+    /// is asking for, and what of it has not arrived is about to. It is
+    /// empty for every reader that reads.
     asking: Range<u32>,
     /// The piece this reader's last pass ran at, so one reader playing on
     /// does not spend another's throttle.
     passed_at: Option<u32>,
     /// What this read asks of the cache: the stream lookahead it was
     /// granted when it opened, and the seconds its buffer profile wants
-    /// held. Zero and `None` for a backing that grants neither (the proxy:
-    /// a proxied body is fetched by its own response and reads nothing
-    /// ahead, and its viewer chooses no profile).
+    /// held. It is zero and `None` for a backing that grants neither (the
+    /// proxy: a proxied body is fetched by its own response and reads
+    /// nothing ahead, and its viewer chooses no profile).
     ///
     /// The committed half is sized to leave room for the largest lookahead
-    /// here; see [`Buffering`]. It is what the reader was *granted*, already
-    /// cut to what the last pass said the entity is asking for and to the
-    /// whole cache, so it binds when the budget moves under a reader that is
-    /// already open.
-    /// [`Buffering::bytes_per_second`] is not this read's to state and is
-    /// always `None` in it; the entity states it.
+    /// here (see [`Buffering`]). It is what the reader was *granted*,
+    /// already cut to what the last pass said the entity is asking for and
+    /// to the whole cache. So it binds when the budget moves under a reader
+    /// that is already open. [`Buffering::bytes_per_second`] is not this
+    /// read's to state and is always `None` in it. The entity states it.
     buffering: Buffering,
 }
 
 /// How many pieces to want after each one a stream is still waiting for,
 /// before the configured window takes over.
 ///
-/// It exists to keep peers busy, and the number it has to beat is one:
-/// a want-set of a single piece is a download from a single peer, because
+/// It exists to keep peers busy, and the number it has to beat is one. A
+/// want-set of a single piece is a download from a single peer, because
 /// librqbit reserves a piece to one peer at a time. Sixteen gives a dozen
-/// or more of them something to reserve -- and, as much to the point, a
+/// or more of them something to reserve. As much to the point, it gives a
 /// measured speed, without which the steal that would rescue a slow piece
 /// has nothing to compare.
 ///
-/// Sixty-four megabytes at a 4 MiB piece, of which a first frame needs
-/// two or three. That is the price of the swarm being busy, it is paid
-/// once per stream, and it buys back the ninety seconds the field spent
-/// on piece 0.
+/// That is sixty-four megabytes at a 4 MiB piece, of which a first frame
+/// needs two or three. It is the price of the swarm being busy. It is paid
+/// once per stream, and it buys back the ninety seconds the field spent on
+/// piece 0.
 const STARTUP_RUN: u32 = 16;
 
 impl<B: Backing> ReaderState<B> {
@@ -1152,15 +1164,15 @@ impl<B: Backing> ReaderState<B> {
     }
 
     /// Where this read is: the last byte it delivered, or the offset it was
-    /// opened at until it has delivered one. What a window is drawn round.
+    /// opened at until it has delivered one. A window is drawn round this.
     fn head(&self) -> Option<B::Position> {
         self.playhead.or(self.opened_at)
     }
 
-    /// Whether anything has been observed of this read -- a promise or a
+    /// Whether anything has been observed of this read: a promise or a
     /// delivered byte. A reader that has been opened and has done neither
     /// is one nothing has observed, and [`Retention::readers_of`] has
-    /// always counted it for nothing; the entry now exists from the open,
+    /// always counted it for nothing. The entry now exists from the open,
     /// for [`Self::opened_at`], so the question has to be asked rather than
     /// read off the map.
     fn observed(&self) -> bool {
@@ -1185,24 +1197,25 @@ pub enum InstallOutcome {
     Resized,
     /// Nothing bounds the entity: no budget yet, no cap, a budget that
     /// covers it, nothing to resolve, or a pin. Whatever was installed
-    /// before has been forgotten; what the entity shares is unchanged.
+    /// before has been forgotten. What the entity shares is unchanged.
     Unbounded,
 }
 
 /// What one pass did.
 #[derive(Debug)]
 pub struct Outcome {
-    /// What the pass concluded, or `None` for a pass that concluded nothing
-    /// -- a pin, nothing installed, no head in this domain before or after
-    /// the listing, a listing we do not have, or a decide that ran under it.
-    /// Every one of those leaves the policy exactly where it was.
+    /// What the pass concluded, or `None` for a pass that concluded
+    /// nothing: a pin, nothing installed, no head in this domain before or
+    /// after the listing, a listing we do not have, or a decide that ran
+    /// under it. Every one of those leaves the policy exactly where it was.
     pub concluded: Option<Conclusion>,
     /// The same claim, handed back because a byte delivered while the pass
-    /// held the turn started nothing and is owed a pass: the head this pass
-    /// measured has moved a stride since, or the policy was replaced under
-    /// the pass by a byte that was due and found the turn taken. `None` is
-    /// the turn released. Decided under L2 on **every** exit of the pass
-    /// and never re-acquired; see rule 3 in the module docs.
+    /// held the turn started nothing and is owed a pass. Either the head
+    /// this pass measured has moved a stride since, or the policy was
+    /// replaced under the pass by a byte that was due and found the turn
+    /// taken. `None` is the turn released. It is decided under L2 on
+    /// **every** exit of the pass and never re-acquired (see rule 3 in the
+    /// module docs).
     pub again: Option<Claim>,
 }
 
@@ -1218,8 +1231,8 @@ pub struct Conclusion {
     /// Pieces the backing reports really left the disk.
     pub reclaimed: usize,
     /// The windows this pass concluded, one per playhead live at its
-    /// re-read. Written to the entity only if the budget was still the one
-    /// measured; [`Holding::windows`] says what stands.
+    /// re-read. They are written to the entity only if the budget was still
+    /// the one measured. [`Holding::windows`] says what stands.
     pub windows: Vec<Range<u32>>,
 }
 
@@ -1242,25 +1255,25 @@ pub struct Holding<B: Backing> {
     pub live_playhead: bool,
     /// Where the entity is being consumed: the detector's answer from the
     /// last pass ([`State::consumed_at`], the piece its busiest stream had
-    /// reached), and only when the detector is silent the readers' head in
-    /// the order [`State::head`] asks -- a live read's, else where playback
-    /// last got to. `None` when nothing has ever read it.
+    /// reached). Only when the detector is silent is it the readers' head,
+    /// in the order [`State::head`] asks: a live read's, else where
+    /// playback last got to. It is `None` when nothing has ever read it.
     ///
     /// **This, and not [`Self::last_position`] or the newest reader, is
     /// what a reading of the window has to split at.** mpv keeps an index
-    /// crawler open beside the viewer and reopens it about once a second,
-    /// so the newest reader is regularly one parked at the tail of the
-    /// file: that is the reading that had the overlay show a 4K film at
-    /// 0:00 with fifty megabytes "behind" the playhead and four ahead. The
-    /// detector tells the two apart by what they eat.
+    /// crawler open beside the viewer and reopens it about once a second.
+    /// So the newest reader is regularly one parked at the tail of the
+    /// file. That reading had the overlay show a 4K film at 0:00 with fifty
+    /// megabytes "behind" the playhead and four ahead. The detector tells
+    /// the two apart by what they eat.
     pub head: Option<B::Position>,
     /// The entity's last delivered byte, from any reader, and `None` until
-    /// one has gone out. Every delivered byte moves it ([`Reader::note`]);
-    /// which of the readers is the viewer is the detector's question, not
+    /// one has gone out. Every delivered byte moves it ([`Reader::note`]).
+    /// Which of the readers is the viewer is the detector's question, not
     /// this field's.
     pub last_position: Option<B::Position>,
-    /// The budget the entity was last decided under, on the delivered byte;
-    /// `None` before any decision and under [`Install::OnOpen`].
+    /// The budget the entity was last decided under, on the delivered byte.
+    /// It is `None` before any decision and under [`Install::OnOpen`].
     pub decided: Option<CacheBudget>,
 }
 
@@ -1278,10 +1291,10 @@ pub struct InstalledView {
 }
 
 /// What a pass snapshots under L2 before the listing, and compares against
-/// after it. Only which domain and which budget; the head is read again at
-/// the re-read, and `at` -- the piece it stood on before the listing -- is
-/// what a listing that fails is measured against when the pass asks whether
-/// it owes another.
+/// after it. It holds only which domain and which budget. The head is read
+/// again at the re-read. `at` is the piece the head stood on before the
+/// listing. A listing that fails is measured against it when the pass asks
+/// whether it owes another.
 struct Begin<B: Backing> {
     domain: B::Domain,
     budget: CacheBudget,
@@ -1290,10 +1303,10 @@ struct Begin<B: Backing> {
 
 impl<B: Backing> Retention<B> {
     /// An owner with no entities, over `backing`, reading its cap from
-    /// `budget`. `Arc`, because every [`Reader`] holds its owner.
+    /// `budget`. It is an `Arc`, because every [`Reader`] holds its owner.
     pub fn new(backing: Arc<B>, budget: Arc<RetentionBudget>) -> Arc<Self> {
-        // `install_now` swaps a policy under L2 alone, with no backend call;
-        // that is only sound for a backing that shares nothing. A backing
+        // `install_now` swaps a policy under L2 alone, with no backend call.
+        // That is only sound for a backing that shares nothing. A backing
         // that shares and installs on the delivered byte would decide what a
         // play session shares under a lock no advertise may be made under.
         const {
@@ -1315,9 +1328,9 @@ impl<B: Backing> Retention<B> {
     }
 
     /// Install the runner a pass calls at its two hook points. Each side
-    /// keeps its own interleave cell where its tests write it; the runner
-    /// reads that cell. Runs with the turn held and no owner lock, so it
-    /// may note, promise, pin or publish a budget.
+    /// keeps its own interleave cell where its tests write it, and the
+    /// runner reads that cell. It runs with the turn held and no owner
+    /// lock, so it may note, promise, pin or publish a budget.
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn hook(&self, runner: impl Fn() + Send + Sync + 'static) {
         *self.hook.lock() = Some(Arc::new(runner));
@@ -1338,10 +1351,10 @@ impl<B: Backing> Retention<B> {
 
     /// The entity for `key`, created with `domain` if it did not exist. L1
     /// only, no I/O. An entity that exists keeps the domain it was made
-    /// with: a key names one directory or one file, and a domain that has
+    /// with. A key names one directory or one file, and a domain that has
     /// really changed is [`Retention::install`]'s to write, under the turn.
-    /// A fresh entity has no head: a byte noted before it existed was a byte
-    /// nothing was bounding, and it is not remembered for it.
+    /// A fresh entity has no head. A byte noted before it existed was a
+    /// byte nothing was bounding, and it is not remembered for it.
     pub fn entity(&self, key: B::Key, domain: B::Domain) -> Arc<Entity<B>> {
         self.entities
             .lock()
@@ -1382,20 +1395,20 @@ impl<B: Backing> Retention<B> {
         self.entities.lock().get(key).cloned()
     }
 
-    /// Every entity's key, in no order. L1 only, no I/O: what a driver
-    /// walks to decide a [`Mode`] per entity, without copying every
+    /// Every entity's key, in no order. L1 only, no I/O. A driver walks
+    /// this to decide a [`Mode`] per entity, without copying every
     /// [`Holding`] out to do it.
     pub fn keys(&self) -> Vec<B::Key> {
         self.entities.lock().keys().cloned().collect()
     }
 
     /// Open a reader on the entity. It records nothing until it promises or
-    /// delivers a byte; a reader that does neither is one nothing has
+    /// delivers a byte. A reader that does neither is one nothing has
     /// observed, and it counts for nothing.
     ///
-    /// **The proxy's opener**, and it takes no offset because there is no
-    /// window for one to place: a proxied entity has nothing installed on
-    /// it until its first delivered byte ([`Install::OnDeliveredByte`]), so
+    /// **The proxy's opener.** It takes no offset, because there is no
+    /// window for one to place. A proxied entity has nothing installed on
+    /// it until its first delivered byte ([`Install::OnDeliveredByte`]). So
     /// a read parked before that byte has nothing to be kept inside of.
     pub fn reader(self: &Arc<Self>, key: B::Key, domain: B::Domain) -> Reader<B> {
         Reader {
@@ -1412,34 +1425,34 @@ impl<B: Backing> Retention<B> {
     }
 
     /// Open a reader on the entity `key` already has, or `None` when it has
-    /// none. The torrent's opener: its install runs before the reader opens
-    /// and made the entity if the file could be bounded at all, and a file
-    /// that could not -- no metadata to name its pieces by -- has nothing a
-    /// head would be measured against, so its bytes are not remembered. L1
-    /// only, no I/O.
+    /// none. This is the torrent's opener. Its install runs before the
+    /// reader opens, and made the entity if the file could be bounded at
+    /// all. A file that could not (no metadata to name its pieces by) has
+    /// nothing a head would be measured against, so its bytes are not
+    /// remembered. L1 only, no I/O.
     ///
-    /// `at` is where the read was opened and `buffering` what it asks of the
-    /// cache -- the lookahead it was granted and the seconds its buffer
+    /// `at` is where the read was opened. `buffering` is what it asks of
+    /// the cache: the lookahead it was granted and the seconds its buffer
     /// profile wants held ([`Buffering`]). Both are recorded here, at the
-    /// open, rather than waiting for a delivered byte: the policy is
-    /// installed before this is called, so the very first pass over the
+    /// open, rather than waiting for a delivered byte. The policy is
+    /// installed before this is called. So the very first pass over the
     /// entity can draw its window round a read that is still parked on its
     /// first piece, and a probe never gets to claim the entity's head at
     /// all.
     ///
     /// **And the caller opens the reader before it opens the stream the
     /// read will be served from**, not only before the first byte. Between
-    /// the install and this call the entity stands with the open already
-    /// counted and no reader on it, and every await the caller spends in
-    /// there is a window for a slack pass: the count is what
+    /// the install and this call, the entity stands with the open already
+    /// counted and no reader on it. Every await the caller spends in there
+    /// is a window for a slack pass. The count is what
     /// [`Self::readers_and_opens_of`] compares, so the pass finds it equal,
-    /// finds nothing observed, and takes the policy back. If it also
-    /// reclaims everything the entity holds -- which a file with nothing on
-    /// the disk yet trivially satisfies -- [`Self::forget_empty`] takes the
-    /// entity, and the reader opened afterwards is `None`: that read notes
-    /// no byte for the rest of its life and nothing re-installs a policy,
+    /// finds nothing observed, and takes the policy back. It may also
+    /// reclaim everything the entity holds, which a file with nothing on the
+    /// disk yet trivially satisfies. Then [`Self::forget_empty`] takes the
+    /// entity, and the reader opened afterwards is `None`. That read notes
+    /// no byte for the rest of its life, and nothing re-installs a policy,
     /// because an install runs only at an open. Opened first, the reader's
-    /// `Arc` on the entity is what keeps `forget_empty` off it.
+    /// `Arc` on the entity keeps `forget_empty` off it.
     pub fn reader_on(
         self: &Arc<Self>,
         key: &B::Key,
@@ -1463,26 +1476,27 @@ impl<B: Backing> Retention<B> {
     }
 
     /// **An asker: something that fetches pieces of `key` nobody has
-    /// promised to read** -- a resumed film's pre-want, asking for the
-    /// resume point while the player is still on the file's head
+    /// promised to read.** An example is a resumed film's pre-want, asking
+    /// for the resume point while the player is still on the file's head
     /// (`Engine::prewant`). The handle says what its stream is asking the
-    /// backend for now ([`Reader::asks`]) and is told how much it may ask
+    /// backend for now ([`Reader::asks`]), and is told how much it may ask
     /// for in all ([`Reader::room`]).
     ///
     /// **It wants, and it holds nothing.** A read's promise does two things
-    /// at once: it has the piece fetched and it exempts it from every
+    /// at once: it has the piece fetched, and it exempts it from every
     /// unlink until it is read. An asker's pieces get only the first. Once
-    /// one is on the disk and the asker has moved on it is cached data like
-    /// any other outside every reader's window: kept while there is room,
-    /// given back by the same order as everything else when there is not
-    /// (`retention::ledger`), and protected again only when a real read
-    /// promises it. That is why an asker needs no share of the cache set
-    /// aside for it, and why it may not ask for what could not be kept.
+    /// one is on the disk and the asker has moved on, it is cached data
+    /// like any other outside every reader's window. It is kept while there
+    /// is room, and given back by the same order as everything else when
+    /// there is not (`retention::ledger`). It is protected again only when
+    /// a real read promises it. That is why an asker needs no share of the
+    /// cache set aside for it, and why it may not ask for what could not be
+    /// kept.
     ///
-    /// **No head either**: where a pass measures from, and where the entity
+    /// **No head either.** Where a pass measures from, and where the entity
     /// is said to be, are the reads' own. It is not an observed reader, so
-    /// it keeps no entity live. `None` for a key with no entity, which is
-    /// one nothing bounds. Dropping the handle ends the asking.
+    /// it keeps no entity live. It is `None` for a key with no entity,
+    /// which is one nothing bounds. Dropping the handle ends the asking.
     pub fn ask_ahead(self: &Arc<Self>, key: &B::Key) -> Option<Reader<B>> {
         let entity = self.lookup(key)?;
         let id = ReaderId(self.next_reader.fetch_add(1, Ordering::Relaxed));
@@ -1500,15 +1514,15 @@ impl<B: Backing> Retention<B> {
         })
     }
 
-    /// Where a reader of `key` last got to, told without a [`Reader`]: the
-    /// entity's head moves and no reader's does. L2 only, never claims the
-    /// turn, never installs. A key with no entity is a byte nothing is
-    /// bounding, and it is not remembered; a byte of another key is that
+    /// Where a reader of `key` last got to, told without a [`Reader`]. The
+    /// entity's head moves and no reader's does. L2 only: it never claims
+    /// the turn and never installs. A key with no entity is a byte nothing
+    /// is bounding, and it is not remembered. A byte of another key is that
     /// key's and moves nothing here.
     ///
-    /// Always a playback position: there is no reader here to be a probe,
-    /// and the callers that have one go through [`Reader::note`], which
-    /// asks what the read is for.
+    /// It is always a playback position. There is no reader here to be a
+    /// probe, and the callers that have one go through [`Reader::note`],
+    /// which asks what the read is for.
     pub fn note_position(&self, key: &B::Key, at: B::Position) {
         let Some(entity) = self.lookup(key) else {
             return;
@@ -1520,14 +1534,14 @@ impl<B: Backing> Retention<B> {
     /// **How long the entity's film is**, without saying where anything is
     /// in it; see [`State::duration`]. What a cast can state.
     ///
-    /// It gives the time caps their number without measuring anything:
-    /// bytes of file over seconds of film is the bitrate by definition, so
+    /// It gives the time caps their number without measuring anything.
+    /// Bytes of file over seconds of film is the bitrate by definition, so
     /// a pause, a stall, a reconnect and a burst are all invisible to it.
-    /// Where the viewer is, nobody states any more -- it is where the reads
+    /// Nobody states where the viewer is any more: it is where the reads
     /// are ([`crate::retention::streams`]).
     ///
-    /// L2 only, like [`Self::note_position`]: no turn, no install, and a
-    /// key with no entity is nothing to remember.
+    /// L2 only, like [`Self::note_position`]: no turn, no install. A key
+    /// with no entity is nothing to remember.
     pub fn note_duration(&self, key: &B::Key, duration: std::time::Duration) {
         if duration.is_zero() {
             return;
@@ -1539,9 +1553,10 @@ impl<B: Backing> Retention<B> {
     }
 
     /// **How long the film of a member is**, told to its container or to
-    /// one of the volumes of its set ([`State::set_duration`]): the rate
-    /// the member's draw is sized with, and nothing else -- the entity's own
-    /// stream keeps no rate from it. L2 only, like [`Self::note_duration`].
+    /// one of the volumes of its set ([`State::set_duration`]). It gives the
+    /// rate the member's draw is sized with, and nothing else. The entity's
+    /// own stream keeps no rate from it. L2 only, like
+    /// [`Self::note_duration`].
     pub fn note_set_duration(&self, key: &B::Key, duration: std::time::Duration) {
         if duration.is_zero() {
             return;
@@ -1569,20 +1584,21 @@ impl<B: Backing> Retention<B> {
     /// [`Mode::Slack`] at the next pass.
     ///
     /// **The draw is decided once per play session, and only for the
-    /// viewer's playback stream** ([`State::draw`], [`Opener`]): here, if
-    /// the film's rate is known already or the budget covers the file, and
-    /// otherwise by the first live pass that finds it known
-    /// ([`DRAW_FALLBACK`]). Sized with the stream's real read-ahead, so a
-    /// budget that cannot hold both it and a shared set shares nothing, and
-    /// advertised to the backend at once, which announces each piece of it
-    /// as it completes and nothing else of the entity. A later open adopts
-    /// the draw it finds. Nothing here ever takes an announcement back.
+    /// viewer's playback stream** ([`State::draw`], [`Opener`]). It is
+    /// decided here if the film's rate is known already or the budget
+    /// covers the file. Otherwise the first live pass that finds it known
+    /// decides it ([`DRAW_FALLBACK`]). It is sized with the stream's real
+    /// read-ahead, so a budget that cannot hold both it and a shared set
+    /// shares nothing. It is advertised to the backend at once, and the
+    /// backend announces each piece of it as it completes and nothing else
+    /// of the entity. A later open adopts the draw it finds. Nothing here
+    /// ever takes an announcement back.
     ///
-    /// Under this key's turn alone: a pin clears the policy; a policy that
-    /// already describes this domain under this budget is kept untouched;
-    /// one over this domain under another budget is resized in place
-    /// ([`InstallOutcome::Resized`]); otherwise the old policy is forgotten
-    /// and the new one installed.
+    /// This runs under this key's turn alone. A pin clears the policy. A
+    /// policy that already describes this domain under this budget is kept
+    /// untouched. One over this domain under another budget is resized in
+    /// place ([`InstallOutcome::Resized`]). Otherwise the old policy is
+    /// forgotten and the new one installed.
     pub async fn install_opening(
         &self,
         key: B::Key,
@@ -1591,9 +1607,9 @@ impl<B: Backing> Retention<B> {
         opener: Opener,
     ) -> InstallOutcome {
         // A key with no entity has no turn to take and nothing installed to
-        // serialise against; its domain has to be resolved before there is
+        // serialise against. Its domain has to be resolved before there is
         // anything to lock. Two firsts on one key both resolve, converge on
-        // one entity in `entity()`, and take the turn in sequence: the
+        // one entity in `entity()`, and take the turn in sequence. The
         // second finds the first's policy and keeps it.
         let (entity, fresh) = match self.lookup(&key) {
             Some(entity) => (entity, None),
@@ -1608,12 +1624,12 @@ impl<B: Backing> Retention<B> {
             guard: entity.turn.clone().lock_owned().await,
             about: None,
         };
-        // Counted here, under the turn and before anything is decided,
-        // because what a [`Mode::Slack`] pass has to know is that a stream
-        // opened -- not what the install made of it. An open that finds the
-        // policy already right (`Kept`), or that cannot be bounded, is
-        // still a viewer starting this file, and a pass that deleted the
-        // entity under one would take the bytes it is about to read.
+        // Counted here, under the turn and before anything is decided. A
+        // [`Mode::Slack`] pass has to know that a stream opened, not what
+        // the install made of it. An open that finds the policy already
+        // right (`Kept`), or that cannot be bounded, is still a viewer
+        // starting this file. A pass that deleted the entity under one
+        // would take the bytes it is about to read.
         entity
             .state
             .lock()
@@ -1622,7 +1638,7 @@ impl<B: Backing> Retention<B> {
             .install_under(&entity, &mut claim, key, want, fresh, opening)
             .await;
         // Whatever the install made of it, the play session's draw may be
-        // decidable now: this open's read-ahead is known, and the film's
+        // decidable now. This open's read-ahead is known, and the film's
         // rate may be.
         self.decide_draw_if_due(&entity, &mut claim, None).await;
         outcome
@@ -1642,9 +1658,9 @@ impl<B: Backing> Retention<B> {
     ) -> InstallOutcome {
         let budget = self.budget.get();
         if self.backing.keeps_everything(&key) {
-            // A pin is a retention property: the user asked for those
-            // bytes, and they are shared whole -- the pin advertises them,
-            // not the owner -- and fetched whole, which the policy's passes
+            // A pin is a retention property. The user asked for those
+            // bytes. They are shared whole (the pin advertises them, not
+            // the owner), and fetched whole, which the policy's passes
             // stopped asking for beyond the window.
             self.clear_under(entity, claim);
             self.want_whole(entity).await;
@@ -1661,16 +1677,16 @@ impl<B: Backing> Retention<B> {
                 return InstallOutcome::Kept;
             }
         }
-        // Resolved under the turn: what the backend says the file is, now. A
-        // fresh entity was
-        // resolved a moment ago to be made at all, and is not asked twice.
+        // Resolved under the turn: what the backend says the file is, now.
+        // A fresh entity was resolved a moment ago to be made at all, and
+        // is not asked twice.
         let resolved = match fresh {
             Some(domain) => Some(domain),
             None => self.backing.resolve(want).await,
         };
-        // Read under L2 and not carried from the open: a reader that opened
-        // a moment ago is in the map by now, and the largest lookahead in
-        // force is what the window may not be sized under -- beside the one
+        // Read under L2 and not carried from the open. A reader that opened
+        // a moment ago is in the map by now. The window may not be sized
+        // under the largest lookahead in force. That sits beside the one
         // the reader about to open will be granted, which is not in the map
         // yet and is the one this open is for.
         let buffering = entity.state.lock().buffering().widest(opening);
@@ -1689,21 +1705,21 @@ impl<B: Backing> Retention<B> {
             CacheBudget::Unknown | CacheBudget::Unbounded => None,
         });
         // The budget covers the file: keep all of it and reclaim none of
-        // it -- and install nothing, because an installed policy is what
-        // makes a piece reclaimable, and nothing is here. What it shares is
-        // the draw, which is then the whole file.
+        // it. Install nothing, because an installed policy is what makes a
+        // piece reclaimable, and nothing is here. What it shares is the
+        // draw, which is then the whole file.
         let mut policy = sized.filter(|policy| policy.shape() != Shape::Whole);
         if let Some(policy) = policy.as_mut() {
-            // The play session's draw, or -- until it is decided -- nothing:
-            // the draw a policy makes on its own is sized against whatever
-            // this open knew, and nothing may be committed that is not
+            // The play session's draw, or nothing until it is decided. The
+            // draw a policy makes on its own is sized against whatever this
+            // open knew, and nothing may be committed that is not
             // advertised.
             let state = entity.state.lock();
             policy.adopt_draw(state.draw.as_ref().unwrap_or(&BTreeSet::new()));
         }
         // A budget that moved under a policy still standing over this very
         // domain. The budget is republished every minute from the free
-        // space, so this is most opens, not a rare one: rebuilt, the fresh
+        // space, so this is most opens, not a rare one. Rebuilt, the fresh
         // policy's first pass would reclaim everything the old one had
         // committed. Resized in place, the committed set stays.
         let carried = match (&resolved, policy.as_mut()) {
@@ -1723,9 +1739,9 @@ impl<B: Backing> Retention<B> {
         }
         self.clear_under(entity, claim);
         // Nothing installed after this point leaves the entity unbounded,
-        // and an unbounded entity is fetched whole: what the old policy's
+        // and an unbounded entity is fetched whole. What the old policy's
         // passes stopped wanting is wanted again. A new policy going in
-        // wants nothing here -- its first pass trims to its own window.
+        // wants nothing here, since its first pass trims to its own window.
         let (Some(domain), Some(policy)) = (resolved, policy) else {
             self.want_whole(entity).await;
             return InstallOutcome::Unbounded;
@@ -1750,9 +1766,10 @@ impl<B: Backing> Retention<B> {
         InstallOutcome::Installed
     }
 
-    /// The pieces holding `domain`'s first [`crate::retention::sniff::HEAD_BYTES`]:
-    /// what [`Backing::content_shares`] reads to tell an archive. Pure, so
-    /// it is asked under L2.
+    /// The pieces holding `domain`'s first
+    /// [`crate::retention::sniff::HEAD_BYTES`], which
+    /// [`Backing::content_shares`] reads to tell an archive. Pure, so it is
+    /// asked under L2.
     fn head_of(domain: &B::Domain) -> Option<Range<u32>> {
         let last = crate::retention::sniff::HEAD_BYTES.saturating_sub(1);
         let first = B::index_of(domain, B::position_at(domain, 0)?)?;
@@ -1761,52 +1778,54 @@ impl<B: Backing> Retention<B> {
     }
 
     /// **Decide what this play session shares, if it is time to**, and
-    /// advertise it. Under the turn; a no-op once decided, so the draw is
-    /// made once and never grows.
+    /// advertise it. It runs under the turn. It is a no-op once decided, so
+    /// the draw is made once and never grows.
     ///
-    /// Only for the viewer's playback stream ([`Opener::Player`]) of an
-    /// entity a play session is on ([`Backing::plays`]), and never under a pin,
-    /// which shares the file whole on its own. Then it is time when any of
-    /// these holds, and only then:
+    /// It is only for the viewer's playback stream ([`Opener::Player`]) of
+    /// an entity a play session is on ([`Backing::plays`]). It never runs
+    /// under a pin, which shares the file whole on its own. Then it is time
+    /// when any of these holds, and only then:
     ///
-    /// * **the film's rate is known** -- the player has said how long it
-    ///   is -- so the read-ahead every later open is granted, the bitrate
-    ///   times the seconds the viewer asked for, is known too, and the draw
+    /// * **the film's rate is known**, because the player has said how long
+    ///   it is. So the read-ahead every later open is granted (the bitrate
+    ///   times the seconds the viewer asked for) is known too, and the draw
     ///   is sized beside it ([`State::draw_buffering`]);
     /// * **the budget covers the file**, where the draw is the whole file
     ///   whatever the read-ahead;
-    /// * **nothing can be sized** -- no budget published, no cap, a file
-    ///   the policy refuses -- and the session shares nothing, as before;
+    /// * **nothing can be sized** (no budget published, no cap, a file the
+    ///   policy refuses), and the session shares nothing, as before;
     /// * **playback has run [`DRAW_FALLBACK`] without a rate**, on the
     ///   clock of the live pass that asks (`now`; an open has none), and
     ///   the draw is sized beside what the opens stated.
     ///
     /// **And not before the content is known** ([`Backing::content_shares`]):
     /// the file's first bytes held and not an archive's. An archive's play
-    /// session decides an empty draw -- unless the session plays a member of
-    /// it ([`Backing::played_member`]): then the content is not asked, and
-    /// the draw is sized and made over the member's extent alone
-    /// ([`Backing::narrowed`]), its rate the extent's length over the
+    /// session decides an empty draw, unless the session plays a member of
+    /// it ([`Backing::played_member`]). Then the content is not asked. The
+    /// draw is sized and made over the member's extent alone
+    /// ([`Backing::narrowed`]). Its rate is the extent's length over the
     /// member's duration, told for the draw alone ([`State::set_duration`]).
     ///
     /// **A member across a set is drawn once for the set**
-    /// ([`Backing::played_set`]): the volume whose session is due first
-    /// draws over every volume's bytes of the member ([`Backing::joined`]),
-    /// sized from the member's whole length (its rate that length over the
-    /// set's duration, [`State::set_duration`]), records the whole draw and
-    /// advertises it; every other volume, at its own open or pass, finds
-    /// that draw on a sibling and adopts it -- nothing drawn or advertised
-    /// again. Each volume's policy keeps its own pieces of it
-    /// ([`RetentionPolicy::adopt_draw`]); the record is the set's, on every
-    /// volume, so what is shared is the union whichever volume is asked.
+    /// ([`Backing::played_set`]). The volume whose session is due first
+    /// draws over every volume's bytes of the member ([`Backing::joined`]).
+    /// The draw is sized from the member's whole length (its rate that
+    /// length over the set's duration, [`State::set_duration`]). That volume
+    /// records the whole draw and advertises it. Every other volume, at its
+    /// own open or pass, finds that draw on a sibling and adopts it. Nothing
+    /// is drawn or advertised again. Each volume's policy keeps its own
+    /// pieces of it ([`RetentionPolicy::adopt_draw`]). The record is the
+    /// set's, on every volume, so what is shared is the union whichever
+    /// volume is asked.
     ///
-    /// Recorded before it is advertised, so a reading of what the entity
-    /// shares ([`Retention::draws`]) that sees the backend's announcement
-    /// also sees the record of it; adopted by the standing policy at once,
-    /// so what it commits from here on is the draw. A refused advertise is
-    /// logged and leaves the draw recorded: the pieces are then ours and
-    /// unshared, which is no failure of the rule, and the driver advertises
-    /// what an entity shares again when it finds the backend short of it.
+    /// It is recorded before it is advertised. So a reading of what the
+    /// entity shares ([`Retention::draws`]) that sees the backend's
+    /// announcement also sees the record of it. The standing policy adopts
+    /// it at once, so what it commits from here on is the draw. A refused
+    /// advertise is logged and leaves the draw recorded. The pieces are
+    /// then ours and unshared, which is no failure of the rule. The driver
+    /// advertises what an entity shares again when it finds the backend
+    /// short of it.
     async fn decide_draw_if_due(
         &self,
         entity: &Entity<B>,
@@ -1820,8 +1839,8 @@ impl<B: Backing> Retention<B> {
         if self.backing.keeps_everything(&entity.key) || !self.backing.plays(&entity.key) {
             return;
         }
-        // A member played through the member path: the path said what the
-        // file is -- a container -- and which of its bytes are the film.
+        // A member played through the member path. The path said what the
+        // file is (a container) and which of its bytes are the film.
         let member = self.backing.played_member(&entity.key);
         // Or a member across a set this file is one volume of.
         let set = self.backing.played_set(&entity.key);
@@ -1829,11 +1848,11 @@ impl<B: Backing> Retention<B> {
             member: member.clone(),
             set: set.clone(),
         };
-        // What the file is, asked of its first bytes once they are held --
-        // off L2, and once per session: an archive shares nothing, and one
-        // that cannot be told yet waits. Not asked for a member, whose
-        // container would answer "archive" to exactly the question the
-        // member path has already answered.
+        // What the file is, asked of its first bytes once they are held,
+        // off L2, and once per session. An archive shares nothing, and one
+        // that cannot be told yet waits. It is not asked for a member,
+        // whose container would answer "archive" to exactly the question
+        // the member path has already answered.
         let (domain, content) = {
             let state = entity.state.lock();
             if state.draw_settled(&made_for) || !state.player_opened {
@@ -1852,18 +1871,18 @@ impl<B: Backing> Retention<B> {
                 content
             }
         };
-        // What a set's draw is made over, found before the record: the
-        // volumes the reader has not reached have no entity, and what they
+        // What a set's draw is made over, found before the record. The
+        // volumes the reader has not reached have no entity, so what they
         // are is asked of the backing, off every owner lock.
         let joined = match &set {
             None => None,
             Some(parts) => Some(self.joined_set(entity, &domain, parts).await),
         };
         // Asked again, off L2 (rule 2) and with no await between it and the
-        // record: the head read above can park, and a viewer who moved to
-        // another file meanwhile -- or from the file to a member of it --
-        // would have this draw recorded and advertised for a file no
-        // session plays, or sized for bytes nobody plays.
+        // record. The head read above can park. A viewer may have moved to
+        // another file meanwhile, or from the file to a member of it. Then
+        // this draw would be recorded and advertised for a file no session
+        // plays, or sized for bytes nobody plays.
         if !self.backing.plays(&entity.key)
             || self.backing.played_member(&entity.key) != member
             || self.backing.played_set(&entity.key) != set
@@ -1871,10 +1890,10 @@ impl<B: Backing> Retention<B> {
             return;
         }
         let budget = self.budget.get();
-        // A set's volumes decide one at a time (S, before L2), and a volume
-        // whose sibling has drawn adopts that draw: copied out of the
-        // sibling's state under its own L2, released before this one's is
-        // taken.
+        // A set's volumes decide one at a time (S, before L2). A volume
+        // whose sibling has drawn adopts that draw. It is copied out of the
+        // sibling's state under the sibling's own L2, released before this
+        // one's is taken.
         let (draw, refused) = {
             let _set_turn = set.as_ref().map(|_| self.set_draws.lock());
             let drawn_by_a_sibling = set
@@ -1885,7 +1904,7 @@ impl<B: Backing> Retention<B> {
                 return;
             }
             if !content {
-                // An archive: decided, and nothing in it.
+                // An archive: decided, with nothing in it.
                 state.adopt_draw(&mut claim.guard, BTreeSet::new(), made_for);
                 drop(state);
                 tracing::debug!(
@@ -1896,16 +1915,17 @@ impl<B: Backing> Retention<B> {
             }
             if let Some(draw) = drawn_by_a_sibling {
                 // The set's draw, made and advertised by the volume that
-                // was due first: this volume keeps its pieces of it, and
+                // was due first. This volume keeps its pieces of it, and
                 // nothing is drawn or advertised again.
                 state.adopt_draw(&mut claim.guard, draw, made_for);
                 return;
             }
-            // What the draw is made over: the member's pieces, with its
-            // length, when the session plays a member -- a season in one
+            // What the draw is made over. When the session plays a member,
+            // it is the member's pieces, with its length: a season in one
             // container shares the episode being watched, not the
-            // container -- the pieces of every volume's bytes of it when it
-            // plays a member across a set, and the entity otherwise.
+            // container. When it plays a member across a set, it is the
+            // pieces of every volume's bytes of it. Otherwise it is the
+            // entity.
             let (over, map) = match (&member, joined) {
                 (_, Some(Some((over, map)))) => (over, Some(map)),
                 (_, Some(None)) => {
@@ -1957,7 +1977,7 @@ impl<B: Backing> Retention<B> {
             let draw: BTreeSet<u32> = sized
                 .map(|policy| policy.draw().clone())
                 .unwrap_or_default();
-            // A set's draw is made in the joined index space: each index
+            // A set's draw is made in the joined index space. Each index
             // there is the piece the list says.
             let draw = match &map {
                 None => draw,
@@ -1996,13 +2016,13 @@ impl<B: Backing> Retention<B> {
         }
     }
 
-    /// **The domain a set's draw is made over** ([`Backing::joined`]): each
-    /// volume's domain -- `entity`'s own (`domain`), a sibling's from its
-    /// entity, or, for a volume no stream has opened yet, the backing's
-    /// ([`Backing::domain_of`]) -- narrowed to the member's bytes in it,
-    /// and the lot joined. `None` when a volume cannot be named or its
-    /// bytes lie outside it: the set then shares nothing. No owner lock is
-    /// held across the backing's await (rule 2).
+    /// **The domain a set's draw is made over** ([`Backing::joined`]). Each
+    /// volume's domain is narrowed to the member's bytes in it, and the lot
+    /// joined. That domain is `entity`'s own (`domain`), a sibling's from
+    /// its entity, or, for a volume no stream has opened yet, the backing's
+    /// ([`Backing::domain_of`]). It is `None` when a volume cannot be named
+    /// or its bytes lie outside it, and the set then shares nothing. No
+    /// owner lock is held across the backing's await (rule 2).
     async fn joined_set(
         &self,
         entity: &Entity<B>,
@@ -2028,11 +2048,11 @@ impl<B: Backing> Retention<B> {
     }
 
     /// The draw a sibling volume of `key`'s set has made **for this set**,
-    /// if one has: read under S, the sibling's entity copied out of L1 and
-    /// its L2 taken alone, one at a time. A sibling's draw made for anything
-    /// else -- the volume played by its URL, whose sniff found an archive
-    /// and drew nothing, or another set -- is not the set's, and adopting
-    /// it would have the set share that instead.
+    /// if one has. It is read under S, with the sibling's entity copied out
+    /// of L1 and its L2 taken alone, one at a time. A sibling's draw made
+    /// for anything else is not the set's: the volume played by its URL,
+    /// whose sniff found an archive and drew nothing, or another set.
+    /// Adopting it would have the set share that instead.
     fn sibling_draw(&self, key: &B::Key, parts: &[(B::Key, Range<u64>)]) -> Option<BTreeSet<u32>> {
         parts
             .iter()
@@ -2054,7 +2074,7 @@ impl<B: Backing> Retention<B> {
     ///
     /// **Nothing is taken back here, however much smaller the new budget
     /// is.** The draw has been advertised, and there is no un-have in
-    /// BitTorrent: `carry_into` adopts the whole draw and the whole
+    /// BitTorrent. `carry_into` adopts the whole draw and the whole
     /// committed set for that reason, so there is nothing over capacity to
     /// give back.
     async fn resize_under(
@@ -2091,13 +2111,13 @@ impl<B: Backing> Retention<B> {
 
     /// `Self::clear` (test builds only) with the turn already held: forget
     /// the policy, and say whether there was one to forget. Nothing is
-    /// advertised or withdrawn -- what the entity shares is its draw, which
+    /// advertised or withdrawn. What the entity shares is its draw, which
     /// outlives every policy of the play session.
     ///
-    /// What the policy stopped wanting is not wanted again here: that is
-    /// [`Self::want_whole`], asked by the callers that leave the entity with
-    /// nothing installed, and not by the ones that replace the policy or
-    /// retire a sibling.
+    /// What the policy stopped wanting is not wanted again here. That is
+    /// [`Self::want_whole`]. The callers that leave the entity with nothing
+    /// installed ask it, and the ones that replace the policy or retire a
+    /// sibling do not.
     fn clear_under(&self, entity: &Entity<B>, claim: &mut Claim) -> bool {
         let mut state = entity.state.lock();
         if state.installed.is_none() {
@@ -2110,17 +2130,17 @@ impl<B: Backing> Retention<B> {
     /// Forget the entity for `key` once its slack pass has taken the last
     /// of it off the disk and no read is open on it.
     ///
-    /// The replacement for the proxy's old 90-second grace, and it prunes on
-    /// a fact rather than on a clock: an entity that holds nothing and that
-    /// nobody is reading has no window to keep, no head worth remembering
-    /// and nothing for a later pass to do. A [`Reader`]'s drop never calls
-    /// it -- a read that ends is not a stream that has been replaced, and
-    /// the entity it read is kept until something else is played.
+    /// It replaces the proxy's old 90-second grace, and it prunes on a fact
+    /// rather than on a clock. An entity that holds nothing and that nobody
+    /// is reading has no window to keep, no head worth remembering and
+    /// nothing for a later pass to do. A [`Reader`]'s drop never calls it.
+    /// A read that ends is not a stream that has been replaced, and the
+    /// entity it read is kept until something else is played.
     ///
-    /// L1 → L2, as [`Self::holdings`] is (rule 1), and never from inside
-    /// a pass: the caller holds no [`Claim`] and no `Arc` of the entity by
-    /// the time it asks, so an entity a later reader has opened in the gap
-    /// keeps itself.
+    /// L1 → L2, as [`Self::holdings`] is (rule 1), and never from inside a
+    /// pass. The caller holds no [`Claim`] and no `Arc` of the entity by the
+    /// time it asks. So an entity a later reader has opened in the gap keeps
+    /// itself.
     pub fn forget_empty(&self, key: &B::Key) {
         let forgotten = {
             let mut entities = self.entities.lock();
@@ -2136,31 +2156,31 @@ impl<B: Backing> Retention<B> {
         }
     }
 
-    /// Nothing bounds `entity` now: every piece of it wanted again
+    /// Nothing bounds `entity` now, so every piece of it is wanted again
     /// ([`Backing::want_all`]). The policy's passes trimmed the backend's
-    /// want-set to the window ([`Backing::want`]), and a piece they left
-    /// unwanted stays unwanted until something wants it: nothing on the pin
-    /// path recomputes a selection that did not change, so a pinned
+    /// want-set to the window ([`Backing::want`]). A piece they left
+    /// unwanted stays unwanted until something wants it. Nothing on the pin
+    /// path recomputes a selection that did not change. So a pinned
     /// single-file torrent would download to the window's edge and stop
-    /// there, short of the file the user asked to keep. Under the turn, after
-    /// a [`Self::clear_under`] that succeeded.
+    /// there, short of the file the user asked to keep. It runs under the
+    /// turn, after a [`Self::clear_under`] that succeeded.
     async fn want_whole(&self, entity: &Entity<B>) {
         let domain = entity.state.lock().domain.clone();
         self.backing.want_all(&domain).await;
     }
 
-    /// A pin stands on `entity`: once nothing bounds it every piece of it
-    /// is wanted again. The pin exit of both passes, under the turn. What it
-    /// shares is the pin's to advertise, which it does whole.
+    /// A pin stands on `entity`. Once nothing bounds it, every piece of it
+    /// is wanted again. This is the pin exit of both passes, under the
+    /// turn. What it shares is the pin's to advertise, which it does whole.
     ///
-    /// Wanted again only by the pass that forgot a policy, or the first one
-    /// after a slack pass took pieces ([`State::slacked`]). This exit is
-    /// taken every tick for as long as the pin stands, and a pinned entity
-    /// has nothing installed after the first of them; asking for the whole
-    /// extent on every one of those is a reselect of every piece of the
-    /// file under librqbit's torrent lock every two seconds, for nothing --
-    /// a piece the first exit wanted is wanted still. The one that cleared
-    /// is the one after which something could be unwanted.
+    /// The entity is wanted again only by the pass that forgot a policy, or
+    /// the first one after a slack pass took pieces ([`State::slacked`]).
+    /// This exit is taken every tick for as long as the pin stands, and a
+    /// pinned entity has nothing installed after the first of them. Asking
+    /// for the whole extent on every one of those would reselect every
+    /// piece of the file under librqbit's torrent lock every two seconds,
+    /// for nothing. A piece the first exit wanted is wanted still. The one
+    /// that cleared is the one after which something could be unwanted.
     async fn release_to_pin(&self, entity: &Entity<B>, claim: &mut Claim) {
         let slacked = std::mem::take(&mut entity.state.lock().slacked);
         if self.clear_under(entity, claim) || slacked {
@@ -2168,9 +2188,9 @@ impl<B: Backing> Retention<B> {
         }
     }
 
-    /// The entity's turn, awaited: the torrent's tick and the proxy's slack
+    /// The entity's turn, awaited. The torrent's tick and the proxy's slack
     /// sweep queue here, with no owner lock held (rule 3). `None` is a key
-    /// with no entity, so nothing to serialise against.
+    /// with no entity, so there is nothing to serialise against.
     pub async fn turn(&self, key: &B::Key) -> Option<Claim> {
         let entity = self.lookup(key)?;
         Some(Claim {
@@ -2179,10 +2199,10 @@ impl<B: Backing> Retention<B> {
         })
     }
 
-    /// The entity's turn if nobody holds it; never waits. `None` is a pass
-    /// in flight, or no such entity. Looks the entity up under L1, so it is
-    /// for callers holding nothing; the `try_lock` under L2 that rule 3
-    /// allows is [`Reader::note`]'s, on an entity it already holds.
+    /// The entity's turn if nobody holds it. It never waits. `None` is a
+    /// pass in flight, or no such entity. It looks the entity up under L1,
+    /// so it is for callers holding nothing. The `try_lock` under L2 that
+    /// rule 3 allows is [`Reader::note`]'s, on an entity it already holds.
     pub fn try_turn(&self, key: &B::Key) -> Option<Claim> {
         let entity = self.lookup(key)?;
         entity
@@ -2197,17 +2217,16 @@ impl<B: Backing> Retention<B> {
     /// draw chose it.** Says whether it joined the committed set.
     ///
     /// The draw was advertised when it was made, so the backend announced
-    /// the piece as it completed; what is left here is the bookkeeping. A
-    /// drawn piece is committed the moment we are found to hold it -- at
-    /// the completion itself, not a pass's next listing -- so that what the
-    /// cache counts as committed does not depend on when a pass happens to
-    /// run.
+    /// the piece as it completed. What is left here is the bookkeeping. A
+    /// drawn piece is committed the moment we are found to hold it: at the
+    /// completion itself, not a pass's next listing. So what the cache
+    /// counts as committed does not depend on when a pass happens to run.
     ///
     /// **Off the path that told us.** The caller is librqbit's completion
-    /// and may not block, so it hands this to a task; here the entity's
-    /// turn is taken like any other writer of a policy, which is what makes
-    /// a commit and a pass one order instead of two. A pass that committed
-    /// it already, or a policy that was replaced under it, leaves nothing to
+    /// and may not block, so it hands this to a task. Here the entity's
+    /// turn is taken like any other writer of a policy. That makes a commit
+    /// and a pass one order instead of two. A pass that committed it
+    /// already, or a policy that was replaced under it, leaves nothing to
     /// commit ([`RetentionPolicy::commit_drawn`]).
     pub async fn commit_completed(&self, piece: u32) -> bool {
         if B::SHARE == Share::Nothing {
@@ -2219,8 +2238,8 @@ impl<B: Backing> Retention<B> {
         let Some(entity) = self.lookup(&key) else {
             return false;
         };
-        // No owner lock held across the turn (rule 3), and the policy is
-        // asked again under it: the key above is a reading the wait for the
+        // No owner lock is held across the turn (rule 3), and the policy is
+        // asked again under it. The key above is a reading the wait for the
         // turn may have made stale.
         let Some(mut claim) = self.turn(&key).await else {
             return false;
@@ -2228,10 +2247,10 @@ impl<B: Backing> Retention<B> {
         entity.state.lock().commit_drawn(&mut claim.guard, piece)
     }
 
-    /// Every entity's draw, as the play session made it, with whether a
-    /// read or the liveness cell still holds that session open is the
-    /// caller's question. L1 → L2, no I/O: the shape [`Self::holdings`]
-    /// has. An entity no open has decided yet is not listed.
+    /// Every entity's draw, as the play session made it. Whether a read or
+    /// the liveness cell still holds that session open is the caller's
+    /// question. L1 → L2, no I/O: the shape [`Self::holdings`] has. An
+    /// entity no open has decided yet is not listed.
     pub fn draws(&self) -> Vec<(B::Key, BTreeSet<u32>)> {
         let entities = self.entities.lock();
         entities
@@ -2243,10 +2262,10 @@ impl<B: Backing> Retention<B> {
             .collect()
     }
 
-    /// [`Self::draws`], each with what it was made for ([`DrawnFor`]): what
-    /// the driver compares with what is played now, since a draw made for
-    /// one member is nothing another member of the same entity shares. L1 →
-    /// L2, no I/O, as [`Self::draws`].
+    /// [`Self::draws`], each with what it was made for ([`DrawnFor`]). The
+    /// driver compares that with what is played now, since a draw made for
+    /// one member is nothing another member of the same entity shares.
+    /// L1 → L2, no I/O, as [`Self::draws`].
     pub fn draws_for(&self) -> Vec<DrawMade<B::Key>> {
         let entities = self.entities.lock();
         entities
@@ -2260,15 +2279,16 @@ impl<B: Backing> Retention<B> {
             .collect()
     }
 
-    /// **`key`'s draw made for `made_for` has been ended**: the driver
-    /// found it shared no more -- the session moved to another member of
-    /// the entity, or off a set onto one volume -- and has taken it out of
-    /// what the backend advertises with the backend out of the swarm
+    /// **`key`'s draw made for `made_for` has been ended.** The driver
+    /// found it shared no more: the session moved to another member of the
+    /// entity, or off a set onto one volume. It has taken it out of what
+    /// the backend advertises, with the backend out of the swarm
     /// (`EndShares`). Forget it under the entity's turn, so the session's
-    /// next open or pass draws what is played now, as [`Self::end_play_session`]
-    /// lets the next open of a deleted file draw afresh -- the session moved
-    /// back meanwhile included: the rebuild left that draw out all the
-    /// same. A draw recorded since for something else is kept.
+    /// next open or pass draws what is played now. That is as
+    /// [`Self::end_play_session`] lets the next open of a deleted file draw
+    /// afresh. It holds even if the session moved back meanwhile, since the
+    /// rebuild left that draw out all the same. A draw recorded since for
+    /// something else is kept.
     pub async fn forget_draw_made_for(&self, key: &B::Key, made_for: &DrawnFor<B::Key>) {
         let Some(entity) = self.lookup(key) else {
             return;
@@ -2282,15 +2302,15 @@ impl<B: Backing> Retention<B> {
         }
     }
 
-    /// **`pieces` leave every draw made for `made_for`**: one volume of a
-    /// played set is being deleted, and the set's union, recorded on every
+    /// **`pieces` leave every draw made for `made_for`.** One volume of a
+    /// played set is being deleted. The set's union, recorded on every
     /// volume that has drawn or adopted it, shares that volume's pieces no
-    /// more -- as [`Self::end_play_session`] ends what a deleted film
+    /// more, as [`Self::end_play_session`] ends what a deleted film
     /// shared. Each volume's record is narrowed under its own turn (one at
-    /// a time, rule 4) and S, so the driver's next reading of what is
-    /// shared ([`Self::draws_for`]) leaves them out and its `EndShares`
+    /// a time, rule 4) and S. So the driver's next reading of what is
+    /// shared ([`Self::draws_for`]) leaves them out, and its `EndShares`
     /// takes them out of the announcement. A volume adopting the union
-    /// meanwhile copies it from a sibling not narrowed yet; the sweep runs
+    /// meanwhile copies it from a sibling not narrowed yet. The sweep runs
     /// again until no record made for the set holds any of `pieces`.
     pub async fn withdraw_from_draws_made_for(
         &self,
@@ -2335,8 +2355,8 @@ impl<B: Backing> Retention<B> {
         }
     }
 
-    /// Decide `key`'s draw now if it is due, as an open would: what a test
-    /// that states the film's length after the open asks, rather than
+    /// Decide `key`'s draw now if it is due, as an open would. A test that
+    /// states the film's length after the open asks this, rather than
     /// opening the file a second time or running a pass.
     #[cfg(test)]
     pub(crate) async fn settle_draw(&self, key: &B::Key) {
@@ -2350,11 +2370,11 @@ impl<B: Backing> Retention<B> {
         self.decide_draw_if_due(&entity, &mut claim, None).await;
     }
 
-    /// **`key`'s play session ends with its file**: the file is being
+    /// **`key`'s play session ends with its file.** The file is being
     /// deleted, and what its session drew is shared no more. The entity
-    /// goes slack under its turn -- no policy, no draw, no player's open --
-    /// so the next open of the file is a new session that draws afresh.
-    /// For a caller that has made sure no read of the file is open.
+    /// goes slack under its turn (no policy, no draw, no player's open), so
+    /// the next open of the file is a new session that draws afresh. It is
+    /// for a caller that has made sure no read of the file is open.
     pub async fn end_play_session(&self, key: &B::Key) {
         let Some(entity) = self.lookup(key) else {
             return;
@@ -2373,15 +2393,14 @@ impl<B: Backing> Retention<B> {
     }
 
     /// The key of the entity whose standing policy has drawn `piece` and
-    /// not committed it yet, or `None` -- which is every piece of every
-    /// file nothing is bounding, and all but a fraction of a percent of
-    /// what a bounded one completes.
+    /// not committed it yet, or `None`. `None` is every piece of every file
+    /// nothing is bounding, and all but a fraction of a percent of what a
+    /// bounded one completes.
     ///
     /// **Asked before the turn**, so that the completions nothing can be
     /// done about do not queue behind a retention pass to find that out. It
-    /// is a reading and not a decision: the turn is taken after it and the
-    /// policy is asked again under it
-    /// ([`RetentionPolicy::commit_drawn`]).
+    /// is a reading and not a decision. The turn is taken after it, and the
+    /// policy is asked again under it ([`RetentionPolicy::commit_drawn`]).
     ///
     /// L1 and one L2 read per entity, no I/O: the shape [`Self::holdings`]
     /// has, without copying a committed set out per piece. A torrent has
@@ -2405,23 +2424,23 @@ impl<B: Backing> Retention<B> {
     /// One pass over `key`, with its turn in hand and the [`Mode`] its
     /// driver decided.
     ///
-    /// [`Mode::Slack`] is the short one: the entity is not being played and
-    /// nothing is reading it, so -- once nothing of it is announced in the
-    /// swarm -- every byte of it is taken off the disk. It keeps
-    /// nothing, so it measures nothing -- no window, no commit, no want-set
-    /// -- and it leaves nothing installed. [`Mode::Live`] is the pass the
-    /// rest of this file describes.
+    /// [`Mode::Slack`] is the short one. The entity is not being played and
+    /// nothing is reading it. So once nothing of it is announced in the
+    /// swarm, every byte of it is taken off the disk. It keeps nothing, so
+    /// it measures nothing (no window, no commit, no want-set), and it
+    /// leaves nothing installed. [`Mode::Live`] is the pass the rest of this
+    /// file describes.
     pub async fn pass(&self, key: &B::Key, store: &B::Store, claim: Claim, mode: Mode) -> Outcome {
         self.pass_at(key, store, claim, mode, std::time::Instant::now())
             .await
     }
 
-    /// [`Self::pass`] with the clock handed in: `now` is what the pass
-    /// measures against on the far side of its listing ([`Asking::now`]),
-    /// so a harness that stamps its reads from its own clock can run the
-    /// pass on that clock too. A pass that read the wall clock beside reads
-    /// stamped `t0 + elapsed` saw no time pass at all: no stream ever
-    /// idled, no report was ever due.
+    /// [`Self::pass`] with the clock handed in. The pass measures against
+    /// `now` on the far side of its listing ([`Asking::now`]). So a harness
+    /// that stamps its reads from its own clock can run the pass on that
+    /// clock too. A pass that read the wall clock beside reads stamped
+    /// `t0 + elapsed` saw no time pass at all: no stream ever idled, and no
+    /// report was ever due.
     pub async fn pass_at(
         &self,
         key: &B::Key,
@@ -2440,43 +2459,42 @@ impl<B: Backing> Retention<B> {
     /// holds goes.
     ///
     /// **Never while the backend is in the swarm and advertises a piece of
-    /// it** ([`Backing::announced_in_swarm`]). Such a piece is one a peer may
-    /// have been told we have, there is no un-Have, and an announcement ends
-    /// only with the torrent leaving the swarm -- which is the driver's to
-    /// do first (the torrent's `EndShares`). So the pass takes nothing then,
-    /// and runs once the backend is out of the swarm, or for an entity that
-    /// shares nothing.
+    /// it** ([`Backing::announced_in_swarm`]). A peer may have been told we
+    /// have such a piece, and there is no un-Have. An announcement ends only
+    /// with the torrent leaving the swarm, which the driver has to do first
+    /// (the torrent's `EndShares`). So the pass takes nothing then. It runs
+    /// once the backend is out of the swarm, or for an entity that shares
+    /// nothing.
     ///
     /// Then the policy, the windows, the decision and the draw are dropped
-    /// under L2 -- an entity nobody is playing has no window, and leaving
-    /// one standing is what let the cleaner's gate call a left file's
-    /// pieces protected. Then every held run this file alone owns goes
-    /// through the same [`Backing::reclaim`] the live pass uses, asking a
-    /// [`Door`] that answers "take everything" -- except under a pin, and
-    /// except once the entity has become live again, either of which stops
-    /// the run where it stands.
+    /// under L2. An entity nobody is playing has no window. Leaving one
+    /// standing is what let the cleaner's gate call a left file's pieces
+    /// protected. Then every held run this file alone owns goes through the
+    /// same [`Backing::reclaim`] the live pass uses. It asks a [`Door`] that
+    /// answers "take everything", except under a pin and except once the
+    /// entity has become live again. Either of those stops the run where it
+    /// stands.
     ///
     /// An entity left holding nothing, with no read open on it, is
-    /// forgotten ([`Self::forget_empty`]). Pieces a delete refused -- a
-    /// hash check running -- stay held, the entity stays, and the next tick
-    /// offers them again.
+    /// forgotten ([`Self::forget_empty`]). Pieces a delete refused (a hash
+    /// check running) stay held, the entity stays, and the next tick offers
+    /// them again.
     ///
     /// **Slack is re-established under the turn before anything is
     /// destroyed, and the whole of the pass hangs on that.** The driver
     /// decided this mode from a reading of the liveness cell taken before
-    /// its first entity, and between that reading and this turn a viewer
-    /// can have started exactly this file: the cell moved, `install` put a
+    /// its first entity. Between that reading and this turn, a viewer can
+    /// have started exactly this file: the cell moved, `install` put a
     /// policy in, a reader opened on it. Carried through, the mode would
     /// have the pass hold the window they are inside back from the swarm,
-    /// throw the policy away and unlink the bytes they are reading -- and
-    /// the door below, which does ask again, gates only the unlinks and by
+    /// throw the policy away and unlink the bytes they are reading. The
+    /// door below does ask again, but it gates only the unlinks, and by
     /// then the policy is already gone. So the three facts the driver read
     /// are read again here, under the turn that every open must take:
     /// [`Backing::is_live`], the open reads, and [`State::opens`] against
     /// the count the mode carries. `opens` is the one that closes the gap
-    /// rather than narrowing it -- the other two are instants, and an
-    /// install that has completed but whose reader is not open yet is
-    /// neither.
+    /// rather than narrowing it. The other two are instants, and an install
+    /// that has completed but whose reader is not open yet is neither.
     async fn slack_pass(
         &self,
         key: &B::Key,
@@ -2492,19 +2510,19 @@ impl<B: Backing> Retention<B> {
             };
         };
         let about = claim.about;
-        // A pin is a retention property and outranks the slack: the user
-        // asked for those bytes. Nothing is taken -- and what stopped being
-        // wanted is wanted again, exactly as the live pass does under a pin.
-        // This exit is not the rare one: the driver reads a pinned file
-        // nobody is playing as slack, so it is the exit every tick takes
+        // A pin is a retention property and outranks the slack, since the
+        // user asked for those bytes. Nothing is taken, and what stopped
+        // being wanted is wanted again, exactly as the live pass does under
+        // a pin. This exit is not the rare one. The driver reads a pinned
+        // file nobody is playing as slack, so every tick takes this exit
         // over a pinned download that is not being watched. "The pin's own
-        // install clears the policy" was the assumption here, and the
-        // install runs only when the file is opened; a pin on a file a slack
-        // pass had already dropped pieces of left the pieces unwanted, with
-        // nothing due to run over it but this.
+        // install clears the policy" was the assumption here, but the
+        // install runs only when the file is opened. A pin on a file a
+        // slack pass had already dropped pieces of left the pieces
+        // unwanted, with nothing due to run over it but this.
         //
-        // Asked before L2, like every copy-out of a lock outside the owner
-        // (rule 1), and so is the liveness cell beside it.
+        // It is asked before L2, like every copy-out of a lock outside the
+        // owner (rule 1), and so is the liveness cell beside it.
         if self.backing.keeps_everything(key) {
             self.release_to_pin(&entity, &mut claim).await;
             return Self::slack_nothing(claim);
@@ -2539,15 +2557,16 @@ impl<B: Backing> Retention<B> {
         let candidates: Vec<u32> = held.iter().copied().collect();
         let alone = self.backing.alone(&domain, &candidates).await;
         // What a peer may have been told stays until the swarm has been
-        // left: asked of exactly the pieces this pass would take, with the
-        // turn held. That holds this entity's own draw back -- advertised
-        // only under its install, which takes this turn -- but not a set's:
-        // the union is advertised by whichever volume drew it, under that
-        // volume's turn, so pieces of this entity can become advertised
-        // behind this answer. What keeps those is the door's reading of the
-        // recorded draws at every unlink ([`Door::drawn`]): a draw is
-        // recorded before it is advertised. A boundary piece a pinned
-        // neighbour shares is not among them and does not hold the rest up.
+        // left. This is asked of exactly the pieces this pass would take,
+        // with the turn held. That holds this entity's own draw back, since
+        // it is advertised only under its install, which takes this turn.
+        // It does not hold a set's draw back. The union is advertised by
+        // whichever volume drew it, under that volume's turn, so pieces of
+        // this entity can become advertised behind this answer. The door's
+        // reading of the recorded draws at every unlink keeps those
+        // ([`Door::drawn`]), because a draw is recorded before it is
+        // advertised. A boundary piece a pinned neighbour shares is not
+        // among them and does not hold the rest up.
         if B::SHARE == Share::Half && self.backing.announced_in_swarm(&alone).await {
             tracing::debug!(
                 key = ?key,
@@ -2563,8 +2582,8 @@ impl<B: Backing> Retention<B> {
             key: key.clone(),
             entities: self.entities.clone(),
             mode: Mode::Slack { opens },
-            // A slack entity keeps nothing it is not still handing out, and
-            // what it is still handing out is a promise, which this door
+            // A slack entity keeps nothing it is not still handing out.
+            // What it is still handing out is a promise, which this door
             // asks the readers for at the unlink itself.
             exempt: std::sync::Arc::new(crate::retention::exempt::Exempt::for_pieces(0)),
         };
@@ -2577,12 +2596,12 @@ impl<B: Backing> Retention<B> {
         let empty = {
             let state = entity.state.lock();
             // Against what this pass could take, not against everything
-            // held: a boundary piece another file shares is never among
-            // `alone`, so a file that has one was never "empty" by the
-            // held count, and its entity outlived every slack pass.
+            // held. A boundary piece another file shares is never among
+            // `alone`. So a file that has one was never "empty" by the held
+            // count, and its entity outlived every slack pass.
             let empty = reclaimed >= alone.len() && state.readers.is_empty();
             // Nothing is installed after `go_slack`, so no exit of a slack
-            // pass ever owes another one; the claim goes here like any
+            // pass ever owes another one. The claim goes here like any
             // other pass's (rule 3).
             let again = Self::release(&state, claim, about, None);
             debug_assert!(again.is_none(), "a slack pass armed another");
@@ -2606,22 +2625,22 @@ impl<B: Backing> Retention<B> {
     }
 
     /// One pass over `key`, with its turn in hand. See the module docs for
-    /// the steps. A pass that concluded nothing -- a pin, nothing installed,
-    /// no head in this domain before or after the listing, a listing we do
-    /// not have, or a decide that ran under us -- answers with no
-    /// [`Conclusion`], and every one of them leaves the policy exactly where
-    /// it was; a pass that ran and found nothing to do answers with zeroed
+    /// the steps. A pass that concluded nothing answers with no
+    /// [`Conclusion`]: a pin, nothing installed, no head in this domain
+    /// before or after the listing, a listing we do not have, or a decide
+    /// that ran under us. Every one of those leaves the policy exactly where
+    /// it was. A pass that ran and found nothing to do answers with zeroed
     /// counts.
     ///
     /// **Every exit decides `again`**, under L2, with the claim dropped or
     /// handed on inside the same block (rule 3). A byte delivered while the
-    /// pass held the turn started nothing; if it was the last of its body,
-    /// this decision is the only thing that remembers it wanted a pass, and
-    /// that is as true of a pass that refused at its re-read as of one that
-    /// concluded. The rule is one: a pass that measured something owes
-    /// another if the head moved a stride from what it measured, and a pass
-    /// that measured nothing because the policy was replaced under it owes
-    /// one outright, because the byte that replaced it was due and could not
+    /// pass held the turn started nothing. If it was the last of its body,
+    /// this decision is the only thing that remembers it wanted a pass.
+    /// That is as true of a pass that refused at its re-read as of one that
+    /// concluded. There is one rule. A pass that measured something owes
+    /// another if the head moved a stride from what it measured. A pass that
+    /// measured nothing because the policy was replaced under it owes one
+    /// outright, because the byte that replaced it was due and could not
     /// start one.
     async fn live_pass(
         &self,
@@ -2631,8 +2650,8 @@ impl<B: Backing> Retention<B> {
         now: std::time::Instant,
     ) -> Outcome {
         let Some(entity) = self.lookup(key) else {
-            // No entity: no L2 to decide under, and no note that could race
-            // the release, because a note is made on an entity.
+            // No entity means no L2 to decide under, and no note that could
+            // race the release, because a note is made on an entity.
             drop(claim);
             return Outcome {
                 concluded: None,
@@ -2641,27 +2660,27 @@ impl<B: Backing> Retention<B> {
         };
         let about = claim.about;
         // 1. A pin taken while the entity was already playing leaves the
-        // policy installed: `install` is the only other place that asks,
-        // and it ran before the pin existed. Without this a pinned file is
-        // reclaimed under its own reader -- measured, half a 32 MiB file
-        // deleted with the pin set throughout -- while librqbit re-fetches
-        // it in a loop.
+        // policy installed. `install` is the only other place that asks,
+        // and it ran before the pin existed. Without this, a pinned file is
+        // reclaimed under its own reader while librqbit re-fetches it in a
+        // loop. That was measured: half a 32 MiB file deleted with the pin
+        // set throughout.
         if self.backing.keeps_everything(key) {
             self.release_to_pin(&entity, &mut claim).await;
             let state = entity.state.lock();
             return Self::nothing(&state, claim, about, None);
         }
         // 1a. The play session's draw, if it waited for the film's rate and
-        // the rate has come -- or the wait has run out. Before the listing,
-        // so this pass already commits and keeps it.
+        // the rate has come, or the wait has run out. This is before the
+        // listing, so this pass already commits and keeps it.
         self.decide_draw_if_due(&entity, &mut claim, Some(now))
             .await;
-        // 1b. And whether it is still waiting on the file's first bytes: a
-        // play session on the file, asked off L2 (rule 2). See the head
-        // held below.
+        // 1b. And whether it is still waiting on the file's first bytes,
+        // with a play session on the file, asked off L2 (rule 2). See the
+        // head held below.
         let session_plays = B::SHARE != Share::Nothing && self.backing.plays(key);
-        // 2. Only which domain and which budget, and the head as a filter:
-        // an entity whose reader has moved on must not pay a listing per
+        // 2. Only which domain and which budget, and the head as a filter.
+        // An entity whose reader has moved on must not pay a listing per
         // tick to discover it has nothing to say.
         let begin = {
             let state = entity.state.lock();
@@ -2674,18 +2693,18 @@ impl<B: Backing> Retention<B> {
         self.run_hook();
         // 4. What the disk holds, from the backing: a memory read for the
         // torrent, a listing off the reactor for the proxy. Where it
-        // suspends, it is the long suspension of the pass, and the reason
-        // the deciding reading below is taken on the far side of it.
+        // suspends, it is the long suspension of the pass. That is why the
+        // deciding reading below is taken on the far side of it.
         let Some(held) = self.backing.held(store, &begin.domain).await else {
             tracing::warn!(
                 key = ?key,
                 "the retention pass has no reading of the disk; this pass concludes nothing"
             );
-            // Nothing measured, so nothing to write -- but a byte that moved
-            // the head a stride while the listing failed is owed its pass,
-            // and asking that of the head this pass started from is what
-            // keeps a disk that will not list from being asked once per
-            // byte rather than once per stride.
+            // Nothing measured, so nothing to write. But a byte that moved
+            // the head a stride while the listing failed is owed its pass.
+            // Asking that of the head this pass started from keeps a disk
+            // that will not list from being asked once per byte rather than
+            // once per stride.
             let state = entity.state.lock();
             return Self::nothing(&state, claim, about, Some(begin.at));
         };
@@ -2696,15 +2715,15 @@ impl<B: Backing> Retention<B> {
         // unlink may touch, and what to give back if something must go.
         //
         // Every number handed over is a published one. The file's own
-        // arithmetic -- size over duration -- is the ceiling every stream
-        // on it is fetched at, and the only honest absolute number there
-        // is: a starving player's reads measure our delivery and not its
-        // consumption (`retention::streams::Stream::sample`). The seconds
-        // are the viewer's buffer profile, which is the viewer's decision
-        // and not the disk's. The cap is over the whole cache and the
-        // headroom is what the volume will still give; what turns those two
-        // into this entity's allowance is what this entity holds -- the
-        // listing above -- and that is the backing's to price.
+        // arithmetic (size over duration) is the ceiling every stream on it
+        // is fetched at. It is the only honest absolute number there is,
+        // because a starving player's reads measure our delivery and not
+        // its consumption (`retention::streams::Stream::sample`). The
+        // seconds are the viewer's buffer profile, which is the viewer's
+        // decision and not the disk's. The cap is over the whole cache, and
+        // the headroom is what the volume will still give. What turns those
+        // two into this entity's allowance is what this entity holds (the
+        // listing above), and that is the backing's to price.
         let (held_by_readers, readers_margin);
         let asking = {
             let state = entity.state.lock();
@@ -2745,21 +2764,21 @@ impl<B: Backing> Retention<B> {
                 })
                 .collect();
             holding.extend(lookaheads.iter().cloned());
-            // What the readers hold, before the askers' reach joins it:
-            // what an asker's room is measured against.
+            // What the readers hold, before the askers' reach joins it. An
+            // asker's room is measured against this.
             held_by_readers = holding.clone();
             // **An asker's reach is a lookahead for these two purposes and
-            // no other**: the backend refuses to forget a piece a stream is
-            // asking for, so offering one to the reclaim frees nothing; and
+            // no other.** The backend refuses to forget a piece a stream is
+            // asking for, so offering one to the reclaim frees nothing. And
             // what of it has not arrived is about to, so the margin has to
-            // leave it room. It is in no want-set and no promise, and the
-            // moment the asker moves on it is in neither of these.
+            // leave it room. It is in no want-set and no promise. The moment
+            // the asker moves on, it is in neither of these.
             holding.extend(asking.iter().cloned());
             drop(state);
             // What the open streams will still fetch: their lookaheads, in
             // this entity's extent, less what the listing already found.
-            // Only that is still to arrive -- a lookahead piece on the disk
-            // is in `held` and priced there -- and counting the whole
+            // Only that is still to arrive, since a lookahead piece on the
+            // disk is in `held` and priced there. Counting the whole
             // lookahead counted every fetched piece of it twice. Under
             // `Maximum` a first open's lookahead is the whole cap, so it
             // was an allowance of nothing for the life of the stream.
@@ -2773,8 +2792,8 @@ impl<B: Backing> Retention<B> {
             let to_readers = still_to_come(&lookaheads);
             let unfetched = to_readers.union(&still_to_come(&asking)).count() as u64;
             let piece_length = B::piece_length(&domain).unwrap_or(0);
-            // The margin the readers' own fill needs, without the askers':
-            // what their room is measured under.
+            // The margin the readers' own fill needs, without the askers'.
+            // Their room is measured under this.
             readers_margin = (to_readers.len() as u64)
                 .max(u64::from(stride))
                 .saturating_mul(piece_length);
@@ -2782,8 +2801,8 @@ impl<B: Backing> Retention<B> {
                 budget: begin.budget,
                 headroom: self.budget.headroom(),
                 ceiling: buffering.bytes_per_second,
-                // No reader has stated a profile: the whole file, bounded
-                // by the allowance, as under `Maximum`.
+                // No reader has stated a profile, so the whole file,
+                // bounded by the allowance, as under `Maximum`.
                 seconds: buffering
                     .window_seconds
                     .unwrap_or(crate::backend::priorities::MAXIMUM_WINDOW_SECONDS),
@@ -2792,13 +2811,13 @@ impl<B: Backing> Retention<B> {
                 committed,
                 // **What arrives between this pass and the next one.**
                 //
-                // Two readings of the same thing and the larger wins. What
-                // the open readers' streams are still pulling -- their
-                // lookaheads less what is already held, above -- is exact
-                // when there is a reader: one that has neither promised nor
+                // Two readings of the same thing, and the larger wins. What
+                // the open readers' streams are still pulling (their
+                // lookaheads less what is already held, above) is exact when
+                // there is a reader. One that has neither promised nor
                 // delivered is not in the entity's map, and a torrent fills
                 // for a file nobody has read a byte of yet. The stride is
-                // what is left then: it is defined as how far the head may
+                // what is left then. It is defined as how far the head may
                 // move before another pass, which is the same interval
                 // measured in pieces.
                 //
@@ -2810,13 +2829,13 @@ impl<B: Backing> Retention<B> {
                     .saturating_mul(piece_length),
             }
         };
-        // What an asker's room is measured from, kept beside the asking
-        // the backing is about to take.
+        // What an asker's room is measured from, kept beside the asking the
+        // backing is about to take.
         let measure = asking.clone();
         let consumers = self.backing.reading(&begin.domain, &held, asking);
-        // **How much an asker may ask for in all** ([`Room`]): what the
-        // entity may hold, less every piece its readers hold that no
-        // reclaim can give back -- what they are fetched for, what they
+        // **How much an asker may ask for in all** ([`Room`]). It is what
+        // the entity may hold, less every piece its readers hold that no
+        // reclaim can give back: what they are fetched for, what they
         // promised, what their streams reach, and the committed set.
         let room = {
             let extent = B::extent(&begin.domain);
@@ -2832,25 +2851,27 @@ impl<B: Backing> Retention<B> {
             (measure.within(piece, held.len(), readers_margin) / piece).saturating_sub(kept)
         };
         // 5. **The deciding reading, taken after the listing.** Read before
-        // the walk the head is the older half of the pair: the window is
-        // drawn round where playback *was*, everything the fill wrote ahead
-        // of it is outside that window, on the disk, and reclaimed --
-        // measured on the proxy before it was reordered, a 16 MB read left
+        // the walk, the head is the older half of the pair. The window is
+        // drawn round where playback *was*. Everything the fill wrote ahead
+        // of it is outside that window, on the disk, and reclaimed. That was
+        // measured on the proxy before it was reordered: a 16 MB read left
         // an empty directory under an 8 MB budget after two passes. Read
-        // after it, the decision may name pieces the listing did not find,
-        // which unlinks nothing, because the listing is the candidate set.
+        // after it, the decision may name pieces the listing did not find.
+        // That unlinks nothing, because the listing is the candidate set.
         //
-        // And the refusal: a policy decided under us -- `install_now` from a
-        // delivered byte, which is legal under L2 alone -- is a different
+        // And the refusal. A policy decided under us (`install_now` from a
+        // delivered byte, which is legal under L2 alone) is a different
         // shape, and this listing was measured for the old one. It concludes
-        // nothing rather than advance the new policy over a reading it never
-        // asked for, or the old one that no longer exists. The byte that
-        // decided it is owed the pass it could not start: `nothing` with no
-        // measurement hands the claim on while something is installed.
+        // nothing, rather than advance the new policy over a reading it
+        // never asked for, or the old one that no longer exists. The byte
+        // that decided it is owed the pass it could not start. `nothing`
+        // with no measurement hands the claim on while something is
+        // installed.
+        //
         // Asked once per pass: whether the trace target is on at all
-        // (`crate::retention::trace`). A disabled target is refused by
-        // `tracing` at each call site anyway; this is what keeps the work
-        // that only feeds those lines from being done for nothing.
+        // (`crate::retention::trace`). `tracing` refuses a disabled target
+        // at each call site anyway. This keeps the work that only feeds
+        // those lines from being done for nothing.
         let tracing_on =
             tracing::enabled!(target: "enginefs::retention::trace", tracing::Level::INFO);
         let (decision, want_windows, door_policy, at, consumed_at, traced) = {
@@ -2860,10 +2881,10 @@ impl<B: Backing> Retention<B> {
             }
             // **The cadence's head, which is the readers'.** A pass is
             // owed another one when a byte moved this head a stride while
-            // the pass held the turn, and that chain terminates only
-            // because nothing a pass does moves it; measured from one
-            // source and compared against another it would never
-            // terminate, and the proxy's cache never settled.
+            // the pass held the turn. That chain terminates only because
+            // nothing a pass does moves it. Measured from one source and
+            // compared against another, it would never terminate, and the
+            // proxy's cache never settled.
             let Some(at) = state
                 .head(about)
                 .and_then(|head| B::index_of(&state.domain, head))
@@ -2873,10 +2894,10 @@ impl<B: Backing> Retention<B> {
             // **Where the entity is being consumed, which is the
             // detector's.** Which of several readers of one file is the
             // viewer is a question about behaviour, and the readers cannot
-            // answer it: mpv keeps an index crawler open beside the viewer
-            // for the life of a film. What this is for is saying where the
-            // entity is -- the trace's head, and the split of what is held
-            // behind it and ahead -- and not what a pass keeps. See
+            // answer it. mpv keeps an index crawler open beside the viewer
+            // for the life of a film. This is for saying where the entity is
+            // (the trace's head, and the split of what is held behind it
+            // and ahead), and not for what a pass keeps. See
             // [`Consumers::at`].
             let consumed_at = consumers.at.unwrap_or(at);
             let promised: Vec<Range<u32>> = state
@@ -2887,10 +2908,10 @@ impl<B: Backing> Retention<B> {
                 .collect();
             // For [`crate::retention::trace`]: the heads and the lookaheads
             // of the reads that are open, and what the read that owns the
-            // head this pass measures from is for. Gathered only while the
-            // trace is on: a pass runs every two seconds per file, and the
-            // `diagnosticsTrace` setting is off on every device that is not
-            // being diagnosed.
+            // head this pass measures from is for. They are gathered only
+            // while the trace is on. A pass runs every two seconds per file,
+            // and the `diagnosticsTrace` setting is off on every device that
+            // is not being diagnosed.
             let traced = tracing_on.then(|| {
                 let readers: Vec<(u32, u64)> = state
                     .readers
@@ -2911,18 +2932,17 @@ impl<B: Backing> Retention<B> {
             };
             // **One list per entity, not one window per playhead.** What is
             // kept and fetched is the run of the file each detected
-            // consumer is moving through; the policy sizes that rather than
+            // consumer is moving through. The policy sizes that rather than
             // placing it. A pass is one decision about what to give back
             // for the whole entity.
             //
             // **What to keep and what to fetch are one list, and it is the
             // detector's.** A window is a promise not to delete and an
-            // order to the swarm to fill it, and both are about the same
-            // thing: the run of disk a consumer is moving through. A probe
-            // -- a read of the container index -- is a consumer like any
-            // other, with its own short run and its own share of the
-            // seconds, not a separate classification owed a promise but no
-            // fetch.
+            // order to the swarm to fill it. Both are about the same thing:
+            // the run of disk a consumer is moving through. A probe (a read
+            // of the container index) is a consumer like any other, with
+            // its own short run and its own share of the seconds. It is not
+            // a separate classification owed a promise but no fetch.
             //
             // The promise is kept at the door through the published set
             // rather than through this list ([`crate::retention::exempt`]),
@@ -2931,25 +2951,24 @@ impl<B: Backing> Retention<B> {
             // **While the stream is still assembling itself, want what is
             // parked on rather than the window.**
             //
-            // What a player needs before it can show a frame is a handful
-            // of pieces -- the header, the container's index, the seek
-            // target -- and they have to be *in* the want-set or nothing
-            // orders them. What they must not be is drowned: a window is
-            // hundreds of pieces, and a swarm spread over hundreds takes
-            // its time over the three.
+            // A player needs a handful of pieces before it can show a
+            // frame: the header, the container's index, the seek target.
+            // They have to be *in* the want-set or nothing orders them. They
+            // must not be drowned. A window is hundreds of pieces, and a
+            // swarm spread over hundreds takes its time over the three.
             //
             // The answer is not to want only those three, which was tried
             // and was worse. librqbit reserves a piece to exactly one peer
-            // (`PieceTracker::inflight`), and a second peer holding it can
-            // only take over by stealing, which wants a 3x or 10x speed
+            // (`PieceTracker::inflight`). A second peer holding it can only
+            // take over by stealing, which wants a 3x or 10x speed
             // advantage it cannot demonstrate with nothing else to
             // download. A want-set of one piece is therefore a download
             // from one peer: 117 kB/s in the field, against 3.1 MB/s over
             // the same swarm a minute later.
             //
             // So: everything still missing, each with a short run after it.
-            // The full window returns the moment nothing is outstanding,
-            // which needs no decision about when start-up ended -- a
+            // The full window returns the moment nothing is outstanding.
+            // That needs no decision about when start-up ended, since a
             // promise is cleared by the byte that unparks the read that
             // made it.
             let outstanding: Vec<Range<u32>> = promised
@@ -2964,12 +2983,13 @@ impl<B: Backing> Retention<B> {
             };
             // **The file's first bytes, while the draw waits on them.** A
             // resumed film is read at its head only for the container's
-            // header, and then at the resume point: trimmed as outside the
-            // window, a head piece still in flight would never arrive, what
+            // header, and then at the resume point. Trimmed as outside the
+            // window, a head piece still in flight would never arrive. What
             // the file is would never be known, and the play session would
-            // share nothing for good. So until it is known the head stays
-            // wanted and out of every unlink -- a piece or two, fetched for
-            // this server alone: nothing is shared before the draw is made.
+            // share nothing for good. So until it is known, the head stays
+            // wanted and out of every unlink. That is a piece or two,
+            // fetched for this server alone, since nothing is shared before
+            // the draw is made.
             let head = (session_plays
                 && state.player_opened
                 && state.draw.is_none()
@@ -2979,32 +2999,31 @@ impl<B: Backing> Retention<B> {
             if let Some(head) = head.clone() {
                 want.push(head);
             }
-            // **The published set is the backing's**, which is where the
-            // want set is decided and where what may not be unlinked has to
-            // be decided with it. What is kept here is the handle, so a
-            // read that parks between passes can write its promise into the
-            // same set under this same lock (`Reader::promises`).
+            // **The published set is the backing's.** The backing decides
+            // the want set, and what may not be unlinked has to be decided
+            // with it. What is kept here is the handle, so a read that
+            // parks between passes can write its promise into the same set
+            // under this same lock (`Reader::promises`).
             state.exempt = Some(consumers.exempt.clone());
             // Where the detector found the entity being consumed, for the
             // head every reading splits at ([`State::consumed_at`]).
             state.consumed_at = consumers.at;
             // And every promise live *now*, re-held under this lock. The
             // publication above was computed from the promises the pass
-            // read before it ran; one made in between wrote into the set
-            // and was then overwritten by it, and what that costs is a
-            // chunk deleted out of a body a player has already been
-            // promised the length of.
+            // read before it ran. One made in between wrote into the set
+            // and was then overwritten by it. That costs a chunk deleted out
+            // of a body a player has already been promised the length of.
             for reader in state.readers.values() {
                 if !reader.promised.is_empty() {
                     consumers.exempt.hold(reader.promised.clone());
                 }
             }
-            // And the play session's draw, held or not: advertised, so a
-            // piece of it that completes is announced at once, and so no
-            // unlink of this pass may take it -- the reclaim's or the
+            // And the play session's draw, held or not. It is advertised,
+            // so a piece of it that completes is announced at once. So no
+            // unlink of this pass may take it: neither the reclaim's nor the
             // want-set's late arrivals ([`Backing::want`]). The reclaim
-            // never offers a committed piece anyway; this is what covers a
-            // drawn piece that completed after the listing.
+            // never offers a committed piece anyway. This covers a drawn
+            // piece that completed after the listing.
             if let Some(draw) = state.draw.as_ref() {
                 for run in runs(&draw.iter().copied().collect::<Vec<_>>()) {
                     consumers.exempt.hold(run);
@@ -3015,13 +3034,13 @@ impl<B: Backing> Retention<B> {
             }
             (decision, want, policy, at, consumed_at, traced)
         };
-        // 6. Nothing to announce here: the draw was advertised when it was
+        // 6. Nothing to announce here. The draw was advertised when it was
         // made, and the backend announces each piece of it as it completes.
-        // Nothing to withdraw either -- a committed piece the disk lost is
+        // Nothing to withdraw either. A committed piece the disk lost is
         // one the backend no longer has, and it announces only what it has.
         let conclusion = Conclusion {
-            // What a pass concluded is what its consumers were asking for:
-            // the holdings panel and the proxy's "is anything live inside
+            // What a pass concluded is what its consumers were asking for.
+            // The holdings panel and the proxy's "is anything live inside
             // this chunk" read the same list.
             windows: consumers.want.clone(),
             committed: decision.committed.len(),
@@ -3034,8 +3053,8 @@ impl<B: Backing> Retention<B> {
         );
         // The door every unlink of this pass asks, the want-set's included.
         // This entity's own draw is advertised only under its turn, which
-        // the pass holds throughout, and it is held above; a set's draw
-        // advertised by a sibling volume under the sibling's turn is the
+        // the pass holds throughout, and it is held above. A set's draw
+        // advertised by a sibling volume, under the sibling's turn, is the
         // door's to refuse, from the record made before that advertise
         // ([`Door::drawn`]).
         let door = Door {
@@ -3046,10 +3065,10 @@ impl<B: Backing> Retention<B> {
             mode: Mode::Live,
             exempt: consumers.exempt.clone(),
         };
-        // And the want-set, trimmed to what this pass keeps: the windows
-        // wanted, everything of the entity outside them and not on the disk
-        // not wanted. What is on the disk and outside them is the reclaim's,
-        // below.
+        // And the want-set, trimmed to what this pass keeps. The windows
+        // are wanted. Everything of the entity outside them and not on the
+        // disk is not wanted. What is on the disk and outside them is the
+        // reclaim's, below.
         self.backing
             .want(store, &begin.domain, &want_windows, &held, &door)
             .await;
@@ -3062,9 +3081,9 @@ impl<B: Backing> Retention<B> {
             .backing
             .reclaim(store, &begin.domain, runs(&alone), door)
             .await;
-        // The pass's trace lines; see [`crate::retention::trace`] for what
-        // turns them on. Everything here is for them alone, so none of it is
-        // done while they are off.
+        // The pass's trace lines (see [`crate::retention::trace`] for what
+        // turns them on). Everything here is for them alone, so none of it
+        // is done while they are off.
         if let Some((readers, buffering)) = traced {
             let backing = self.backing.trace(store, &begin.domain);
             let name = trace::name(key, backing.as_ref());
@@ -3123,13 +3142,13 @@ impl<B: Backing> Retention<B> {
         // the same block (rule 3).
         let mut state = entity.state.lock();
         // A budget published while this pass ran has already rebuilt the
-        // policy for the shape it makes and made every reader due under it;
-        // this pass measured the old one, and its conclusion is not the
-        // current one. Neither the windows nor `passed_at` are written then:
-        // the windows would be a measurement against a cap nobody holds, and
+        // policy for the shape it makes, and made every reader due under
+        // it. This pass measured the old one, and its conclusion is not the
+        // current one. Neither the windows nor `passed_at` are written then.
+        // The windows would be a measurement against a cap nobody holds.
         // `passed_at` would keep a reader the new shape made due from being
         // due until it had travelled a whole *new* stride. The policy needs
-        // no guard of its own: it was never out.
+        // no guard of its own, since it was never out.
         let current = state.still(&begin);
         if current {
             if let Some(reader) = about.and_then(|about| state.readers.get_mut(&about)) {
@@ -3140,13 +3159,13 @@ impl<B: Backing> Retention<B> {
         }
         // Whether this pass swallowed the trigger for the next one. A
         // delivered byte while a pass is running starts none and does not
-        // remember that it wanted one -- right for every byte but the last
-        // of a body, which brings nothing after it. So the pass asks the
-        // same `head` it measured from: the distance is zero unless a byte
-        // really went out in between, and each arming is paid for by one
-        // such byte, so the chain terminates. A pass whose measurement was
-        // refused measured nothing this question can be asked of, and the
-        // byte that refused it is owed a pass outright.
+        // remember that it wanted one. That is right for every byte but the
+        // last of a body, which brings nothing after it. So the pass asks
+        // the same `head` it measured from. The distance is zero unless a
+        // byte really went out in between, and each arming is paid for by
+        // one such byte, so the chain terminates. A pass whose measurement
+        // was refused measured nothing this question can be asked of, and
+        // the byte that refused it is owed a pass outright.
         let again = Self::release(&state, claim, about, current.then_some(at));
         Outcome {
             concluded: Some(conclusion),
@@ -3154,19 +3173,19 @@ impl<B: Backing> Retention<B> {
         }
     }
 
-    /// The end of a pass that concluded nothing: `again` decided under the
-    /// L2 guard the caller holds, and the claim dropped or handed on before
-    /// that guard goes (rule 3). `measured` as for [`State::owes_a_pass`].
-    /// A slack pass that takes nothing lets its turn go and hands nothing
-    /// on. **Every exit before `go_slack`, not only the last**: they are
-    /// all the entity turning out to be pinned or live, or a listing that
-    /// failed, and the slack driver has nowhere to hand a claim to --
-    /// `drop_slack` reads nothing back. Under [`Trigger::OnMove`]
-    /// [`Self::release`] would answer "again" here whenever a policy stands
-    /// and a head is in the domain, so the claim was handed back and
-    /// dropped unread; a driver that looped on the answer would spin. A
-    /// byte due on an entity that has become live is the next live pass's,
-    /// armed by the byte after it.
+    /// The end of a pass that concluded nothing. `again` is decided under
+    /// the L2 guard the caller holds, and the claim is dropped or handed on
+    /// before that guard goes (rule 3). `measured` is as for
+    /// [`State::owes_a_pass`]. A slack pass that takes nothing lets its turn
+    /// go and hands nothing on. **Every exit before `go_slack`, not only the
+    /// last.** They are all the entity turning out to be pinned or live, or
+    /// a listing that failed. The slack driver has nowhere to hand a claim
+    /// to, since `drop_slack` reads nothing back. Under
+    /// [`Trigger::OnMove`], [`Self::release`] would answer "again" here
+    /// whenever a policy stands and a head is in the domain. So the claim
+    /// was handed back and dropped unread, and a driver that looped on the
+    /// answer would spin. A byte due on an entity that has become live is
+    /// the next live pass's, armed by the byte after it.
     fn slack_nothing(claim: Claim) -> Outcome {
         drop(claim);
         Outcome {
@@ -3188,8 +3207,8 @@ impl<B: Backing> Retention<B> {
     }
 
     /// Drop the claim or hand it on, under the L2 guard the caller holds.
-    /// The one place a pass lets go of its turn: a byte that lands after
-    /// this and before the guard goes finds the turn free, and one that
+    /// This is the one place a pass lets go of its turn. A byte that lands
+    /// after this and before the guard goes finds the turn free. One that
     /// landed before it was counted by `owes_a_pass`.
     fn release(
         state: &State<B>,
@@ -3206,7 +3225,7 @@ impl<B: Backing> Retention<B> {
     }
 
     /// Every entity's holding. L1 → L2, no I/O, and nothing is pruned
-    /// here: an entity goes when a [`Mode::Slack`] pass has taken the last
+    /// here. An entity goes when a [`Mode::Slack`] pass has taken the last
     /// of it off the disk ([`Self::forget_empty`]), which is a fact about
     /// the entity rather than an age.
     pub fn holdings(&self) -> Vec<(B::Key, Holding<B>)> {
@@ -3224,25 +3243,25 @@ impl<B: Backing> Retention<B> {
     }
 
     /// How far ahead of `at` the window this position is in reaches, with
-    /// the domain it is measured in, or `None` when nothing bounds the
+    /// the domain it is measured in. It is `None` when nothing bounds the
     /// entity, `at` is not in its domain, or no window of the last pass
-    /// reaches past it. One L2 reading and no I/O: what a reader about to
-    /// open is sized by, so the pieces it asks the backend to fetch ahead
-    /// are pieces the next pass will keep.
+    /// reaches past it. One L2 reading and no I/O. A reader about to open is
+    /// sized by this, so the pieces it asks the backend to fetch ahead are
+    /// pieces the next pass will keep.
     pub fn reach(&self, key: &B::Key, at: B::Position) -> Option<(B::Domain, Range<u32>)> {
         let entity = self.lookup(key)?;
         let state = entity.state.lock();
         state.installed.as_ref()?;
         let index = B::index_of(&state.domain, at)?;
         // **What the last pass said this entity is asking for**, at the
-        // window this position is in. Not a window drawn round the position
-        // from a budget: what is being fetched for is what the consumers
-        // are being fetched for, and a stream that read past it would have
-        // the next pass refuse to keep what it just pulled.
+        // window this position is in. It is not a window drawn round the
+        // position from a budget. What is being fetched for is what the
+        // consumers are being fetched for. A stream that read past it would
+        // have the next pass refuse to keep what it just pulled.
         //
         // The window *in front of* this position, which is where a consumer
-        // here is being fetched to: a want set is drawn from where a
-        // consumer has got to and reaches forward, so a reader is normally
+        // here is being fetched to. A want set is drawn from where a
+        // consumer has got to and reaches forward. So a reader is normally
         // just behind the window rather than inside it.
         let reach = state
             .windows
@@ -3256,17 +3275,17 @@ impl<B: Backing> Retention<B> {
     /// **The entity's own bitrate**: its size over the duration a player
     /// stated, or `None` where nobody has stated one.
     ///
-    /// It is what a second of this film costs, and it is the only absolute
-    /// number about playback that arithmetic can give -- exact at the first
-    /// report, nothing to converge, and no read pattern can distort it. A
-    /// stream's lookahead is this times the seconds the viewer asked to
-    /// have buffered, which makes what the swarm is asked for and what the
+    /// It is what a second of this film costs. It is the only absolute
+    /// number about playback that arithmetic can give: exact at the first
+    /// report, with nothing to converge, and no read pattern can distort
+    /// it. A stream's lookahead is this times the seconds the viewer asked
+    /// to have buffered. That makes what the swarm is asked for and what the
     /// disk is kept for one answer with one source
     /// ([`crate::retention::streams`] sizes the want set from the same
     /// number).
     ///
-    /// Asked of the entity rather than of a reader, because a reader
-    /// opening is the first thing that asks and it is not in the map yet.
+    /// It is asked of the entity rather than of a reader, because a reader
+    /// opening is the first thing that asks, and it is not in the map yet.
     pub fn bitrate(&self, key: &B::Key) -> Option<u64> {
         let entity = self.lookup(key)?;
         let buffering = entity.state.lock().buffering();
@@ -3277,9 +3296,9 @@ impl<B: Backing> Retention<B> {
     /// what the whole cache may hold.
     ///
     /// Reading further than the cache can keep is the one thing a lookahead
-    /// may not do. The pass cannot keep what is past the cap, the backend
-    /// refuses to forget a piece a live stream is reading ahead over, and
-    /// the two together leave the disk over its budget for the life of the
+    /// may not do. The pass cannot keep what is past the cap. The backend
+    /// refuses to forget a piece a live stream is reading ahead over. The
+    /// two together leave the disk over its budget for the life of the
     /// stream. `None` is a cache nothing bounds.
     pub fn cap(&self) -> Option<u64> {
         match self.budget.get() {
@@ -3289,7 +3308,7 @@ impl<B: Backing> Retention<B> {
     }
 
     /// How many open reads have promised pieces or delivered a byte and have
-    /// not ended: what says an entity is still being read when nothing is
+    /// not ended. This says an entity is still being read when nothing is
     /// playing it.
     pub fn readers(&self) -> usize {
         let entities: Vec<Arc<Entity<B>>> = self.entities.lock().values().cloned().collect();
@@ -3322,22 +3341,23 @@ impl<B: Backing> Retention<B> {
     /// promised or delivered and not ended, and how many streams have ever
     /// been opened on it. `(0, 0)` for a key with no entity.
     ///
-    /// One L2 acquisition, and it has to be one. The count travels with
-    /// [`Mode::Slack`] so the pass can tell whether a stream opened between
-    /// the driver's reading and the pass's turn, and it can only tell that
-    /// about the reading it was taken beside. Read as two acquisitions --
-    /// "no reader" first, the count second -- an install that lands between
-    /// them is inside the count: the pass compares, finds it equal, finds
-    /// no reader open yet, because an aside's install completes before its
-    /// reader opens and moves no liveness cell, and takes the bytes the
-    /// stream is about to read. The gap the count exists to close, reopened
-    /// one lock-release wide by the reading of it.
+    /// It is one L2 acquisition, and it has to be one. The count travels
+    /// with [`Mode::Slack`] so the pass can tell whether a stream opened
+    /// between the driver's reading and the pass's turn. It can only tell
+    /// that about the reading it was taken beside. Suppose it were read as
+    /// two acquisitions, "no reader" first and the count second. An install
+    /// that lands between them is inside the count. The pass compares and
+    /// finds it equal. It finds no reader open yet, because an aside's
+    /// install completes before its reader opens and moves no liveness
+    /// cell. It then takes the bytes the stream is about to read. That is
+    /// the gap the count exists to close, reopened one lock-release wide by
+    /// the reading of it.
     ///
     /// **It closes one direction only.** An install that *preceded* this
-    /// reading is already inside the count, so the comparison is equal and
-    /// nothing here says the stream it belongs to is still on its way --
-    /// exactly the state an opener is in between its install and its
-    /// reader. Nothing in this reading can close that; what closes it is
+    /// reading is already inside the count. So the comparison is equal, and
+    /// nothing here says the stream it belongs to is still on its way. That
+    /// is exactly the state an opener is in between its install and its
+    /// reader. Nothing in this reading can close that. What closes it is
     /// the opener taking its reader before it awaits anything, so the
     /// entity is held by something the pass cannot forget. See
     /// [`Self::reader_on`].
@@ -3352,13 +3372,13 @@ impl<B: Backing> Retention<B> {
 }
 
 impl<B: Backing> State<B> {
-    /// How many of this entity's open reads something has observed -- a
-    /// promise or a delivered byte. **Not the size of the reader map**,
-    /// which has held an entry per read since the open (for
-    /// [`ReaderState::opened_at`]) and so counts a read that has done
+    /// How many of this entity's open reads something has observed: a
+    /// promise or a delivered byte. **Not the size of the reader map.** The
+    /// map has held an entry per read since the open (for
+    /// [`ReaderState::opened_at`]), so it counts a read that has done
     /// neither. Every "is anything reading this" in the owner is this
-    /// question, and answering it with the map would have a slack pass
-    /// refuse an entity a handed-out-and-abandoned stream still holds.
+    /// question. Answering it with the map would have a slack pass refuse
+    /// an entity a handed-out-and-abandoned stream still holds.
     fn observed_readers(&self) -> usize {
         self.readers
             .values()
@@ -3369,31 +3389,31 @@ impl<B: Backing> State<B> {
     /// What the entity's open readers have already been promised: the
     /// largest stream lookahead any of them was granted.
     ///
-    /// The window is sized never to be smaller than this
-    /// ([`Buffering`]), and the max and not the newest because every open
-    /// reader fetches its own lookahead and the pass has to hold all of
-    /// them. A reader that has ended is out of the map and out of this: its
-    /// stream is not fetching anything.
+    /// The window is sized never to be smaller than this ([`Buffering`]).
+    /// It is the max and not the newest, because every open reader fetches
+    /// its own lookahead and the pass has to hold all of them. A reader that
+    /// has ended is out of the map and out of this, since its stream is not
+    /// fetching anything.
     fn buffering(&self) -> Buffering {
         let mut asked = Buffering {
             seed: self.seed,
             ..Buffering::default()
         };
         for reader in self.readers.values() {
-            // The most generous profile in force wins; the `Maximum`
+            // The most generous profile in force wins. The `Maximum`
             // profile is a number. See [`Buffering::widest`].
             asked = asked.widest(reader.buffering);
         }
         // **Computed, never measured.** Size over duration is the film's
-        // bitrate by arithmetic: exact at the first report, nothing to
+        // bitrate by arithmetic: exact at the first report, with nothing to
         // converge, and nothing a player's read pattern can distort. It is
         // the entity's and not any one reader's, because no reader outlives
-        // a reconnect. There is no fallback: a stream whose length nobody
+        // a reconnect. There is no fallback. A stream whose length nobody
         // has stated has no rate here, the two time caps do not apply, and
-        // the byte arithmetic stands on its own -- which is better than the
-        // measurement this replaced, whose three bytes a second and
-        // seventeen bytes a second both collapsed a window onto its floor
-        // and stopped playback.
+        // the byte arithmetic stands on its own. That is better than the
+        // measurement this replaced. Its three bytes a second and seventeen
+        // bytes a second both collapsed a window onto its floor and stopped
+        // playback.
         asked.bytes_per_second = self.rate_over(&self.domain);
         asked
     }
@@ -3409,47 +3429,47 @@ impl<B: Backing> State<B> {
     /// its body is open, and the entity's otherwise.
     ///
     /// **One function, because it is one question.** Where a pass measures
-    /// from and whether a pass is still owed are the same question asked at
-    /// two moments, and the second only terminates if it is a fixed point of
-    /// the first: two spellings of it, one reading the reader and one the
-    /// entity, differ by however far apart two players are, no pass moves
-    /// either of them, and so every pass arms the next one forever.
+    /// from, and whether a pass is still owed, are the same question asked
+    /// at two moments. The second only terminates if it is a fixed point of
+    /// the first. Two spellings of it, one reading the reader and one the
+    /// entity, differ by however far apart two players are. No pass moves
+    /// either of them, so every pass arms the next one forever.
     ///
-    /// The entity's own head, which is what a tick pass and every stats
-    /// reading ask for, is three questions in order and each one answers
-    /// only what it knows:
+    /// The entity's own head is what a tick pass and every stats reading
+    /// ask for. It is three questions in order, and each one answers only
+    /// what it knows:
     ///
     /// **The detector outranks all three, and this is the fallback under
     /// it.** Which of several readers of one file is the viewer is a
-    /// question about behaviour, and `Consumers::at` is what answers it
-    /// from the bytes each stream has eaten; [`Self::holding`] reports
-    /// that first ([`Self::consumed_at`]) and only falls here when the
-    /// detector is silent. The pass's own cadence -- where it measures
-    /// from, whether it is owed another -- is this order throughout, since
-    /// it has to be a fixed point of itself. What is below is the order
-    /// for an entity the detector is silent about.
+    /// question about behaviour. `Consumers::at` answers it from the bytes
+    /// each stream has eaten. [`Self::holding`] reports that first
+    /// ([`Self::consumed_at`]) and only falls here when the detector is
+    /// silent. The pass's own cadence (where it measures from, whether it is
+    /// owed another) is this order throughout, since it has to be a fixed
+    /// point of itself. What is below is the order for an entity the
+    /// detector is silent about.
     ///
-    /// 1. **A read that is playing it now**, at its head -- the last byte
-    ///    it delivered, or where it was opened if it is still parked on its
-    ///    first piece. The newest of them, because a seek is a second
-    ///    response on the file still playing and the one just opened is the
-    ///    one the player is using.
+    /// 1. **A read that is playing it now**, at its head: the last byte it
+    ///    delivered, or where it was opened if it is still parked on its
+    ///    first piece. It is the newest of them, because a seek is a second
+    ///    response on the file still playing, and the one just opened is
+    ///    the one the player is using.
     /// 2. **Where playback last got to**, [`Self::last_position`]. A paused
-    ///    film holds its body open or has closed it; either way nothing is
+    ///    film holds its body open or has closed it. Either way nothing is
     ///    delivering, and a pass still has to measure from somewhere.
     /// 3. **Any live read at all**, playing or not. A file being
     ///    downloaded, or probed, and never played has no playback position
-    ///    of either kind -- and an entity with no head at all is an entity
-    ///    no pass measures at all.
+    ///    of either kind. An entity with no head at all is an entity no pass
+    ///    measures at all.
     ///
     /// **What a player says about itself is not asked, and neither is what
     /// its range header looks like.** Converting where a player claims to
     /// be in the picture to a byte offset drifts on a variable-bitrate
-    /// encode; reading a range's offset and length to tell mpv's crawl over
-    /// the container index apart from a viewer's seek gets it wrong in both
-    /// directions -- a viewer seeking into the last minutes of a film looks
-    /// like an index read, and a crawler far enough out looks like a seek.
-    /// Both are answered instead by what the reads *do*
+    /// encode. Reading a range's offset and length, to tell mpv's crawl
+    /// over the container index apart from a viewer's seek, gets it wrong
+    /// in both directions. A viewer seeking into the last minutes of a film
+    /// looks like an index read, and a crawler far enough out looks like a
+    /// seek. Both are answered instead by what the reads *do*
     /// (`crate::retention::streams`).
     fn head(&self, about: Option<ReaderId>) -> Option<B::Position> {
         if let Some(head) = about
@@ -3486,7 +3506,7 @@ impl<B: Backing> State<B> {
 
     /// Whether the policy a pass began over is still the one installed: the
     /// same budget and the same domain. `false` is a decide that ran under
-    /// the pass, and the pass's measurement is of a shape that no longer
+    /// the pass. The pass's measurement is then of a shape that no longer
     /// exists.
     fn still(&self, begin: &Begin<B>) -> bool {
         self.installed
@@ -3495,21 +3515,23 @@ impl<B: Backing> State<B> {
             && self.domain == begin.domain
     }
 
-    /// Whether the head a pass was about owes another pass; asked under L2
-    /// at the end of every pass, and the only way one pass starts the next.
+    /// Whether the head a pass was about owes another pass. It is asked
+    /// under L2 at the end of every pass, and it is the only way one pass
+    /// starts the next.
     ///
     /// `measured` is the piece the pass measured from, and the head has to
-    /// have moved a stride from it since: nothing a pass does moves a
-    /// playhead, so the distance is zero unless a byte really went out
-    /// while the pass held the turn, each arming is paid for by one such
+    /// have moved a stride from it since. Nothing a pass does moves a
+    /// playhead. So the distance is zero unless a byte really went out
+    /// while the pass held the turn. Each arming is paid for by one such
     /// byte, and the chain terminates. `None` is a pass that measured
-    /// nothing because the policy was replaced under it: the byte that
+    /// nothing because the policy was replaced under it. The byte that
     /// replaced it was due (`install_now` makes every reader due), found the
-    /// turn taken and started nothing, and if it was the last of its body
-    /// nothing else remembers it -- so a pass is owed as long as something
-    /// is installed and the head is in the domain. That terminates too: the
-    /// successor measures under the new policy and is back on the stride
-    /// rule. Only under [`Trigger::OnMove`]; the tick has its own clock.
+    /// turn taken and started nothing. If it was the last of its body,
+    /// nothing else remembers it. So a pass is owed as long as something is
+    /// installed and the head is in the domain. That terminates too, since
+    /// the successor measures under the new policy and is back on the
+    /// stride rule. This applies only under [`Trigger::OnMove`]. The tick
+    /// has its own clock.
     fn owes_a_pass(&self, about: Option<ReaderId>, measured: Option<u32>) -> bool {
         if !matches!(B::TRIGGER, Trigger::OnMove { .. }) || self.installed.is_none() {
             return false;
@@ -3523,18 +3545,18 @@ impl<B: Backing> State<B> {
         measured.is_none_or(|at| to.abs_diff(at) >= self.stride)
     }
 
-    /// Decide the entity under `budget`, under L2 alone: **the one write to
-    /// the policy cell that does not require the turn** (rule 5). Sound only
-    /// because [`Share::Nothing`] held nothing back for the policy this
-    /// replaces, so there is no backend to tell; a pass in flight finds the
-    /// budget changed at its re-read and concludes nothing.
+    /// Decide the entity under `budget`, under L2 alone. This is **the one
+    /// write to the policy cell that does not require the turn** (rule 5).
+    /// It is sound only because [`Share::Nothing`] held nothing back for
+    /// the policy this replaces, so there is no backend to tell. A pass in
+    /// flight finds the budget changed at its re-read and concludes nothing.
     ///
-    /// Every reader is due again: a budget is a different shape, so the
-    /// stride the last one's passes measured against is not this one's, and
+    /// Every reader is due again. A budget is a different shape, so the
+    /// stride the last one's passes measured against is not this one's.
     /// `passed_at` left standing would keep a reader that has not travelled
     /// a whole *new* stride from ever being due. The windows are NOT
-    /// cleared; see [`State::windows`]. The error is returned, not logged:
-    /// this runs under L2.
+    /// cleared (see [`State::windows`]). The error is returned, not logged,
+    /// because this runs under L2.
     fn install_now(&mut self, budget: CacheBudget) -> Result<(), anyhow::Error> {
         self.decided = Some(budget);
         self.installed = None;
@@ -3547,7 +3569,7 @@ impl<B: Backing> State<B> {
         };
         let policy = B::policy(&self.domain, bytes, self.buffering())?;
         let Shape::Split { unshared, .. } = policy.shape() else {
-            // The budget covers it: nothing here will reclaim anything, and
+            // The budget covers it. Nothing here will reclaim anything, and
             // a reader inside it is inside all of it.
             return Ok(());
         };
@@ -3590,17 +3612,18 @@ impl<B: Backing> State<B> {
     }
 
     /// Forget the policy, and that the entity was decided at all. Under the
-    /// turn: see [`Retention::clear_under`]. The draw stays -- it is the
-    /// play session's, not the policy's.
+    /// turn (see [`Retention::clear_under`]). The draw stays, since it is
+    /// the play session's, not the policy's.
     ///
     /// `decided` goes with the policy. Left standing, the next delivered
-    /// byte finds it equal to the published budget, skips `install_now`,
-    /// and the entity is unbounded until the budget's *value* changes --
-    /// the hole this module exists to close, reopened by its own clear.
-    /// Under a pin that makes each delivered byte a decide, a claim and a
-    /// pass that clears again at its first step; cheap (no listing, and
-    /// under [`Share::Nothing`] no backend call), and on a combination --
-    /// pins and [`Install::OnDeliveredByte`] -- no backing has.
+    /// byte finds it equal to the published budget and skips
+    /// `install_now`. The entity is then unbounded until the budget's
+    /// *value* changes. That is the hole this module exists to close,
+    /// reopened by its own clear. Under a pin, that makes each delivered
+    /// byte a decide, a claim and a pass that clears again at its first
+    /// step. It is cheap (no listing, and under [`Share::Nothing`] no
+    /// backend call), and on a combination no backing has: pins and
+    /// [`Install::OnDeliveredByte`].
     fn forget_policy(&mut self, _turn: &mut Turn) {
         self.installed = None;
         self.decided = None;
@@ -3616,11 +3639,12 @@ impl<B: Backing> State<B> {
         giving_up: &[u32],
         held: &BTreeSet<u32>,
     ) -> Option<(Decision, RetentionPolicy)> {
-        // Under what the readers are doing *now*, before the decision: the
+        // Under what the readers are doing *now*, before the decision. The
         // bitrate the time caps are sized from needs a duration the player
-        // states after the policy is built, and a reader that opened or
-        // ended since changes what the window has to hold. The budget is not re-read -- a
-        // budget that moves builds a new policy under the turn.
+        // states after the policy is built. A reader that opened or ended
+        // since changes what the window has to hold. The budget is not
+        // re-read, because a budget that moves builds a new policy under the
+        // turn.
         let buffering = self.buffering();
         let installed = self.installed.as_mut()?;
         if installed.policy.observe(buffering)
@@ -3634,8 +3658,8 @@ impl<B: Backing> State<B> {
     }
 
     /// Commit `piece` into the standing policy's committed set, now that the
-    /// backing holds it, and say whether it joined the set. Under the turn;
-    /// see [`Retention::commit_completed`].
+    /// backing holds it, and say whether it joined the set. Under the turn
+    /// (see [`Retention::commit_completed`]).
     fn commit_drawn(&mut self, _turn: &mut Turn, piece: u32) -> bool {
         self.installed
             .as_mut()
@@ -3649,7 +3673,7 @@ impl<B: Backing> State<B> {
 
     /// A stream has been opened on this entity, by `opener`, asking
     /// `opening` of the cache. Under the turn, from
-    /// [`Retention::install_opening`] alone; see [`Self::opens`],
+    /// [`Retention::install_opening`] alone. See [`Self::opens`],
     /// [`Self::player_opened`] and [`Self::asked`].
     fn opened(&mut self, _turn: &mut Turn, opening: Buffering, opener: Opener) {
         self.opens += 1;
@@ -3657,20 +3681,20 @@ impl<B: Backing> State<B> {
         self.asked = self.asked.widest(opening);
     }
 
-    /// What the play session's draw is sized beside: every read-ahead in
-    /// force or stated by an open of the session, and -- once the film's
-    /// rate is known -- the read-ahead a later open is granted, the rate
-    /// times the widest seconds the viewer asked for, never past the whole
-    /// cache (`Engine::try_get_file_with_intent` asks exactly that).
+    /// What the play session's draw is sized beside. It is every read-ahead
+    /// in force or stated by an open of the session. Once the film's rate
+    /// is known, it is also the read-ahead a later open is granted: the
+    /// rate times the widest seconds the viewer asked for, never past the
+    /// whole cache (`Engine::try_get_file_with_intent` asks exactly that).
     ///
     /// The rate is `over`'s: the entity's own domain over its stated
-    /// duration -- or, for a `member` (the member a play session plays
-    /// inside one container, [`Backing::narrowed`], or its bytes in every
-    /// volume of a set, [`Backing::joined`]), the member's length over the
-    /// duration told for the draw alone ([`State::set_duration`]), which
-    /// gives the entity's own stream no rate: a container's length over an
-    /// episode's duration is the episode's rate times however many episodes
-    /// the container holds.
+    /// duration. For a `member` it is the member's length over the duration
+    /// told for the draw alone ([`State::set_duration`]). A `member` is the
+    /// member a play session plays inside one container
+    /// ([`Backing::narrowed`]), or its bytes in every volume of a set
+    /// ([`Backing::joined`]). That gives the entity's own stream no rate. A
+    /// container's length over an episode's duration is the episode's rate
+    /// times however many episodes the container holds.
     fn draw_buffering(&self, budget: CacheBudget, over: &B::Domain, member: bool) -> Buffering {
         let mut buffering = self.buffering().widest(self.asked);
         buffering.bytes_per_second = if member {
@@ -3694,7 +3718,7 @@ impl<B: Backing> State<B> {
     /// Whether the play session has waited [`DRAW_FALLBACK`] of playback
     /// for the film's rate, on the pass clock `now` (`None` for an open,
     /// which has no clock and never runs the fallback out). Playback is
-    /// under way once a byte has been delivered; the first pass to see that
+    /// under way once a byte has been delivered. The first pass to see that
     /// starts the wait.
     fn fallback_ran_out(&mut self, now: Option<std::time::Instant>) -> bool {
         let Some(now) = now else {
@@ -3723,10 +3747,10 @@ impl<B: Backing> State<B> {
     }
 
     /// Whether the draw is decided for `made_for`, so nothing is drawn
-    /// again: a draw is recorded, and it is not an empty one made for
-    /// something else. An empty draw advertised nothing, so one made for
-    /// another member, another set or the file as itself -- a volume first
-    /// played by its URL, whose sniff found an archive -- is replaced by
+    /// again. It is when a draw is recorded and it is not an empty one made
+    /// for something else. An empty draw advertised nothing. So one made
+    /// for another member, another set or the file as itself (a volume
+    /// first played by its URL, whose sniff found an archive) is replaced by
     /// the draw of what is played now, which withdraws nothing.
     fn draw_settled(&self, made_for: &DrawnFor<B::Key>) -> bool {
         match &self.draw {
@@ -3735,11 +3759,11 @@ impl<B: Backing> State<B> {
         }
     }
 
-    /// The draw is shared no more and its announcement has been ended:
-    /// forget it, so the session's next open or pass draws what is played
+    /// The draw is shared no more and its announcement has been ended.
+    /// Forget it, so the session's next open or pass draws what is played
     /// now. The standing policy keeps nothing of it any more. Under the
-    /// turn. The open, the read-ahead asked and what the content is stay:
-    /// the session is still on the entity.
+    /// turn. The open, the read-ahead asked and what the content is all
+    /// stay, since the session is still on the entity.
     fn forget_draw(&mut self, _turn: &mut Turn) {
         if let Some(installed) = self.installed.as_mut() {
             installed.policy.adopt_draw(&BTreeSet::new());
@@ -3753,13 +3777,13 @@ impl<B: Backing> State<B> {
     /// everything it holds is on its way off the disk. Under the turn, once
     /// nothing it holds is announced in the swarm.
     ///
-    /// The windows go with the policy, deliberately: a window is what a
+    /// The windows go with the policy, deliberately. A window is what a
     /// pass measured round a head somebody was at, and an entity nobody is
-    /// playing has none. Left standing they would tell a protection reading
-    /// that a left file's pieces are protected, which is how a switch used
-    /// to leave the previous film on the disk under two owners' protection
-    /// and neither one's deleter. The draw goes too: the next open of this
-    /// file is a new play session, and draws afresh.
+    /// playing has none. Left standing, they would tell a protection
+    /// reading that a left file's pieces are protected. That is how a
+    /// switch used to leave the previous film on the disk under two owners'
+    /// protection and neither one's deleter. The draw goes too. The next
+    /// open of this file is a new play session, and draws afresh.
     fn go_slack(&mut self, _turn: &mut Turn) {
         self.installed = None;
         self.decided = None;
@@ -3775,9 +3799,9 @@ impl<B: Backing> State<B> {
     }
 
     /// [`Self::consumed_at`] as a position, or `None` when the detector
-    /// was silent or the backing cannot make one. To the piece: a file
-    /// that starts inside a piece is placed at that piece's start, which
-    /// is the granularity every reading of this has anyway.
+    /// was silent or the backing cannot make one. It is to the piece. A
+    /// file that starts inside a piece is placed at that piece's start,
+    /// which is the granularity every reading of this has anyway.
     fn consumed_head(&self) -> Option<B::Position> {
         let piece = self.consumed_at?;
         let extent = B::extent(&self.domain);
@@ -3822,10 +3846,10 @@ impl<B: Backing> State<B> {
 /// A fresh draw for one entity's shared set ([`State::seed`]).
 ///
 /// `RandomState` is seeded from the operating system once per process and
-/// is keyed per instance, so two `RandomState`s in one process disagree and
-/// two processes disagree -- which is exactly what is wanted here, and it
-/// costs no dependency. What is hashed is a counter, so two entities of one
-/// process never draw the same set either.
+/// is keyed per instance. So two `RandomState`s in one process disagree,
+/// and two processes disagree. That is exactly what is wanted here, and it
+/// costs no dependency. What is hashed is a counter, so two entities of
+/// one process never draw the same set either.
 #[cfg(not(test))]
 fn share_seed() -> u64 {
     use std::hash::BuildHasher;
@@ -3833,9 +3857,9 @@ fn share_seed() -> u64 {
     std::collections::hash_map::RandomState::new().hash_one(NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
-/// Fixed under test: what the tests are about is which pieces a given draw
-/// keeps and that nothing ever takes one back, not that the draw is random
-/// -- that it *is* is one call to `RandomState`, above. The value is
+/// Fixed under test. The tests are about which pieces a given draw keeps,
+/// and that nothing ever takes one back, not about the draw being random.
+/// That it *is* random is one call to `RandomState`, above. The value is
 /// chosen so that the eight-piece fake files draw their first two pieces,
 /// which is where the tests that predate the draw had their windows.
 #[cfg(test)]
@@ -3858,16 +3882,16 @@ fn stride_for<B: Backing>(window: u32) -> u32 {
 }
 
 /// **How many pieces of an entity an asker may have asked for in all**
-/// ([`Reader::room`]): the rule that a piece which could not be kept is not
-/// asked for.
+/// ([`Reader::room`]). This is the rule that a piece which could not be
+/// kept is not asked for.
 ///
-/// What the entity may hold, less everything its readers hold that no
-/// reclaim can give back -- their windows, their promises, their streams'
+/// It is what the entity may hold, less everything its readers hold that
+/// no reclaim can give back: their windows, their promises, their streams'
 /// lookaheads, the committed set. An asker that stays inside it can always
-/// be kept beside them, whatever else has to go to make the room; one that
+/// be kept beside them, whatever else has to go to make the room. One that
 /// went past it would be fetching pieces for the next pass to take, or
-/// pushing out the pieces it fetched first. Measured by each pass, from the
-/// budget and what is held then; no fixed share of anything.
+/// pushing out the pieces it fetched first. Each pass measures it, from
+/// the budget and what is held then. It is no fixed share of anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Room {
     /// Nothing bounds the entity: a budget that covers it, or a pin.
@@ -3875,12 +3899,12 @@ pub enum Room {
     /// This many pieces, counting every one the asker has asked for so far.
     Pieces(u64),
     /// A policy bounds the entity and no pass has measured it under that
-    /// policy yet: the next one will, and until then nothing is asked for.
+    /// policy yet. The next one will, and until then nothing is asked for.
     Unmeasured,
 }
 
 /// One open read: a handle that holds its promise and carries its playhead.
-/// Dropping it is what says the read is over, and it is the only thing that
+/// Dropping it says the read is over, and it is the only thing that
 /// releases a promise.
 pub struct Reader<B: Backing> {
     owner: Arc<Retention<B>>,
@@ -3901,11 +3925,11 @@ impl<B: Backing> Reader<B> {
 
     /// The piece at `at` is what this read is waiting for.
     ///
-    /// [`Self::promises`] in the entity's own coordinates, so a caller that
-    /// has a position and not a piece index -- every reader of a torrent
-    /// file, whose cursor counts from the file and not from the torrent --
-    /// does not have to do the conversion itself and get it wrong on a file
-    /// that does not start at piece zero.
+    /// [`Self::promises`] in the entity's own coordinates. A caller that
+    /// has a position and not a piece index then does not have to do the
+    /// conversion itself, and get it wrong on a file that does not start at
+    /// piece zero. Every reader of a torrent file is such a caller, since
+    /// its cursor counts from the file and not from the torrent.
     pub fn promises_at(&self, at: B::Position) {
         let index = {
             let state = self.entity.state.lock();
@@ -3926,11 +3950,11 @@ impl<B: Backing> Reader<B> {
         }
         let mut state = self.entity.state.lock();
         // **And held against every unlink, at once.** A promise is made
-        // between passes -- a read parks on a piece the last pass knew
-        // nothing about -- and the door reads the published set and nothing
-        // else. Written here, under the entity's lock, which is the lock
-        // the pass publishes under: the two writers are the owner's and
-        // they cannot interleave. Nothing clears it; the next pass
+        // between passes: a read parks on a piece the last pass knew
+        // nothing about. The door reads the published set and nothing else.
+        // It is written here, under the entity's lock, which is the lock
+        // the pass publishes under. The two writers are the owner's, and
+        // they cannot interleave. Nothing clears it. The next pass
         // republishes what is asked for and what is promised then.
         if let Some(exempt) = state.exempt.as_ref() {
             exempt.hold(pieces.clone());
@@ -3943,7 +3967,7 @@ impl<B: Backing> Reader<B> {
     }
 
     /// **This asker's stream is asking the backend for `pieces` now**, and
-    /// for nothing else: what it asked for before and has left is no
+    /// for nothing else. What it asked for before and has left is no
     /// longer its own ([`Retention::ask_ahead`]). An empty range is a
     /// stream that asks for nothing.
     pub fn asks(&self, pieces: Range<u32>) {
@@ -3956,8 +3980,8 @@ impl<B: Backing> Reader<B> {
             .asking = pieces;
     }
 
-    /// **How much an asker may ask for**, as the entity stands; see
-    /// [`Room`].
+    /// **How much an asker may ask for**, as the entity stands (see
+    /// [`Room`]).
     pub fn room(&self) -> Room {
         let state = self.entity.state.lock();
         match (&state.installed, state.room) {
@@ -3974,28 +3998,28 @@ impl<B: Backing> Reader<B> {
     /// **Every delivered byte moves the entity's `last_position`, and it is
     /// the last resort under the detector.** Where the entity is being
     /// consumed is [`Consumers::at`], from the bytes each detected stream
-    /// has eaten; this value is only what a pass falls back to when no
-    /// stream has read the entity lately -- a film nobody is watching,
-    /// whose crawler has stopped too. Moving it on every delivered byte,
-    /// not only a byte some caller declares to be playback, keeps mpv's
-    /// read of the container index at the tail from stranding the head
-    /// there once that read has closed.
+    /// has eaten. This value is only what a pass falls back to when no
+    /// stream has read the entity lately: a film nobody is watching, whose
+    /// crawler has stopped too. It moves on every delivered byte, not only
+    /// a byte some caller declares to be playback. That keeps mpv's read of
+    /// the container index at the tail from stranding the head there once
+    /// that read has closed.
     ///
-    /// The budget is read before L2 (a copy-out of a foreign lock, rule 2);
-    /// under L2 the entity's `last_position`, an
+    /// The budget is read before L2 (a copy-out of a foreign lock, rule 2).
+    /// Under L2 come the entity's `last_position`, an
     /// [`Install::OnDeliveredByte`] decide when the budget moved, this
-    /// reader's playhead and the shrink of its promise; and, for
-    /// [`Trigger::OnMove`], whether the byte moved a stride since this
-    /// reader's last pass -- `abs_diff`, so a seek back is as much a reason
-    /// to look as playing on. A due byte tries the turn **under L2** (rule
-    /// 3): `Some` is a claim the caller must hand to [`Retention::pass`];
-    /// `None` is a pass in flight, and the pass's conclusion asks the same
-    /// head again.
+    /// reader's playhead and the shrink of its promise. For
+    /// [`Trigger::OnMove`] it also asks whether the byte moved a stride
+    /// since this reader's last pass. That uses `abs_diff`, so a seek back
+    /// is as much a reason to look as playing on. A due byte tries the turn
+    /// **under L2** (rule 3). `Some` is a claim the caller must hand to
+    /// [`Retention::pass`]. `None` is a pass in flight, and the pass's
+    /// conclusion asks the same head again.
     ///
-    /// No clock: nothing here is timed. The reads a detector measures are
-    /// stamped where they are served ([`crate::retention::streams::Read`]),
-    /// and the pass measures against the clock it is handed
-    /// ([`Retention::pass_at`]).
+    /// There is no clock, since nothing here is timed. The reads a detector
+    /// measures are stamped where they are served
+    /// ([`crate::retention::streams::Read`]), and the pass measures against
+    /// the clock it is handed ([`Retention::pass_at`]).
     pub fn note(&self, at: B::Position) -> Option<Claim> {
         let budget = self.owner.budget.get();
         let (claim, refused) = {
@@ -4016,7 +4040,7 @@ impl<B: Backing> Reader<B> {
             reader.playhead = Some(at);
             let due = match index {
                 Some(index) => {
-                    // Delivered is no longer promised: the piece went out
+                    // Delivered is no longer promised. The piece went out
                     // whole before this was called, so the promise starts
                     // after it.
                     reader.promised.start = reader
@@ -4031,7 +4055,7 @@ impl<B: Backing> Reader<B> {
                 }
                 None => false,
             };
-            // A due byte tries the turn, under L2 (rule 3): `None` is a
+            // A due byte tries the turn, under L2 (rule 3). `None` is a
             // pass in flight, and its conclusion asks the same head again.
             let claim = due
                 .then(|| self.entity.turn.clone().try_lock_owned().ok())
@@ -4054,9 +4078,9 @@ impl<B: Backing> Reader<B> {
 }
 
 impl<B: Backing> Drop for Reader<B> {
-    /// The read is over: its promise is released and its playhead is not a
+    /// The read is over. Its promise is released, and its playhead is not a
     /// live reader's any more. The entity and the windows its last pass
-    /// chose stay: a read that ends is not a stream that has been replaced,
+    /// chose stay. A read that ends is not a stream that has been replaced,
     /// and what ends one is [`Mode::Slack`].
     fn drop(&mut self) {
         self.entity.state.lock().readers.remove(&self.id);
@@ -4064,32 +4088,32 @@ impl<B: Backing> Drop for Reader<B> {
 }
 
 /// The pass's last asking, built by the owner and handed to
-/// [`Backing::reclaim`]. Sync and cheap, callable from a blocking thread:
-/// [`Self::refuses`] takes L2 briefly and no other lock, and asks
-/// [`Backing::keeps_everything`] before L2, never under it;
+/// [`Backing::reclaim`]. It is sync and cheap, callable from a blocking
+/// thread. [`Self::refuses`] takes L2 briefly and no other lock, and asks
+/// [`Backing::keeps_everything`] before L2, never under it.
 /// [`Self::drawn`], asked once per run, takes L1 → L2 to copy out.
 pub struct Door<B: Backing> {
     state: Arc<parking_lot::Mutex<State<B>>>,
     backing: Arc<B>,
     key: B::Key,
-    /// L1, for [`Self::drawn`]: every entity's recorded draw, read at the
+    /// L1, for [`Self::drawn`]. Every entity's recorded draw is read at the
     /// unlink.
     entities: Arc<Entities<B>>,
     /// Which pass this door is for. A [`Mode::Slack`] door keeps nothing
     /// but what a live read was promised, and closes the moment the entity
     /// is played again.
     mode: Mode,
-    /// **What may not be unlinked, as one bit per piece.** Everything this
-    /// entity's consumers are asking for and every promise live when the
-    /// pass published it, so the answer at the door is a load and a mask
-    /// rather than a lock taken once per candidate piece from a blocking
-    /// thread. Empty under [`Mode::Slack`], which keeps nothing but a live
-    /// promise.
+    /// **What may not be unlinked, as one bit per piece.** It is everything
+    /// this entity's consumers are asking for, and every promise live when
+    /// the pass published it. So the answer at the door is a load and a
+    /// mask, rather than a lock taken once per candidate piece from a
+    /// blocking thread. It is empty under [`Mode::Slack`], which keeps
+    /// nothing but a live promise.
     exempt: std::sync::Arc<crate::retention::exempt::Exempt>,
 }
 
 impl<B: Backing> Door<B> {
-    /// **Take nothing more at all**, whatever the run says: the entity is
+    /// **Take nothing more at all**, whatever the run says. The entity is
     /// pinned now, or it is slack and a player has opened it again while
     /// its bytes were going. Neither un-happens mid-loop, so a reclaim that
     /// sees this stops rather than skipping a run.
@@ -4102,24 +4126,24 @@ impl<B: Backing> Door<B> {
     }
 
     /// **Every piece a play session's draw has recorded, of every entity
-    /// a session plays**: what the backing refuses to unlink beside what
-    /// the backend announces, read once per run at the act
+    /// a session plays.** The backing refuses to unlink these, beside what
+    /// the backend announces. It is read once per run at the act
     /// ([`Backing::reclaim`], [`Backing::want`]).
     ///
-    /// Because a draw is recorded before it is advertised, and -- under a
-    /// set -- it is advertised by whichever volume drew it, under that
-    /// volume's turn and not this one's: a reading of what the backend
-    /// announces, taken by this pass a moment before a sibling's advertise
-    /// of the union lands, says nothing of pieces of this entity that are
-    /// about to be announced. The record is there before the advertise, so
+    /// This is needed because a draw is recorded before it is advertised.
+    /// Under a set, it is advertised by whichever volume drew it, under that
+    /// volume's turn and not this one's. Suppose this pass reads what the
+    /// backend announces a moment before a sibling's advertise of the union
+    /// lands. That reading says nothing of pieces of this entity that are
+    /// about to be announced. The record is there before the advertise. So
     /// this reading, taken after the backend's, sees what that one could
     /// not. A recorded draw of an entity no session plays any more is left
-    /// out: its file was left, and what it announced is the backend's
+    /// out. Its file was left, and what it announced is the backend's
     /// reading to answer for.
     ///
-    /// L1 → L2 per entity to copy the draws out, as
-    /// [`Retention::draws`] does; the backing's `plays` asked after both
-    /// are released (rule 2). Never asked under an owner lock.
+    /// L1 → L2 per entity to copy the draws out, as [`Retention::draws`]
+    /// does. The backing's `plays` is asked after both are released (rule
+    /// 2). It is never asked under an owner lock.
     pub fn drawn(&self) -> BTreeSet<u32> {
         let draws: Vec<(B::Key, BTreeSet<u32>)> = {
             let entities = self.entities.lock();
@@ -4140,19 +4164,19 @@ impl<B: Backing> Door<B> {
 
     /// **Whether `index` may not be taken at this instant.**
     ///
-    /// [`Self::shut`] first -- the backing's pin read and, on a slack pass,
-    /// its liveness read, each a lock outside the owner -- and then, on the
-    /// live path, a load and a bit test: the set was published by the pass
-    /// under the entity's lock, and every promise made since was written
-    /// into it under that same lock. The door is never a writer -- two
+    /// [`Self::shut`] comes first: the backing's pin read and, on a slack
+    /// pass, its liveness read, each a lock outside the owner. Then, on the
+    /// live path, a load and a bit test. The pass published the set under
+    /// the entity's lock, and every promise made since was written into it
+    /// under that same lock. The door is never a writer, because two
     /// unordered writers to one piece of state is the defect this owner
-    /// keeps finding -- and it takes no owner lock on the live path, because
-    /// it is asked once per candidate piece, per unlink, from a blocking
+    /// keeps finding. It takes no owner lock on the live path, because it
+    /// is asked once per candidate piece, per unlink, from a blocking
     /// thread.
     ///
     /// The race it tolerates is a region that grew onto a piece just after
     /// the door was asked, which costs a re-fetch. The race that cannot
-    /// happen is a set bit being unlinked: bits are only cleared by the
+    /// happen is a set bit being unlinked. Bits are only cleared by the
     /// pass, for a region it has just measured as gone.
     pub fn refuses(&self, index: u32) -> bool {
         if self.shut() {
@@ -4163,7 +4187,7 @@ impl<B: Backing> Door<B> {
         }
         if matches!(self.mode, Mode::Slack { .. }) {
             // Nothing of a slack entity is kept for what somebody might
-            // read; what is kept is what an open read was already promised,
+            // read. What is kept is what an open read was already promised,
             // and it is served every byte of it. A slack pass publishes no
             // set of its own, so this is asked of the readers.
             return self
@@ -4182,7 +4206,7 @@ mod tests {
     use super::*;
 
     // The fixture every test here is built over lives in
-    // `crate::retention::scenario`, one module up: the policy that replaces
+    // `crate::retention::scenario`, one module up. The policy that replaces
     // this one has to be drivable through the same fake, and a fixture
     // buried in this module's own `mod tests` cannot be. See that module
     // for why it is a sibling rather than a child.
@@ -4200,11 +4224,11 @@ mod tests {
     /// **A pass that dies leaves the policy where it was, and the next one
     /// runs.**
     ///
-    /// The abandoned-pass hole, closed by construction: a driver that took
+    /// The abandoned-pass hole, closed by construction. A driver that took
     /// the policy for the length of a pass would lose it to a pass future
-    /// dropped at its listing -- the runtime shutting down -- and a
-    /// `running` flag it set would never be cleared, so no later pass would
-    /// run either. Here the policy never moves and the claim is a guard.
+    /// dropped at its listing (the runtime shutting down). A `running` flag
+    /// it set would never be cleared, so no later pass would run either.
+    /// Here the policy never moves and the claim is a guard.
     #[tokio::test]
     async fn a_pass_dropped_at_its_listing_leaves_the_policy_installed_and_the_next_pass_runs() {
         let (backing, owner, _budget) = proxy();
@@ -4225,10 +4249,10 @@ mod tests {
             holding.windows.is_empty(),
             "the dead pass concluded something"
         );
-        // Turn free, policy in its cell: the next pass keeps what the one
-        // consumer is reading ahead over -- pieces 1 and 2, since its read
-        // ended at the start of piece 1 -- and gives back four pieces of
-        // the rest, oldest first. Piece 0 is behind the consumer and is
+        // Turn free, policy in its cell. The next pass keeps what the one
+        // consumer is reading ahead over: pieces 1 and 2, since its read
+        // ended at the start of piece 1. It gives back four pieces of the
+        // rest, oldest first. Piece 0 is behind the consumer and is
         // scrub-back, which this budget cannot afford.
         backing.read_from(0, PIECE);
         let claim = owner.try_turn(&0).expect("the dead pass released the turn");
@@ -4247,7 +4271,7 @@ mod tests {
     async fn a_reclaim_that_panics_leaves_the_policy_the_decision_and_the_windows_untouched() {
         let (backing, owner, _budget) = proxy();
         let second = owner.reader(0, domain(0, 0..8));
-        // The second player's first byte is due too; its claim is dropped
+        // The second player's first byte is due too. Its claim is dropped
         // unused, which is a pass that never ran.
         drop(second.note((0, 6 * PIECE)));
         backing.seek_to(6 * PIECE);
@@ -4288,7 +4312,7 @@ mod tests {
     /// arms exactly one successor if that byte moved the head a stride --
     /// and none if it did not.**
     ///
-    /// The arming fixed point: the pass re-asks the same `head` it measured
+    /// The arming fixed point. The pass re-asks the same `head` it measured
     /// from, so each arming is paid for by one delivered byte and the chain
     /// terminates. The claim it hands on is the same one, so nothing can
     /// slip a pass in between.
@@ -4316,7 +4340,7 @@ mod tests {
             "the claim was handed on and yet the turn is free"
         );
         // The successor measures from where the head is now, and the head
-        // has not moved since: nothing further is owed.
+        // has not moved since, so nothing further is owed.
         let outcome = owner.pass(&0, &(), again, Mode::Live).await;
         assert!(outcome.concluded.is_some(), "the successor");
         assert!(
@@ -4326,7 +4350,7 @@ mod tests {
         assert_eq!(owner.holding(&0).unwrap().windows, vec![2..6]);
         assert!(owner.try_turn(&0).is_some());
         // With the turn free, a byte inside the stride of the pass that
-        // measured this reader is not due: one reader playing on does not
+        // measured this reader is not due. One reader playing on does not
         // spend a listing per byte.
         assert!(
             reader.note((0, 2 * PIECE + 1)).is_none(),
@@ -4351,7 +4375,7 @@ mod tests {
     }
 
     /// A waker that records whether the entity's state lock was held at
-    /// the instant it was woken -- which, for a waiter on the turn, is the
+    /// the instant it was woken. For a waiter on the turn, that is the
     /// instant the claim was dropped.
     struct WokenUnder<B: Backing> {
         state: Arc<parking_lot::Mutex<State<B>>>,
@@ -4399,20 +4423,20 @@ mod tests {
     /// a pass running and start none.**
     ///
     /// Rule 3. A note reads "is a pass running" (`try_lock` on the turn)
-    /// and "is this byte due" under one L2 acquisition; the pass's
-    /// conclusion decides `again` from the head and drops or hands on the
+    /// and "is this byte due" under one L2 acquisition. The pass's
+    /// conclusion decides `again` from the head, and drops or hands on the
     /// claim under the same L2 block. Released after the block instead,
-    /// there is a gap in which a delivered byte sees the turn taken, starts
-    /// nothing, and the conclusion has already decided nothing is owed --
-    /// the swallowed last byte of a body, which the proxy test at L2250
-    /// pins from outside.
+    /// there is a gap. In it a delivered byte sees the turn taken and starts
+    /// nothing, and the conclusion has already decided nothing is owed.
+    /// That is the swallowed last byte of a body, which the proxy test at
+    /// L2250 pins from outside.
     ///
     /// No test can put a thread into that gap on purpose, so the instant
-    /// of the release is observed instead: a waiter queued on the turn is
+    /// of the release is observed instead. A waiter queued on the turn is
     /// woken synchronously when the claim drops (tokio's semaphore hands
-    /// the permit over inside the drop), and its waker records whether L2
-    /// was held at that instant. Then the behaviour: a byte that moves a
-    /// stride after the conclusion gets its pass.
+    /// the permit over inside the drop). Its waker records whether L2 was
+    /// held at that instant. Then the behaviour: a byte that moves a stride
+    /// after the conclusion gets its pass.
     #[tokio::test]
     async fn a_byte_landing_between_the_conclusion_and_the_release_still_gets_a_pass() {
         let (backing, owner, _budget) = proxy();
@@ -4431,7 +4455,7 @@ mod tests {
             probe.under_state.load(Ordering::SeqCst),
             "the claim was released outside the conclusion's state lock"
         );
-        // The waiter now holds the permit; let it go so the note below can
+        // The waiter now holds the permit. Let it go so the note below can
         // claim.
         drop(waiter);
         let claim = reader
@@ -4481,10 +4505,10 @@ mod tests {
     /// it" was a pass reading a listing every couple of seconds, a drawn
     /// piece fetched and given back between two passes was never committed
     /// at all. Here every piece of the file arrives and is gone again before
-    /// any pass runs, so a pass would have found nothing whatever, and the
-    /// draw's two pieces are committed -- and the backend was told about
-    /// them exactly once, at the install, so it could announce each as it
-    /// completed: a completion tells the backend nothing new.
+    /// any pass runs, so a pass would have found nothing whatever. The
+    /// draw's two pieces are committed. The backend was told about them
+    /// exactly once, at the install, so it could announce each as it
+    /// completed. A completion tells the backend nothing new.
     #[tokio::test]
     async fn a_drawn_piece_completing_between_two_passes_is_committed_without_one() {
         let (backing, owner, _budget) = torrent();
@@ -4515,7 +4539,8 @@ mod tests {
             if owner.commit_completed(piece).await {
                 committed.push(piece);
             }
-            // And the window moves on: nothing is left for a pass to find.
+            // And the window moves on, so nothing is left for a pass to
+            // find.
             backing.held.lock().remove(&piece);
         }
         assert_eq!(committed, drawn, "what was committed is the draw");
@@ -4534,8 +4559,8 @@ mod tests {
             advertised,
             "a completion told the backend nothing: the draw was advertised already"
         );
-        // And a piece that completes again -- the same bytes downloaded a
-        // second time -- is committed once: a committed piece is committed.
+        // A piece that completes again (the same bytes downloaded a second
+        // time) is committed once. A committed piece is committed.
         backing.holds(drawn.iter().copied());
         for piece in &drawn {
             assert!(
@@ -4546,12 +4571,12 @@ mod tests {
     }
 
     /// **Only the viewer's playback stream draws.** An open the liveness
-    /// cell does not name -- a subtitle beside the film, which the aside
-    /// rule keeps off the cell -- draws nothing, and neither does an
-    /// unshared open of the file being played (a translated source's). The
-    /// player's own open of the film draws; and a side file the cell is
-    /// later handed to (the next episode, opened before the last one's read
-    /// had closed) draws at its next pass.
+    /// cell does not name draws nothing: a subtitle beside the film, which
+    /// the aside rule keeps off the cell. Neither does an unshared open of
+    /// the file being played (a translated source's). The player's own open
+    /// of the film draws. A side file the cell is later handed to (the next
+    /// episode, opened before the last one's read had closed) draws at its
+    /// next pass.
     #[tokio::test]
     async fn only_the_players_stream_of_the_file_being_played_draws() {
         let (backing, owner, _budget) = torrent();
@@ -4598,11 +4623,11 @@ mod tests {
     /// read-ahead a reader is really granted once it comes.**
     ///
     /// Six pieces of budget, and a first open that states one piece of
-    /// read-ahead -- what a stream is granted before the player has said how
-    /// long the film is. Drawn then, the set would be three pieces. The
-    /// length arrives: 8000 bytes over 32 s is 250 B/s, and the ten seconds
-    /// the open asked for come to 2500 bytes, four pieces touched -- beside
-    /// which six pieces hold two. The pass that finds the rate draws those
+    /// read-ahead: what a stream is granted before the player has said how
+    /// long the film is. Drawn then, the set would be three pieces. Then the
+    /// length arrives. 8000 bytes over 32 s is 250 B/s, and the ten seconds
+    /// the open asked for come to 2500 bytes, four pieces touched. Beside
+    /// that, six pieces hold two. The pass that finds the rate draws those
     /// two, and nothing after it changes them.
     #[tokio::test]
     async fn the_draw_waits_for_the_films_rate_and_is_sized_with_the_real_read_ahead() {
@@ -4641,8 +4666,8 @@ mod tests {
         assert_eq!(draw.len(), 2, "{draw:?}");
         let advertised = backing.advertised_pieces();
         assert_eq!(advertised, draw.iter().copied().collect::<Vec<_>>());
-        // The swarm brings the file back -- the pass before the rate had
-        // taken what nobody was reading -- and the standing policy commits
+        // The swarm brings the file back (the pass before the rate had
+        // taken what nobody was reading), and the standing policy commits
         // exactly the draw.
         backing.holds(0..8);
         let claim = owner.turn(&0).await.expect("the turn");
@@ -4671,9 +4696,9 @@ mod tests {
 
     /// **A film whose length never comes draws after [`DRAW_FALLBACK`] of
     /// playback**, sized beside what its opens asked for. The wait starts at
-    /// the first pass that finds a byte delivered -- not at the open, which
-    /// on a cold swarm can be a minute before the first frame -- and is
-    /// measured on the passes' own clock.
+    /// the first pass that finds a byte delivered. It does not start at the
+    /// open, which on a cold swarm can be a minute before the first frame.
+    /// It is measured on the passes' own clock.
     #[tokio::test]
     async fn a_film_whose_length_never_comes_draws_after_the_fallback() {
         let (backing, owner, budget) = torrent();
@@ -4693,7 +4718,7 @@ mod tests {
                 owner.pass_at(&0, &(), claim, Mode::Live, t0 + at).await;
             }
         };
-        // Nothing delivered yet: the wait has not begun, however late.
+        // Nothing delivered yet, so the wait has not begun, however late.
         pass_at(Duration::from_secs(60)).await;
         assert!(owner.draws().is_empty());
         owner.note_position(&0, (0, 0));
@@ -4718,10 +4743,10 @@ mod tests {
 
     /// **A second open in the play session draws nothing new.**
     ///
-    /// The draw is made once, before playing, and every policy after it --
-    /// the next open, a seek's, one under a budget that moved -- adopts it.
-    /// Drawn again, a second open would either share pieces nobody sized the
-    /// read-ahead against or leave out pieces a peer has been told of.
+    /// The draw is made once, before playing. Every policy after it adopts
+    /// it: the next open, a seek's, one under a budget that moved. Drawn
+    /// again, a second open would either share pieces nobody sized the
+    /// read-ahead against, or leave out pieces a peer has been told of.
     #[tokio::test]
     async fn a_second_open_of_the_play_session_adopts_the_draw_and_advertises_nothing() {
         let (backing, owner, budget) = torrent();
@@ -4743,9 +4768,9 @@ mod tests {
         );
     }
 
-    /// **An advertise the backend refuses still leaves the draw decided**:
-    /// the entity is bounded, the draw is out of every reclaim's reach, and
-    /// the refusal costs the swarm the pieces -- ours and unshared -- and
+    /// **An advertise the backend refuses still leaves the draw decided.**
+    /// The entity is bounded, and the draw is out of every reclaim's reach.
+    /// The refusal costs the swarm the pieces (ours and unshared) and
     /// nothing else. Nothing is withdrawn anywhere, so there is nothing a
     /// refusal could leave half done.
     #[tokio::test]
@@ -4778,9 +4803,9 @@ mod tests {
         );
     }
 
-    /// **No owner lock is held across a backing call**: a backing that
-    /// takes the entity's own state lock inside `advertise` gets it. Asked
-    /// with `try_lock` so a violation is an assertion and not a hang.
+    /// **No owner lock is held across a backing call.** A backing that
+    /// takes the entity's own state lock inside `advertise` gets it. It is
+    /// asked with `try_lock`, so a violation is an assertion and not a hang.
     #[tokio::test]
     async fn a_backing_that_takes_the_state_lock_inside_advertise_does_not_deadlock() {
         let (backing, owner, _budget) = torrent();
@@ -4806,14 +4831,14 @@ mod tests {
     /// entity keeps everything.
     ///
     /// The published set is the pass's own reading, and it does not move
-    /// under the door: a reader ending mid-reclaim does not open its region
+    /// under the door. A reader ending mid-reclaim does not open its region
     /// up, and a playhead moving does not close one. What *does* change is a
-    /// promise, because a parked read writes one into the set under the same
-    /// lock the pass publishes under -- a read that parks mid-reclaim is
-    /// waiting on that piece now, and nothing else can say so in time.
+    /// promise. A parked read writes one into the set under the same lock
+    /// the pass publishes under. A read that parks mid-reclaim is waiting on
+    /// that piece now, and nothing else can say so in time.
     ///
     /// A playhead that merely moves changes nothing until the next pass
-    /// republishes -- the tolerated race, which costs a re-fetch.
+    /// republishes. That is the tolerated race, which costs a re-fetch.
     #[tokio::test]
     async fn the_door_refuses_what_was_published_and_what_has_been_promised_since() {
         let (backing, owner, budget) = proxy();
@@ -4821,13 +4846,13 @@ mod tests {
         // does not cover the whole reclaim.
         budget.set(Some(2 * PIECE), None);
         let reader = owner.reader(0, domain(0, 0..8));
-        // A second player at piece 7 whose body ends while the unlinks run:
-        // its window is in the pass's own windows and nowhere else by then.
+        // A second player at piece 7 whose body ends while the unlinks run.
+        // Its window is in the pass's own windows and nowhere else by then.
         let second = owner.reader(0, domain(0, 0..8));
         drop(second.note((0, 7 * PIECE)));
         backing.seek_to(7 * PIECE);
         let second = parking_lot::Mutex::new(Some(second));
-        // A body framed over piece 4 that ends while the unlinks run: the
+        // A body framed over piece 4 that ends while the unlinks run. The
         // pass snapshotted its promise at the re-read and honours it to the
         // end.
         let ended = owner.reader(0, domain(0, 0..8));
@@ -4926,7 +4951,7 @@ mod tests {
             "the coldest pieces of what nothing is asking for"
         );
         assert_eq!(outcome.reclaimed, 2);
-        // The next pass finds the pin first: the policy goes, nothing is
+        // The next pass finds the pin first. The policy goes, nothing is
         // listed, and the claim is released under the state lock like any
         // other exit's.
         let claim = owner.turn(&0).await.expect("the turn");
@@ -4945,7 +4970,7 @@ mod tests {
         drop(waiter);
         assert!(owner.holding(&0).unwrap().installed.is_none());
         // **And nothing was said to the backend but the draw**, at the
-        // install: the reclaim took none of it, and the pin announces the
+        // install. The reclaim took none of it, and the pin announces the
         // file through its own door, not through the policy it clears.
         assert_eq!(
             *backing.advertised.lock(),
@@ -4959,11 +4984,11 @@ mod tests {
     /// torrent is in the swarm, and all of it once the torrent has left.**
     ///
     /// The draw is advertised, and the backend announces each piece of it
-    /// it holds: there is no un-Have, and an announcement ends only with the
+    /// it holds. There is no un-Have, and an announcement ends only with the
     /// torrent leaving the swarm. So the pass over a file the viewer left
-    /// takes nothing then -- not even what nobody was told of, since the
-    /// play session ends with the torrent stopped whatever it fetched -- and
-    /// leaves the policy standing; out of the swarm, as the torrent's
+    /// takes nothing then, and leaves the policy standing. It takes not even
+    /// what nobody was told of, since the play session ends with the torrent
+    /// stopped whatever it fetched. Out of the swarm, as the torrent's
     /// `EndShares` has it, the same pass takes everything. The fake fails
     /// any unlink of an advertised piece while it is in the swarm.
     #[tokio::test]
@@ -4972,7 +4997,7 @@ mod tests {
         *backing.held.lock() = (0..8).collect();
         assert_eq!(play(&owner, &backing, 0).await, InstallOutcome::Installed);
         assert_eq!(backing.advertised_pieces(), vec![0, 1]);
-        // The viewer leaves it: slack, and only the swarm keeps it.
+        // The viewer leaves it. It is slack, and only the swarm keeps it.
         *backing.playing.lock() = None;
         let opens = owner.opens_of(&0);
 
@@ -5001,7 +5026,7 @@ mod tests {
     }
 
     /// **And a play session that shared nothing goes with the torrent in
-    /// the swarm**: nothing of it was advertised, so nothing of it was
+    /// the swarm.** Nothing of it was advertised, so nothing of it was
     /// announced, and there is nothing to wait for.
     #[tokio::test]
     async fn a_slack_pass_takes_a_session_that_shared_nothing_while_the_torrent_is_in_the_swarm() {
@@ -5028,14 +5053,14 @@ mod tests {
     /// still slack -- and a viewer who started this file in the meantime
     /// keeps everything.**
     ///
-    /// The mode is decided by the driver from a reading taken before its
-    /// first entity, and the pass runs seconds later. What can happen in
-    /// between is a viewer starting exactly this file: the liveness cell
-    /// moves first, the install follows. A pass that carried its mode
-    /// through would hold the window they are inside back from the swarm,
-    /// throw the fresh policy away and unlink what they are reading -- and
-    /// the door below would gate none of it, because the door is asked at
-    /// the unlink and the policy is gone before the first one.
+    /// The driver decides the mode from a reading taken before its first
+    /// entity, and the pass runs seconds later. In between, a viewer can
+    /// start exactly this file: the liveness cell moves first, and the
+    /// install follows. A pass that carried its mode through would hold the
+    /// window they are inside back from the swarm, throw the fresh policy
+    /// away and unlink what they are reading. The door below would gate
+    /// none of it, because the door is asked at the unlink and the policy
+    /// is gone before the first one.
     #[tokio::test]
     async fn a_slack_pass_takes_nothing_from_a_file_being_played_again() {
         let (backing, owner, _budget) = torrent();
@@ -5068,18 +5093,18 @@ mod tests {
 
     /// **And so does a viewer who opened it before the cell could say so.**
     ///
-    /// The liveness cell moves for the file being *played*; an open on
-    /// another file of the same torrent while the film is still being read
-    /// is an aside -- a subtitle -- and deliberately moves nothing. There
-    /// is no instant to ask about for one of those: the install has
-    /// finished and the reader is not open yet, so "is it live?" and "is
-    /// anything reading it?" both answer no while a stream is being handed
-    /// out on it.
+    /// The liveness cell moves for the file being *played*. An open on
+    /// another file of the same torrent, while the film is still being
+    /// read, is an aside (a subtitle) and deliberately moves nothing. There
+    /// is no instant to ask about for one of those. The install has finished
+    /// and the reader is not open yet. So "is it live?" and "is anything
+    /// reading it?" both answer no while a stream is being handed out on
+    /// it.
     ///
     /// So the pass compares counts instead of asking again. Every open
-    /// takes this entity's turn ([`Retention::install`]), so an open the
+    /// takes this entity's turn ([`Retention::install`]). So an open the
     /// driver did not see is either in this number or still waiting behind
-    /// the pass -- including one that found the policy already right and
+    /// the pass. That includes one that found the policy already right and
     /// installed nothing.
     #[tokio::test]
     async fn a_slack_pass_takes_nothing_from_an_entity_a_stream_opened_since() {
@@ -5107,7 +5132,7 @@ mod tests {
         assert!(owner.holding(&0).unwrap().installed.is_some());
 
         // With the count the driver read now the current one, the same pass
-        // empties it -- once the torrent is out of the swarm, since two of
+        // empties it, once the torrent is out of the swarm, since two of
         // those pieces are the draw's.
         backing.in_swarm.store(false, Ordering::SeqCst);
         let opens = owner.opens_of(&0);
@@ -5123,12 +5148,12 @@ mod tests {
 
     /// **And a read that opened on it in the same gap.**
     ///
-    /// An open read is not what makes an entity live, but it is a response
+    /// An open read is not what makes an entity live. But it is a response
     /// being delivered out of these bytes, and [`Mode::Slack`] means nobody
     /// is reading it either. The reader can arrive after the driver counted
-    /// the readers and before the pass takes the turn -- the install and the
-    /// reader are two steps with a backend call between them -- so the
-    /// readers are counted again here.
+    /// the readers and before the pass takes the turn, since the install
+    /// and the reader are two steps with a backend call between them. So
+    /// the readers are counted again here.
     #[tokio::test]
     async fn a_slack_pass_takes_nothing_from_an_entity_with_a_read_open() {
         let (backing, owner, _budget) = torrent();
@@ -5152,7 +5177,7 @@ mod tests {
         assert_eq!(backing.on_disk(), vec![0, 1, 2]);
         assert!(backing.advertised.lock().is_empty());
 
-        // The body ends, and the file nobody is playing is slack again; out
+        // The body ends, and the file nobody is playing is slack again. Out
         // of the swarm, its draw goes with the rest.
         drop(reader);
         backing.in_swarm.store(false, Ordering::SeqCst);
@@ -5170,10 +5195,10 @@ mod tests {
 
     /// **A pin outranks the slack: nothing of a pinned entity is taken.**
     ///
-    /// A pin is a retention property -- the user asked for those bytes --
-    /// and the slack pass is the one delete in this owner that would take a
-    /// whole extent, so it is also the one that would empty a pinned
-    /// download, which is shared whole for as long as the pin stands.
+    /// A pin is a retention property: the user asked for those bytes. The
+    /// slack pass is the one delete in this owner that would take a whole
+    /// extent. So it is also the one that would empty a pinned download,
+    /// which is shared whole for as long as the pin stands.
     #[tokio::test]
     async fn a_pinned_entity_is_never_slack() {
         let (backing, owner, _budget) = torrent();
@@ -5208,9 +5233,9 @@ mod tests {
     ///
     /// The pass drops the policy under the turn whether or not the unlinks
     /// that follow succeed, and the windows go with it. A window is what
-    /// some pass measured round a head somebody was at; left standing on an
-    /// entity nobody is playing it tells [`Retention::holdings`] that the
-    /// left file's pieces are protected -- which is a piece with protection
+    /// some pass measured round a head somebody was at. Left standing on an
+    /// entity nobody is playing, it tells [`Retention::holdings`] that the
+    /// left file's pieces are protected. That is a piece with protection
     /// and no deleter, the shape this slice exists to remove.
     #[tokio::test]
     async fn a_slack_pass_that_took_nothing_leaves_no_window_standing() {
@@ -5231,8 +5256,8 @@ mod tests {
         );
 
         // The unlinks die, so the entity survives its own slack pass and
-        // the next tick has to walk it again. Out of the swarm, so the pass
-        // runs at all: two of these pieces are the draw's.
+        // the next tick has to walk it again. It is out of the swarm, so the
+        // pass runs at all, since two of these pieces are the draw's.
         backing.in_swarm.store(false, Ordering::SeqCst);
         backing.reclaim_panics.store(true, Ordering::SeqCst);
         let opens = owner.opens_of(&0);
@@ -5260,8 +5285,8 @@ mod tests {
 
     /// **A slack pass that took everything it could take forgets the
     /// entity, a shared boundary piece notwithstanding.** The piece another
-    /// file shares is never this file's to take (`Backing::alone`), so
-    /// measured against everything held the file was never empty, and its
+    /// file shares is never this file's to take (`Backing::alone`). So
+    /// measured against everything held, the file was never empty, and its
     /// entity stood for the rest of the process over nothing of its own.
     #[tokio::test]
     async fn a_slack_pass_forgets_an_entity_whose_last_piece_is_shared() {
@@ -5295,12 +5320,12 @@ mod tests {
     /// **A file watched again after its slack pass emptied it is a new play
     /// session, with a draw of its own.**
     ///
-    /// The slack pass takes the draw with the bytes -- it runs once the
-    /// torrent is out of the swarm, whose advertised set the torrent's
-    /// `EndShares` then clears -- and forgets the entity. The next open is a
-    /// fresh start: under a budget that now covers the file, its draw is the
-    /// whole file. And an entity that goes straight to a policy advertises
-    /// its draw and nothing else.
+    /// The slack pass takes the draw with the bytes, and forgets the
+    /// entity. It runs once the torrent is out of the swarm, whose
+    /// advertised set the torrent's `EndShares` then clears. The next open
+    /// is a fresh start. Under a budget that now covers the file, its draw
+    /// is the whole file. And an entity that goes straight to a policy
+    /// advertises its draw and nothing else.
     #[tokio::test]
     async fn a_rewatch_after_the_slack_pass_is_a_new_play_session_with_a_draw_of_its_own() {
         let (backing, owner, budget) = torrent();
@@ -5327,8 +5352,8 @@ mod tests {
         );
         assert!(owner.draws().is_empty(), "and its draw with it");
 
-        // The rewatch, under a budget that covers the file: nothing to
-        // install, and the whole file shared.
+        // The rewatch, under a budget that covers the file. There is
+        // nothing to install, and the whole file is shared.
         budget.set(Some(8 * PIECE), None);
         assert_eq!(play(&owner, &backing, 0).await, InstallOutcome::Unbounded);
         assert_eq!(*backing.advertised.lock(), vec![0..2, 0..8]);
@@ -5361,12 +5386,12 @@ mod tests {
     /// **A pin on a file nobody plays wants it whole again on the slack
     /// pass, because the slack pass is the one that runs over it.**
     ///
-    /// A pinned download nobody is watching is read by the driver as
-    /// [`Mode::Slack`] every tick, so the slack pass's pin exit has to want
+    /// The driver reads a pinned download nobody is watching as
+    /// [`Mode::Slack`] every tick. So the slack pass's pin exit has to want
     /// the pieces back itself. The pin's own install only clears the policy
     /// when the file is opened, and an offline download is pinned to be
-    /// fetched *without* being opened -- without this, the pieces the slack
-    /// pass dropped would stay unwanted, so a download the user asked to
+    /// fetched *without* being opened. Without this, the pieces the slack
+    /// pass dropped would stay unwanted, and a download the user asked to
     /// keep would stand still. What the pin shares is the engine's to
     /// advertise, not the owner's.
     #[tokio::test]
@@ -5389,7 +5414,7 @@ mod tests {
             "a slack pass wants nothing"
         );
 
-        // The user pins the file and does not open it: the next tick reads
+        // The user pins the file and does not open it. The next tick reads
         // it as slack, and that pass is the one that has to put it right.
         backing.reclaim_panics.store(false, Ordering::SeqCst);
         backing.keeps_everything.store(true, Ordering::SeqCst);
@@ -5416,8 +5441,8 @@ mod tests {
     ///
     /// The pin exit runs every tick for as long as the pin stands, and after
     /// the first there is nothing installed to clear. `want_all` is a
-    /// reselect of every piece of the file under the torrent's write lock;
-    /// once is what changes anything, and every two seconds was the cost of
+    /// reselect of every piece of the file under the torrent's write lock.
+    /// Once is what changes anything. Every two seconds was the cost of
     /// asking a question whose answer was already in force.
     #[tokio::test]
     async fn a_pinned_entity_is_wanted_whole_once_and_not_on_every_pass() {
@@ -5452,14 +5477,13 @@ mod tests {
         }
     }
 
-    /// **The driver's two counts come as one reading**: no reader and no
-    /// open for a key with no entity, and then the reads that have
-    /// delivered beside the streams that have opened, off one lock.
+    /// **The driver's two counts come as one reading.** A key with no
+    /// entity has no reader and no open. Then the reads that have delivered
+    /// come beside the streams that have opened, off one lock.
     ///
-    /// What this pins is the values. That they are read under one
-    /// acquisition is the shape of the method -- one guard, two fields --
-    /// and no interleaving a test can construct gets between two reads
-    /// that are not there.
+    /// This pins the values. That they are read under one acquisition is
+    /// the shape of the method (one guard, two fields). No interleaving a
+    /// test can construct gets between two reads that are not there.
     #[tokio::test]
     async fn the_readers_and_the_opens_are_one_reading() {
         let (backing, owner, _budget) = torrent();
@@ -5493,13 +5517,13 @@ mod tests {
 
     /// **An entity a reader is open on is never forgotten, even emptied.**
     ///
-    /// [`Retention::forget_empty`] prunes on a fact -- it holds nothing and
-    /// nobody is reading it -- and both halves are asked under L1 after the
-    /// pass has let go of its own `Arc`. A [`Reader`] that has delivered
-    /// nothing yet is a stream handed out a moment ago, whose first byte
-    /// has not gone out: nothing has observed it, so it does not stop the
-    /// slack pass -- and forgetting the entity under it would leave the
-    /// read with no head and so no window for the pass that follows.
+    /// [`Retention::forget_empty`] prunes on a fact: it holds nothing and
+    /// nobody is reading it. Both halves are asked under L1 after the pass
+    /// has let go of its own `Arc`. A [`Reader`] that has delivered nothing
+    /// yet is a stream handed out a moment ago, whose first byte has not
+    /// gone out. Nothing has observed it, so it does not stop the slack
+    /// pass. But forgetting the entity under it would leave the read with
+    /// no head, and so no window for the pass that follows.
     #[tokio::test]
     async fn an_emptied_entity_a_reader_holds_is_not_forgotten() {
         let (backing, owner, _budget) = torrent();
@@ -5540,10 +5564,11 @@ mod tests {
     /// have concludes nothing** and leaves the policy where it is.
     ///
     /// Each entity has its own head, and only its own bytes reach it. A
-    /// byte noted for file 1 -- before file 0 has a head, or while file 0's
-    /// pass is at its listing -- leaves file 0's head where it was: no head,
-    /// so no listing and nothing concluded; then the head at piece 0, so the
-    /// pass concludes on it as if nothing had happened elsewhere.
+    /// byte noted for file 1 leaves file 0's head where it was, whether it
+    /// lands before file 0 has a head or while file 0's pass is at its
+    /// listing. First there is no head, so no listing and nothing
+    /// concluded. Then the head is at piece 0, so the pass concludes on it
+    /// as if nothing had happened elsewhere.
     #[tokio::test]
     async fn a_byte_of_another_key_moves_no_head_here_and_a_failed_listing_concludes_nothing() {
         let (backing, owner, _budget) = torrent();
@@ -5568,7 +5593,7 @@ mod tests {
             0,
             "a file with no head paid a listing to learn it"
         );
-        // A byte of file 1 lands while file 0's listing runs: file 0's head
+        // A byte of file 1 lands while file 0's listing runs. File 0's head
         // is still piece 0 at the re-read, and the pass concludes on it.
         owner.note_position(&0, (0, 0));
         let (entered, release) = backing.park_held();
@@ -5590,8 +5615,8 @@ mod tests {
         assert_eq!(concluded.reclaimed, 6);
         assert_eq!(owner.holding(&0).unwrap().last_position, Some((0, 0)));
         assert_eq!(backing.reclaims.lock().len(), 1);
-        // And a listing the disk would not give: nothing concluded, nothing
-        // withdrawn, the policy standing.
+        // And a listing the disk would not give. Nothing is concluded,
+        // nothing withdrawn, and the policy stands.
         backing.holds(0..16);
         backing.fail_held.store(true, Ordering::SeqCst);
         let claim = owner.turn(&0).await.expect("the turn");
@@ -5618,8 +5643,8 @@ mod tests {
     }
 
     /// **A budget that changes under a pass replaces the policy on the
-    /// delivered byte, and the pass concludes nothing**: no reclaim call,
-    /// windows unchanged, the new policy standing. And under
+    /// delivered byte, and the pass concludes nothing.** There is no reclaim
+    /// call, the windows are unchanged, and the new policy stands. Under
     /// `Install::OnOpen` the budget is nothing the note looks at.
     #[tokio::test]
     async fn an_install_on_the_delivered_byte_during_a_pass_makes_the_pass_conclude_nothing() {
@@ -5671,7 +5696,7 @@ mod tests {
             "the overtaken pass wrote its policy back over the new one"
         );
         // The byte that decided the new budget was due and found the turn
-        // taken: the refused pass hands its claim on, and the successor
+        // taken. The refused pass hands its claim on, and the successor
         // measures under the new policy from where that byte left the head.
         let again = overtaken
             .again
@@ -5686,10 +5711,10 @@ mod tests {
         assert_eq!(backing.on_disk(), vec![2]);
 
         // The same publish landing during the unlinks rather than the
-        // listing: the re-read has passed, the unlinks stand as refetch cost,
-        // and the conclusion is still not written.
+        // listing. The re-read has passed, the unlinks stand as refetch
+        // cost, and the conclusion is still not written.
         budget.set(Some(4 * PIECE), None);
-        // A publish makes every reader due again, whatever the stride: the
+        // A publish makes every reader due again, whatever the stride. The
         // old `passed_at` described a shape that no longer exists.
         let claim = reader
             .note((0, 2 * PIECE))
@@ -5727,7 +5752,7 @@ mod tests {
             Some(CacheBudget::Bytes(2 * PIECE))
         );
         // And this one too owes the pass its overtaking byte could not
-        // start; the successor writes the first conclusion under the new
+        // start. The successor writes the first conclusion under the new
         // budget.
         let again = outcome.again.expect("owed");
         let successor = owner.pass(&0, &(), again, Mode::Live).await;
@@ -5735,13 +5760,13 @@ mod tests {
         assert_eq!(owner.holding(&0).unwrap().windows, vec![2..6, 5..8, 5..8]);
 
         // A proxy entity has held nothing back, so clearing it asks the
-        // backing for nothing -- and neither does installing on one.
+        // backing for nothing, and neither does installing on one.
         owner.clear(&0).await;
         assert!(owner.holding(&0).unwrap().installed.is_none());
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         assert!(backing.advertised.lock().is_empty());
 
-        // OnOpen: the note carries the byte and nothing else.
+        // Under OnOpen the note carries the byte and nothing else.
         let (_backing, owner, budget) = torrent();
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Installed);
         budget.set(Some(2 * PIECE), None);
@@ -5765,15 +5790,16 @@ mod tests {
     /// **A last byte delivered under a new budget while a pass is at its
     /// listing gets its pass.**
     ///
-    /// The interleaving: the reader's byte at piece 2 claims the turn and
-    /// its pass parks at the listing; a smaller budget is published; the
-    /// body's last byte, piece 6, lands -- it decides the new policy under
-    /// L2, is due (every reader is), tries the turn, finds it taken, and
-    /// the body ends. The pass resumes and refuses at its
-    /// re-read, correctly: it measured for a budget nobody holds. Dropped
-    /// there with no `again`, the claim takes the last byte's pass with it,
-    /// and the tail the fill wrote stays over budget until the grace prunes
-    /// the entity. The owner hands the claim on from the refusal too.
+    /// The interleaving. The reader's byte at piece 2 claims the turn and
+    /// its pass parks at the listing. A smaller budget is published. The
+    /// body's last byte, piece 6, lands. It decides the new policy under
+    /// L2, is due (every reader is), tries the turn and finds it taken, and
+    /// the body ends. The pass resumes and refuses at its re-read,
+    /// correctly, since it measured for a budget nobody holds. Dropped
+    /// there with no `again`, the claim takes the last byte's pass with it.
+    /// The tail the fill wrote then stays over budget until the grace
+    /// prunes the entity. The owner hands the claim on from the refusal
+    /// too.
     #[tokio::test]
     async fn the_last_byte_under_a_new_budget_during_a_refused_pass_gets_its_pass() {
         let (backing, owner, budget) = proxy();
@@ -5823,12 +5849,12 @@ mod tests {
     /// **A listing that fails owes a pass only for a byte that moved a
     /// stride while it failed**, and leaves the reader due where it stood.
     ///
-    /// Nothing was measured, so nothing is written -- not the windows and
+    /// Nothing was measured, so nothing is written: not the windows and
     /// not `passed_at`. But a byte that moved the head a stride during the
     /// failure is the same swallowed byte as during any pass, and is owed
-    /// the same. Asked of the head the pass started from, not of nothing:
-    /// a disk that will not list is asked once per stride, not once per
-    /// byte, and never in a loop.
+    /// the same. It is asked of the head the pass started from, not of
+    /// nothing. So a disk that will not list is asked once per stride, not
+    /// once per byte, and never in a loop.
     #[tokio::test]
     async fn a_failed_listing_owes_a_pass_only_for_a_byte_that_moved_a_stride() {
         let (backing, owner, _budget) = proxy();
@@ -5873,9 +5899,10 @@ mod tests {
     }
 
     /// **An entity nothing bounds is never due, and a pass over it lists
-    /// nothing**: no budget, a budget that covers it, a domain no policy can
-    /// be sized for. A key with no entity remembers no byte and has nothing
-    /// to pass over, and an entity keeps the domain it was made with.
+    /// nothing.** That covers no budget, a budget that covers it, and a
+    /// domain no policy can be sized for. A key with no entity remembers no
+    /// byte and has nothing to pass over. An entity keeps the domain it was
+    /// made with.
     #[tokio::test]
     async fn an_unbounded_entity_is_never_due_and_a_pass_over_it_lists_nothing() {
         let (backing, owner, budget) = proxy();
@@ -5917,7 +5944,7 @@ mod tests {
         );
         owner.entity(0, domain(0, 0..4));
         assert_eq!(owner.holding(&0).unwrap().domain, domain(0, 0..8));
-        // The budget covers the file: decided, and nothing installed.
+        // The budget covers the file: decided, with nothing installed.
         budget.set(Some(8 * PIECE), None);
         assert!(reader.note((0, PIECE)).is_none());
         backing.read_from(PIECE, 1);
@@ -5937,11 +5964,11 @@ mod tests {
     }
 
     /// **What `install` answers when it installs nothing**: no budget, a
-    /// budget that covers the file, a want that resolves to nothing, a pin;
-    /// `Kept` only under the same budget, `Resized` under another over the
-    /// same domain; the domain resolved afresh under the turn -- and what the
-    /// play session shares decided by its first open, whatever the later
-    /// ones find.
+    /// budget that covers the file, a want that resolves to nothing, a pin.
+    /// It answers `Kept` only under the same budget, and `Resized` under
+    /// another over the same domain. The domain is resolved afresh under
+    /// the turn. What the play session shares is decided by its first open,
+    /// whatever the later ones find.
     #[tokio::test]
     async fn an_install_that_bounds_nothing_says_so() {
         let (backing, owner, budget) = torrent();
@@ -5959,7 +5986,7 @@ mod tests {
             "a budget that covers the file installed a policy"
         );
         assert!(owner.holding(&0).unwrap().installed.is_none());
-        // A budget that covers the file shares all of it -- on a file whose
+        // A budget that covers the file shares all of it, on a file whose
         // session has not drawn yet.
         assert_eq!(play(&owner, &backing, 1).await, InstallOutcome::Unbounded);
         budget.set(Some(4 * PIECE), None);
@@ -6005,12 +6032,12 @@ mod tests {
     /// **A pass commits the draw it holds and withdraws nothing the disk
     /// lost.**
     ///
-    /// The torrent's share: the draw was advertised at the install, and a
-    /// pass that finds a piece of it held commits it; a committed piece the
+    /// The torrent's share. The draw was advertised at the install, and a
+    /// pass that finds a piece of it held commits it. A committed piece the
     /// disk no longer holds leaves the committed set, and nothing is said to
-    /// the backend for it -- it announces only what it has, and there is no
-    /// un-Have to send. The tick is the torrent's trigger, so a head that
-    /// moved during the reclaim arms nothing.
+    /// the backend for it. The backend announces only what it has, and
+    /// there is no un-Have to send. The tick is the torrent's trigger, so a
+    /// head that moved during the reclaim arms nothing.
     #[tokio::test]
     async fn a_pass_commits_the_draw_it_holds_and_withdraws_nothing_the_disk_lost() {
         let (backing, owner, _budget) = torrent();
@@ -6060,7 +6087,7 @@ mod tests {
             vec![0..2],
             "nothing was withdrawn for the piece the disk lost"
         );
-        // It coming back commits it again: it is still the draw's.
+        // Its coming back commits it again, since it is still the draw's.
         backing.holds([0]);
         let claim = owner.turn(&0).await.expect("the turn");
         let fourth = owner
@@ -6080,10 +6107,11 @@ mod tests {
     /// would reclaim what the old one had committed and announced.
     ///
     /// **A bigger budget draws nothing more**, because the draw is the play
-    /// session's and was sized against its read-ahead before it began; **and
-    /// a smaller one takes back nothing**, because there is no un-have. So
-    /// the committed set is carried whole, over the new capacity and all,
-    /// and those bytes are the price of having said we had them.
+    /// session's and was sized against its read-ahead before it began.
+    /// **And a smaller one takes back nothing**, because there is no
+    /// un-have. So the committed set is carried whole, over the new
+    /// capacity and all. Those bytes are the price of having said we had
+    /// them.
     #[tokio::test]
     async fn a_budget_that_moved_resizes_the_policy_and_keeps_what_it_committed() {
         let (backing, owner, budget) = torrent();
@@ -6106,7 +6134,7 @@ mod tests {
         assert_eq!(committed(&owner), vec![0, 1]);
         assert_eq!(*backing.advertised.lock(), vec![0..2]);
 
-        // A roomier budget would draw a third piece, 5, of its own: it does
+        // A roomier budget would draw a third piece, 5, of its own. It does
         // not, and piece 5 arriving is a piece like any other.
         budget.set(Some(6 * PIECE), None);
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Resized);
@@ -6145,9 +6173,9 @@ mod tests {
         );
     }
 
-    /// **A reader reports what it holds**: its promise shrinks from the
-    /// front as bytes go out and an empty promise records nothing; a seek
-    /// back a stride is as due as playing on; the holding says what is
+    /// **A reader reports what it holds.** Its promise shrinks from the
+    /// front as bytes go out, and an empty promise records nothing. A seek
+    /// back a stride is as due as playing on. The holding says what is
     /// promised, whether a playhead is live, and the extent.
     #[tokio::test]
     async fn a_reader_reports_what_it_holds() {
@@ -6184,8 +6212,8 @@ mod tests {
     }
 
     /// **A byte in file B between two runs of file A's reclaim leaves A's
-    /// pass concluding normally on A's own head**: the byte is B's, A's
-    /// head is where it was, A's door still refuses exactly what A's pass
+    /// pass concluding normally on A's own head.** The byte is B's, and A's
+    /// head is where it was. A's door still refuses exactly what A's pass
     /// published, and the second run is asked about and taken.
     #[tokio::test]
     async fn a_byte_in_another_file_between_the_runs_of_a_reclaim_leaves_it_running() {
@@ -6222,11 +6250,11 @@ mod tests {
     }
 
     /// **Two readers on one entity are both covered by what the door
-    /// refuses.** The entity's head is the last byte either delivered, and
-    /// what the door refuses is the set the pass published, which covers
-    /// what every consumer of the entity is being fetched for; it stands
-    /// for the length of the pass, so a reader that ends mid-reclaim does
-    /// not open its region up.
+    /// refuses.** The entity's head is the last byte either delivered. What
+    /// the door refuses is the set the pass published, which covers what
+    /// every consumer of the entity is being fetched for. It stands for the
+    /// length of the pass, so a reader that ends mid-reclaim does not open
+    /// its region up.
     #[tokio::test]
     async fn the_torrents_door_answers_a_window_per_open_reader() {
         let (backing, owner, _budget) = torrent();
@@ -6274,7 +6302,7 @@ mod tests {
             .concluded
             .expect("a pass");
         // What the door refuses is what the pass published, and it stands
-        // for the length of the pass: a reader ending mid-reclaim does not
+        // for the length of the pass. A reader ending mid-reclaim does not
         // open its region up, because the promise not to delete was made
         // before the unlinks began.
         let answers = answers.lock();
@@ -6334,12 +6362,12 @@ mod tests {
     /// **A budget that shrinks under an open reader does not shrink the
     /// window under that reader's lookahead.**
     ///
-    /// The stream's lookahead is fixed when the reader opens and the fork
-    /// has no setter for it, while the budget is republished every sixty
-    /// seconds from the volume's free space. So what a pass asks for and
-    /// what it refuses to unlink both have to cover what an open reader was
-    /// granted -- the backend will not forget a piece inside a live stream's
-    /// lookahead anyway, so a pass that asked would be refused and the disk
+    /// The stream's lookahead is fixed when the reader opens, and the fork
+    /// has no setter for it. The budget is republished every sixty seconds
+    /// from the volume's free space. So what a pass asks for, and what it
+    /// refuses to unlink, both have to cover what an open reader was
+    /// granted. The backend will not forget a piece inside a live stream's
+    /// lookahead anyway. A pass that asked would be refused, and the disk
     /// would grow by exactly that much, for the life of the stream.
     #[tokio::test]
     async fn a_budget_that_shrinks_under_a_reader_keeps_its_lookahead_inside_the_window() {
@@ -6355,7 +6383,7 @@ mod tests {
                 },
             )
             .expect("the entity the install made");
-        // The volume filled: half the budget, published under the reader.
+        // The volume filled. Half the budget is published under the reader.
         budget.set(Some(2 * PIECE), None);
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Resized);
 
@@ -6381,14 +6409,14 @@ mod tests {
 
     /// **A lookahead the stream has already fetched is on the disk once.**
     ///
-    /// The margin is the room the fill needs before the next pass, and an
-    /// open stream's part of that is what its lookahead has still to bring.
+    /// The margin is the room the fill needs before the next pass. An open
+    /// stream's part of that is what its lookahead has still to bring.
     /// Counted as the whole lookahead, every piece of it already fetched
-    /// was priced twice -- in what is held, and again as room still owed --
-    /// and the disk settled a lookahead short of the cap. Under `Maximum`
-    /// a first open's lookahead is the cap itself, so that was an
-    /// allowance of nothing: every stream at its floor and all of the
-    /// scrub-back reclaimed on every pass.
+    /// was priced twice: in what is held, and again as room still owed. The
+    /// disk settled a lookahead short of the cap. Under `Maximum` a first
+    /// open's lookahead is the cap itself, so that was an allowance of
+    /// nothing: every stream at its floor, and all of the scrub-back
+    /// reclaimed on every pass.
     #[tokio::test]
     async fn a_fetched_lookahead_is_not_counted_again_as_room_the_fill_needs() {
         // The proxy's shape, so no committed set stands in the way of
@@ -6421,13 +6449,13 @@ mod tests {
             let claim = owner.turn(&0).await.expect("the turn");
             owner.pass_at(&0, &(), claim, Mode::Live, now).await;
         }
-        // The cap less a stride of room: the lookahead the fill still owes
+        // The cap less a stride of room. The lookahead the fill still owes
         // is none, so the stride is all the margin there is.
         let left = backing.on_disk();
         assert_eq!(left.len(), 9, "where the disk settled: {left:?}");
 
-        // And what it does still owe is room kept for it: the file back on
-        // the disk but for two pieces of the lookahead, so the rest of it
+        // And what it does still owe is room kept for it. The file is back
+        // on the disk but for two pieces of the lookahead, so the rest of it
         // makes room for those.
         backing.holds(0..16);
         backing
@@ -6449,14 +6477,14 @@ mod tests {
     /// **A probe's window is kept and not fetched.**
     ///
     /// The other half of the same field bug. A live probe never claimed the
-    /// entity's head, but it did put a window of its own into the list the
+    /// entity's head. But it did put a window of its own into the list the
     /// pass hands [`Backing::want`], and that list is an order to the
-    /// swarm: a sixteen-megabyte read of the container index at the tail
-    /// ordered the whole forward reach of a window round it -- a hundred
-    /// and thirty-eight megabytes on the device this was measured on --
-    /// which the next pass reclaimed again. So the two lists are split: the
-    /// probe is in the one that says "do not delete this" and out of the
-    /// one that says "fetch this".
+    /// swarm. A sixteen-megabyte read of the container index at the tail
+    /// ordered the whole forward reach of a window round it: a hundred and
+    /// thirty-eight megabytes on the device this was measured on. The next
+    /// pass reclaimed it again. So the two lists are split. The probe is in
+    /// the one that says "do not delete this", and out of the one that says
+    /// "fetch this".
     #[tokio::test]
     async fn a_live_probe_keeps_its_window_without_ordering_it_fetched() {
         let (backing, owner, _budget) = torrent();
@@ -6481,7 +6509,7 @@ mod tests {
             .expect("a pass");
         assert_eq!(
             outcome.windows,
-            // One run of disk, so one consumer: what a reader is depends on
+            // One run of disk, so one consumer. What a reader is depends on
             // what is between the reads, and here the whole file is held.
             vec![7..8],
             "the consumer both reads belong to, which is the run they are in"
@@ -6508,19 +6536,19 @@ mod tests {
     ///
     /// This is the other half of the same tick, and on a cold open it is
     /// the whole of it. The policy is installed before the reader opens
-    /// ([`Install::OnOpen`]), so between the open and the first byte -- a
-    /// whole piece, tens of seconds on a slow swarm -- the entity has a
-    /// policy and no head: without a promise, every pass over it concludes
-    /// nothing and nothing trims the want-set, so the swarm fills the disk
-    /// with the file in whatever order it likes while the player shows
-    /// 0:00 (measured on a television: 180 MB fetched and 54 MB kept
-    /// before the first frame).
+    /// ([`Install::OnOpen`]). So between the open and the first byte (a
+    /// whole piece, tens of seconds on a slow swarm), the entity has a
+    /// policy and no head. Without a promise, every pass over it concludes
+    /// nothing and nothing trims the want-set. The swarm then fills the
+    /// disk with the file in whatever order it likes while the player shows
+    /// 0:00. That was measured on a television: 180 MB fetched and 54 MB
+    /// kept before the first frame.
     ///
-    /// What keeps it is the promise, which is what a parked read makes:
-    /// `poll_read` returning `Pending` promises the piece it is waiting on,
-    /// and a promise is published into the set the door reads. A handle that
-    /// has neither promised nor delivered has asked for nothing, and there
-    /// is nothing for a pass to keep.
+    /// The promise keeps it, and a parked read makes one. `poll_read`
+    /// returning `Pending` promises the piece it is waiting on, and a
+    /// promise is published into the set the door reads. A handle that has
+    /// neither promised nor delivered has asked for nothing, and there is
+    /// nothing for a pass to keep.
     #[tokio::test]
     async fn a_read_parked_on_its_first_piece_keeps_what_it_promised() {
         let (backing, owner, _budget) = torrent();
@@ -6563,10 +6591,10 @@ mod tests {
     }
 
     /// A sixteen-piece film under a budget of eight, its viewer reading at
-    /// the top: the viewer's window is 0..3, the disk may hold seven pieces
-    /// -- the budget less a stride of room -- and the play session's draw
-    /// is pieces 0, 1, 5 and 9, which the tests over this keep off the
-    /// disk past the first two so that what is held by nothing is plain.
+    /// the top. The viewer's window is 0..3. The disk may hold seven pieces:
+    /// the budget less a stride of room. The play session's draw is pieces
+    /// 0, 1, 5 and 9. The tests over this keep the draw off the disk past
+    /// the first two, so that what is held by nothing is plain.
     async fn film_with_a_viewer_at_the_top() -> (
         Arc<Torrent>,
         Arc<Retention<Torrent>>,
@@ -6603,25 +6631,26 @@ mod tests {
 
     /// **What an asker fetched is cached data like any other once it has
     /// moved on: held by nothing, and given back in the one order
-    /// everything is given back in.** A pre-want's pieces, in the scenario
-    /// they are for -- a viewer at the top of the film, an asker fetching
-    /// further in.
+    /// everything is given back in.** These are a pre-want's pieces, in the
+    /// scenario they are for: a viewer at the top of the film, an asker
+    /// fetching further in.
     ///
-    /// While the asker is asking for a piece, no reclaim is offered it: the
-    /// backend will not forget what a stream is asking for. The moment it
-    /// asks for something else, what it left is ranked by when it arrived,
-    /// exactly as a piece that was read is ranked by when it was read: not
-    /// first to go -- data that arrived before it goes first -- and not
-    /// last -- data that arrived after it outlives it. The viewer's window
-    /// and the draw are never among what goes, and the disk is never left
-    /// over what it may hold.
+    /// While the asker is asking for a piece, no reclaim is offered it,
+    /// because the backend will not forget what a stream is asking for. The
+    /// moment it asks for something else, what it left is ranked by when it
+    /// arrived, exactly as a piece that was read is ranked by when it was
+    /// read. It is not first to go, since data that arrived before it goes
+    /// first. It is not last, since data that arrived after it outlives it.
+    /// The viewer's window and the draw are never among what goes, and the
+    /// disk is never left over what it may hold.
     #[tokio::test]
     async fn what_an_asker_fetched_is_cached_data_like_any_other_once_it_has_moved_on() {
         let (backing, owner, _budget, _viewer) = film_with_a_viewer_at_the_top().await;
         let t0 = Instant::now();
         let at = |secs: u64| t0 + Duration::from_secs(secs);
         // The viewer's three pieces, and one that has been lying on the
-        // disk since before anything here: never read, held by nothing.
+        // disk since before anything here. It was never read and is held by
+        // nothing.
         *backing.held.lock() = [0, 1, 2, 6].into_iter().collect();
         pass_with_the_viewer_reading(&backing, &owner, at(0)).await;
 
@@ -6639,9 +6668,9 @@ mod tests {
         pass_with_the_viewer_reading(&backing, &owner, at(10)).await;
         asker.asks(12..14);
         backing.holds([12, 13]);
-        // Eight on a disk that may hold seven: one has to go, and it is
-        // the oldest thing nothing holds -- the piece that was there first,
-        // not the asker's, which arrived after it.
+        // Eight on a disk that may hold seven, so one has to go. It is the
+        // oldest thing nothing holds: the piece that was there first, not
+        // the asker's, which arrived after it.
         pass_with_the_viewer_reading(&backing, &owner, at(20)).await;
         assert_eq!(
             backing.on_disk(),
@@ -6649,10 +6678,10 @@ mod tests {
             "older cached data went before what the asker fetched"
         );
 
-        // On again -- back, this time, as a walk outward goes -- and
-        // something else arrives with its piece. Nine on the disk: two have
-        // to go, and now the oldest thing nothing holds is what the asker
-        // fetched first.
+        // On again (back, this time, as a walk outward goes), and something
+        // else arrives with its piece. Nine on the disk, so two have to go.
+        // Now the oldest thing nothing holds is what the asker fetched
+        // first.
         asker.asks(7..8);
         backing.holds([7, 14]);
         pass_with_the_viewer_reading(&backing, &owner, at(30)).await;
@@ -6665,9 +6694,9 @@ mod tests {
 
         // And what it is asking for is not offered while it asks. Three
         // more arrive, so three have to go: the asker's second pair, and
-        // then, of the two that came together, not the one its stream is
-        // on -- the first in the file, which is how a tie goes -- but the
-        // other.
+        // then one of the two that came together. That is not the one its
+        // stream is on, though it is the first in the file, which is how a
+        // tie goes. It is the other.
         backing.holds([6, 8, 15]);
         pass_with_the_viewer_reading(&backing, &owner, at(40)).await;
         assert_eq!(
@@ -6675,8 +6704,8 @@ mod tests {
             vec![0, 1, 2, 6, 7, 8, 15],
             "a piece a stream is asking for was offered to the reclaim"
         );
-        // Let go, that piece is the oldest of what is left, and the first
-        // to go.
+        // Once let go, that piece is the oldest of what is left, and the
+        // first to go.
         drop(asker);
         assert!(owner.holding(&0).expect("a holding").asking.is_empty());
         backing.holds([10, 11]);
@@ -6689,17 +6718,17 @@ mod tests {
     }
 
     /// **What an asker has yet to receive is room the disk keeps for it,
-    /// and it is never a reader's piece that makes that room**: a reach
+    /// and it is never a reader's piece that makes that room.** A reach
     /// that has not arrived is fill to come, as a reading stream's
-    /// lookahead is, so the pass makes the room before the pieces land and
-    /// the disk is not over its line when they do -- and what goes for it
-    /// is what nothing holds, never the viewer's window nor what a parked
-    /// read was promised, however old.
+    /// lookahead is. So the pass makes the room before the pieces land, and
+    /// the disk is not over its line when they do. What goes for it is what
+    /// nothing holds, never the viewer's window nor what a parked read was
+    /// promised, however old.
     #[tokio::test]
     async fn what_an_asker_is_still_to_receive_is_room_kept_for_it() {
         let (backing, owner, _budget, _viewer) = film_with_a_viewer_at_the_top().await;
         let t0 = Instant::now();
-        // Seven on the disk, which is what it may hold; a second read is
+        // Seven on the disk, which is what it may hold. A second read is
         // parked on the oldest of them outside the viewer's window.
         *backing.held.lock() = [0, 1, 2, 4, 6, 7, 8].into_iter().collect();
         let parked = owner
@@ -6724,9 +6753,10 @@ mod tests {
     }
 
     /// **An asker may ask for what could be kept beside everything the
-    /// readers hold, and no more** ([`Room`]): what the entity may hold
-    /// less the viewer's window, the draw, and every promise and lookahead
-    /// of an open read -- measured by each pass, and by nothing else.
+    /// readers hold, and no more** ([`Room`]). That is what the entity may
+    /// hold less the viewer's window, the draw, and every promise and
+    /// lookahead of an open read. Each pass measures it, and nothing else
+    /// does.
     #[tokio::test]
     async fn an_askers_room_is_what_the_readers_do_not_hold() {
         let (backing, owner, budget, viewer) = film_with_a_viewer_at_the_top().await;
@@ -6739,8 +6769,8 @@ mod tests {
             Room::Unmeasured,
             "a policy bounds the film and no pass has measured it"
         );
-        // Twice: the first pass is the one that commits what of the draw
-        // is on the disk, and the second measures with it committed.
+        // Twice. The first pass commits what of the draw is on the disk,
+        // and the second measures with it committed.
         pass_with_the_viewer_reading(&backing, &owner, t0).await;
         pass_with_the_viewer_reading(&backing, &owner, t0).await;
         assert_eq!(
@@ -6748,22 +6778,22 @@ mod tests {
             Room::Pieces(3),
             "seven the disk may hold; three are the viewer's and one more is committed"
         );
-        // What the asker itself is asking for takes nothing from its room:
-        // the room is for it.
+        // What the asker itself is asking for takes nothing from its room,
+        // since the room is for it.
         asker.asks(12..14);
         pass_with_the_viewer_reading(&backing, &owner, t0).await;
         assert_eq!(asker.room(), Room::Pieces(3));
 
-        // A second read parks further in, promising two pieces: all but
-        // one of the rest is spoken for.
+        // A second read parks further in, promising two pieces. All but one
+        // of the rest is spoken for.
         let seeking = owner
             .reader_on(&0, (0, 8 * PIECE), Buffering::default())
             .expect("the same entity");
         seeking.promises(8..10);
         pass_with_the_viewer_reading(&backing, &owner, t0).await;
         assert_eq!(asker.room(), Room::Pieces(1));
-        // And a viewer whose own stream reaches further leaves none: what
-        // eviction cannot give, an asker may not ask for.
+        // And a viewer whose own stream reaches further leaves none. An
+        // asker may not ask for what eviction cannot give.
         drop(viewer);
         let _viewer = owner
             .reader_on(
@@ -6779,7 +6809,7 @@ mod tests {
         assert_eq!(asker.room(), Room::Pieces(0));
         drop(seeking);
 
-        // A new budget is a new policy: what was measured under the old one
+        // A new budget is a new policy. What was measured under the old one
         // says nothing until a pass has measured this one.
         budget.set(Some(10 * PIECE), None);
         assert_eq!(owner.install(0, 0).await, InstallOutcome::Resized);
@@ -6794,10 +6824,11 @@ mod tests {
     }
 
     /// **And a parked read is one of the windows, not only the pass's
-    /// own.** The seek: the response the player has just opened is waiting
-    /// for its first piece while the one it is abandoning still delivers,
-    /// so the entity's head is the old response's and the new one is among
-    /// the others. A window per head, and the parked head is a head.
+    /// own.** Take the seek. The response the player has just opened is
+    /// waiting for its first piece while the one it is abandoning still
+    /// delivers. So the entity's head is the old response's, and the new
+    /// one is among the others. There is a window per head, and the parked
+    /// head is a head.
     #[tokio::test]
     async fn a_parked_read_beside_a_delivering_one_gets_a_window_of_its_own() {
         let (backing, owner, _budget) = torrent();
@@ -6833,10 +6864,10 @@ mod tests {
     }
 
     /// **The paused film, which is why a closed playback read leaves its
-    /// position behind.** Nothing is open, nothing is delivering, and the
-    /// window still belongs where the viewer stopped -- so the entity's
-    /// head falls back to the last playback byte and a pass keeps drawing
-    /// the same window over it, tick after tick.
+    /// position behind.** Nothing is open and nothing is delivering. The
+    /// window still belongs where the viewer stopped. So the entity's head
+    /// falls back to the last playback byte, and a pass keeps drawing the
+    /// same window over it, tick after tick.
     #[tokio::test]
     async fn a_paused_film_with_no_reader_open_keeps_the_window_where_it_stopped() {
         let (backing, owner, _budget) = torrent();
@@ -6881,13 +6912,12 @@ mod tests {
 
     /// **A film's length is not a playhead and does not go stale with one.**
     ///
-    /// It is what a cast can state and nothing else: the receiver does the
+    /// It is what a cast can state, and nothing else. The receiver does the
     /// reading and reports seconds, which do not convert to a byte offset
-    /// without a constant bitrate. The length *is* the bitrate, so the
-    /// window is sized exactly even though where it sits is left to the
-    /// reads -- and it keeps sizing it when the viewer stops reporting a
-    /// position, because a film does not get shorter while nobody is
-    /// looking.
+    /// without a constant bitrate. The length *is* the bitrate. So the
+    /// window is sized exactly, even though where it sits is left to the
+    /// reads. It keeps sizing it when the viewer stops reporting a position,
+    /// because a film does not get shorter while nobody is looking.
     #[tokio::test]
     async fn a_films_length_sizes_the_window_with_no_playhead_at_all() {
         let (_backing, owner, budget) = torrent();
@@ -6905,7 +6935,7 @@ mod tests {
             )
             .expect("the entity the install made");
 
-        // Eight pieces of a thousand bytes over eighty seconds: a hundred
+        // Eight pieces of a thousand bytes over eighty seconds is a hundred
         // bytes a second, and ten seconds of it is one piece. No position
         // was ever reported.
         owner.note_duration(&0, std::time::Duration::from_secs(80));
@@ -6926,13 +6956,13 @@ mod tests {
     }
 
     /// **While a read is parked, the want-set is a small window round what
-    /// it is waiting for** -- not the configured one, and not one piece.
+    /// it is waiting for.** It is not the configured one, and not one piece.
     ///
     /// Not the configured one, because a swarm spread over two hundred
     /// pieces takes its time over the three a first frame needs. Not one
     /// piece, because librqbit reserves a piece to exactly one peer, so a
-    /// want-set of one is a download from one: 117 kB/s in the field where
-    /// the same swarm gave 3.1 MB/s a minute later.
+    /// want-set of one is a download from one. That gave 117 kB/s in the
+    /// field, where the same swarm gave 3.1 MB/s a minute later.
     #[tokio::test]
     async fn a_parked_read_gets_a_small_window_round_what_it_waits_for() {
         let (backing, owner, _budget) = torrent();
@@ -6959,7 +6989,7 @@ mod tests {
     /// **And the configured window is wanted again the moment it arrives.**
     ///
     /// The narrowing ends by itself, which is why it can be as blunt as it
-    /// is: a promise is made by a parked read and cleared by the byte that
+    /// is. A promise is made by a parked read and cleared by the byte that
     /// unparks it, so nothing has to decide when start-up is over.
     #[tokio::test]
     async fn a_promise_the_disk_can_meet_leaves_the_windows_wanted() {
@@ -6984,8 +7014,8 @@ mod tests {
 
     /// **An entity nothing has ever played is still bounded.** A download,
     /// or a probe, on a file no viewer has opened is a live read like any
-    /// other -- and an entity with no head is one no pass measures, so
-    /// nothing would trim its want-set or take anything off its disk.
+    /// other. An entity with no head is one no pass measures, so nothing
+    /// would trim its want-set or take anything off its disk.
     #[tokio::test]
     async fn a_file_only_a_probe_is_reading_is_bounded_round_the_probe() {
         let (backing, owner, _budget) = torrent();
@@ -7013,20 +7043,21 @@ mod tests {
     /// **A read that opens while the reclaim is running is a window at the
     /// door, from its open and not from its first byte.**
     ///
-    /// The door is asked at every unlink because a read can open between
-    /// the decision and the unlink -- a pass over a 4 MiB piece on a slow
+    /// The door is asked at every unlink, because a read can open between
+    /// the decision and the unlink. A pass over a 4 MiB piece on a slow
     /// disk is not instant, and mpv opens its read of the container index
     /// while the film is already streaming. That read has delivered
-    /// nothing, so a door that asks for a *playhead* does not see it at
+    /// nothing. So a door that asks for a *playhead* does not see it at
     /// all, cuts no run round it, refuses no index of it, and unlinks the
     /// piece it is parked on waiting for. Asking for its head instead is
-    /// the whole of the difference, and it is the reason both readings in
-    /// [`Door`] say `head()`.
+    /// the whole of the difference. It is why both readings in [`Door`] say
+    /// `head()`.
     ///
-    /// A probe deliberately, and not a second player: a parked *playback*
-    /// read is the entity's head as well ([`State::playing_head`]), so the
-    /// door's first window would cover it however the readers were asked
-    /// about. Nothing but the per-reader reading protects a parked probe.
+    /// It is a probe deliberately, and not a second player. A parked
+    /// *playback* read is the entity's head as well
+    /// ([`State::playing_head`]), so the door's first window would cover it
+    /// however the readers were asked about. Only the per-reader reading
+    /// protects a parked probe.
     #[tokio::test]
     async fn a_read_that_opens_under_the_reclaim_is_a_window_at_the_door() {
         let (backing, owner, _budget) = torrent();
@@ -7042,7 +7073,7 @@ mod tests {
 
         // mpv's read of the Cues, opened after the pass had decided what to
         // take and while it is taking it. It is parked on the last piece of
-        // the file: it has promised nothing and delivered nothing.
+        // the file. It has promised nothing and delivered nothing.
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let held_open = Arc::new(parking_lot::Mutex::new(None));
         let hook: Hook<TorrentSide> = Box::new({
@@ -7070,9 +7101,9 @@ mod tests {
             outcome.windows
         );
         // The read that opened mid-reclaim is not in what the pass
-        // published -- it did not exist when the pass published it -- and
-        // the pieces it is parked on are refused only once it promises
-        // them, which is what a parked read does.
+        // published, since it did not exist when the pass published it. The
+        // pieces it is parked on are refused only once it promises them,
+        // which is what a parked read does.
         assert!(
             !seen.lock()[0].is_empty(),
             "the door refused nothing the pass had published"
@@ -7087,7 +7118,7 @@ mod tests {
     }
 
     /// **The test hook runs twice per pass, with the turn held and no owner
-    /// lock**: a note inside it finds the pass running, and a holding can
+    /// lock.** A note inside it finds the pass running, and a holding can
     /// be read.
     #[tokio::test]
     async fn the_hook_runs_before_the_listing_and_before_the_reclaim_with_no_owner_lock() {
@@ -7124,14 +7155,14 @@ mod tests {
     }
 
     /// **An install parked inside `advertise` under the turn blocks
-    /// nothing that must not wait on it**: a note, a note_position, a pin
-    /// and a holding all land while the backend is being asked, which is
-    /// the module doc's witness for deadlock-freedom, at the owner.
+    /// nothing that must not wait on it.** A note, a note_position, a pin
+    /// and a holding all land while the backend is being asked. This is the
+    /// module doc's witness for deadlock-freedom, at the owner.
     #[tokio::test]
     async fn a_pass_parked_inside_advertise_blocks_no_note_pin_or_holding() {
         let (backing, owner, _budget) = torrent();
         let (entered, release) = backing.park_advertise();
-        // The viewer's open, with the film's length known: its draw is
+        // The viewer's open, with the film's length known. Its draw is
         // decided and advertised at the open.
         *backing.playing.lock() = Some(0);
         owner.entity(0, domain(0, 0..8));
@@ -7167,11 +7198,11 @@ mod tests {
 
     /// **A cleared entity is decided afresh on its next delivered byte.**
     ///
-    /// `clear` forgets the policy; had it left `decided` standing, every
-    /// later note would find it equal to the published budget, skip the
-    /// decide, and the entity would be unbounded until the budget's *value*
-    /// changed -- the hole this module exists to close, reopened by its own
-    /// clear.
+    /// `clear` forgets the policy. Had it left `decided` standing, every
+    /// later note would find it equal to the published budget and skip the
+    /// decide. The entity would then be unbounded until the budget's
+    /// *value* changed. That is the hole this module exists to close,
+    /// reopened by its own clear.
     #[tokio::test]
     async fn a_cleared_entity_is_decided_afresh_on_the_next_delivered_byte() {
         let (backing, owner, _budget) = proxy();
@@ -7196,11 +7227,11 @@ mod tests {
 
     /// **A pass overtaken at its reclaim leaves the reader due.**
     ///
-    /// The byte that replaced the policy under the pass reset `passed_at`
-    /// so every reader is due under the new shape; the pass's conclusion
-    /// must not write the old measurement back over that, or a reader that
-    /// has not travelled a whole *new* stride is never due and the new
-    /// budget is never measured.
+    /// The byte that replaced the policy under the pass reset `passed_at`,
+    /// so every reader is due under the new shape. The pass's conclusion
+    /// must not write the old measurement back over that. Otherwise a
+    /// reader that has not travelled a whole *new* stride is never due, and
+    /// the new budget is never measured.
     #[tokio::test]
     async fn a_pass_overtaken_at_its_reclaim_leaves_the_reader_due() {
         let (backing, owner, budget) = proxy();
@@ -7215,9 +7246,9 @@ mod tests {
         backing.read_from(5 * PIECE, 1);
         release.send(()).expect("the parked pass");
         let outcome = pass.await.expect("joined");
-        // The pass hands its claim on (the replaced policy is owed a pass);
-        // dropped unused here, the reader itself must still be due on the
-        // byte it delivered under the new budget.
+        // The pass hands its claim on (the replaced policy is owed a pass).
+        // With that dropped unused here, the reader itself must still be due
+        // on the byte it delivered under the new budget.
         drop(outcome);
         assert!(
             reader.note((0, 5 * PIECE)).is_some(),
@@ -7233,7 +7264,7 @@ mod tests {
     /// scenario fake each carried their own copy of this arithmetic, and
     /// the scenarios tested the fake's. What this entity may hold is the
     /// smaller of the configured cap and what it holds plus the volume's
-    /// headroom, less the margin the fill needs; an unknown budget over an
+    /// headroom, less the margin the fill needs. An unknown budget over an
     /// unread volume is nothing.
     #[test]
     fn the_allowance_is_the_smaller_of_cap_and_volume_less_the_margin() {
@@ -7277,7 +7308,7 @@ mod tests {
             "nothing stated and nothing read is not a licence"
         );
         // Ten pieces of a thousand bytes held, three of them committed,
-        // under a cap of six pieces: the window may be three.
+        // under a cap of six pieces. The window may be three.
         let mut committed = asking(CacheBudget::Bytes(6_000), None, 0);
         committed.committed = vec![0..2, 5..6];
         assert_eq!(
@@ -7297,7 +7328,7 @@ mod tests {
     /// not the newest reader's.**
     ///
     /// mpv keeps an index crawler open beside the viewer and reopens it
-    /// about once a second, so the newest reader with a head is regularly
+    /// about once a second. So the newest reader with a head is regularly
     /// one parked at the tail. The detector tells them apart by what they
     /// eat, and the holding reports its answer.
     #[tokio::test]
@@ -7339,12 +7370,12 @@ mod tests {
     /// it.**
     ///
     /// The backing publishes what may not be unlinked with no owner lock
-    /// held, and a read can park and promise a piece between the pass's
-    /// reading of the promises and that publication; the publication is a
+    /// held. A read can park and promise a piece between the pass's reading
+    /// of the promises and that publication. The publication is a
     /// whole-word store and overwrites the promise's bit. Step 5 re-holds
-    /// every live promise under the entity's lock, and that is the only
-    /// thing that keeps a chunk out of a body a player has been promised
-    /// the length of.
+    /// every live promise under the entity's lock. That is the only thing
+    /// that keeps a chunk out of a body a player has been promised the
+    /// length of.
     #[tokio::test]
     async fn a_promise_made_under_the_publication_is_re_held_after_it() {
         let (backing, owner, _budget) = proxy();
@@ -7377,11 +7408,11 @@ mod tests {
 
     /// **The pass runs on the clock it is handed.**
     ///
-    /// The scenario harness stamps its reads from its own clock, `t0`
-    /// plus the beat's offset, and ran the pass on the wall clock beside
-    /// them: to the detector no time ever passed, so no stream in any
-    /// scenario ever idled and no report was ever due. A pass handed
-    /// `t0 + 60 s` after a read at `t0` finds that stream gone.
+    /// The scenario harness stamps its reads from its own clock, `t0` plus
+    /// the beat's offset. It ran the pass on the wall clock beside them. To
+    /// the detector no time ever passed, so no stream in any scenario ever
+    /// idled and no report was ever due. A pass handed `t0 + 60 s` after a
+    /// read at `t0` finds that stream gone.
     #[tokio::test]
     async fn the_pass_measures_against_the_clock_it_is_handed() {
         let (backing, owner, _budget) = torrent();
@@ -7413,10 +7444,10 @@ mod tests {
     /// **A slack pass that finds the entity live hands no claim on.**
     ///
     /// Under [`Trigger::OnMove`] the ordinary release answers "again"
-    /// whenever a policy stands and a head is in the domain, but an early
-    /// exit of the slack pass must not: the driver never reads a slack
-    /// pass's claim back, so answering `Some` here would hand on a claim
-    /// nobody takes, and a driver that looped on it would spin.
+    /// whenever a policy stands and a head is in the domain. An early exit
+    /// of the slack pass must not. The driver never reads a slack pass's
+    /// claim back. So answering `Some` here would hand on a claim nobody
+    /// takes, and a driver that looped on it would spin.
     #[tokio::test]
     async fn a_slack_pass_that_finds_the_entity_live_hands_no_claim_on() {
         let (backing, owner, _budget) = proxy();
