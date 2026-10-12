@@ -2,53 +2,53 @@
 //! URL the player is playing.
 //!
 //! A client's playback panel wants two rows of numbers about the stream on
-//! screen: the bytes our cache holds unbroken behind and ahead of the
-//! playhead ([`CacheWindow`]), and -- for a torrent --
-//! what we have committed for sharing and what the session has moved. Both
-//! rows are readings of a store, and there are two stores: the piece store
-//! keyed by info hash ([`enginefs::piece_store`]) and the proxy cache keyed
-//! by entity ([`crate::proxy_cache`]). This module is the one interface over
+//! screen. One is the bytes our cache holds unbroken behind and ahead of
+//! the playhead ([`CacheWindow`]). The other, for a torrent only, is what
+//! we have committed for sharing and what the session has moved. Both rows
+//! are readings of a store, and there are two stores: the piece store keyed
+//! by info hash ([`enginefs::piece_store`]) and the proxy cache keyed by
+//! entity ([`crate::proxy_cache`]). This module is the one interface over
 //! them.
 //!
 //! # One call, and the URL is what dispatches it
 //!
 //! The client already holds exactly one thing that names the stream: the URL
-//! it handed its player. So that is the whole of the question, and the shape
-//! of the URL is what decides which store answers it -- a torrent stream is
-//! `/{infoHash}/{fileIdx}` (or `/stream/{infoHash}/{fileIdx}`), a proxied one
-//! is `/proxy/?d=...`, and both of those shapes are this crate's own routes.
+//! it handed its player. So that URL is the whole question, and its shape
+//! decides which store answers it. A torrent stream is
+//! `/{infoHash}/{fileIdx}` (or `/stream/{infoHash}/{fileIdx}`), and a
+//! proxied one is `/proxy/?d=...`. Both shapes are this crate's own routes.
 //! `{fileIdx}` includes `-1`, the auto-select this server's own stream and
-//! stats routes resolve with the `f=` filters: see [`StreamFile`].
-//! Each implementation recognises its own and no other, which is why a URL
-//! **neither** recognises is not an error: it is a stream this server does not
-//! hold -- a file:// path, another server's URL, an addon's direct link the
-//! player fetched itself -- and the honest answer is no rows.
+//! stats routes resolve with the `f=` filters (see [`StreamFile`]).
+//! Each implementation recognises its own shape and no other. So a URL
+//! **neither** recognises is not an error. It is a stream this server does
+//! not hold -- a file:// path, another server's URL, an addon's direct link
+//! the player fetched itself -- and the honest answer is no rows.
 //!
 //! # The trait carries no state, and that is the point
 //!
 //! [`StreamStore`] is an interface, not a layer. Both stores are already
-//! correctly keyed by something this server maintains for other reasons, and
-//! each implementation answers from a reading of its own store taken at the
-//! call -- the piece store's held bits, the proxy owner's held set (seeded
-//! once from a listing of the entity's chunk directories) -- and remembers
+//! correctly keyed by something this server maintains for other reasons.
+//! Each implementation answers from a reading of its own store taken at the
+//! call: the piece store's held bits, or the proxy owner's held set (seeded
+//! once from a listing of the entity's chunk directories). It remembers
 //! nothing between calls. A route with bookkeeping of its own would have been
-//! a third thing to keep true, and the readings it cached would be claims
-//! about a past by the time anybody read them.
+//! a third thing to keep true. The readings it cached would be claims about
+//! a past by the time anybody read them.
 //!
 //! Nothing here is persisted, for the same reason. **The transfer totals in
-//! particular are this session's**, librqbit's own per-torrent counters,
-//! which begin at zero when a torrent is added to this process. Conventional
-//! BitTorrent clients keep a ratio per torrent across restarts; doing that
-//! here would mean storing counters we then have to keep true, and a stored
-//! counter read back as an observation is the bug this codebase has shipped
-//! more than once. So the ratio is labelled for what it is and the numbers
-//! start where the process did.
+//! particular are this session's.** They are librqbit's own per-torrent
+//! counters, which begin at zero when a torrent is added to this process.
+//! Conventional BitTorrent clients keep a ratio per torrent across restarts.
+//! Doing that here would mean storing counters we then have to keep true.
+//! A stored counter read back as an observation is the bug this codebase has
+//! shipped more than once. So the ratio is labelled for what it is, and the
+//! numbers start where the process did.
 //!
 //! # What absence means
 //!
-//! Every `None` here is "there is no such number", never "the number is
-//! zero", because a client draws no row for the first and a misleading zero
-//! for the second:
+//! Every `None` here means "there is no such number", never "the number is
+//! zero". A client draws no row for the first and a misleading zero for the
+//! second:
 //!
 //! * **no [`StreamNumbers`] at all** -- this server is not holding that
 //!   stream;
@@ -56,25 +56,27 @@
 //!   the torrent stream in this process, so there is no playhead to
 //!   measure from. A proxied stream that is not being played, or that no
 //!   byte has reached a player of yet, has no answer at all. **The
-//!   budget has nothing to do with it**: a stream the budget covers, one
-//!   no budget has been published for and a pinned file each have a
-//!   window, which is then whatever has been fetched round the playhead --
-//!   still exactly what a scrub back and playback can be served from;
+//!   budget has nothing to do with it.** A stream the budget covers, one
+//!   no budget has been published for, and a pinned file each have a
+//!   window. It is then whatever has been fetched round the playhead,
+//!   which is still exactly what a scrub back and playback can be served
+//!   from;
 //! * **no [`StreamNumbers::sharing`]** -- a proxied response is not seeded.
 //!   There is no swarm, so there is no committed set and no ratio, and the
 //!   row is absent rather than a line of zeroes;
 //! * **no [`Sharing::committed_bytes`]** -- the play session has promised
-//!   nothing: no draw decided yet (it waits for the film's length), or a
-//!   pin, which shares the file whole on its own. Under a budget that
-//!   covers the file it is not absent: the draw is the whole file;
+//!   nothing. Either no draw is decided yet (it waits for the film's
+//!   length), or it is a pin, which shares the file whole on its own. It is
+//!   not absent under a budget that covers the file: the draw is then the
+//!   whole file;
 //! * **no [`Sharing::transfer`]** -- the backend has no counters to read
-//!   for this torrent, which for librqbit is any torrent that is not live:
+//!   for this torrent. For librqbit that is any torrent that is not live:
 //!   paused, still checking, stopped for space, in error. A torrent that
-//!   has moved gigabytes and then paused has not moved nothing, so the
+//!   has moved gigabytes and then paused has not moved nothing. So the
 //!   three numbers go absent together rather than reading as a session
-//!   that has shared nothing. A torrent still has its sharing row then,
-//!   because [`Sharing::refused_reclaims`] is always there: a count, which
-//!   is `0` and not absent when nothing has been refused.
+//!   that has shared nothing. The torrent still has its sharing row then,
+//!   because [`Sharing::refused_reclaims`] is always there. It is a count,
+//!   which is `0` and not absent when nothing has been refused.
 
 use enginefs::EngineFS;
 use enginefs::backend::TorrentHandle;
@@ -101,27 +103,27 @@ pub struct StreamNumbers {
 #[serde(rename_all = "camelCase")]
 pub struct Sharing {
     /// Bytes of the play session's draw we hold -- announced, and not
-    /// reclaimed while the torrent is in the swarm; every byte of the file
-    /// held, under a budget that covers it. `None` where the session has
-    /// promised nothing: see the module docs.
+    /// reclaimed while the torrent is in the swarm. Under a budget that
+    /// covers the file, it is every byte of the file held. `None` where the
+    /// session has promised nothing (see the module docs).
     pub committed_bytes: Option<u64>,
     /// What the torrent has moved this session, or `None` where the backend
-    /// has no counters to read: see [`Transfer`].
+    /// has no counters to read (see [`Transfer`]).
     pub transfer: Option<Transfer>,
     /// How many pieces this engine's retention passes asked the backend to
     /// forget and were refused, over the life of the engine.
     ///
     /// **Zero is the only healthy value, and it is here because it was
-    /// invisible.** A refusal is librqbit keeping a piece an open stream's
-    /// lookahead still covers and this policy's window no longer does: the
-    /// disk cannot come back under budget while that stream lives, and
-    /// every tick spends a `drop_pieces` to be refused again. It and
-    /// [`Transfer::unverified_bytes`] are the two numbers that made a phone
-    /// fetching 1.6 GB to play a hundred megabytes legible, and they stay
+    /// invisible.** A refusal is librqbit keeping a piece that an open
+    /// stream's lookahead still covers and this policy's window no longer
+    /// does. The disk cannot come back under budget while that stream lives,
+    /// and every tick spends a `drop_pieces` to be refused again. This count
+    /// and [`Transfer::unverified_bytes`] are the two numbers that made a
+    /// phone fetching 1.6 GB to play a hundred megabytes legible. They stay
     /// for that reason.
     ///
-    /// Never absent while the torrent's store is live: a proxied response,
-    /// which has no engine, has no sharing row at all, and a torrent in
+    /// It is never absent while the torrent's store is live. A proxied
+    /// response has no engine, so it has no sharing row at all. A torrent in
     /// error, or whose store is not seeded yet, can answer nothing at all.
     pub refused_reclaims: usize,
 }
@@ -129,12 +131,12 @@ pub struct Sharing {
 /// What a torrent has moved over the connection **in this session**, and
 /// the ratio of the two.
 ///
-/// One value rather than three fields beside the committed set, because the
-/// three stand or fall together: librqbit keeps these counters in a
-/// torrent's live state, so a torrent that is paused, still checking,
-/// stopped for space or in error has none to read -- and a torrent that has
+/// It is one value rather than three fields beside the committed set,
+/// because the three stand or fall together. librqbit keeps these counters
+/// in a torrent's live state. A torrent that is paused, still checking,
+/// stopped for space or in error has none to read. Yet a torrent that has
 /// moved gigabytes and then paused has not moved nothing. The absence is
-/// the whole group's, and a client draws no transfer row for it rather than
+/// the whole group's. A client draws no transfer row for it rather than
 /// three zeroes that say the opposite.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -146,32 +148,31 @@ pub struct Transfer {
     /// `downloaded_and_checked_bytes`.
     ///
     /// **Not "wasted", because the subtraction cannot tell.** Chunks of a
-    /// piece still in flight are in it and leave it when that piece checks;
-    /// so is the second copy of a chunk this server asked a fast peer for
-    /// on purpose, to get a piece out from under a stalled one; and so is
-    /// what really was thrown away, a piece deleted before it completed or
-    /// one a peer beat us to. A client should draw it as a level rather
-    /// than as loss: a few per cent of what was played is the ordinary
-    /// cost of duplication in flight, and a multiple of it is a stream
-    /// fetching what its own retention pass is deleting, which is the bug
-    /// this figure exists to show.
+    /// piece still in flight are in it, and leave it when that piece checks.
+    /// So is the second copy of a chunk this server asked a fast peer for on
+    /// purpose, to get a piece out from under a stalled one. So is what
+    /// really was thrown away: a piece deleted before it completed, or one a
+    /// peer beat us to. A client should draw it as a level rather than as
+    /// loss. A few per cent of what was played is the ordinary cost of
+    /// duplication in flight. A multiple of it is a stream fetching what its
+    /// own retention pass is deleting, which is the bug this figure exists
+    /// to show.
     pub unverified_bytes: u64,
     /// Bytes this torrent has sent to peers **in this session**.
     pub uploaded_bytes: u64,
     /// Uploaded over downloaded, the form every BitTorrent client shows.
     ///
-    /// `None` when nothing has been downloaded: a ratio against zero is not
-    /// `0.00`, it is undefined, and a client should say so rather than
-    /// report a session that has uploaded something as having shared
-    /// nothing.
+    /// `None` when nothing has been downloaded. A ratio against zero is not
+    /// `0.00`; it is undefined. A client should say so rather than report a
+    /// session that has uploaded something as having shared nothing.
     pub ratio: Option<f64>,
 }
 
 impl Sharing {
     /// The sharing row for a torrent whose play session has committed
     /// `committed_bytes`, whose backend reports `transfer` and whose
-    /// engine has had `refused_reclaims` refused. Always a row: the count
-    /// is always known, so a torrent always has something to draw.
+    /// engine has had `refused_reclaims` refused. It is always a row. The
+    /// count is always known, so a torrent always has something to draw.
     fn of(
         committed_bytes: Option<u64>,
         transfer: Option<enginefs::backend::TransferTotals>,
@@ -194,21 +195,21 @@ impl Sharing {
 
 /// A store that can say what it holds of the stream a URL names.
 ///
-/// Implemented once per store, over the URL shape that store's own route
-/// defines. It has no state of its own: see the module docs.
+/// It is implemented once per store, over the URL shape that store's own
+/// route defines. It has no state of its own (see the module docs).
 #[async_trait::async_trait]
 pub trait StreamStore {
     /// The numbers for the stream `url` names, or `None` when this store is
-    /// not holding it -- which includes every URL whose shape is not this
+    /// not holding it. That includes every URL whose shape is not this
     /// store's.
     async fn stream_numbers(&self, url: &Url) -> Option<StreamNumbers>;
 }
 
 /// The numbers for the stream `url` names, from whichever store holds it.
 ///
-/// The one call a client makes. `url` is the URL it handed its player,
-/// absolute or just the path and query of one -- only the path and the query
-/// decide anything here.
+/// This is the one call a client makes. `url` is the URL it handed its
+/// player, absolute or just the path and query of one. Only the path and
+/// the query decide anything here.
 pub async fn stream_numbers(state: &AppState, url: &str) -> Option<StreamNumbers> {
     let url = parse(url)?;
     match state.engine.stream_numbers(&url).await {
@@ -220,8 +221,8 @@ pub async fn stream_numbers(state: &AppState, url: &str) -> Option<StreamNumbers
 /// A player's URL, absolute or relative.
 ///
 /// A client that stores the path it built rather than the whole URL is
-/// asking about the same stream, and the host it would have to invent to be
-/// allowed to ask decides nothing: both implementations read the path and
+/// asking about the same stream. The host it would have to invent to be
+/// allowed to ask decides nothing. Both implementations read the path and
 /// the query and nothing else.
 fn parse(url: &str) -> Option<Url> {
     match Url::parse(url) {
@@ -244,9 +245,9 @@ impl StreamStore for EngineFS {
     ///
     /// `None` for a hash no engine exists for, and for a `-1` that names
     /// no file of it (see [`StreamFile`], which is where `-1` is resolved).
-    /// **A peek**: it creates no engine and starts no magnet add, and it
-    /// does not count as a poll, so a panel asking every second cannot keep
-    /// a torrent out of the idle sweep by looking at it.
+    /// **A peek.** It creates no engine and starts no magnet add. It does
+    /// not count as a poll, so a panel asking every second cannot keep a
+    /// torrent out of the idle sweep by looking at it.
     async fn stream_numbers(&self, url: &Url) -> Option<StreamNumbers> {
         let (info_hash, file) = torrent_stream(url)?;
         let file_idx = file.resolve(self, &info_hash).await?;
@@ -268,7 +269,8 @@ impl StreamStore for ProxyCache {
     /// [`crate::routes::proxy::requested`] the route itself reads them with,
     /// so "which stream is this" is decided in one place.
     ///
-    /// Never a [`StreamNumbers::sharing`]: a proxied response is not seeded.
+    /// It never has a [`StreamNumbers::sharing`]: a proxied response is not
+    /// seeded.
     async fn stream_numbers(&self, url: &Url) -> Option<StreamNumbers> {
         proxied_numbers(self, proxied_target(url)?).await
     }
@@ -278,8 +280,8 @@ impl StreamStore for ProxyCache {
 /// `/proxy` URL names, or a Drive file's media URL (`crate::media`, which
 /// holds a Drive file by id rather than by a URL of this server's).
 pub(crate) async fn proxied_numbers(cache: &ProxyCache, target: Url) -> Option<StreamNumbers> {
-    // Off the reactor: the first ask of an entity seeds its held set from a
-    // listing of its chunk directories.
+    // This runs off the reactor. The first ask of an entity seeds its held
+    // set from a listing of its chunk directories.
     let retention = cache.retention().clone();
     let window = tokio::task::spawn_blocking(move || {
         retention.window(target.as_str(), std::time::Instant::now())
@@ -296,8 +298,9 @@ pub(crate) async fn proxied_numbers(cache: &ProxyCache, target: Url) -> Option<S
 ///
 /// Read through [`crate::routes::proxy::requested`], the same function the
 /// route itself reads its target with, so "which stream is this" is decided
-/// in one place: `/proxy` and `/proxy/` are the query format, anything under
-/// `/proxy/` the Core path format, exactly as the router splits them.
+/// in one place. `/proxy` and `/proxy/` are the query format, and anything
+/// under `/proxy/` is the Core path format, exactly as the router splits
+/// them.
 fn proxied_target(url: &Url) -> Option<Url> {
     let rest = match url.path() {
         "/proxy" | "/proxy/" => None,
@@ -311,8 +314,8 @@ fn proxied_target(url: &Url) -> Option<Url> {
 /// path of any other shape.
 ///
 /// The hash is spelled as the routes and the registry spell it: forty hex
-/// digits, matched case-insensitively and answered in lower case, which is
-/// how the engine registry is keyed.
+/// digits, matched case-insensitively. It is answered in lower case, which
+/// is how the engine registry is keyed.
 pub(crate) fn torrent_stream(url: &Url) -> Option<(String, StreamFile)> {
     let mut segments: Vec<&str> = url.path_segments()?.collect();
     if segments.first() == Some(&"stream") {
@@ -335,12 +338,12 @@ pub(crate) fn torrent_stream(url: &Url) -> Option<(String, StreamFile)> {
 /// **`-1` is a file index like any other here, because it is one on the
 /// route this dispatch mirrors.** `/{infoHash}/-1` is the documented "pick
 /// the file yourself" -- `routes::compat::resolve_file_idx`, the largest
-/// video narrowed by the `f=` filters -- and the stream route, the archive
-/// route and the sibling control route `/{infoHash}/-1/stats.json` all
-/// resolve it that way. A client whose player URL is one of those is
-/// playing a file this server is holding, and answering "no rows" for it
-/// while `stats.json` answers about the same stream would be this
-/// dispatch disagreeing with the route it claims to mirror.
+/// video narrowed by the `f=` filters. The stream route, the archive route
+/// and the sibling control route `/{infoHash}/-1/stats.json` all resolve it
+/// that way. A client whose player URL is one of those is playing a file
+/// this server is holding. Answering "no rows" for it while `stats.json`
+/// answers about the same stream would be this dispatch disagreeing with
+/// the route it claims to mirror.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StreamFile {
     /// An index, which names its file with no list to consult.
@@ -353,7 +356,7 @@ pub(crate) enum StreamFile {
 
 impl StreamFile {
     /// The `{fileIdx}` segment, with `filters` read only where they are
-    /// wanted -- `-1` is the only spelling that consults them.
+    /// wanted. `-1` is the only spelling that consults them.
     pub(crate) fn parse(file_idx: &str, filters: impl FnOnce() -> Vec<String>) -> Option<Self> {
         match file_idx {
             "-1" => Some(Self::Auto(filters())),
@@ -362,13 +365,14 @@ impl StreamFile {
     }
 
     /// Which file of `info_hash` this is, or `None` when it cannot be
-    /// decided: no engine exists (so there is no file list, and no stream
-    /// either), or the filters match nothing playable.
+    /// decided. That happens when no engine exists (so there is no file
+    /// list, and no stream either), or when the filters match nothing
+    /// playable.
     ///
-    /// **A peek**, like everything else on this path: it looks the engine
+    /// **A peek**, like everything else on this path. It looks the engine
     /// up without creating one and without touching its idle clock. An
     /// index needs no lookup at all, so the ordinary URL costs nothing
-    /// here; only `-1` asks for the file list, which is the same list the
+    /// here. Only `-1` asks for the file list, which is the same list the
     /// stream route resolves it against.
     pub(crate) async fn resolve(&self, engines: &EngineFS, info_hash: &str) -> Option<usize> {
         let filters = match self {
@@ -381,8 +385,8 @@ impl StreamFile {
         Self::auto(&candidates, filters)
     }
 
-    /// The auto-select itself: the route's own function, so the file a
-    /// panel is told about is the file the player is being served.
+    /// The auto-select itself. It is the route's own function, so the file
+    /// a panel is told about is the file the player is being served.
     fn auto(
         candidates: &[crate::routes::compat::FileCandidate],
         filters: &[String],
@@ -413,9 +417,9 @@ mod tests {
         }
     }
 
-    /// The hash is answered in the case the engine registry is keyed in, or
-    /// a client that spelled its URL in upper case gets no rows for a
-    /// torrent this server is holding.
+    /// The hash is answered in the case the engine registry is keyed in.
+    /// Otherwise a client that spelled its URL in upper case gets no rows
+    /// for a torrent this server is holding.
     #[test]
     fn an_upper_case_hash_names_the_same_torrent() {
         let url = parse(&format!("http://127.0.0.1:11470/{}/0", "AB".repeat(20)))
@@ -429,12 +433,12 @@ mod tests {
     /// **`-1` is a file index this server serves, so it is one this
     /// dispatch answers about.**
     ///
-    /// `/{infoHash}/-1?f=...` is the documented auto-select: the stream
+    /// `/{infoHash}/-1?f=...` is the documented auto-select. The stream
     /// route plays it, and `/{infoHash}/-1/stats.json` reports on it. A
     /// client holding that URL is holding the URL of a stream that is
-    /// playing, and the panel it is drawing must get the numbers for the
-    /// file the player is actually being served -- the same file, picked by
-    /// the same function, from the same filters.
+    /// playing. The panel it is drawing must get the numbers for the file
+    /// the player is actually being served: the same file, picked by the
+    /// same function, from the same filters.
     #[test]
     fn the_auto_select_is_a_stream_url_and_the_filters_pick_its_file() {
         let hash = "a".repeat(40);
@@ -482,9 +486,9 @@ mod tests {
             "the query format, with the player token left out of the target"
         );
 
-        // The Core path format: the segment before the first slash is the
-        // proxy's own parameters, the rest is the file on the origin, and
-        // the proxy URL's own query belongs to the target.
+        // The Core path format. The segment before the first slash is the
+        // proxy's own parameters, and the rest is the file on the origin.
+        // The proxy URL's own query belongs to the target.
         let path = parse(
             "http://127.0.0.1:11470/proxy/d=https%3A%2F%2Forigin.example/dir/film.mkv?token=abc",
         )
@@ -504,8 +508,8 @@ mod tests {
             // A `/proxy` URL naming no target at all.
             "http://127.0.0.1:11470/proxy/?p=abc",
             // The Core parameter format under another of this server's
-            // routes. It parses as a target perfectly well; what makes it
-            // not a proxied stream is the path it is under.
+            // routes. It parses as a target perfectly well. The path it is
+            // under is what makes it not a proxied stream.
             "http://127.0.0.1:11470/ftp/d=https%3A%2F%2Forigin.example/film.mkv",
         ] {
             assert_eq!(
@@ -516,19 +520,19 @@ mod tests {
         }
     }
 
-    /// The wire shape a client parses: camelCase, like every other response
-    /// of this server, and an absent row spelled `null` rather than left
-    /// out, so a client that reads a missing key as "the server is old"
-    /// still sees the difference between "no rows" and "zero".
+    /// The wire shape a client parses is camelCase, like every other
+    /// response of this server. An absent row is spelled `null` rather than
+    /// left out. A client that reads a missing key as "the server is old"
+    /// then still sees the difference between "no rows" and "zero".
     #[test]
     fn the_wire_shape_is_camel_case_with_absences_spelled_null() {
         let numbers = StreamNumbers {
             window: Some(CacheWindow {
                 behind_bytes: 1_288_490_188,
                 ahead_bytes: 356_515_840,
-                // One of each: a half measured against a head that is
-                // consuming, and a half whose head is not, which is an
-                // absence and is spelled `null` like every other here.
+                // One of each. One half is measured against a head that is
+                // consuming. The other half's head is not, which is an
+                // absence, spelled `null` like every other here.
                 behind_seconds: Some(412.5),
                 ahead_seconds: None,
             }),
@@ -578,8 +582,8 @@ mod tests {
     ///
     /// A session that has uploaded bytes and downloaded none -- a torrent
     /// resumed onto a complete file and seeded from it -- has an undefined
-    /// ratio, and reporting it as zero tells a viewer they have shared
-    /// nothing while they are sharing.
+    /// ratio. Reporting it as zero tells a viewer they have shared nothing
+    /// while they are sharing.
     #[test]
     fn a_ratio_against_nothing_downloaded_is_absent_rather_than_zero() {
         use enginefs::backend::TransferTotals;
@@ -616,9 +620,9 @@ mod tests {
     /// **A torrent whose counters cannot be read has moved what it has
     /// moved, and this must not say it has moved nothing.**
     ///
-    /// librqbit keeps them in a torrent's live state, so a torrent that is
+    /// librqbit keeps them in a torrent's live state. A torrent that is
     /// paused, still checking, stopped for space or in error has none to
-    /// read -- and every one of those is reachable with a panel up: the
+    /// read. Every one of those is reachable with a panel up: the
     /// fastresume check at the start of every stream, and the idle,
     /// background and free-space arms of the reconciler. Three zeroes there
     /// would tell a viewer their session has shared nothing.
@@ -648,7 +652,7 @@ mod tests {
             "http://127.0.0.1:11470/notahash/0",
             // A hash, but the file index is not one.
             "http://127.0.0.1:11470/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/last",
-            // Nor is any other negative one: `-1` is the route's only
+            // Nor is any other negative one. `-1` is the route's only
             // auto-select, and `resolve_file_idx` refuses the rest.
             "http://127.0.0.1:11470/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/-2",
             // The stats route of the same torrent is not the stream.

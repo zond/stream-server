@@ -18,56 +18,56 @@ pub struct AppState {
     pub base_url: String,
     pub http_addr: SocketAddr,
     /// Bearer token the control routes require. `run` always sets one (see
-    /// `ServerAuth`); `None` is only the value a hand-built state starts
+    /// `ServerAuth`). `None` is only the value a hand-built state starts
     /// with, and `auth::require_bearer` refuses rather than opens on it.
     pub auth_token: Option<Arc<str>>,
     /// Translated containers: an index and the sources it was read from,
     /// and **no file at all** (see `crate::translators::session`). Both
-    /// forms live here -- a `/{fmt}/create` from URLs and the `torrent:`
+    /// forms live here: a `/{fmt}/create` from URLs, and the `torrent:`
     /// key, which has no create and indexes itself on first use.
     ///
-    /// Kept for as long as the bytes they index are: while nothing else
-    /// has become live, and gone when the viewer opens something that is
-    /// not this container. The map holds no clock and starts no task; the
-    /// rule is handed to it by the switch task in `crate::run`, on the
-    /// same signal the torrent and proxy retention owners drop their slack
-    /// on.
+    /// A container is kept for as long as the bytes it indexes are. It
+    /// stays while nothing else has become live, and goes when the viewer
+    /// opens something that is not this container. The map holds no clock
+    /// and starts no task. The switch task in `crate::run` hands it the
+    /// rule, on the same signal the torrent and proxy retention owners drop
+    /// their slack on.
     pub translated_archives:
         crate::translators::session::Sessions<crate::translators::session::TranslatedSession>,
     /// Google Drive files `ServerHandle::open_drive_file` has opened, keyed by the
     /// random key their stream URL carries (see `crate::routes::drive`).
-    /// The same map type and the same lifetime rule as
-    /// [`Self::translated_archives`]: a session stays while its own file is
-    /// what is playing, a lease outranks that, and the switch task in
-    /// `crate::run` is what applies it.
+    /// It has the same map type and the same lifetime rule as
+    /// [`Self::translated_archives`]. A session stays while its own file is
+    /// what is playing, and a lease outranks that. The switch task in
+    /// `crate::run` applies the rule.
     ///
     /// **This is where the refresh token lives while a file is open**, one
     /// layer down inside each source's `DriveCredential`. Nothing but the
-    /// header supplier can reach it and nothing here can print it.
+    /// header supplier can reach it, and nothing here can print it.
     pub drive_files: crate::translators::session::Sessions<crate::routes::drive::DriveSession>,
     /// Every media id `ServerHandle::register` has issued and not let go,
     /// and what resolving each found (`crate::media`). Memory only: a
     /// restart forgets them, and the app registers at open.
     pub(crate) media: crate::media::registry::Registry,
     /// Where the last play session on each torrent file ended, kept beside
-    /// `settings.json` (`crate::media::memory`): what a resumed film's
-    /// pre-want asks for first. `run` loads it; a hand-built state keeps it
-    /// for the process only.
+    /// `settings.json` (`crate::media::memory`). A resumed film's pre-want
+    /// asks for that first. `run` loads it. A hand-built state keeps it for
+    /// the process only.
     pub(crate) read_memory: Arc<crate::media::memory::ReadMemory>,
     /// Where a Drive file's two services are, or `None` for a server whose
-    /// embedder named no pairing service -- which is every server but the
-    /// app's, and which refuses a create rather than guessing
+    /// embedder named no pairing service. That is every server but the
+    /// app's. Such a server refuses a create rather than guessing
     /// (`crate::routes::drive::DriveEndpoints`).
     pub drive: Option<Arc<crate::routes::drive::DriveEndpoints>>,
     /// The proxied streams players are reading right now, so a client can
     /// end its own player's (see `crate::proxy_streams`).
     pub proxy_streams: Arc<crate::proxy_streams::ProxyStreams>,
     /// What `/proxy` has already fetched, on disk (see
-    /// `crate::proxy_cache`). Rooted inside the engine's `download_dir`, so
-    /// it is counted in the same usage figure and capped by the same
-    /// published budget -- and every byte of it is disposable the moment a
-    /// viewer opens something else, with the two exceptions its retention
-    /// owner makes: a chunk under the live stream's window and one an open
+    /// `crate::proxy_cache`). It is rooted inside the engine's
+    /// `download_dir`, so it is counted in the same usage figure and capped
+    /// by the same published budget. Every byte of it is disposable the
+    /// moment a viewer opens something else. Its retention owner makes two
+    /// exceptions: a chunk under the live stream's window, and one an open
     /// body has been framed to deliver and has not yet
     /// (`crate::proxy_retention`).
     pub proxy_cache: Arc<crate::proxy_cache::ProxyCache>,
@@ -75,38 +75,39 @@ pub struct AppState {
     /// `crate::proxy_downloads`).
     pub proxy_downloads: Arc<crate::proxy_downloads::ProxyDownloads>,
     /// The optional LAN media listener shared by `run` and `ServerHandle`
-    /// (see `crate::lan_media`). Constructed disabled; `run` replaces it with
-    /// one carrying `ServerConfig::lan_media_addr`.
+    /// (see `crate::lan_media`). It is constructed disabled. `run` replaces
+    /// it with one carrying `ServerConfig::lan_media_addr`.
     pub lan_media: Arc<crate::lan_media::LanMedia>,
     /// The standing reading behind `ServerHandle::background_traffic` (see
-    /// `routes::system::background_traffic`). One per server, not per
-    /// caller: the verdict is a comparison against the last reading, and
+    /// `routes::system::background_traffic`). There is one per server, not
+    /// per caller. The verdict is a comparison against the last reading, so
     /// two callers with two of these would each consume windows the other
     /// never sees.
     pub traffic_window: Arc<enginefs::traffic::TrafficWindow>,
-    /// Whose turn it is to publish the cache budget: one publication at a
-    /// time, each reading its inputs inside its turn (see
+    /// Whose turn it is to publish the cache budget. One publication runs
+    /// at a time, and each reads its inputs inside its turn (see
     /// `crate::cache_budget::publish_now`).
     pub budget_publication: Arc<tokio::sync::Mutex<()>>,
     /// One settings update at a time, from the merge to the save
     /// (`routes::system::update_settings`). The settings lock alone is
-    /// dropped before the update is pushed into the engine, so two updates
-    /// could merge in one order and apply in the other: a `seedingEnabled`
-    /// saved as `false` with the session left uploading.
+    /// dropped before the update is pushed into the engine. Without this,
+    /// two updates could merge in one order and apply in the other. The
+    /// result would be a `seedingEnabled` saved as `false` with the session
+    /// left uploading.
     pub settings_update: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
-    /// A state around the one engine, with the settings and the file they
-    /// are kept in that `run` loaded before the engine was opened; `run`
-    /// fills in the rest (the addresses, the token, the LAN listener, the
-    /// Drive endpoints) before anything reads them.
+    /// A state around the one engine, with the settings and their file,
+    /// which `run` loaded before the engine was opened. `run` fills in the
+    /// rest (the addresses, the token, the LAN listener, the Drive
+    /// endpoints) before anything reads them.
     pub fn new(
         engine: Arc<EngineFS>,
         settings: Arc<RwLock<ServerSettings>>,
         settings_file: Arc<SettingsFile>,
     ) -> Self {
-        // The published cap, shared and not copied: `/proxy`'s cache and
+        // The published cap is shared, not copied. `/proxy`'s cache and
         // the piece store are two adapters over one chunk store on one
         // volume, and the retention policy over them is sized from one
         // number.
@@ -151,16 +152,16 @@ impl AppState {
 ///
 /// **Every write goes through one place** -- both `AppState::save_settings`
 /// (every `POST /settings` and `update_settings`) and the tracker
-/// refresher's `save_trackers` -- and that place does two things. It writes
+/// refresher's `save_trackers`. That place does two things. First, it writes
 /// to a uniquely named temporary file beside the target and renames it into
-/// place, so the file on disk is always a whole serialization: the old one
+/// place. The file on disk is then always a whole serialization: the old one
 /// or the new one, never a mixture and never empty, whatever a concurrent
-/// writer or a kill mid-write does. And it holds a mutex from serialization
-/// through rename, which the rename alone does not buy: two writers racing
-/// without it can still land the *older* serialization last, undoing a
-/// user's settings change with a tracker refresh that had serialized a
-/// moment before it. Under the lock the order of serialization is the order
-/// on disk.
+/// writer or a kill mid-write does. Second, it holds a mutex from
+/// serialization through rename, which the rename alone does not buy. Two
+/// writers racing without it can still land the *older* serialization last.
+/// A tracker refresh that had serialized a moment earlier would then undo a
+/// user's settings change. Under the lock, the order of serialization is
+/// the order on disk.
 pub struct SettingsFile {
     path: PathBuf,
     /// Serialises writers -- see the type doc for why the rename is not
@@ -192,18 +193,17 @@ impl SettingsFile {
 
     /// The settings on disk, or `defaults` when there is no file.
     ///
-    /// The file is read over `defaults`: every key it has is kept and every
+    /// The file is read over `defaults`. Every key it has is kept and every
     /// key it lacks takes the default, so a file written before a setting
-    /// existed loads with all it says (and a missing `cacheSize` is the
-    /// default cap, not `null`'s unlimited -- only a `null` the file holds
-    /// is that).
+    /// existed loads with all it says. A missing `cacheSize` is the default
+    /// cap, not `null`'s unlimited. Only a `null` the file holds is that.
     ///
     /// A file that is there but will not parse is a different case from a
-    /// missing one and is treated as such: the defaults still stand in, but
-    /// at WARN rather than INFO, and the file is moved aside to
-    /// `settings.json.corrupt-<unix time>` first -- the next save would
-    /// otherwise overwrite the only record of what the settings were, and a
-    /// user asking why every setting reset would find nothing.
+    /// missing one, and is treated as such. The defaults still stand in, but
+    /// at WARN rather than INFO. The file is first moved aside to
+    /// `settings.json.corrupt-<unix time>`. Otherwise the next save would
+    /// overwrite the only record of what the settings were, and a user
+    /// asking why every setting reset would find nothing.
     pub fn load(&self, defaults: &ServerSettings) -> ServerSettings {
         let content = match std::fs::read_to_string(&self.path) {
             Ok(content) => content,
@@ -234,9 +234,9 @@ impl SettingsFile {
             }
         };
         tracing::info!("Loaded settings from {:?}", self.path);
-        // Reported, not settable: they describe the running binary, so the
-        // file's copy -- written by whichever build saved last -- is not
-        // the answer after an upgrade or a move.
+        // These are reported, not settable. They describe the running
+        // binary, so the file's copy (written by whichever build saved
+        // last) is not the answer after an upgrade or a move.
         settings.app_path = defaults.app_path.clone();
         settings.server_version = defaults.server_version.clone();
         // Respect the file, but a cache_root it does not name is the
@@ -258,8 +258,9 @@ impl SettingsFile {
     }
 
     /// Move an unparsable `settings.json` to `settings.json.corrupt-<unix
-    /// time>` so the next save cannot overwrite it; `None` when the move
-    /// failed (then the file stays where it is and the next save does).
+    /// time>` so the next save cannot overwrite it. `None` when the move
+    /// failed. The file then stays where it is, and the next save
+    /// overwrites it.
     fn set_aside_corrupt(&self) -> Option<PathBuf> {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -283,10 +284,10 @@ impl SettingsFile {
     }
 }
 
-/// `content`, a settings file, read over `defaults`: each top-level key the
+/// `content`, a settings file, read over `defaults`. Each top-level key the
 /// file has replaces the default's, and a key it lacks keeps the default.
-/// Anything that is not a JSON object, or a key whose value is the wrong
-/// type, is an error -- the file does not parse.
+/// Anything that is not a JSON object is an error, and so is a key whose
+/// value is the wrong type. Either way the file does not parse.
 fn over_defaults(content: &str, defaults: &ServerSettings) -> serde_json::Result<ServerSettings> {
     let file: serde_json::Map<String, serde_json::Value> = serde_json::from_str(content)?;
     let mut merged = match serde_json::to_value(defaults)? {
@@ -319,12 +320,14 @@ pub(crate) async fn write_whole(path: &Path, bytes: &[u8]) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Wrapper for TrackerStorage that bridges sync trait with async AppState
-/// This is created before EngineFS and passed to it for tracker persistence
+/// Wrapper for TrackerStorage that bridges the sync trait with the async
+/// AppState. It is created before EngineFS and passed to it for tracker
+/// persistence.
 pub struct TrackerStorageBridge {
     settings: Arc<RwLock<ServerSettings>>,
-    /// The same [`SettingsFile`] `AppState` writes through -- one writer
-    /// path, or a tracker refresh and a settings change race for the file.
+    /// The same [`SettingsFile`] `AppState` writes through. There must be
+    /// one writer path, or a tracker refresh and a settings change race for
+    /// the file.
     settings_file: Arc<SettingsFile>,
 }
 
@@ -389,8 +392,8 @@ impl enginefs::TrackerStorage for TrackerStorageBridge {
         let settings = self.settings.clone();
         let settings_file = self.settings_file.clone();
 
-        // The trait is sync and this is called from the refresher's task;
-        // the update and the save run on the runtime.
+        // The trait is sync, and this is called from the refresher's task.
+        // The update and the save run on the runtime.
         tokio::spawn(async move {
             {
                 let mut guard = settings.write().await;
@@ -418,14 +421,14 @@ mod tests {
         }
     }
 
-    /// Many writers, through both paths the process has -- a settings
-    /// change and a tracker refresh -- while a reader keeps opening the
-    /// file: every read is a whole serialization, never one writer's bytes
-    /// with another's behind them and never an empty file, and the file at
-    /// the end is the settings as they finally are, not an older state that
+    /// Many writers go through both paths the process has (a settings
+    /// change and a tracker refresh) while a reader keeps opening the file.
+    /// Every read is a whole serialization. It is never one writer's bytes
+    /// with another's behind them, and never an empty file. The file at the
+    /// end is the settings as they finally are, not an older state that
     /// happened to land last. Nothing of the writing is left beside it.
     ///
-    /// The tracker list is made large on purpose: only a multi-megabyte
+    /// The tracker list is made large on purpose. Only a multi-megabyte
     /// write is open to a reader for long enough to make a torn read
     /// observable here at all.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -506,7 +509,7 @@ mod tests {
     }
 
     /// A file that will not parse is set aside under a name the next save
-    /// will not touch, and the defaults stand in; a file that is not there
+    /// will not touch, and the defaults stand in. A file that is not there
     /// is the ordinary first launch and sets nothing aside.
     #[tokio::test]
     async fn an_unparsable_settings_file_is_set_aside_not_overwritten() {
@@ -561,7 +564,7 @@ mod tests {
 
     /// A file written before a setting existed -- here one with no
     /// `btMaxConnections` and no `cacheSize` -- keeps every key it has and
-    /// takes the default for the rest: it is not set aside, a missing
+    /// takes the default for the rest. It is not set aside. A missing
     /// `cacheSize` is the default cap rather than unlimited, and a `null`
     /// the file does hold is still unlimited.
     #[test]
@@ -600,8 +603,8 @@ mod tests {
     }
 
     /// `appPath` and `serverVersion` name the running binary, not the one
-    /// that last wrote the file: after an upgrade the file's old values are
-    /// replaced at load.
+    /// that last wrote the file. After an upgrade, the file's old values
+    /// are replaced at load.
     #[test]
     fn app_path_and_server_version_are_the_running_binarys() {
         let dir = tempfile::tempdir().unwrap();
