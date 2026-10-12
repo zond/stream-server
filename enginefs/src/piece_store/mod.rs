@@ -1,46 +1,44 @@
 //! Torrent data stored as one file per piece.
 //!
-//! Uniformly, for the streaming cache and for offline downloads alike. Whole
-//! `.mkv` files are never produced: downloads exist so content plays offline
-//! inside the client, not to hand the user a file.
+//! This holds uniformly, for the streaming cache and for offline downloads
+//! alike. Whole `.mkv` files are never produced: downloads exist so content
+//! plays offline inside the client, not to hand the user a file.
 //!
 //! # Why
 //!
 //! * **Reclaim becomes `fs::remove_file`**, on every filesystem. Punching
-//!   holes into a whole-file layout needed `fallocate(FALLOC_FL_PUNCH_HOLE)`,
-//!   which a filesystem is free to answer with `EOPNOTSUPP` -- clearing the
-//!   have-bits while freeing nothing -- and whose ordering against the
-//!   bitfield flush left a crash window in which the recorded haves were
-//!   holes.
+//!   holes into a whole-file layout needed `fallocate(FALLOC_FL_PUNCH_HOLE)`.
+//!   A filesystem is free to answer that with `EOPNOTSUPP`, which clears the
+//!   have-bits while freeing nothing. Its ordering against the bitfield
+//!   flush also left a crash window in which the recorded haves were holes.
 //! * **Piece presence is the have-set.** There is no record of ours for a
-//!   crash to leave disagreeing with the disk; the disk *is* the record. That
-//!   is why a piece's bytes are written under a staging name and renamed into
-//!   place only once librqbit's hash check has passed
-//!   ([`crate::chunk_store::STAGING_SUFFIX`]): presence has to mean
-//!   *complete*, and a
-//!   file created by a piece's first 16 KiB chunk is there for the whole of
-//!   the download. The errors are not symmetric -- a wrong "no" costs a
-//!   re-download, a wrong "yes" leaves a have-bit standing over bytes nothing
-//!   verified, and the fastresume check that might have caught it samples
-//!   ~65 pieces of a torrent however large.
+//!   crash to leave disagreeing with the disk. The disk *is* the record.
+//!   That is why a piece's bytes are written under a staging name and
+//!   renamed into place only once librqbit's hash check has passed
+//!   ([`crate::chunk_store::STAGING_SUFFIX`]). Presence has to mean
+//!   *complete*, and a file created by a piece's first 16 KiB chunk is there
+//!   for the whole of the download. The errors are not symmetric. A wrong
+//!   "no" costs a re-download. A wrong "yes" leaves a have-bit standing over
+//!   bytes nothing verified, and the fastresume check that might have caught
+//!   it samples ~65 pieces of a torrent however large.
 //!
-//!   With one exception, stated here because this is where the invariant is
-//!   claimed: a piece lying *entirely* inside a BEP-47 padding file has no
-//!   owner to write it, so it never gets a file and
+//!   There is one exception, stated here because this is where the
+//!   invariant is claimed. A piece lying *entirely* inside a BEP-47 padding
+//!   file has no owner to write it. So it never gets a file, and
 //!   [`store::PieceStore::has_piece`] is false for it for ever. Nothing
-//!   transfers those bytes -- librqbit skips padding on every storage path
-//!   -- so no read can reach the piece and no hash check waits on it; it is
-//!   not payload. Giving it a zero-byte file would put a have-record on disk
-//!   that no write ever justified, which is the failure mode this design
+//!   transfers those bytes, because librqbit skips padding on every storage
+//!   path. So no read can reach the piece and no hash check waits on it; it
+//!   is not payload. Giving it a zero-byte file would put a have-record on
+//!   disk that no write ever justified. That is the failure mode this design
 //!   exists to remove, so the hole is named rather than filled. A conforming
 //!   torrent cannot open one anyway: padding runs to the next piece boundary
 //!   and is therefore always shorter than a piece. The question
-//!   [`librqbit::storage::TorrentStorage::has_piece`] asks is a different one
-//!   -- "can this storage have lost the piece?" -- and for such a piece the
+//!   [`librqbit::storage::TorrentStorage::has_piece`] asks is a different
+//!   one: "can this storage have lost the piece?" For such a piece the
 //!   answer is no, so it does not have the hole.
 //! * **It is not an rqbit core change.** `TorrentStorage` and `StorageFactory`
-//!   are existing public seams, and enginefs reads through
-//!   `librqbit::FileStreamOptions` rather than opening files itself, so this
+//!   are existing public seams. enginefs reads through
+//!   `librqbit::FileStreamOptions` rather than opening files itself. So this
 //!   backend lives in our crate.
 //! * **Uniform means no per-purpose branch.** Streaming and downloads share
 //!   one engine, so a torrent has no purpose at add time and a two-backend
@@ -49,27 +47,28 @@
 //! # The parts
 //!
 //! The bytes are not this module's. They are
-//! [`crate::chunk_store::ChunkDir`]'s -- the one chunk store, shared with
-//! `/proxy`'s cache, which owns the bucketed directory shape, the two
-//! staging spellings, the rename that makes presence mean complete, the
-//! listings, the occupancy, the typed read and the open-handle LRU. What is
-//! here is the torrent half.
+//! [`crate::chunk_store::ChunkDir`]'s: the one chunk store, shared with
+//! `/proxy`'s cache. It owns the bucketed directory shape, the two staging
+//! spellings, the rename that makes presence mean complete, the listings,
+//! the occupancy, the typed read and the open-handle LRU. What is here is
+//! the torrent half.
 //!
-//! [`layout`] is the arithmetic of *where* a byte lives -- `(file_id, offset)`
-//! to `(piece, offset_in_piece)` -- and [`policy`] is the arithmetic of *which*
-//! pieces we keep and which of those we share; neither has a filesystem or a
-//! librqbit type in it. [`store`] is the
-//! [`librqbit::storage::TorrentStorage`] adapter over the first: the piece
-//! and file-table arithmetic, BEP-47 padding, info-hash keying and its
-//! spelling rule, and the have-set interlock -- everything a chunk store
-//! cannot know. [`registry`] is how the rest of the process reaches the
-//! store librqbit holds: a store registers there once `init` has seeded its
-//! held set, the retention pass reads the set through it instead of listing
-//! the directory, and every unlink of a registered torrent's piece goes
-//! through the registered store. [`sweep`] reconciles the store against the
-//! session at launch. What drives [`policy`] against a real torrent -- the playhead, the
-//! draw a play session advertises, the reclaim, and the claim that keeps a
-//! delete atomic with the have-set -- is [`crate::retention`].
+//! [`layout`] is the arithmetic of *where* a byte lives: `(file_id, offset)`
+//! to `(piece, offset_in_piece)`. [`policy`] is the arithmetic of *which*
+//! pieces we keep and which of those we share. Neither has a filesystem or
+//! a librqbit type in it. [`store`] is the
+//! [`librqbit::storage::TorrentStorage`] adapter over the first. It holds
+//! everything a chunk store cannot know: the piece and file-table
+//! arithmetic, BEP-47 padding, info-hash keying and its spelling rule, and
+//! the have-set interlock. [`registry`] is how the rest of the process
+//! reaches the store librqbit holds. A store registers there once `init`
+//! has seeded its held set. The retention pass reads the set through it
+//! instead of listing the directory. Every unlink of a registered torrent's
+//! piece goes through the registered store. [`sweep`] reconciles the store
+//! against the session at launch. [`crate::retention`] drives [`policy`]
+//! against a real torrent: the playhead, the draw a play session
+//! advertises, the reclaim, and the claim that keeps a delete atomic with
+//! the have-set.
 //!
 //! Two things about the chunk store are *parameters* an adapter sets, and
 //! this one sets both differently from `/proxy`. Its staged copy is
@@ -91,86 +90,86 @@
 //! `session_storage_factory`, installed in `open_session`), rooted at
 //! [`store::StoreRoot::in_download_dir`] of the same `download_dir` librqbit
 //! persists the session into.
-//! It is passed to no individual add, and that is not a stylistic choice:
-//! the things below had to be decided in the rqbit fork before it could be
+//! It is passed to no individual add, and that is not a stylistic choice.
+//! The things below had to be decided in the rqbit fork before it could be
 //! wired at all, and they are about the have-set rather than about storage.
-//! All of them are settled at the rev this crate pins, and the last of them
-//! is what let [`policy`] be wired up ([`crate::retention`]).
+//! All of them are settled at the rev this crate pins. The last of them is
+//! what let [`policy`] be wired up ([`crate::retention`]).
 //!
 //! **Settled: where the have-set comes from.** `initial_check` walks files in
-//! order and, on the first read error in a file, marks the rest of that file
-//! not-have without reading it. A sparsely populated cache -- which is the
-//! normal state here -- would report the pieces before the first gap and
+//! order. On the first read error in a file, it marks the rest of that file
+//! not-have without reading it. A sparsely populated cache, which is the
+//! normal state here, would report the pieces before the first gap and
 //! nothing after it. The have-set instead is the resume bitfield intersected
 //! with [`librqbit::storage::TorrentStorage::has_piece`], asked of the
 //! storage, and [`store::PieceStore`] answers it. A read of an absent piece
-//! still has to fail ([`store::MissingPiece`]) rather than return zeroes, or
-//! a hash check would call a hole a verified piece, and it does.
+//! still has to fail ([`store::MissingPiece`]) rather than return zeroes,
+//! or a hash check would call a hole a verified piece. It does fail.
 //!
 //! **Settled: persistence, and why "default" is the only place this can go.**
 //! A `SerializedTorrent` names an output folder and a file selection and no
-//! storage at all, so a restart replays it onto the session's *default*
-//! factory -- which is why this store can only work as the default. This
+//! storage at all. So a restart replays it onto the session's *default*
+//! factory, which is why this store can only work as the default. This
 //! session runs with persistence on (`LibrqbitBackend::new` hands it
-//! `SessionPersistenceConfig::Json`), and
+//! `SessionPersistenceConfig::Json`).
 //! `JsonSessionPersistenceStore::update_db` requires the factory to make a
 //! `StorageFactory::ensure_persistable` promise: a restart finds this data
 //! again, and the have-bitfield will not outlive it.
 //!
 //! [`store::PieceStoreFactory`] makes that promise
-//! (its `StorageFactory` impl in [`store`]) and may only make it
-//! because it is the default and its root is derived from the session's own
-//! `download_dir`: the next process builds a store over the same directory
+//! (its `StorageFactory` impl in [`store`]). It may only make it because it
+//! is the default and its root is derived from the session's own
+//! `download_dir`. The next process builds a store over the same directory
 //! and finds the same pieces under the same info hash. Handed to a single
 //! add instead, the promise would be a lie the next restart collects on.
 //!
 //! **Settled: reclaim capability.** The rev this crate pins adds a second
-//! factory promise, `StorageFactory::ensure_can_release_pieces`, and
+//! factory promise, `StorageFactory::ensure_can_release_pieces`.
 //! `Session::add_torrent` refuses `AddTorrentOptions::piece_reclaim` on a
-//! factory that does not make it -- because `drop_pieces` frees nothing on a
+//! factory that does not make it, because `drop_pieces` frees nothing on a
 //! storage that cannot let one piece go. [`store::PieceStoreFactory`] makes
 //! this one too: a piece is a file, and releasing it is
 //! [`store::PieceStore::delete_piece`]. That is a statement about the layout
 //! alone, true whether or not this is the default factory, unlike
 //! `ensure_persistable` above. Because this store *is* the default, the
-//! session's answer to "can my storage release a piece?" is now yes, so
+//! session's answer to "can my storage release a piece?" is now yes. So
 //! every add sets `piece_reclaim` and `drop_file_pieces` works. It also means
-//! librqbit restores **every** torrent paused -- the piece-level want-set is
-//! not in the persisted record -- and the engine layer is what starts them
+//! librqbit restores **every** torrent paused, because the piece-level
+//! want-set is not in the persisted record. The engine layer starts them
 //! again, once `BackendEngineFS::apply_pins` has put the
 //! want-set back (see [`crate::reconcile::Conditions::settled`]).
 //!
 //! **There is no migration, by decision.** A whole-file download an earlier
-//! version wrote is neither converted nor read: the torrent that owns it
+//! version wrote is neither converted nor read. The torrent that owns it
 //! comes up with an empty have-set and re-downloads as pieces. The old
 //! bytes belong to nobody. They sit beside the store
-//! (`<download dir>/<torrent name>/<file>`), not under it, so
+//! (`<download dir>/<torrent name>/<file>`), not under it. So
 //! [`store::StoreRoot::unregistered_bytes`] never reads them (it is one
-//! `read_dir` of `.pieces`) and no usage figure counts them -- and so
-//! [`sweep::sweep_legacy_downloads`] removes them whole, on the first launch that
-//! is handed a pin set, on the same hop as [`sweep_before_session`]'s sweep
-//! of `.pieces`. Named here rather than left to be discovered: a category
-//! of byte with no owner and no deleter is how a disk becomes unbounded,
-//! and the launch is this one's deleter.
+//! `read_dir` of `.pieces`), and no usage figure counts them. That is why
+//! [`sweep::sweep_legacy_downloads`] removes them whole, on the first launch
+//! that is handed a pin set, on the same hop as [`sweep_before_session`]'s
+//! sweep of `.pieces`. They are named here rather than left to be
+//! discovered. A category of byte with no owner and no deleter is how a
+//! disk becomes unbounded, and the launch is this one's deleter.
 //!
-//! Nothing else has a stake in the default factory: the client's activity
+//! Nothing else has a stake in the default factory. The client's activity
 //! signal reads librqbit's own peer counters ([`crate::traffic`]) and never
-//! sees the storage, so this factory is the bare default, and its own
+//! sees the storage. So this factory is the bare default, and its own
 //! initial-check reads are nobody's traffic.
 //!
 //! **Settled: a have-bit that is not an announcement.** [`policy`] decides
-//! that only a play session's draw is advertised and that a window piece is
-//! held and readable and *not* announced. The fork's advertised set is the
-//! third state, independent of both the have-set and the reclaim want-set:
-//! under `explicit_piece_advertising` a torrent announces a piece -- in the
-//! handshake bitfield, by a Have -- only when it has it *and* something
-//! advertised it (`ManagedTorrent::set_pieces_advertised`), from the moment
-//! the torrent exists, and serves a request only for such a piece. Without
-//! it, `have` implies announced on both paths, and a window piece has to be
-//! `have` for the stream to read it. The set lives beside the torrent, not in
-//! its chunk tracker, so a restart out of an error keeps it, and a live
-//! torrent refuses to take an announcement back. [`crate::retention`] is the
-//! wiring that performs the policy.
+//! that only a play session's draw is advertised. A window piece is held
+//! and readable and *not* announced. The fork's advertised set is the third
+//! state, independent of both the have-set and the reclaim want-set. Under
+//! `explicit_piece_advertising` a torrent announces a piece (in the
+//! handshake bitfield, by a Have) only when it has it *and* something
+//! advertised it (`ManagedTorrent::set_pieces_advertised`). That holds from
+//! the moment the torrent exists, and it serves a request only for such a
+//! piece. Without it, `have` implies announced on both paths, and a window
+//! piece has to be `have` for the stream to read it. The set lives beside
+//! the torrent, not in its chunk tracker. So a restart out of an error
+//! keeps it, and a live torrent refuses to take an announcement back.
+//! [`crate::retention`] is the wiring that performs the policy.
 //!
 //! The settled points are exercised rather than assumed. The storage is driven through
 //! a real librqbit session's own initial check below, and through a real
@@ -200,12 +199,12 @@ pub use sweep::{SweepReport, sweep_before_session};
 
 /// The store's directory inside a torrent cache root.
 ///
-/// Dot-prefixed, like the proxy cache's `.proxy` beside it, so that a
+/// It is dot-prefixed, like the proxy cache's `.proxy` beside it, so that a
 /// torrent named `pieces` cannot land on top of it.
 ///
-/// Inside the cache root rather than beside it, deliberately: piece files
-/// are cache, and whoever is counting the cache has to be able to see them
-/// -- which they do by asking the store ([`store::StoreRoot::stat`] and
+/// It is inside the cache root rather than beside it, on purpose. Piece
+/// files are cache, and whoever is counting the cache has to be able to see
+/// them. They do that by asking the store ([`store::StoreRoot::stat`] and
 /// [`registry::StoreRegistry::occupancy`]), never by walking in here.
 /// Nothing exempts the directory from the launch sweep either: pieces are
 /// exactly what a full disk should be reclaiming.
@@ -213,9 +212,9 @@ pub(crate) const PIECE_STORE_DIR: &str = ".pieces";
 
 /// Where a torrent cache root keeps its piece store.
 ///
-/// Crate-private, and reached from outside only through
-/// [`store::StoreRoot::in_download_dir`]: naming the store is the one thing
-/// a caller needs, and handing out the *path* instead is how the directory
+/// It is crate-private, and reached from outside only through
+/// [`store::StoreRoot::in_download_dir`]. Naming the store is the one thing
+/// a caller needs. Handing out the *path* instead is how the directory
 /// shape leaks into a walker outside this module that has no business
 /// depending on it.
 pub(crate) fn root_in(download_dir: &std::path::Path) -> std::path::PathBuf {

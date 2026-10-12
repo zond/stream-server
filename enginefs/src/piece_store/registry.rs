@@ -2,33 +2,33 @@
 //! whoever decides retention reads the held set the store keeps and unlinks
 //! through the store that keeps it.
 //!
-//! The live [`PieceStore`] of a running torrent is librqbit's: the factory
+//! The live [`PieceStore`] of a running torrent is librqbit's. The factory
 //! builds it and hands it to a torrent state this crate holds no reference
-//! to. The registry is what lets the retention pass read the held set
-//! without listing the torrent's directory every couple of seconds, and lets
-//! a reclaim unlink through the store instead of by path behind its back --
-//! a path unlink would leave the store's open-handle cache holding an
-//! unlinked inode's blocks, and a held set that never learned of the unlink
-//! standing over files that had gone. A store registers itself when `init`
-//! has seeded it, the pass asks the registry for the set, and every unlink
-//! of a registered torrent's piece goes through the registered store's own
-//! delete.
+//! to. The registry lets the retention pass read the held set without
+//! listing the torrent's directory every couple of seconds. It also lets a
+//! reclaim unlink through the store instead of by path behind its back. A
+//! path unlink would leave the store's open-handle cache holding an
+//! unlinked inode's blocks. It would also leave a held set that never
+//! learned of the unlink standing over files that had gone. A store
+//! registers itself when `init` has seeded it, and the pass asks the
+//! registry for the set. Every unlink of a registered torrent's piece goes
+//! through the registered store's own delete.
 //!
 //! A registration is a `Weak`, and the live store is whichever `Inner` the
-//! entry points at. A torrent in Error holds no storage -- librqbit pauses
-//! (a take) and drops the successor -- so its `Inner` goes, takes its
+//! entry points at. A torrent in Error holds no storage: librqbit pauses
+//! (a take) and drops the successor. So its `Inner` goes and takes its
 //! registration with it, and the registry answers "no store" for the hash.
-//! That is the answer the pass concludes nothing over; it is never an empty
-//! set, for the reason [`PieceStore::held`] gives. It is an answer the
-//! registry reaches *after* the state does: the `Inner` lives as long as
-//! its last handle, and the errored live state's handle goes when the peer
-//! tasks it cancelled have exited -- milliseconds after `run_state` says
-//! Error -- and every commit still queued on its committer holds one too,
-//! so the `Inner` stays until the last of those has been flushed: up to a
-//! full queue of fdatasyncs, which on a busy eMMC is seconds. In that gap
-//! the hash still answers a set and a delete through it still goes;
-//! nothing here reads the run state, and nothing that reads it may trust
-//! one reading across an unlink.
+//! The pass concludes nothing over that answer. It is never an empty set,
+//! for the reason [`PieceStore::held`] gives. The registry reaches this
+//! answer *after* the state does. The `Inner` lives as long as its last
+//! handle. The errored live state's handle goes when the peer tasks it
+//! cancelled have exited, milliseconds after `run_state` says Error. Every
+//! commit still queued on its committer holds a handle too. So the `Inner`
+//! stays until the last of those has been flushed: up to a full queue of
+//! fdatasyncs, which on a busy eMMC is seconds. In that gap the hash still
+//! answers a set, and a delete through it still goes. Nothing here reads
+//! the run state, and nothing that reads it may trust one reading across
+//! an unlink.
 //!
 //! [`PieceStore`]: super::PieceStore
 //! [`PieceStore::held`]: super::PieceStore::held
@@ -44,10 +44,11 @@ use super::store::{HeldSnapshot, Inner, StoreRoot};
 
 /// The stores under one root, by the info hash each registered under.
 ///
-/// One per [`super::PieceStoreFactory`], shared with everything that asks
-/// after a torrent's held set or deletes a piece of it. Two sessions in one
-/// process over two roots -- which the tests open -- have two of these, so
-/// a hash is looked up only among the stores that could hold it.
+/// There is one per [`super::PieceStoreFactory`], shared with everything
+/// that asks after a torrent's held set or deletes a piece of it. Two
+/// sessions in one process over two roots (which the tests open) have two
+/// of these, so a hash is looked up only among the stores that could hold
+/// it.
 pub struct StoreRegistry {
     /// The root the registered stores are under: where the factory opens a
     /// new store, and what [`Self::unregistered_bytes`] counts the stores
@@ -57,11 +58,11 @@ pub struct StoreRegistry {
     /// Who to tell when a store under this root accepts a piece, by the
     /// hash it is the watcher for. See [`PieceCompleted`].
     ///
-    /// `Weak`, like a registration: the watcher is the torrent's engine,
-    /// and an engine that has gone leaves an entry the next completion of
-    /// its hash drops. Keyed by hash rather than by store, so the fresh
-    /// store a restart out of error builds is watched by the same engine
-    /// without re-registering.
+    /// It is `Weak`, like a registration. The watcher is the torrent's
+    /// engine, and an engine that has gone leaves an entry the next
+    /// completion of its hash drops. It is keyed by hash rather than by
+    /// store, so the fresh store a restart out of error builds is watched by
+    /// the same engine without re-registering.
     watchers: Mutex<HashMap<String, Weak<dyn PieceCompleted>>>,
 }
 
@@ -69,14 +70,15 @@ pub struct StoreRegistry {
 /// and held by the store from that instant.
 ///
 /// **The one event that says a drawn piece is ours.** What may be shared is
-/// drawn when the policy is built and committed the moment this fires
-/// (`crate::piece_store::policy`), not on a retention pass's next reading of
-/// a directory listing -- which would miss a piece fetched and given back
-/// between two passes, and make what a session shares depend on whatever the
-/// cache happened to be holding when a pass last ran.
+/// drawn when the policy is built, and committed the moment this fires
+/// (`crate::piece_store::policy`). It is not committed on a retention pass's
+/// next reading of a directory listing. That would miss a piece fetched and
+/// given back between two passes. It would also make what a session shares
+/// depend on whatever the cache happened to be holding when a pass last
+/// ran.
 ///
 /// **Called on librqbit's own path**, inside a peer connection's
-/// `block_in_place` and concurrent across peers, so an implementation takes
+/// `block_in_place` and concurrent across peers. So an implementation takes
 /// no lock a slow reader holds, does no I/O, and hands the work on rather
 /// than doing it here.
 pub trait PieceCompleted: Send + Sync + 'static {
@@ -87,18 +89,18 @@ pub trait PieceCompleted: Send + Sync + 'static {
 /// What [`StoreRegistry::delete`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteOutcome {
-    /// A store is registered for the hash and the delete went through it:
-    /// this many pieces had a file that really left the disk -- either
-    /// copy, since either occupies blocks the volume gets back.
+    /// A store is registered for the hash and the delete went through it.
+    /// This many pieces had a file that really left the disk. Either copy
+    /// counts, since either occupies blocks the volume gets back.
     Registered { unlinked: usize },
     /// A store is registered and its initial hash check may still be
-    /// reading it, so nothing was unlinked: a piece taken from under the
-    /// check is one the check has just claimed and the torrent then
-    /// advertises without having.
+    /// reading it, so nothing was unlinked. A piece taken from under the
+    /// check is one the check has just claimed, and the torrent then
+    /// advertises it without having it.
     Refused,
-    /// No store is registered for the hash -- the session does not hold the
+    /// No store is registered for the hash. The session does not hold the
     /// torrent, holds it in Error, or the store has not run `init`. Nothing
-    /// was unlinked; the caller decides whether a path-addressed delete is
+    /// was unlinked. The caller decides whether a path-addressed delete is
     /// its to make.
     Unregistered,
 }
@@ -116,9 +118,9 @@ impl StoreRegistry {
     /// Tell `watcher` about every piece the store for `info_hash` accepts,
     /// for as long as the watcher is alive.
     ///
-    /// One watcher per hash -- the torrent's engine, which is the thing
-    /// that has a retention owner to commit into -- so a second registration
-    /// replaces the first, as a second store registration does.
+    /// There is one watcher per hash: the torrent's engine, which is the
+    /// thing that has a retention owner to commit into. So a second
+    /// registration replaces the first, as a second store registration does.
     pub fn watch(&self, info_hash: &str, watcher: Weak<dyn PieceCompleted>) {
         self.watchers
             .lock()
@@ -126,14 +128,14 @@ impl StoreRegistry {
     }
 
     /// A piece of `info_hash` has been accepted: whole, hash-checked and
-    /// held. From [`super::store::PieceStore`]'s completion and nowhere
-    /// else.
+    /// held. It is called from [`super::store::PieceStore`]'s completion and
+    /// nowhere else.
     ///
-    /// The map lock is dropped before the watcher is called: this runs on
+    /// The map lock is dropped before the watcher is called. This runs on
     /// librqbit's own completion path, and a watcher that took its time
     /// under this lock would hold up every other torrent's completions too.
-    /// A watcher that has gone takes its entry with it here, which is the
-    /// only pruning the map needs -- an engine outlives a piece.
+    /// A watcher that has gone takes its entry with it here. That is the
+    /// only pruning the map needs, because an engine outlives a piece.
     pub(super) fn completed(&self, info_hash: &str, piece: u32) {
         let key = info_hash.to_ascii_lowercase();
         let watcher = {
@@ -156,10 +158,10 @@ impl StoreRegistry {
 
     /// The held set of the live store registered for `info_hash`, or `None`
     /// when there is no such store: the session does not hold the torrent,
-    /// holds it in Error, or its `init` has not run. Synchronous and
-    /// lock-free past the map lookup -- a copy of the store's atomic words,
-    /// no listing -- which is what lets a retention pass read it on every
-    /// tick without a directory walk.
+    /// holds it in Error, or its `init` has not run. It is synchronous and
+    /// lock-free past the map lookup: a copy of the store's atomic words, no
+    /// listing. That is what lets a retention pass read it on every tick
+    /// without a directory walk.
     pub fn held(&self, info_hash: &str) -> Option<HeldSnapshot> {
         self.live(info_hash)?.held()
     }
@@ -193,28 +195,29 @@ impl StoreRegistry {
     /// files; or say why not.
     ///
     /// **Only for a caller that has already had the backend forget the
-    /// pieces** and is holding that claim across this call -- the interlock
-    /// [`crate::retention::take_claimed`] imposes, and the one way into the
-    /// store's files there is. Refused outright while the store is under its
-    /// initial check, asked at this instant and not earlier: the check
-    /// reads every piece it means to claim, and a piece unlinked from under
-    /// it becomes a have-bit over nothing.
+    /// pieces** and is holding that claim across this call. That is the
+    /// interlock [`crate::retention::take_claimed`] imposes, and the one way
+    /// into the store's files there is. It is refused outright while the
+    /// store is under its initial check, asked at this instant and not
+    /// earlier. The check reads every piece it means to claim, and a piece
+    /// unlinked from under it becomes a have-bit over nothing.
     ///
     /// A piece the volume refuses to unlink is logged and stepped over, not
-    /// returned: the count of what did go is what `ENOSPC` recovery reads.
-    /// Its held bit stays, so the next pass offers it again, and the backend
+    /// returned. The count of what did go is what `ENOSPC` recovery reads.
+    /// Its held bit stays, so the next pass offers it again. The backend
     /// hands a piece it has already forgotten to that pass's claim once
-    /// this one is released -- the retry is the next pass's, not the
+    /// this one is released. The retry is the next pass's, not the
     /// caller's.
     ///
     /// What this does not close: the check is asked of the store registered
-    /// at entry and the run is unlinked through that store. A restart out
-    /// of error that registers a fresh store over the same directory while
-    /// the run is still being unlinked has that store's check reading files
-    /// this loop is removing -- a window the length of one run's unlinks,
-    /// open only for a torrent that errored between the claim and here.
-    /// Closing it means an unlink under the registry's lock, which `init`
-    /// takes on the reactor under librqbit's own; it is left open and named.
+    /// at entry, and the run is unlinked through that store. A restart out
+    /// of error may register a fresh store over the same directory while
+    /// the run is still being unlinked. That store's check then reads files
+    /// this loop is removing. The window is the length of one run's
+    /// unlinks, and open only for a torrent that errored between the claim
+    /// and here. Closing it means an unlink under the registry's lock, which
+    /// `init` takes on the reactor under librqbit's own. It is left open and
+    /// named.
     pub fn delete(&self, info_hash: &str, pieces: &[u32]) -> DeleteOutcome {
         let Some(inner) = self.live(info_hash) else {
             return DeleteOutcome::Unregistered;
@@ -237,22 +240,22 @@ impl StoreRegistry {
         DeleteOutcome::Registered { unlinked }
     }
 
-    /// Whether a live store is registered for `info_hash` at all -- the
-    /// question a dormant download's delete asks before it takes the
-    /// directory. A registered store is one `init` seeded for a torrent
-    /// librqbit holds, and that torrent keeps a have-set over the same
-    /// pieces; a delete nobody had the backend forget first leaves that
-    /// have-set standing over nothing. So the delete by path goes only
-    /// where this is false, and steps back where it is true -- whatever
-    /// state the caller read the torrent in earlier, because the read and
-    /// the delete are two instants and a restart fits between them.
+    /// Whether a live store is registered for `info_hash` at all. A dormant
+    /// download's delete asks this before it takes the directory. A
+    /// registered store is one `init` seeded for a torrent librqbit holds,
+    /// and that torrent keeps a have-set over the same pieces. A delete
+    /// nobody had the backend forget first leaves that have-set standing
+    /// over nothing. So the delete by path goes only where this is false,
+    /// and steps back where it is true. That holds whatever state the caller
+    /// read the torrent in earlier, because the read and the delete are two
+    /// instants and a restart fits between them.
     pub fn is_registered(&self, info_hash: &str) -> bool {
         self.live(info_hash).is_some()
     }
 
     /// What every registered store holds, in bytes, by the held bits and
-    /// the layout -- no I/O. What a budget or a usage figure is built from
-    /// once nothing walks the disk to count it.
+    /// the layout, with no I/O. A budget or a usage figure is built from
+    /// this, once nothing walks the disk to count it.
     pub fn occupancy(&self) -> u64 {
         self.every_live()
             .filter_map(|inner| inner.held())
@@ -261,25 +264,25 @@ impl StoreRegistry {
     }
 
     /// What lies under the root that no registered store's held set
-    /// accounts for, in bytes -- the other half of [`Self::occupancy`].
+    /// accounts for, in bytes: the other half of [`Self::occupancy`].
     ///
-    /// One `read_dir` of the root and a `stat` of every directory no live
-    /// store speaks for: a torrent the session holds in Error (which holds
-    /// no storage, so it has no registration), one a previous process left,
-    /// and whatever is not a piece file. And the staged copies of the
-    /// stores that are registered, one `stat` each: a held set counts
-    /// complete pieces, so without them every piece in flight was in
-    /// neither half. Filesystem work, so it belongs off the reactor and is
-    /// asked on demand, never on the tick.
+    /// It costs one `read_dir` of the root and a `stat` of every directory
+    /// no live store speaks for. That is a torrent the session holds in
+    /// Error (which holds no storage, so it has no registration), one a
+    /// previous process left, and whatever is not a piece file. It also
+    /// costs one `stat` for each staged copy of the stores that are
+    /// registered. A held set counts complete pieces, so without them every
+    /// piece in flight was in neither half. This is filesystem work, so it
+    /// belongs off the reactor and is asked on demand, never on the tick.
     ///
     /// What a registered store's directory holds beyond its pieces and
     /// their staged copies is in neither half. Nothing writes such a file
     /// there, and finding one would take the walk of the tree this exists
     /// not to make.
     ///
-    /// The registration is asked at this instant and the `stat` follows it,
-    /// so a torrent that registers between the two is counted twice for the
-    /// length of one usage figure and a torrent that errors between them is
+    /// The registration is asked at this instant and the `stat` follows it.
+    /// So a torrent that registers between the two is counted twice for the
+    /// length of one usage figure. A torrent that errors between them is
     /// counted by neither. Both are a reading of a moving tree, which is
     /// what a usage figure is.
     pub fn unregistered_bytes(&self) -> u64 {
@@ -292,7 +295,7 @@ impl StoreRegistry {
     }
 
     /// Whether the store registered for `info_hash` is under its initial
-    /// hash check. False for a hash with no store: there is nothing to
+    /// hash check. It is false for a hash with no store: there is nothing to
     /// check.
     #[cfg(test)]
     pub fn checking(&self, info_hash: &str) -> bool {
@@ -300,17 +303,17 @@ impl StoreRegistry {
             .is_some_and(|inner| inner.is_checking())
     }
 
-    /// How many hashes have an entry, live or not: the probe for the tests
-    /// that pin what a store's drop does to the map.
+    /// How many hashes have an entry, live or not. It is the probe for the
+    /// tests that pin what a store's drop does to the map.
     #[cfg(test)]
     pub fn registration_count(&self) -> usize {
         self.by_hash.lock().len()
     }
 
     /// The store registered for `info_hash` whose `Inner` is still alive.
-    /// Lowercased on the way in, as [`StoreRoot::torrent_dir`] lowercases:
-    /// a caller that spelled the hash any other way asks about the same
-    /// store.
+    /// The hash is lowercased on the way in, as [`StoreRoot::torrent_dir`]
+    /// lowercases. A caller that spelled the hash any other way asks about
+    /// the same store.
     fn live(&self, info_hash: &str) -> Option<Arc<Inner>> {
         self.by_hash
             .lock()
@@ -329,8 +332,8 @@ impl StoreRegistry {
     }
 
     /// Make `inner` the live store for `info_hash`, replacing whatever was
-    /// there: a restart out of error builds a fresh store while the old
-    /// one's registration may not have gone yet, and the newest is the one
+    /// there. A restart out of error builds a fresh store while the old
+    /// one's registration may not have gone yet. The newest is the one
     /// librqbit reads and writes.
     pub(super) fn insert(&self, info_hash: &str, inner: &Arc<Inner>) {
         let mut by_hash = self.by_hash.lock();
@@ -338,8 +341,8 @@ impl StoreRegistry {
     }
 
     /// Drop the registration for `info_hash` if it still points at
-    /// `inner` -- from `Inner`'s drop, so an earlier store going away never
-    /// unregisters the one that replaced it.
+    /// `inner`. It is called from `Inner`'s drop, so an earlier store going
+    /// away never unregisters the one that replaced it.
     pub(super) fn forget(&self, info_hash: &str, inner: *const Inner) {
         let mut by_hash = self.by_hash.lock();
         let key = info_hash.to_ascii_lowercase();
@@ -403,9 +406,9 @@ mod tests {
     /// what commits a drawn piece on the event rather than on the next
     /// retention pass's reading of a listing.
     ///
-    /// And a watcher that has gone -- the torrent's engine dropped -- takes
-    /// its registration with it, so a later completion finds nothing and
-    /// leaves nothing behind.
+    /// And a watcher that has gone (the torrent's engine dropped) takes its
+    /// registration with it. So a later completion finds nothing and leaves
+    /// nothing behind.
     #[test]
     fn a_completed_piece_reaches_the_torrents_watcher() {
         struct Heard(Mutex<Vec<u32>>);
@@ -439,11 +442,11 @@ mod tests {
     }
 
     /// The store the factory makes is the one the registry answers for, and
-    /// only once `init` has seeded it: before that it is a store that holds
+    /// only once `init` has seeded it. Before that it is a store that holds
     /// unknown, and a registration of unknown would be read as a torrent
-    /// holding nothing. `Session::delete` builds exactly such a store --
-    /// create with no `init` -- to delete through, and it must neither
-    /// register itself nor push the live store out.
+    /// holding nothing. `Session::delete` builds exactly such a store
+    /// (create with no `init`) to delete through. It must neither register
+    /// itself nor push the live store out.
     #[test]
     fn a_store_registers_when_init_seeds_it_and_a_fallback_store_never_does() {
         let tmp = tempfile::tempdir().unwrap();
@@ -487,11 +490,11 @@ mod tests {
         assert_eq!(held_of(&registry), Some(BTreeSet::from([1, 2])));
     }
 
-    /// A restart out of error seeds a fresh store for the same hash; the
-    /// registration is the newest store's, and the old one's drop -- which
-    /// librqbit times as it likes -- must not take the new one's
-    /// registration with it. Once the last store is gone the hash answers
-    /// as a torrent in Error does: no store, not an empty set.
+    /// A restart out of error seeds a fresh store for the same hash. The
+    /// registration is the newest store's. The old one's drop, which
+    /// librqbit times as it likes, must not take the new one's registration
+    /// with it. Once the last store is gone, the hash answers as a torrent
+    /// in Error does: no store, not an empty set.
     #[test]
     fn the_newest_seeded_store_wins_and_an_older_ones_drop_leaves_it_registered() {
         let tmp = tempfile::tempdir().unwrap();
@@ -543,7 +546,7 @@ mod tests {
         assert_eq!(registry.delete(HASH, &[0]), DeleteOutcome::Unregistered);
     }
 
-    /// The registered delete is the store's own: the cached handle goes
+    /// The registered delete is the store's own. The cached handle goes
     /// with the file, the bit goes with the unlink, and a piece that was not
     /// there is not counted. `StoreRoot::delete_pieces` unlinked by path and
     /// could do neither of the first two.
@@ -579,9 +582,9 @@ mod tests {
         );
     }
 
-    /// From `init` until the take that ends the initial check, the check may
-    /// be reading any piece the seed found; a delete asked in that window is
-    /// refused and the file and its bit stay. The instant the check has
+    /// The check may be reading any piece the seed found, from `init` until
+    /// the take that ends the initial check. A delete asked in that window
+    /// is refused, and the file and its bit stay. The instant the check has
     /// handed over, the same delete goes through.
     #[test]
     fn a_delete_asked_while_the_store_is_checking_is_refused_and_takes_nothing() {
@@ -613,9 +616,9 @@ mod tests {
     }
 
     /// A hash is one store however it is spelled. librqbit and
-    /// `StoreRoot::torrent_dir` spell it lowercase and the server lowercases
-    /// before it asks, but the registry is the meeting point of every
-    /// caller, and one that spelled the hash as the user typed it would
+    /// `StoreRoot::torrent_dir` spell it lowercase, and the server
+    /// lowercases before it asks. But the registry is the meeting point of
+    /// every caller. One that spelled the hash as the user typed it would
     /// otherwise be told the torrent it is looking at has no store.
     #[test]
     fn a_hash_answers_the_same_store_however_it_is_spelled() {
@@ -642,12 +645,11 @@ mod tests {
     ///
     /// A registered store's bytes are its bits: no syscall, and the
     /// directory is stepped over entirely. What no store speaks for is
-    /// everything else on the volume under this root -- a torrent held in
+    /// everything else on the volume under this root: a torrent held in
     /// Error, a directory a previous process left, a file the store would
-    /// never have written -- and a usage figure that left those out would
-    /// read smaller than the disk does. So they are `stat`ed, and the two
-    /// halves are disjoint by construction: a hash is in one or the other,
-    /// never both.
+    /// never have written. A usage figure that left those out would read
+    /// smaller than the disk does. So they are `stat`ed. The two halves are
+    /// disjoint by construction: a hash is in one or the other, never both.
     #[test]
     fn what_no_store_speaks_for_is_stated_and_what_one_does_is_stepped_over() {
         let tmp = tempfile::tempdir().unwrap();
@@ -674,16 +676,16 @@ mod tests {
         // And debris directly under the root, which addresses no torrent at
         // all.
         std::fs::write(tmp.path().join(".pieces").join("stray"), [2u8; 8]).unwrap();
-        // And a *directory* whose name this store would never have written:
-        // a hash is lowercase here, so no registration can speak for this
-        // one and `stat` of it would read the lowercase directory beside it
-        // instead. It is on the volume, so what is in it is counted, and it
-        // is counted the one way that cannot address the wrong files --
+        // And a *directory* whose name this store would never have written.
+        // A hash is lowercase here, so no registration can speak for this
+        // one, and `stat` of it would read the lowercase directory beside it
+        // instead. It is on the volume, so what is in it is counted. It is
+        // counted the one way that cannot address the wrong files:
         // everything under the name, as a stray.
         //
-        // Only where the filesystem tells the two names apart. On a
-        // case-insensitive volume -- Windows, and macOS by default -- the
-        // shouted name *is* the lowercase directory, there is no second
+        // This holds only where the filesystem tells the two names apart.
+        // On a case-insensitive volume (Windows, and macOS by default) the
+        // shouted name *is* the lowercase directory. There is no second
         // entry for a rule to get wrong, and writing through it would just
         // overwrite the piece written above. Asked there, this half of the
         // test would be asserting something about the filesystem.
@@ -700,7 +702,7 @@ mod tests {
         if case_matters {
             std::fs::create_dir_all(shouted.join("0")).unwrap();
             // Deliberately a different size from the lowercase directory's
-            // piece: a rule that let this name through would `stat` the
+            // piece. A rule that let this name through would `stat` the
             // *lowercase* directory beside it, and the two would only add
             // up if both held the same bytes.
             std::fs::write(shouted.join("0").join("0"), [3u8; 40960]).unwrap();
@@ -718,9 +720,9 @@ mod tests {
 
     /// **A piece in flight is on the volume, so it is in the figure.** A
     /// held set counts complete pieces, and the directory of a registered
-    /// store is stepped over, so a staged copy was in neither half: up to a
-    /// piece per piece in flight, and the copy a re-download writes over a
-    /// complete one, all missing from `GET /cache.json`.
+    /// store is stepped over. So a staged copy was in neither half. Up to a
+    /// piece per piece in flight was missing from `GET /cache.json`, and so
+    /// was the copy a re-download writes over a complete one.
     #[test]
     fn a_registered_stores_staged_copies_are_in_the_unregistered_half() {
         let tmp = tempfile::tempdir().unwrap();
@@ -748,7 +750,7 @@ mod tests {
     }
 
     /// Occupancy is the registered stores' held bits priced by their
-    /// layouts -- the short last piece at its own length -- and it follows
+    /// layouts, the short last piece at its own length. It follows
     /// completions and unlinks without a `stat`. A store nothing has seeded
     /// and a hash whose store is gone contribute nothing.
     #[test]

@@ -1,35 +1,36 @@
 //! The startup sweep: delete piece data nothing has adopted.
 //!
-//! Android kills a backgrounded app without ceremony, so the process can and
+//! Android kills a backgrounded app without ceremony. So the process can and
 //! does die between a torrent being added and anything recording that it
-//! exists -- and between a torrent being removed and its pieces being deleted.
-//! Cleanup that only runs on the way out is cleanup that does not run. What is
-//! left behind is not visible as a download, is not counted by anything that
-//! asks the engine what it holds, and is never reclaimed: exactly the
-//! invisible disk usage this design exists to stop producing.
+//! exists. It can also die between a torrent being removed and its pieces
+//! being deleted. Cleanup that only runs on the way out is cleanup that does
+//! not run. What is left behind is not visible as a download, is not counted
+//! by anything that asks the engine what it holds, and is never reclaimed.
+//! That is exactly the invisible disk usage this design exists to stop
+//! producing.
 //!
 //! So the store is reconciled against the embedder's pin set once, at launch, before
-//! the session opens: every directory under the piece root whose info hash no
+//! the session opens. Every directory under the piece root whose info hash no
 //! pin claims is removed outright. Running before the session is what makes
-//! that safe -- a torrent being restored or added concurrently would have a
+//! that safe. A torrent being restored or added concurrently would have a
 //! directory, a registered store and no claim yet.
 //!
 //! It is idempotent by construction: it deletes what is not claimed, and a
 //! second pass finds the same claims and nothing left to delete.
 //!
 //! What may claim a torrent is therefore the whole of the question, and the
-//! answer is now one word: a pin. Everything else under this root is cache --
+//! answer is now one word: a pin. Everything else under this root is cache:
 //! a window round a playhead, the committed half a peer is served from, a
-//! slack file the next tick takes -- and none of it is worth a byte across a
+//! slack file the next tick takes. None of it is worth a byte across a
 //! restart, because nothing is playing in a process that has served nothing.
-//! So the claim set is the embedder's keys ([`super::pin_record`]) and the
-//! sweep runs *before the session opens*, while no store is registered and no
-//! torrent can be mid-check: what it deletes, it deletes with nothing holding
-//! a handle on it.
+//! So the claim set is the embedder's keys ([`super::pin_record`]). The
+//! sweep runs *before the session opens*, while no store is registered and
+//! no torrent can be mid-check. What it deletes, it deletes with nothing
+//! holding a handle on it.
 //!
 //! The one state it refuses to run in is one where nobody named the pins.
 //! Silence names no pins, and sweeping on that would delete every offline
-//! download the user has -- so it is skipped for that boot and the disk keeps
+//! download the user has. So it is skipped for that boot, and the disk keeps
 //! what it held; see [`super::pin_record::PinsUnknown`].
 
 use std::collections::HashSet;
@@ -43,12 +44,12 @@ use super::store::StoreRoot;
 pub struct SweepReport {
     /// Torrent directories removed because nothing claimed them.
     pub removed: usize,
-    /// What they occupied, in bytes as the volume counts them -- the one
-    /// `st_blocks` accounting this repository has, so a sparse or
+    /// What they occupied, in bytes as the volume counts them. This is the
+    /// one `st_blocks` accounting this repository has, so a sparse or
     /// partly-written piece is reported at what deleting it actually frees.
     pub freed_bytes: u64,
-    /// Entries that could not be removed. Logged, never fatal: a sweep that
-    /// trips over one directory must still do the rest.
+    /// Entries that could not be removed. They are logged, never fatal: a
+    /// sweep that trips over one directory must still do the rest.
     pub errors: usize,
 }
 
@@ -56,7 +57,7 @@ pub struct SweepReport {
 /// info hash is in `adopted`.
 ///
 /// Strays that are not directories, and directories that are not named like an
-/// info hash, are removed too: the root belongs to this store alone, so
+/// info hash, are removed too. The root belongs to this store alone, so
 /// anything in it that is not a torrent's pieces is debris from an interrupted
 /// write.
 pub fn sweep_unadopted(store: &StoreRoot, adopted: &HashSet<String>) -> SweepReport {
@@ -89,8 +90,8 @@ pub fn sweep_unadopted(store: &StoreRoot, adopted: &HashSet<String>) -> SweepRep
         if claimed {
             continue;
         }
-        // What the store says is in there, never a walk of our own: the
-        // bucketing is `StoreRoot`'s and this is the same reading a usage
+        // What the store says is in there, never a walk of our own. The
+        // bucketing is `StoreRoot`'s, and this is the same reading a usage
         // figure gets.
         let freed = match (is_dir, name) {
             (true, Some(name)) => store.stat(name).occupancy(),
@@ -101,9 +102,9 @@ pub fn sweep_unadopted(store: &StoreRoot, adopted: &HashSet<String>) -> SweepRep
     report
 }
 
-/// Remove one entry a sweep has condemned, and book it in `report`: the one
-/// removal both launch sweeps make. `what` names the category for the log
-/// line; a failure is logged and counted, never fatal.
+/// Remove one entry a sweep has condemned, and book it in `report`. This is
+/// the one removal both launch sweeps make. `what` names the category for
+/// the log line. A failure is logged and counted, never fatal.
 fn remove_swept(path: &Path, is_dir: bool, freed: u64, what: &str, report: &mut SweepReport) {
     let removed = if is_dir {
         std::fs::remove_dir_all(path)
@@ -127,15 +128,15 @@ fn remove_swept(path: &Path, is_dir: bool, freed: u64, what: &str, report: &mut 
 /// claims is kept and everything else under the piece root goes, before the
 /// session opens.
 ///
-/// Skipped outright when nobody named a set. Silence claims nothing, and a
-/// sweep on nothing is `remove_dir_all` over every offline download the user
-/// has -- so the disk keeps what it held for that boot, the condition is
-/// reported instead ([`super::pin_record::PinsUnknown`]), and the next boot
-/// that is told a set sweeps what this one left.
+/// It is skipped outright when nobody named a set. Silence claims nothing,
+/// and a sweep on nothing is `remove_dir_all` over every offline download
+/// the user has. So the disk keeps what it held for that boot, and the
+/// condition is reported instead ([`super::pin_record::PinsUnknown`]). The
+/// next boot that is told a set sweeps what this one left.
 ///
-/// On the blocking pool: it is `read_dir` plus `remove_dir_all` over a tree
-/// that can be the whole cache, and it runs on the thread that is opening the
-/// session.
+/// It runs on the blocking pool. It is `read_dir` plus `remove_dir_all` over
+/// a tree that can be the whole cache, and it runs on the thread that is
+/// opening the session.
 pub async fn sweep_before_session(download_dir: &Path, pins: Option<&PinSet>) -> SweepReport {
     let Some(pins) = pins else {
         tracing::warn!(
@@ -149,9 +150,9 @@ pub async fn sweep_before_session(download_dir: &Path, pins: Option<&PinSet>) ->
     match tokio::task::spawn_blocking(move || {
         let mut report = sweep_unadopted(&root, &claims);
         // Beside the store, not under it, and nothing else will ever take
-        // them: see `sweep_legacy_downloads`. On the same hop, because both
-        // are `read_dir` plus `remove_dir_all` on the thread opening the
-        // session.
+        // them: see `sweep_legacy_downloads`. They go on the same hop,
+        // because both are `read_dir` plus `remove_dir_all` on the thread
+        // opening the session.
         let legacy = sweep_legacy_downloads(&legacy_root);
         report.removed += legacy.removed;
         report.freed_bytes += legacy.freed_bytes;
@@ -171,29 +172,29 @@ pub async fn sweep_before_session(download_dir: &Path, pins: Option<&PinSet>) ->
 /// Directories under the download root that belong to something else, each
 /// of which reconciles itself.
 ///
-/// `.pieces` is [`sweep_unadopted`]'s, and it is the embedder's pin set that
-/// decides what survives there. `.proxy` is the proxy cache's, emptied by its own
+/// `.pieces` is [`sweep_unadopted`]'s, and the embedder's pin set decides
+/// what survives there. `.proxy` is the proxy cache's, emptied by its own
 /// launch sweep. Handing either of them to [`sweep_legacy_downloads`] would be
 /// one sweep deciding another's business, and for `.pieces` it would delete
 /// every pin. **A new directory under the download root goes on this list,
 /// or the next launch deletes it.**
 ///
-/// Nothing else is: `.cache` and `.metadata`, a pre-fork server's, are
-/// read and written by nothing -- not this crate, the server or librqbit,
-/// whose own session files sit directly under the root, where
-/// [`is_session_artifact`] names them -- so they are a previous release's
-/// data like anything else here.
+/// Nothing else is on it. `.cache` and `.metadata`, a pre-fork server's,
+/// are read and written by nothing: not this crate, the server or librqbit.
+/// librqbit's own session files sit directly under the root, where
+/// [`is_session_artifact`] names them. So `.cache` and `.metadata` are a
+/// previous release's data like anything else here.
 const NOT_OURS: [&str; 2] = [".pieces", ".proxy"];
 
 /// Whether `name`, directly under the download root, is something the
 /// session writes and reads.
 ///
-/// librqbit keeps its resume data beside the data itself -- `session.json`,
-/// a `.torrent` and a `.bitv` per info hash -- and the DHT its bootstrap.
-/// `pinned-downloads.json` (and the `.tmp-<n>` an interrupted write of it
-/// left) is also on the list: nothing here writes one, but an install
-/// upgraded from a build that did still has the file, and it is a record,
-/// not a previous release's data.
+/// librqbit keeps its resume data beside the data itself (`session.json`,
+/// a `.torrent` and a `.bitv` per info hash), and the DHT keeps its
+/// bootstrap there. `pinned-downloads.json` (and the `.tmp-<n>` an
+/// interrupted write of it left) is also on the list. Nothing here writes
+/// one, but an install upgraded from a build that did still has the file.
+/// It is a record, not a previous release's data.
 fn is_session_artifact(name: &str) -> bool {
     let name = name.strip_suffix(".tmp").unwrap_or(name);
     if matches!(
@@ -217,28 +218,28 @@ fn is_session_artifact(name: &str) -> bool {
 /// whole-file downloads at `<download dir>/<torrent name>/<file>`.
 ///
 /// **This is the one category of byte with no owner.** Everything this
-/// server writes goes through the piece store or the proxy cache, and both
-/// have an owner that bounds them and a launch sweep that reconciles them.
-/// A whole-file download predates all of it: no store speaks for it, no
+/// server writes goes through the piece store or the proxy cache. Both have
+/// an owner that bounds them and a launch sweep that reconciles them. A
+/// whole-file download predates all of it. No store speaks for it, no
 /// policy bounds it, no pass will ever look at it, and this sweep is the
 /// only thing that ever takes one. Left alone it is invisible disk usage
-/// that grows once and never shrinks -- the failure this design exists to
-/// stop producing, wearing the clothes of a previous release.
+/// that grows once and never shrinks. That is the failure this design
+/// exists to stop producing, wearing the clothes of a previous release.
 ///
-/// So it goes, once, at launch: what is not another component's directory
+/// So it goes, once, at launch. What is not another component's directory
 /// ([`NOT_OURS`]) and not a session artifact ([`is_session_artifact`]) is a
 /// previous release's data.
 ///
 /// **It runs where the session's own data lives**, so the exemptions are
-/// load-bearing rather than tidy: removing `session.json` would lose every
+/// load-bearing rather than tidy. Removing `session.json` would lose every
 /// torrent the user has, and removing `.pieces` would delete every pin.
-/// A name this server has never written is removed with them, which is the
+/// A name this server has never written is removed with them. That is the
 /// same judgement [`sweep_unadopted`] makes about its own root: the
 /// directory is this server's, and the alternative to deleting what we do
 /// not recognise is keeping it for ever.
 ///
-/// Skipped when nobody named a pin set, like [`sweep_before_session`] and
-/// for the same reason: that boot keeps what the disk held.
+/// It is skipped when nobody named a pin set, like [`sweep_before_session`]
+/// and for the same reason: that boot keeps what the disk held.
 pub fn sweep_legacy_downloads(download_dir: &Path) -> SweepReport {
     let mut report = SweepReport::default();
     let Ok(entries) = std::fs::read_dir(download_dir) else {
@@ -281,10 +282,10 @@ pub fn sweep_legacy_downloads(download_dir: &Path) -> SweepReport {
 
 /// What a tree occupies, as the volume counts it.
 ///
-/// A walk, unlike [`sweep_unadopted`]'s figure, because there is no store to
-/// ask: these bytes are exactly the ones nothing keeps a reading of. It runs
-/// once per launch over what a previous release left, and never again once
-/// that is gone.
+/// It is a walk, unlike [`sweep_unadopted`]'s figure, because there is no
+/// store to ask. These bytes are exactly the ones nothing keeps a reading
+/// of. It runs once per launch over what a previous release left, and never
+/// again once that is gone.
 fn tree_bytes(dir: &Path) -> u64 {
     let mut files = Vec::new();
     crate::chunk_store::collect_strays(dir, &mut files);
@@ -312,12 +313,12 @@ mod tests {
     /// **The one category of byte with no owner goes at launch.**
     ///
     /// A whole-file download from an older release lives beside the store,
-    /// not under it: no store speaks for it, no policy bounds it, no pass
+    /// not under it. No store speaks for it, no policy bounds it, no pass
     /// will ever look at it, and this sweep is the only thing that ever
     /// takes one. Left alone it is disk usage that grows once and never
     /// shrinks.
     ///
-    /// What it must not take is anything the session needs: `session.json`
+    /// What it must not take is anything the session needs. `session.json`
     /// and the per-hash resume files are how every torrent the user has
     /// comes back, and `.pieces` is where every pin lives.
     #[test]
@@ -333,8 +334,8 @@ mod tests {
         // And one it left directly under the root.
         std::fs::write(root.join("loose.mkv"), vec![7u8; 2048]).unwrap();
         // And a pre-fork server's torrent cache, and the `.metadata` beside
-        // it: read by nothing in this process, so as much a previous
-        // release's as the film.
+        // it. Nothing in this process reads them, so they are as much a
+        // previous release's as the film.
         std::fs::create_dir_all(root.join(".cache")).unwrap();
         std::fs::write(
             root.join(".cache").join(format!("{ADOPTED}.torrent")),
@@ -357,9 +358,9 @@ mod tests {
             std::fs::create_dir_all(root.join(name).join("inside")).unwrap();
         }
         // `.archives` is not exempt (see `NOT_OURS`): it is swept like any
-        // other unrecognised name. Nothing puts one *here* though -- the
+        // other unrecognised name. Nothing puts one *here* though. The
         // extraction cache is `<cacheRoot>/.archives`, a level above this
-        // root -- so this only exercises the default deletion path.
+        // root, so this only exercises the default deletion path.
         std::fs::create_dir_all(root.join(".archives")).unwrap();
         std::fs::write(root.join(".archives").join("archive_x.7z"), [3u8; 2048]).unwrap();
 
@@ -405,8 +406,8 @@ mod tests {
     /// The rule is the cleaner's: forty hex characters and one of two
     /// extensions. A directory a user named `notahash.torrent`, or a
     /// `.bitv` whose stem is the wrong length, is a previous release's as
-    /// far as this sweep is concerned -- and that is the safe direction,
-    /// because the session names its own files and this one would not open.
+    /// far as this sweep is concerned. That is the safe direction, because
+    /// the session names its own files and this one would not open.
     #[test]
     fn only_a_real_resume_file_is_spared() {
         assert!(is_session_artifact(&format!("{ADOPTED}.torrent")));
@@ -422,7 +423,7 @@ mod tests {
     }
 
     /// The point of the sweep, and the reason it has to be safe to run every
-    /// launch: a process killed mid-write leaves piece data nothing knows
+    /// launch. A process killed mid-write leaves piece data nothing knows
     /// about, and a second run must find nothing left to do.
     #[test]
     fn unclaimed_piece_data_goes_and_claimed_data_stays_however_often_it_runs() {
@@ -452,7 +453,7 @@ mod tests {
     }
 
     /// The root belongs to the store alone, so anything in it that is not a
-    /// claimed torrent's pieces is debris -- including a file where a
+    /// claimed torrent's pieces is debris. That includes a file where a
     /// directory should be, which is what an interrupted write leaves.
     #[test]
     fn debris_that_is_not_a_torrent_directory_goes_too() {
@@ -471,9 +472,9 @@ mod tests {
     }
 
     /// A dormant delete renames the directory to `<hash>.deleting-<nonce>`
-    /// before it walks it, and a process killed in the walk leaves that
-    /// behind. It is not the hash's name, so even with the hash pinned
-    /// again the sweep takes it.
+    /// before it walks it. A process killed in the walk leaves that behind.
+    /// It is not the hash's name, so even with the hash pinned again the
+    /// sweep takes it.
     #[test]
     fn a_delete_a_killed_process_left_goes_even_under_a_pinned_hash() {
         let tmp = tempfile::tempdir().unwrap();
@@ -510,7 +511,7 @@ mod tests {
         assert!(!root.join(ADOPTED).exists());
     }
 
-    /// The claim set is the embedder's keys and nothing else: a torrent the
+    /// The claim set is the embedder's keys and nothing else. A torrent the
     /// session will restore in a moment, and whose pieces are right there,
     /// is cache unless the embedder named it.
     #[tokio::test]
@@ -530,8 +531,8 @@ mod tests {
         assert!(!root.join(ORPHAN).exists(), "and nothing else is claimed");
     }
 
-    /// An embedder that names an empty set has said something -- the user
-    /// has pinned nothing -- and the sweep acts on it.
+    /// An embedder that names an empty set has said something: the user has
+    /// pinned nothing. The sweep acts on it.
     #[tokio::test]
     async fn an_empty_set_claims_nothing_and_the_sweep_runs() {
         let tmp = tempfile::tempdir().unwrap();
@@ -546,8 +547,8 @@ mod tests {
         assert!(!root.join(ADOPTED).exists());
     }
 
-    /// And an embedder that names no set at all is not an empty claim set:
-    /// nothing is swept, because what it would have claimed is exactly what
+    /// And an embedder that names no set at all is not an empty claim set.
+    /// Nothing is swept, because what it would have claimed is exactly what
     /// would go.
     #[tokio::test]
     async fn an_unnamed_pin_set_sweeps_nothing() {
@@ -578,8 +579,8 @@ mod tests {
     ///
     /// Two sweeps, one hop: what no pin claims under the store, and what an
     /// older version left beside it. The second has no other deleter at all
-    /// -- see [`sweep_legacy_downloads`] -- so a boot that ran only the
-    /// first would leave those bytes for the life of the install.
+    /// (see [`sweep_legacy_downloads`]). A boot that ran only the first
+    /// would leave those bytes for the life of the install.
     #[tokio::test]
     async fn the_launch_sweep_takes_a_previous_releases_download_as_well() {
         let tmp = tempfile::tempdir().unwrap();

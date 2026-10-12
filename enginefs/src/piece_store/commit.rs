@@ -1,32 +1,33 @@
 //! Which staged pieces are waiting to be made durable, process-wide.
 //!
 //! [`super::store::PieceStore::complete_piece`] queues the piece for its
-//! store's committer thread on librqbit's completion path and returns; the
+//! store's committer thread on librqbit's completion path, and returns. The
 //! piece is read from its staged copy until the rename lands. This is the
 //! bookkeeping that makes that safe to race against everything else that
 //! addresses the same file:
 //!
 //! * a delete of the piece (retention's reclaim, `remove_file`) must either
-//!   cancel the commit before its rename or wait for the rename to finish and
-//!   then delete the result -- never unlink the staged copy while the
-//!   committer is renaming it, and never leave a rename to land after the
-//!   delete has cleared the held bit;
-//! * anything that reads the *durable* record -- librqbit's `has_piece`, and
-//!   the walk `init` seeds the held set from -- must see a queued piece's
-//!   rename first, or it would call a piece it is about to own absent.
+//!   cancel the commit before its rename, or wait for the rename to finish
+//!   and then delete the result. It must never unlink the staged copy while
+//!   the committer is renaming it, and never leave a rename to land after
+//!   the delete has cleared the held bit;
+//! * anything that reads the *durable* record must see a queued piece's
+//!   rename first, or it would call a piece it is about to own absent. That
+//!   is librqbit's `has_piece`, and the walk `init` seeds the held set from.
 //!
-//! Keyed by the staged copy's **path** and kept for the whole process rather
-//! than per store, because two stores can stand over one directory: a
-//! restart out of error builds a fresh store while the errored one may still
-//! have commits queued, and the fresh store's walk has to wait for them.
+//! It is keyed by the staged copy's **path** and kept for the whole process
+//! rather than per store, because two stores can stand over one directory.
+//! A restart out of error builds a fresh store while the errored one may
+//! still have commits queued, and the fresh store's walk has to wait for
+//! them.
 //!
 //! The lock is never held across I/O. A rename on a busy eMMC waits behind
-//! the journal like any other metadata operation, and a lock held across it
-//! would put every completion of every torrent back behind the device --
-//! which is what the queue exists to take them out from behind. So a rename
-//! is announced ([`Pending::start_rename`]) and finished
-//! ([`Pending::finish`]) under the lock, and done between the two without
-//! it; a delete that meets a rename in progress waits on the condvar.
+//! the journal like any other metadata operation. A lock held across it
+//! would put every completion of every torrent back behind the device, and
+//! the queue exists to take them out from behind it. So a rename is
+//! announced ([`Pending::start_rename`]) and finished ([`Pending::finish`])
+//! under the lock, and done between the two without it. A delete that
+//! meets a rename in progress waits on the condvar.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -57,13 +58,13 @@ pub(super) struct Pending {
     by_path: Mutex<HashMap<PathBuf, State>>,
     changed: Condvar,
     next_id: AtomicU64,
-    /// The paths a [`Self::cancel`] is on its way into the lock for: what a
-    /// test holding the lock polls to know a delete has reached it, rather
+    /// The paths a [`Self::cancel`] is on its way into the lock for. A test
+    /// holding the lock polls this to know a delete has reached it, rather
     /// than sleeping while every other test's commit waits behind it.
     #[cfg(test)]
     cancelling: Mutex<Vec<PathBuf>>,
     /// The paths (or directories) a [`Self::wait_for`] or
-    /// [`Self::wait_under`] is parked on the condvar for: what a test polls
+    /// [`Self::wait_under`] is parked on the condvar for. A test polls this
     /// to know a reader is waiting out a rename, rather than sleeping and
     /// hoping it got there.
     #[cfg(test)]
@@ -84,14 +85,14 @@ pub(super) static PENDING: LazyLock<Pending> = LazyLock::new(|| Pending {
 impl Pending {
     /// Queue the staged copy at `path`, and return the ticket the committer
     /// finishes it by. A commit of the same path still in progress is
-    /// waited out first: nothing completes a piece twice without the piece
-    /// going in between, but if it ever did, the second must not be taken
-    /// for the first -- by its committer, or by a delete waiting on it.
+    /// waited out first. Nothing completes a piece twice without the piece
+    /// going in between. But if it ever did, the second must not be taken
+    /// for the first, by its committer or by a delete waiting on it.
     ///
     /// `and` runs under the same lock as the queueing, so that a delete's
-    /// [`Self::cancel`] sees both or neither: the store marks the piece held
-    /// there, and a delete that cancelled the commit and then cleared the
-    /// bit must not have the bit set again behind it.
+    /// [`Self::cancel`] sees both or neither. The store marks the piece held
+    /// there. A delete that cancelled the commit and then cleared the bit
+    /// must not have the bit set again behind it.
     pub(super) fn begin(&self, path: &Path, and: impl FnOnce()) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut map = self.by_path.lock();
@@ -104,8 +105,8 @@ impl Pending {
     }
 
     /// Take the commit of `path` off the queue, for a delete about to unlink
-    /// the file: after this no rename of it will land. A rename already in
-    /// progress is waited for -- its result is the file the delete then
+    /// the file. After this no rename of it will land. A rename already in
+    /// progress is waited for, and its result is the file the delete then
     /// removes. Returns whether a queued commit was cancelled.
     pub(super) fn cancel(&self, path: &Path) -> bool {
         #[cfg(test)]
@@ -127,15 +128,15 @@ impl Pending {
     }
 
     /// Whether a [`Self::cancel`] of `path` is standing at the lock while
-    /// something holds it: for a caller that holds it, "the cancel is
-    /// blocked behind me". A cancel passing through an unheld lock is not
-    /// this, however it is timed. See [`Self::cancelling`].
+    /// something holds it. For a caller that holds it, this means "the
+    /// cancel is blocked behind me". A cancel passing through an unheld lock
+    /// is not this, however it is timed. See [`Self::cancelling`].
     #[cfg(test)]
     pub(super) fn cancel_is_blocked(&self, path: &Path) -> bool {
         self.by_path.is_locked() && self.cancelling.lock().iter().any(|waiting| waiting == path)
     }
 
-    /// The committer's claim on the rename: false when the commit was
+    /// The committer's claim on the rename. It is false when the commit was
     /// cancelled while it was queued or being flushed, and then the
     /// committer does nothing more with it.
     pub(super) fn start_rename(&self, path: &Path, id: u64) -> bool {
@@ -238,9 +239,9 @@ mod tests {
         assert!(!p.is_pending(path));
     }
 
-    /// The half of the interlock the module doc puts first: a delete that
-    /// meets a rename in progress does not return until the rename has, so
-    /// what it unlinks next is the renamed file and not a name that is
+    /// The half of the interlock the module doc puts first. A delete that
+    /// meets a rename in progress does not return until the rename has. So
+    /// what it unlinks next is the renamed file, and not a name that is
     /// about to appear.
     #[test]
     fn a_delete_waits_out_a_rename_in_progress() {

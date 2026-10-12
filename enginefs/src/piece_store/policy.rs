@@ -3,17 +3,17 @@
 //!
 //! The store can hold a piece or give it back, and the want-set can want a
 //! piece or stop wanting it. Neither of them decides *which* pieces. That
-//! decision is a handful of numbers -- a budget, a piece length, the pieces of
-//! one file, what the readers were granted -- and it lives here on its own, beside
-//! [`super::layout`] and for the same reason: it is the part that is easy to
-//! get quietly wrong and easy to test exhaustively, and it should not have to
+//! decision is a handful of numbers: a budget, a piece length, the pieces of
+//! one file, what the readers were granted. It lives here on its own, beside
+//! [`super::layout`] and for the same reason. It is the part that is easy to
+//! get quietly wrong and easy to test exhaustively. It should not have to
 //! be reasoned about through a session, a disk and a swarm.
 //!
 //! # The policy
 //!
 //! **The budget** is bytes, per volume, and comes from the server's
 //! `CacheLimit::effective` -- `min(configured, occupied + available - floor)`.
-//! It is an input here and is not recomputed: a second reading of "how much
+//! It is an input here and is not recomputed. A second reading of "how much
 //! room is there" that disagreed with the published one would have the two
 //! halves of the cache sized against different numbers.
 //!
@@ -24,115 +24,116 @@
 //! **If it does not, it is split:**
 //!
 //! * One part is not shared. What goes in it is what the entity's consumers
-//!   are asking for -- the runs of the file the read-pattern detector sees
-//!   being read (`crate::retention::streams`) -- and no number here bounds
-//!   that; what is sized here is how much of the budget it leaves.
+//!   are asking for: the runs of the file the read-pattern detector sees
+//!   being read (`crate::retention::streams`). No number here bounds that.
+//!   What is sized here is how much of the budget it leaves.
 //! * The other is committed for sharing. It is filled *opportunistically*,
-//!   from pieces we already hold -- nothing here ever asks for a byte no
-//!   consumer asked for -- and once a piece is in it, it stays.
+//!   from pieces we already hold, and nothing here ever asks for a byte no
+//!   consumer asked for. Once a piece is in it, it stays.
 //!
 //! Where the split falls is not simply a half. Both parts are bounded in
-//! *time* first ([`Buffering`]) -- so many seconds of this stream at the rate
-//! bytes are really leaving the server at -- and the budget is only the
-//! ceiling. The committed part yields first, and it yields to a floor too:
-//! the lookahead an open stream was already granted is pinned as surely as
-//! the committed set is, the two have to fit under the budget together, and
+//! *time* first ([`Buffering`]): so many seconds of this stream, at the rate
+//! bytes are really leaving the server at. The budget is only the ceiling.
+//! The committed part yields first, and it yields to a floor too. The
+//! lookahead an open stream was already granted is pinned as surely as the
+//! committed set is. The two have to fit under the budget together, and
 //! the committed half is the one that can give ([`Buffering`]).
 //!
 //! **Only the draw is advertised**, and a piece of it is announced when we
-//! hold it. That is the whole of being a good citizen here: a piece we might
+//! hold it. That is the whole of being a good citizen here. A piece we might
 //! reclaim is never announced, so we never advertise-then-refuse, which is
 //! what gets a client choked. An unshared piece is held and readable and
 //! *not* announced, because it will go. On a small volume
 //! that means we honestly seed little; on a roomy one we seed everything.
 //!
 //! **That last part is a decision this module states but does not perform.**
-//! [`RetentionPolicy::draw`] says which pieces to show a peer, and
-//! [`crate::retention`] is what turns it into what librqbit actually
-//! announces, through the fork's `ManagedTorrent::set_pieces_advertised`,
-//! under which a torrent announces nothing it was not told to.
+//! [`RetentionPolicy::draw`] says which pieces to show a peer.
+//! [`crate::retention`] turns it into what librqbit actually announces,
+//! through the fork's `ManagedTorrent::set_pieces_advertised`. Under that,
+//! a torrent announces nothing it was not told to.
 //!
 //! # Two choices worth stating, because they look arbitrary
 //!
 //! **Which pieces we share is drawn once per play session, and never
-//! changes.** The draw is a uniformly random subset of the file's pieces, of
-//! the size the committed capacity allows once the stream's read-ahead is
-//! known -- the budget less the real read-ahead, the film's bitrate times
-//! the viewer's seconds, nothing when the budget cannot hold both -- taken
-//! from a seed held per entity (see [`choose`]). A seek, a budget that rises
-//! or falls, a length stated again: none of them redraws it, because a
-//! redraw is either a withdrawal or a set the viewer never agreed to share. Random and not a stride,
-//! because a stride is a lattice -- two clients with the same k differ only by
-//! phase and can still overlap almost completely -- and independent draws
-//! overlap only by chance, which is the property that makes peers who cannot
-//! see each other sum to even coverage of a torrent. Even and not biased late,
-//! because a shared late bias only moves the hole: if every client kept the
-//! tail, the tail becomes the over-replicated part and the head goes scarce.
+//! changes.** The draw is a uniformly random subset of the file's pieces,
+//! taken from a seed held per entity (see [`choose`]). Its size is what the
+//! committed capacity allows once the stream's read-ahead is known: the
+//! budget less the real read-ahead (the film's bitrate times the viewer's
+//! seconds), or nothing when the budget cannot hold both. A seek, a budget
+//! that rises or falls, a length stated again: none of them redraws it. A
+//! redraw is either a withdrawal or a set the viewer never agreed to share.
+//! It is random and not a stride, because a stride is a lattice. Two
+//! clients with the same k differ only by phase, and can still overlap
+//! almost completely. Independent draws overlap only by chance. That is the
+//! property that makes peers who cannot see each other sum to even coverage
+//! of a torrent. It is even and not biased late, because a shared late bias
+//! only moves the hole. If every client kept the tail, the tail would become
+//! the over-replicated part and the head would go scarce.
 //!
-//! It is not committed when the window *releases* a piece -- the playhead
-//! having walked past it -- because that would settle the shared set out of
-//! the first minutes of the film: in a swarm of streaming clients everyone
+//! It is not committed when the window *releases* a piece (the playhead
+//! having walked past it). That would settle the shared set out of the
+//! first minutes of the film. In a swarm of streaming clients everyone
 //! watches from the start, so the head is the most replicated part of a
-//! torrent and the tail is the scarce part, and committing on release would
-//! keep exactly the pieces nobody needs. Measured on the field device -- a
-//! cap of thirty-six pieces, about fifty seconds of a 23 Mbps film -- that
+//! torrent and the tail is the scarce part. Committing on release would
+//! keep exactly the pieces nobody needs. Measured on the field device (a
+//! cap of thirty-six pieces, about fifty seconds of a 23 Mbps film), that
 //! approach shares the first fifty seconds of a 109-minute feature and
 //! nothing else for the rest of the process.
 //!
 //! **A drawn piece is committed and announced the moment we hold it**,
-//! verified on the disk, rather than when something lets go of it: with the
-//! set fixed up front there is nothing to take back, so a piece can go out
-//! the moment it verifies -- which is what any BitTorrent client does with
-//! every piece it completes -- and it means peers learn we have those bytes
+//! verified on the disk, rather than when something lets go of it. With the
+//! set fixed up front there is nothing to take back. So a piece can go out
+//! the moment it verifies, which is what any BitTorrent client does with
+//! every piece it completes. It means peers learn we have those bytes
 //! *while* the viewer is watching, which is when the upload switch lets us
 //! serve them. Deciding membership by playback instead would always leave a
-//! piece we might still reclaim, and announcing one of those is the
+//! piece we might still reclaim. Announcing one of those is the
 //! advertise-then-refuse this module exists to prevent.
 //!
-//! **And the moment is the completion, not the next pass.**
-//! [`RetentionPolicy::commit_drawn`] is what the completion calls (see
-//! [`super::registry::PieceCompleted`]); the pass still commits whatever it
-//! finds held that the event missed, which is a property of the window and
-//! the tick and not of the draw.
+//! **And the moment is the completion, not the next pass.** The completion
+//! calls [`RetentionPolicy::commit_drawn`] (see
+//! [`super::registry::PieceCompleted`]). The pass still commits whatever it
+//! finds held that the event missed. That is a property of the window and
+//! the tick, not of the draw.
 //!
 //! **Nothing drawn is ever un-announced or reclaimed.** There is no
-//! un-have in BitTorrent: hiding a piece changes only the bitfield a *new*
+//! un-have in BitTorrent. Hiding a piece changes only the bitfield a *new*
 //! peer is handed at its handshake, while a peer that already holds our Have
 //! can still ask for it. So a capacity that shrinks under the draw leaves it
-//! as it is ([`RetentionPolicy::observe`]), and a policy under another
-//! budget adopts the draw whole, over its capacity and all
-//! ([`RetentionPolicy::carry_into`]). The draw ends with the play session:
-//! the torrent leaves the swarm first, and only then are its pieces deleted
+//! as it is ([`RetentionPolicy::observe`]). A policy under another budget
+//! adopts the draw whole, over its capacity and all
+//! ([`RetentionPolicy::carry_into`]). The draw ends with the play session.
+//! The torrent leaves the swarm first, and only then are its pieces deleted
 //! (the reconciler's [`crate::reconcile::Decision::EndShares`], which
 //! `BackendEngineFS` carries out).
 //!
-//! **The set under-fills, and that is correct.** It is never fetched for: we
-//! commit what we hold, and we hold what the viewer's window fetched, so a
-//! viewer who stops halfway fills about half the draw and the rest of it stays
-//! empty. Filling it would mean fetching bytes for the swarm rather than for
-//! the viewer, which on a metered phone is a trade nobody agreed to, and an
-//! unfilled cache costs nothing.
+//! **The set under-fills, and that is correct.** It is never fetched for. We
+//! commit what we hold, and we hold what the viewer's window fetched. So a
+//! viewer who stops halfway fills about half the draw, and the rest of it
+//! stays empty. Filling it would mean fetching bytes for the swarm rather
+//! than for the viewer. On a metered phone that is a trade nobody agreed
+//! to, and an unfilled cache costs nothing.
 //!
 //! **And the draw is uniform rather than ranked.** The design says to choose by
-//! whatever is cheapest and explicitly not by rarity: measured across four live
-//! swarms, rarity-based retention beat random by <=0.15%, and by 0.00% on three
-//! of them, because seeder fractions of 94-100% cap the whole effect. So there
-//! is no availability map here and nothing to rank.
+//! whatever is cheapest, and explicitly not by rarity. Measured across four
+//! live swarms, rarity-based retention beat random by <=0.15%, and by 0.00%
+//! on three of them, because seeder fractions of 94-100% cap the whole
+//! effect. So there is no availability map here and nothing to rank.
 //!
 //! # What this does not decide
 //!
 //! Nothing durable. The draw is per-session state held by the retention
-//! owner: sharing runs for the play session and ends when playback moves to
-//! anything else, and there is no set to re-adopt at launch. A piece it never
-//! reclaimed still has to be claimed by the startup sweep like everything else
-//! (see [`super::sweep`]), because "clean on close" does not run when Android
-//! kills the app.
+//! owner. Sharing runs for the play session and ends when playback moves to
+//! anything else, and there is no set to re-adopt at launch. A piece it
+//! never reclaimed still has to be claimed by the startup sweep like
+//! everything else (see [`super::sweep`]). "Clean on close" does not run
+//! when Android kills the app.
 
 use std::collections::BTreeSet;
 use std::ops::Range;
 
 /// How much of a forward-reach window ([`window_for_reach`]) is treated as
-/// sitting behind the playhead rather than ahead of it, in percent: a cap
+/// sitting behind the playhead rather than ahead of it, in percent. A cap
 /// stated in seconds is converted assuming 90% of the window reaches ahead
 /// and 10% behind.
 const BEHIND_PERCENT: u64 = 10;
@@ -142,27 +143,27 @@ const BEHIND_PERCENT: u64 = 10;
 ///
 /// **This is the only thing that differs between the two kinds of stream this
 /// policy governs, and it is a number rather than a branch.** The budget is
-/// split between what playback needs and what a peer may be offered; a
-/// proxied URL response is not seeded, so nobody can be offered any of it and
-/// the whole budget is unshared. Everything else -- the sizing, and the rule
-/// that a committed piece is never reclaimed -- is the same on both, which is
-/// what "one retention policy over both stores" means.
+/// split between what playback needs and what a peer may be offered. A
+/// proxied URL response is not seeded, so nobody can be offered any of it,
+/// and the whole budget is unshared. Everything else is the same on both:
+/// the sizing, and the rule that a committed piece is never reclaimed. That
+/// is what "one retention policy over both stores" means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Share {
     /// Half of it: a torrent's pieces, which a peer may ask us for.
     Half,
-    /// None of it. **Not "share nothing yet"** -- there is no swarm for a
-    /// URL response and there never will be, so a committed set for one
-    /// would be a permanently unreclaimable half of the cache held for a
-    /// reader that does not exist.
+    /// None of it. **Not "share nothing yet"**: there is no swarm for a
+    /// URL response and there never will be. A committed set for one would
+    /// be a permanently unreclaimable half of the cache, held for a reader
+    /// that does not exist.
     Nothing,
 }
 
 impl Share {
     /// How many of `budget` pieces this leaves for the committed set.
     ///
-    /// The odd piece goes to the window: it is what keeps playback fed, and
-    /// the committed half is generosity.
+    /// The odd piece goes to the window. The window is what keeps playback
+    /// fed, and the committed half is generosity.
     fn committed_of(self, budget: u32) -> u32 {
         match self {
             Self::Half => budget / 2,
@@ -176,25 +177,24 @@ impl Share {
 ///
 /// **An open stream's lookahead and the committed set are both pinned, and
 /// together they have to fit under the budget.** The lookahead is fixed
-/// when the reader opens (`Engine::try_get_file_with_intent`) and there is
-/// no setter for it in the fork; the backend refuses to forget a piece
-/// inside it, and every pass hands it in as
-/// [`crate::retention::owner::Asking::holding`] so that no reclaim is
+/// when the reader opens (`Engine::try_get_file_with_intent`), and there is
+/// no setter for it in the fork. The backend refuses to forget a piece
+/// inside it. Every pass hands it in as
+/// [`crate::retention::owner::Asking::holding`], so that no reclaim is
 /// chosen against it. The committed set is what `advance` never reclaims.
-/// Nothing here bounds what a stream fetches or what a pass takes back --
-/// see [`Shape::Split`] -- so what this number does is size the committed
-/// half. The budget is
-/// republished every sixty seconds from the volume's free space and a
-/// shrink resizes the policy under readers that are already open; a
-/// committed set drawn at half of the new budget, beside a lookahead
-/// granted under the old one, would leave the pass less than nothing to
-/// reclaim and a disk that cannot come back under its budget until the
-/// stream ends. The committed half is what yields, because it is the half
-/// that can.
+/// Nothing here bounds what a stream fetches or what a pass takes back
+/// (see [`Shape::Split`]). So what this number does is size the committed
+/// half. The budget is republished every sixty seconds from the volume's
+/// free space, and a shrink resizes the policy under readers that are
+/// already open. Take a committed set drawn at half of the new budget,
+/// beside a lookahead granted under the old one. It would leave the pass
+/// less than nothing to reclaim, and a disk that cannot come back under its
+/// budget until the stream ends. The committed half is what yields, because
+/// it is the half that can.
 ///
 /// The number is what a reader was *granted*, not what its buffer profile
-/// would have liked: the grant is already cut to what the last pass said
-/// the entity is asking for and to the whole cache, so the floor binds
+/// would have liked. The grant is already cut to what the last pass said
+/// the entity is asking for, and to the whole cache. So the floor binds
 /// when the budget moves under a reader that is already open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Buffering {
@@ -210,51 +210,51 @@ pub struct Buffering {
     ///
     /// **This is the user's decision and the disk is only the ceiling.**
     /// Sized from the budget alone, the forward reach is a fixed fraction
-    /// of `cacheSize`, so a viewer who gave the app a bigger cache bought a
-    /// bigger mobile-data bill without being asked. It binds only once
-    /// [`Self::bytes_per_second`] is known.
+    /// of `cacheSize`. A viewer who gave the app a bigger cache would then
+    /// buy a bigger mobile-data bill without being asked. It binds only
+    /// once [`Self::bytes_per_second`] is known.
     pub window_seconds: Option<u64>,
     /// How many seconds of watched video the committed set may hold, or
     /// `None` for no cap.
     ///
-    /// The committed set is what a peer may be offered and what a scan back
-    /// is served from; both want the recent past, not half the volume.
-    /// Sizing it as half the budget would, on a small cache, take exactly
-    /// the half the forward buffer needs, leaving nothing over for either
+    /// The committed set is what a peer may be offered, and what a scan
+    /// back is served from. Both want the recent past, not half the volume.
+    /// On a small cache, sizing it as half the budget would take exactly
+    /// the half the forward buffer needs, and leave nothing over for either
     /// use.
     pub committed_seconds: Option<u64>,
     /// The film's average bitrate for this entity, or `None` until its
     /// length has been stated.
     ///
     /// **A bitrate and not an observation.** It is the entity's size over
-    /// the duration the player reported (`Retention::note_duration`), which
+    /// the duration the player reported (`Retention::note_duration`). That
     /// is exact at the first report and cannot be distorted by a read
-    /// pattern: an EWMA over delivered bytes instead would measure the
-    /// swarm and the player's own buffer rather than the film -- as little
-    /// as three bytes a second across a gap in which nothing played --
-    /// collapsing the window onto its floor. Until there is a rate the two
-    /// time caps do not apply at all and the byte arithmetic below stands
-    /// on its own.
+    /// pattern. An EWMA over delivered bytes would instead measure the
+    /// swarm and the player's own buffer rather than the film. That can be
+    /// as little as three bytes a second across a gap in which nothing
+    /// played, which collapses the window onto its floor. Until there is a
+    /// rate, the two time caps do not apply at all, and the byte arithmetic
+    /// below stands on its own.
     pub bytes_per_second: Option<u64>,
     /// The draw that decides which pieces of this entity this process
     /// offers to the swarm; see [`choose`].
     ///
-    /// One per entity, held for as long as the entity is, and **random**:
-    /// clients that all keep the same pieces cover a torrent as unevenly as
-    /// clients that all keep its first minute. It is not persisted, because
-    /// the committed set is not -- sharing runs between sessions and the
-    /// next stream ends it.
+    /// There is one per entity, held for as long as the entity is, and it
+    /// is **random**. Clients that all keep the same pieces cover a torrent
+    /// as unevenly as clients that all keep its first minute. It is not
+    /// persisted, because the committed set is not: sharing runs between
+    /// sessions and the next stream ends it.
     pub seed: u64,
 }
 
 impl Buffering {
-    /// What two readers of one entity ask of it together: the larger
-    /// lookahead, since each fetches its own and the window has to hold
-    /// both, and the more generous of each profile -- a second reader
-    /// asking for less must not shrink the window under the one already
-    /// open. `None` is a reader that stated no profile and says nothing
-    /// either way. The rate and the seed are the entity's, not a reader's,
-    /// and are `self`'s.
+    /// What two readers of one entity ask of it together. That is the
+    /// larger lookahead, since each fetches its own and the window has to
+    /// hold both. It is also the more generous of each profile, because a
+    /// second reader asking for less must not shrink the window under the
+    /// one already open. `None` is a reader that stated no profile, and says
+    /// nothing either way. The rate and the seed are the entity's, not a
+    /// reader's, and are `self`'s.
     pub fn widest(self, other: Buffering) -> Buffering {
         let most = |a: Option<u64>, b: Option<u64>| match (a, b) {
             (Some(a), Some(b)) => Some(a.max(b)),
@@ -278,24 +278,24 @@ impl Buffering {
 
 /// The smallest a time cap may come to, whatever the bitrate says.
 ///
-/// A cap is a promise about playback, and ninety seconds of a 2 Mbps
-/// talking-heads documentary is twenty-two megabytes -- enough buffer for a
-/// good connection and nothing at all for a bad one, where the cost of
-/// having fetched more is only disk we had anyway. So the cap never falls
-/// below this, and the budget is still what bounds it from above.
+/// A cap is a promise about playback. Ninety seconds of a 2 Mbps
+/// talking-heads documentary is twenty-two megabytes. That is enough buffer
+/// for a good connection and nothing at all for a bad one, where the cost
+/// of having fetched more is only disk we had anyway. So the cap never
+/// falls below this, and the budget is still what bounds it from above.
 const SMALLEST_TIME_CAP_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The most pieces a lookahead of `bytes` can pin, wherever in a piece it
 /// starts: its whole pieces, and one more for the piece it starts inside of
-/// and runs off the end of. Zero for no lookahead.
+/// and runs off the end of. It is zero for no lookahead.
 ///
 /// This is the window's floor ([`RetentionPolicy::shape_for`]), and it is a
-/// count of pieces and nothing else -- not a forward reach
+/// count of pieces and nothing else. It is not a forward reach
 /// ([`window_for_reach`]), because that assumes a tenth of the window sits
-/// behind a playhead, and what the floor protects is the lookahead the
-/// backend refuses to forget, which has nothing behind it: sizing it as a
-/// reach would come out a ninth over the lookahead, leaving the committed
-/// set that much short of what the rule leaves it.
+/// behind a playhead. What the floor protects is the lookahead the backend
+/// refuses to forget, which has nothing behind it. Sizing it as a reach
+/// would come out a ninth over the lookahead, and leave the committed set
+/// that much short of what the rule leaves it.
 fn pieces_touched_by(bytes: u64, piece_length: u64) -> u32 {
     debug_assert!(piece_length > 0, "a piece length of zero");
     if bytes == 0 {
@@ -311,15 +311,15 @@ fn pieces_touched_by(bytes: u64, piece_length: u64) -> u32 {
 /// on the window comes to in pieces.
 ///
 /// The reach is the window less the `BEHIND_PERCENT` of it that sits
-/// behind the playhead, so a cap stated as seconds of forward buffer is
-/// converted here rather than being applied to the window directly: read as
-/// a window it would leave the forward reach a tenth short of the seconds
-/// the profile asked for.
+/// behind the playhead. So a cap stated as seconds of forward buffer is
+/// converted here, rather than being applied to the window directly. Read
+/// as a window, it would leave the forward reach a tenth short of the
+/// seconds the profile asked for.
 fn window_for_reach(bytes: u64, piece_length: u64) -> u32 {
     debug_assert!(piece_length > 0, "a piece length of zero");
     let pieces = bytes.div_ceil(piece_length.max(1)).min(u64::from(u32::MAX));
     // `reach(w) = w - w * BEHIND_PERCENT / 100` is non-decreasing in `w`,
-    // so this is a search and not a formula: a closed form has to round,
+    // so this is a search and not a formula. A closed form has to round,
     // and rounding the wrong way costs a whole piece of window at every
     // budget. Climb by the deficit, which converges in a few steps, then
     // walk back to the least window that still covers it.
@@ -339,7 +339,7 @@ fn window_for_reach(bytes: u64, piece_length: u64) -> u32 {
 /// `u64`.
 ///
 /// SplitMix64's finaliser. Nothing here needs a cryptographic hash or a
-/// generator with state -- what it needs is that two clients with different
+/// generator with state. What it needs is that two clients with different
 /// seeds pick unrelated sets, and that one client's set is the same every
 /// time it is asked.
 fn rank(seed: u64, piece: u32) -> u64 {
@@ -356,17 +356,17 @@ fn rank(seed: u64, piece: u32) -> u64 {
 ///
 /// **A uniformly random subset, drawn once and not sampled from playback.**
 /// A stride is a lattice, so two clients that chose the same one differ
-/// only by phase and can still overlap almost completely; an independent
-/// draw per client overlaps only by chance, which is the property that
+/// only by phase and can still overlap almost completely. An independent
+/// draw per client overlaps only by chance. That is the property that
 /// makes many peers with no way to see each other add up to even coverage
-/// of a torrent. And even rather than biased late, because a shared bias
-/// only moves the hole: if every client kept the tail, the tail is the
-/// over-replicated part and the head goes scarce.
+/// of a torrent. It is even rather than biased late, because a shared bias
+/// only moves the hole. If every client kept the tail, the tail would be
+/// the over-replicated part and the head would go scarce.
 ///
-/// The lowest `count` ranks and not a threshold on the rank, so the set is
-/// exactly the size asked for; and lowest-`count` is nested in `count`, so
-/// a set that grows or shrinks with the budget keeps every piece it had
-/// rather than being redrawn under what is already announced.
+/// It takes the lowest `count` ranks and not a threshold on the rank, so
+/// the set is exactly the size asked for. Lowest-`count` is nested in
+/// `count`, so a set that grows or shrinks with the budget keeps every
+/// piece it had, rather than being redrawn under what is already announced.
 fn choose(seed: u64, pieces: Range<u32>, count: u32) -> BTreeSet<u32> {
     let total = pieces.end - pieces.start;
     if count >= total {
@@ -375,7 +375,7 @@ fn choose(seed: u64, pieces: Range<u32>, count: u32) -> BTreeSet<u32> {
     if count == 0 {
         return BTreeSet::new();
     }
-    // A bounded max-heap, keyed on the rank: at most `count` entries are
+    // A bounded max-heap, keyed on the rank. At most `count` entries are
     // ever held, so a torrent of millions of pieces costs one pass and the
     // memory of the set it is choosing.
     let mut best: BTreeSet<(u64, u32)> = BTreeSet::new();
@@ -401,10 +401,10 @@ pub enum Shape {
         /// **Not a rolling window.** What is fetched and kept is what the
         /// detector's consumers ask for (`crate::retention::streams`),
         /// which no number here bounds. What this sizes is the part of the
-        /// budget `committed` may not take -- which is what sizes
-        /// `committed` at all -- and, on a backing whose passes run off a
-        /// moving byte rather than a tick, how far that byte may move
-        /// between two of them (`stride_for`).
+        /// budget `committed` may not take, which is what sizes `committed`
+        /// at all. On a backing whose passes run off a moving byte rather
+        /// than a tick, it also sizes how far that byte may move between
+        /// two of them (`stride_for`).
         unshared: u32,
         /// Pieces the committed set may hold.
         committed: u32,
@@ -415,9 +415,9 @@ impl Shape {
     /// The most pieces this shape intends to hold at once, or `None` when it
     /// holds the whole file.
     ///
-    /// The two halves are disjoint as *sets* -- a piece is committed
-    /// exactly when the unshared half lets go of it -- so they sum, and the
-    /// sum is the budget.
+    /// The two halves are disjoint as *sets*: a piece is committed exactly
+    /// when the unshared half lets go of it. So they sum, and the sum is the
+    /// budget.
     #[cfg(test)]
     pub fn piece_budget(self) -> Option<u32> {
         match self {
@@ -435,7 +435,7 @@ impl Shape {
 pub struct Decision {
     /// What this pass gives back: held, uncommitted, and not asked for by
     /// any consumer. Drop them from the want-set and then delete them, in
-    /// that order -- not have, not wanted, not advertised, then gone.
+    /// that order: not have, not wanted, not advertised, then gone.
     pub reclaim: Vec<u32>,
     /// Pieces that joined the committed set on this pass. They may be
     /// advertised from now on, and nothing will ever reclaim them.
@@ -443,7 +443,7 @@ pub struct Decision {
     /// Pieces that left the committed set because we no longer hold them.
     ///
     /// Nothing here takes a committed piece away, so this is only ever the
-    /// disk losing one behind our back. Nothing is withdrawn for it: the
+    /// disk losing one behind our back. Nothing is withdrawn for it. The
     /// piece stays in the draw, the backend announces only what it has, and
     /// a piece that comes back is committed again.
     pub lost: Vec<u32>,
@@ -452,14 +452,14 @@ pub struct Decision {
 /// The policy for one file being streamed, carrying the committed set across
 /// passes.
 ///
-/// It governs a range of *torrent* piece indices -- the pieces of the file
-/// being played -- and ignores everything outside it, so the pieces of a
+/// It governs a range of *torrent* piece indices (the pieces of the file
+/// being played) and ignores everything outside it. So the pieces of a
 /// torrent's other files are neither committed nor reclaimed here. A piece on
 /// the boundary between two files belongs to both, and this module cannot
-/// tell: its reclaim set includes the file's first and last piece whoever
-/// else owns bytes in them, and [`crate::retention`] is what takes those
-/// back out before anything is deleted. The unpin path has its own answer to
-/// the same question in [`PieceStore`](super::store::PieceStore)'s
+/// tell. Its reclaim set includes the file's first and last piece, whoever
+/// else owns bytes in them. [`crate::retention`] takes those back out
+/// before anything is deleted. The unpin path has its own answer to the
+/// same question in [`PieceStore`](super::store::PieceStore)'s
 /// `TorrentStorage::remove_file`, which
 /// deletes a boundary piece only once every file that owns bytes in it is
 /// gone.
@@ -468,7 +468,7 @@ pub struct RetentionPolicy {
     pieces: Range<u32>,
     /// What this policy was built from, so [`Self::observe`] can re-shape
     /// it under a rate that was not known when it was built. None of them
-    /// is ever re-read from the world: a second reading of the budget that
+    /// is ever re-read from the world. A second reading of the budget that
     /// disagreed with the published one would size the two halves of the
     /// cache against different numbers.
     budget_bytes: u64,
@@ -483,21 +483,21 @@ pub struct RetentionPolicy {
     ///
     /// **Membership is decided in advance, not sampled from playback** (see
     /// the module docs for why). A chosen piece is committed the moment we
-    /// hold it -- verified on the disk -- announced from then on, and kept
-    /// for the life of the policy; nothing here ever takes one back. That
+    /// hold it, verified on the disk. It is announced from then on and kept
+    /// for the life of the policy. Nothing here ever takes one back. That
     /// is exactly what a BitTorrent client with no retention at all does
-    /// with every piece it completes, and it is available here only
-    /// because the set is fixed up front.
+    /// with every piece it completes. It is available here only because
+    /// the set is fixed up front.
     ///
     /// It is never *fetched* for. We commit what we hold, and we hold what
-    /// the viewer's window fetched, so a viewer who stops halfway fills
-    /// about half the set and the rest of it stays empty. That is correct:
-    /// an unfilled cache costs nothing, and filling it would mean fetching
-    /// bytes for the swarm rather than for the viewer -- on a metered phone
-    /// a trade nobody agreed to.
+    /// the viewer's window fetched. So a viewer who stops halfway fills
+    /// about half the set, and the rest of it stays empty. That is correct.
+    /// An unfilled cache costs nothing. Filling it would mean fetching
+    /// bytes for the swarm rather than for the viewer, and on a metered
+    /// phone that is a trade nobody agreed to.
     ///
-    /// Every piece of the file under [`Shape::Whole`], which shares the
-    /// whole file as it arrives.
+    /// It is every piece of the file under [`Shape::Whole`], which shares
+    /// the whole file as it arrives.
     chosen: BTreeSet<u32>,
 }
 
@@ -507,16 +507,16 @@ impl RetentionPolicy {
     /// which may be committed for a peer.
     ///
     /// "Pieces" here are a torrent's when the caller is the piece store's
-    /// adapter and 256 KiB chunks when it is `/proxy`'s: the arithmetic is
-    /// the store's own -- an index space and a length -- and neither
-    /// adapter's names for them reach in here.
+    /// adapter, and 256 KiB chunks when it is `/proxy`'s. The arithmetic is
+    /// the store's own (an index space and a length), and neither adapter's
+    /// names for them reach in here.
     ///
     /// All four numbers have to describe the same file, and three of them
-    /// overdetermine the fourth, so the disagreement is checked for rather
-    /// than assumed away: `bytes` must be what `pieces` holds at this piece
+    /// overdetermine the fourth. So the disagreement is checked for rather
+    /// than assumed away. `bytes` must be what `pieces` holds at this piece
     /// length, which is a full piece each except that the last may be short.
-    /// A mismatch means the caller resolved the file to the wrong range, and
-    /// every window and every reclaim after that would be about somebody
+    /// A mismatch means the caller resolved the file to the wrong range.
+    /// Every window and every reclaim after that would be about somebody
     /// else's bytes.
     pub fn new(
         budget_bytes: u64,
@@ -562,16 +562,16 @@ impl RetentionPolicy {
 
     /// Split the budget, or don't.
     ///
-    /// The comparison that decides is in bytes and not in pieces, because the
-    /// last piece of a file is usually short and "the budget covers the file"
+    /// The comparison that decides is in bytes and not in pieces. The last
+    /// piece of a file is usually short, and "the budget covers the file"
     /// has to mean the file and not a rounded-up multiple of it. Everything
     /// after it is in pieces, and the conversion floors: a budget that is two
     /// and a half pieces buys two.
     ///
-    /// Where the split falls is [`Share`]'s and there is no branch on the
-    /// kind of stream here: a torrent gives half of it to the committed set,
-    /// a proxied response gives none, and what is left over is the unshared
-    /// part in both cases.
+    /// [`Share`] decides where the split falls, and there is no branch on
+    /// the kind of stream here. A torrent gives half of it to the committed
+    /// set, a proxied response gives none, and what is left over is the
+    /// unshared part in both cases.
     fn shape_for(
         budget_bytes: u64,
         piece_length: u64,
@@ -585,20 +585,20 @@ impl RetentionPolicy {
         // `budget_bytes < bytes`, so this cannot exceed the file's own piece
         // count and cannot need more than the u32 piece indices already are.
         let budget = (budget_bytes / piece_length) as u32;
-        // The floor, and the committed half is what yields to it -- to
-        // nothing, if that is what it takes. Sharing is generosity; a
-        // committed set that, beside the lookahead an open stream is
-        // already pinning, overfills the budget is a disk that can never
-        // come back under it, because neither is a set the pass may
+        // The floor, and the committed half is what yields to it, to
+        // nothing if that is what it takes. Sharing is generosity. Take a
+        // committed set that overfills the budget beside the lookahead an
+        // open stream is already pinning. That is a disk that can never
+        // come back under the budget, because neither is a set the pass may
         // reclaim. See [`Buffering`].
         let floor = pieces_touched_by(buffering.lookahead_bytes, piece_length);
         // Three numbers, composed in one order: what the disk can hold,
         // what the viewer asked for in time, and what an open stream is
         // already fetching.
         // What the committed set could want, capped by time before the
-        // window is sized: the rest of the budget is the window's, so a
+        // window is sized. The rest of the budget is the window's. So a
         // profile with no time cap of its own (`Maximum`) takes everything
-        // sharing does not need rather than stopping at half.
+        // sharing does not need, rather than stopping at half.
         let committed_cap = buffering
             .committed_seconds
             .and_then(|seconds| buffering.over(seconds))
@@ -614,9 +614,9 @@ impl RetentionPolicy {
                 // The floor is bigger than the time the design wants to
                 // buffer, which means the playback lookahead is. The
                 // alternative to letting the floor win is a committed set
-                // with no room left beside the lookahead, so it wins -- and
-                // the fact is said out loud, because it is a statement
-                // about the constants and not about this file.
+                // with no room left beside the lookahead, so the floor
+                // wins. The fact is said out loud, because it is a
+                // statement about the constants and not about this file.
                 tracing::info!(
                     floor_pieces = floor,
                     cap_pieces = cap,
@@ -629,7 +629,7 @@ impl RetentionPolicy {
         }
         let window = window.max(floor);
         // And what is left of the budget may be shared, for as much of it
-        // as time allows. The rest is simply not used: an unfilled cache
+        // as time allows. The rest is simply not used. An unfilled cache
         // costs nothing, and a starved forward buffer costs a stall.
         let mut committed = budget.saturating_sub(window).min(wants_committed);
         if let Some(cap) = committed_cap {
@@ -645,17 +645,17 @@ impl RetentionPolicy {
         }
     }
 
-    /// Re-shape under what the entity's readers are doing now -- a rate
-    /// that has been measured since this policy was built, a reader that
-    /// has opened or ended -- and say whether anything moved.
+    /// Re-shape under what the entity's readers are doing now, and say
+    /// whether anything moved. That is a rate measured since this policy
+    /// was built, or a reader that has opened or ended.
     ///
     /// The budget, the file and the share are this policy's own and are not
-    /// re-read: a budget that moves builds a new policy through
+    /// re-read. A budget that moves builds a new policy through
     /// [`Self::carry_into`]. **The draw does not move with the shape**, in
-    /// either direction: a capacity that grows under it would share pieces
-    /// the viewer's read-ahead was sized against, and one that shrinks
-    /// would withdraw what we announced. What the shape moves is the window
-    /// the pass keeps and fetches.
+    /// either direction. A capacity that grows under it would share pieces
+    /// the viewer's read-ahead was sized against. One that shrinks would
+    /// withdraw what we announced. What the shape moves is the window the
+    /// pass keeps and fetches.
     pub fn observe(&mut self, buffering: Buffering) -> bool {
         let shape = Self::shape_for(
             self.budget_bytes,
@@ -681,25 +681,25 @@ impl RetentionPolicy {
     /// The committed set: the pieces of the draw we hold, which is what a
     /// peer is told we have.
     ///
-    /// [`crate::retention`] is what makes that true -- it advertises the
-    /// draw once, when the play session decides it, and the backend
-    /// announces each piece of it as it completes (or at once, if it is
-    /// held already), and nothing else. What we announce is
-    /// exactly what nothing will reclaim while the torrent is in the swarm.
+    /// [`crate::retention`] is what makes that true. It advertises the draw
+    /// once, when the play session decides it. The backend announces each
+    /// piece of it as it completes (or at once, if it is held already), and
+    /// nothing else. What we announce is exactly what nothing will reclaim
+    /// while the torrent is in the swarm.
     pub fn advertised(&self) -> &BTreeSet<u32> {
         &self.committed
     }
 
-    /// The draw: every piece this policy shares, held or not. What is
+    /// The draw: every piece this policy shares, held or not. It is what is
     /// advertised to the backend, and what no reclaim may take.
     pub fn draw(&self) -> &BTreeSet<u32> {
         &self.chosen
     }
 
-    /// Share `draw` and nothing else: the draw the play session made with
-    /// its first policy, handed to every policy after it -- one built at
-    /// another open, one under another budget. Pieces outside this file are
-    /// not this policy's and are left out.
+    /// Share `draw` and nothing else. That is the draw the play session made
+    /// with its first policy, handed to every policy after it: one built at
+    /// another open, or one under another budget. Pieces outside this file
+    /// are not this policy's and are left out.
     pub fn adopt_draw(&mut self, draw: &BTreeSet<u32>) {
         self.chosen = draw
             .iter()
@@ -719,20 +719,20 @@ impl RetentionPolicy {
     /// pieces under another budget.
     ///
     /// The committed set is what we announce, and a policy built afresh
-    /// starts with none of it, so its first pass would find every piece
-    /// this one committed outside its window, in no committed set, and
-    /// reclaim it -- pieces a peer was told about minutes ago, deleted
+    /// starts with none of it. Its first pass would find every piece this
+    /// one committed outside its window, in no committed set, and reclaim
+    /// it. Those are pieces a peer was told about minutes ago, deleted
     /// under it.
     ///
     /// **The draw comes across whole, whatever the new budget's capacity.**
-    /// There is no un-have in BitTorrent: hiding a piece changes only the
+    /// There is no un-have in BitTorrent. Hiding a piece changes only the
     /// bitfield a *new* peer is sent at its handshake, and a peer that
     /// already has our Have can still ask for it. A client that advertises
     /// and then cannot serve is an unreliable peer, and some clients snub or
     /// ban for it. So a smaller budget keeps what the bigger one drew, over
-    /// its capacity and all -- those bytes are the price of having said we
-    /// would share them, bounded by the capacity that said it -- and a
-    /// bigger one shares no more than was drawn.
+    /// its capacity and all. Those bytes are the price of having said we
+    /// would share them, bounded by the capacity that said it. A bigger
+    /// budget shares no more than was drawn.
     pub fn carry_into(&self, next: &mut Self) {
         debug_assert_eq!(
             self.pieces, next.pieces,
@@ -745,15 +745,15 @@ impl RetentionPolicy {
     /// **Commit `piece`, which we have just been found to hold**, and say
     /// whether it joined the set.
     ///
-    /// The same rule [`Self::advance`] applies to a held piece, asked one
-    /// piece at a time so that the answer does not depend on when a pass
+    /// It is the same rule [`Self::advance`] applies to a held piece, asked
+    /// one piece at a time. So the answer does not depend on when a pass
     /// happens to run (see [`super::registry::PieceCompleted`] for why that
     /// matters). Completion is the event that says a piece is ours, and
     /// this is what hears it; see
     /// [`crate::retention::owner::Retention::commit_completed`].
     ///
-    /// The draw alone: nothing here can commit a piece the draw did not
-    /// choose, which is the same thing that bounds `advance`.
+    /// Only the draw decides. Nothing here can commit a piece the draw did
+    /// not choose, which is the same thing that bounds `advance`.
     pub fn commit_drawn(&mut self, piece: u32) -> bool {
         if !self.draws(piece) {
             return false;
@@ -764,10 +764,10 @@ impl RetentionPolicy {
     /// Whether [`Self::commit_drawn`] would have anything to do for
     /// `piece`: the draw chose it and it is not committed yet.
     ///
-    /// Asked before the entity's turn is taken, so that the completion of a
-    /// piece nothing can be done about does not queue behind a retention
+    /// It is asked before the entity's turn is taken. So the completion of
+    /// a piece nothing can be done about does not queue behind a retention
     /// pass to find that out. On the field's film the draw is a few dozen
-    /// pieces of five and a half thousand, so this refuses all but a
+    /// pieces of five and a half thousand. So this refuses all but a
     /// fraction of a percent of the completions outright.
     pub fn draws(&self, piece: u32) -> bool {
         self.pieces.contains(&piece)
@@ -778,7 +778,7 @@ impl RetentionPolicy {
     /// Decide, over the pieces we currently `held`, what joins the committed
     /// set, what leaves it, and which of `giving_up` to give back.
     ///
-    /// `held` is what is on disk -- the have-set, which under this design is
+    /// `held` is what is on disk: the have-set, which under this design is
     /// the piece files themselves. `giving_up` is what the pass has already
     /// chosen to let go of: what the entity's consumers are not asking for,
     /// oldest by effective age, as much as the allowance needs
@@ -786,23 +786,23 @@ impl RetentionPolicy {
     /// not this policy's to touch and are skipped, not reclaimed.
     ///
     /// Three things can happen to a held piece of this file, not two. A piece
-    /// already in the committed set is **left alone** -- not reclaimed, and
-    /// not committed a second time -- because nothing here ever takes a
-    /// committed piece back (see [`Decision::committed`]); a caller that
-    /// reclaimed whatever it was giving up would delete the pieces it is
-    /// advertising, which is the advertise-then-refuse the whole policy
-    /// exists to avoid. Any *other* held piece is **committed** if the draw
-    /// chose it ([`Self::chosen`]), and **reclaimed** if it is in
-    /// `giving_up` and the draw did not choose it. Where anybody is reading
-    /// decides neither: membership was settled when the policy was built, so
-    /// a piece is committed the moment we hold it, and a seek in either
-    /// direction commits exactly the pieces it happens to have brought in.
+    /// already in the committed set is **left alone**: not reclaimed, and
+    /// not committed a second time. Nothing here ever takes a committed
+    /// piece back (see [`Decision::committed`]). A caller that reclaimed
+    /// whatever it was giving up would delete the pieces it is advertising.
+    /// That is the advertise-then-refuse the whole policy exists to avoid.
+    /// Any *other* held piece is **committed** if the draw chose it
+    /// ([`Self::chosen`]). It is **reclaimed** if it is in `giving_up` and
+    /// the draw did not choose it. Where anybody is reading decides
+    /// neither. Membership was settled when the policy was built, so a piece
+    /// is committed the moment we hold it. A seek in either direction
+    /// commits exactly the pieces it happens to have brought in.
     ///
-    /// Idempotent for a fixed `giving_up` and a fixed `held`: the second call
-    /// commits nothing new -- the pieces it would commit are committed -- and
-    /// reclaims the same pieces, because a reclaim is a request rather than a
-    /// record. The caller is what makes that true, by deleting them and no
-    /// longer holding them.
+    /// It is idempotent for a fixed `giving_up` and a fixed `held`. The
+    /// second call commits nothing new (the pieces it would commit are
+    /// committed), and reclaims the same pieces, because a reclaim is a
+    /// request rather than a record. The caller makes that true, by
+    /// deleting them and no longer holding them.
     pub fn advance(&mut self, giving_up: &[u32], held: &BTreeSet<u32>) -> Decision {
         let mut decision = Decision::default();
 
@@ -817,9 +817,9 @@ impl RetentionPolicy {
             }
         });
 
-        // Ascending, for a stable order in the decision and nothing else:
-        // which pieces we share is not a function of the order they are
-        // offered -- that was settled when the policy was built.
+        // Ascending, for a stable order in the decision and nothing else.
+        // Which pieces we share is not a function of the order they are
+        // offered: that was settled when the policy was built.
         for &piece in held {
             if !self.pieces.contains(&piece) || self.committed.contains(&piece) {
                 continue;
@@ -833,9 +833,9 @@ impl RetentionPolicy {
         }
         // **What to give up is not this module's to decide.** It is what
         // the entity's consumers are not asking for, oldest by effective
-        // age, and only as much of it as the allowance needs --
-        // `crate::retention::streams`. What is still this module's is that
-        // a committed piece is never one of them: a piece we have offered a
+        // age, and only as much of it as the allowance needs
+        // (`crate::retention::streams`). What is still this module's is that
+        // a committed piece is never one of them. A piece we have offered a
         // peer is out of reach of every reclaim, which is the whole of what
         // "committed" means.
         decision.reclaim = giving_up
@@ -877,7 +877,7 @@ mod tests {
     /// The same file under a stream nothing can be shared from: `/proxy`'s.
     ///
     /// Not to be confused with `Shape::Split`'s `unshared`, which is a size
-    /// and exists on both sides; this is `Share::Nothing`, the backing that
+    /// and exists on both sides. This is `Share::Nothing`, the backing that
     /// has no peers to share with at all.
     fn shares_nothing(budget_pieces: u64, count: u32) -> RetentionPolicy {
         RetentionPolicy::new(
@@ -891,12 +891,12 @@ mod tests {
         .expect("a consistent file")
     }
 
-    /// Play the stream through `playheads`, as a caller would: honour every
+    /// Play the stream through `playheads`, as a caller would. Honour every
     /// reclaim, and fill in whatever the window covers, because covering a
     /// piece is what fetches it.
     ///
     /// Stepping matters, and several tests below need it rather than a single
-    /// leap: what a policy commits is what it has held, and it holds what the
+    /// leap. What a policy commits is what it has held, and it holds what the
     /// windows it was walked through covered.
     fn play(
         p: &mut RetentionPolicy,
@@ -905,11 +905,11 @@ mod tests {
     ) {
         for playhead in playheads {
             // What arrives is what a consumer at `playhead` is fetched, and
-            // what is offered up is everything else -- neither of which the
-            // policy decides (`crate::retention::streams`). The walk states
-            // both, which is all these tests ever needed them for: what a
-            // policy commits is what it has held, and what it refuses to
-            // give back is what it has committed.
+            // what is offered up is everything else. The policy decides
+            // neither (`crate::retention::streams`). The walk states both,
+            // which is all these tests ever needed them for. What a policy
+            // commits is what it has held, and what it refuses to give back
+            // is what it has committed.
             let width = match p.shape() {
                 Shape::Whole => p.pieces().end,
                 Shape::Split { unshared, .. } => unshared.max(1),
@@ -960,10 +960,10 @@ mod tests {
     /// **A bigger disk cache must not silently buy a bigger data bill.**
     ///
     /// Sized from the budget alone, the forward reach is 45% of
-    /// `cacheSize`: a viewer who gave the app ten gigabytes got a
-    /// five-gigabyte window and fetched it over whatever connection they
-    /// were on. What a buffer is *for* is measured in seconds of the film,
-    /// so that is the unit the cap is stated in, converted at the rate
+    /// `cacheSize`. A viewer who gave the app ten gigabytes got a
+    /// five-gigabyte window, and fetched it over whatever connection they
+    /// were on. What a buffer is *for* is measured in seconds of the film.
+    /// So that is the unit the cap is stated in, converted at the rate
     /// bytes are really going out.
     #[test]
     fn the_window_is_bounded_by_the_seconds_of_stream_it_buys() {
@@ -989,9 +989,9 @@ mod tests {
     /// **`Maximum` has no time cap: it is the whole file while you are
     /// watching it.**
     ///
-    /// Where the budget covers the film that is [`Shape::Whole`] and
+    /// Where the budget covers the film, that is [`Shape::Whole`] and
     /// nothing is bounded at all. Where it does not, it is the widest
-    /// window the budget allows -- everything sharing does not need, rather
+    /// window the budget allows: everything sharing does not need, rather
     /// than the half a budget-sized split would leave.
     #[test]
     fn the_maximum_profile_asks_for_the_file_and_not_for_a_number_of_seconds() {
@@ -1024,9 +1024,9 @@ mod tests {
     /// **Where the floor and the cap disagree, the floor wins.**
     ///
     /// The alternative is a stream fetching exactly what the pass then
-    /// deletes. It says something true when it happens -- that the
-    /// lookahead granted is wider than the time the profile wants to
-    /// buffer -- which is why the policy says it out loud.
+    /// deletes. It says something true when it happens: the lookahead
+    /// granted is wider than the time the profile wants to buffer. That is
+    /// why the policy says it out loud.
     #[test]
     fn a_lookahead_wider_than_the_time_cap_wins_over_it() {
         const MIB: u64 = 1 << 20;
@@ -1069,12 +1069,11 @@ mod tests {
     /// **A rate measured after the policy was built re-shapes it in
     /// place.**
     ///
-    /// The rate is not knowable at the open -- nothing has been delivered
-    /// yet -- so the shape the first passes run under is the fallback one,
-    /// and the pass is what folds the measurement in
-    /// (`State::advance`). Nothing else about the policy is re-read: the
-    /// budget is the publisher's, and a budget that moves builds a new
-    /// policy.
+    /// The rate is not knowable at the open, because nothing has been
+    /// delivered yet. So the first passes run under the fallback shape, and
+    /// the pass is what folds the measurement in (`State::advance`).
+    /// Nothing else about the policy is re-read. The budget is the
+    /// publisher's, and a budget that moves builds a new policy.
     #[test]
     fn a_policy_re_shapes_when_a_rate_is_measured_under_it() {
         const MIB: u64 = 1 << 20;
@@ -1118,13 +1117,13 @@ mod tests {
     ///
     /// What the floor is for is the *next* budget, republished sixty
     /// seconds later off a volume that has filled. That policy is built
-    /// without the reader in view, so the floor must leave room for a
-    /// lookahead the backend will not forget a piece of: without it, two
-    /// pinned sets could between them overfill the budget, leaving the disk
-    /// over it for the life of the stream and paying a refused
+    /// without the reader in view. So the floor must leave room for a
+    /// lookahead the backend will not forget a piece of. Without it, two
+    /// pinned sets could between them overfill the budget. The disk would
+    /// stay over it for the life of the stream, paying a refused
     /// `drop_pieces` per tick. What is asserted is the arithmetic itself,
     /// `committed <= budget - floor`, and not `piece_budget`, which nothing
-    /// in production reads; and the lookahead varies, because a floor that
+    /// in production reads. The lookahead varies, because a floor that
     /// only ever had one piece to cover was only ever checked at a budget
     /// of one.
     #[test]
@@ -1142,8 +1141,8 @@ mod tests {
             let granted = half_pieces * piece / 2;
             // The floor, counted rather than computed: the most pieces a
             // lookahead of `granted` bytes touches, over where in a piece it
-            // can start -- the piece of its first byte to the piece of its
-            // last.
+            // can start. That is the piece of its first byte to the piece of
+            // its last.
             let floor = [0, 1, piece / 2, piece - 1]
                 .into_iter()
                 .map(|start| (start + granted - 1) / piece - start / piece + 1)
@@ -1186,7 +1185,7 @@ mod tests {
     ///
     /// Sharing is generosity and playback is the job. A committed set that
     /// overfills the budget beside the lookahead an open stream is already
-    /// pinning cannot come back under budget at all, so there is nothing to
+    /// pinning cannot come back under budget at all. So there is nothing to
     /// protect by keeping half the budget for a peer.
     #[test]
     fn the_committed_half_yields_to_the_windows_floor() {
@@ -1211,7 +1210,7 @@ mod tests {
             },
             "twenty pieces already cover the ten a nine-piece lookahead can touch: the floor is a no-op"
         );
-        // What that lookahead can touch, counted: begun one byte into a
+        // What that lookahead can touch, counted. Begun one byte into a
         // piece, its last byte is in the tenth.
         let touched = u32::try_from((1 + 9 * PIECE - 1) / PIECE + 1).expect("ten");
 
@@ -1269,11 +1268,11 @@ mod tests {
     ///
     /// A proxied URL response is not seeded: nothing will ever ask us for a
     /// chunk of it. A committed half for one would be half the cache held
-    /// permanently -- never reclaimed, by the committed set's own rule --
-    /// for a reader that does not exist, and the window playback actually
-    /// needs would be half what the disk could give it. So the split is
-    /// [`Share::Nothing`] and everything else about the policy is the same
-    /// arithmetic the torrent gets.
+    /// permanently, for a reader that does not exist. (It is never
+    /// reclaimed, by the committed set's own rule.) The window playback
+    /// actually needs would be half what the disk could give it. So the
+    /// split is [`Share::Nothing`], and everything else about the policy is
+    /// the same arithmetic the torrent gets.
     #[test]
     fn a_stream_nothing_can_be_shared_from_spends_the_whole_budget_on_the_window() {
         let shared = policy(10, 40);
@@ -1300,7 +1299,7 @@ mod tests {
         );
     }
 
-    /// And it commits nothing, ever -- so nothing of it is exempt from the
+    /// And it commits nothing, ever. So nothing of it is exempt from the
     /// reclaim, whatever the playhead does. Played straight through, the
     /// disk holds a window and no more.
     #[test]
@@ -1327,7 +1326,7 @@ mod tests {
     }
 
     /// The boundary is in bytes, because the last piece of a file is usually
-    /// short: a budget one byte under the file's real size is still a split.
+    /// short. A budget one byte under the file's real size is still a split.
     #[test]
     fn the_whole_file_test_is_the_files_own_length_not_a_rounded_one() {
         let bytes = 19 * PIECE + 1;
@@ -1402,8 +1401,8 @@ mod tests {
                 "advertising a piece that is not on disk"
             );
             // The unshared, the committed set, and the overhang of what a
-            // walk put on the disk this step: the policy gives back what it
-            // is offered, and it is offered what was outside the unshared
+            // walk put on the disk this step. The policy gives back what it
+            // is offered. It is offered what was outside the unshared
             // *before* this step's arrivals.
             assert!(
                 disk.len() <= (unshared + committed + unshared / 10) as usize,
@@ -1420,9 +1419,9 @@ mod tests {
     /// advertising a piece that is not there.
     ///
     /// **And it is the only one.** Nothing in this policy ever takes a
-    /// piece we have announced back: there is no un-have in BitTorrent, so
-    /// a piece we hide is still one a peer that has our Have may ask for,
-    /// and the answer to such a request with the bytes gone is to hang up.
+    /// piece we have announced back. There is no un-have in BitTorrent, so
+    /// a piece we hide is still one a peer that has our Have may ask for.
+    /// The answer to such a request with the bytes gone is to hang up.
     #[test]
     fn a_committed_piece_we_have_lost_stops_being_advertised() {
         let mut p = policy(20, 200);
@@ -1440,7 +1439,7 @@ mod tests {
         assert!(!p.is_advertised(2));
         assert!(p.advertised().is_empty());
 
-        // It coming back puts it back: it is a piece of the draw and we hold
+        // It coming back puts it back. It is a piece of the draw and we hold
         // it, which is the whole of the rule.
         disk.insert(2);
         let d = p.advance(&[], &disk);
@@ -1478,7 +1477,7 @@ mod tests {
         // and has not committed can be given away.
         let disk = held([0, 5, 99, 100, 147, 150, 199, 200, 4000]);
         // And one piece of this file the disk does not hold, offered up
-        // anyway -- a ledger entry a moment staler than the listing.
+        // anyway: a ledger entry a moment staler than the listing.
         let mut everything: Vec<u32> = disk.iter().copied().collect();
         everything.push(160);
         let d = p.advance(&everything, &disk);
@@ -1504,9 +1503,9 @@ mod tests {
     /// **A drawn piece is committed the moment we hold it, and the pieces
     /// beside it in the same window are not.**
     ///
-    /// Committed and the window are two protections over the same piece and
-    /// both can apply at once (see the module docs for why membership is
-    /// drawn up front rather than released by the window).
+    /// Committed and the window are two protections over the same piece, and
+    /// both can apply at once. (See the module docs for why membership is
+    /// drawn up front rather than released by the window.)
     #[test]
     fn a_drawn_piece_is_committed_as_soon_as_it_is_held() {
         let mut p = policy(20, 200);
@@ -1526,7 +1525,7 @@ mod tests {
         );
 
         // Everything on the disk is offered up. The two drawn ones are out
-        // of reach; their neighbours go like anything else.
+        // of reach. Their neighbours go like anything else.
         let disk = held(30..46);
         let everything: Vec<u32> = disk.iter().copied().collect();
         let d = p.advance(&everything, &disk);
@@ -1545,10 +1544,10 @@ mod tests {
     /// [`RetentionPolicy::observe`] runs at the top of every pass and
     /// re-shapes whenever the readers move, which a stated bitrate makes
     /// often enough to matter. A draw that followed the capacity down would
-    /// drop pieces we have announced -- a withdrawal -- and one that
+    /// drop pieces we have announced, which is a withdrawal. One that
     /// followed it up would share pieces nobody sized the read-ahead
-    /// against. So the draw is the one made when the policy was built, and
-    /// a piece of it the disk loses and gets back is announced again.
+    /// against. So the draw is the one made when the policy was built. A
+    /// piece of it the disk loses and gets back is announced again.
     #[test]
     fn a_capacity_that_shrinks_under_the_set_keeps_what_it_announced_in_the_draw() {
         let mut p = policy(30, 500);
@@ -1561,7 +1560,7 @@ mod tests {
             "the walk has to announce more than the shrunk capacity: {announced:?}"
         );
 
-        // A bitrate is stated, and ten seconds of it is one piece: the
+        // A bitrate is stated, and ten seconds of it is one piece. The
         // committed capacity falls to one, under a set of several.
         p.observe(Buffering {
             committed_seconds: Some(10),
@@ -1600,8 +1599,8 @@ mod tests {
     ///
     /// [`RetentionPolicy::carry_into`] adopts the whole draw and the whole
     /// committed set, over the new capacity and all, because there is no
-    /// un-have. The draw the new policy was built with -- a fresh `choose`
-    /// at the smaller capacity -- is not the one that was announced, and is
+    /// un-have. The draw the new policy was built with (a fresh `choose`
+    /// at the smaller capacity) is not the one that was announced, and is
     /// dropped for it.
     #[test]
     fn a_budget_that_shrinks_carries_what_was_announced_into_the_new_draw() {
@@ -1637,7 +1636,7 @@ mod tests {
     ///
     /// A bigger budget published under a stream, or a seek that brings in
     /// pieces the old draw did not have, must not share more than the
-    /// viewer's first open agreed to: a rise carried onto a roomier policy
+    /// viewer's first open agreed to. A rise carried onto a roomier policy
     /// keeps the draw it had, and a policy handed a draw shares exactly it.
     #[test]
     fn a_draw_does_not_grow_with_the_budget_or_a_seek() {
@@ -1670,12 +1669,12 @@ mod tests {
     ///
     /// That is the whole reason the draw is random rather than a rule. A
     /// peer cannot see the swarm and cannot coordinate, so the only
-    /// property available to it is independence: independent uniform draws
-    /// by many peers sum to even coverage, where any shared rule -- keep
-    /// the first minute, keep every k-th piece, keep the tail -- sums to a
-    /// shared hole. Even and not biased late, because a shared late bias
-    /// only moves the hole: if every client kept the tail, the tail becomes
-    /// the over-replicated part and the head goes scarce.
+    /// property available to it is independence. Independent uniform draws
+    /// by many peers sum to even coverage. Any shared rule (keep the first
+    /// minute, keep every k-th piece, keep the tail) sums to a shared hole.
+    /// The draw is even and not biased late, because a shared late bias
+    /// only moves the hole. If every client kept the tail, the tail would
+    /// become the over-replicated part and the head would go scarce.
     #[test]
     fn two_policies_over_one_file_draw_different_sets() {
         let draw = |seed: u64| {
@@ -1700,8 +1699,9 @@ mod tests {
         assert_eq!(ours.len(), 10);
         assert_eq!(theirs.len(), 10);
         for set in [&ours, &theirs] {
-            // Spread across the file rather than clustered anywhere: at
-            // least one piece in each half, and a span covering most of it.
+            // Spread across the file rather than clustered anywhere. There
+            // is at least one piece in each half, and a span covering most
+            // of it.
             assert!(set.iter().any(|piece| *piece < 100));
             assert!(set.iter().any(|piece| *piece >= 100));
             let span = set.last().expect("ten") - set.first().expect("ten");
@@ -1737,8 +1737,8 @@ mod tests {
     }
 
     /// Asking twice with nothing changed must not change anything the second
-    /// time: a reclaim is a request, and it is the caller deleting the piece
-    /// that makes it true.
+    /// time. A reclaim is a request, and the caller deleting the piece is
+    /// what makes it true.
     #[test]
     fn a_second_pass_over_the_same_disk_decides_the_same_thing() {
         let mut p = policy(20, 200);
@@ -1792,8 +1792,8 @@ mod tests {
     }
 
     /// The halves sum to the budget, the window never exceeds its half, and
-    /// nothing held ever exceeds the two together -- over every budget from
-    /// nothing to more than the file.
+    /// nothing held ever exceeds the two together. That holds over every
+    /// budget from nothing to more than the file.
     #[test]
     fn the_split_holds_for_every_budget() {
         let count = 64u32;
@@ -1826,9 +1826,9 @@ mod tests {
 
             let mut disk: BTreeSet<u32> = BTreeSet::new();
             for playhead in (0..count).chain((0..count).rev()) {
-                // What a consumer at this playhead is fetched -- not the
-                // policy's decision -- and everything held offered up,
-                // which is what the walk is measuring the ceiling of.
+                // What a consumer at this playhead is fetched (not the
+                // policy's decision), and everything held offered up. That
+                // is what the walk is measuring the ceiling of.
                 let width = match p.shape() {
                     Shape::Whole => count,
                     Shape::Split { unshared, .. } => unshared.max(1),
@@ -1840,8 +1840,8 @@ mod tests {
                     disk.remove(piece);
                 }
                 let ceiling = match p.shape() {
-                    // One piece over, and only when the budget is nothing:
-                    // the window is never empty.
+                    // One piece over, and only when the budget is nothing,
+                    // because the window is never empty.
                     Shape::Whole => count as usize,
                     Shape::Split {
                         unshared,

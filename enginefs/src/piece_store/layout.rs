@@ -2,16 +2,16 @@
 //!
 //! librqbit addresses storage as `(file_id, offset within that file)`. One
 //! file per piece addresses it as `(piece index, offset within that piece)`.
-//! Everything hard about the backend is the translation between the two, so
-//! it lives here on its own where it can be tested exhaustively against
-//! hand-built torrents -- including the shapes a real swarm would take an
+//! Everything hard about the backend is the translation between the two. So
+//! it lives here on its own, where it can be tested exhaustively against
+//! hand-built torrents. That includes the shapes a real swarm would take an
 //! evening to reproduce: a piece spanning three files, a padding file in the
 //! middle of one, a zero-length file on a piece boundary, the short last
 //! piece.
 //!
 //! The torrent's global byte space is the concatenation of every file in
-//! metadata order, padding files included -- that is how the piece hashes
-//! were computed and it is how librqbit's own `offset_in_torrent` is built
+//! metadata order, padding files included. That is how the piece hashes
+//! were computed, and it is how librqbit's own `offset_in_torrent` is built
 //! (a running sum over `iter_file_details_ext`). Pieces tile that space from
 //! zero at a fixed length, the last one short whenever the total does not
 //! divide evenly.
@@ -22,7 +22,7 @@ use std::ops::Range;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileSpec {
     pub len: u64,
-    /// A BEP-47 padding file: it occupies global offset space and its bytes
+    /// A BEP-47 padding file. It occupies global offset space and its bytes
     /// are hashed as zeroes, but librqbit never reads or writes one through
     /// storage.
     pub padding: bool,
@@ -48,10 +48,10 @@ struct FileExtent {
     len: u64,
     /// Whether any of this file's bytes are payload somebody can want.
     ///
-    /// A padding file's are not -- they are zeroes nobody transfers, and
-    /// librqbit skips them on every storage path -- and a zero-length file
-    /// has no bytes at all. Neither can keep a piece alive once the real
-    /// files sharing it are gone, which is what [`PieceLayout::files_overlapping_piece`]
+    /// A padding file's are not: they are zeroes nobody transfers, and
+    /// librqbit skips them on every storage path. A zero-length file has no
+    /// bytes at all. Neither can keep a piece alive once the real files
+    /// sharing it are gone. That is what [`PieceLayout::files_overlapping_piece`]
     /// is asked about when a piece is a candidate for deletion.
     owns_bytes: bool,
 }
@@ -79,12 +79,12 @@ impl PieceLayout {
     /// Build the map from the torrent's piece length, its total length and
     /// its files in metadata order.
     ///
-    /// `total_length` must be the sum of the file lengths: that identity is
-    /// what makes a file offset resolvable to a piece at all, and both
-    /// numbers come from the same metadata, so a disagreement means we are
-    /// about to write bytes at addresses the swarm does not share. Refusing
-    /// the torrent is the only safe answer -- a mapping built on a wrong
-    /// total silently shifts every piece after the discrepancy.
+    /// `total_length` must be the sum of the file lengths. That identity is
+    /// what makes a file offset resolvable to a piece at all. Both numbers
+    /// come from the same metadata, so a disagreement means we are about to
+    /// write bytes at addresses the swarm does not share. Refusing the
+    /// torrent is the only safe answer. A mapping built on a wrong total
+    /// silently shifts every piece after the discrepancy.
     pub fn new(
         piece_length: u64,
         total_length: u64,
@@ -140,8 +140,8 @@ impl PieceLayout {
 
     /// The length of one piece. Every piece is [`Self::default_piece_length`]
     /// except the last, which is short exactly when the total length does not
-    /// divide evenly -- when it does, the last piece is full size, which is
-    /// why this is a remainder test and not `total % piece_length`.
+    /// divide evenly. When it does, the last piece is full size. That is why
+    /// this is a remainder test and not `total % piece_length`.
     pub fn piece_length_of(&self, piece: u32) -> u64 {
         if piece == self.last_piece {
             let rem = self.total_length % self.piece_length;
@@ -153,10 +153,10 @@ impl PieceLayout {
 
     /// How long a piece's file is once every byte of it that anybody
     /// writes has landed: the end, within the piece, of the last byte a
-    /// payload file owns. [`Self::piece_length_of`] less a BEP-47 padding
-    /// tail, since librqbit never writes padding and a piece file is only
-    /// as long as the highest byte written to it. Zero for a piece that is
-    /// padding or zero-length files throughout.
+    /// payload file owns. It is [`Self::piece_length_of`] less a BEP-47
+    /// padding tail. librqbit never writes padding, and a piece file is only
+    /// as long as the highest byte written to it. It is zero for a piece
+    /// that is padding or zero-length files throughout.
     pub fn written_length_of(&self, piece: u32) -> u64 {
         let start = self.piece_offset(piece);
         let end = start + self.piece_length_of(piece);
@@ -173,7 +173,7 @@ impl PieceLayout {
         piece as u64 * self.piece_length
     }
 
-    /// Whether this file has payload bytes of its own -- see
+    /// Whether this file has payload bytes of its own; see
     /// `FileExtent::owns_bytes`. `false` for an out-of-range id.
     pub fn owns_bytes(&self, file_id: usize) -> bool {
         self.files.get(file_id).is_some_and(|f| f.owns_bytes)
@@ -189,14 +189,14 @@ impl PieceLayout {
     /// satisfy it, in order.
     ///
     /// A request that starts mid-piece and ends mid-another is the normal
-    /// case, not the edge case: librqbit asks in 16 KiB chunks and 64 KiB
-    /// hash slices whose alignment to *pieces* is whatever the file's own
+    /// case, not the edge case. librqbit asks in 16 KiB chunks and 64 KiB
+    /// hash slices. Their alignment to *pieces* is whatever the file's own
     /// offset in the torrent happens to be.
     ///
     /// A zero-length request is legal at any offset up to and including the
-    /// file's length, and yields nothing. librqbit really does issue those:
-    /// its per-file walk in `file_ops` tests `absolute_offset > file_len`,
-    /// not `>=`, so a chunk that ends exactly on a file boundary reaches the
+    /// file's length, and yields nothing. librqbit really does issue those.
+    /// Its per-file walk in `file_ops` tests `absolute_offset > file_len`,
+    /// not `>=`. So a chunk that ends exactly on a file boundary reaches the
     /// next file with nothing left to do.
     pub fn segments(&self, file_id: usize, offset: u64, len: u64) -> anyhow::Result<Segments<'_>> {
         let file = self.file(file_id)?;
@@ -216,9 +216,9 @@ impl PieceLayout {
         })
     }
 
-    /// Every piece any of this file's bytes land in. Empty for a zero-length
-    /// file, which has no bytes and therefore no pieces -- librqbit's own
-    /// `piece_range` says the same for one.
+    /// Every piece any of this file's bytes land in. It is empty for a
+    /// zero-length file, which has no bytes and therefore no pieces.
+    /// librqbit's own `piece_range` says the same for one.
     pub fn pieces_overlapping_file(&self, file_id: usize) -> anyhow::Result<Range<u32>> {
         let file = self.file(file_id)?;
         if file.len == 0 {
@@ -231,8 +231,8 @@ impl PieceLayout {
 
     /// Every file with a byte in this piece, as a range of file ids.
     ///
-    /// This is what makes a piece deletable or not: a piece is shared by as
-    /// many files as it straddles, and dropping it because one of them was
+    /// This is what makes a piece deletable or not. A piece is shared by as
+    /// many files as it straddles. Dropping it because one of them was
     /// removed would take the others' data with it.
     pub fn files_overlapping_piece(&self, piece: u32) -> Range<usize> {
         let start = self.piece_offset(piece);
@@ -261,9 +261,9 @@ impl Iterator for Segments<'_> {
         }
         let piece = (self.global / self.layout.piece_length) as u32;
         let offset_in_piece = self.global % self.layout.piece_length;
-        // `segments` bounded the request by the file's length and the file
-        // extents sum to the total length, so the whole request lies inside
-        // the torrent and this subtraction cannot underflow.
+        // `segments` bounded the request by the file's length, and the file
+        // extents sum to the total length. So the whole request lies inside
+        // the torrent, and this subtraction cannot underflow.
         let to_piece_end = self.layout.piece_length_of(piece) - offset_in_piece;
         let len = self.remaining.min(to_piece_end);
         self.global += len;
@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn a_padding_file_takes_offset_space_but_owns_nothing() {
-        // BEP-47 padding between two payload files: it shifts everything
+        // BEP-47 padding between two payload files. It shifts everything
         // after it, and it is on piece 0 without being able to keep it.
         let l = layout(
             16,
@@ -385,8 +385,8 @@ mod tests {
         );
     }
 
-    /// A padded piece's file is written only up to its payload, so that is
-    /// the length a whole copy of it has -- not the piece's length.
+    /// A padded piece's file is written only up to its payload. So that is
+    /// the length a whole copy of it has, not the piece's length.
     #[test]
     fn a_piece_is_written_up_to_its_last_payload_byte() {
         let l = layout(
@@ -457,11 +457,11 @@ mod tests {
     }
 
     /// Every request that resolves at all must resolve to a contiguous run of
-    /// the torrent's global bytes, each segment inside one real piece. Checked
-    /// over every offset and length of every file in a torrent shaped to hit
-    /// all of it at once: files shorter and longer than a piece, a padding
-    /// file, a zero-length file, boundaries hit exactly, and a short last
-    /// piece.
+    /// the torrent's global bytes, each segment inside one real piece. It is
+    /// checked over every offset and length of every file in a torrent
+    /// shaped to hit all of it at once: files shorter and longer than a
+    /// piece, a padding file, a zero-length file, boundaries hit exactly,
+    /// and a short last piece.
     #[test]
     fn every_request_maps_to_the_bytes_it_asked_for() {
         let specs = [
@@ -508,9 +508,9 @@ mod tests {
         }
     }
 
-    /// The two directions have to agree: if a piece overlaps a file then that
-    /// file overlaps the piece. A disagreement is how a shared piece gets
-    /// deleted out from under its other owner.
+    /// The two directions have to agree. If a piece overlaps a file, then
+    /// that file overlaps the piece. A disagreement is how a shared piece
+    /// gets deleted out from under its other owner.
     #[test]
     fn the_file_and_piece_overlap_views_agree() {
         let specs = [
