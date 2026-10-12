@@ -5,11 +5,11 @@
 //! cache. Everything between a fetched file and the player is a
 //! translation of byte ranges, and a translation stores nothing. So the
 //! one thing an archive, a disc image or a nested container is ever given
-//! is a [`ByteSource`](crate::sources::ByteSource): something it can ask for bytes `a..b` of, which
+//! is a [`ByteSource`](crate::sources::ByteSource): something it can ask for bytes `a..b` of. It
 //! answers out of whatever store already holds them and fetches exactly the
 //! rest. A format that cannot say which bytes of the underlying file a
-//! member is made of is refused rather than extracted; see
-//! `docs/design/translated-sources.md`.
+//! member is made of is refused rather than extracted (see
+//! `docs/design/translated-sources.md`).
 //!
 //! What is here is the seam itself and the sources behind it:
 //!
@@ -55,13 +55,13 @@ pub use view::{MemberReader, MemberView};
 /// A reader over a source's bytes: what [`ByteSource::open`] hands out.
 ///
 /// **Seekable, like every other handle on a fetched file.** A fetcher
-/// already assumes a consumer it does not understand -- mpv seeks
-/// anywhere, the piece store and the proxy cache serve what they hold and
-/// fetch the rest, the stream detector and the cache's own bound cope with
-/// whatever that consumer does. A translator is one more such consumer,
-/// and a forward-only handle capped at its hint would be a second, weaker
-/// copy of a protection the fetcher already gives -- one no other consumer
-/// is held to, and one the format crates fight, since their parsers take
+/// already assumes a consumer it does not understand. mpv seeks anywhere.
+/// The piece store and the proxy cache serve what they hold and fetch the
+/// rest. The stream detector and the cache's own bound cope with whatever
+/// that consumer does. A translator is one more such consumer. A
+/// forward-only handle capped at its hint would be a second, weaker copy
+/// of a protection the fetcher already gives. No other consumer is held to
+/// it, and the format crates fight it, since their parsers take
 /// `Read + Seek`. So a seek is a seek: cheap in the piece store, and one
 /// new ranged request through the proxy cache, which is exactly what a
 /// player's seek through `/proxy` already is.
@@ -75,9 +75,9 @@ impl<T: AsyncRead + AsyncSeek + Send + Unpin> SeekableReader for T {}
 /// How far from the offset the caller expects to read, handed to
 /// [`ByteSource::open`].
 ///
-/// **Advisory.** It exists because an HTTP source can spend it -- one
-/// ranged request for the whole span instead of one per chunk -- and a
-/// torrent cannot: the engine works the lookahead out from the intent, the
+/// **Advisory.** It exists because an HTTP source can spend it: one ranged
+/// request for the whole span instead of one per chunk. A torrent cannot
+/// spend it. The engine works the lookahead out from the intent, the
 /// film's measured bitrate and what the retention budget can keep, which
 /// is a better answer than any caller has. A reader may read past its
 /// hint, and the one that does simply asks its source for the next span.
@@ -97,7 +97,7 @@ impl ReadHint {
     }
 
     /// The last byte this hint covers in a source of `len` bytes, or `None`
-    /// when `offset` is at or past the end -- which is the inclusive end an
+    /// when `offset` is at or past the end. This is the inclusive end an
     /// HTTP `Range` is written with.
     pub fn last_byte(self, offset: u64, len: u64) -> Option<u64> {
         if offset >= len {
@@ -111,15 +111,15 @@ impl ReadHint {
     }
 }
 
-/// A file whose bytes are fetched and kept by something else. Random access
-/// by construction: a source that cannot answer [`read_at`] for an
-/// arbitrary offset is not a `ByteSource`, it is a refusal.
+/// A file whose bytes are fetched and kept by something else. It is random
+/// access by construction: a source that cannot answer [`read_at`] for an
+/// arbitrary offset is not a `ByteSource` but a refusal.
 ///
-/// Two ways in, because the two uses differ. An index is a handful of reads
-/// at offsets the format dictates -- the end of a ZIP, the start of a RAR
-/// volume, sector 16 of an ISO -- and a body is one long read the fetcher
-/// should treat as a stream, with a lookahead on a torrent and one ranged
-/// request on HTTP, not thousands of [`read_at`]s.
+/// There are two ways in, because the two uses differ. An index is a
+/// handful of reads at offsets the format dictates: the end of a ZIP, the
+/// start of a RAR volume, sector 16 of an ISO. A body is one long read the
+/// fetcher should treat as a stream, with a lookahead on a torrent and one
+/// ranged request on HTTP, not thousands of [`read_at`]s.
 ///
 /// [`read_at`]: ByteSource::read_at
 #[async_trait]
@@ -138,14 +138,14 @@ pub trait ByteSource: Send + Sync {
 
     /// A short name for logs and errors: **never a URL and never a
     /// credential**. A `d=` target carries the viewer's signed query and an
-    /// `h=` header carries their token, and the log files this process
-    /// keeps for the last ten launches are the one place neither may turn
-    /// up -- see `routes::util::log_origin`, which is what an HTTP source
-    /// describes itself through.
+    /// `h=` header carries their token. The log files this process keeps
+    /// for the last ten launches are the one place neither may turn up. See
+    /// `routes::util::log_origin`, which is what an HTTP source describes
+    /// itself through.
     fn describe(&self) -> String;
 
-    /// `buf.len()` bytes at `offset`, or fewer at the end of the file --
-    /// and `0` for an offset at or past it. Short reads below that are
+    /// `buf.len()` bytes at `offset`, or fewer at the end of the file, and
+    /// `0` for an offset at or past it. Short reads below that are
     /// filled in, so a caller reading a header gets the header or the
     /// reason it could not.
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize>;
@@ -156,26 +156,27 @@ pub trait ByteSource: Send + Sync {
     /// why a seek on one is a seek rather than a refusal.
     async fn open(&self, offset: u64, hint: ReadHint) -> io::Result<Box<dyn SeekableReader>>;
 
-    /// Whether the entity `reading` names -- the one stream this server is
-    /// playing (`enginefs::retention::live`) -- is this source's own file.
+    /// Whether the entity `reading` names is this source's own file. That
+    /// entity is the one stream this server is playing
+    /// (`enginefs::retention::live`).
     ///
     /// What it is for: a translated container's session is kept while its
-    /// container is what is playing and goes when the viewer opens
-    /// something else, and the container is a list of these
+    /// container is what is playing, and goes when the viewer opens
+    /// something else. The container is a list of these
     /// (`crate::translators::session`). A source is the only thing that
     /// knows which retained entity its bytes are, so it is the thing that
     /// answers.
     ///
     /// **The default is `false`, and it is the honest answer for a source
-    /// whose bytes this server does not retain** -- a view over other
-    /// sources, a fixture in memory: nothing in the retention cell could
+    /// whose bytes this server does not retain**, such as a view over other
+    /// sources or a fixture in memory. Nothing in the retention cell could
     /// ever name one, so nothing could keep it alive and nothing should
     /// pretend to. A source added later over bytes this server *does* keep
-    /// must answer for itself; a `false` from one of those would read as
+    /// must answer for itself. A `false` from one of those would read as
     /// "the viewer has moved on" every time the cell was consulted.
     ///
-    /// Cheap and synchronous by contract: it is asked of every session in
-    /// the map at the instant the live entity moves, so it may compute a
+    /// It is cheap and synchronous by contract. It is asked of every session
+    /// in the map at the instant the live entity moves, so it may compute a
     /// key but it may not go to the disk or the network.
     fn is_live(&self, reading: &enginefs::retention::live::Reading) -> bool {
         let _ = reading;
@@ -185,11 +186,11 @@ pub trait ByteSource: Send + Sync {
 
 /// One run of one source's bytes: where a member's bytes physically are.
 ///
-/// A member is a list of these -- one for a stored ZIP or TAR member, one
+/// A member is a list of these: one for a stored ZIP or TAR member, one
 /// per volume for a RAR set, one per directory record for an ISO file over
-/// 4 GiB -- and [`MemberView`] is that list read as a file. `source` is an
-/// index into the view's own source list, which for a multi-volume set is
-/// the volume number.
+/// 4 GiB. [`MemberView`] is that list read as a file. `source` is an index
+/// into the view's own source list, which for a multi-volume set is the
+/// volume number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Extent {
     /// Which of the view's sources these bytes are in.

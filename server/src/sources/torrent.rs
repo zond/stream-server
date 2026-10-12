@@ -1,11 +1,11 @@
 //! One file of a torrent as a [`ByteSource`]: [`TorrentSource`].
 //!
 //! The piece store already holds these bytes, or fetches them from the
-//! swarm the moment a reader asks; a seek in it is the one thing the store
+//! swarm the moment a reader asks. A seek in it is the one thing the store
 //! and its retention were built to serve well. So a container inside a
-//! torrent -- a film in a stored ZIP, a RAR set across three volumes -- is
-//! read by asking the torrent for the byte ranges the member occupies, and
-//! nothing is extracted, copied or written anywhere.
+//! torrent (a film in a stored ZIP, a RAR set across three volumes) is
+//! read by asking the torrent for the byte ranges the member occupies.
+//! Nothing is extracted, copied or written anywhere.
 //!
 //! **One source, with or without a player behind it**
 //! (`docs/design/media-pipeline.md` §2.2). With a [`Play`], an open is the
@@ -13,32 +13,31 @@
 //! (`crate::routes::stream::open_torrent_stream`): the viewer's play
 //! session moved, the stream registered, the disk gate, the focus, and the
 //! shared reader for the current screen of a file that shares. Without
-//! one it is an aside -- an archive's index and member reads today, a
-//! subtitle -- which registers a stream, opens every reader unshared and
+//! one it is an aside (an archive's index and member reads today, a
+//! subtitle). An aside registers a stream, opens every reader unshared and
 //! touches no play session.
 //!
 //! Two things this gets right that the `torrent:` archive route once did
 //! not:
 //!
 //! * **`Fetching::Streaming`, not `Download`.** That route opened its
-//!   reader with the download intent's 256 MiB lookahead, on the reasoning
-//!   that an archive member is read whole and sequentially. It is not: a
-//!   player seeks in it, and a 256 MiB read-ahead in front of a seeking
-//!   player is the swarm fetching a quarter of a gigabyte nobody is about
-//!   to watch, and the retention owner unable to keep any of it.
+//!   reader with the download intent's 256 MiB lookahead, reasoning that
+//!   an archive member is read whole and sequentially. It is not: a player
+//!   seeks in it. A 256 MiB read-ahead in front of a seeking player is the
+//!   swarm fetching a quarter of a gigabyte nobody is about to watch, and
+//!   the retention owner unable to keep any of it.
 //! * **The stream registration lasts as long as the source, not the
 //!   handle.** Every route that opens a reader on a torrent registers a
-//!   stream first (AGENTS.md), because the reconciler stops a torrent
-//!   nothing holds, and a registered stream is what holds it while a body
-//!   is delivered -- without one, a torrent nothing else holds stops
-//!   mid-body, dropping its peers -- and because a
-//!   request arriving on a torrent an earlier pass stopped gets a reader
-//!   that parks on pieces nobody is fetching. A source holds that
-//!   registration (and, with a play, the play session's move) for its
-//!   whole life, so every read through it, and every index read between
-//!   reads, is inside it; a file handle is per position, and a seek is a
-//!   new one at the new offset, which neither ends the stream nor moves the
-//!   session again.
+//!   stream first (AGENTS.md), for two reasons. The reconciler stops a
+//!   torrent nothing holds, and a registered stream is what holds it while
+//!   a body is delivered. Without one, a torrent nothing else holds stops
+//!   mid-body, dropping its peers. And a request arriving on a torrent an
+//!   earlier pass stopped gets a reader that parks on pieces nobody is
+//!   fetching. A source holds that registration (and, with a play, the
+//!   play session's move) for its whole life. So every read through it,
+//!   and every index read between reads, is inside it. A file handle is
+//!   per position, and a seek is a new one at the new offset, which
+//!   neither ends the stream nor moves the session again.
 
 use super::{ByteSource, ReadHint, SeekableReader, read_filling};
 use crate::routes::stream::{
@@ -97,9 +96,9 @@ struct Played {
     /// Whose slack the disk gate drops beside the torrents'.
     proxy_cache: Arc<crate::proxy_cache::ProxyCache>,
     /// `None` until the first reader: the open is the route's, and the
-    /// route's open is at an offset. Held from then on, for the source's
-    /// life -- the registration and the play session are the source's,
-    /// the handle is the position's.
+    /// route's open is at an offset. It is held from then on, for the
+    /// source's life. The registration and the play session are the
+    /// source's, and the handle is the position's.
     stream: tokio::sync::Mutex<Option<TorrentStream>>,
 }
 
@@ -113,14 +112,14 @@ pub struct TorrentSource {
     len: u64,
     name: String,
     play: Option<Played>,
-    /// One reader kept open for the scattered reads an index is made of,
-    /// seeked under the lock rather than reopened: the piece store serves
-    /// a seek cheaply, and opening a reader is a `prepare_file_for_
-    /// streaming` and a retention install each time.
+    /// One reader kept open for the scattered reads an index is made of.
+    /// It is seeked under the lock rather than reopened, because the piece
+    /// store serves a seek cheaply, and opening a reader is a
+    /// `prepare_file_for_ streaming` and a retention install each time.
     index_reader: tokio::sync::Mutex<Option<Box<dyn SeekableReader>>>,
     /// The engine's [`enginefs::EngineFS::clear_generation`] when this
-    /// source was made: a cache clear since stopped what it was streaming,
-    /// and it opens nothing more ([`Self::reader`]).
+    /// source was made. A cache clear since then stopped what it was
+    /// streaming, and the source opens nothing more ([`Self::reader`]).
     cleared_at: u64,
 }
 
@@ -170,19 +169,19 @@ impl TorrentSource {
     ) -> io::Result<Self> {
         let file = Self::file(&info_hash, file_idx, files)?;
         let (len, name) = (file.length, file.name.clone());
-        // Before any reader, and it has to be before: what the reconciler
+        // This comes before any reader, and it has to. What the reconciler
         // is being told is that a read is about to start, and the
         // reconcile it makes is what starts a torrent an earlier pass left
         // stopped.
         //
-        // The sibling of the stream route's registration, for the same
-        // reasons -- including the handover: `on_stream_start` undoes its
-        // own registration if it is dropped before it returns, and from the
-        // instant it returns the source below owns ending it, with no await
-        // in between (see `crate::routes::stream::StreamLifecycleGuard::
-        // start`). Without it the reconciler's tick reads nobody playing and
-        // pauses the torrent under the read, and a request arriving on a
-        // torrent an earlier pass stopped gets a reader that parks on
+        // It is the sibling of the stream route's registration, for the
+        // same reasons, including the handover. `on_stream_start` undoes
+        // its own registration if it is dropped before it returns. From the
+        // instant it returns, the source below owns ending it, with no
+        // await in between (see `crate::routes::stream::StreamLifecycleGuard::
+        // start`). Without it the reconciler's tick reads nobody playing
+        // and pauses the torrent under the read. And a request arriving on
+        // a torrent an earlier pass stopped gets a reader that parks on
         // pieces nobody is fetching.
         engine.on_stream_start(&info_hash, file_idx).await;
         Ok(Self {
@@ -229,9 +228,9 @@ impl TorrentSource {
 
     /// Make the next open with `buffer`: the viewer's read-ahead choice,
     /// changed mid-playback. The lookahead is worked out at an open, so it
-    /// takes effect at the next one -- a seek -- and never in a handle
-    /// already reading. Nothing for an aside, whose reads are opened at
-    /// the default whatever a viewer chose.
+    /// takes effect at the next one (a seek) and never in a handle already
+    /// reading. It does nothing for an aside, whose reads are opened at the
+    /// default whatever a viewer chose.
     pub(crate) async fn set_buffer(&self, buffer: BufferProfile) {
         let Some(played) = &self.play else {
             return;
@@ -246,10 +245,10 @@ impl TorrentSource {
     }
 
     /// The read-ahead choice the stream's opens are made with, once the
-    /// first one has been; `None` for an aside or a played source not yet
-    /// opened. What a test of [`Self::set_buffer`] can read, since what the
-    /// profile changes -- how far ahead the engine fetches -- is not a
-    /// number this crate is shown.
+    /// first one has been. `None` for an aside or a played source not yet
+    /// opened. A test of [`Self::set_buffer`] can read this, since what the
+    /// profile changes (how far ahead the engine fetches) is not a number
+    /// this crate is shown.
     pub(crate) async fn buffer_in_use(&self) -> Option<BufferProfile> {
         let played = self.play.as_ref()?;
         played
@@ -284,11 +283,11 @@ impl TorrentSource {
         })
     }
 
-    /// The names of the torrent's files, in the torrent's own order --
-    /// what a translator that comes in sets is handed to pick its sibling
-    /// volumes out of (`Translator::volumes`). The order is the list's,
-    /// not the set's: the naming rules put the volumes in order, and a
-    /// torrent lists what it lists.
+    /// The names of the torrent's files, in the torrent's own order. A
+    /// translator that comes in sets is handed this to pick its sibling
+    /// volumes out of (`Translator::volumes`). The order is the list's, not
+    /// the set's: the naming rules put the volumes in order, and a torrent
+    /// lists what it lists.
     pub async fn file_names(
         engine: &Arc<enginefs::EngineFS>,
         info_hash: &str,
@@ -297,9 +296,9 @@ impl TorrentSource {
         Ok(files.into_iter().map(|file| file.name).collect())
     }
 
-    /// The torrent's file list. `get_files` and not `stats()`: the latter
-    /// builds the whole snapshot -- per-file progress, trackers, a scrape
-    /// scheduled -- for a name lookup.
+    /// The torrent's file list. It uses `get_files` and not `stats()`,
+    /// because the latter builds the whole snapshot (per-file progress,
+    /// trackers, a scrape scheduled) for a name lookup.
     async fn files(
         engine: &Arc<enginefs::EngineFS>,
         info_hash: &str,
@@ -341,25 +340,25 @@ impl TorrentSource {
         })
     }
 
-    /// A reader on this file, the engine told the read is about to be at
-    /// `offset`, at the streaming intent. A new handle every call: the
-    /// handle is per position, the registration is the source's.
+    /// A reader on this file at the streaming intent, with the engine told
+    /// the read is about to be at `offset`. It is a new handle every call:
+    /// the handle is per position, and the registration is the source's.
     ///
     /// **How far ahead the swarm is asked for is the engine's to decide**,
-    /// not this call's: `try_get_file_with_intent` (and its unshared twin)
+    /// not this call's. `try_get_file_with_intent` (and its unshared twin)
     /// takes the intent and works the lookahead out from the film's
     /// measured bitrate, the viewer's buffer profile and what the retention
-    /// budget can keep -- which is the whole reason to go through it rather
+    /// budget can keep. That is the whole reason to go through it rather
     /// than through `get_file_reader`, whose lookahead argument installs no
-    /// policy to keep what it pulls. A [`ReadHint`] is therefore spent on
-    /// nothing at all here (see [`ByteSource::open`]).
+    /// policy to keep what it pulls. So a [`ReadHint`] is spent on nothing
+    /// at all here (see [`ByteSource::open`]).
     async fn reader(&self, offset: u64) -> io::Result<Box<dyn SeekableReader>> {
         // **A source a cache clear stopped stays stopped.** The clear failed
-        // the reads it had open (`enginefs::Engine::cut_reads`); a seek is a
-        // new open, and one that succeeded would fetch again behind a
-        // player that was told its stream had ended -- on a torrent the
-        // clear stopped, for a stream it no longer counts. Whoever wants it
-        // again opens a new source, which is a new ask.
+        // the reads it had open (`enginefs::Engine::cut_reads`). A seek is a
+        // new open. One that succeeded would fetch again behind a player
+        // that was told its stream had ended, on a torrent the clear
+        // stopped, for a stream it no longer counts. Whoever wants it again
+        // opens a new source, which is a new ask.
         if self.engine.clear_generation() != self.cleared_at {
             return Err(enginefs::files::cleared_error());
         }
@@ -373,7 +372,7 @@ impl TorrentSource {
                     offset,
                     PLAYER_PRIORITY,
                     // **Streaming, never Download.** A player seeks in a
-                    // member; the download intent's 256 MiB lookahead in
+                    // member. The download intent's 256 MiB lookahead in
                     // front of a seeking player is a quarter of a gigabyte
                     // the swarm fetches and the retention owner cannot
                     // keep.
@@ -412,7 +411,7 @@ impl TorrentSource {
                 member: played.play.member.clone(),
             }),
             // A played source is read by a reader, never by a response
-            // body: its end line says so rather than reporting a body that
+            // body. Its end line says so rather than reporting a body that
             // never existed.
             consumer: Consumer::Reader,
         })
@@ -454,12 +453,12 @@ impl ByteSource for TorrentSource {
     /// The entity being played is this source's own when **any file of
     /// this torrent** is it.
     ///
-    /// Per torrent rather than per file, for the same reason the retention
-    /// window is not: a container made of several files of one torrent --
-    /// a RAR set -- is read by a body that crosses from one to the next,
-    /// and the cell names whichever of them the body is inside. See
-    /// `crate::translators::session::TranslatedSession::is_live`, which is
-    /// what asks.
+    /// It is per torrent rather than per file, for the same reason the
+    /// retention window is not per file. A container made of several files
+    /// of one torrent (a RAR set) is read by a body that crosses from one
+    /// to the next, and the cell names whichever of them the body is
+    /// inside. See `crate::translators::session::TranslatedSession::is_live`,
+    /// which is what asks.
     fn is_live(&self, reading: &enginefs::retention::live::Reading) -> bool {
         reading.is_torrent(&self.info_hash)
     }
@@ -488,12 +487,12 @@ impl ByteSource for TorrentSource {
         }
         // **The offset is told twice, and has to be.** The engine takes it
         // as where the read is about to be, which is what the intent
-        // prioritises around; the handle itself still starts at the top of
+        // prioritises around. The handle itself still starts at the top of
         // the file, exactly as `routes::stream` finds it. A body served
         // without this seek is the archive's first bytes under the
         // member's name.
         //
-        // The hint is spent by the engine and not here: it works the
+        // The hint is spent by the engine and not here. It works the
         // lookahead out from the intent, the film's measured bitrate and
         // what the retention budget can keep, which is a better answer
         // than a caller has. See [`ReadHint`].

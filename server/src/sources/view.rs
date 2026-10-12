@@ -1,34 +1,34 @@
 //! A member of a container as a file: several extents of several sources,
 //! read in order.
 //!
-//! A member that is *stored* -- written into its container uncompressed --
-//! is a list of byte ranges of that container, so serving it needs no
-//! decoding and no second copy on disk. A [`MemberView`] over the
-//! container's sources answers every read and every seek in the member's
-//! own coordinates, and the bytes come from wherever the container's bytes
-//! come from: a torrent, where a player's seek becomes a seek in the piece
+//! A member that is *stored* (written into its container uncompressed) is
+//! a list of byte ranges of that container. Serving it needs no decoding
+//! and no second copy on disk. A [`MemberView`] over the container's
+//! sources answers every read and every seek in the member's own
+//! coordinates. The bytes come from wherever the container's bytes come
+//! from: a torrent, where a player's seek becomes a seek in the piece
 //! store, or the proxy cache, where it becomes one ranged request.
 //!
 //! **Several sources, not one**, because a RAR set is one member across
 //! `.part1.rar`, `.part2.rar` and `.part3.rar`, and an ISO file over 4 GiB
-//! is several directory records under one name. The single-extent case --
-//! a stored ZIP or TAR member -- is this with one extent.
+//! is several directory records under one name. The single-extent case (a
+//! stored ZIP or TAR member) is this with one extent.
 //!
-//! The member and a read of it are two types. [`MemberView`] is the member
-//! -- what it is made of, with no read in progress -- and is the
-//! [`ByteSource`]; [`MemberReader`] is one read of it, and is what is
+//! The member and a read of it are two types. [`MemberView`] is the
+//! member: what it is made of, with no read in progress. It is the
+//! [`ByteSource`]. [`MemberReader`] is one read of it, and is what is
 //! `AsyncRead + AsyncSeek`. They are apart because a `ByteSource` is
 //! `Sync` (an `Arc<dyn ByteSource>` is shared between tasks, and a
-//! translator holds one while it awaits) and a value with a reader open
-//! inside it cannot be: the reader a body is being served through is not
-//! `Sync` and neither is the `open` future in flight before it. A view is
-//! cheap to clone and every reader taken from one is independent, which is
-//! also exactly what a player's second range request wants.
+//! translator holds one while it awaits). A value with a reader open
+//! inside it cannot be `Sync`: the reader a body is being served through
+//! is not `Sync`, and neither is the `open` future in flight before it. A
+//! view is cheap to clone and every reader taken from one is independent.
+//! That is also exactly what a player's second range request wants.
 //!
 //! The `assume_init`/`advance` discipline in [`MemberReader::poll_read`] is
-//! not an optimisation: `ReadBuf::take` hands out a buffer over the
-//! parent's *unfilled* region, and filling it without advancing the parent
-//! reports zero bytes read -- which every reader treats as the end of the
+//! not an optimisation. `ReadBuf::take` hands out a buffer over the
+//! parent's *unfilled* region. Filling it without advancing the parent
+//! reports zero bytes read, which every reader treats as the end of the
 //! file.
 
 use super::{ByteSource, Extent, ReadHint, SeekableReader, open_owned};
@@ -48,8 +48,8 @@ struct Member {
     sources: Vec<Arc<dyn ByteSource>>,
     extents: Vec<Extent>,
     /// Where each extent begins in the member's own coordinates, with the
-    /// member's length as a final entry -- so the extent a position is in
-    /// is one `partition_point` away.
+    /// member's length as a final entry. So the extent a position is in is
+    /// one `partition_point` away.
     starts: Vec<u64>,
     len: u64,
 }
@@ -64,12 +64,12 @@ pub struct MemberView {
 impl MemberView {
     /// The member `name` made of `extents` over `sources`.
     ///
-    /// Refuses an extent naming a source the list does not have, or one
-    /// reaching past its source's end: a translator that computed an
+    /// It refuses an extent naming a source the list does not have, or one
+    /// reaching past its source's end. A translator that computed an
     /// offset wrongly is a bug to be told about at the index, not a body
     /// that ends in a read error halfway through a film. Zero-length
-    /// extents are dropped -- they are bytes nobody reads, and keeping
-    /// them would put a position in two extents at once.
+    /// extents are dropped. They are bytes nobody reads, and keeping them
+    /// would put a position in two extents at once.
     pub fn new(
         name: impl Into<String>,
         sources: Vec<Arc<dyn ByteSource>>,
@@ -158,15 +158,15 @@ impl ByteSource for MemberView {
         self.member.name.clone()
     }
 
-    /// A view is live when **any** source its extents run over is: the
-    /// bytes it reads are theirs, and a member that spans a set of volumes
-    /// is being played whichever of them the reader is inside -- the same
-    /// reason `TranslatedSession::is_live` asks the same way.
+    /// A view is live when **any** source its extents run over is live.
+    /// The bytes it reads are theirs, and a member that spans a set of
+    /// volumes is being played whichever of them the reader is inside.
+    /// `TranslatedSession::is_live` asks the same way for the same reason.
     ///
     /// A view is a `ByteSource` so that a translator can sit on another
-    /// translator's member, and this is what keeps that honest: the
-    /// default answer of `false` is right for a source over bytes nobody
-    /// retains, and a view over a proxied body is not one of those.
+    /// translator's member, and this is what keeps that honest. The default
+    /// answer of `false` is right for a source over bytes nobody retains,
+    /// and a view over a proxied body is not one of those.
     fn is_live(&self, reading: &enginefs::retention::live::Reading) -> bool {
         self.member
             .sources
@@ -175,19 +175,19 @@ impl ByteSource for MemberView {
     }
 
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
-        // Straight through to the sources rather than through a reader: an
-        // index read is a handful of scattered reads and must not disturb
-        // -- or wait behind -- the body read of the same member.
+        // This goes straight through to the sources rather than through a
+        // reader. An index read is a handful of scattered reads and must
+        // not disturb, or wait behind, the body read of the same member.
         let mut filled = 0;
         let mut pos = offset;
         while filled < buf.len() {
             let Some((_, extent, within)) = self.member.extent_at(pos) else {
                 break;
             };
-            // Compared as `u64` and cast after, never before: `usize` is
-            // 32 bits on the Android ABI this ships to (armeabi-v7a), and
-            // an extent longer than 4 GiB -- an ISO's, a film's -- casts
-            // there to something shorter than itself or to nothing at all.
+            // Compared as `u64` and cast after, never before. `usize` is
+            // 32 bits on the Android ABI this ships to (armeabi-v7a). An
+            // extent longer than 4 GiB (an ISO's, a film's) casts there to
+            // something shorter than itself or to nothing at all.
             let want = (extent.len - within).min((buf.len() - filled) as u64) as usize;
             let read = self.member.sources[extent.source]
                 .read_at(extent.offset + within, &mut buf[filled..filled + want])
@@ -202,9 +202,9 @@ impl ByteSource for MemberView {
     }
 
     async fn open(&self, offset: u64, _hint: ReadHint) -> io::Result<Box<dyn SeekableReader>> {
-        // The hint is spent by the extents the reader opens as it reaches
-        // them -- each one asks its own source for its own span -- so
-        // there is nothing here to narrow it against.
+        // The extents the reader opens spend the hint as it reaches them,
+        // each asking its own source for its own span. So there is nothing
+        // here to narrow it against.
         Ok(Box::new(self.reader_at(offset)))
     }
 }
@@ -212,13 +212,13 @@ impl ByteSource for MemberView {
 /// What a reader is doing right now.
 enum State {
     /// Nothing open: the next read opens the extent its position is in.
-    /// Where every reader starts, and where a seek out of the open extent
-    /// puts one.
+    /// Every reader starts here, and a seek out of the open extent puts
+    /// one here.
     Idle,
     /// A source's `open` is in flight for extent `index`.
     Opening { index: usize, open: Opening },
     /// A seek of the open reader is in flight, to `left` bytes before the
-    /// end of extent `index`: a seek **inside** the extent a reader is
+    /// end of extent `index`. A seek **inside** the extent a reader is
     /// already open on is that reader's own seek, not another `open`.
     Seeking {
         index: usize,
@@ -297,7 +297,7 @@ impl AsyncRead for MemberReader {
                         open: Box::pin(open_owned(
                             source,
                             extent.offset + within,
-                            // This extent and no further: the hint is what
+                            // This extent and no further. The hint is what
                             // a torrent reads ahead by and what an HTTP
                             // source puts in its `Range`, and the bytes
                             // after this extent are not this member's.
@@ -369,10 +369,11 @@ impl AsyncRead for MemberReader {
                             let read = window.filled().len() - before;
                             if read == 0 {
                                 // The extent promised bytes its source
-                                // stopped short of. Said as an error
-                                // rather than as the member's end: a short
-                                // body under a stated `Content-Length` is
-                                // a player quietly playing half a film.
+                                // stopped short of. It is said as an error
+                                // rather than as the member's end, because
+                                // a short body under a stated
+                                // `Content-Length` is a player quietly
+                                // playing half a film.
                                 let short = *left;
                                 let name = this.member.name.clone();
                                 this.state = State::Idle;
@@ -383,7 +384,7 @@ impl AsyncRead for MemberReader {
                             }
                             // `take` hands out a buffer over the parent's
                             // *unfilled* region, and filling it does not
-                            // move the parent along -- so say so, or the
+                            // move the parent along. So say so, or the
                             // caller is told the read produced nothing and
                             // reads it as the end of the member.
                             // SAFETY: the read initialised `read` bytes of
@@ -421,10 +422,10 @@ impl AsyncSeek for MemberReader {
             this.pos = target;
             // **A seek inside the open extent is that reader's own seek.**
             // A source's reader is a handle on the file it came from (see
-            // `sources::SeekableReader`), so the member's coordinates are
-            // translated to the source's and the handle moves; a target
-            // in another extent -- or past the member's end -- is a new
-            // reader, because it is a different source's span.
+            // `sources::SeekableReader`). So the member's coordinates are
+            // translated to the source's and the handle moves. A target in
+            // another extent, or past the member's end, is a new reader,
+            // because it is a different source's span.
             let open = std::mem::replace(&mut this.state, State::Idle);
             if let State::Reading { index, reader, .. } | State::Seeking { index, reader, .. } =
                 open
@@ -447,9 +448,10 @@ impl AsyncSeek for MemberReader {
                 }
             }
         }
-        // A seek of the inner reader started above -- or left over from a
-        // read that was polled while one was in flight -- is driven here,
-        // so the position this returns is one the next read can start at.
+        // A seek of the inner reader is driven here, whether it was started
+        // above or left over from a read that was polled while one was in
+        // flight. So the position this returns is one the next read can
+        // start at.
         if let State::Seeking { reader, .. } = &mut this.state {
             match Pin::new(reader).poll_complete(cx) {
                 Poll::Pending => return Poll::Pending,
@@ -484,9 +486,9 @@ mod tests {
     use crate::sources::testing::{CountingSource, MemorySource};
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-    /// A source over bytes something else keeps -- the only kind that can
-    /// be the live entity -- with the answer fixed, so what the tests
-    /// below are about is who is asked rather than what the cell holds.
+    /// A source over bytes something else keeps (the only kind that can be
+    /// the live entity), with the answer fixed. So the tests below are
+    /// about who is asked rather than what the cell holds.
     struct Retained(MemorySource, bool);
 
     #[async_trait::async_trait]
@@ -513,8 +515,8 @@ mod tests {
     }
 
     /// **A view answers for the sources under it**, and so does the
-    /// counting wrapper between them: a member that spans a set is being
-    /// played whichever volume the reader is inside, and a wrapper that
+    /// counting wrapper between them. A member that spans a set is being
+    /// played whichever volume the reader is inside. A wrapper that
     /// answered for itself would report the viewer had moved on while they
     /// were watching (`crate::translators::session`).
     #[test]
@@ -599,8 +601,8 @@ mod tests {
     }
 
     /// A member read whole is its own bytes and nothing of the containers
-    /// around it -- across the join, where the reader for one extent is
-    /// closed and the next opened.
+    /// around it. That holds across the join, where the reader for one
+    /// extent is closed and the next opened.
     #[tokio::test]
     async fn a_view_reads_its_extents_in_order_and_nothing_between_them() {
         let (view, first, second) = split_view();
@@ -620,11 +622,11 @@ mod tests {
 
     /// **A member ends where its extents end, whatever its sources hand
     /// out.** A [`ReadHint`] is advice about how much is coming and not a
-    /// cap -- a source's reader is a handle on the whole file, and a
-    /// torrent's runs to the end of it -- so what keeps a read inside the
-    /// member is the run of the extent it is in. Checked here with the
-    /// container's own bytes on either side of every extent, which a
-    /// reader that trusted its source to stop would hand to the player.
+    /// cap. A source's reader is a handle on the whole file, and a
+    /// torrent's runs to the end of it. So what keeps a read inside the
+    /// member is the run of the extent it is in. This is checked here with
+    /// the container's own bytes on either side of every extent. A reader
+    /// that trusted its source to stop would hand those to the player.
     #[tokio::test]
     async fn a_source_that_reads_past_its_hint_still_reads_only_the_member() {
         let member = member();
@@ -664,8 +666,8 @@ mod tests {
     /// reader**, rather than opening another at the new offset.
     ///
     /// That is what a source's reader being a handle on its file buys
-    /// (`sources::SeekableReader`): the member's position is translated
-    /// into the source's and the handle goes there -- a seek of the piece
+    /// (`sources::SeekableReader`). The member's position is translated
+    /// into the source's and the handle goes there: a seek of the piece
     /// store, or one ranged request through the proxy cache. Crossing into
     /// another extent is still an `open`, because that is a different
     /// source's span.
@@ -732,9 +734,9 @@ mod tests {
     }
 
     /// **A seek while a reader is open is still a seek.** The reader that
-    /// was open is positioned where the last read left it, and nothing but
-    /// opening its source again at the new offset can move it -- which is
-    /// the only thing an HTTP source could do anyway, and is what a player
+    /// was open is positioned where the last read left it. Nothing but
+    /// opening its source again at the new offset can move it. That is the
+    /// only thing an HTTP source could do anyway, and is what a player
     /// seeking mid-file is. Every seek here is made from a reader that is
     /// open and elsewhere: backwards, forwards inside the same extent, and
     /// across the join.
@@ -758,8 +760,8 @@ mod tests {
     }
 
     /// A seek exactly onto an extent boundary reads the next extent from
-    /// its first byte, and one just before it reads across -- the two ways
-    /// a `partition_point` off by one shows up.
+    /// its first byte, and one just before it reads across. Those are the
+    /// two ways a `partition_point` off by one shows up.
     #[tokio::test]
     async fn a_seek_lands_on_the_extent_that_holds_the_byte() {
         let (view, first, second) = split_view();
@@ -781,8 +783,8 @@ mod tests {
         assert_eq!(across, member[63..65]);
     }
 
-    /// A seek past the end is not an error -- a player probing a file does
-    /// it -- and what follows it is the end of the member.
+    /// A seek past the end is not an error (a player probing a file does
+    /// it), and what follows it is the end of the member.
     #[tokio::test]
     async fn a_seek_past_the_end_reads_nothing() {
         let (view, first, second) = split_view();
@@ -828,8 +830,8 @@ mod tests {
     }
 
     /// The view is a `ByteSource` too, so a translator can sit on another
-    /// translator's member -- and its `read_at` crosses extents without
-    /// moving what a body read of the same member is doing.
+    /// translator's member. Its `read_at` crosses extents without moving
+    /// what a body read of the same member is doing.
     #[tokio::test]
     async fn a_view_is_itself_a_source_whose_index_reads_cross_extents() {
         let (view, first, second) = split_view();

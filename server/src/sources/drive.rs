@@ -4,12 +4,12 @@
 //! The shape the design named (`docs/design/translated-sources.md`): "`DriveSource`
 //! (Google Drive; ranged `GET` with the addon's OAuth header, which is a
 //! `ProxySource` with a header supplier that refreshes)". That is what this
-//! is. Drive serves `files/{id}?alt=media` with a `206` for a `Range`, so
-//! everything the archive layer already does over a link -- one request per
-//! span, a seek that is a new request, the proxy cache's narrowing and
-//! `If-Range` -- works over a Drive file unchanged. The one thing Drive
-//! needs that a link does not is the header, and the whole of this module
-//! is about that header.
+//! is. Drive serves `files/{id}?alt=media` with a `206` for a `Range`. So
+//! everything the archive layer already does over a link works over a
+//! Drive file unchanged: one request per span, a seek that is a new
+//! request, the proxy cache's narrowing and `If-Range`. The one thing
+//! Drive needs that a link does not is the header, and the whole of this
+//! module is about that header.
 //!
 //! # The token, and why the renewal is here rather than in the app
 //!
@@ -17,14 +17,14 @@
 //! the television collects a refresh token, an access token and the file's
 //! id ([`DrivePairing`]). Access tokens last about an hour. Films do not.
 //! So the credential cannot be a value captured at construction, and the
-//! renewal cannot be a call back into the app: a token expiring in the
+//! renewal cannot be a call back into the app. A token expiring in the
 //! middle of a byte range must not need a round trip across FFI on a
-//! device whose frame budget is already spent. [`DriveCredential`] is a
-//! [`OwnGrant`] -- asked for headers once per request, on this side of
+//! device whose frame budget is already spent. [`DriveCredential`] is an
+//! [`OwnGrant`]: it is asked for headers once per request, on this side of
 //! that boundary, in Rust.
 //!
-//! Four things it is careful about, each of which is a stall or a leak if
-//! it is got wrong:
+//! It is careful about four things. Getting any of them wrong is a stall
+//! or a leak:
 //!
 //! * **Renewed before it bites.** A read that `401`s mid-film is a stall
 //!   the viewer sees and then a retry they wait through. The credential
@@ -32,35 +32,35 @@
 //!   [`RENEW_MARGIN`] left, so the origin is never handed one it will
 //!   refuse.
 //! * **A renewal is a wait, not a failure.** Reads already streaming carry
-//!   the token they left with and are untouched: Google does not revoke a
-//!   response it has begun framing. A read that has *not* yet built its
-//!   request waits on the one renewal -- one round trip, measured under a
-//!   second -- and then goes with the new token. Nothing is cancelled and
-//!   nothing is retried. The margin exists precisely so that this wait
-//!   falls between two reads rather than inside a body.
+//!   the token they left with and are untouched, because Google does not
+//!   revoke a response it has begun framing. A read that has *not* yet
+//!   built its request waits on the one renewal (one round trip, measured
+//!   under a second) and then goes with the new token. Nothing is
+//!   cancelled and nothing is retried. The margin exists precisely so that
+//!   this wait falls between two reads rather than inside a body.
 //! * **One refresh at a time.** The token is behind a `Mutex` and the
 //!   freshness check is *inside* it, so several reads meeting one expiry
 //!   make one request: the first renews, the rest find its token and go.
-//!   A renewal that fails for a reason that could pass -- the pairing
-//!   service unreachable -- leaves the old token in place and the lock
-//!   open, so the read that met the failure fails and the next read tries
-//!   again. One failure does not poison the source.
+//!   A renewal can fail for a reason that could pass, such as the pairing
+//!   service being unreachable. It then leaves the old token in place and
+//!   the lock open, so the read that met the failure fails and the next
+//!   read tries again. One failure does not poison the source.
 //! * **`pairAgain` is terminal.** `invalid_grant` means the grant is gone
-//!   and no retry can bring it back; only a new QR scan can. It is
-//!   recorded ([`DriveCredential::is_dead`]) and every later read fails at
-//!   once with [`DriveError::PairAgain`] rather than asking again, so the
-//!   app shows a code instead of a spinner and Google is not hammered by
+//!   and no retry can bring it back. Only a new QR scan can. It is
+//!   recorded ([`DriveCredential::is_dead`]), and every later read fails at
+//!   once with [`DriveError::PairAgain`] rather than asking again. So the
+//!   app shows a code instead of a spinner, and Google is not hammered by
 //!   a player that keeps seeking.
 //!
 //! # What is never written down
 //!
 //! Neither token reaches a log, a `describe`, or an error string.
-//! [`ByteSource::describe`] is `ProxySource`'s -- the origin and nothing
-//! else, so not even the file id -- and every [`DriveError`] is a sentence
-//! written here rather than a body echoed back, because the body of a
-//! failed refresh is somebody else's text and may contain anything that
-//! was sent to them. `DriveCredential` derives no `Debug` for the same
-//! reason: a `{:?}` in a trace is the commonest way a secret gets filed.
+//! [`ByteSource::describe`] is `ProxySource`'s: the origin and nothing
+//! else, so not even the file id. Every [`DriveError`] is a sentence
+//! written here rather than a body echoed back. The body of a failed
+//! refresh is somebody else's text and may contain anything that was sent
+//! to them. `DriveCredential` derives no `Debug` for the same reason: a
+//! `{:?}` in a trace is the commonest way a secret gets filed.
 
 use super::proxy::{Credentials, OwnGrant, ProxySource, ProxySourceError, Vouch};
 use super::{ByteSource, ReadHint, SeekableReader};
@@ -73,19 +73,19 @@ use std::time::Duration;
 use tokio::time::Instant;
 use url::Url;
 
-/// Where Drive serves file bytes from. A constant because it is not a
-/// caller's URL: this server builds it from a file id, which is what keeps
-/// `DriveSource` out of the open-relay shape `/proxy` has.
+/// Where Drive serves file bytes from. It is a constant because it is not
+/// a caller's URL. This server builds it from a file id, which is what
+/// keeps `DriveSource` out of the open-relay shape `/proxy` has.
 pub const GOOGLE_DRIVE_API: &str = "https://www.googleapis.com/";
 
 /// How long before an access token expires the credential renews it.
 ///
-/// A minute. What it buys is that the wait for a renewal lands *between*
-/// two reads rather than inside one: a read issued at the last moment
-/// still has the better part of a minute of validity when it reaches
-/// Google, which is more than a ranged `GET` over domestic wifi takes to
-/// be accepted. What it costs is one extra refresh an hour at most, which
-/// is one request against a token that lasts 3599 seconds.
+/// A minute. It makes the wait for a renewal land *between* two reads
+/// rather than inside one. A read issued at the last moment still has the
+/// better part of a minute of validity when it reaches Google. That is
+/// more than a ranged `GET` over domestic wifi takes to be accepted. It
+/// costs one extra refresh an hour at most, which is one request against
+/// a token that lasts 3599 seconds.
 ///
 /// It is deliberately much larger than any plausible clock skew between
 /// this device and Google, and deliberately much smaller than the token's
@@ -93,13 +93,13 @@ pub const GOOGLE_DRIVE_API: &str = "https://www.googleapis.com/";
 const RENEW_MARGIN: Duration = Duration::from_secs(60);
 
 /// How long a refresh may take before it is a failure. The pairing service
-/// answers in well under a second; a request still open after this is a
+/// answers in well under a second. A request still open after this is a
 /// network that is not going to come back inside a viewer's patience, and
 /// a read waiting on it is a spinner.
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The most of a refresh answer that is read. It is a two-field JSON
-/// object; anything past this is not one, and reading it whole would let
+/// object, so anything past this is not one. Reading it whole would let
 /// whatever is on the other end of the pairing URL decide how much memory
 /// this process uses.
 const MAX_REFRESH_BODY: usize = 8 * 1024;
@@ -110,18 +110,18 @@ const MAX_REFRESH_BODY: usize = 8 * 1024;
 #[derive(Debug)]
 pub enum DriveError {
     /// **The pairing is dead.** The refresh token has been revoked or has
-    /// expired, the pairing service said so (`invalid_grant` ->
-    /// `pairAgain`), and no amount of retrying will change it: a grant
-    /// that is gone cannot be renewed into existence. The only thing that
-    /// makes this file readable again is a new pairing -- a QR on the
-    /// television, a phone that signs in.
+    /// expired, and the pairing service said so (`invalid_grant` ->
+    /// `pairAgain`). No amount of retrying will change it: a grant that is
+    /// gone cannot be renewed into existence. The only thing that makes
+    /// this file readable again is a new pairing: a QR on the television,
+    /// a phone that signs in.
     ///
     /// **Terminal, and distinct for that reason.** An app that cannot tell
     /// this from "the network is having a moment" shows a spinner for
     /// something that will never finish.
     PairAgain,
     /// The pairing service could not be reached at all, or did not answer
-    /// in time. Worth trying again; the grant may be perfectly good.
+    /// in time. It is worth trying again. The grant may be perfectly good.
     Unreachable(String),
     /// It was reached and answered something that is not a token.
     Refused(u16),
@@ -154,11 +154,11 @@ impl std::error::Error for DriveError {}
 
 impl DriveError {
     /// The typed reason a *read* failed, when it failed for this module's
-    /// sake -- above all [`Self::PairAgain`], which a caller has to be
+    /// sake. Above all that is [`Self::PairAgain`], which a caller has to be
     /// able to tell apart without matching English.
     ///
     /// A read answers `io::Error` because that is what a [`ByteSource`]
-    /// answers; the error a mint failed with is boxed inside it, and this
+    /// answers. The error a mint failed with is boxed inside it, and this
     /// is how it comes back out.
     pub fn in_read(error: &io::Error) -> Option<&Self> {
         error.get_ref()?.downcast_ref::<Self>()
@@ -183,8 +183,8 @@ impl From<ProxySourceError> for DriveError {
 /// once and the app keeps it.
 ///
 /// **Nothing in this repository is ever an instance of this.** A refresh
-/// token and a file id belong to whoever's Drive they name; they arrive at
-/// run time from the app and the tests build their own against a fake
+/// token and a file id belong to whoever's Drive they name. They arrive at
+/// run time from the app, and the tests build their own against a fake
 /// origin.
 pub struct DrivePairing {
     /// Where a refresh is asked for: a `POST` of `{"refreshToken": ...}`
@@ -197,19 +197,20 @@ pub struct DrivePairing {
     /// The access token the pairing arrived with, already valid. Secret.
     pub access_token: String,
     /// How much of that token's life was left when it was measured.
-    /// **A duration and not an instant on purpose**: an absolute
-    /// wall-clock time would be compared against a television's own clock,
-    /// which is set by whatever DHCP handed it and is routinely wrong by
-    /// hours, and a token believed expired is a refresh per read while one
-    /// believed fresh is the `401` this exists to avoid.
+    /// **A duration and not an instant on purpose.** An absolute wall-clock
+    /// time would be compared against a television's own clock. That clock
+    /// is set by whatever DHCP handed it and is routinely wrong by hours. A
+    /// token believed expired is a refresh per read, while one believed
+    /// fresh is the `401` this exists to avoid.
     pub expires_in: Duration,
-    /// Which file in that Drive. Not a secret, and **it is what the cache
-    /// key is**: the id names the content, whoever happens to be entitled
-    /// to fetch it, which is the assertion [`DriveSource`] vouches with.
+    /// Which file in that Drive. It is not a secret, and **it is what the
+    /// cache key is**. The id names the content, whoever happens to be
+    /// entitled to fetch it, which is the assertion [`DriveSource`] vouches
+    /// with.
     pub file_id: String,
-    /// Where Drive itself is. [`GOOGLE_DRIVE_API`] in every shipped build;
-    /// a loopback origin in the tests, which is how they read a Drive file
-    /// without one existing.
+    /// Where Drive itself is: [`GOOGLE_DRIVE_API`] in every shipped build,
+    /// and a loopback origin in the tests, which is how they read a Drive
+    /// file without one existing.
     pub api_base: Url,
 }
 
@@ -266,9 +267,9 @@ const MAX_METADATA_BODY: usize = 16 * 1024;
 
 /// What Drive says about a file's current content, as `files/{id}` answers
 /// it for the fields [`DrivePairing::metadata_url`] asks. Every field is
-/// optional -- a Google-native document has no `md5Checksum` -- and the
-/// 64-bit ones arrive as JSON strings, which is how the API writes an
-/// `int64`; a number is taken too.
+/// optional: a Google-native document has no `md5Checksum`. The 64-bit
+/// ones arrive as JSON strings, which is how the API writes an `int64`,
+/// and a number is taken too.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DriveMetadata {
@@ -287,7 +288,7 @@ impl DriveMetadata {
     /// its content, or `None` when it says nothing that could name one.
     ///
     /// Drive's `files/{id}?alt=media` names neither an `ETag` nor a
-    /// `Last-Modified` (measured on a phone, 2026-10-01), so without this a
+    /// `Last-Modified` (measured on a phone, 2026-10-01). Without this, a
     /// Drive file would be kept under its length alone, and a file replaced
     /// in Drive by one of the same size would be served as it was. In
     /// order of strength:
@@ -301,9 +302,9 @@ impl DriveMetadata {
     ///
     /// `probed_total` is the length the probe of the bytes found. A
     /// metadata `size` that disagrees with it is a file that changed
-    /// between the two requests, so neither answer can say which generation
-    /// the bytes are of: `None`, and the open goes on under the response's
-    /// own identity.
+    /// between the two requests. Then neither answer can say which
+    /// generation the bytes are of. The answer is `None`, and the open goes
+    /// on under the response's own identity.
     pub(crate) fn identity(&self, probed_total: u64) -> Option<String> {
         let text = |field: &Option<serde_json::Value>| {
             match field.as_ref()? {
@@ -356,9 +357,9 @@ pub struct DriveCredential {
     refresh_endpoint: Url,
     refresh_token: String,
     /// The current token. The lock is what makes several reads meeting one
-    /// expiry into one refresh, and the freshness check lives *inside* it
-    /// -- a check outside would let every waiter decide to renew before
-    /// any of them had.
+    /// expiry into one refresh. The freshness check lives *inside* it,
+    /// because a check outside would let every waiter decide to renew
+    /// before any of them had.
     token: tokio::sync::Mutex<Token>,
     /// Set once the pairing service has said the grant is gone. Read
     /// before the lock is taken, so a dead pairing costs a seeking player
@@ -375,7 +376,7 @@ struct RefreshedToken {
 }
 
 /// And what a refusal answers with. `pairAgain` is the one field that
-/// matters: it is the service saying the grant is gone rather than that
+/// matters. It is the service saying the grant is gone, rather than that
 /// this request went wrong.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -411,13 +412,13 @@ impl DriveCredential {
     /// Age the token in hand to the end of its life, as an hour of real
     /// time would.
     ///
-    /// The test hook the alternatives are worse than: the clock this
+    /// The test hook the alternatives are worse than. The clock this
     /// compares against is `tokio::time::Instant`, and a paused runtime
-    /// auto-advances whenever it is idle -- which a fake origin on its own
-    /// blocking threads makes it, repeatedly and unpredictably -- so
-    /// `advance()` would decide for itself how many expiries a test saw.
-    /// Waiting out the real margin is a minute per test. This states the
-    /// one thing the test is about.
+    /// auto-advances whenever it is idle. A fake origin on its own blocking
+    /// threads makes it idle, repeatedly and unpredictably. So `advance()`
+    /// would decide for itself how many expiries a test saw. Waiting out
+    /// the real margin is a minute per test. This states the one thing the
+    /// test is about.
     #[cfg(test)]
     async fn expire_now(&self) {
         self.token.lock().await.expires_at = Instant::now();
@@ -427,8 +428,8 @@ impl DriveCredential {
     /// near enough its end to be refused by the time it lands.
     ///
     /// **Serialised, and that is the feature.** Everything between taking
-    /// the lock and putting the new token back is one refresh; a second
-    /// read that arrives during it waits, and then finds a token that is
+    /// the lock and putting the new token back is one refresh. A second
+    /// read that arrives during it waits. It then finds a token that is
     /// good for another hour rather than deciding to fetch one of its own.
     pub async fn bearer(&self) -> Result<String, DriveError> {
         if self.is_dead() {
@@ -438,9 +439,9 @@ impl DriveCredential {
         if held.usable_at(Instant::now()) {
             return Ok(held.bearer.clone());
         }
-        // Asked again under the lock: the waiter in front may have been the
+        // Asked again under the lock. The waiter in front may have been the
         // one that discovered the grant is gone, and a second request to
-        // find that out again is a request that can only be refused.
+        // find that out again can only be refused.
         if self.is_dead() {
             return Err(DriveError::PairAgain);
         }
@@ -462,13 +463,13 @@ impl DriveCredential {
             .send()
             .await
             // The reqwest error's own text names the URL and nothing else
-            // of ours -- there is no secret in a pairing endpoint -- but
-            // the body is never in it, which is what matters.
+            // of ours (there is no secret in a pairing endpoint). The body
+            // is never in it, which is what matters.
             .map_err(|error| DriveError::Unreachable(error.to_string()))?;
         let status = response.status();
-        // Read whole but never past the cap (`read_capped`): a refresh
-        // service is somebody else's, and `Response::bytes` would buffer
-        // whatever it sends before anyone could look at the length.
+        // It is read whole but never past the cap (`read_capped`). A
+        // refresh service is somebody else's, and `Response::bytes` would
+        // buffer whatever it sends before anyone could look at the length.
         let body = enginefs::http_client::read_capped(response, MAX_REFRESH_BODY)
             .await
             .map_err(|error| DriveError::Unreachable(format!("the refresh answer: {error:#}")))?;
@@ -482,9 +483,10 @@ impl DriveCredential {
                 expires_at: Instant::now() + Duration::from_secs(expires_in),
             });
         }
-        // `pairAgain` and not the status: the service is what knows
-        // whether `invalid_grant` was behind this, and a `401` without it
-        // is an answer about this request rather than about the grant.
+        // This checks `pairAgain` and not the status. The service is what
+        // knows whether `invalid_grant` was behind this, and a `401`
+        // without it is an answer about this request rather than about the
+        // grant.
         if serde_json::from_slice::<RefreshRefusal>(&body).is_ok_and(|refusal| refusal.pair_again) {
             self.dead.store(true, Ordering::Relaxed);
             return Err(DriveError::PairAgain);
@@ -494,9 +496,9 @@ impl DriveCredential {
 }
 
 /// What Drive says of the file's content now, or `None` when it could not
-/// be asked or did not answer with it. Never a failure of the open: the
-/// bytes read the same without it, and are kept under the response's own
-/// identity -- for Drive, the length.
+/// be asked or did not answer with it. It is never a failure of the open.
+/// The bytes read the same without it, and are kept under the response's
+/// own identity, which for Drive is the length.
 async fn fetch_metadata(credential: &DriveCredential, url: Url) -> Option<DriveMetadata> {
     let bearer = credential.bearer().await.ok()?;
     let client = crate::routes::proxy::http_client()?;
@@ -532,9 +534,9 @@ impl OwnGrant for DriveCredential {
 /// **A Drive file, read by range.**
 ///
 /// A [`ProxySource`] over `files/{id}?alt=media` with a
-/// [`DriveCredential`] supplying its header, which is the whole of it:
-/// every question about ranges, seeks, caching and retention is already
-/// answered one layer down, and the answers do not change because the
+/// [`DriveCredential`] supplying its header, which is the whole of it.
+/// Every question about ranges, seeks, caching and retention is already
+/// answered one layer down. The answers do not change because the
 /// authorisation is ours instead of a caller's.
 ///
 /// # Cached, and this is the source that vouches for it
@@ -542,44 +544,46 @@ impl OwnGrant for DriveCredential {
 /// `ProxyCache::entry` refuses every credentialed read and is not relaxed
 /// by any of this. What is here instead is the assertion that rule has no
 /// way of making for itself: **`files/{id}?alt=media` identifies the
-/// bytes**. The same id is the same file for everyone entitled to it, so
+/// bytes**. The same id is the same file for everyone entitled to it. So
 /// the credential authorises the *fetch* and does not determine the
-/// *result* -- which is what lets the key be the URL, with no token in it
-/// and nothing that churns when the token rotates every hour.
+/// *result*. That is what lets the key be the URL, with no token in it and
+/// nothing that churns when the token rotates every hour.
 ///
 /// So this source passes `Vouch::UrlIdentifiesBytes`, in as many words, at
 /// the one place a source is constructed. A source that does not say so
-/// is not cached. The full cost of saying so -- including who can read
-/// those bytes back out of the store without being authorised for them,
-/// and why the owner accepted that -- is written where the key is minted:
-/// `crate::proxy_cache::ProxyCache::entry_for_vouched_url`. Read it before
+/// is not cached. The full cost of saying so is written where the key is
+/// minted: `crate::proxy_cache::ProxyCache::entry_for_vouched_url`. That
+/// includes who can read those bytes back out of the store without being
+/// authorised for them, and why the owner accepted that. Read it before
 /// vouching for anything else.
 ///
 /// What a viewer gets for it: a backward seek inside what the cache still
 /// holds is a disk read rather than a round trip to Google over the
 /// television's wifi. The player keeps an 8 MiB back-window and nothing
-/// more, so without this every seek back beyond a few seconds of film is a
+/// more. Without this, every seek back beyond a few seconds of film is a
 /// new request and a re-download of bytes this device already had.
 ///
 /// # The generation, which is a separate question
 ///
 /// A vouch says the URL names the file. It does not say *which version* of
 /// it, so a file edited in Drive under the same id must not be served from
-/// the old bytes. That is the entity directory's job, not the key's: it is
-/// named for the entity's identity (`routes::proxy::entity_identity`), and
-/// whatever is kept under another identity is dropped.
+/// the old bytes. That is the entity directory's job, not the key's. The
+/// directory is named for the entity's identity
+/// (`routes::proxy::entity_identity`), and whatever is kept under another
+/// identity is dropped.
 ///
-/// **Drive's media responses name no validator** -- no `ETag`, no
-/// `Last-Modified` (measured on a phone, 2026-10-01) -- so this source
-/// supplies one from what Drive says of the file: one `files/{id}` request
-/// at open for `md5Checksum`, `version`, `modifiedTime` and `size`
-/// ([`DriveMetadata::identity`]), every read filed and compared under it
-/// ([`ProxySource::identified_as`]), and the open retiring what is kept of
-/// any other generation ([`ProxySource::retire_stale`]) -- so each open is
-/// the revalidation. A file Drive says nothing useful about is kept by its
-/// length. A finished download is the exception: it opens off the disk
-/// with no request at all (`proxy_downloads::held_download`), which is
-/// what makes it play offline, and so is what it was when it finished.
+/// **Drive's media responses name no validator** (no `ETag`, no
+/// `Last-Modified`, measured on a phone, 2026-10-01). So this source
+/// supplies one from what Drive says of the file. It makes one
+/// `files/{id}` request at open for `md5Checksum`, `version`,
+/// `modifiedTime` and `size` ([`DriveMetadata::identity`]). Every read is
+/// filed and compared under it ([`ProxySource::identified_as`]). The open
+/// retires what is kept of any other generation
+/// ([`ProxySource::retire_stale`]), so each open is the revalidation. A
+/// file Drive says nothing useful about is kept by its length. A finished
+/// download is the exception. It opens off the disk with no request at
+/// all (`proxy_downloads::held_download`), which is what makes it play
+/// offline, and so it is what it was when it finished.
 pub struct DriveSource {
     inner: ProxySource,
     credential: Arc<DriveCredential>,
@@ -591,18 +595,17 @@ pub struct DriveSource {
 impl DriveSource {
     /// Open a paired file as a source, or say why it could not be one.
     ///
-    /// The token is minted **before** the probe rather than inside it, so
-    /// that a dead pairing is [`DriveError::PairAgain`] at the first
-    /// attempt and not a sentence about a link that could not be
-    /// authorised. Everything after that is `ProxySource`'s: one ranged
-    /// `GET` of `bytes=0-0`, which is how the entity's length, type and
-    /// validator are learned and how an origin that will not range is
-    /// refused.
+    /// The token is minted **before** the probe rather than inside it. So
+    /// a dead pairing is [`DriveError::PairAgain`] at the first attempt,
+    /// not a sentence about a link that could not be authorised. Everything
+    /// after that is `ProxySource`'s: one ranged `GET` of `bytes=0-0`. That
+    /// is how the entity's length, type and validator are learned, and how
+    /// an origin that will not range is refused.
     ///
     /// It takes the server rather than a cache because a `ProxyCache` is
-    /// not part of the embeddable API -- the same reason
-    /// [`ProxySource::open`] is `pub(crate)` -- and what a caller has in
-    /// its hand is the server.
+    /// not part of the embeddable API (the same reason
+    /// [`ProxySource::open`] is `pub(crate)`). What a caller has in its
+    /// hand is the server.
     pub async fn open(state: &crate::AppState, pairing: DrivePairing) -> Result<Self, DriveError> {
         Self::open_against(state.proxy_cache.clone(), state.http_addr, pairing).await
     }
@@ -634,18 +637,18 @@ impl DriveSource {
                 // id names one file's content for everyone entitled to
                 // fetch it, so the URL identifies the bytes and the
                 // credential only buys the right to ask for them. This
-                // line is the whole of why these reads are cached; see
-                // the note on [`DriveSource`] for what it costs.
+                // line is the whole of why these reads are cached. See the
+                // note on [`DriveSource`] for what it costs.
                 vouch: Vouch::UrlIdentifiesBytes {
                     vouched_by: "DriveSource",
                 },
             },
         )
         .await?;
-        // Which generation of the file this is, by Drive's own word, and
-        // then whatever is kept of any other generation goes: this open is
-        // the revalidation. Without the metadata -- a failed request, or a
-        // file that changed between the two -- the bytes are kept under
+        // This finds which generation of the file this is, by Drive's own
+        // word. Then whatever is kept of any other generation goes, so this
+        // open is the revalidation. Without the metadata (a failed request,
+        // or a file that changed between the two), the bytes are kept under
         // the response's own identity, which for Drive is the length.
         let identity = match pairing_metadata_url {
             Ok(url) => fetch_metadata(&credential, url)
@@ -731,9 +734,9 @@ impl ByteSource for DriveSource {
         self.inner.len()
     }
 
-    /// The origin and nothing else -- so not the token, and not the file
-    /// id either. It is `ProxySource`'s, which is `log_origin` of the
-    /// media URL.
+    /// The origin and nothing else, so not the token, and not the file id
+    /// either. It is `ProxySource`'s, which is `log_origin` of the media
+    /// URL.
     fn describe(&self) -> String {
         self.inner.describe()
     }
@@ -770,8 +773,8 @@ mod tests {
     const FILE_LENGTH: usize = 512 * 1024;
 
     /// The checksum the fake's metadata states for the film. Drive's media
-    /// responses name no validator -- this fake's do not either, as the
-    /// real ones do not -- so this is what the film is kept under.
+    /// responses name no validator, and this fake's do not either. So this
+    /// is what the film is kept under.
     const FILM_MD5: &str = "0123456789ABCDEF0123456789abcdef";
 
     /// The film's bytes: a pattern, so a range can be checked to have come
@@ -785,9 +788,9 @@ mod tests {
     enum Refreshes {
         /// A new access token every time.
         Yes,
-        /// `401` with `pairAgain`, and -- to prove the error text is
-        /// written here rather than echoed -- the refresh token in the
-        /// body, which is what a naive service would do.
+        /// `401` with `pairAgain`, and the refresh token in the body, which
+        /// is what a naive service would do. That proves the error text is
+        /// written here rather than echoed.
         PairAgain,
     }
 
@@ -811,10 +814,10 @@ mod tests {
     /// **Every issued token stays valid**, which is Google's own behaviour:
     /// a refresh mints a new access token and does not revoke the one in
     /// flight. A fake that revoked would make the "one refresh" test pass
-    /// for the wrong reason -- the reads would be *forced* to serialise --
-    /// and would model something Drive does not do. What a test asserts
-    /// instead is `last_bearer`: which token a read actually went out
-    /// under.
+    /// for the wrong reason, because the reads would be *forced* to
+    /// serialise. It would also model something Drive does not do. What a
+    /// test asserts instead is `last_bearer`: which token a read actually
+    /// went out under.
     struct Tokens {
         issued: Vec<String>,
         last_bearer: Option<String>,
@@ -844,8 +847,8 @@ mod tests {
                     let tokens = tokens.clone();
                     let (refreshes, reads, rejections) =
                         (refreshes.clone(), reads.clone(), rejections.clone());
-                    // A thread per connection: the concurrency test has
-                    // several reads open at once and a serial fake would
+                    // A thread per connection. The concurrency test has
+                    // several reads open at once, and a serial fake would
                     // turn its question into a queue.
                     std::thread::spawn(move || {
                         serve(stream, mode, &tokens, &refreshes, &reads, &rejections)
@@ -1047,8 +1050,8 @@ mod tests {
     const FRESH: Duration = Duration::from_secs(3600);
 
     /// **A ranged read returns the bytes it asked for**, from the offset it
-    /// asked for -- which is the whole claim a `ByteSource` over Drive
-    /// makes, and the thing every translator above it depends on.
+    /// asked for. That is the whole claim a `ByteSource` over Drive makes,
+    /// and the thing every translator above it depends on.
     #[tokio::test]
     async fn a_ranged_read_returns_exactly_the_bytes_it_asked_for() {
         let fake = Fake::start(Refreshes::Yes);
@@ -1081,25 +1084,25 @@ mod tests {
     }
 
     /// **An expiring token is renewed before the read, not after a
-    /// `401`.** The margin is the point: a token with less life left than
+    /// `401`.** The margin is the point. A token with less life left than
     /// [`RENEW_MARGIN`] is replaced while it is still good, so the origin
     /// never refuses anything and the viewer never sees the stall a
     /// refused range would be.
     ///
     /// The fake proves the renewal really happened rather than that the
-    /// read merely worked: it records which token each read arrived with,
-    /// so the assertion is that the read went out under the *new* one and
-    /// not merely that it succeeded.
+    /// read merely worked. It records which token each read arrived with.
+    /// So the assertion is that the read went out under the *new* one, not
+    /// merely that it succeeded.
     #[tokio::test]
     async fn an_expiring_token_is_renewed_before_the_read_and_the_read_succeeds() {
         let fake = Fake::start(Refreshes::Yes);
         let (_root, cache) = cache();
         // **Thirty seconds, written out and not `RENEW_MARGIN / 2`.** A
         // test phrased in terms of the constant it is about cannot fail
-        // when the constant changes: with the margin set to zero -- which
-        // is precisely the regression of renewing *after* a `401` instead
-        // of before it -- half of it is still expired, and the test would
-        // pass having proved nothing.
+        // when the constant changes. With the margin set to zero (precisely
+        // the regression of renewing *after* a `401` instead of before
+        // it), half of it is still expired, and the test would pass having
+        // proved nothing.
         const NEARLY_GONE: Duration = Duration::from_secs(30);
         const _: () = assert!(
             RENEW_MARGIN.as_secs() > NEARLY_GONE.as_secs(),
@@ -1135,10 +1138,10 @@ mod tests {
         assert_eq!(fake.refreshes(), 1);
     }
 
-    /// **A token that expires between two reads is renewed between them**,
-    /// which is the claim the header being minted per request rather than
-    /// held on the source exists to make. A film runs longer than an
-    /// access token, so the read that matters is not the first one -- it is
+    /// **A token that expires between two reads is renewed between them.**
+    /// That is the claim the header being minted per request, rather than
+    /// held on the source, exists to make. A film runs longer than an
+    /// access token, so the read that matters is not the first one. It is
     /// the one an hour in, and there is no opening it can piggyback on.
     ///
     /// The source is opened with an hour of life, reads (no refresh), is
@@ -1200,10 +1203,10 @@ mod tests {
 
     /// **Several reads meeting one expiry cause exactly one refresh.**
     /// Not "few": one. A player seeking makes a handful of reads in the
-    /// same instant, and a refresh each would be a burst of identical
-    /// requests, several new tokens, and -- because each mints and
-    /// invalidates the last -- reads going out under tokens that were
-    /// current when they were built and stale when they landed.
+    /// same instant. A refresh each would be a burst of identical requests
+    /// and several new tokens. Because each mints and invalidates the last,
+    /// reads would also go out under tokens that were current when they
+    /// were built and stale when they landed.
     #[tokio::test]
     async fn concurrent_reads_across_an_expiry_cause_one_refresh() {
         let fake = Fake::start(Refreshes::Yes);
@@ -1232,8 +1235,8 @@ mod tests {
         );
         // **The expiry has to come after the probe, not before it.** A
         // source opened on an already-expired token renews during the
-        // probe and hands the reads an hour-old-nothing, so the reads meet
-        // no expiry at all and the test passes whatever the lock does.
+        // probe and hands the reads an hour-old-nothing. The reads then
+        // meet no expiry at all, and the test passes whatever the lock does.
         assert_eq!(
             fake.refreshes(),
             0,
@@ -1247,8 +1250,8 @@ mod tests {
             reading.push(tokio::spawn(async move {
                 // Distinct offsets inside the file, so no read can be
                 // answered from the cache by another's bytes and skip its
-                // own mint -- and none of them is a short read at the end,
-                // which would prove nothing about a token.
+                // own mint. None of them is a short read at the end, which
+                // would prove nothing about a token.
                 let at = nth * 16 * 1024;
                 let mut buf = vec![0u8; 512];
                 let read = source.read_at(at, &mut buf).await.expect("a ranged read");
@@ -1273,7 +1276,7 @@ mod tests {
     }
 
     /// **`pairAgain` is terminal and is never retried.** The grant is
-    /// gone; asking again can only be refused again, and a player that
+    /// gone. Asking again can only be refused again, and a player that
     /// keeps seeking would turn that into a request per seek. The service
     /// is asked exactly once, however many reads follow.
     #[tokio::test]
@@ -1317,9 +1320,9 @@ mod tests {
             2,
             "a dead pairing was asked again after it had answered"
         );
-        // And what a *read* fails with carries the same fact, typed: a
+        // And what a *read* fails with carries the same fact, typed. A
         // `ByteSource` can only answer `io::Error`, so the terminal reason
-        // has to survive inside one or an app is left matching English.
+        // has to survive inside one, or an app is left matching English.
         // This is the very error a read would get, taken from the mint a
         // read makes.
         let failed = OwnGrant::headers(&*credential)
@@ -1332,10 +1335,10 @@ mod tests {
         assert_eq!(fake.refreshes(), 2, "the mint asked a dead pairing again");
     }
 
-    /// **Nothing a token could reach is written down.** Not the describe
-    /// string, not any error this module can produce -- including the one
-    /// made from a refusal whose *body* carried the refresh token, which
-    /// is what a naive pairing service answers and what proves the
+    /// **Nothing a token could reach is written down.** That covers the
+    /// describe string and any error this module can produce. It includes
+    /// the one made from a refusal whose *body* carried the refresh token.
+    /// A naive pairing service answers that way, and that error proves the
     /// sentences here are written rather than echoed.
     #[tokio::test]
     async fn no_token_reaches_a_describe_string_or_an_error() {
@@ -1382,8 +1385,8 @@ mod tests {
             assert!(!line.contains("Bearer"), "a bearer header is in {line:?}");
         }
 
-        // The describe is the origin and nothing more -- not the file id,
-        // which is not ours to write down either.
+        // The describe is the origin and nothing more. It is not the file
+        // id, which is not ours to write down either.
         assert_eq!(source.describe(), format!("http://{}", working.addr));
         assert!(!source.describe().contains("a-file-id"));
     }
@@ -1392,11 +1395,11 @@ mod tests {
         serde_json::from_str(json).expect("a metadata answer")
     }
 
-    /// **What a Drive file is kept under**, from what Drive says of it:
-    /// the checksum when there is one, lowercased so one hash is one
-    /// spelling; else the version and modification time with the length;
-    /// else nothing. Drive writes `int64` fields as strings; a number is
-    /// taken too.
+    /// **What a Drive file is kept under**, from what Drive says of it.
+    /// That is the checksum when there is one, lowercased so one hash is
+    /// one spelling. Else it is the version and modification time with the
+    /// length, else nothing. Drive writes `int64` fields as strings, and a
+    /// number is taken too.
     #[test]
     fn a_drive_file_is_identified_by_its_checksum_else_its_version() {
         assert_eq!(
@@ -1424,10 +1427,10 @@ mod tests {
         assert_eq!(metadata("{}").identity(10), None);
     }
 
-    /// **A metadata length that is not the bytes' length names nothing**:
-    /// the file changed between the metadata and the probe, so which
-    /// generation the bytes are of is not known, and the checksum is not
-    /// filed over them.
+    /// **A metadata length that is not the bytes' length names nothing.**
+    /// The file changed between the metadata and the probe, so which
+    /// generation the bytes are of is not known. The checksum is not filed
+    /// over them.
     #[test]
     fn a_checksum_for_another_length_is_not_taken() {
         let changed = metadata(r#"{"md5Checksum":"abc","size":"11"}"#);
@@ -1444,7 +1447,7 @@ mod tests {
     /// it.** Both halves matter. The first is the point of vouching at
     /// all: a second read of a range is the disk's, so a backward seek is
     /// not a round trip to Google. The second is what makes it survive the
-    /// hour: the same range read again *after the token has rotated* is
+    /// hour. The same range read again *after the token has rotated* is
     /// still the disk's, which a key with a credential in it could never
     /// be.
     #[tokio::test]
@@ -1476,19 +1479,19 @@ mod tests {
             "the second read of the same range went back to Drive"
         );
 
-        // And a second pairing -- a different grant, the same file id --
-        // finds those bytes. **This is the decision, asserted**: the key
-        // is the URL, the credential authorises the fetch and does not
-        // determine the content, so the store does not churn when a token
-        // does and does not hold a copy per account. What it means is
+        // And a second pairing (a different grant, the same file id) finds
+        // those bytes. **This is the decision, asserted.** The key is the
+        // URL, and the credential authorises the fetch and does not
+        // determine the content. So the store does not churn when a token
+        // does, and does not hold a copy per account. What it means is
         // written where the key is minted: an entry made with
         // authorisation can be read without it, which the owner accepted
         // knowingly for a loopback-only server.
         let mut other = fake.pairing(FRESH);
         other.refresh_token = "a-quite-different-grant".to_string();
-        // A different account's access token, which this fake -- like
-        // Google -- has never issued, so the pairing has to renew before
-        // it can read at all.
+        // A different account's access token. This fake, like Google, has
+        // never issued it, so the pairing has to renew before it can read
+        // at all.
         other.access_token = "a-quite-different-access-token".to_string();
         other.expires_in = Duration::ZERO;
         let theirs = DriveSource::open_against(cache.clone(), SELF_ADDR, other)
@@ -1506,9 +1509,9 @@ mod tests {
     }
 
     /// **A source that mints its own header and vouches for nothing is not
-    /// cached**, so caching is something a source opts into by saying so
-    /// and never something it acquires by being credentialed. Same URL,
-    /// same grant, one word different.
+    /// cached.** So caching is something a source opts into by saying so,
+    /// never something it acquires by being credentialed. Same URL, same
+    /// grant, one word different.
     #[tokio::test]
     async fn an_unvouched_grant_is_read_and_never_kept() {
         let fake = Fake::start(Refreshes::Yes);
@@ -1546,8 +1549,8 @@ mod tests {
     }
 
     /// The media URL is Drive's, built here from a file id rather than
-    /// taken from a caller -- which is the whole reason these reads have
-    /// no open relay in them.
+    /// taken from a caller. That is the whole reason these reads have no
+    /// open relay in them.
     #[test]
     fn a_pairing_names_the_drive_media_endpoint() {
         let pairing = DrivePairing::new(

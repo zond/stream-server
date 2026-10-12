@@ -2,20 +2,20 @@
 //! (`docs/design/media-pipeline.md` §2.3, step B): a path, or on Android an
 //! fd `ParcelFileDescriptor.detachFd()` handed over.
 //!
-//! Nothing fetches it and nothing retains it: the bytes are the file's own
+//! Nothing fetches it and nothing retains it. The bytes are the file's own
 //! and stay where they are, so [`ByteSource::is_live`] keeps its `false`
-//! default -- no retention cell could ever name one.
+//! default: no retention cell could ever name one.
 //!
 //! **Random access or nothing.** A cloud provider behind Android's storage
-//! framework may hand out a pipe rather than a file: its bytes can be read
+//! framework may hand out a pipe rather than a file. Its bytes can be read
 //! once, forwards, and a player seeks. [`LocalSource::open_file`] asks the
 //! fd to seek (`lseek`) and refuses one that cannot, with
-//! [`LocalError::NotSeekable`]'s sentence, rather than streaming it forward
-//! only and failing at the viewer's first seek.
+//! [`LocalError::NotSeekable`]'s sentence. It does not stream such a file
+//! forward only and fail at the viewer's first seek.
 //!
 //! **Every read is positional** (`pread`, `seek_read` on Windows), on the
 //! blocking pool. An fd handed over is one open file description, and a
-//! `dup` of it shares its offset: two readers of one id that each seeked
+//! `dup` of it shares its offset. Two readers of one id that each seeked
 //! and read would move each other's position. A positional read has no
 //! position to share, so a reader here is a `pos` of its own over one
 //! shared [`std::fs::File`].
@@ -29,12 +29,13 @@ use std::task::{Context, Poll, ready};
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 
 /// How much one read of a reader asks the disk for at most: one blocking
-/// call's worth, the buffer a player reads through being far smaller.
+/// call's worth. The buffer a player reads through is far smaller.
 const READ_CHUNK: usize = 256 * 1024;
 
 /// A file on this device, as the app names it to
-/// [`crate::ServerHandle::register`] -- the only way one is ever named: no
-/// HTTP route resolves an id, so no URL can reach a file on this device.
+/// [`crate::ServerHandle::register`]. That is the only way one is ever
+/// named. No HTTP route resolves an id, so no URL can reach a file on this
+/// device.
 #[derive(Debug)]
 pub enum LocalFile {
     /// A path the app can open.
@@ -98,7 +99,7 @@ pub struct LocalSource {
 
 impl LocalSource {
     /// Open `file` and prove it a source: seekable, regular, its length
-    /// read. Blocking -- call it from the blocking pool ([`Self::open`]).
+    /// read. It blocks, so call it from the blocking pool ([`Self::open`]).
     /// An fd is duplicated rather than consumed, so a refusal leaves the
     /// caller's as it was.
     pub fn open_file(file: &LocalFile, name: String) -> Result<Self, LocalError> {
@@ -107,8 +108,8 @@ impl LocalSource {
             #[cfg(unix)]
             LocalFile::Fd(fd) => std::fs::File::from(fd.try_clone().map_err(LocalError::Open)?),
         };
-        // The pipe question first: a pipe is not a regular file either, and
-        // the sentence that says why it cannot play is this one.
+        // The pipe question comes first. A pipe is not a regular file
+        // either, and this is the sentence that says why it cannot play.
         // `stream_position` is `lseek(fd, 0, SEEK_CUR)`, which a pipe
         // answers with `ESPIPE`.
         opened
@@ -243,7 +244,7 @@ impl AsyncRead for LocalReader {
         this.reading = None;
         let read = read?;
         // The buffer may be smaller than the read begun for an earlier,
-        // larger one; what does not fit is read again.
+        // larger one. What does not fit is read again.
         let taken = read.len().min(buf.remaining());
         buf.put_slice(&read[..taken]);
         this.pos += taken as u64;
@@ -288,7 +289,7 @@ mod tests {
     }
 
     /// `read_at` answers the bytes at the offset, short at the end and
-    /// nothing past it; a reader reads from where it was opened and from
+    /// nothing past it. A reader reads from where it was opened and from
     /// where a seek put it.
     #[tokio::test]
     async fn reads_at_an_offset_and_through_a_reader() {

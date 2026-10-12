@@ -2,28 +2,29 @@
 //!
 //! This is the source an archive behind a web link is read from: the
 //! `urls` an addon puts in `rarUrls`/`zipUrls`, a debrid link, a CDN. A
-//! read of it is the route's own read -- [`cache_assisted_range`], which
+//! read of it is the route's own read, [`cache_assisted_range`]. That
 //! serves what the cache holds and fetches exactly the rest under
 //! `If-Range`, filling the cache on the way past. The cache stays the
-//! owner of those bytes: its retention pass keeps reclaiming them and
+//! owner of those bytes. Its retention pass keeps reclaiming them and
 //! `ServerHandle::stream_numbers` keeps answering for them, exactly as if the
 //! player had fetched the file through `/proxy` itself.
 //!
 //! **An origin that will not range is refused here**, at construction,
 //! rather than read from. Serving one would mean downloading the whole
 //! archive to reach a member's bytes, which is the thing this design
-//! exists to prevent; the refusal has a sentence the player can show
+//! exists to prevent. The refusal has a sentence the player can show
 //! ([`ProxySourceError`]).
 //!
-//! Credentials travel one of two ways ([`Credentials`]): the caller's own
-//! `h=` request headers, relayed as `/proxy` relays them, or a header this
-//! server mints per request out of a grant only it holds -- which is what
-//! a credential that expires halfway through a film has to be. Whether
-//! either read is *kept* is a third thing and not a property of the
-//! header: the proxy cache refuses every credentialed request, and the one
-//! way past that is a [`Vouch`] from the source's own constructor that its
-//! URL identifies the bytes. Neither credential reaches a log --
-//! [`ByteSource::describe`] is the target's origin and nothing else.
+//! Credentials travel one of two ways ([`Credentials`]). One is the
+//! caller's own `h=` request headers, relayed as `/proxy` relays them. The
+//! other is a header this server mints per request out of a grant only it
+//! holds, which is what a credential that expires halfway through a film
+//! has to be. Whether either read is *kept* is a third thing and not a
+//! property of the header. The proxy cache refuses every credentialed
+//! request. The one way past that is a [`Vouch`] from the source's own
+//! constructor that its URL identifies the bytes. Neither credential
+//! reaches a log: [`ByteSource::describe`] is the target's origin and
+//! nothing else.
 
 use super::{ByteSource, ReadHint, SeekableReader, read_filling};
 use crate::routes::proxy::{
@@ -52,7 +53,7 @@ pub enum ProxySourceError {
     Fetch(String),
     /// The headers this read was to go out with could not be minted at
     /// all: the grant behind them ([`Credentials::Own`]) is not usable.
-    /// The error is the grant's own and carries its own typed reason --
+    /// The error is the grant's own and carries its own typed reason.
     /// `DriveError::in_read` is how a caller gets it back.
     Credentials(io::Error),
 }
@@ -84,7 +85,7 @@ impl From<FetchFailure> for ProxySourceError {
 
 /// **Where a source's request headers come from.**
 ///
-/// [`Self::Caller`] is a fixed `BTreeMap` -- it cannot hold a credential
+/// [`Self::Caller`] is a fixed `BTreeMap`. It cannot hold a credential
 /// that expires, since the map is fixed at construction and a film is
 /// longer than an access token. [`Self::Own`] is the other half the design
 /// asked for (`docs/design/translated-sources.md`: "a `ProxySource` with a
@@ -113,27 +114,28 @@ pub(crate) enum Credentials {
 /// bytes**, which is what decides whether a credentialed read may be kept.
 ///
 /// The proxy cache refuses every credentialed request because the question
-/// it is in a position to ask -- *"does this request carry a
-/// credential?"* -- is the wrong one: it is about the request, and a key
-/// needs to know about the bytes. The constructor of a source can ask the
-/// right one, *"does this URL identify the content I am about to get
-/// back?"*, and this type is where it answers. [`super::DriveSource`]
-/// answers [`Self::UrlIdentifiesBytes`] because `files/{id}?alt=media` is
-/// the same file for everyone entitled to it: the credential authorises
-/// the fetch and does not determine the result.
+/// it is in a position to ask is the wrong one. That question, *"does this
+/// request carry a credential?"*, is about the request, and a key needs to
+/// know about the bytes. The constructor of a source can ask the right
+/// one, *"does this URL identify the content I am about to get back?"*,
+/// and this type is where it answers. [`super::DriveSource`] answers
+/// [`Self::UrlIdentifiesBytes`] because `files/{id}?alt=media` is the same
+/// file for everyone entitled to it. The credential authorises the fetch
+/// and does not determine the result.
 ///
 /// **A value that has to be passed, not a trait method that could be
 /// defaulted**, so that a source added later gets caching only by saying
-/// so in as many words. Saying nothing is [`Self::Unvouched`] and the
-/// reads are never kept -- the safe direction, and the one a mistake falls
-/// in.
+/// so in as many words. Saying nothing is [`Self::Unvouched`], and the
+/// reads are never kept. That is the safe direction, and the one a mistake
+/// falls in.
 ///
 /// What a vouch costs is written where the key is minted
 /// ([`crate::proxy_cache::ProxyCache::entry_for_vouched_url`]), and it is
-/// not nothing: the key holds no credential, so anything that reaches this
+/// not nothing. The key holds no credential, so anything that reaches this
 /// server and names the same URL reads those bytes without being
-/// authorised for them. Bounded by this server being loopback-only, and
-/// knowingly accepted. Do not vouch for a URL without reading that.
+/// authorised for them. That is bounded by this server being
+/// loopback-only, and knowingly accepted. Do not vouch for a URL without
+/// reading that.
 #[derive(Clone, Copy)]
 pub(crate) enum Vouch {
     /// Nobody said anything. Read, never kept.
@@ -142,15 +144,15 @@ pub(crate) enum Vouch {
     /// unvouched today**, and this variant is the reason a later one has to
     /// think about it. Without it `Credentials::Own` would be
     /// self-vouching, which is precisely the accident this type exists to
-    /// prevent -- a source that mints a header would get a cache directory
+    /// prevent: a source that mints a header would get a cache directory
     /// by existing. It is constructed in the tests, where the claim that
     /// an unvouched grant is not cached is made.
     #[allow(dead_code)]
     Unvouched,
     /// The URL names the content, whoever is entitled to fetch it.
     /// `vouched_by` is the source that said so. It is deliberately **not**
-    /// in the key -- two vouchers for one URL mean one set of bytes, and
-    /// keying on the name would fragment the store for nothing -- and is
+    /// in the key: two vouchers for one URL mean one set of bytes, and
+    /// keying on the name would fragment the store for nothing. It is
     /// carried so that a fill under a credentialed read can say in a trace
     /// who licensed the keeping.
     UrlIdentifiesBytes { vouched_by: &'static str },
@@ -166,10 +168,10 @@ impl From<BTreeMap<String, String>> for Credentials {
 /// request.
 ///
 /// **Once per request is the whole point.** A token that expires halfway
-/// through a film cannot be a value captured at construction, and the
-/// renewal has to happen on this side of the FFI boundary -- a device
-/// whose frame budget is already tight must not go into Dart to find out
-/// what its next `Authorization` is.
+/// through a film cannot be a value captured at construction. The renewal
+/// has to happen on this side of the FFI boundary: a device whose frame
+/// budget is already tight must not go into Dart to find out what its next
+/// `Authorization` is.
 #[async_trait::async_trait]
 pub(crate) trait OwnGrant: Send + Sync {
     /// The headers one read goes out with, valid now. An implementation
@@ -189,41 +191,41 @@ pub struct ProxySource {
     entity: Arc<Entity>,
 }
 
-/// What issuing a ranged read of this entity takes. Behind an `Arc`
+/// What issuing a ranged read of this entity takes. It is behind an `Arc`
 /// because a reader outlives the call that opened it and has to be able to
-/// ask again -- which is what a seek on one is.
+/// ask again, which is what a seek on one is.
 #[derive(Clone)]
 struct Entity {
     /// The cache the reads go through. The entry is taken per read, as the
-    /// route takes one per request: an `Entry` is a key's directory and
-    /// the doors onto it, and asking again is what makes a source built
-    /// before a sweep read correctly after one.
+    /// route takes one per request. An `Entry` is a key's directory and the
+    /// doors onto it, and asking again is what makes a source built before
+    /// a sweep read correctly after one.
     cache: Arc<crate::proxy_cache::ProxyCache>,
-    /// This server's own listener, which is what tells a target on it from
-    /// an ordinary loopback origin -- an addon a viewer runs on the same
+    /// This server's own listener, which tells a target on it from an
+    /// ordinary loopback origin. An addon a viewer runs on the same
     /// machine is not us. See `ProxyCache::entry`.
     self_addr: SocketAddr,
     url: Url,
-    /// Where each read's request headers come from, and never logged
-    /// whichever it is. A credential among a caller's `h=` is what makes
-    /// [`Self::entry`] `None` -- so a *relayed* credentialed read is an
-    /// uncached one -- while a grant of this server's own is keyed by its
-    /// scope. See [`Credentials`].
+    /// Where each read's request headers come from. It is never logged,
+    /// whichever it is. A credential among a caller's `h=` makes
+    /// [`Self::entry`] `None`, so a *relayed* credentialed read is an
+    /// uncached one. A grant of this server's own is keyed by its scope.
+    /// See [`Credentials`].
     credentials: Credentials,
     /// The player's negotiation headers (`routes::proxy::FORWARDED_REQUEST_HEADERS`
     /// less the range ones), when this source stands in for a player's own
-    /// reads: they are part of the cache key and are sent to the origin,
-    /// so a source built for read-ahead must carry the ones the player
-    /// sent or it fetches into -- and out of -- a different entity than
-    /// the one the player reads. Empty for a source that is its own
-    /// caller (an archive's index, a download's filler).
+    /// reads. They are part of the cache key and are sent to the origin.
+    /// So a source built for read-ahead must carry the ones the player
+    /// sent, or it fetches into (and out of) a different entity than the
+    /// one the player reads. Empty for a source that is its own caller (an
+    /// archive's index, a download's filler).
     player_headers: HeaderMap,
     total: u64,
     content_type: String,
     /// The identity the entity is filed under
     /// (`routes::proxy::entity_identity`): what the source supplied, else
-    /// the origin's validator, else its length alone. Always one: every
-    /// entity is kept.
+    /// the origin's validator, else its length alone. There is always one:
+    /// every entity is kept.
     validator: String,
     /// What the source that opened this knows of the entity beyond any
     /// response ([`ProxySource::identified_as`]): a Drive file's checksum.
@@ -242,10 +244,10 @@ struct Entity {
 }
 
 impl ProxySource {
-    /// Probe `url` and open it as a source, or say why it cannot be one --
-    /// and **retire what the cache holds of any other generation of it**
-    /// ([`Self::retire_stale`]): the probe has just said what the entity is
-    /// now, and bytes of one it no longer is must not be served.
+    /// Probe `url` and open it as a source, or say why it cannot be one.
+    /// It also **retires what the cache holds of any other generation of
+    /// it** ([`Self::retire_stale`]). The probe has just said what the
+    /// entity is now, and bytes of one it no longer is must not be served.
     pub(crate) async fn open(
         cache: Arc<crate::proxy_cache::ProxyCache>,
         self_addr: SocketAddr,
@@ -257,25 +259,25 @@ impl ProxySource {
         Ok(source)
     }
 
-    /// The probe [`Self::open`] makes, without the retiring: for a caller
-    /// that learns more about the entity before it can say which generation
-    /// is current ([`super::DriveSource`], whose metadata names it), and
-    /// retires then.
+    /// The probe [`Self::open`] makes, without the retiring. It is for a
+    /// caller that learns more about the entity before it can say which
+    /// generation is current ([`super::DriveSource`], whose metadata names
+    /// it), and retires then.
     ///
     /// The probe is one `GET` of `bytes=0-0` through the proxy's own
-    /// request builder -- its redirect chain, its credential rule, its
-    /// `h=` overrides -- which is how this learns the entity's length, the
-    /// type the origin labels it with, the validator it identifies it by,
-    /// and the one thing that decides whether there is a source here at
+    /// request builder: its redirect chain, its credential rule, its `h=`
+    /// overrides. That is how this learns the entity's length, the type the
+    /// origin labels it with and the validator it identifies it by. It also
+    /// learns the one thing that decides whether there is a source here at
     /// all: whether a `Range` gets a `206`.
     ///
     /// It deliberately goes to the origin rather than to the cache. What
     /// is being established is what the origin will do *now* with a
     /// ranged request, and a store that never revalidates cannot answer
-    /// that; a byte off the disk would say only what it did once.
+    /// that. A byte off the disk would say only what it did once.
     ///
-    /// `pub(crate)` rather than `pub` because a `ProxyCache` is not part
-    /// of the embeddable API; `routes::archive` builds one of these per
+    /// `pub(crate)` rather than `pub`, because a `ProxyCache` is not part
+    /// of the embeddable API. `routes::archive` builds one of these per
     /// URL a `/{fmt}/create` names.
     pub(crate) async fn probe(
         cache: Arc<crate::proxy_cache::ProxyCache>,
@@ -302,9 +304,9 @@ impl ProxySource {
         )
         .await?;
         let RangeAnswer::Origin(origin) = answer else {
-            // Unreachable with no entry to look up in, and stated rather
-            // than assumed: a hit here would be an answer about the store
-            // where the question was about the origin.
+            // It is unreachable with no entry to look up in, and stated
+            // rather than assumed. A hit here would be an answer about the
+            // store where the question was about the origin.
             return Err(ProxySourceError::Fetch(
                 "the probe was answered from the cache".to_string(),
             ));
@@ -329,8 +331,8 @@ impl ProxySource {
         } = &credentials
         {
             // The one line that says a credentialed read is being kept and
-            // who licensed it. The origin and the voucher's name, which is
-            // all there is here that is not a secret.
+            // who licensed it. It carries the origin and the voucher's name,
+            // which is all there is here that is not a secret.
             tracing::debug!(
                 origin = %crate::routes::util::log_origin(url.as_str()),
                 vouched_by,
@@ -347,13 +349,13 @@ impl ProxySource {
         ))
     }
 
-    /// A source over an entity the origin has already described -- what
-    /// [`Self::open`] builds after its own probe, and what the `/proxy`
-    /// route builds from the answer it is relaying, so that the entity a
+    /// A source over an entity the origin has already described.
+    /// [`Self::open`] builds one after its own probe. The `/proxy` route
+    /// builds one from the answer it is relaying, so that the entity a
     /// player is reading can be read ahead of without a second probe
     /// (`crate::proxy_retention::ProxyRetention::note_source`).
-    /// `player_headers` are that player's, see [`Entity::player_headers`];
-    /// a source that is its own caller passes none.
+    /// `player_headers` are that player's (see [`Entity::player_headers`]).
+    /// A source that is its own caller passes none.
     pub(crate) fn from_probe(
         cache: Arc<crate::proxy_cache::ProxyCache>,
         self_addr: SocketAddr,
@@ -405,12 +407,12 @@ impl ProxySource {
     }
 
     /// This source, its entity identified by what its opener knows of it
-    /// beyond any response: `supplied` is filed as the entity's identity
-    /// (`routes::proxy::entity_identity`), every read files and compares
-    /// under it, and the cache's `Cache-Control` refusals are the
-    /// opener's to answer (`routes::proxy::SourceIdentity`). Only for a
-    /// source that vouched for its URL, which is the one kind that knows
-    /// anything past a response; anything else is returned unchanged.
+    /// beyond any response. `supplied` is filed as the entity's identity
+    /// (`routes::proxy::entity_identity`), and every read files and
+    /// compares under it. The cache's `Cache-Control` refusals are the
+    /// opener's to answer (`routes::proxy::SourceIdentity`). It is only for
+    /// a source that vouched for its URL, which is the one kind that knows
+    /// anything past a response. Anything else is returned unchanged.
     pub(crate) fn identified_as(self, supplied: String) -> Self {
         if !self.entity.vouched() {
             return self;
@@ -434,10 +436,10 @@ impl ProxySource {
 
     /// Retire every generation the cache holds under this source's key
     /// but the one it is reading now
-    /// ([`crate::proxy_cache::Entry::retire_others`]). What makes an
-    /// open the revalidation: a file changed at the origin is a different
-    /// entity -- a different identity, or a different length -- and what
-    /// was kept of the old one goes before anything reads it.
+    /// ([`crate::proxy_cache::Entry::retire_others`]). This is what makes
+    /// an open the revalidation. A file changed at the origin is a
+    /// different entity (a different identity, or a different length), and
+    /// what was kept of the old one goes before anything reads it.
     pub(crate) async fn retire_stale(&self) {
         let Some(entry) = self.entity.entry() else {
             return;
@@ -450,12 +452,12 @@ impl ProxySource {
         let _ = tokio::task::spawn_blocking(move || entry.retire_others(&current)).await;
     }
 
-    /// This source with every reader it opens **quiet**: a download's
+    /// This source with every reader it opens **quiet**. A download's
     /// filler reads an entity nobody is watching, and must neither claim
     /// the live entity nor leave a playhead
     /// (`crate::proxy_retention::ProxyRetention::reader_with`). Same URL,
-    /// same credentials, same cache key -- the bytes it lands are the ones
-    /// a player later reads.
+    /// same credentials, same cache key: the bytes it lands are the ones a
+    /// player later reads.
     pub(crate) fn for_filling(&self) -> Self {
         Self {
             entity: Arc::new(Entity {
@@ -466,11 +468,11 @@ impl ProxySource {
     }
 
     /// This source with every byte it fetches from the origin added to
-    /// `counter` -- what a cache hit serves is not counted, since it did
-    /// not cross the connection. A download's filler counts into the
-    /// downloads' total (`crate::proxy_downloads::ProxyDownloads`), which
-    /// is how a download of what is not a torrent lights the activity
-    /// light; nothing else counts.
+    /// `counter`. What a cache hit serves is not counted, since it did not
+    /// cross the connection. A download's filler counts into the downloads'
+    /// total (`crate::proxy_downloads::ProxyDownloads`), which is how a
+    /// download of what is not a torrent lights the activity light. Nothing
+    /// else counts.
     pub(crate) fn counting_into(&self, counter: Arc<std::sync::atomic::AtomicU64>) -> Self {
         Self {
             entity: Arc::new(Entity {
@@ -496,7 +498,7 @@ impl ProxySource {
 
 impl Credentials {
     /// The headers this read goes out with. A caller's `h=` is a value
-    /// and answers at once; a grant of our own is asked, which is where a
+    /// and answers at once. A grant of our own is asked, which is where a
     /// renewal happens.
     async fn headers(&self) -> io::Result<BTreeMap<String, String>> {
         match self {
@@ -533,23 +535,23 @@ impl Entity {
     ///
     /// For a caller's `h=`: **the very same entry `/proxy` would use for
     /// this URL and these headers**, because it is the same call. `None`
-    /// for a target the cache will not touch -- a credentialed relay, or
-    /// this server's own listener.
+    /// for a target the cache will not touch (a credentialed relay, or
+    /// this server's own listener).
     ///
     /// The player headers are empty, and that is the whole of the
-    /// difference from a request a player makes: `accept`,
+    /// difference from a request a player makes. `accept`,
     /// `accept-language` and `user-agent` are content negotiation and are
-    /// keyed on, so a source reading with none of them reads the entity a
+    /// keyed on. So a source reading with none of them reads the entity a
     /// request with none of them would. `Range` is not keyed on either
     /// way.
     ///
     /// For a grant of our own: an entry on the URL alone, and only when
     /// the source's constructor vouched that the URL identifies the bytes
     /// ([`Vouch`]). The minted header is not in that key and could not
-    /// usefully be -- it changes every hour, so a key with the token in it
-    /// is a key that is never hit twice, which is not a cache but an empty
-    /// directory tree with a sweep over it. An unvouched grant is `None`:
-    /// the reads go out, and nothing of them is kept.
+    /// usefully be. It changes every hour, so a key with the token in it is
+    /// never hit twice. That is not a cache but an empty directory tree
+    /// with a sweep over it. An unvouched grant is `None`: the reads go
+    /// out, and nothing of them is kept.
     fn entry(&self) -> Option<crate::proxy_cache::Entry> {
         let entry = match &self.credentials {
             Credentials::Caller(request_headers) => self.cache.entry(
@@ -585,12 +587,12 @@ impl Entity {
             HeaderValue::from_str(&format!("bytes={first}-{last}"))
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?,
         );
-        // Minted here, immediately before the request, and *not* held on
-        // the source: this is the instant a grant that is about to expire
-        // renews, so that no request carries a token the origin will
-        // refuse. A read already streaming carries the token it left with
-        // and is untouched -- a response Google has begun framing is not
-        // re-authorised mid-body.
+        // The header is minted here, immediately before the request, and
+        // *not* held on the source. This is the instant a grant that is
+        // about to expire renews, so that no request carries a token the
+        // origin will refuse. A read already streaming carries the token
+        // it left with and is untouched. A response Google has begun
+        // framing is not re-authorised mid-body.
         let request_headers = self.credentials.headers().await?;
         let answer = cache_assisted_range(
             self.entry(),
@@ -617,11 +619,11 @@ impl Entity {
                 } = *origin;
                 if status != StatusCode::PARTIAL_CONTENT {
                     // The origin ranged when it was probed and does not
-                    // now -- or the `If-Range` found the head stale and it
+                    // now. Or the `If-Range` found the head stale and it
                     // sent the whole of a new entity. Either way what
-                    // arrived is not the span that was asked for, and the
-                    // one thing this must not do is read from the top of
-                    // the file until it reaches the bytes it wanted.
+                    // arrived is not the span that was asked for. The one
+                    // thing this must not do is read from the top of the
+                    // file until it reaches the bytes it wanted.
                     return Err(io::Error::other(NotTheSpan(format!(
                         "{} answered {status} to a ranged read",
                         self.describe
@@ -642,11 +644,12 @@ impl Entity {
 }
 
 /// A ranged read the origin answered with something that is not the span
-/// asked for: it no longer ranges, or -- the usual case -- the `If-Range`
-/// found the entity changed and it sent the whole of a new one. Carried
-/// inside the read's `io::Error` so a caller that reads on (a download's
-/// filler) can tell it from an origin it could not reach
-/// ([`is_not_the_span`]) and open the source again, which says which.
+/// asked for. Either it no longer ranges, or (the usual case) the
+/// `If-Range` found the entity changed and it sent the whole of a new one.
+/// It is carried inside the read's `io::Error`, so a caller that reads on
+/// (a download's filler) can tell it from an origin it could not reach
+/// ([`is_not_the_span`]). That caller then opens the source again, which
+/// says which.
 #[derive(Debug)]
 pub(crate) struct NotTheSpan(String);
 
@@ -667,8 +670,8 @@ pub(crate) fn is_not_the_span(error: &io::Error) -> bool {
 }
 
 /// `body`, with the length of every chunk added to `counter` as it goes
-/// past -- what reached this server, whether or not the reader went on to
-/// want all of it.
+/// past. That counts what reached this server, whether or not the reader
+/// went on to want all of it.
 fn counted(body: ProxiedBody, counter: Arc<std::sync::atomic::AtomicU64>) -> ProxiedBody {
     use futures_util::StreamExt;
     Box::pin(body.inspect(move |chunk| {
@@ -685,18 +688,18 @@ impl ByteSource for ProxySource {
     }
 
     /// The entity being played is this source's own when it is a proxied
-    /// body filed under this source's key -- the key `/proxy` would mint
-    /// for the same URL and the same `h=` headers, which is the same call
-    /// ([`Self::entry`]).
+    /// body filed under this source's key. That is the key `/proxy` would
+    /// mint for the same URL and the same `h=` headers, which is the same
+    /// call ([`Self::entry`]).
     ///
-    /// Asked of the *key* and not of the entity directory under it: the
-    /// entity is one generation of the resource, and a container indexed
-    /// from a link is still the same container after the origin has
-    /// revalidated it (`Reading::proxy_under`). A target the cache will
-    /// not touch -- a credentialed relay, this server's own listener -- has
-    /// no key, and nothing the cell can name; it reads every time as
-    /// "not playing", which is correct, since nothing here retains a byte
-    /// of it either.
+    /// It is asked of the *key* and not of the entity directory under it.
+    /// The entity is one generation of the resource, and a container
+    /// indexed from a link is still the same container after the origin
+    /// has revalidated it (`Reading::proxy_under`). A target the cache will
+    /// not touch (a credentialed relay, this server's own listener) has no
+    /// key, and nothing the cell can name. It reads every time as "not
+    /// playing", which is correct, since nothing here retains a byte of it
+    /// either.
     fn is_live(&self, reading: &enginefs::retention::live::Reading) -> bool {
         self.entity
             .entry()
@@ -738,8 +741,8 @@ type Fetching =
 /// A handle on the entity: reads through the cache, and **seeks by ending
 /// the response it is reading and asking for one at the new offset**.
 ///
-/// That is what a seek on a proxied file already is -- a player dragging
-/// the scrubber through `/proxy` makes exactly this request -- and it is
+/// That is what a seek on a proxied file already is: a player dragging
+/// the scrubber through `/proxy` makes exactly this request. It is also
 /// the one thing an HTTP source can do about a seek. What it costs is one
 /// request, and what it saves is every consumer of a fetched file being
 /// able to treat it as a file (see [`super::SeekableReader`]).
@@ -747,8 +750,8 @@ struct ProxyReader {
     entity: Arc<Entity>,
     /// Where the next byte comes from.
     pos: u64,
-    /// The last byte of the span the current -- or next -- fetch covers,
-    /// or `None` for "to the end of the entity".
+    /// The last byte of the span the current (or next) fetch covers, or
+    /// `None` for "to the end of the entity".
     until: Option<u64>,
     state: ReaderState,
     /// Where `start_seek` said to go, until `poll_complete` takes it.
@@ -810,8 +813,8 @@ impl tokio::io::AsyncRead for ProxyReader {
                                 // The response this was reading is over.
                                 // A reader is a handle on the whole
                                 // entity and not a window onto the span
-                                // it was hinted, so a caller still
-                                // reading gets the next span -- one more
+                                // it was hinted. So a caller still
+                                // reading gets the next span: one more
                                 // request, to the end. A response that
                                 // ends while *that* is what is being read
                                 // is the entity's own end.
@@ -865,7 +868,7 @@ impl tokio::io::AsyncSeek for ProxyReader {
         {
             this.pos = target;
             // The response being read covers the old offset and nothing
-            // else; the next read asks for one that covers this one.
+            // else. The next read asks for one that covers this one.
             this.state = ReaderState::Idle;
             this.until = None;
         }
@@ -892,8 +895,8 @@ mod tests {
     const ORIGIN_ETAG: &str = "\"the-archive\"";
 
     /// A test origin on loopback that answers ranges, and counts what it
-    /// was asked for -- which is the whole of what the cache tests assert:
-    /// a read the store answered is a request the origin never saw.
+    /// was asked for. That count is the whole of what the cache tests
+    /// assert: a read the store answered is a request the origin never saw.
     struct Origin {
         addr: SocketAddr,
         requests: Arc<AtomicUsize>,
@@ -997,10 +1000,10 @@ mod tests {
         (dir, Arc::new(cache))
     }
 
-    /// An origin that names **no validator** -- no `ETag`, no
-    /// `Last-Modified` -- serving a body as long as `length` says at the
-    /// moment it is asked, its bytes depending on that length: replacing
-    /// the file is storing another length. Answers what it was asked
+    /// An origin that names **no validator** (no `ETag`, no
+    /// `Last-Modified`). It serves a body as long as `length` says at the
+    /// moment it is asked, its bytes depending on that length, so replacing
+    /// the file is storing another length. It answers what it was asked
     /// for, counted.
     fn bare_origin(length: Arc<AtomicUsize>) -> (Url, Arc<AtomicUsize>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("a loopback port");
@@ -1061,8 +1064,8 @@ mod tests {
 
     /// **An origin naming no validator is kept, under its length**, and
     /// a second read is the disk's. Then the file is replaced by one of
-    /// another length: the next open retires what was kept, and what is
-    /// read is the new file -- not the old one's chunk, which a lookup
+    /// another length. The next open retires what was kept, and what is
+    /// read is the new file. It is not the old one's chunk, which a lookup
     /// would otherwise answer whole.
     #[tokio::test]
     async fn an_origin_naming_no_validator_is_kept_and_a_new_length_retires_it() {
@@ -1114,12 +1117,13 @@ mod tests {
         }
     }
 
-    /// **What an opener supplies is the identity, when it can be filed**:
-    /// one too long for a directory name leaves the response's own in
-    /// place, since the reads -- which file by the same rule
-    /// (`routes::proxy::entity_identity`) -- would fall back to it too, and
-    /// a source naming one entity while its reads fill another would retire
-    /// its own bytes at every open. And only a vouched source takes one.
+    /// **What an opener supplies is the identity, when it can be filed.**
+    /// One too long for a directory name leaves the response's own in
+    /// place. The reads file by the same rule
+    /// (`routes::proxy::entity_identity`) and would fall back to it too,
+    /// and a source naming one entity while its reads fill another would
+    /// retire its own bytes at every open. And only a vouched source takes
+    /// one.
     #[tokio::test]
     async fn a_supplied_identity_is_taken_only_where_it_can_be_filed() {
         let chunk = crate::proxy_cache::CHUNK_BYTES as usize;
@@ -1160,8 +1164,8 @@ mod tests {
     }
 
     /// **A second read of a range is the disk's**, and the origin is asked
-    /// once -- which is the whole of why a member is read through the
-    /// proxy cache rather than beside it.
+    /// once. That is the whole of why a member is read through the proxy
+    /// cache rather than beside it.
     #[tokio::test]
     async fn a_range_read_twice_asks_the_origin_once() {
         let origin = Origin::start(true);
@@ -1176,8 +1180,8 @@ mod tests {
         let probed = origin.asked();
         assert_eq!(probed, 1);
 
-        // A whole chunk, so what is read fills one and is committed --
-        // a fill that never completes a chunk leaves nothing on disk, by
+        // A whole chunk, so what is read fills one and is committed. A
+        // fill that never completes a chunk leaves nothing on disk, by
         // design (`proxy_cache::Filler`).
         let want = crate::proxy_cache::CHUNK_BYTES as usize;
         let mut first = vec![0u8; want];
@@ -1212,7 +1216,7 @@ mod tests {
         cache.settled().await;
 
         // The key a `/proxy` request for this target mints, built the way
-        // the route builds it: a player's `Range` is not part of it, which
+        // the route builds it. A player's `Range` is not part of it, which
         // is what lets a source's ranged read and a player's find each
         // other's bytes.
         let mut player = HeaderMap::new();
@@ -1256,9 +1260,9 @@ mod tests {
     /// says so.
     ///
     /// The probe goes to the origin with no cache entry at all, so it
-    /// opens no reader and moves nothing -- a `/{fmt}/create` that only
-    /// asked whether an origin ranges has not made the viewer's stream --
-    /// and the first real read does.
+    /// opens no reader and moves nothing. A `/{fmt}/create` that only
+    /// asked whether an origin ranges has not made the viewer's stream.
+    /// The first real read does.
     #[tokio::test]
     async fn a_source_is_the_live_entity_once_it_has_read_and_not_before() {
         use enginefs::retention::live::{Live, LiveEntity};
@@ -1333,7 +1337,7 @@ mod tests {
     }
 
     /// **An origin that answers `200` to a ranged request is refused**, and
-    /// refused at construction: reading a member out of it would mean
+    /// refused at construction. Reading a member out of it would mean
     /// downloading the whole archive, which is what this design exists to
     /// stop.
     #[tokio::test]
@@ -1356,7 +1360,7 @@ mod tests {
     /// **An origin that stops ranging breaks the read**, rather than
     /// quietly reading the file from its first byte to reach the span that
     /// was asked for. It is the same refusal the construction probe makes,
-    /// at the only other moment it can be found out: a `200` to a narrowed
+    /// at the only other moment it can be found out. A `200` to a narrowed
     /// range is also what an origin answers when the `If-Range` finds the
     /// cached head stale, and neither is a tail.
     #[tokio::test]
@@ -1395,7 +1399,7 @@ mod tests {
         assert_eq!(origin.asked(), probed + 1, "one request for the span");
 
         // **The hint is advice, not a cap.** A caller that reads on past
-        // it gets the bytes after it -- one more request, for the rest --
+        // it gets the bytes after it (one more request, for the rest),
         // rather than a short read it would have to work out for itself.
         let mut past = [0u8; 8];
         reader.read_exact(&mut past).await.unwrap();
@@ -1404,7 +1408,7 @@ mod tests {
 
     /// **A seek on a reader is one new ranged request at the new offset**,
     /// which is exactly what a player dragging the scrubber through
-    /// `/proxy` already makes. The response being read is ended; nothing
+    /// `/proxy` already makes. The response being read is ended. Nothing
     /// is read through from the old offset to the new one.
     #[tokio::test]
     async fn a_seek_ends_the_response_and_asks_for_the_new_offset() {

@@ -1,17 +1,18 @@
 //! **A complete entry of the proxy cache as a [`ByteSource`]**: a finished
 //! download, read off `.proxy` with no origin behind it.
 //!
-//! What lets a pinned link or Drive file play on a device with no network
-//! (`docs/design/media-pipeline.md` §2.3). A [`super::ProxySource`] probes
-//! its origin before it is a source at all, which is exactly what cannot
-//! happen offline; a download that is whole on the disk needs no probe,
-//! and every read of it is a lookup of the entry ([`Entry::look_up`]) and
-//! its chunks ([`Cached::body`]) -- the same lookup `/proxy` answers a hit
-//! with, and `/downloads/{key}/stream` a finished download.
+//! This is what lets a pinned link or Drive file play on a device with no
+//! network (`docs/design/media-pipeline.md` §2.3). A [`super::ProxySource`]
+//! probes its origin before it is a source at all, which is exactly what
+//! cannot happen offline. A download that is whole on the disk needs no
+//! probe. Every read of it is a lookup of the entry ([`Entry::look_up`])
+//! and its chunks ([`Cached::body`]). That is the same lookup `/proxy`
+//! answers a hit with, and `/downloads/{key}/stream` a finished download.
 //!
-//! A read that finds a chunk gone fails rather than fetching it: there is
-//! nothing here to fetch it with. A pin's chunks are not reclaimed, so
-//! that is a download unpinned under its reader.
+//! A read that finds a chunk gone fails rather than fetching it, because
+//! there is nothing here to fetch it with. A pin's chunks are not
+//! reclaimed, so a gone chunk means a download was unpinned under its
+//! reader.
 //!
 //! [`Cached::body`]: crate::proxy_cache::Cached::body
 
@@ -36,7 +37,7 @@ pub(crate) struct HeldSource {
 
 impl HeldSource {
     /// `entry` as a source, when every byte of its one entity is on the
-    /// disk; `None` otherwise -- then the origin has to be asked.
+    /// disk. `None` otherwise, and then the origin has to be asked.
     pub(crate) async fn complete(entry: Entry) -> Option<Self> {
         let asked = entry.clone().quiet();
         let facts = tokio::task::spawn_blocking(move || asked.held_facts())

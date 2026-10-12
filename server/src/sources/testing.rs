@@ -1,10 +1,10 @@
 //! Sources a test can hold in its hand: bytes in memory, and a wrapper
 //! that counts what was asked of the source underneath.
 //!
-//! **Test builds only** (`#[cfg(test)]` in `sources/mod.rs`). What
-//! [`CountingSource`] is for is the claim the whole design rests on --
-//! that reading a container's index reads the index and not the film --
-//! and every translator's unit tests make it through this one definition.
+//! **Test builds only** (`#[cfg(test)]` in `sources/mod.rs`).
+//! [`CountingSource`] exists for the claim the whole design rests on:
+//! reading a container's index reads the index and not the film. Every
+//! translator's unit tests make that claim through this one definition.
 
 use super::{ByteSource, ReadHint, SeekableReader};
 use std::io;
@@ -53,11 +53,11 @@ impl ByteSource for MemorySource {
     }
 
     async fn open(&self, offset: u64, _hint: ReadHint) -> io::Result<Box<dyn SeekableReader>> {
-        // The whole source, positioned at `offset`: a reader is a handle
-        // on the file and not a window onto a span of it, and the hint is
+        // The whole source, positioned at `offset`. A reader is a handle on
+        // the file and not a window onto a span of it, and the hint is
         // advisory (see [`ReadHint`]). What a reader here can be seen to
-        // do -- read on past the hint, seek backwards -- is what a
-        // torrent's file handle does.
+        // do (read on past the hint, seek backwards) is what a torrent's
+        // file handle does.
         let mut reader = io::Cursor::new(self.bytes.clone());
         reader.set_position(offset.min(self.bytes.len() as u64));
         Ok(Box::new(reader))
@@ -76,9 +76,9 @@ pub struct Counts {
     opens: AtomicU64,
     opened_bytes: AtomicU64,
     /// Every `(offset, len)` a [`ByteSource::read_at`] actually returned,
-    /// in order. A total is not enough for the claim these exist for: a
+    /// in order. A total is not enough for the claim these exist for. A
     /// parser that read a film in small pieces would pass a byte count and
-    /// fail this -- see [`Counts::read_any_of`].
+    /// fail this (see [`Counts::read_any_of`]).
     ranges: std::sync::Mutex<Vec<(u64, u64)>>,
 }
 
@@ -233,9 +233,9 @@ mod tests {
 
     /// A reader is a handle on the file: it starts where it was opened,
     /// reads on past its hint, and **seeks**, backwards included. The hint
-    /// is advice about how much is coming, not a cap -- a cap here would
-    /// be a second, weaker copy of a bound the fetcher already keeps, and
-    /// one no other consumer of a fetched file is held to.
+    /// is advice about how much is coming, not a cap. A cap here would be a
+    /// second, weaker copy of a bound the fetcher already keeps, and one no
+    /// other consumer of a fetched file is held to.
     #[tokio::test]
     async fn an_opened_reader_is_a_handle_and_not_a_window() {
         let source = MemorySource::new("archive.zip", (0..100u8).collect::<Vec<_>>());
