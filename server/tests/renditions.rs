@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 
 use stream_server::rendition::{NotServed, RenditionTuning};
 use stream_server::{
-    AudioPlan, CastToken, LocalFile, MediaId, MediaSpec, RenditionReadiness, RenditionSpec,
-    RenditionState, ServerConfig, TrackKind, VideoPlan,
+    AudioPlan, CastToken, LocalFile, MediaId, MediaSpec, PictureTarget, RenditionReadiness,
+    RenditionSpec, RenditionState, ServerConfig, TrackKind, VideoPlan,
 };
 
 #[path = "support/torrent_fixtures.rs"]
@@ -34,6 +34,7 @@ use torrent_fixtures::offline_config;
 
 #[path = "support/test_producer.rs"]
 mod test_producer;
+use test_producer::fake_converter::{FakeOptions, encoded_of};
 use test_producer::{ASC, Gate, IndexKnob, Knobs, PPS, SPS, TestProducer, frame_of};
 
 /// A bound on a mistake, never a wait a correct run spends.
@@ -1621,6 +1622,9 @@ fn an_overflowing_segment_spills_into_the_next_slot() -> anyhow::Result<()> {
     assert_eq!(probe.exact, Some(true));
     assert_eq!(probe.spilled, vec![10]);
     assert!(probe.truncated.is_empty());
+    let numbers = serde_json::to_value(fixture.handle.cast_numbers(&token))?;
+    assert_eq!(numbers["rendition"]["spilled"], 1, "the panel is told");
+    assert_eq!(numbers["rendition"]["truncated"], 0);
     let (video, audio) = frames_in(&file, &header, &knobs);
     let all_video: Vec<i64> = knobs
         .video_frames()
@@ -1683,6 +1687,9 @@ fn an_overflow_into_a_decided_slot_is_truncated() -> anyhow::Result<()> {
     let probe = fixture.probe(&token);
     assert_eq!(probe.truncated, vec![10]);
     assert!(probe.spilled.is_empty());
+    let numbers = serde_json::to_value(fixture.handle.cast_numbers(&token))?;
+    assert_eq!(numbers["rendition"]["truncated"], 1, "the panel is told");
+    assert_eq!(numbers["rendition"]["spilled"], 0);
     let segment = parse_segment(fragment_of(&ten));
     let (want_video, _) = expected(&knobs, 10);
     let kept = segment.video_pts(&knobs);
@@ -2886,5 +2893,367 @@ fn an_unpublished_token_has_no_cast_numbers() -> anyhow::Result<()> {
     assert!(fixture.handle.cast_numbers(&token).is_some());
     assert!(fixture.handle.unpublish(&token));
     assert_eq!(fixture.handle.cast_numbers(&token), None);
+    Ok(())
+}
+
+// --- A converted picture ---------------------------------------------------------
+
+/// The bitrate the converted renditions here are asked for.
+const CONVERT_BPS: u32 = 2_000_000;
+
+/// A 30 s film whose picture is converted by the fake converter, with open
+/// GOPs (three leading pictures each) and a decoder that reorders them.
+/// Its keys are 0.48 s apart, so a converted rendition, cut two seconds
+/// apart at least (`layout::CONVERTED_MIN_SEGMENT_US`), is cut at every
+/// fifth: [`converted_cut`].
+fn converting() -> Knobs {
+    Knobs {
+        length: Duration::from_secs(30),
+        convert: Some(PictureTarget::H264High),
+        open_gop: 3,
+        converter: FakeOptions {
+            reorder: 4,
+            ..FakeOptions::default()
+        },
+        ..Knobs::default()
+    }
+}
+
+/// Where segment `n` of [`converting`]'s rendition begins, mirrored: every
+/// 2.4 s.
+fn converted_cut(n: u64) -> i64 {
+    n as i64 * 2_400_000
+}
+
+fn converted_spec(duration_ms: u64) -> RenditionSpec {
+    RenditionSpec {
+        video: VideoPlan::Convert {
+            target: PictureTarget::H264High,
+            bitrate: CONVERT_BPS,
+        },
+        ..spec(duration_ms, T_MS, 0)
+    }
+}
+
+impl Fixture {
+    fn publish_converted(&self, duration_ms: u64) -> anyhow::Result<CastToken> {
+        self.handle
+            .publish_rendition(&self.id, converted_spec(duration_ms), None)
+    }
+}
+
+/// The pictures in a converted slot, as their bytes name them: when each
+/// is shown (in ms), the segment whose encoder made it, and whether it is
+/// a sync picture.
+fn converted_in(slot: &[u8]) -> Vec<(i64, u64, bool)> {
+    let segment = parse_segment(fragment_of(slot));
+    let Some(traf) = segment.track(1) else {
+        return Vec::new();
+    };
+    traf.data
+        .iter()
+        .map(|data| encoded_of(&data[4..]))
+        .collect()
+}
+
+/// A converted slot's length, as the layout must give it: the base, the
+/// chunks' headers, the picture's bitrate with a 12% margin and the
+/// sound's over its span, a quarter second of the bitrate for its opening
+/// sync picture, and 1336 bytes of `trun` entries a second.
+fn rate_slot(lasts_us: i64, video_bps: u64, sound_bps: u64) -> u64 {
+    let lasts = lasts_us as u64;
+    8 * 1024
+        + chunk_room(lasts_us)
+        + (lasts * (video_bps * 112 / 100 + sound_bps)).div_ceil(8_000_000)
+        + video_bps / 8 * 250 / 1000
+        + lasts * 1336 / 1_000_000
+}
+
+/// **A converted slot is the same bytes whichever run made it.** Each
+/// segment's pictures go to an encoder of their own: those shown from its
+/// cut to the next, an open GOP's leading pictures included, the first a
+/// sync picture. So the file read whole is the same, from slot 6 on, as a
+/// second publication's first asked at slot 6. That run starts at a sync
+/// picture before the cut, cannot decode its leading pictures, and drops
+/// what is shown before the cut.
+#[test]
+fn a_converted_slot_is_the_same_bytes_from_any_run() -> anyhow::Result<()> {
+    let knobs = converting();
+    let fixture = Fixture::quick(knobs.clone())?;
+    let token = fixture.publish_converted(30_000)?;
+    let file = fixture.file(&token);
+    let header = Header::of(&file, file.len() as u64);
+    assert_eq!(header.slots.len(), 13);
+    let mut shown = Vec::new();
+    for n in 0..13u64 {
+        let pictures = converted_in(header.slot(&file, n as usize));
+        assert!(pictures[0].2, "slot {n} opens with a sync picture");
+        assert!(
+            pictures[1..].iter().all(|(_, _, key)| !key),
+            "slot {n}: one sync picture"
+        );
+        let to = if n == 12 {
+            i64::MAX
+        } else {
+            converted_cut(n + 1)
+        };
+        for (ms, segment, _) in &pictures {
+            assert_eq!(
+                *segment, n,
+                "slot {n} holds segment {n}'s encoder's pictures"
+            );
+            assert!(
+                (converted_cut(n)..to).contains(&(ms * 1000)),
+                "slot {n}: a picture shown at {ms} ms"
+            );
+        }
+        shown.extend(pictures.iter().map(|(ms, _, _)| ms * 1000));
+    }
+    let every: Vec<i64> = knobs
+        .video_frames()
+        .into_iter()
+        .map(|(pts, _)| pts)
+        .collect();
+    assert_eq!(shown, every, "every picture once, in order");
+
+    let other = fixture.publish_converted(30_000)?;
+    assert_eq!(fixture.header(&other).total, header.total);
+    let at = header.slots[6].0;
+    let tail = fixture.range(&other, at, header.total - 1);
+    assert!(tail == file[at as usize..], "the same bytes from slot 6 on");
+    let runs = fixture.producer.runs();
+    let started = runs
+        .iter()
+        .find(|run| run.from == asked_from(converted_cut(6)))
+        .expect("a run started at slot 6");
+    assert_eq!(started.converter.encoders.lock().unwrap()[0], 6);
+    assert!(
+        !started.converter.undecodable.lock().unwrap().is_empty(),
+        "it began at a sync picture with leading pictures"
+    );
+    let dropped = started.converter.dropped.lock().unwrap().clone();
+    assert!(!dropped.is_empty() && dropped.iter().all(|pts| *pts < converted_cut(6)));
+    Ok(())
+}
+
+/// **The lookahead blocks a converting producer too.** A converter holds
+/// pictures back, and a segment's last ones come out only once the next
+/// segment's first is in. The run still makes every slot to its
+/// lookahead and then stops reading.
+#[test]
+fn the_lookahead_blocks_a_converting_producer() -> anyhow::Result<()> {
+    let fixture = Fixture::quick(converting())?;
+    let token = fixture.publish_converted(30_000)?;
+    fixture.init(&token);
+    let run = fixture.producer.runs()[0].clone();
+    let held = |ring: &[u64], next: u64| {
+        let probe = fixture.probe(&token);
+        probe.ring == ring && probe.in_production == Some(next) && run.probe.is_blocked()
+    };
+    until("the producer blocks with slots 0 to 2 made", || {
+        held(&[0, 1, 2], 3)
+    });
+    let furthest = |run: &test_producer::RunRecord| {
+        run.emitted().iter().map(|(_, pts)| *pts).max().unwrap_or(0)
+    };
+    assert!(
+        furthest(&run) < converted_cut(5),
+        "the producer ran on: {}",
+        furthest(&run)
+    );
+    fixture.segment(&token, 1);
+    until(
+        "one more slot is made, and the producer blocks again",
+        || held(&[0, 1, 2, 3], 4),
+    );
+    assert!(furthest(&run) < converted_cut(6));
+    assert!(!run.stopped());
+    Ok(())
+}
+
+/// **A converted slot is sized by its rates**, mirrored or estimated: the
+/// picture's bitrate and a copy's most for the sound. Mirrored, each slot
+/// is labelled at its cut. Estimated, on a two-second grid though the spec
+/// asks for one, each is labelled a tenth of a second after its cut, not a
+/// GOP. A run started on an estimated layout asks its producer for ten
+/// seconds more before the cut.
+#[test]
+fn a_converted_slot_is_sized_by_its_rates() -> anyhow::Result<()> {
+    let rate = |lasts_us| rate_slot(lasts_us, u64::from(CONVERT_BPS), 400_000);
+    let fixture = Fixture::quick(converting())?;
+    let token = fixture.publish_converted(30_000)?;
+    let header = fixture.header(&token);
+    assert_eq!(fixture.probe(&token).exact, Some(true));
+    for (n, (at, size, duration)) in header.slots.iter().enumerate() {
+        let n = n as u64;
+        let end = if n == 12 {
+            30_000_000
+        } else {
+            converted_cut(n + 1)
+        };
+        let last = n == 12;
+        assert_eq!(
+            *size,
+            lengthened(*at, rate(end - converted_cut(n)), last),
+            "slot {n}'s size"
+        );
+        let label = |n: u64| {
+            if n == 0 {
+                0
+            } else {
+                converted_cut(n) - 500_000
+            }
+        };
+        let to = if last { end } else { label(n + 1) };
+        assert_eq!(
+            i64::from(*duration),
+            (to - label(n)) * 9 / 100,
+            "slot {n}'s duration"
+        );
+    }
+
+    let fixture = Fixture::quick(Knobs {
+        index: None,
+        ..converting()
+    })?;
+    let token = fixture.publish_converted(30_000)?;
+    let header = fixture.header(&token);
+    assert_eq!(fixture.probe(&token).exact, Some(false));
+    assert_eq!(header.slots.len(), 15, "two seconds a slot");
+    for (n, (at, size, duration)) in header.slots.iter().enumerate() {
+        let last = n == 14;
+        assert_eq!(*size, lengthened(*at, rate(2_000_000), last), "slot {n}");
+        let expected = match n {
+            0 => 144_000,
+            14 => 216_000,
+            _ => 180_000,
+        };
+        assert_eq!(*duration, expected, "slot {n}: labelled 0.1 s late, less D");
+    }
+    fixture.range(&token, header.slots[10].0, header.slots[10].0 + 99);
+    let runs = fixture.producer.runs();
+    assert_eq!(
+        runs.last().expect("a run at slot 10").from,
+        Duration::from_secs(20 - 2 - 10),
+        "the cut less SEEK_BACK and the longest GOP"
+    );
+    Ok(())
+}
+
+/// **A converting run that comes back from a seek configured differently
+/// fails the rendition**, with the sentence a format change gets.
+#[test]
+fn a_converted_run_configured_differently_fails_the_rendition() -> anyhow::Result<()> {
+    let fixture = Fixture::quick(Knobs {
+        other_format_on_run: Some(1),
+        ..converting()
+    })?;
+    let token = fixture.publish_converted(30_000)?;
+    let header = fixture.header(&token);
+    fixture.segment(&token, 0);
+    let response = fixture.get(&token, Some(format!("bytes={}-", header.slots[10].0)));
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let RenditionState::Failed { sentence } = fixture.handle.rendition_state(&token) else {
+        panic!("the rendition did not fail");
+    };
+    assert_eq!(
+        sentence,
+        "The conversion came back from a seek in a different format, which the television \
+         cannot follow. Cast the film again."
+    );
+    Ok(())
+}
+
+/// **A converter slower than real time fails the rendition**, with a
+/// sentence that names the work.
+#[test]
+fn a_converter_slower_than_real_time_fails_the_rendition() -> anyhow::Result<()> {
+    let fixture = Fixture::start(
+        Knobs {
+            converter: FakeOptions {
+                // 80 ms for each 40 ms picture: half real time.
+                slow: Some(Duration::from_millis(80)),
+                ..converting().converter
+            },
+            ..converting()
+        },
+        RenditionTuning {
+            speed_window: Duration::from_secs(1),
+            ..tuning()
+        },
+    )?;
+    let token = fixture.publish_converted(30_000)?;
+    fixture.header(&token);
+    let mut sentence = String::new();
+    until("the rendition fails", || {
+        match fixture.handle.rendition_state(&token) {
+            RenditionState::Failed { sentence: said } => {
+                sentence = said;
+                true
+            }
+            _ => false,
+        }
+    });
+    let prefix = "This phone cannot convert this film's picture fast enough for the television: \
+                  it made ";
+    let rest = sentence
+        .strip_prefix(prefix)
+        .unwrap_or_else(|| panic!("{sentence}"));
+    let (made, took) = rest
+        .strip_suffix('.')
+        .and_then(|rest| rest.split_once(" seconds of film in "))
+        .unwrap_or_else(|| panic!("{sentence}"));
+    let seconds = |said: &str| said.parse::<f64>().unwrap_or_else(|_| panic!("{sentence}"));
+    assert!(seconds(made) < seconds(took), "{sentence}");
+    Ok(())
+}
+
+/// **A converting producer that sends sound before the picture's format
+/// fails the rendition.** The formats are taken at the first sample, and a
+/// file with no picture would be frozen.
+#[test]
+fn sound_before_the_converted_pictures_format_fails() -> anyhow::Result<()> {
+    let fixture = Fixture::quick(Knobs {
+        unheld_sound: true,
+        ..converting()
+    })?;
+    let token = fixture.publish_converted(30_000)?;
+    let header = fixture.handle.rendition_init(&token);
+    assert!(matches!(header, Err(NotServed::Failed(_))), "{header:?}");
+    let RenditionState::Failed { sentence } = fixture.handle.rendition_state(&token) else {
+        panic!("the rendition did not fail");
+    };
+    assert_eq!(
+        sentence,
+        "The conversion sent sound before it described the picture."
+    );
+    Ok(())
+}
+
+/// **The panel is told what a converted rendition makes**: the plan as
+/// the app asked for it, each live run's busy time and the film it made
+/// in it, and how many slots spilled or were cut short.
+#[test]
+fn the_cast_numbers_say_a_converted_runs_speed() -> anyhow::Result<()> {
+    let fixture = Fixture::quick(converting())?;
+    let token = fixture.publish_converted(30_000)?;
+    fixture.header(&token);
+    let numbers =
+        || serde_json::to_value(fixture.handle.cast_numbers(&token)).expect("numbers serialize");
+    until("the run's speed is read", || {
+        numbers()["rendition"]["runs"][0]["mediaMs"]
+            .as_u64()
+            .is_some_and(|ms| ms > 0)
+    });
+    let json = numbers();
+    let rendition = &json["rendition"];
+    assert_eq!(
+        rendition["video"],
+        serde_json::json!({"convert": {"target": "h264High", "bitrate": 2_000_000}})
+    );
+    assert_eq!(rendition["videoOut"]["codec"], "h264");
+    assert!(rendition["runs"][0]["busyMs"].is_u64());
+    assert_eq!(rendition["spilled"], 0);
+    assert_eq!(rendition["truncated"], 0);
     Ok(())
 }

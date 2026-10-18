@@ -267,8 +267,6 @@ pub struct ConvertedPicture<C: PictureConverter> {
     converter: C,
     segments: Segments,
     target: PictureTarget,
-    /// The video's format, from the first encoder's configuration.
-    format: Option<TrackFormat>,
     /// The first encoder's configuration and size, which every later one must repeat.
     csd: Option<(u32, u32, Bytes)>,
     open: Option<Open>,
@@ -285,7 +283,6 @@ impl<C: PictureConverter> ConvertedPicture<C> {
             converter,
             segments,
             target,
-            format: None,
             csd: None,
             open: None,
             done: None,
@@ -362,7 +359,6 @@ impl<C: PictureConverter> ConvertedPicture<C> {
                         None => {
                             let format = self.format_of(width, height, &csd)?;
                             self.csd = Some((width, height, csd));
-                            self.format = Some(format.clone());
                             out.push(Converted::Format(format));
                         }
                     }
@@ -501,4 +497,448 @@ impl<C: PictureConverter> ConvertedPicture<C> {
 /// Bytes as hex, for a detail in a log.
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rendition::layout::{Plan, Sizing};
+    use std::collections::{BTreeSet, VecDeque};
+
+    const SEC: i64 = 1_000_000;
+
+    fn segments(first: u64) -> Segments {
+        Segments::new(vec![i64::MIN, 2 * SEC, 4 * SEC].into(), first)
+    }
+
+    /// **A picture is its segment's by when it is shown**: the last
+    /// segment whose cut is at or before it. Before the run's first
+    /// segment it is dropped.
+    #[test]
+    fn a_picture_is_routed_by_when_it_is_shown() {
+        let segments = segments(1);
+        assert_eq!(segments.count(), 3);
+        assert_eq!(segments.first(), 1);
+        assert_eq!(segments.of(-5), 0);
+        assert_eq!(segments.of(2 * SEC - 1), 0);
+        assert_eq!(segments.of(2 * SEC), 1);
+        assert_eq!(segments.of(9 * SEC), 2);
+        assert_eq!(segments.start_us(0), i64::MIN);
+        assert_eq!(segments.start_us(2), 4 * SEC);
+        assert_eq!(segments.start_us(3), i64::MAX);
+        assert_eq!(segments.route(2 * SEC - 1), Route::Drop);
+        assert_eq!(segments.route(2 * SEC), Route::Encode { segment: 1 });
+        assert_eq!(segments.route(4 * SEC), Route::Encode { segment: 2 });
+        assert_eq!(
+            Segments::new(vec![i64::MIN, SEC].into(), 0).route(-SEC),
+            Route::Encode { segment: 0 },
+            "nothing is dropped from a run that starts at the film's start"
+        );
+    }
+
+    fn index() -> Vec<IndexEntry> {
+        // A key every 0.48 s over 30 s, 1000 bytes a second.
+        (0..63)
+            .map(|k| IndexEntry {
+                pts_us: k * 480_000,
+                pos: k as u64 * 480,
+            })
+            .collect()
+    }
+
+    /// **A run's segments are the layout's.** A later run's are the frozen
+    /// layout's, whatever index it is handed. The run that fixes the layout
+    /// cuts them from the index it reports by the layout's own function,
+    /// mirrored or estimated, copied or converted.
+    #[test]
+    fn a_runs_segments_are_cut_as_the_layout_is() {
+        let frozen = segments(2);
+        let plan = SegmentPlan::of_run(
+            Some(frozen.clone()),
+            30_000,
+            30 * SEC,
+            6 * SEC,
+            Sizing::Source,
+        );
+        assert_eq!(plan.segments(Some(&index())), frozen);
+        assert_eq!(plan.segments(None), frozen);
+        let rate = Sizing::Rate {
+            video_bps: 8_000_000,
+            sound_bps: 0,
+        };
+        for sizing in [Sizing::Source, rate] {
+            let plan = SegmentPlan::of_run(None, 30_000, 30 * SEC, 6 * SEC, sizing);
+            for reported in [Some(index()), None] {
+                let cut = Plan::new(reported.as_deref(), 30_000, 30 * SEC, 6 * SEC, sizing).cuts;
+                let segments = plan.segments(reported.as_deref());
+                assert_eq!(&*segments.cuts, cut.as_slice(), "{sizing:?}");
+                assert_eq!(segments.first(), 0);
+            }
+        }
+        let film = SegmentPlan::for_film(30_000, 30_000, 6_000).segments(Some(&index()));
+        let converted = Plan::new(Some(&index()), 30_000, 30 * SEC, 6 * SEC, rate).cuts;
+        assert_eq!(
+            &*film.cuts,
+            converted.as_slice(),
+            "a film's plan is a converted one"
+        );
+    }
+
+    /// A converter that answers each call with the next batch of events.
+    struct Script(VecDeque<Vec<PictureEvent>>);
+
+    impl PictureConverter for Script {
+        fn push(&mut self, _: SourcePicture, _: &Segments) -> Result<Vec<PictureEvent>, String> {
+            Ok(self.0.pop_front().unwrap_or_default())
+        }
+
+        fn finish(&mut self, _: &Segments) -> Result<Vec<PictureEvent>, String> {
+            Ok(self.0.drain(..).flatten().collect())
+        }
+    }
+
+    const SPS: &[u8] = &[
+        0, 0, 0, 1, 0x67, 0x64, 0x00, 0x0d, 0xac, 0xd9, 0x41, 0x41, 0xfb, 0x01, 0x10, 0x00, 0x00,
+        0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x03, 0x20, 0xf1, 0x42, 0x99, 0x60,
+    ];
+    const PPS: &[u8] = &[0, 0, 0, 1, 0x68, 0xeb, 0xe3, 0xcb, 0x22, 0xc0];
+    const SEI: &[u8] = &[0, 0, 1, 0x06, 0x05, 0x01, 0x80];
+
+    fn csd() -> Bytes {
+        Bytes::from([SPS, SEI, PPS].concat())
+    }
+
+    fn config(segment: u64) -> PictureEvent {
+        PictureEvent::Config {
+            segment,
+            width: 320,
+            height: 240,
+            csd: csd(),
+        }
+    }
+
+    fn picture(segment: u64, pts_us: i64, key: bool) -> PictureEvent {
+        PictureEvent::Picture {
+            segment,
+            pts_us,
+            key,
+            data: Bytes::from_static(&[0, 0, 0, 1, 0x65]),
+        }
+    }
+
+    fn done(segment: u64, pictures: u32) -> PictureEvent {
+        PictureEvent::SegmentDone {
+            segment,
+            pictures_in: pictures,
+            pictures_out: pictures,
+        }
+    }
+
+    fn source(pts_us: i64) -> SourcePicture {
+        SourcePicture {
+            pts_us,
+            key: true,
+            data: Bytes::new(),
+        }
+    }
+
+    /// Drive `events` (one batch per push, the last from `finish`) for a
+    /// run from segment `first`, and answer what came out or the first
+    /// error.
+    fn drive(
+        first: u64,
+        target: PictureTarget,
+        events: Vec<Vec<PictureEvent>>,
+    ) -> Result<Vec<Converted>, String> {
+        let pushes = events.len().saturating_sub(1);
+        let mut driver = ConvertedPicture::new(Script(events.into()), segments(first), target);
+        let mut out = Vec::new();
+        for at in 0..pushes {
+            out.extend(driver.push(source(at as i64))?);
+        }
+        out.extend(driver.finish()?);
+        Ok(out)
+    }
+
+    /// **The first encoder's configuration is the video's format**, said
+    /// once: for H.264 its SPS and PPS apart, Annex-B, and anything else
+    /// in it left out; for HEVC all of it. Each segment's pictures follow
+    /// as samples, and an encoder given nothing may end unconfigured.
+    #[test]
+    fn the_first_configuration_is_the_format_said_once() {
+        let out = drive(
+            1,
+            PictureTarget::H264High,
+            vec![
+                vec![
+                    config(1),
+                    picture(1, 2 * SEC, true),
+                    picture(1, 3 * SEC, false),
+                ],
+                vec![done(1, 2), config(2), picture(2, 4 * SEC, true)],
+                vec![done(2, 1)],
+            ],
+        )
+        .expect("a clean run");
+        let Converted::Format(TrackFormat::H264 {
+            width,
+            height,
+            csd0,
+            csd1,
+        }) = &out[0]
+        else {
+            panic!("the format first: {out:?}");
+        };
+        assert_eq!((*width, *height), (320, 240));
+        assert_eq!(&csd0[..], SPS);
+        assert_eq!(&csd1[..], PPS);
+        let rest: Vec<(i64, bool)> = out[1..]
+            .iter()
+            .map(|converted| match converted {
+                Converted::Sample(sample) => {
+                    assert_eq!(sample.track, TrackKind::Video);
+                    (sample.pts_us, sample.key)
+                }
+                Converted::Format(_) => panic!("the format twice"),
+            })
+            .collect();
+        assert_eq!(
+            rest,
+            vec![(2 * SEC, true), (3 * SEC, false), (4 * SEC, true)]
+        );
+
+        let out = drive(
+            0,
+            PictureTarget::HevcMain10,
+            vec![
+                vec![done(0, 0), config(1), picture(1, 2 * SEC, true)],
+                vec![done(1, 1)],
+            ],
+        )
+        .expect("an encoder given nothing ends unconfigured");
+        assert!(matches!(
+            &out[0],
+            Converted::Format(TrackFormat::Hevc { csd0, .. }) if *csd0 == csd()
+        ));
+    }
+
+    /// **Every check the bytes depend on fails the run**, with a detail.
+    /// Each case breaks one rule and is a clean run otherwise, so it is
+    /// that rule's check that refuses it.
+    #[test]
+    fn the_driver_refuses_what_would_change_the_bytes() {
+        let other = |segment, width, csd: &[u8]| PictureEvent::Config {
+            segment,
+            width,
+            height: 240,
+            csd: Bytes::copy_from_slice(csd),
+        };
+        let first = || vec![config(1), picture(1, 2 * SEC, true), done(1, 1)];
+        let second = |config: PictureEvent| vec![config, picture(2, 4 * SEC, true), done(2, 1)];
+        let lost = |pictures_in, pictures_out| PictureEvent::SegmentDone {
+            segment: 1,
+            pictures_in,
+            pictures_out,
+        };
+        let cases: Vec<(&str, Vec<Vec<PictureEvent>>)> = vec![
+            (
+                "configured unlike",
+                vec![first(), second(other(2, 320, &[SPS, PPS].concat()))],
+            ),
+            (
+                "configured unlike",
+                vec![first(), second(other(2, 640, &csd()))],
+            ),
+            (
+                "lacks a sequence or picture parameter set",
+                vec![vec![
+                    other(1, 320, SEI),
+                    picture(1, 2 * SEC, true),
+                    done(1, 1),
+                ]],
+            ),
+            (
+                "is not a sync picture",
+                vec![vec![config(1), picture(1, 2 * SEC, false), done(1, 1)]],
+            ),
+            (
+                "came after one at",
+                vec![vec![
+                    config(1),
+                    picture(1, 3 * SEC, true),
+                    picture(1, 2 * SEC, false),
+                    done(1, 2),
+                ]],
+            ),
+            (
+                "is segment 2's, not segment 1's",
+                vec![vec![config(1), picture(1, 4 * SEC, true), done(1, 1)]],
+            ),
+            (
+                "came before the run's first",
+                vec![vec![config(0), picture(0, SEC, true), done(0, 1)]],
+            ),
+            (
+                "came before its encoder's configuration",
+                vec![vec![config(1), picture(2, 4 * SEC, true)]],
+            ),
+            (
+                "took 2 pictures and gave back 1",
+                vec![vec![config(1), picture(1, 2 * SEC, true), lost(2, 1)]],
+            ),
+            (
+                "gave back 2, of which 1 arrived",
+                vec![vec![config(1), picture(1, 2 * SEC, true), lost(2, 2)]],
+            ),
+            (
+                "started before segment 1's ended",
+                vec![vec![
+                    config(1),
+                    picture(1, 2 * SEC, true),
+                    config(2),
+                    picture(2, 4 * SEC, true),
+                    done(2, 1),
+                ]],
+            ),
+            (
+                "came after segment 1's ended",
+                vec![first(), vec![config(1), done(1, 0)]],
+            ),
+            (
+                "still open",
+                vec![vec![config(1), picture(1, 2 * SEC, true)]],
+            ),
+        ];
+        for (detail, events) in cases {
+            match drive(1, PictureTarget::H264High, events) {
+                Err(said) => assert!(said.contains(detail), "{said:?} for {detail:?}"),
+                Ok(out) => panic!("{detail:?} was let through: {out:?}"),
+            }
+        }
+    }
+
+    /// A converter that decodes in presentation order with `depth`
+    /// pictures held, starts at the first picture it is given and cannot
+    /// decode what is shown before it, and encodes at once.
+    struct Reorder {
+        depth: usize,
+        start: Option<i64>,
+        held: BTreeSet<i64>,
+        open: Option<(u64, u32)>,
+    }
+
+    impl Reorder {
+        fn route(&mut self, pts_us: i64, segments: &Segments, out: &mut Vec<PictureEvent>) {
+            let Route::Encode { segment } = segments.route(pts_us) else {
+                return;
+            };
+            if self.open.is_none_or(|(open, _)| open != segment) {
+                if let Some((open, count)) = self.open.take() {
+                    out.push(done(open, count));
+                }
+                out.push(config(segment));
+                self.open = Some((segment, 0));
+            }
+            let open = self.open.as_mut().expect("open");
+            out.push(picture(segment, pts_us, open.1 == 0));
+            open.1 += 1;
+        }
+    }
+
+    impl PictureConverter for Reorder {
+        fn push(
+            &mut self,
+            picture: SourcePicture,
+            segments: &Segments,
+        ) -> Result<Vec<PictureEvent>, String> {
+            let start = *self.start.get_or_insert(picture.pts_us);
+            if picture.pts_us >= start {
+                self.held.insert(picture.pts_us);
+            }
+            let mut out = Vec::new();
+            while self.held.len() > self.depth {
+                let pts = self.held.pop_first().expect("held");
+                self.route(pts, segments, &mut out);
+            }
+            Ok(out)
+        }
+
+        fn finish(&mut self, segments: &Segments) -> Result<Vec<PictureEvent>, String> {
+            let mut out = Vec::new();
+            while let Some(pts) = self.held.pop_first() {
+                self.route(pts, segments, &mut out);
+            }
+            if let Some((open, count)) = self.open.take() {
+                out.push(done(open, count));
+            }
+            Ok(out)
+        }
+    }
+
+    /// **An open GOP's leading pictures are the segment before's.** The
+    /// sync picture at cut 1 (2 s) is followed in decode order by two
+    /// pictures shown before it. They go to segment 0's encoder, which ends
+    /// only then. A run from segment 1 decodes from an earlier sync picture
+    /// and makes segment 1 the same.
+    #[test]
+    fn leading_pictures_go_to_the_segment_they_are_shown_in() {
+        const F: i64 = 40_000;
+        // Pictures every 40 ms for 3 s, a sync picture every second, each
+        // followed in decode order by the two shown before it.
+        let mut order = Vec::new();
+        for frame in 0..75i64 {
+            if frame % 25 >= 23 {
+                continue;
+            }
+            order.push(frame);
+            if frame % 25 == 0 && frame > 0 {
+                order.extend([frame - 2, frame - 1]);
+            }
+        }
+        order.extend([73, 74]);
+        let run = |from: usize, first: u64| {
+            let converter = Reorder {
+                depth: 3,
+                start: None,
+                held: BTreeSet::new(),
+                open: None,
+            };
+            let mut driver =
+                ConvertedPicture::new(converter, segments(first), PictureTarget::H264High);
+            let mut out = Vec::new();
+            for frame in &order[from..] {
+                let picture = SourcePicture {
+                    pts_us: frame * F,
+                    key: frame % 25 == 0,
+                    data: Bytes::new(),
+                };
+                out.extend(driver.push(picture).expect("a clean push"));
+            }
+            out.extend(driver.finish().expect("a clean finish"));
+            out.into_iter()
+                .filter_map(|converted| match converted {
+                    Converted::Sample(sample) => Some((sample.pts_us, sample.key)),
+                    Converted::Format(_) => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let whole = run(0, 0);
+        let shown: Vec<i64> = whole.iter().map(|(pts, _)| *pts).collect();
+        assert_eq!(shown, (0..75).map(|frame| frame * F).collect::<Vec<_>>());
+        let keys: Vec<i64> = whole
+            .iter()
+            .filter(|(_, key)| *key)
+            .map(|(pts, _)| *pts)
+            .collect();
+        assert_eq!(keys, vec![0, 2 * SEC], "a sync picture opens each segment");
+        // From the sync picture at 1.0 s: what is shown before 2 s is
+        // dropped, and segment 1 is the same pictures.
+        let at = order
+            .iter()
+            .position(|frame| *frame == 25)
+            .expect("frame 25");
+        let from_one = run(at, 1);
+        assert_eq!(from_one.first(), Some(&(2 * SEC, true)));
+        assert_eq!(from_one, whole[50..]);
+    }
 }

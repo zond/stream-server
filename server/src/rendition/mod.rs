@@ -558,6 +558,11 @@ pub struct RenditionNumbers {
     /// slot asked for is not in the ring.
     pub made_to: Option<u64>,
     pub made_to_ms: Option<u64>,
+    /// Slots whose content did not fit since the publish: spilled into the
+    /// next slot, or cut short (`docs/design/renditions.md` §2.8). Each slot
+    /// is counted once, by how it was first made.
+    pub spilled: u64,
+    pub truncated: u64,
 }
 
 /// A track a rendition makes, as its run reported it.
@@ -621,6 +626,13 @@ pub struct RunNumbers {
     pub from_ms: Option<u64>,
     /// How many slots it has made.
     pub produced: u64,
+    /// Its busy time so far (its own work, without the waits for the
+    /// receiver and the source: `docs/design/renditions.md` §2.5) and the
+    /// film it has made in it, in milliseconds. Its production speed is
+    /// media over busy. Both are as of its last speed check, a tenth of
+    /// [`SPEED_WINDOW`] apart.
+    pub busy_ms: u64,
+    pub media_ms: u64,
 }
 
 /// Why a request under a rendition is not answered with bytes.
@@ -741,6 +753,9 @@ pub(crate) struct RunSlot {
     /// idle, however long the making takes (a source that stalls is waited
     /// for).
     joined: usize,
+    /// Its busy time and the film it made in it, at its last speed check.
+    busy: Duration,
+    media: Duration,
     stop: CancellationToken,
 }
 
@@ -813,6 +828,14 @@ impl Inner {
         self.runs
             .iter_mut()
             .find(|run| run.generation == generation)
+    }
+
+    /// Run `generation`'s speed check read `busy` time and `media` made.
+    pub(crate) fn note_speed(&mut self, generation: u64, busy: Duration, media: Duration) {
+        if let Some(run) = self.run_mut(generation) {
+            run.busy = busy;
+            run.media = media;
+        }
     }
 
     /// A request for `slot` reached run `generation`. Its lookahead counts
@@ -1149,6 +1172,8 @@ impl Rendition {
                     from: run.from,
                     from_ms: at_ms(run.from),
                     produced: run.next_out.saturating_sub(run.from),
+                    busy_ms: run.busy.as_millis() as u64,
+                    media_ms: run.media.as_millis() as u64,
                 })
                 .collect(),
             runs_started: inner.runs_started,
@@ -1160,6 +1185,18 @@ impl Rendition {
             made_to_ms: made_to
                 .zip(layout)
                 .map(|(slot, layout)| ms(self.slot_end_us(layout, slot))),
+            spilled: inner
+                .plan
+                .ends
+                .values()
+                .filter(|end| matches!(end, slots::End::Spill(_)))
+                .count() as u64,
+            truncated: inner
+                .plan
+                .ends
+                .values()
+                .filter(|end| matches!(end, slots::End::Truncated { .. }))
+                .count() as u64,
         }
     }
 
@@ -1228,9 +1265,9 @@ impl Rendition {
         }
         inner.runs_started += 1;
         let generation = inner.runs_started;
-        let back = i64::try_from(SEEK_BACK.as_micros()).unwrap_or(i64::MAX);
         let (from_us, from_slot, anchor) = match (slot, inner.layout.clone()) {
             (Some(slot), Some(layout)) => {
+                let back = seek_back_us(&self.spec, &layout);
                 // A run is started here. The slot's start is decided now, if
                 // the slot before has not decided it. The lookahead is
                 // counted from it, whoever asked last.
@@ -1258,6 +1295,8 @@ impl Rendition {
             last_request: from_slot,
             last_request_at: request_now(),
             joined: 0,
+            busy: Duration::ZERO,
+            media: Duration::ZERO,
             stop: stop.clone(),
         });
         tracing::info!(
@@ -1530,6 +1569,22 @@ impl Rendition {
     }
 }
 
+/// **How far before its first segment's cut a run asks its producer to
+/// start**: [`SEEK_BACK`], and a GOP more for a converted picture on an
+/// estimated layout. A converted segment begins at the first picture at or
+/// after its cut, so its decoder must start at a sync sample before the
+/// cut. With no index, a seek can land up to the longest GOP assumed
+/// ([`layout::ESTIMATE_LABEL_LATE_US`]) after where it was asked for.
+fn seek_back_us(spec: &RenditionSpec, layout: &layout::Layout) -> i64 {
+    let back = i64::try_from(SEEK_BACK.as_micros()).unwrap_or(i64::MAX);
+    match spec.video {
+        VideoPlan::Convert { .. } if !layout.exact => {
+            back.saturating_add(layout::ESTIMATE_LABEL_LATE_US)
+        }
+        _ => back,
+    }
+}
+
 /// Where slot `slot` begins on the film's clock: its cut. The first slot
 /// begins at the film's first sync sample.
 fn slot_start_us(layout: &layout::Layout, slot: u64) -> i64 {
@@ -1606,6 +1661,8 @@ mod tests {
                 last_request: *at,
                 last_request_at: request_now(),
                 joined: 0,
+                busy: Duration::ZERO,
+                media: Duration::ZERO,
                 stop: CancellationToken::new(),
             });
         }

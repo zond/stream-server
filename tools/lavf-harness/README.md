@@ -31,7 +31,11 @@ tools/lavf-harness/compare.py film.mp4 rendition.mp4
   of picture and of sound against the film's, that the picture's decode
   times strictly increase, that no seek is asked of the reader in a
   straight read, and, for each seek, where the picture lands and the three
-  seconds after it. It exits 1 on any finding.
+  seconds after it. It exits 1 on any finding. With `--converted`, for a
+  rendition whose picture was converted (`docs/design/renditions.md` §5
+  F4), a seek is held against the rendition's own sync pictures, which
+  open its segments, instead of the film's. The packets are compared as
+  for a copy, since every picture keeps the film's time.
 
 Where a rendition to measure comes from:
 

@@ -459,7 +459,9 @@ async fn drive(
                 }
             }
             _ = tick.tick() => {
-                if let Some(slow) = speed.check(busy(Instant::now()), shown.media.media()) {
+                let (busy, media) = (busy(Instant::now()), shown.media.media());
+                rendition.inner().note_speed(generation, busy, media);
+                if let Some(slow) = speed.check(busy, media) {
                     return Outcome::Failed(speed_sentence(&rendition.spec, slow.media, slow.busy));
                 }
             }
@@ -495,6 +497,19 @@ async fn drive(
                         }
                     }
                     SinkMessage::Sample(sample) => {
+                        if making.is_none()
+                            && matches!(rendition.spec.video, super::VideoPlan::Convert { .. })
+                            && formats.video.is_none()
+                        {
+                            // The formats are taken as they stand now. A
+                            // converting producer that let a sample through
+                            // before its picture's format would freeze a
+                            // file with no picture.
+                            return Outcome::Failed(
+                                "The conversion sent sound before it described the picture."
+                                    .to_string(),
+                            );
+                        }
                         if making.is_none() {
                             let frozen = rendition.freeze(
                                 generation,

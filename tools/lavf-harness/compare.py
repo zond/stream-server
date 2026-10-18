@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """compare.py <film> <rendition.mp4> [--versions n4.4,n6.1,master]
               [--seeks 300,100,43] [--shift-us 0] [--ahead-us 500000]
+              [--converted]
 
 Reads a rendition with each FFmpeg version's probe (build.sh) the way
 Chrome's FFmpegDemuxer does -- its own 32 KiB reader, av_seek_frame on the
@@ -17,6 +18,10 @@ video stream, backward -- and holds it against the film it was made from
 
 --shift-us is what the producer adds to every time: xtremio's shifts a
 Matroska film by its sound's priming (21 ms for AAC at 48 kHz).
+--converted is for a rendition whose picture was converted. Its sync
+pictures are where each segment begins, not the film's, so the keys a seek
+is held against are read from the rendition. Every picture still keeps the
+film's time, so the packets are compared as for a copy.
 One line a version; anything but "ok", "+0.00" and no reader seek is a
 finding.
 """
@@ -28,17 +33,18 @@ ap.add_argument("--versions", default="n4.4,n6.1,master")
 ap.add_argument("--seeks", default="300,100,250,330,43,30,301,5")
 ap.add_argument("--shift-us", type=int, default=0)
 ap.add_argument("--ahead-us", type=int, default=500_000)
+ap.add_argument("--converted", action="store_true")
 ap.add_argument("--dir", default=os.environ.get("LAVF_HARNESS_DIR", os.path.expanduser("~/.cache/lavf-harness")))
 a = ap.parse_args()
 
-def film_packets():
+def packets(path, shift_us):
     out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "packet=stream_index,pts_time,flags",
-                          "-of", "csv=p=0", a.film], capture_output=True, text=True).stdout
+                          "-of", "csv=p=0", path], capture_output=True, text=True).stdout
     tracks, keys = {0: [], 1: []}, []
     for line in out.split("\n"):
         p = line.split(",")
         if len(p) < 3 or p[1] in ("", "N/A"): continue
-        s, t = int(p[0]), round(float(p[1]) * 1e6) + a.shift_us
+        s, t = int(p[0]), round(float(p[1]) * 1e6) + shift_us
         if s == 1 and t < 0: continue  # the sound's priming: not carried
         if s not in tracks: continue
         tracks[s].append(t)
@@ -55,7 +61,9 @@ def run_ok(got, film):
             return "packet %d: %d vs film %d" % (k, t, film[i + k] if i + k < len(film) else -1)
     return "ok"
 
-film, keys = film_packets()
+film, keys = packets(a.film, a.shift_us)
+if a.converted:
+    keys = packets(a.rendition, 0)[1]
 bad = False
 for v in a.versions.split(","):
     probe = os.path.join(a.dir, "ad-" + v)

@@ -1199,4 +1199,134 @@ mod tests {
         assert_eq!(layout.first_slot_from(3_000_000), 3);
         assert_eq!(layout.first_slot_from(3_000_001), 4);
     }
+
+    const RATE: Sizing = Sizing::Rate {
+        video_bps: 8_000_000,
+        sound_bps: 400_000,
+    };
+
+    /// **A converted slot is its rates over its span**: the base and the
+    /// chunks' headers, the picture's bitrate with its margin and the
+    /// sound's, the opening sync picture's room, and the `trun` entries.
+    #[test]
+    fn rate_slot_is_the_rates_over_the_span() {
+        assert_eq!(CONVERTED_MARGIN_PERCENT, 112);
+        assert_eq!(CONVERTED_KEY_ROOM_MS, 250);
+        assert_eq!(COPIED_SOUND_BPS, 400_000);
+        assert_eq!(SAMPLE_ROOM_BYTES_PER_S, 1336);
+        // 8192 + 9152 + 2 s x 9.36 Mbit/s + 250 ms of 8 Mbit/s + 2 x 1336.
+        assert_eq!(
+            rate_slot(2_000_000, 8_000_000, 400_000),
+            8192 + 9152 + 2_340_000 + 250_000 + 2672
+        );
+        assert_eq!(rate_slot(-1, 0, 0), SLOT_BASE + interleave_room(0));
+    }
+
+    /// **A converted picture is sized by rate and cut two seconds apart at
+    /// least.** Mirrored, a sync sample sooner than
+    /// [`CONVERTED_MIN_SEGMENT_US`] after the cut before is skipped, and
+    /// each slot is its rates over its span. Estimated, the grid is that
+    /// long at least, each slot is its rates over its span too, and its
+    /// label is a frame or two late, not a GOP. A copy's cuts are the
+    /// index's sync samples a second apart, as before.
+    #[test]
+    fn a_converted_picture_is_cut_two_seconds_apart_and_sized_by_rate() {
+        assert_eq!(CONVERTED_MIN_SEGMENT_US, 2_000_000);
+        // Keys every 0.48 s for 10 s.
+        let index: Vec<IndexEntry> = (0..21)
+            .map(|k| entry(k * 480_000, 1000 * k as u64))
+            .collect();
+        let copied = Plan::new(Some(&index), 21_000, 10 * T, 6 * T, Sizing::Source);
+        assert_eq!(
+            copied.cuts[1..4],
+            [1_440_000, 2_400_000, 3_360_000],
+            "a copy is cut a second apart"
+        );
+        let converted = Plan::new(Some(&index), 21_000, 10 * T, 6 * T, RATE);
+        assert!(converted.exact);
+        assert_eq!(
+            converted.cuts,
+            vec![i64::MIN, 2_400_000, 4_800_000, 7_200_000, 9_600_000],
+            "each the first key two seconds or more after the one before"
+        );
+        assert_eq!(converted.label_late_us, 0);
+        let starts = [0, 2_400_000, 4_800_000, 7_200_000, 9_600_000, 10 * T];
+        assert_eq!(
+            converted.sizes,
+            starts
+                .windows(2)
+                .map(|pair| rate_slot(pair[1] - pair[0], 8_000_000, 400_000))
+                .collect::<Vec<_>>()
+        );
+
+        let estimated = Plan::new(None, 21_000, 5 * T, T, RATE);
+        assert!(!estimated.exact);
+        assert_eq!(
+            estimated.cuts,
+            vec![i64::MIN, 2 * T, 4 * T],
+            "on a two-second grid, not the spec's one"
+        );
+        assert_eq!(estimated.label_late_us, CONVERTED_LABEL_LATE_US);
+        assert_eq!(
+            estimated.sizes,
+            vec![
+                rate_slot(2 * T, 8_000_000, 400_000),
+                rate_slot(2 * T, 8_000_000, 400_000),
+                rate_slot(T, 8_000_000, 400_000),
+            ]
+        );
+        let longer = Plan::new(None, 21_000, 12 * T, 6 * T, RATE);
+        assert_eq!(longer.cuts, vec![i64::MIN, 6 * T], "a longer grid stays");
+    }
+
+    /// **How a rendition sizes its slots**: by the source for a copied
+    /// picture, by the bitrate for a converted one, with the sound's rate
+    /// (the conversion's, or a copy's most) when there is sound.
+    #[test]
+    fn the_sizing_follows_the_picture_and_the_sound() {
+        use super::super::{AudioPlan, PictureTarget, RenditionSpec, TrackFormat, VideoPlan};
+        let spec = |video, audio| RenditionSpec {
+            duration_ms: 1,
+            segment_ms: 1,
+            start_ms: 0,
+            video,
+            audio,
+            audio_track: 0,
+        };
+        let convert = VideoPlan::Convert {
+            target: PictureTarget::HevcMain,
+            bitrate: 8_000_000,
+        };
+        let sound = mux::Formats {
+            video: None,
+            audio: Some(TrackFormat::Aac {
+                sample_rate: 48_000,
+                channels: 2,
+                csd0: Bytes::from_static(&[0x11, 0x90]),
+            }),
+        };
+        let rate = |sound_bps| Sizing::Rate {
+            video_bps: 8_000_000,
+            sound_bps,
+        };
+        assert_eq!(
+            Sizing::of(&spec(VideoPlan::Copy, AudioPlan::Copy), &sound),
+            Sizing::Source
+        );
+        assert_eq!(
+            Sizing::of(&spec(convert.clone(), AudioPlan::Copy), &sound),
+            rate(COPIED_SOUND_BPS)
+        );
+        assert_eq!(
+            Sizing::of(
+                &spec(convert.clone(), AudioPlan::AacStereo { bitrate: 192_000 }),
+                &sound
+            ),
+            rate(192_000)
+        );
+        assert_eq!(
+            Sizing::of(&spec(convert, AudioPlan::Copy), &mux::Formats::default()),
+            rate(0)
+        );
+    }
 }

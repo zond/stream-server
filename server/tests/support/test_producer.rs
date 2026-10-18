@@ -19,15 +19,30 @@
 //! index it reports when the job wants one ([`IndexKnob`]): every sync
 //! sample at a position in proportion to its time over the reader's
 //! length, one squeezed against the next, or none.
+//!
+//! **Converting** ([`Knobs::convert`]): the run feeds its video through a
+//! `ConvertedPicture` over a [`fake_converter::FakeConverter`] with the
+//! job's segments, as the embedder's producer does. It sends the sound's
+//! format, then holds the sound until the picture's format has gone. With
+//! [`Knobs::open_gop`], the film's GOPs are open: each sync picture is
+//! followed in decode order by the last pictures of the GOP before.
 
 #![allow(dead_code)]
 
+#[path = "fake_converter.rs"]
+pub mod fake_converter;
+
 use bytes::Bytes;
+use fake_converter::{ConverterRecord, FakeConverter, FakeOptions};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use stream_server::rendition::SinkProbe;
-use stream_server::{IndexEntry, Job, Producer, ProducerRefusal, Sample, TrackFormat, TrackKind};
+use stream_server::{
+    Converted, ConvertedPicture, IndexEntry, Job, PictureTarget, Producer, ProducerRefusal, Sample,
+    SourcePicture, TrackFormat, TrackKind,
+};
 
 /// x264's SPS for 320x240 High, Annex-B, as `csd-0` carries it.
 pub const SPS: &[u8] = &[
@@ -95,6 +110,16 @@ pub struct Knobs {
     /// or after this time, until the test opens it. It is a source that
     /// stalls there.
     pub time_gate: Option<(i64, Arc<Gate>)>,
+    /// Convert the picture into this, through a fake converter.
+    pub convert: Option<PictureTarget>,
+    /// How the fake converter behaves.
+    pub converter: FakeOptions,
+    /// Leading pictures per GOP: the last this many pictures of each GOP
+    /// come after the next sync picture in decode order.
+    pub open_gop: u32,
+    /// A converting run sends its sound as it comes, not held until the
+    /// picture's format has gone (a producer with the bug).
+    pub unheld_sound: bool,
 }
 
 /// A source that stalls until opened ([`Knobs::index_gate`]), with a probe
@@ -160,6 +185,10 @@ impl Default for Knobs {
             start_gate: None,
             run_gate: None,
             time_gate: None,
+            convert: None,
+            converter: FakeOptions::default(),
+            open_gop: 0,
+            unheld_sound: false,
         }
     }
 }
@@ -224,6 +253,29 @@ impl Knobs {
             .collect()
     }
 
+    /// Every video frame's number in decode order. With [`Self::open_gop`]
+    /// at `n`, the last `n` frames of each GOP come right after the next
+    /// GOP's sync frame (the film's last GOP's at the end).
+    pub fn decode_order(&self) -> Vec<i64> {
+        let count = self.video_frames().len() as i64;
+        let gop = i64::from(self.gop);
+        let lead = i64::from(self.open_gop).min(gop - 1);
+        let leading = |frame: i64| frame % gop >= gop - lead;
+        let mut order = Vec::with_capacity(count as usize);
+        for frame in 0..count {
+            if leading(frame) {
+                continue;
+            }
+            order.push(frame);
+            if self.is_key(frame) && frame > 0 {
+                order.extend((frame - lead).max(0)..frame);
+            }
+        }
+        let last_key = (count - 1) / gop * gop;
+        order.extend((last_key + 1..count).filter(|frame| leading(*frame)));
+        order
+    }
+
     /// The first sync sample at or after `at_us`.
     pub fn key_at_or_after(&self, at_us: i64) -> Option<i64> {
         self.video_frames()
@@ -247,6 +299,8 @@ pub struct RunRecord {
     pub emitted: Mutex<Vec<(TrackKind, i64)>>,
     /// The thread is gone.
     pub done: AtomicBool,
+    /// What its converter did, when it converts.
+    pub converter: Arc<ConverterRecord>,
 }
 
 impl RunRecord {
@@ -291,6 +345,7 @@ impl Producer for TestProducer {
             ended: AtomicBool::new(false),
             emitted: Mutex::new(Vec::new()),
             done: AtomicBool::new(false),
+            converter: Arc::new(ConverterRecord::default()),
         });
         let index = {
             let mut runs = self.runs.lock().unwrap();
@@ -299,7 +354,10 @@ impl Producer for TestProducer {
         };
         let knobs = self.knobs.clone();
         std::thread::spawn(move || {
-            produce(&knobs, index, job, &record);
+            match knobs.convert {
+                Some(target) => produce_converted(&knobs, index, job, &record, target),
+                None => produce(&knobs, index, job, &record),
+            }
             record.done.store(true, Ordering::SeqCst);
         });
         Ok(())
@@ -483,6 +541,177 @@ fn produce(knobs: &Knobs, index: usize, job: Job, record: &RunRecord) {
     }
     // The reader is dropped here, on this thread, as a foreign producer's
     // would be.
+    drop(reader);
+    sink.end();
+    record.ended.store(true, Ordering::SeqCst);
+}
+
+/// What a converting producer says when its converter fails.
+pub const PICTURE_FAILED: &str = "Converting this film's picture for the television failed.";
+
+/// A converting run: the sound's format, the index, then the picture
+/// through a `ConvertedPicture` over the fake converter, the sound held
+/// until the picture's format has gone.
+fn produce_converted(
+    knobs: &Knobs,
+    index: usize,
+    job: Job,
+    record: &RunRecord,
+    target: PictureTarget,
+) {
+    let Job {
+        reader,
+        from,
+        sink,
+        wants_index,
+        segments,
+        ..
+    } = job;
+    let stopped = || record.stopped.store(true, Ordering::SeqCst);
+    let audio_format = TrackFormat::Aac {
+        sample_rate: 48_000,
+        channels: 2,
+        csd0: Bytes::from_static(ASC),
+    };
+    if sink.format(TrackKind::Audio, audio_format).is_err() {
+        return stopped();
+    }
+    let reported = match knobs.index {
+        Some(knob) if wants_index => Some(knobs.index(knob, reader.len())),
+        _ => None,
+    };
+    if let Some(entries) = &reported
+        && sink.index(entries.clone()).is_err()
+    {
+        return stopped();
+    }
+    let mut options = knobs.converter.clone();
+    if knobs.other_format_on_run == Some(index) {
+        let mut csd = OTHER_SPS.to_vec();
+        csd.extend_from_slice(PPS);
+        options.csd = Bytes::from(csd);
+    }
+    let segments = segments.segments(reported.as_deref());
+    let converter = FakeConverter::new(options, record.converter.clone());
+    let mut picture = ConvertedPicture::new(converter, segments, target);
+
+    // Video from the sync frame at or before `from`, in decode order.
+    let from_us = from.as_micros() as i64;
+    let gop = i64::from(knobs.gop);
+    let key = from_us * i64::from(knobs.fps) / 1_000_000 / gop * gop;
+    let order = knobs.decode_order();
+    let mut video = order
+        .iter()
+        .position(|frame| *frame == key)
+        .unwrap_or(order.len());
+    let mut audio = (from_us * AAC_RATE / AAC_FRAME / 1_000_000 - 1).max(0);
+    let length = knobs.length.as_micros() as i64;
+    let mut held: Option<VecDeque<Sample>> = (!knobs.unheld_sound).then(VecDeque::new);
+    let wall = Instant::now();
+    let first = order
+        .get(video)
+        .map_or(i64::MAX, |frame| knobs.video_pts(*frame))
+        .min(Knobs::audio_pts(audio));
+
+    // Hand the sink what the driver gave back. `false` once the run is
+    // gone or failed.
+    let forward =
+        |out: Result<Vec<Converted>, String>, held: &mut Option<VecDeque<Sample>>| -> bool {
+            let out = match out {
+                Ok(out) => out,
+                Err(_) => return false,
+            };
+            for converted in out {
+                let sent = match converted {
+                    Converted::Format(format) => {
+                        let mut sent = sink.format(TrackKind::Video, format);
+                        for sample in held.take().into_iter().flatten() {
+                            let pts = sample.pts_us;
+                            sent = sent.and_then(|()| sink.sample(sample));
+                            record.emitted.lock().unwrap().push((TrackKind::Audio, pts));
+                        }
+                        sent
+                    }
+                    Converted::Sample(sample) => {
+                        let pts = sample.pts_us;
+                        let sent = sink.sample(sample);
+                        record.emitted.lock().unwrap().push((TrackKind::Video, pts));
+                        sent
+                    }
+                };
+                if sent.is_err() {
+                    stopped();
+                    return false;
+                }
+            }
+            true
+        };
+    loop {
+        let video_pts = order.get(video).map(|frame| knobs.video_pts(*frame));
+        let audio_pts = Knobs::audio_pts(audio);
+        let take_video = video_pts.is_some_and(|pts| pts <= audio_pts);
+        let pts = if take_video {
+            video_pts.unwrap_or(i64::MAX)
+        } else {
+            audio_pts
+        };
+        if pts >= length {
+            break;
+        }
+        if let Some(speed) = knobs.speed {
+            let due = wall + Duration::from_micros(((pts - first).max(0) as f64 / speed) as u64);
+            let now = Instant::now();
+            if due > now {
+                std::thread::sleep(due - now);
+            }
+        }
+        if take_video {
+            let frame = order[video];
+            video += 1;
+            let key = knobs.is_key(frame);
+            let out = picture.push(SourcePicture {
+                pts_us: pts,
+                key,
+                data: video_payload(frame, key, knobs.frame_bytes),
+            });
+            let failed = out.is_err();
+            if !forward(out, &mut held) {
+                if failed {
+                    sink.fail(PICTURE_FAILED.to_string());
+                }
+                return;
+            }
+        } else {
+            let sample = Sample {
+                track: TrackKind::Audio,
+                pts_us: audio_pts,
+                key: true,
+                data: audio_payload(audio),
+            };
+            audio += 1;
+            match held.as_mut() {
+                Some(held) => held.push_back(sample),
+                None => {
+                    if sink.sample(sample).is_err() {
+                        return stopped();
+                    }
+                    record
+                        .emitted
+                        .lock()
+                        .unwrap()
+                        .push((TrackKind::Audio, audio_pts));
+                }
+            }
+        }
+    }
+    let out = picture.finish();
+    let failed = out.is_err();
+    if !forward(out, &mut held) {
+        if failed {
+            sink.fail(PICTURE_FAILED.to_string());
+        }
+        return;
+    }
     drop(reader);
     sink.end();
     record.ended.store(true, Ordering::SeqCst);
