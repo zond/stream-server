@@ -9,12 +9,13 @@
 //! [`super::Stopped`]. Cancelling the reader is what wakes a producer
 //! parked in a read.
 
-use super::layout::Layout;
+use super::layout::{Layout, Sizing};
 use super::mux::{self, Formats, MuxSample};
 use super::slots::{self, Cursor, End};
 use super::speed::Speed;
 use super::{
-    IndexEntry, Job, Rendition, SINK_CAPACITY, SampleSink, SinkMessage, SinkShown, TrackKind,
+    IndexEntry, Job, Rendition, SINK_CAPACITY, SampleSink, SegmentPlan, Segments, SinkMessage,
+    SinkShown, TrackKind,
 };
 use crate::state::AppState;
 use std::collections::BTreeMap;
@@ -207,28 +208,30 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// Run `generation` of `rendition` until it ends. The producer is handed
-/// `from`, and the output starts at slot `start` (or, for the run that
-/// freezes the layout, at the first slot cut at or after `from`).
+/// Where a run begins.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Begin {
+    /// The slot its output starts at. `None` for the run that freezes the
+    /// layout, whose output starts at the first slot cut at or after
+    /// `from`.
+    pub start: Option<u64>,
+    /// The first segment it makes: its start slot's anchor (0 for the run
+    /// that freezes the layout).
+    pub anchor: u64,
+    /// What the producer is handed ([`Job::from`]).
+    pub from: Duration,
+}
+
+/// Run `generation` of `rendition` until it ends, from `begin`.
 pub(crate) async fn run(
     rendition: Arc<Rendition>,
     state: AppState,
     generation: u64,
-    start: Option<u64>,
-    from: Duration,
+    begin: Begin,
     stop: CancellationToken,
 ) {
     let mut produced = 0u64;
-    let outcome = drive(
-        &rendition,
-        &state,
-        generation,
-        start,
-        from,
-        &stop,
-        &mut produced,
-    )
-    .await;
+    let outcome = drive(&rendition, &state, generation, begin, &stop, &mut produced).await;
     stop.cancel();
     let kind = match &outcome {
         Outcome::Stopped => "stopped",
@@ -248,7 +251,7 @@ pub(crate) async fn run(
     }
     rendition.bump();
     tracing::info!(
-        from = start,
+        from = begin.start,
         produced,
         outcome = kind,
         stage = "rendition_run_end",
@@ -258,7 +261,7 @@ pub(crate) async fn run(
 
 fn speed_sentence(spec: &super::RenditionSpec, media: Duration, busy: Duration) -> String {
     let what = match (&spec.video, &spec.audio) {
-        (super::VideoPlan::H264 { .. }, _) => "convert this film to H.264",
+        (super::VideoPlan::Convert { .. }, _) => "convert this film's picture",
         (super::VideoPlan::Copy, super::AudioPlan::AacStereo { .. }) => "convert this film's sound",
         (super::VideoPlan::Copy, super::AudioPlan::Copy) => "repackage this film",
     };
@@ -360,11 +363,15 @@ async fn drive(
     rendition: &Arc<Rendition>,
     state: &AppState,
     generation: u64,
-    start: Option<u64>,
-    from: Duration,
+    begin: Begin,
     stop: &CancellationToken,
     produced: &mut u64,
 ) -> Outcome {
+    let Begin {
+        start,
+        anchor,
+        from,
+    } = begin;
     let started = Instant::now();
     let reader = tokio::select! {
         biased;
@@ -386,11 +393,26 @@ async fn drive(
         stop: stop.clone(),
         shown: shown.clone(),
     };
+    // One look at the layout decides both: a run that finds none fixes it
+    // and reports the index, and its segments are cut from that index.
+    let frozen = rendition.inner().layout.clone();
+    let segments = SegmentPlan::of_run(
+        frozen
+            .as_ref()
+            .map(|layout| Segments::new(layout.cuts.clone(), anchor)),
+        source_len,
+        rendition.duration_us(),
+        rendition.segment_us(),
+        // The tracks are not known yet. The cuts depend on whether the
+        // picture is converted, not on the sound's rate.
+        Sizing::of(&rendition.spec, &Formats::default()),
+    );
     let job = Job {
         reader,
         spec: rendition.spec.clone(),
         from,
-        wants_index: !rendition.has_layout(),
+        wants_index: frozen.is_none(),
+        segments,
         sink,
     };
     if let Err(refusal) = rendition.producer.start(job) {
@@ -758,9 +780,8 @@ mod tests {
             duration_ms: 1,
             segment_ms: 1,
             start_ms: 0,
-            video: super::super::VideoPlan::H264 {
-                width: 1,
-                height: 1,
+            video: super::super::VideoPlan::Convert {
+                target: super::super::PictureTarget::H264High,
                 bitrate: 1,
             },
             audio: super::super::AudioPlan::Copy,
@@ -768,7 +789,7 @@ mod tests {
         };
         assert_eq!(
             speed_sentence(&spec, Duration::from_millis(7000), Duration::from_secs(10)),
-            "This phone cannot convert this film to H.264 fast enough for the television: it \
+            "This phone cannot convert this film's picture fast enough for the television: it \
              made 7 seconds of film in 10."
         );
     }

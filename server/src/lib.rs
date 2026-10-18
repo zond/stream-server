@@ -29,9 +29,10 @@ pub use media::{
     ReadWait, Refusal, Resolved, ResumeHint,
 };
 pub use rendition::{
-    AudioPlan, IndexEntry, Job, LayoutNumbers, Producer, ProducerRefusal, RenditionNumbers,
-    RenditionReadiness, RenditionSpec, RenditionState, RunNumbers, Sample, SampleSink, Stopped,
-    TrackFormat, TrackKind, TrackOut, VideoPlan,
+    AudioPlan, Converted, ConvertedPicture, IndexEntry, Job, LayoutNumbers, PictureConverter,
+    PictureEvent, PictureTarget, Producer, ProducerRefusal, RenditionNumbers, RenditionReadiness,
+    RenditionSpec, RenditionState, Route, RunNumbers, Sample, SampleSink, SegmentPlan, Segments,
+    SourcePicture, Stopped, TrackFormat, TrackKind, TrackOut, VideoPlan,
 };
 pub use routes::drive::{DriveFileOpened, DriveOpenError};
 #[doc(hidden)]

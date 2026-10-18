@@ -71,6 +71,7 @@
 
 pub(crate) mod layout;
 pub(crate) mod mux;
+pub mod picture;
 mod run;
 mod slots;
 pub(crate) mod speed;
@@ -85,6 +86,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
+pub use picture::{
+    Converted, ConvertedPicture, PictureConverter, PictureEvent, PictureTarget, Route, SegmentPlan,
+    Segments, SourcePicture,
+};
 pub(crate) use speed::WaitClock;
 
 /// The fewest slots produced past the last request before the producer is
@@ -152,13 +157,11 @@ pub struct RenditionSpec {
 pub enum VideoPlan {
     /// The source's samples, repackaged.
     Copy,
-    /// Transcoded to H.264 at this size and bitrate.
+    /// Converted by the embedder's [`PictureConverter`] into `target` at
+    /// `bitrate` bits a second, at the source's size and frame rate
+    /// (`docs/design/renditions.md` §5 F4).
     #[serde(rename_all = "camelCase")]
-    H264 {
-        width: u32,
-        height: u32,
-        bitrate: u32,
-    },
+    Convert { target: PictureTarget, bitrate: u32 },
 }
 
 /// What happens to the sound.
@@ -331,6 +334,10 @@ pub struct Job {
     /// The rendition's layout is not fixed yet. Report the source's index
     /// ([`SampleSink::index`]) before the first sample, if it has one.
     pub wants_index: bool,
+    /// Where this run's segments begin, for a producer that converts the
+    /// picture ([`VideoPlan::Convert`]): each segment's pictures go to an
+    /// encoder of their own ([`ConvertedPicture`]).
+    pub segments: SegmentPlan,
     pub sink: SampleSink,
 }
 
@@ -998,10 +1005,6 @@ impl Rendition {
         i64::try_from(self.spec.duration_ms.saturating_mul(1000)).unwrap_or(i64::MAX)
     }
 
-    pub(crate) fn has_layout(&self) -> bool {
-        self.inner().layout.is_some()
-    }
-
     pub(crate) fn state(&self) -> RenditionState {
         if self.cut.is_cancelled() {
             return RenditionState::Ended;
@@ -1226,7 +1229,7 @@ impl Rendition {
         inner.runs_started += 1;
         let generation = inner.runs_started;
         let back = i64::try_from(SEEK_BACK.as_micros()).unwrap_or(i64::MAX);
-        let (from_us, from_slot) = match (slot, inner.layout.clone()) {
+        let (from_us, from_slot, anchor) = match (slot, inner.layout.clone()) {
             (Some(slot), Some(layout)) => {
                 // A run is started here. The slot's start is decided now, if
                 // the slot before has not decided it. The lookahead is
@@ -1238,13 +1241,13 @@ impl Rendition {
                 } else {
                     layout.cuts[anchor as usize].saturating_sub(back).max(0)
                 };
-                (from, slot)
+                (from, slot, anchor)
             }
             // The run that fixes the layout, for the file's header. It
             // starts from the film's start, which is what a reader of the
             // header reads on into. It never starts from where a player was
             // told to start.
-            _ => (0, 0),
+            _ => (0, 0, 0),
         };
         let stop = self.cut.child_token();
         // Its lookahead counts from where it starts: whoever asked last.
@@ -1268,8 +1271,11 @@ impl Rendition {
             self.clone(),
             state.clone(),
             generation,
-            slot,
-            Duration::from_micros(from_us as u64),
+            run::Begin {
+                start: slot,
+                anchor,
+                from: Duration::from_micros(from_us as u64),
+            },
             stop,
         ));
         generation
@@ -1307,8 +1313,13 @@ impl Rendition {
             _ => {
                 let init = mux::init_segment(formats, self.spec.duration_ms)
                     .map_err(run::Frozen::Failed)?;
-                let plan =
-                    layout::Plan::new(index, source_len, self.duration_us(), self.segment_us());
+                let plan = layout::Plan::new(
+                    index,
+                    source_len,
+                    self.duration_us(),
+                    self.segment_us(),
+                    layout::Sizing::of(&self.spec, formats),
+                );
                 let (track, timescale) = formats.indexed_track();
                 let layout = Arc::new(
                     layout::Layout::new(
@@ -1659,10 +1670,9 @@ mod tests {
     #[test]
     fn the_spec_crosses_ffi_in_camel_case() {
         let spec = RenditionSpec {
-            video: VideoPlan::H264 {
-                width: 1920,
-                height: 1080,
-                bitrate: 8_000_000,
+            video: VideoPlan::Convert {
+                target: PictureTarget::HevcMain10,
+                bitrate: 16_000_000,
             },
             audio: AudioPlan::AacStereo { bitrate: 192_000 },
             ..spec(1000, 6000)
@@ -1672,7 +1682,7 @@ mod tests {
             json,
             serde_json::json!({
                 "durationMs": 1000, "segmentMs": 6000, "startMs": 0,
-                "video": {"h264": {"width": 1920, "height": 1080, "bitrate": 8_000_000}},
+                "video": {"convert": {"target": "hevcMain10", "bitrate": 16_000_000}},
                 "audio": {"aacStereo": {"bitrate": 192_000}},
                 "audioTrack": 0
             })

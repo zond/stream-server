@@ -102,6 +102,85 @@ const INDEX_REACH_US: i64 = 60_000_000;
 /// early (`docs/design/renditions.md`, *A slot per sync sample*).
 pub(crate) const MIRROR_GRID_US: i64 = 1_000_000;
 
+/// **The shortest segment a converted rendition cuts.** The converter
+/// starts a fresh encoder at every segment, which costs some 90 ms and
+/// opens with a sync picture the constant bitrate pays for in padding. A
+/// mirrored layout of a converted rendition skips a sync sample sooner
+/// than this after the cut before, and an estimated one is cut on this
+/// grid at least. The bench tunes it.
+pub(crate) const CONVERTED_MIN_SEGMENT_US: i64 = 2_000_000;
+/// How much more than its bitrate a converted segment may weigh, in
+/// percent. The encoder runs at a constant bitrate over a segment.
+pub(crate) const CONVERTED_MARGIN_PERCENT: u64 = 112;
+/// The room a converted segment's opening sync picture takes beyond its
+/// share, as milliseconds of the bitrate.
+pub(crate) const CONVERTED_KEY_ROOM_MS: u64 = 250;
+/// The sound a copy carries at most: AAC in one or two channels.
+pub(crate) const COPIED_SOUND_BPS: u64 = 400_000;
+/// The `trun` entries a second of a converted segment takes: 60 pictures
+/// at 16 bytes and 47 sound frames at 8.
+pub(crate) const SAMPLE_ROOM_BYTES_PER_S: u64 = 60 * 16 + 47 * 8;
+/// How much later than its cut an estimated converted slot's time in the
+/// `sidx` is. The converter begins a segment with a sync picture at the
+/// first picture at or after the cut, so this is a frame or two, not a GOP
+/// ([`ESTIMATE_LABEL_LATE_US`]).
+pub(crate) const CONVERTED_LABEL_LATE_US: i64 = 100_000;
+
+/// **How a layout sizes its slots.** A copy weighs what the source weighs
+/// over the same span. A converted picture weighs its bitrate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Sizing {
+    /// From the source's bytes.
+    Source,
+    /// From the rates: the converted picture's and the sound's (none
+    /// without a sound track).
+    Rate { video_bps: u64, sound_bps: u64 },
+}
+
+impl Sizing {
+    /// How a rendition asked for as `spec`, with the tracks `formats`,
+    /// sizes its slots.
+    pub(crate) fn of(spec: &super::RenditionSpec, formats: &mux::Formats) -> Self {
+        let super::VideoPlan::Convert { bitrate, .. } = spec.video else {
+            return Self::Source;
+        };
+        let sound_bps = match (&formats.audio, &spec.audio) {
+            (None, _) => 0,
+            (Some(_), super::AudioPlan::AacStereo { bitrate }) => u64::from(*bitrate),
+            (Some(_), super::AudioPlan::Copy) => COPIED_SOUND_BPS,
+        };
+        Self::Rate {
+            video_bps: u64::from(bitrate),
+            sound_bps,
+        }
+    }
+
+    /// The shortest segment this cuts: none for a copy,
+    /// [`CONVERTED_MIN_SEGMENT_US`] for a converted picture.
+    fn min_segment_us(self) -> i64 {
+        match self {
+            Self::Source => 0,
+            Self::Rate { .. } => CONVERTED_MIN_SEGMENT_US,
+        }
+    }
+}
+
+/// **A converted slot's length**, for a segment `lasts_us` long at the
+/// rates given: the base and the chunks' headers, the rates over the span
+/// (the picture's with [`CONVERTED_MARGIN_PERCENT`]), the opening sync
+/// picture's room, and the `trun` entries.
+pub(crate) fn rate_slot(lasts_us: i64, video_bps: u64, sound_bps: u64) -> u64 {
+    let lasts = lasts_us.max(0) as u128;
+    let bps =
+        u128::from(video_bps) * u128::from(CONVERTED_MARGIN_PERCENT) / 100 + u128::from(sound_bps);
+    let media = (lasts * bps).div_ceil(8_000_000) as u64;
+    SLOT_BASE
+        + interleave_room(lasts_us)
+        + media
+        + video_bps / 8 * CONVERTED_KEY_ROOM_MS / 1000
+        + (lasts * u128::from(SAMPLE_ROOM_BYTES_PER_S) / 1_000_000) as u64
+}
+
 /// The most slots a `sidx` can count.
 const MAX_SLOTS: i64 = u16::MAX as i64 / 2;
 
@@ -157,14 +236,17 @@ pub(crate) struct Plan {
 impl Plan {
     /// The plan for a source `source_len` bytes long and `duration_us`
     /// long, cut every `segment_us`: mirrored from `index` when it is one
-    /// ([`usable`]), estimated otherwise.
+    /// ([`usable`]), estimated otherwise. Its slots are sized by `sizing`.
+    /// A converted picture's segments are [`CONVERTED_MIN_SEGMENT_US`]
+    /// long at least.
     pub(crate) fn new(
         index: Option<&[IndexEntry]>,
         source_len: u64,
         duration_us: i64,
         segment_us: i64,
+        sizing: Sizing,
     ) -> Self {
-        let segment_us = segment_us.max(1);
+        let segment_us = segment_us.max(sizing.min_segment_us()).max(1);
         let duration_us = duration_us.max(1);
         match index.and_then(|index| usable(index, source_len, duration_us)) {
             Some(candidates) => Self::mirrored(
@@ -172,8 +254,9 @@ impl Plan {
                 source_len,
                 duration_us,
                 mirror_grid(duration_us),
+                sizing,
             ),
-            None => Self::estimated(source_len, duration_us, segment_us),
+            None => Self::estimated(source_len, duration_us, segment_us, sizing),
         }
     }
 
@@ -182,15 +265,21 @@ impl Plan {
         source_len: u64,
         duration_us: i64,
         segment_us: i64,
+        sizing: Sizing,
     ) -> Self {
         // Segment k's sync sample: the first candidate at or after k x T,
-        // never one already taken. A GOP longer than T makes no empty
+        // never one already taken, and none sooner than the shortest
+        // segment after the one before. A GOP longer than T makes no empty
         // segment. It makes fewer.
+        let least = sizing.min_segment_us();
         let mut chosen: Vec<IndexEntry> = vec![candidates[0]];
         let mut next = 1;
         let mut k = 1i64;
         while next < candidates.len() {
-            let target = k.saturating_mul(segment_us);
+            let previous = chosen.last().map_or(i64::MIN, |entry| entry.pts_us);
+            let target = k
+                .saturating_mul(segment_us)
+                .max(previous.saturating_add(least));
             match candidates[next..].iter().position(|c| c.pts_us >= target) {
                 None => break,
                 Some(at) => {
@@ -212,7 +301,13 @@ impl Plan {
                 .get(at + 1)
                 .map_or(duration_us, |next| next.pts_us)
                 .saturating_sub(entry.pts_us);
-            sizes.push(span + headroom(span) + interleave_room(lasts));
+            sizes.push(match sizing {
+                Sizing::Source => span + headroom(span) + interleave_room(lasts),
+                Sizing::Rate {
+                    video_bps,
+                    sound_bps,
+                } => rate_slot(lasts, video_bps, sound_bps),
+            });
         }
         Self {
             cuts,
@@ -223,7 +318,7 @@ impl Plan {
         }
     }
 
-    fn estimated(source_len: u64, duration_us: i64, segment_us: i64) -> Self {
+    fn estimated(source_len: u64, duration_us: i64, segment_us: i64, sizing: Sizing) -> Self {
         let count = (duration_us as u64).div_ceil(segment_us as u64).max(1);
         let scaled = |k: u64| -> u64 {
             let at = (k as i128 * segment_us as i128).min(duration_us as i128);
@@ -241,12 +336,28 @@ impl Plan {
             })
             .collect();
         let sizes = (0..count)
-            .map(|k| scaled(k + 1) - scaled(k) + SLOT_BASE + interleave_room(segment_us))
+            .map(|k| match sizing {
+                Sizing::Source => {
+                    scaled(k + 1) - scaled(k) + SLOT_BASE + interleave_room(segment_us)
+                }
+                Sizing::Rate {
+                    video_bps,
+                    sound_bps,
+                } => {
+                    let from = k as i64 * segment_us;
+                    let to = (from + segment_us).min(duration_us);
+                    rate_slot(to - from, video_bps, sound_bps)
+                }
+            })
             .collect();
+        let label_late_us = match sizing {
+            Sizing::Source => ESTIMATE_LABEL_LATE_US,
+            Sizing::Rate { .. } => CONVERTED_LABEL_LATE_US,
+        };
         Self {
             cuts,
             first_us: 0,
-            label_late_us: ESTIMATE_LABEL_LATE_US,
+            label_late_us,
             sizes,
             exact: false,
         }
@@ -635,7 +746,7 @@ mod tests {
             .iter()
             .map(|ms| entry(ms * 1000, 100 + *ms as u64))
             .collect();
-        let plan = Plan::new(Some(&index), 5_100, 5_000_000, T);
+        let plan = Plan::new(Some(&index), 5_100, 5_000_000, T, Sizing::Source);
         assert!(plan.exact);
         assert_eq!(
             plan.cuts,
@@ -669,14 +780,14 @@ mod tests {
             .enumerate()
             .map(|(k, pts)| entry(*pts, 1_000 * k as u64))
             .collect();
-        let plan = Plan::new(Some(&index), 11_000, 30_000_000, 6 * T);
+        let plan = Plan::new(Some(&index), 11_000, 30_000_000, 6 * T, Sizing::Source);
         assert!(plan.exact);
         assert_eq!(plan.cuts[1..], keys[1..]);
 
         let dense: Vec<IndexEntry> = (0..75)
             .map(|k| entry(k * 400_000, 100 * k as u64))
             .collect();
-        let plan = Plan::new(Some(&dense), 7_500, 30_000_000, 6 * T);
+        let plan = Plan::new(Some(&dense), 7_500, 30_000_000, 6 * T, Sizing::Source);
         assert_eq!(
             plan.cuts[1..6],
             [1_200_000, 2_000_000, 3_200_000, 4_000_000, 5_200_000]
@@ -697,7 +808,7 @@ mod tests {
             .enumerate()
             .map(|(k, pts)| entry(*pts, 1_000 * k as u64))
             .collect();
-        let plan = Plan::new(Some(&index), 11_000, 30_000_000, 6 * T);
+        let plan = Plan::new(Some(&index), 11_000, 30_000_000, 6 * T, Sizing::Source);
         let layout = Layout::new(
             Bytes::new(),
             plan,
@@ -747,9 +858,9 @@ mod tests {
         let start = [entry(0, 0), entry(2_000_000, 1000)];
         let hour = 3_600_000_000;
         assert!(usable(&start, 1 << 30, hour).is_none());
-        assert!(!Plan::new(Some(&start), 1 << 30, hour, 6 * T).exact);
-        assert!(!Plan::new(Some(&start[..1]), 1 << 30, 3 * T, T).exact);
-        assert!(!Plan::new(None, 1 << 30, 3 * T, T).exact);
+        assert!(!Plan::new(Some(&start), 1 << 30, hour, 6 * T, Sizing::Source).exact);
+        assert!(!Plan::new(Some(&start[..1]), 1 << 30, 3 * T, T, Sizing::Source).exact);
+        assert!(!Plan::new(None, 1 << 30, 3 * T, T, Sizing::Source).exact);
         // Within a minute of the end is the whole film's, every gap a
         // minute at most.
         let whole: Vec<IndexEntry> = (0..=60)
@@ -769,7 +880,7 @@ mod tests {
     /// film's remainder.
     #[test]
     fn no_index_is_estimated_on_the_grid() {
-        let plan = Plan::new(None, 10_000, 2_500_000, T);
+        let plan = Plan::new(None, 10_000, 2_500_000, T, Sizing::Source);
         assert!(!plan.exact);
         assert_eq!(plan.cuts, vec![i64::MIN, 1_000_000, 2_000_000]);
         let slack = |bytes: u64| bytes * (100 + ESTIMATE_SLACK_PERCENT) / 100;
@@ -802,7 +913,7 @@ mod tests {
         let index: Vec<IndexEntry> = (0..6)
             .map(|k| entry(k * 1_000_000 + 40_000, 1000 + k as u64 * 10_000))
             .collect();
-        let plan = Plan::new(Some(&index), 70_000, 6_000_000, T);
+        let plan = Plan::new(Some(&index), 70_000, 6_000_000, T, Sizing::Source);
         let init = Bytes::from_static(b"\0\0\0\x08ftyp");
         let layout = Layout::new(
             init,
@@ -887,7 +998,7 @@ mod tests {
         let index: Vec<IndexEntry> = (0..6)
             .map(|k| entry(k * 1_000_000 + 40_000, 1000 + k as u64 * 123_457))
             .collect();
-        let plan = Plan::new(Some(&index), 800_000, 6_000_000, T);
+        let plan = Plan::new(Some(&index), 800_000, 6_000_000, T, Sizing::Source);
         let planned = plan.sizes.clone();
         let layout = Layout::new(
             Bytes::from_static(b"\0\0\0\x08ftyp"),
@@ -950,7 +1061,7 @@ mod tests {
         let index: Vec<IndexEntry> = (0..6)
             .map(|k| entry(k * 1_000_000 + 40_000, 1000 + k as u64 * 10_000))
             .collect();
-        let plan = Plan::new(Some(&index), 70_000, 6_000_000, T);
+        let plan = Plan::new(Some(&index), 70_000, 6_000_000, T, Sizing::Source);
         let layout = Layout::new(
             Bytes::from_static(b"\0\0\0\x08ftyp"),
             plan,
@@ -1026,7 +1137,7 @@ mod tests {
     /// stop at the film's end.
     #[test]
     fn an_estimated_slot_is_labelled_a_gop_after_its_cut() {
-        let plan = Plan::new(None, 1_000_000, 30_000_000, 6 * T);
+        let plan = Plan::new(None, 1_000_000, 30_000_000, 6 * T, Sizing::Source);
         let layout = Layout::new(
             Bytes::new(),
             plan,
@@ -1047,6 +1158,7 @@ mod tests {
             1_000,
             12 * T,
             6 * T,
+            Sizing::Source,
         );
         assert_eq!(
             mirrored.label_late_us, 0,
@@ -1072,7 +1184,7 @@ mod tests {
     /// after it.
     #[test]
     fn a_run_from_a_time_makes_the_first_slot_cut_after_it() {
-        let plan = Plan::new(None, 10_000, 10_000_000, T);
+        let plan = Plan::new(None, 10_000, 10_000_000, T, Sizing::Source);
         let layout = Layout::new(
             Bytes::new(),
             plan,
