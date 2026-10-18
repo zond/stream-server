@@ -236,9 +236,10 @@ lock, no runtime hop) and safe to poll once a second.
     "videoOut": {"codec": "hevc", "width": 1920, "height": 1040, "channels": null, "sampleRate": null},
     "audioOut": {"codec": "aac", "width": null, "height": null, "channels": 2, "sampleRate": 48000},
     "layout": {"slots": 3363, "slotMs": null, "exact": true, "total": 2471230464},
-    "runs": [{"from": 63, "fromMs": 126040, "produced": 67}],
+    "runs": [{"from": 63, "fromMs": 126040, "produced": 67, "busyMs": 41200, "mediaMs": 133500}],
     "runsStarted": 2, "slotsMade": 70, "filmMadeMs": 139800,
-    "askedSlot": 64, "askedMs": 128040, "madeTo": 129, "madeToMs": 262000
+    "askedSlot": 64, "askedMs": 128040, "madeTo": 129, "madeToMs": 262000,
+    "spilled": 0, "truncated": 0
   }
 }
 ```
@@ -262,19 +263,26 @@ lock, no runtime hop) and safe to poll once a second.
   file on this device). `http` names the reader, not the network. A
   rendition token's bodies at `/cast/{token}` count here too, as a plain
   publication's do.
-* `rendition`, for a rendition: the spec's plans and the tracks the first
+* `rendition`, for a rendition: the spec's plans (`video` is `"copy"` or
+  `{"convert": {"target": "hevcMain10", "bitrate": 16000000}}`, the target
+  one of `h264High`, `hevcMain` and `hevcMain10`) and the tracks the first
   run reported making; the layout once it is fixed (`slotMs` when every slot
   but the last holds the same film -- an estimated layout's grid, or a
   mirrored one whose sync samples are evenly spaced -- and `null` with
   fewer than three slots); the live
-  runs, each with the slot it began at and how many it has made; runs
+  runs, each with the slot it began at, how many it has made, and its busy
+  time and the film it made in it as of its last speed check (`busyMs`,
+  `mediaMs`: `mediaMs` over `busyMs` is how fast it makes film when it is
+  not waiting for the receiver or the source); runs
   begun since the publish; every slot made and the film they hold (a slot
   dropped from the ring and asked again is made again, and counted again
   -- `filmMadeMs` over the wall time between two answers is the production
   speed); the slot the receiver last asked for (a range's first slot, or
   one it read on into); and `madeTo`/`madeToMs`, the end of the unbroken
   run of slots in the ring from that one, which is how far ahead of the
-  receiver the film is made. Every absence is `null`.
+  receiver the film is made; and `spilled` and `truncated`, the slots
+  whose content did not fit (design/renditions.md §2.8, the overflow
+  rule), each counted once. Every absence is `null`.
 
 A publication's end -- unpublished, or every token at the listener's stop
 -- writes one INFO line with its totals (`stage="cast_publication_end"`:

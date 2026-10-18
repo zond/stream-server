@@ -1,6 +1,6 @@
 # Renditions: a cast the receiver can decode, produced on demand, nothing on disk
 
-Design, 2026-10-01; §2.8 2026-10-02 to 2026-10-05. **F0, F1 and F1½ are done (F1½ answered libavformat). F2 is built: a Rust producer in xtremio over libavformat, its file seekable by bytes (§2.8). F3's sound conversion is built in the app (2026-10-04). F4 is not built: the producer refuses an H.264 plan with a sentence. F5 is built in part, in the app: a row per receiver model judged by the name the receiver announces (xtremio `0daab79`, `5b05898`; no eureka_info lookup), the channel count in the stats poll (`2fe3b2e`), and a cast whose receiver shows no picture ended (`50d1f55`). What a publication has served is `cast_numbers` (§3).**
+Design, 2026-10-01; §2.8 2026-10-02 to 2026-10-05. **F0, F1 and F1½ are done (F1½ answered libavformat). F2 is built: a Rust producer in xtremio over libavformat, its file seekable by bytes (§2.8). F3's sound conversion is built in the app (2026-10-04). F4's server half is built (2026-10-18): the converted-picture contract (`rendition/picture.rs`, §2.2 *A converted picture*), `VideoPlan::Convert`, and slots sized by bitrate (§2.8). The app's converter over MediaCodec (§2.4) is being built. F5 is built in part, in the app: a row per receiver model judged by the name the receiver announces (xtremio `0daab79`, `5b05898`; no eureka_info lookup), the channel count in the stats poll (`2fe3b2e`), and a cast whose receiver shows no picture ended (`50d1f55`). What a publication has served is `cast_numbers` (§3).**
 
 > **Amended in F2 (zond, 2026-10-01): a rendition is ONE progressive
 > fragmented MP4, not HLS.** It was measured on zond's Chromecast with
@@ -140,12 +140,14 @@ pub struct RenditionSpec {
     pub audio_track: u32,
 }
 
-pub enum VideoPlan { Copy, H264 { width: u32, height: u32, bitrate: u32 } }
+pub enum VideoPlan { Copy, Convert { target: PictureTarget, bitrate: u32 } }
+pub enum PictureTarget { H264High, HevcMain, HevcMain10 }
 pub enum AudioPlan { Copy, AacStereo { bitrate: u32 } }
 ```
 
 "Repackage only" is `Copy`/`Copy`. "Audio only" is `Copy`/`AacStereo`. A
-full transcode is `H264` with either audio plan. Audio is copied only when
+converted picture is `Convert` with either audio plan. On the wire it is
+`{"convert": {"target": "hevcMain10", "bitrate": 16000000}}`. Audio is copied only when
 it is AAC (the decision's rule, 2.7), so the muxer needs no audio sample
 entry but AAC's.
 
@@ -161,8 +163,10 @@ presentation time is at or after N x T**, and ends where segment N+1
 begins. Each audio sample belongs to the segment its presentation time
 falls in. One rule for every plan:
 
-* When video is encoded, the producer forces a sync frame at every N x T
-  (2.4), so the rule cuts at exactly N x T and every segment is T long.
+* When the picture is converted, each segment's pictures go to an
+  encoder of their own, whose first picture is a sync picture (2.2, *A
+  converted picture*). So a segment begins at the first picture shown at
+  or after its cut.
 * When video is copied, the cuts are wherever the source's keyframes are,
   at or after N x T. Every segment then starts with a keyframe, which a
   receiver needs after a seek. (A media segment appended after a
@@ -252,6 +256,9 @@ pub struct Job {
     /// The layout is not fixed yet: report the source's index
     /// (`SampleSink::index`) before the first sample.
     pub wants_index: bool,
+    /// Where this run's segments begin, for a producer that converts the
+    /// picture (`SegmentPlan::segments`, below).
+    pub segments: SegmentPlan,
     pub sink: SampleSink,
 }
 
@@ -312,6 +319,67 @@ B-frames, so there decode time is presentation time. There is no new
 dependency and nothing native, and `cargo test` covers the muxer. It would
 not cover a muxer on the Kotlin side.
 
+**A converted picture** (`server/src/rendition/picture.rs`, F4). The server
+never decodes, and it never sees a source picture: the producer is the
+embedder's. So the server defines what a converter must do, and the
+embedder implements the codecs. The pieces:
+
+* `PictureTarget`: `H264High` (8-bit), `HevcMain` (8-bit) or
+  `HevcMain10` (10-bit, the source's colours and transfer kept, so HDR10
+  and HLG stay HDR). The picture keeps the source's size and frame rate.
+* `Segments`: where a run's segments begin (the layout's cuts) and the
+  run's first segment (its start slot's anchor). `of(pts)` is the segment
+  a picture shown at `pts` belongs to, by the cutter's own rule.
+  `route(pts)` is `Drop` before the first segment and `Encode { segment }`
+  otherwise.
+* `SegmentPlan` (`Job::segments`): the segments before the producer has
+  read the source. A later run's are the frozen layout's from its anchor.
+  The run that fixes the layout cuts them from the index it reports, with
+  the layout's own function (`layout::Plan::new`). So the two cannot
+  disagree. `run.rs` builds it from the same one look at the layout that
+  sets `wants_index`.
+* `PictureConverter`: a decoder and **one encoder per segment**, built for
+  one run on the producer's thread. Its contract: `push` queues one
+  picture in decode order and drains both codecs; every decoded picture is
+  routed by `segments.route(pts)`; a fresh encoder's events start with
+  `Config` (its codec configuration, Annex-B) and its first picture is a
+  sync picture; every picture keeps the time it went in with; all of
+  segment j's events come before any of j+1's; `finish` drains and ends
+  the open encoder. Dropping it releases every codec.
+* `ConvertedPicture`: the driver the producer feeds, over a converter. It
+  turns the first `Config` into the video's `TrackFormat` (H.264: the SPS
+  and the PPS apart; HEVC: all of it, SEI included) and hands it out once
+  as `Converted::Format`. Then it hands out `Converted::Sample`s. It fails
+  the run with a developer's detail when a later encoder's configuration
+  or size differs from the first, a segment's first picture is not a sync
+  picture, a picture's time does not rise, a picture is not its segment's
+  by `of`, an encoder is for a segment before the run's first or one
+  already ended, or an encoder's pictures in, out and handed back differ.
+  An encoder given nothing may end without a `Config`.
+
+**The per-segment contract.** Segment k holds the pictures *shown* in
+[cut k, cut k+1), whatever the source's decode order. An open GOP's
+leading pictures follow the next sync picture in decode order but are
+shown before it, so they are the segment before's. A run started at k
+starts its decoder at a sync sample before the cut (`SEEK_BACK`, and more
+on an estimated layout: 2.8), and drops what it decodes before cut k. So
+segment k's encoder is fed the same pictures whether a run started at k
+or passed through it, and its bytes are the same. A segment's encoder
+closes only when a picture of a later segment is decoded. That lag needs
+nothing of the server: the cutter closes segment k only when a sync
+sample of a later one arrives, and the lookahead gate stops reading only
+past the lookahead.
+
+**The producer's order.** It sends the sound's format, seeks, and reports
+the index. It takes `job.segments.segments(index)` with exactly the index
+it reported (`None` if it reported none). It feeds every video packet to
+`ConvertedPicture::push` and forwards what comes back. It holds every
+sound sample until the picture's format has gone. The formats are taken
+as they stand at the first sample, so a sample before the picture's
+format fails the run: "The conversion sent sound before it described the
+picture." A seek is a new run: a new `Job`, a new demuxer seek and a new
+converter.
+
 ### 2.3 Reading the source: a `MediaDataSource` over the media id's reader
 
 The producer reads the media id through 2.4 of the pipeline. The server
@@ -347,53 +415,47 @@ calls `install_producer` when the Kotlin side has said it is there.
 `rustls-platform-verifier`, under `reqwest`), so the exports add no crate.
 Nothing in the crate exports a JNI symbol today.
 
-### 2.4 The Kotlin producer
+### 2.4 The producer, and the NDK converter
 
-A run has one `MediaExtractor`, opened with
-`setDataSource(MediaDataSource)` (API 23; the app's `minSdk` is Flutter's
-default, 24). The video track and the chosen audio track are both
-selected: one extractor, interleaved reads, **one reader per run**. Then
+*(This section described a Kotlin producer over `MediaExtractor`. As
+built, the producer is xtremio's Rust `repackage` over libavformat (F2),
+and nothing of it is Kotlin.)* A run has one demuxer over the media id's
+reader, with the video track and the chosen sound track selected. Then
 per plan:
 
-* **Repackage (`Copy`/`Copy`).** `readSampleData` straight to
-  `sink.sample`, with `getSampleTime` and `SAMPLE_FLAG_SYNC`. **No
-  `MediaCodec` at all.** The run is as fast as the source can be read.
-* **Audio only (`Copy`/`AacStereo`).** Video samples as above. Audio
-  samples go into a `MediaCodec` decoder for the source's MIME. Its PCM is
-  downmixed to stereo (a fixed ITU-R BS.775 matrix over the decoded
-  frames) and goes into a `MediaCodec` encoder `audio/mp4a-latm` (AAC-LC,
-  48 kHz, 2 channels), whose output goes to the sink. **The video encoder
-  is never created.** The only codec work is audio, which is cheap.
-* **Full transcode (`H264`).** A `MediaCodec` decoder for the source video
-  renders into a `Surface`. The encoder (`video/avc`, the plan's size and
-  bitrate, `KEY_MAX_B_FRAMES` 0) takes its input from
-  `createInputSurface()`. Same size: the decoder renders straight into the
-  encoder's surface. A different size (4K to 1080p): one GL pass between
-  them (a `SurfaceTexture`, one textured quad into the encoder's surface
-  with `eglPresentationTimeANDROID`). **The surface path, not byte
-  buffers**: decoder output in byte buffers is a vendor YUV layout and a
-  CPU copy per frame, which at 4K is the whole budget. A sync frame is
-  requested (`PARAMETER_KEY_REQUEST_SYNC_FRAME`) when the first frame at
-  or after each N x T is released to the encoder. That is what makes the
-  cut rule land on N x T.
+* **Repackage (`Copy`/`Copy`).** Packets straight to `sink.sample`, with
+  their presentation times and sync flags. No codec at all. The run is as
+  fast as the source can be read.
+* **Sound only (`Copy`/`AacStereo`).** Video packets as above. The sound
+  is decoded by libavcodec and encoded to stereo AAC by `MediaCodec` (F3).
+* **A converted picture (`Convert`).** Video packets go to a
+  `ConvertedPicture` over the NDK converter (2.2). That is a `MediaCodec`
+  decoder and one `MediaCodec` encoder per segment, through a `dlopen`ed
+  `libmediandk.so` on the run's own thread, with no JNI and no Java
+  looper. For `H264High` and `HevcMain` the decoder renders into the
+  encoder's input surface (API 26). For `HevcMain10` the decoder hands
+  out P010 buffers and they are copied into the encoder's (API 33). An
+  encoder runs at the source's size and frame rate, at a constant bitrate,
+  with no B-frames. Its colour keys come from the container, and every
+  encoder of a run gets the same keys, which keeps the codec configuration
+  the same. At each segment's first picture, the open encoder is drained
+  and released before the next is created, so a run holds one encoder.
+  On the surface path the decoder's output surface is then moved to the
+  new encoder. An HDR10 film's mastering display and light levels go in
+  the HEVC configuration as SEI when the encoder leaves them out.
 
-**A seek is a new run.** `seekTo(N x T, SEEK_TO_PREVIOUS_SYNC)` puts the
-extractor on the keyframe at or before N's timestamp. Everything before N
-x T is decoded and **discarded**. A decoded video frame before it is
-released with `render = false`, so it never reaches the encoder. Audio is
-fed to the encoder from one AAC frame before N x T, and encoder output
-before N x T is dropped, so the encoder's priming delay is spent on audio
-nobody hears. In copy mode nothing is decoded, and the server discards
-samples before the cut. Every timestamp the sink sees is the source's own
-presentation time, minus the source's first so the film starts at zero. So
-a restart cannot shift the timeline: `tfdt` is computed from the source's
-clock, never from a count of what this run produced.
+**A seek is a new run.** The demuxer seeks to the sync sample at or
+before the job's `from`. In copy mode nothing is decoded, and the server
+discards samples before the cut. A converted run decodes from there and
+drops every picture shown before its first segment (`Route::Drop`). Every
+time the sink sees is the source's own presentation time, less the
+source's first, so the film starts at zero. So a restart cannot shift the
+timeline: `tfdt` comes from the source's clock, never from a count of what
+this run produced.
 
-**The run refuses what the extractor cannot read**, with a sentence:
-`setDataSource` or the track selection failing is `sink.fail`. This note
-has not verified whether `MediaExtractor`'s Matroska extractor exposes
-every audio codec the decision needs (DTS, TrueHD), or whether it reads
-AVI at all (§9). 2.6 has the way out if it does not.
+**The run refuses what it cannot read or convert**, with a sentence a
+viewer is shown (the producer's: an unknown container, a source codec the
+phone has no hardware decoder for, a picture with stretched pixels).
 
 ### 2.5 Speed: measured, and the cast ended with a sentence
 
@@ -406,7 +468,7 @@ server knows how long the source kept it.) A run below 1.0x over its last
 first segment is out, so a codec's start-up is not counted against it.
 Nothing more is produced, waiting requests are answered `503`, and
 `rendition_state` reports the sentence, e.g. "This phone cannot convert
-this film to H.264 fast enough for the television: it made 7 seconds of
+this film's picture fast enough for the television: it made 7 seconds of
 film in 10." The app polls that state with its cast watchdog and ends the
 cast with the sentence (2.7).
 
@@ -414,6 +476,13 @@ A slow *source* is not a failure. A torrent that stalls is the stall the
 receiver buffers through, as it does for a plain cast, and the speed
 excludes it. The two are told apart because the server serves both the
 reads and the sink.
+
+A converted run's busy time includes its encoder restarts, one per
+segment (some 60 to 110 ms each on zond's phone), and its decoding of the
+pictures before its first cut. The minimum segment length (2.8) keeps the
+restarts few. Each live run's busy time and the film it made in it are in
+`cast_numbers` (`runs[].busyMs`, `runs[].mediaMs`), as of its last speed
+check. Their ratio is how fast the phone converts.
 
 The other failures `rendition_state` carries the same way: a producer's
 `fail` (an extractor that cannot read the file, no decoder for the codec
@@ -489,6 +558,11 @@ not from a build in this tree:
 Pick: raw `MediaExtractor` + `MediaCodec`, and the server's muxer.
 Revisit Transformer only if HDR sources to SDR receivers become a case
 zond hits (§6).
+
+*(As built: libavformat demuxes (F2) and libavcodec decodes sound (F3).
+The picture is converted by `MediaCodec` through the NDK's C API (2.4),
+the codecs only, so neither Transformer nor `MediaMuxer` is in the app.
+The server's muxer takes the encoder's output as it takes a copy's.)*
 
 ### 2.7 The app: the receiver table, the decision, and a third outcome
 
@@ -726,6 +800,34 @@ approved is **the mirror layout**, built in `rendition/layout.rs`,
   the slot's last sync sample before the target, a few seconds of decoding
   at most. `ffprobe` did not show this, because it seeks to the target in
   either.
+* **A converted picture's slots are sized by its bitrate**
+  (`layout::Sizing::Rate`, F4). The source's bytes say nothing about what
+  an encoder makes. A converted slot is `layout::rate_slot` of its span:
+  8 KiB, the chunks' room, the picture's bitrate times
+  `CONVERTED_MARGIN_PERCENT` (112%) and the sound's rate (the conversion's,
+  or `COPIED_SOUND_BPS`, 400 kbit/s, for a copy) over the span,
+  `CONVERTED_KEY_ROOM_MS` (250 ms) of the bitrate for the segment's
+  opening sync picture, and `SAMPLE_ROOM_BYTES_PER_S` (1336) of `trun`
+  entries a second. What does not fit spills or is truncated by the rule
+  below.
+  * **Its segments are two seconds long at least**
+    (`CONVERTED_MIN_SEGMENT_US`). Every segment starts a fresh encoder,
+    which costs some 90 ms and opens with a sync picture the constant
+    bitrate pays for in padding. Mirrored, a sync sample sooner than two
+    seconds after the cut before is skipped. Estimated, the grid is two
+    seconds at least, whatever the spec says. So the cuts depend on
+    whether the picture is converted, not on the rates. A converted run's
+    `Job::segments` are cut the same way, so they match. The bench in
+    xtremio tunes these constants.
+  * **An estimated slot's label is a tenth of a second late**
+    (`CONVERTED_LABEL_LATE_US`), not a GOP. A converted segment begins
+    with a sync picture at its cut's first picture, so its real start is
+    within a frame of its cut.
+  * **A run on an estimated layout seeks back a GOP more**
+    (`ESTIMATE_LABEL_LATE_US`, 10 s, on top of `SEEK_BACK`). Its decoder
+    must start at a sync sample before the cut, and a seek in a source
+    with no index can land up to a GOP late. If it lands after the cut
+    anyway, the driver logs it.
 * **The overflow rule** (`slots.rs`). A segment whose fragment does not
   leave 24 bytes of its slot (a `free` header and a zero tail) keeps the
   longest prefix that fits. The prefix is cut in decode order only where
@@ -1530,9 +1632,23 @@ F3. **Audio to stereo AAC** (M). `MediaCodec` decode when the phone has a
      across a codec stop/configure/start and its 1600-sample priming are
      read from AOSP's source, not measured.*
 
-F4. **Video transcode to H.264** (L). Surface path, the GL scaling pass,
-   forced sync frames at N x T, speed measured on zond's phone at 1080p
-   from HEVC. The decision's video rule.
+F4. **A converted picture** (L). The source's picture decoded and encoded
+   again by the phone's hardware, as H.264 High, HEVC Main or HEVC Main 10,
+   at the source's size and frame rate: for a receiver that cannot take
+   the source's codec, profile or depth. One encoder per segment (2.2, *A
+   converted picture*), so a segment is the same bytes from any run.
+
+   *(The server half is built, 2026-10-18: `rendition/picture.rs`,
+   `VideoPlan::Convert`, `Job::segments`, slots sized by rate with
+   segments two seconds long at least, and the longer seek back on an
+   estimated layout (2.8). `cast_numbers` says each run's busy time and
+   film made, and the slots spilled and truncated. It is tested with a fake
+   converter in `server/tests/support/fake_converter.rs`: open GOPs, a
+   reordering decoder, encoder latency, a slow converter. Not yet built:
+   xtremio's NDK converter (2.4), its bench, and the app's decision. HwProbe
+   measured on zond's phone, not in this tree: the 8-bit surface path at
+   4.8x, the 4K P010 path at 0.45x from Kotlin, 60 to 110 ms per encoder
+   restart, identical bytes over two runs from the same start.)*
 
 F5. **The receiver table and the decision UI** (M). `ReceiverCaps`, the
    eureka_info fetch, `CastRendition`, the channel count in the stats
@@ -1604,7 +1720,10 @@ F5. **The receiver table and the decision UI** (M). `ReceiverCaps`, the
   stops an app's threads in the background. The downloads already run
   under a foreground service with a notification (`docs/ANDROID.md`). A
   rendition's producer runs under the same one for the length of the cast,
-  or the receiver stalls the moment the phone sleeps.
+  or the receiver stalls the moment the phone sleeps. A converted picture
+  also needs the CPU awake while the screen is off: the app holds a
+  partial wake lock while a rendition whose picture is converted is
+  published.
 
 ## 7. What this does not do
 
@@ -1612,11 +1731,15 @@ It does not write anything to disk, and it does not keep a rendition: a
 second cast of the same film produces it again. It does not transcode for
 this device's own player, because mpv decodes what it plays.
 
-It does not **tone-map**. An HDR10 or Dolby Vision source transcoded to an
-SDR receiver comes out washed out: the surface path converts 10-bit to
-8-bit and does nothing about the transfer function. Such a source to an
-SDR receiver is refused with a sentence, until Transformer's tone mapping
-(or a GL shader of our own) is worth its cost. A Dolby Vision profile 5
+It does not **tone-map**. An HDR source is converted only to HEVC Main
+10, with its colours and transfer kept, for a receiver that shows HDR. An
+HDR source for an SDR receiver is refused with a sentence: converting
+10-bit to 8-bit does nothing about the transfer function, and the picture
+would come out washed out.
+
+It does not **make a picture smaller**. A converted picture keeps the
+source's size and frame rate. A film larger than the receiver takes is
+refused, as before. A Dolby Vision profile 5
 file is refused for every receiver that is not DV-capable. Nothing here
 converts it.
 
@@ -1638,18 +1761,26 @@ the sentence.
 
 ## 8. Risks
 
-* **Hardware encoder availability and speed.** H.264 encoding at 1080p30
-  in real time is ordinary for a phone's hardware encoder. Decoding 4K
-  HEVC 10-bit while doing it, plus a GL scale, is not guaranteed. The
-  encoder's instances are shared with the camera and with mpv's own
-  decoder (which the cast pauses, not releases). A configuration the
-  encoder refuses is `sink.fail` with the codec's name. F4 measures zond's
-  phone before the decision offers a full transcode of 4K sources.
-* **Surface versus byte buffers.** The surface path is the fast one and
-  the only one this design builds. It carries the presentation time
-  through `releaseOutputBuffer` and `eglPresentationTimeANDROID`. A vendor
-  decoder that misreports timestamps on a surface would break the cut rule
-  silently. The byte-buffer path is not a fallback here.
+* **Hardware encoder speed.** The 8-bit surface path converted at 4.8x
+  on zond's phone (HwProbe). The 4K P010 path for HEVC Main 10 managed 0.45x from
+  Kotlin, its copy through `Image` planes the cost. It needs 2x, so that
+  two runs or a seek still clear 1.0x. The bench in xtremio measures it
+  from Rust. The encoder's instances are shared with the camera and with
+  mpv's own decoder (which the cast pauses, not releases). A configuration
+  the encoder refuses fails the run with the producer's sentence.
+* **A fresh encoder per segment.** It costs 60 to 110 ms, and a constant
+  bitrate pads a short segment around its opening sync picture. Two
+  seconds a segment at least (2.8) bounds both. The margin and the key
+  room are first guesses, to be set from the bench's per-segment sizes.
+  Padding is sent over the Wi-Fi, so the margin should not be generous.
+* **The same bytes from another start.** Two runs from the same start
+  gave identical bytes on zond's phone. A segment reached from a
+  different sync sample is not measured yet: the bench's
+  `--from-segment` hashes and the device's same-bytes check settle it. A
+  different configuration from a later encoder fails the rendition.
+* **Timestamps through a surface.** A vendor decoder that misreports
+  presentation times on a surface would put pictures in the wrong
+  segment. The driver fails the run then rather than make a wrong file.
 * **A/V sync at a restart.** Video restarts at the keyframe before N x T
   and audio from one AAC frame before it, both discarded up to the cut,
   both stamped from the source's clock. So a restart cannot drift. But an
