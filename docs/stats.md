@@ -92,11 +92,22 @@ So a client should treat `enabled && !everBootstrapped` as an **informational st
 
 librqbit's own per-attempt DHT warnings (`librqbit_dht::dht`) are pinned to `error` in the default log directives, so they do not appear at INFO. The DHT retries forever and warns on every attempt, which would otherwise produce hundreds of identical lines and no conclusion. The single conclusion from `diagnostics::dht_health` stands in their place.
 
-### Port forwarding
+### Port forwarding: `ServerHandle::port_forwarding_status()`
 
 The server asks the router to forward the torrent listener's port over UPnP, so peers behind NAT can dial in. It does so for the OS-picked port (`TorrentListenPort::Ephemeral`, the default) and for a fixed range alike. Only a `Loopback` listener does not ask. The mapping is leased for 60 seconds and renewed every 30, so it is gone within a minute of the app exiting. The forwarder maps the same external port number as the internal one. Two devices on one network almost never pick the same OS-chosen port, where a shared fixed port would collide.
 
-**No router is not an error.** A cellular network has none, and many home routers have UPnP turned off. The torrent still downloads. Peers behind NAT just cannot dial in. The forwarder logs each condition once, at WARN when it starts and INFO when it clears (`librqbit_upnp=info` in the default directives). While nothing answers, it waits 60 seconds before searching again and doubles the wait each time, up to 10 minutes.
+`ServerHandle::port_forwarding_status()` answers a `PortForwardingStatus` (as JSON over FFI, these names):
+
+| Field | Meaning |
+|---|---|
+| `enabled` | Whether the server is asking the router at all: a session is running and its listener is not `Loopback` |
+| `searched` | Whether a search for a router has finished yet. Until one has, no router is not news |
+| `gateway` | The name of the router that answered, or `null` when none did |
+| `port` | The port the server asks to have forwarded, which is the port it announces to peers |
+| `held` | Whether the router holds the mapping right now. This is "reachable through the router" |
+| `error` | Why the search or the mapping failed, while it stands |
+
+**No router is not an error.** A cellular network has none, and many home routers have UPnP turned off. Then `searched` is true, `gateway` is `null` and `error` is `null`. The torrent still downloads. Peers behind NAT just cannot dial in. The forwarder logs each condition once, at WARN when it starts and INFO when it clears (`librqbit_upnp=info` in the default directives). While nothing answers, it waits 60 seconds before searching again and doubles the wait each time, up to 10 minutes, so a panel need not poll it quickly.
 
 ### Query parameters and metadata resolution
 

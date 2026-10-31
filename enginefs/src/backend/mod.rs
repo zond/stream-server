@@ -105,6 +105,12 @@ pub trait TorrentBackend: Send + Sync {
     fn dht_status(&self) -> DhtStatus {
         DhtStatus::default()
     }
+    /// Whether the router forwards the listener's port to us (see
+    /// [`PortForwardingStatus`]). The default is "not asking", the right
+    /// answer for a backend with no listener a router could forward.
+    fn port_forwarding_status(&self) -> PortForwardingStatus {
+        PortForwardingStatus::default()
+    }
     /// Upload to peers, or stop: every torrent at once, and nothing else
     /// about them changed. They stay connected and go on downloading. This
     /// is re-asserted on every reconciler tick
@@ -871,6 +877,37 @@ impl DhtStatus {
     pub fn is_usable(&self) -> bool {
         self.enabled && (self.nodes + self.nodes_v6) > 0
     }
+}
+
+/// Whether peers outside the local network can dial in through the router,
+/// as the UPnP port forwarder sees it.
+///
+/// It is a stats-panel reading, not an error report. A cellular network has
+/// no router to ask, and many home routers have UPnP turned off. A torrent
+/// downloads either way. Without a forwarded port, only the peers we dial
+/// ourselves take part, and peers behind NAT cannot reach us.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortForwardingStatus {
+    /// Whether the server is asking a router at all. It is `false` with no
+    /// session running, and for a loopback listener, which nothing off this
+    /// machine may reach.
+    pub enabled: bool,
+    /// Whether a search for a router has finished yet, whatever it found.
+    /// Until one has, no router is not news.
+    pub searched: bool,
+    /// The name of the router that answered the latest search. `None` when
+    /// nothing answered, which is no router to ask, not a failure.
+    pub gateway: Option<String>,
+    /// The port the server asks to have forwarded. It is the port the
+    /// listener announces to peers.
+    pub port: Option<u16>,
+    /// Whether the router holds the mapping right now: reachable through
+    /// the router.
+    pub held: bool,
+    /// Why the latest search failed or, failing that, why the router
+    /// refused the mapping. `None` once the failure clears.
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

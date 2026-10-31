@@ -395,6 +395,40 @@ fn header_value(response: &reqwest::blocking::Response, name: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// The port-forwarding reading crosses FFI as JSON in these names. A
+/// server whose listener is on loopback asks no router, and says so with
+/// `enabled: false` rather than a failure.
+#[test]
+fn a_loopback_server_reports_port_forwarding_as_off() -> anyhow::Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let handle = stream_server::start(stream_server::ServerConfig {
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        config_dir: Some(config_dir.path().join("config")),
+        cache_dir: Some(cache_dir.path().join("cache")),
+        ..offline_config()
+    })?;
+    assert!(handle.torrent_listen_addr().is_some(), "the listener is up");
+
+    let status = handle.port_forwarding_status();
+    assert_eq!(status, Default::default());
+    assert_eq!(
+        serde_json::to_value(&status)?,
+        serde_json::json!({
+            "enabled": false,
+            "searched": false,
+            "gateway": null,
+            "port": null,
+            "held": false,
+            "error": null,
+        })
+    );
+
+    handle.shutdown()?;
+    handle.join()?;
+    Ok(())
+}
+
 /// The two status probes clients poll, on one server.
 ///
 /// stremio-core probes `/device-info` at startup expecting

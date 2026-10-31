@@ -3687,6 +3687,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         self.backend.dht_status()
     }
 
+    /// Whether the router forwards the torrent listener's port (see
+    /// [`crate::backend::PortForwardingStatus`]). It is one read of the
+    /// forwarder's latest state, cheap enough to call per request.
+    pub fn port_forwarding_status(&self) -> crate::backend::PortForwardingStatus {
+        self.backend.port_forwarding_status()
+    }
+
     /// Every existing engine's [`crate::backend::TransferTotals`], keyed by
     /// info hash. This is the activity light's reading of the connection.
     ///

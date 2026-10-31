@@ -534,6 +534,19 @@ impl ServerHandle {
         routes::system::dht_status(&self.state)
     }
 
+    /// Whether peers outside the local network can dial in through the
+    /// router (see `routes::system::port_forwarding_status`).
+    ///
+    /// The server asks the router over UPnP to forward the torrent
+    /// listener's port. `held` is "reachable through the router". No router
+    /// (a cellular network, or UPnP turned off) is a reading, not an error:
+    /// `searched` true with no `gateway`. A loopback listener asks nothing
+    /// and answers `enabled: false`. It is cheap: one read of the
+    /// forwarder's latest state.
+    pub fn port_forwarding_status(&self) -> enginefs::backend::PortForwardingStatus {
+        routes::system::port_forwarding_status(&self.state)
+    }
+
     /// **Tell the server how long the film is**, without saying where the
     /// player is in it. That is all a cast can say, since the receiver does
     /// the reading and reports only seconds. It is also all anything says

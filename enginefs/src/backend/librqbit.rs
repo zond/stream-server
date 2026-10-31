@@ -2,7 +2,7 @@ use crate::backend::dht_bootstrap::{self, BootstrapResolvers};
 use crate::backend::{
     BackendFileInfo, BtSettingEffect, BtSettingSupport, BtSettingsReport, DhtStatus,
     DroppedFilePieces, EngineStats, FileStreamTrait, Footprint, LEAN_PEER_LIMIT, PeerDiscovery,
-    RunState, Source, StartupPhase, StatsFile, StatsOptions, TorrentBackend,
+    PortForwardingStatus, RunState, Source, StartupPhase, StatsFile, StatsOptions, TorrentBackend,
     TorrentFilePriorityPlan, TorrentHandle, TorrentListenPort, TorrentPlacement,
     TorrentPrivacyConfig, TorrentProxyType, TorrentSource, TorrentSpeedProfile, TransferTotals,
 };
@@ -2141,6 +2141,40 @@ impl TorrentBackend for LibrqbitBackend {
             ever_bootstrapped: self.dht_ever_bootstrapped.load(Ordering::Relaxed),
         }
     }
+
+    /// The forwarder's latest state, read off its watch channel. librqbit
+    /// has no forwarder for a session that does not ask (a loopback
+    /// listener), and that reads as `enabled: false`.
+    fn port_forwarding_status(&self) -> PortForwardingStatus {
+        let state = self
+            .session
+            .port_forwarding()
+            .map(|forwarding| forwarding.borrow().clone());
+        port_forwarding_status(state.as_ref(), self.session.announce_port())
+    }
+}
+
+/// librqbit's [`librqbit::PortForwardingState`] for the announced `port`, as
+/// a [`PortForwardingStatus`]. No state is a session with no forwarder.
+fn port_forwarding_status(
+    state: Option<&librqbit::PortForwardingState>,
+    port: Option<u16>,
+) -> PortForwardingStatus {
+    let Some(state) = state else {
+        return PortForwardingStatus::default();
+    };
+    let mapping = port.and_then(|port| state.port(port));
+    PortForwardingStatus {
+        enabled: true,
+        searched: state.searched,
+        gateway: state.gateway.as_ref().map(|gateway| gateway.name.clone()),
+        port,
+        held: mapping.is_some_and(|mapping| mapping.held),
+        error: state
+            .discovery_error
+            .clone()
+            .or_else(|| mapping.and_then(|mapping| mapping.error.clone())),
+    }
 }
 
 #[async_trait::async_trait]
@@ -3477,6 +3511,165 @@ mod tests {
         assert!(!status.enabled);
         assert!(!status.is_usable());
         assert!(!status.ever_bootstrapped);
+    }
+
+    /// The forwarder's state for one mapped port, as librqbit publishes it
+    /// before a search has run.
+    fn forwarder_state(port: u16) -> librqbit::PortForwardingState {
+        librqbit::PortForwardingState {
+            searched: false,
+            gateway: None,
+            discovery_error: None,
+            ports: vec![librqbit::PortMappingState {
+                port,
+                held: false,
+                held_via: Vec::new(),
+                mapped_at: None,
+                error: None,
+            }],
+        }
+    }
+
+    fn router() -> Option<librqbit::PortForwardingGateway> {
+        Some(librqbit::PortForwardingGateway {
+            name: "Home Router".to_string(),
+            location: "http://192.168.1.1:5000/rootDesc.xml".to_string(),
+        })
+    }
+
+    /// No forwarder is not asking: a loopback listener, or no session.
+    #[test]
+    fn no_forwarder_reads_as_not_asking() {
+        assert_eq!(
+            port_forwarding_status(None, Some(42000)),
+            PortForwardingStatus::default()
+        );
+        assert!(!PortForwardingStatus::default().enabled);
+    }
+
+    /// Before the first search ends, the reading is "asking, nothing known
+    /// yet": no router, nothing held, and no error.
+    #[test]
+    fn a_forwarder_that_has_not_searched_yet_is_asking_and_knows_nothing() {
+        assert_eq!(
+            port_forwarding_status(Some(&forwarder_state(42000)), Some(42000)),
+            PortForwardingStatus {
+                enabled: true,
+                searched: false,
+                gateway: None,
+                port: Some(42000),
+                held: false,
+                error: None,
+            }
+        );
+    }
+
+    /// A search nobody answered is no router, not an error.
+    #[test]
+    fn a_search_nobody_answered_is_no_router_and_no_error() {
+        let state = librqbit::PortForwardingState {
+            searched: true,
+            ..forwarder_state(42000)
+        };
+        let status = port_forwarding_status(Some(&state), Some(42000));
+        assert!(status.enabled);
+        assert!(status.searched);
+        assert_eq!(status.gateway, None);
+        assert!(!status.held);
+        assert_eq!(status.error, None);
+    }
+
+    /// A router holding the mapping is "reachable through the router", and
+    /// it is named.
+    #[test]
+    fn a_held_mapping_reads_as_reachable_through_the_named_router() {
+        let mut state = librqbit::PortForwardingState {
+            searched: true,
+            gateway: router(),
+            ..forwarder_state(42000)
+        };
+        state.ports[0].held = true;
+        state.ports[0].held_via = vec!["http://192.168.1.1:5000/ctl/IPConn".to_string()];
+        state.ports[0].mapped_at = Some(std::time::SystemTime::now());
+        let status = port_forwarding_status(Some(&state), Some(42000));
+        assert_eq!(status.gateway.as_deref(), Some("Home Router"));
+        assert!(status.held);
+        assert_eq!(status.error, None);
+    }
+
+    /// A refused mapping is the error while it stands.
+    #[test]
+    fn a_refused_mapping_is_the_error() {
+        let mut state = librqbit::PortForwardingState {
+            searched: true,
+            gateway: router(),
+            ..forwarder_state(42000)
+        };
+        state.ports[0].error = Some("ConflictInMappingEntry".to_string());
+        let status = port_forwarding_status(Some(&state), Some(42000));
+        assert!(!status.held);
+        assert_eq!(status.error.as_deref(), Some("ConflictInMappingEntry"));
+    }
+
+    /// A failed search stands before a mapping error, since no mapping can
+    /// be asked for without a router.
+    #[test]
+    fn a_failed_search_is_the_error_before_a_mapping_error() {
+        let mut state = librqbit::PortForwardingState {
+            searched: true,
+            discovery_error: Some("network unreachable".to_string()),
+            ..forwarder_state(42000)
+        };
+        state.ports[0].error = Some("ConflictInMappingEntry".to_string());
+        let status = port_forwarding_status(Some(&state), Some(42000));
+        assert_eq!(status.error.as_deref(), Some("network unreachable"));
+    }
+
+    /// The reading is of the announced port, not of whichever port comes
+    /// first in the forwarder's list.
+    #[test]
+    fn the_reading_is_of_the_announced_port() {
+        let mut state = forwarder_state(41000);
+        state.ports[0].held = true;
+        state.ports.push(librqbit::PortMappingState {
+            port: 42000,
+            held: false,
+            held_via: Vec::new(),
+            mapped_at: None,
+            error: Some("refused".to_string()),
+        });
+        let status = port_forwarding_status(Some(&state), Some(42000));
+        assert_eq!(status.port, Some(42000));
+        assert!(!status.held);
+        assert_eq!(status.error.as_deref(), Some("refused"));
+    }
+
+    /// A session that asks no router reads `enabled: false`, so a panel
+    /// can tell it from one whose router said no.
+    #[tokio::test]
+    async fn a_loopback_session_reports_forwarding_as_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (backend, _) = LibrqbitBackend::new_with_settings(
+            tmp.path().to_path_buf(),
+            TorrentListenPort::Loopback,
+            Vec::new(),
+            BootstrapResolvers::offline(),
+            SessionTuning {
+                dht: false,
+                lsd: false,
+                ..SessionTuning::default()
+            },
+        )
+        .await
+        .expect("loopback session");
+        assert!(
+            backend.session.listen_addr().is_some(),
+            "the listener is up"
+        );
+        assert_eq!(
+            backend.port_forwarding_status(),
+            PortForwardingStatus::default()
+        );
     }
 
     /// The exact list, not just "non-empty and well-formed". Every entry

@@ -68,6 +68,13 @@ pub fn dht_status(state: &AppState) -> enginefs::backend::DhtStatus {
     state.engine.clone().dht_status()
 }
 
+/// Whether the router forwards the torrent listener's port -- see
+/// [`enginefs::backend::PortForwardingStatus`]. It is behind
+/// [`crate::ServerHandle::port_forwarding_status`]. No route reports it.
+pub fn port_forwarding_status(state: &AppState) -> enginefs::backend::PortForwardingStatus {
+    state.engine.clone().port_forwarding_status()
+}
+
 // stremio-core probes this at startup (models/streaming_server.rs) expecting
 // `{"availableHardwareAccelerations": [...]}`. This fork does no transcoding
 // and has no hwaccel profiles, so an empty list is the honest answer. The
