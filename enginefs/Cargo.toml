@@ -27,7 +27,7 @@ test-hooks = []
 # `sha1-crypto-hash` (openssl-backed) to `sha1-ring` (aws-lc-rs-backed) and keeps
 # reqwest on rustls, so nothing here pulls in openssl-sys. `http-api-client` is
 # kept because backend/librqbit.rs uses librqbit::api::TorrentIdOrHash.
-librqbit = { git = "https://github.com/zond/rqbit", rev = "bd2a11526c1171d0e798bbba21fd6870c81b5da6", default-features = false, features = [
+librqbit = { git = "https://github.com/zond/rqbit", rev = "ea42f3a4edae5ea2223664cf712a725cfcb96379", default-features = false, features = [
     "rust-tls",
     "http-api-client",
 ] }
@@ -38,7 +38,7 @@ librqbit = { git = "https://github.com/zond/rqbit", rev = "bd2a11526c1171d0e798b
 # and would not satisfy the trait. `default-features=false` keeps its
 # `sha1-crypto-hash` default out of the feature union, which is what the note
 # above is protecting.
-librqbit-core = { git = "https://github.com/zond/rqbit", rev = "bd2a11526c1171d0e798bbba21fd6870c81b5da6", default-features = false }
+librqbit-core = { git = "https://github.com/zond/rqbit", rev = "ea42f3a4edae5ea2223664cf712a725cfcb96379", default-features = false }
 tokio = { version = "1.42.0", features = [
     "rt-multi-thread",
     "macros",

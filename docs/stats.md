@@ -107,7 +107,7 @@ The server asks the router to forward the torrent listener's port over UPnP, so 
 | `held` | Whether the router holds the mapping right now. This is "reachable through the router" |
 | `error` | Why the search or the mapping failed, while it stands |
 
-**No router is not an error.** A cellular network has none, and many home routers have UPnP turned off. Then `searched` is true, `gateway` is `null` and `error` is `null`. The torrent still downloads. Peers behind NAT just cannot dial in. The forwarder logs each condition once, at WARN when it starts and INFO when it clears (`librqbit_upnp=info` in the default directives). While nothing answers, it waits 60 seconds before searching again and doubles the wait each time, up to 10 minutes, so a panel need not poll it quickly.
+**No router is not an error.** A cellular network has none, and many home routers have UPnP turned off. Then `searched` is true, `gateway` is `null` and `error` is `null`. The torrent still downloads. Peers behind NAT just cannot dial in. The forwarder logs each condition once, at WARN when it starts and INFO when it clears (`librqbit_upnp=info` in the default directives). While nothing answers, it waits 60 seconds before searching again and doubles the wait each time, up to 10 minutes, so a panel need not poll it quickly. A router that answers neither of two searches in a row, as after a move to another network, is forgotten: its mapping is no longer renewed, `held` drops and its `error` is cleared, and it is asked again if it answers again. One search it misses is a reply lost on the way, and changes nothing.
 
 ### Query parameters and metadata resolution
 
