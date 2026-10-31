@@ -1387,9 +1387,8 @@ pub const DEFAULT_LISTEN_PORT_RANGE: std::ops::Range<u16> = 42000..42010;
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TorrentListenPort {
     /// Try each port of the range in order and keep the first that binds.
-    /// Fail if none does. This gives a stable, forwardable port, which is
-    /// what a UPnP mapping needs to be worth taking. An embedder that wants
-    /// one asks for this explicitly.
+    /// Fail if none does. This gives a stable port, for an embedder that
+    /// wants one (a firewall rule by hand, say). It asks for it explicitly.
     Fixed(std::ops::Range<u16>),
     /// Port 0: the OS picks a free port (librqbit reads the bound address
     /// back and announces that port). This is the default here, in
@@ -1422,25 +1421,29 @@ impl TorrentListenPort {
         }
     }
 
-    /// Whether a UPnP port-forwarding request for this listener is worth
-    /// making at all.
+    /// Whether to ask the router, over UPnP, to forward this listener's
+    /// port to us.
     ///
-    /// Only for [`Self::Fixed`]. A forwarded mapping is a lease on the
-    /// router for one external port number. It is only worth anything if
-    /// the same port comes back next launch. That is precisely what `Fixed`
-    /// means, and why only an embedder that asked for a fixed port gets a
-    /// mapping. An [`Self::Ephemeral`] listener (the `ServerConfig` default)
-    /// binds a different port every launch. So each run asks the router for
-    /// a fresh mapping and leaves the previous one to expire on its own, and
-    /// the embedders that use it get nothing durable out of it. On Android
-    /// the request cannot succeed at all. SSDP discovery is multicast the app
-    /// sandbox is not permitted to send ("Operation not permitted (os error
-    /// 1)" in a real device log), and on a cellular APN there is no gateway
-    /// to ask. Meanwhile librqbit's forwarder retries on an interval
-    /// *forever*, so every failure is a `librqbit_upnp` WARN for the whole
-    /// life of the process.
+    /// Yes for [`Self::Fixed`] and [`Self::Ephemeral`], no for
+    /// [`Self::Loopback`], which nothing off this machine may reach. A
+    /// forwarded port lets peers behind NAT dial in. They cannot reach us
+    /// any other way.
+    ///
+    /// An OS-picked port suits forwarding well. librqbit's forwarder leases
+    /// a mapping for 60 seconds and renews it every 30. So a mapping is gone
+    /// within a minute of the process exiting, and a launch leaves nothing
+    /// behind on the router. The forwarder maps the external port to the same
+    /// number as the internal one, with no fallback. Two devices on one
+    /// network sharing a fixed port would collide, while two OS-picked
+    /// ports almost never do. The listener announces the port it bound, so
+    /// trackers and the DHT hand peers the right number.
+    ///
+    /// Nothing on Android forbids the request. The SSDP search is one UDP
+    /// datagram, sent under the Internet permission, and the replies come
+    /// back unicast. Where there is no gateway (a cellular network) or the
+    /// router has UPnP off, the forwarder says so once and backs off.
     pub fn wants_upnp_forwarding(&self) -> bool {
-        matches!(self, Self::Fixed(_))
+        matches!(self, Self::Fixed(_) | Self::Ephemeral)
     }
 }
 

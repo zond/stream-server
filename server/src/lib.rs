@@ -73,23 +73,23 @@ pub use url::Url;
 /// (`torrent_error_state`). But it does so only when something polls the
 /// torrent's statistics, so it cannot be relied on to notice a disk problem
 /// by itself. It is WARN, not INFO, because librqbit is chatty per-peer at
-/// INFO and would drown the log. `librqbit_dht::dht` and `librqbit_upnp` are
-/// turned back down to ERROR on top of that. Both retry a network operation
-/// forever and WARN on every single attempt. `librqbit_dht::dht`'s only WARN
-/// is the bootstrap retry notifier (`dht.rs`'s
+/// INFO and would drown the log. `librqbit_dht::dht` is turned back down to
+/// ERROR on top of that. It retries the bootstrap forever and WARNs on every
+/// single attempt. Its only WARN is the bootstrap retry notifier (`dht.rs`'s
 /// `bootstrap_hostname_with_backoff`). On a network that drops the DHT's UDP
 /// it fires for every host, forever. A real 28-minute Android session was
-/// hundreds of identical lines and no conclusion. `librqbit_upnp`'s are the
-/// SSDP-discovery and port-forward loops, which retry on a fixed interval
-/// whatever happens. Neither is actionable per attempt. The *state* both are
-/// trying to describe is now reported once, properly, by
-/// `diagnostics::dht_health` (DHT), or is simply not a problem (UPnP). UPnP
-/// is only enabled for a fixed listen port at all (see
-/// `TorrentListenPort::wants_upnp_forwarding`). It is ERROR rather than OFF
-/// so a genuinely fatal DHT error still lands. `librqbit_dht`'s persistence
-/// warnings are on a different target and keep their level.
+/// hundreds of identical lines and no conclusion. The *state* it is trying
+/// to describe is reported once, properly, by `diagnostics::dht_health`. It
+/// is ERROR rather than OFF so a genuinely fatal DHT error still lands.
+/// `librqbit_dht`'s persistence warnings are on a different target and keep
+/// their level.
+///
+/// `librqbit_upnp` is at INFO, the same shape `diagnostics::dht_health`
+/// reports in. The forwarder warns once when a condition starts (no gateway,
+/// a failed search, a refused mapping), and notes at info when it clears.
+/// While a condition lasts, it logs at debug only.
 pub(crate) const DEFAULT_LOG_FILTER: &str = "stream_server=info,tower_http=info,\
-     enginefs=info,librqbit=warn,librqbit_dht::dht=error,librqbit_upnp=error";
+     enginefs=info,librqbit=warn,librqbit_dht::dht=error,librqbit_upnp=info";
 
 /// The port stremio-core's default profile builds `streaming_server_url` from
 /// (`http://127.0.0.1:11470/`). That is why [`ServerConfig::default`] binds
@@ -296,10 +296,10 @@ pub struct ServerConfig {
     pub pins: Option<Vec<PinKey>>,
     /// The port librqbit's incoming BitTorrent listener binds. It is
     /// [`TorrentListenPort::Ephemeral`] by default, so any number of embedded
-    /// servers (and the tests) coexist. An embedder that needs a fixed,
-    /// forwardable port sets [`TorrentListenPort::Fixed`] itself. One that
-    /// must not be reachable off the machine (a test) sets
-    /// [`TorrentListenPort::Loopback`].
+    /// servers coexist. An embedder that needs a stable port sets
+    /// [`TorrentListenPort::Fixed`] itself. Both ask the router to forward
+    /// the port over UPnP. One that must not be reachable off the machine (a
+    /// test) sets [`TorrentListenPort::Loopback`], which asks for nothing.
     pub torrent_listen_port: TorrentListenPort,
     /// Where the LAN media listener binds when it runs. It is a second HTTP
     /// listener serving `/cast/{token}` (and a rendition's
@@ -2863,16 +2863,18 @@ mod default_log_filter_tests {
         tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER);
     }
 
-    /// The two chronically-noisy librqbit targets are silenced at WARN while
-    /// the rest of `librqbit` keeps it. The piece-write failure that makes a
-    /// full cache volume visible is a `librqbit::` WARN and must survive.
+    /// The chronically-noisy DHT target is silenced at WARN while the rest
+    /// of `librqbit` keeps it. The piece-write failure that makes a full
+    /// cache volume visible is a `librqbit::` WARN and must survive. The
+    /// UPnP forwarder's conclusions get through at INFO, and its per-attempt
+    /// debug lines do not.
     ///
     /// It is asserted through a real subscriber rather than by reading the
     /// string. It depends on `EnvFilter` preferring the more specific
     /// directive (`librqbit_dht::dht=error`) over the prefix one
     /// (`librqbit=warn`) for the same event, and that is the whole mechanism.
     #[test]
-    fn the_repeating_dht_and_upnp_warnings_are_filtered_out_but_librqbit_warn_is_not() {
+    fn the_repeating_dht_warnings_are_filtered_out_and_the_upnp_conclusions_are_not() {
         use std::sync::{Arc, Mutex};
         use tracing_subscriber::layer::SubscriberExt;
 
@@ -2898,11 +2900,14 @@ mod default_log_filter_tests {
         tracing::subscriber::with_default(subscriber, || {
             // The two the field log drowned in.
             tracing::warn!(target: "librqbit_dht::dht", "error in bootstrap");
-            tracing::warn!(target: "librqbit_upnp", "failed to run SSDP/UPNP discovery");
+            // A UPnP condition that lasts: debug after its first warning.
+            tracing::debug!(target: "librqbit_upnp", "no UPnP gateway answered");
             // Must still get through.
             tracing::error!(target: "librqbit_dht::dht", "dht: error in get_peers_root()");
             tracing::warn!(target: "librqbit_dht::persistence", "cannot deserialize routing table");
             tracing::warn!(target: "librqbit::torrent_state", "error writing piece");
+            tracing::warn!(target: "librqbit_upnp", "no UPnP gateway answered");
+            tracing::info!(target: "librqbit_upnp", "a UPnP gateway answered");
             tracing::info!(target: "stream_server::lib", "listening");
         });
 
@@ -2913,6 +2918,8 @@ mod default_log_filter_tests {
                 "librqbit_dht::dht",
                 "librqbit_dht::persistence",
                 "librqbit::torrent_state",
+                "librqbit_upnp",
+                "librqbit_upnp",
                 "stream_server::lib",
             ]
         );

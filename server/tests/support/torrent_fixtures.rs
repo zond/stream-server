@@ -35,7 +35,8 @@ pub fn offline_config() -> ServerConfig {
         // would then find each other and feed each other pieces.
         enable_local_service_discovery: false,
         enable_dht: false,
-        // Nor reachable: the torrent listener on loopback alone.
+        // Nor reachable: the torrent listener on loopback alone. That also
+        // keeps the UPnP forwarder off, so no test sends an SSDP search.
         torrent_listen_port: enginefs::backend::TorrentListenPort::Loopback,
         // An embedder that keeps a pin record and has nothing in it yet.
         // `None` is not the same thing. It is "nobody said", which keeps

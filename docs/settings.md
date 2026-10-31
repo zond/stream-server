@@ -92,8 +92,10 @@ and `btNumOutgoingPorts` are accepted, echoed back and persisted like every
 other key, and none of them reaches librqbit. The incoming listener is the
 launch configuration's `TorrentListenPort`. It is `Ephemeral` by default, so
 the OS picks the port, or `Fixed(42000..42010)` for an embedder that wants
-one it can forward (the only case UPnP is asked for). Outgoing ports are the
-OS's to pick, and librqbit has no knob for a fixed range.
+a stable one. Either way the server asks the router to forward the port
+over UPnP. Only a `Loopback` listener, which is for tests, does not ask.
+Outgoing ports are the OS's to pick, and librqbit has no knob for a fixed
+range.
 
 ### Tracker and Peer Proxy
 

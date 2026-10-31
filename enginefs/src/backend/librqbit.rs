@@ -1097,12 +1097,11 @@ impl LibrqbitBackend {
             let session_opts = librqbit::SessionOptions {
                 listen: Some(librqbit::ListenerOptions {
                     listen_addr: (listen_port.bind_ip(), port).into(),
-                    // Only for a fixed, repeatable port (see
-                    // `TorrentListenPort::wants_upnp_forwarding`). An
-                    // ephemeral listener would ask the router for a
-                    // mapping it can never reuse. On the Android embed
-                    // the request cannot succeed at all, while
-                    // librqbit's forwarder retries (and WARNs) forever.
+                    // Every listener but a loopback one asks the router
+                    // to forward its port, the OS-picked one included (see
+                    // `TorrentListenPort::wants_upnp_forwarding`). The
+                    // lease runs out within a minute of the process
+                    // exiting, so nothing is left on the router.
                     enable_upnp_port_forwarding: upnp_forwarding,
                     ..Default::default()
                 }),
@@ -3452,16 +3451,16 @@ mod tests {
         assert_ne!(port, 0, "{entry:?} has the zero port");
     }
 
-    /// UPnP is asked for only when the mapping it installs is worth having
-    /// next launch (see `TorrentListenPort::wants_upnp_forwarding`). The
-    /// embedded/JNI/test default is `Ephemeral`. There librqbit's forwarder
-    /// would otherwise retry (and WARN) on a loop for the life of the
-    /// process, for a port number that never comes back.
+    /// Every listener peers can reach asks the router to forward its port:
+    /// the OS-picked default and a fixed range alike. A loopback listener,
+    /// which nothing off this machine may reach, never does. That is also
+    /// what keeps the test sessions from sending an SSDP search.
     #[test]
-    fn only_a_fixed_listen_port_asks_the_router_to_forward() {
-        assert!(!TorrentListenPort::default().wants_upnp_forwarding());
+    fn every_reachable_listen_port_asks_the_router_to_forward() {
+        assert!(TorrentListenPort::default().wants_upnp_forwarding());
+        assert!(TorrentListenPort::Ephemeral.wants_upnp_forwarding());
         assert!(TorrentListenPort::Fixed(DEFAULT_LISTEN_PORT_RANGE).wants_upnp_forwarding());
-        assert!(!TorrentListenPort::Ephemeral.wants_upnp_forwarding());
+        assert!(!TorrentListenPort::Loopback.wants_upnp_forwarding());
     }
 
     /// A backend built without a DHT says so, rather than looking like one
@@ -3609,38 +3608,39 @@ mod tests {
     /// spurious failure.
     const TEST_WAIT_BOUND: Duration = Duration::from_secs(60);
 
-    /// `Ephemeral` sessions never collide: the OS hands each its own port.
-    /// (Whether a second bind of an already-taken *fixed* port fails is
-    /// platform-dependent, since Windows lets it through, so that is not
-    /// asserted here.)
+    /// Sessions on an OS-picked port never collide: the OS hands each its
+    /// own. They listen on loopback, which shares the port-0 path with
+    /// `Ephemeral` and asks no router to forward anything. (Whether a second
+    /// bind of an already-taken *fixed* port fails is platform-dependent,
+    /// since Windows lets it through, so that is not asserted here.)
     #[tokio::test(flavor = "multi_thread")]
-    async fn ephemeral_sessions_coexist() {
+    async fn os_picked_port_sessions_coexist() {
         let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
 
         // `offline()`, because this test is about port binding. A real
         // resolver here would put a DNS lookup on a hermetic test's path.
         let (a, _) = LibrqbitBackend::new(
             dirs[0].path().to_path_buf(),
-            TorrentListenPort::Ephemeral,
+            TorrentListenPort::Loopback,
             Vec::new(),
             BootstrapResolvers::offline(),
         )
         .await
-        .expect("first ephemeral session");
+        .expect("first session");
         let (b, _) = LibrqbitBackend::new(
             dirs[1].path().to_path_buf(),
-            TorrentListenPort::Ephemeral,
+            TorrentListenPort::Loopback,
             Vec::new(),
             BootstrapResolvers::offline(),
         )
         .await
-        .expect("second ephemeral session alongside the first");
+        .expect("second session alongside the first");
 
         let pa = a.session.listen_addr().expect("listening").port();
         let pb = b.session.listen_addr().expect("listening").port();
         assert_ne!(pa, 0);
         assert_ne!(pb, 0);
-        assert_ne!(pa, pb, "each ephemeral session gets its own port");
+        assert_ne!(pa, pb, "each session gets its own port");
     }
 
     fn privacy_with_proxy(kind: TorrentProxyType, host: &str, port: u16) -> TorrentPrivacyConfig {
@@ -3805,7 +3805,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (backend, _) = LibrqbitBackend::new_with_settings(
             tmp.path().to_path_buf(),
-            TorrentListenPort::Ephemeral,
+            TorrentListenPort::Loopback,
             Vec::new(),
             BootstrapResolvers::offline(),
             SessionTuning::from_settings(
@@ -3851,7 +3851,7 @@ mod tests {
         };
         let (backend, _) = LibrqbitBackend::new_with_settings(
             tmp.path().to_path_buf(),
-            TorrentListenPort::Ephemeral,
+            TorrentListenPort::Loopback,
             Vec::new(),
             BootstrapResolvers::offline(),
             SessionTuning::from_settings(&profile, &privacy),
@@ -3957,7 +3957,7 @@ mod tests {
         );
         let (backend, _) = LibrqbitBackend::new_with_settings(
             tmp.path().to_path_buf(),
-            TorrentListenPort::Ephemeral,
+            TorrentListenPort::Loopback,
             Vec::new(),
             BootstrapResolvers::offline(),
             tuning,
@@ -3993,7 +3993,7 @@ mod tests {
         };
         let (backend, _) = LibrqbitBackend::new_with_settings(
             tmp.path().join("dl"),
-            TorrentListenPort::Ephemeral,
+            TorrentListenPort::Loopback,
             Vec::new(),
             BootstrapResolvers::offline(),
             SessionTuning::from_settings(&TorrentSpeedProfile::default(), &privacy),
@@ -7486,7 +7486,7 @@ mod tests {
         // peers, so nothing here waits for the network.
         let (backend, _) = LibrqbitBackend::new_with_settings(
             tmp.path().join("dl"),
-            TorrentListenPort::Ephemeral,
+            TorrentListenPort::Loopback,
             Vec::new(),
             BootstrapResolvers::offline(),
             SessionTuning {

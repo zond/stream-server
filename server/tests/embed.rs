@@ -1,9 +1,10 @@
 // Every test in this file starts a full embedded server. Both of its ports
-// are ephemeral: the HTTP port (`http_addr` port 0) and librqbit's
-// BitTorrent listener, through `ServerConfig`'s default
-// `TorrentListenPort::Ephemeral`. So any number of these servers coexist
+// are OS-picked: the HTTP port (`http_addr` port 0) and librqbit's
+// BitTorrent listener, through `offline_config`'s
+// `TorrentListenPort::Loopback`. So any number of these servers coexist
 // with each other and with a desktop instance on its fixed 42000..42010
-// range, and `cargo test`'s parallelism needs no limiting.
+// range, and `cargo test`'s parallelism needs no limiting. A loopback
+// listener also asks no router to forward its port.
 
 use stream_server::{ServerAuth, ServerConfig, ServerHandle, TorrentListenPort};
 
@@ -128,8 +129,8 @@ fn the_stock_config_generates_a_token() {
 }
 
 /// A server takes an OS-assigned BitTorrent listen port, so any number of
-/// them coexist. The fixed, forwardable range is still reachable, but only
-/// for an embedder that names it. The type's own `Default` is `Ephemeral`
+/// them coexist. The fixed range is still reachable, but only for an
+/// embedder that names it. The type's own `Default` is `Ephemeral`
 /// too, so `..Default::default()` on any config holding one cannot bind it.
 #[test]
 fn the_stock_config_uses_an_ephemeral_torrent_port() {

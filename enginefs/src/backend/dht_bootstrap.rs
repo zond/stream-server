@@ -58,9 +58,11 @@
 //! **This fixes the DNS half only.** The network may drop the DHT's UDP
 //! outright: carrier-grade NAT, a firewalled mobile APN, a captive portal.
 //! Then perfectly correct bootstrap addresses change nothing, because the
-//! queries never leave. A network that blocks this traffic wholesale looks
-//! like SSDP refused with `EPERM` and UPnP timing out alongside a DNS
-//! failure. Resolving names ourselves removes one specific, observed cause
+//! queries never leave. The device can also cut the app off itself. A
+//! sleeping Android TV's doze mode takes the app's network away, and then
+//! everything fails at once: DNS, the DHT, and the UPnP search (refused with
+//! `EPERM`). That is power saving, not a rule against any one of them.
+//! Resolving names ourselves removes one specific, observed cause
 //! of bootstrap failure. It is not a fix for "the DHT does not work on this
 //! network", and `diagnostics::dht_health` still exists to say so once.
 

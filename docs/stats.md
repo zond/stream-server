@@ -90,7 +90,13 @@ So a client should treat `enabled && !everBootstrapped` as an **informational st
 
 **The bootstrap list is the two hosts measured to answer**: `dht.libtorrent.org:25401` and `dht.transmissionbt.com:6881`. `router.utorrent.com`, `dht.aelitis.com` and `router.bittorrent.com` resolve but answer no mainline `ping` or `find_node` from either of two networks tried, so they are left out. A name that never replies is retry noise, not resilience. Do not add a host without pinging it first. `dhtBootstrapNodes` ([settings.md](settings.md)) replaces the list.
 
-librqbit's own per-attempt DHT and UPnP warnings (`librqbit_dht::dht` and `librqbit_upnp`) are pinned to `error` in the default log directives, so they do not appear at INFO. Both retry forever and warn on every attempt, which would otherwise produce hundreds of identical lines and no conclusion. The single conclusion from `diagnostics::dht_health` stands in their place. UPnP port forwarding is only requested for a **fixed** torrent listen port (`TorrentListenPort::Fixed`, `42000..42010`). An ephemeral one (the default, and what xtremio uses) asks the router for a mapping that never comes back.
+librqbit's own per-attempt DHT warnings (`librqbit_dht::dht`) are pinned to `error` in the default log directives, so they do not appear at INFO. The DHT retries forever and warns on every attempt, which would otherwise produce hundreds of identical lines and no conclusion. The single conclusion from `diagnostics::dht_health` stands in their place.
+
+### Port forwarding
+
+The server asks the router to forward the torrent listener's port over UPnP, so peers behind NAT can dial in. It does so for the OS-picked port (`TorrentListenPort::Ephemeral`, the default) and for a fixed range alike. Only a `Loopback` listener does not ask. The mapping is leased for 60 seconds and renewed every 30, so it is gone within a minute of the app exiting. The forwarder maps the same external port number as the internal one. Two devices on one network almost never pick the same OS-chosen port, where a shared fixed port would collide.
+
+**No router is not an error.** A cellular network has none, and many home routers have UPnP turned off. The torrent still downloads. Peers behind NAT just cannot dial in. The forwarder logs each condition once, at WARN when it starts and INFO when it clears (`librqbit_upnp=info` in the default directives). While nothing answers, it waits 60 seconds before searching again and doubles the wait each time, up to 10 minutes.
 
 ### Query parameters and metadata resolution
 
