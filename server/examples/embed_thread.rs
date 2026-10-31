@@ -14,6 +14,10 @@ fn main() -> anyhow::Result<()> {
         // does. Asking for one only risks losing the bind to a desktop
         // Stremio or to a second copy of this example.
         http_addr: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+        // A loopback torrent listener, which asks no router for a port. The
+        // default listener would send an SSDP search onto whatever network
+        // runs this, and CI is not where that belongs.
+        torrent_listen_port: stream_server::TorrentListenPort::Loopback,
         ..stream_server::ServerConfig::default()
     })?;
 
@@ -39,6 +43,12 @@ fn main() -> anyhow::Result<()> {
     println!(
         "serverVersion by call: {}",
         handle.settings()?.server_version
+    );
+    // Whether the router is being asked to let peers in: not for a loopback
+    // listener, which is what this example runs.
+    println!(
+        "asks the router for a port: {}",
+        handle.port_forwarding_status().enabled
     );
 
     handle.shutdown()?;
