@@ -402,6 +402,21 @@ mod tests {
         registry.held(HASH).map(|held| held.in_range(0..4))
     }
 
+    /// Wait for a store whose last handle was just dropped to be gone.
+    ///
+    /// A store is gone when nothing holds it, and a commit holds it. The
+    /// committer thread says a commit has landed and lets go of it a moment
+    /// later, so a test that dropped its last handle after
+    /// `complete_piece_and_wait` can still find the store standing. Reading
+    /// the registry at once failed about one run in eight on a busy machine.
+    fn until_gone(what: &str, mut gone: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !gone() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     /// **A piece the store accepts reaches the torrent's watcher**, which is
     /// what commits a drawn piece on the event rather than on the next
     /// retention pass's reading of a listing.
@@ -534,9 +549,9 @@ mod tests {
             "a taken handle dropping leaves the Inner its successor still holds"
         );
         drop(taken);
-        assert!(
-            registry.held(HASH).is_none(),
-            "the last handle gone, the hash has no store: unknown, not empty"
+        until_gone(
+            "the last handle gone, the hash has no store: unknown, not empty",
+            || registry.held(HASH).is_none(),
         );
         assert_eq!(
             registry.registration_count(),
@@ -799,10 +814,9 @@ mod tests {
             "an unlink takes its bytes off the count"
         );
         drop(other);
-        assert_eq!(
-            registry.occupancy(),
-            6,
-            "a store that is gone holds nothing"
-        );
+        until_gone("a store that is gone holds nothing", || {
+            registry.occupancy() != 6 + 16
+        });
+        assert_eq!(registry.occupancy(), 6);
     }
 }
