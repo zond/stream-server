@@ -66,7 +66,7 @@ mime_guess = "2.0.5"
 # under rustls and under librqbit's SHA-1, so the crate's default
 # `crypto-aws-lc` would change RAR's crypto backend and not what the build
 # needs.
-unrar-rs = { version = "0.10", default-features = false, features = [
+unrar-rs = { version = "0.16", default-features = false, features = [
     "crypto-rust",
 ], optional = true }
 lz-str = "0.2.1"
@@ -84,7 +84,7 @@ lz-str = "0.2.1"
 # deprecates it because the RFC prefers explicit FTPS; the URL a caller
 # hands this route does not, and `curl` reads `ftps://` the implicit way
 # too. Dropping it would silently turn one scheme into a different protocol.
-suppaftp = { version = "12.0.0", default-features = false, features = [
+suppaftp = { version = "13.0.0", default-features = false, features = [
     "tokio",
     "tokio-rustls-aws-lc-rs",
     "deprecated",
@@ -113,9 +113,9 @@ uuid = "1.19.0"
 bytes = "1.11.0"
 # Pure-Rust 7z decompression (also used by tests to write fixtures via the
 # default "compress" feature); no C++ toolchain or libclang required.
-sevenz-rust2 = "0.23.0"
+sevenz-rust2 = "0.27.0"
 chrono = "0.4.42"
-sysinfo = "0.39.5"
+sysinfo = "0.40.4"
 
 [dev-dependencies]
 # Fixture writers and scratch roots: the ZIP and tar translators parse by
@@ -128,7 +128,7 @@ tempfile = "3.23.0"
 # The TLS origin `server/tests/proxy.rs` stands up to test what `/proxy` does
 # with an HTTPS upstream -- a test-only use: nothing in the library speaks
 # TLS server-side.
-axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+axum-server = { version = "0.9.2", features = ["tls-rustls"] }
 # Turns on the test-root registry in the same enginefs the tests link, so the
 # proxy's TLS fixture can present a chain that verifies, and the retention
 # owner's test hook, which is how a proxy test stands inside a pass. Feature

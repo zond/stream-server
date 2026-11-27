@@ -21,11 +21,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Matches the 1.98.0 pin in rust-toolchain.toml. The @master ref of
+      # Matches the 1.100.0 pin in rust-toolchain.toml. The @master ref of
       # this action requires an explicit `toolchain` input; the version-named
       # ref installs that version directly.
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: rustfmt
 
@@ -38,11 +38,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Matches the 1.98.0 pin in rust-toolchain.toml. The @master ref of
+      # Matches the 1.100.0 pin in rust-toolchain.toml. The @master ref of
       # this action requires an explicit `toolchain` input; the version-named
       # ref installs that version directly.
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: clippy
 
@@ -100,7 +100,7 @@ jobs:
       # always compiled and is not a feature, so no backend feature needs to
       # be named. No apt installs.
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@1.100.0
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
@@ -117,7 +117,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@1.100.0
         with:
           targets: armv7-linux-androideabi,aarch64-linux-android
 
@@ -153,11 +153,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Matches the 1.98.0 pin in rust-toolchain.toml. The @master ref of
+      # Matches the 1.100.0 pin in rust-toolchain.toml. The @master ref of
       # this action requires an explicit `toolchain` input; the version-named
       # ref installs that version directly.
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@1.100.0
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2

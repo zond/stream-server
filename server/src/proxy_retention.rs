@@ -1301,7 +1301,7 @@ impl Occupancy {
     fn take(&self, bytes: u64) {
         let _ = self
             .occupied
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
                 Some(held.saturating_sub(bytes))
             });
     }

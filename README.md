@@ -97,7 +97,7 @@ The full route table, the `ServerHandle` method reference, archive behaviour and
 
 There is nothing to install: this crate builds no program of its own. An embedder adds it as a path or git dependency and calls `stream_server::start` (see [Quick Start](#quick-start)). Building here checks that it compiles and runs its tests.
 
-It needs Rust through [rustup](https://rustup.rs) and a C compiler. `rust-toolchain.toml` pins the exact toolchain (1.98.0), and rustup installs it on the first build. The C is what `aws-lc-sys` bundles and builds from source (and, on macOS, a one-file shim `network-interface` compiles). No feature combination needs a system library. The C compiler is `build-essential` on Debian and Ubuntu, `base-devel` on Arch, `gcc` on Fedora, the Xcode command-line tools on macOS, and the MSVC C++ build tools rustup asks for on Windows.
+It needs Rust through [rustup](https://rustup.rs) and a C compiler. `rust-toolchain.toml` pins the exact toolchain (1.100.0), and rustup installs it on the first build. The C is what `aws-lc-sys` bundles and builds from source (and, on macOS, a one-file shim `network-interface` compiles). No feature combination needs a system library. The C compiler is `build-essential` on Debian and Ubuntu, `base-devel` on Arch, `gcc` on Fedora, the Xcode command-line tools on macOS, and the MSVC C++ build tools rustup asks for on Windows.
 
 ```bash
 cargo test                                  # default features: RAR on, through unrar-rs
@@ -112,7 +112,7 @@ ZIP, 7Z, TAR and ISO streaming are always built in, and no feature gates them. T
 
 ### CI
 
-[`ci.yml`](.github/workflows/ci.yml) runs on every push and pull request to `master`/`main`, on the pinned 1.98.0 toolchain, with no `apt install` step:
+[`ci.yml`](.github/workflows/ci.yml) runs on every push and pull request to `master`/`main`, on the pinned 1.100.0 toolchain, with no `apt install` step:
 
 | Job | What it runs |
 |---|---|

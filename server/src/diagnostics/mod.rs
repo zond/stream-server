@@ -19,7 +19,14 @@ pub struct ProcessMemorySnapshot {
 /// handful of reads of `/proc/self`.
 pub fn process_memory_snapshot() -> ProcessMemorySnapshot {
     let pid = Pid::from_u32(std::process::id());
-    let mut system = System::new();
+    // sysinfo can refuse to start on a system it cannot read. The panic
+    // line then reports no memory, which the hook must survive.
+    let Ok(mut system) = System::new() else {
+        return ProcessMemorySnapshot {
+            rss_bytes: 0,
+            virtual_memory_bytes: 0,
+        };
+    };
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[pid]),
         false,

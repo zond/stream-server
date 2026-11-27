@@ -5,7 +5,7 @@
 //! A rendition is a published cast token ([`crate::ServerHandle::publish_rendition`])
 //! with **one progressive fragmented MP4** behind it
 //! (`/cast/{token}/stream.mp4`, `crate::cast`). Each media segment is
-//! produced on demand by a [`Producer`](crate::rendition::Producer) the
+//! produced on demand by a [`Producer`] the
 //! embedder installed. The producer demuxes, decodes and encodes, which
 //! the server never does itself. The server's half is everything else: the
 //! route, the file's byte layout, the cut rule, the fMP4 muxer (`mux.rs`),
@@ -65,7 +65,7 @@
 //!   of busy time once its first slot is out. Busy time leaves out the
 //!   sink's and the reader's waits (`speed.rs`).
 //! * **Cut by unpublish**, as a plain cast is. The run is dropped (its sink
-//!   answers [`Stopped`](crate::rendition::Stopped), its reader is
+//!   answers [`Stopped`], its reader is
 //!   cancelled), the ring goes, and a request waiting on a slot is answered
 //!   with an error.
 

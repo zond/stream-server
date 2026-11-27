@@ -7,7 +7,7 @@
 //! block, because mpv's `stream_cb` callbacks and a JNI export are blocking
 //! calls. There are two halves:
 //!
-//! * [`registry`](crate::media::registry) -- [`MediaSpec`](crate::media::MediaSpec) in, [`MediaId`](crate::media::MediaId) out, with no I/O
+//! * [`registry`](crate::media::registry) -- [`MediaSpec`] in, [`MediaId`] out, with no I/O
 //!   (`Registry::register`). The work is `resolve`'s: adding the torrent,
 //!   probing the origin, renewing the Drive grant. Its answer is kept on
 //!   the entry. The entries are a

@@ -66,9 +66,8 @@ reqwest = { version = "0.13", features = ["json", "rustls"] }
 # feature pulls in, depends on it -- so naming it here compiles nothing new.
 webpki-root-certs = "1"
 urlencoding = "2.1"
-bumpalo = { version = "3.19", features = ["collections"] }
 memmap2 = "0.9.9"
-parking_lot = "0.12.5"
+parking_lot = "0.13.0"
 # Free-space probe (`available_space`) for the pin_download margin check:
 # pure Rust on Unix and Windows, default `sync` feature only.
 fs4 = "1.1.0"
