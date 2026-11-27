@@ -66,7 +66,12 @@ mime_guess = "2.0.5"
 # under rustls and under librqbit's SHA-1, so the crate's default
 # `crypto-aws-lc` would change RAR's crypto backend and not what the build
 # needs.
-unrar-rs = { version = "0.16", default-features = false, features = [
+#
+# Held at 0.14: 0.15 and 0.16 (to 0.16.8) do not compile for 32-bit Android,
+# which xtremio's TV build is. Their `link_anchor.rs` ands `st_mode` (u32
+# there) with `S_IFMT` (u16 there). Move up when a release compiles under
+# `cargo check --target armv7-linux-androideabi`.
+unrar-rs = { version = "0.14", default-features = false, features = [
     "crypto-rust",
 ], optional = true }
 lz-str = "0.2.1"

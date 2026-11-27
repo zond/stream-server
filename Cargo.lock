@@ -4157,9 +4157,9 @@ dependencies = [
 
 [[package]]
 name = "unrar-rs"
-version = "0.16.8"
+version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6baf20fd1d5ca100a72e822e105df57a005eb7327a216dd2a81d5663a8a5839b"
+checksum = "e29589d51510630894b83abe33ff77839e1f32369abdbbcaccfb08facb28f61f"
 dependencies = [
  "aes",
  "blake2s_simd",
